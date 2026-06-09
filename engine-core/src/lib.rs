@@ -62,9 +62,10 @@
 //!     .unwrap();
 //! assert!(!engine.is_completed(instance_key));
 //!
-//! // A worker completes the job; the token resumes and the instance finishes.
-//! let job_key = engine.pending_jobs()[0].key;
-//! engine.apply_command(Command::complete_job(job_key)).unwrap();
+//! // A worker activates the job (locking it for 30s of logical time), does the
+//! // work, and completes it by key; the token resumes and the instance finishes.
+//! let jobs = engine.activate_jobs("payment", "worker-1", 10, 30_000, 0);
+//! engine.apply_command(Command::complete_job(jobs[0].key)).unwrap();
 //! assert!(engine.is_completed(instance_key));
 //! ```
 
@@ -77,7 +78,7 @@ mod state;
 pub mod bpmn;
 
 pub use command::Command;
-pub use engine::{Engine, EngineError};
+pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;
 pub use model::{
     BuildError, Condition, Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition,

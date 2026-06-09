@@ -24,13 +24,17 @@ pub enum ProcessInstanceState {
 /// Lifecycle state of a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobState {
-    /// Created and waiting to be completed.
+    /// Created and activatable: available for a worker to activate. A job is
+    /// also back in this state once its activation lock expires.
     Created,
+    /// Activated and locked to a worker until its `deadline`. While locked it
+    /// cannot be activated by another worker, but completion is by key alone.
+    Activated,
     /// Completed by a worker.
     Completed,
 }
 
-/// A job created for a service task, awaiting completion.
+/// A job created for a service task, awaiting activation and completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub key: Key,
@@ -40,6 +44,18 @@ pub struct Job {
     pub element_id: ElementId,
     pub job_type: String,
     pub state: JobState,
+    /// Name of the worker currently holding the activation lock, if any.
+    pub worker: Option<String>,
+    /// Logical instant at which the current activation lock expires, if locked.
+    /// Compared against the caller-supplied `now`; the engine never reads a
+    /// wall clock itself.
+    pub deadline: Option<u64>,
+    /// Whether this job has ever been activated. Completion is permitted for any
+    /// job that has been activated at least once and is not yet completed —
+    /// regardless of which worker currently holds (or held) the lock. This is
+    /// what lets a slow worker still complete a job whose lock expired and was
+    /// re-activated by someone else.
+    pub activated: bool,
 }
 
 /// A running (or completed) process instance.
@@ -222,13 +238,42 @@ pub fn apply(state: &mut State, event: &Event) {
                     element_id: element_id.clone(),
                     job_type: job_type.clone(),
                     state: JobState::Created,
+                    worker: None,
+                    deadline: None,
+                    activated: false,
                 },
             );
+        }
+
+        Event::JobActivated {
+            job_key,
+            worker,
+            deadline,
+            ..
+        } => {
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                job.state = JobState::Activated;
+                job.worker = Some(worker.clone());
+                job.deadline = Some(*deadline);
+                job.activated = true;
+            }
+        }
+
+        Event::JobLockExpired { job_key, .. } => {
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                if job.state == JobState::Activated {
+                    job.state = JobState::Created;
+                    job.worker = None;
+                    job.deadline = None;
+                }
+            }
         }
 
         Event::JobCompleted { job_key, .. } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Completed;
+                job.worker = None;
+                job.deadline = None;
             }
         }
 

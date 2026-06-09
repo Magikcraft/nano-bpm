@@ -33,8 +33,9 @@ fn two_service_tasks_complete_in_order() {
     assert_eq!(engine.pending_jobs()[0].job_type, "inventory");
     assert!(!engine.is_completed(instance_key));
 
-    // Complete the first job -> token advances to the second task.
+    // Activate then complete the first job -> token advances to the second task.
     let first = engine.pending_jobs()[0].key;
+    engine.activate_jobs("inventory", "worker-1", 10, 60_000, 0);
     engine
         .apply_command(Command::complete_job(first))
         .expect("complete first");
@@ -42,8 +43,9 @@ fn two_service_tasks_complete_in_order() {
     assert_eq!(engine.pending_jobs()[0].job_type, "logistics");
     assert!(!engine.is_completed(instance_key));
 
-    // Complete the second job -> instance finishes.
+    // Activate then complete the second job -> instance finishes.
     let second = engine.pending_jobs()[0].key;
+    engine.activate_jobs("logistics", "worker-1", 10, 60_000, 0);
     let events = engine
         .apply_command(Command::complete_job(second))
         .expect("complete second");

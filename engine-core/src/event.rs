@@ -99,6 +99,18 @@ pub enum Event {
         element_id: ElementId,
         job_type: String,
     },
+    /// A job was activated by a worker and locked until `deadline` (a logical
+    /// instant supplied by the caller). Another worker cannot activate it until
+    /// the lock expires, but any holder of the key may complete it.
+    JobActivated {
+        job_key: Key,
+        instance_key: Key,
+        worker: String,
+        deadline: u64,
+    },
+    /// A job's activation lock expired (its `deadline` passed); it becomes
+    /// activatable again. Emitted by an `ExpireJobs` tick.
+    JobLockExpired { job_key: Key, instance_key: Key },
     /// A job was completed.
     JobCompleted { job_key: Key, instance_key: Key },
 
@@ -133,6 +145,8 @@ impl Event {
             | Event::ParallelJoinTokenArrived { instance_key, .. }
             | Event::ParallelJoinReset { instance_key, .. }
             | Event::JobCreated { instance_key, .. }
+            | Event::JobActivated { instance_key, .. }
+            | Event::JobLockExpired { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),

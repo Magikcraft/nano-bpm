@@ -25,11 +25,26 @@ pub enum Command {
         variables: HashMap<String, Value>,
     },
     /// Report that the work for a job has finished, optionally merging variables
-    /// into the instance before the token resumes.
+    /// into the instance before the token resumes. Completion is by key alone:
+    /// any holder of the key may complete a job that has been activated.
     CompleteJob {
         job_key: Key,
         variables: HashMap<String, Value>,
     },
+    /// Activate up to `max_jobs` activatable jobs of `job_type` for `worker`,
+    /// locking each until `now + timeout`. `now` is a caller-supplied logical
+    /// instant — the engine never reads a wall clock.
+    ActivateJobs {
+        job_type: String,
+        worker: String,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+    },
+    /// Release the activation lock of every job whose `deadline` is at or before
+    /// `now`, making it activatable again. A periodic "tick" the host drives;
+    /// keeps lock expiry deterministic and out of the engine's clock.
+    ExpireJobs { now: u64 },
 }
 
 impl Command {
@@ -63,5 +78,22 @@ impl Command {
     /// Convenience constructor for a `CompleteJob` that sets variables.
     pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::CompleteJob { job_key, variables }
+    }
+
+    /// Convenience constructor for an `ActivateJobs` request.
+    pub fn activate_jobs(
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+    ) -> Self {
+        Command::ActivateJobs {
+            job_type: job_type.into(),
+            worker: worker.into(),
+            max_jobs,
+            timeout,
+            now,
+        }
     }
 }

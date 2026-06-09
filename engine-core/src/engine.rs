@@ -80,13 +80,91 @@ impl Engine {
         self.state.jobs.get(&key)
     }
 
-    /// All jobs currently awaiting completion.
+    /// All jobs currently awaiting activation (created, or with an expired lock).
     pub fn pending_jobs(&self) -> Vec<&state::Job> {
         self.state
             .jobs
             .values()
             .filter(|j| j.state == state::JobState::Created)
             .collect()
+    }
+
+    /// Activates up to `max_jobs` activatable jobs of `job_type` for `worker`,
+    /// locking each until `now + timeout`, and returns them — the **pull** worker
+    /// API for embedded use (no polling, no network). `now` is a caller-supplied
+    /// logical instant. Equivalent to applying a [`Command::ActivateJobs`] and
+    /// reading back the activated jobs.
+    pub fn activate_jobs(
+        &mut self,
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+    ) -> Vec<ActivatedJob> {
+        let events = self
+            .apply_command(Command::activate_jobs(
+                job_type, worker, max_jobs, timeout, now,
+            ))
+            .expect("ActivateJobs never fails");
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::JobActivated {
+                    job_key,
+                    worker,
+                    deadline,
+                    ..
+                } => self.job(*job_key).map(|job| ActivatedJob {
+                    key: job.key,
+                    job_type: job.job_type.clone(),
+                    instance_key: job.instance_key,
+                    element_instance_key: job.element_instance_key,
+                    element_id: job.element_id.clone(),
+                    worker: worker.clone(),
+                    deadline: *deadline,
+                    variables: self.variables(job.instance_key),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Releases the activation lock of every job whose deadline is at or before
+    /// `now`. The host drives this periodically (a "tick"); the engine itself
+    /// never reads a clock.
+    pub fn expire_jobs(&mut self, now: u64) {
+        self.apply_command(Command::ExpireJobs { now })
+            .expect("ExpireJobs never fails");
+    }
+
+    /// Activates jobs of `job_type` and dispatches each to `handler` — the
+    /// **callback** worker API for embedded use. Whatever variables the handler
+    /// returns complete the job (by key); returning `None` leaves the job locked.
+    /// Returns the number of jobs the handler completed. Runs entirely on the
+    /// single-writer thread, so there is no concurrency to reason about.
+    pub fn poll_jobs<F>(
+        &mut self,
+        job_type: impl Into<String>,
+        worker: impl Into<String>,
+        max_jobs: usize,
+        timeout: u64,
+        now: u64,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(&ActivatedJob) -> Option<HashMap<String, Value>>,
+    {
+        let jobs = self.activate_jobs(job_type, worker, max_jobs, timeout, now);
+        let mut completed = 0;
+        for job in jobs {
+            if let Some(variables) = handler(&job) {
+                self.apply_command(Command::complete_job_with(job.key, variables))
+                    .expect("activated job can be completed");
+                completed += 1;
+            }
+        }
+        completed
     }
 
     fn mint_key(&mut self) -> Key {
@@ -188,8 +266,15 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
-                if job.state != state::JobState::Created {
+                if job.state == state::JobState::Completed {
                     return Err(EngineError::JobNotActive { job_key });
+                }
+                // Completion is by key alone, but a job must have been activated
+                // at least once first. The current lock holder is irrelevant:
+                // any worker that holds the key may complete it, even after the
+                // lock expired and another worker re-activated it.
+                if !job.activated {
+                    return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
@@ -217,6 +302,62 @@ impl Engine {
                     element_instance_key,
                     element_id,
                 });
+            }
+
+            Command::ActivateJobs {
+                job_type,
+                worker,
+                max_jobs,
+                timeout,
+                now,
+            } => {
+                let deadline = now.saturating_add(timeout);
+                // Deterministic selection: activatable jobs of this type, by key
+                // ascending, capped at max_jobs.
+                let mut keys: Vec<Key> = self
+                    .state
+                    .jobs
+                    .values()
+                    .filter(|j| j.job_type == job_type && job_activatable(j, now))
+                    .map(|j| j.key)
+                    .collect();
+                keys.sort_unstable();
+                keys.truncate(max_jobs);
+                for job_key in keys {
+                    let instance_key = self.state.jobs[&job_key].instance_key;
+                    self.emit(
+                        &mut log,
+                        Event::JobActivated {
+                            job_key,
+                            instance_key,
+                            worker: worker.clone(),
+                            deadline,
+                        },
+                    );
+                }
+            }
+
+            Command::ExpireJobs { now } => {
+                let mut expired: Vec<(Key, Key)> = self
+                    .state
+                    .jobs
+                    .values()
+                    .filter(|j| {
+                        j.state == state::JobState::Activated
+                            && j.deadline.is_some_and(|d| d <= now)
+                    })
+                    .map(|j| (j.key, j.instance_key))
+                    .collect();
+                expired.sort_unstable();
+                for (job_key, instance_key) in expired {
+                    self.emit(
+                        &mut log,
+                        Event::JobLockExpired {
+                            job_key,
+                            instance_key,
+                        },
+                    );
+                }
             }
         }
 
@@ -572,8 +713,11 @@ pub enum EngineError {
     NoStartEvent { process_id: String },
     /// `CompleteJob` referenced a job key that does not exist.
     JobNotFound { job_key: Key },
-    /// `CompleteJob` referenced a job that is not in the `Created` state.
+    /// `CompleteJob` referenced a job that has already been completed.
     JobNotActive { job_key: Key },
+    /// `CompleteJob` referenced a job that has never been activated. A job must
+    /// be activated at least once before it can be completed.
+    JobNotActivated { job_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -590,13 +734,46 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::JobNotFound { job_key } => write!(f, "no job with key {job_key}"),
             EngineError::JobNotActive { job_key } => {
-                write!(f, "job {job_key} is not active and cannot be completed")
+                write!(f, "job {job_key} has already been completed")
+            }
+            EngineError::JobNotActivated { job_key } => {
+                write!(
+                    f,
+                    "job {job_key} must be activated before it can be completed"
+                )
             }
         }
     }
 }
 
 impl std::error::Error for EngineError {}
+
+/// A job handed to a worker by [`Engine::activate_jobs`]: everything the worker
+/// needs to do the work and complete it by key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivatedJob {
+    pub key: Key,
+    pub job_type: String,
+    pub instance_key: Key,
+    pub element_instance_key: Key,
+    pub element_id: String,
+    /// The worker the job was locked to.
+    pub worker: String,
+    /// Logical instant at which the activation lock expires.
+    pub deadline: u64,
+    /// A snapshot of the instance's variables at activation time.
+    pub variables: HashMap<String, Value>,
+}
+
+/// Whether a job can be activated at the logical instant `now`: it is created
+/// (never activated, or its lock was released) or its current lock has expired.
+fn job_activatable(job: &state::Job, now: u64) -> bool {
+    match job.state {
+        state::JobState::Completed => false,
+        state::JobState::Created => true,
+        state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -614,13 +791,17 @@ mod tests {
             .unwrap()
     }
 
-    fn job_of_type(engine: &Engine, job_type: &str) -> Key {
-        engine
-            .pending_jobs()
+    /// Test helper: activate the first job of `job_type` (locking it) and
+    /// complete it by key, returning the events from completion.
+    fn complete_one(engine: &mut Engine, job_type: &str) -> Vec<Event> {
+        let job = engine
+            .activate_jobs(job_type, "test-worker", 10, 60_000, 0)
             .into_iter()
-            .find(|j| j.job_type == job_type)
-            .unwrap_or_else(|| panic!("no pending job of type {job_type}"))
-            .key
+            .next()
+            .unwrap_or_else(|| panic!("no activatable job of type {job_type}"));
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap()
     }
 
     #[test]
@@ -639,6 +820,7 @@ mod tests {
         assert!(!engine.is_completed(instance_key));
 
         let job_key = engine.pending_jobs()[0].key;
+        engine.activate_jobs("payment", "worker-1", 10, 60_000, 0);
         let events = engine
             .apply_command(Command::complete_job(job_key))
             .unwrap();
@@ -699,15 +881,11 @@ mod tests {
         assert!(!engine.is_completed(instance_key));
 
         // when the first branch's job completes, the join must still wait
-        engine
-            .apply_command(Command::complete_job(job_of_type(&engine, "ja")))
-            .unwrap();
+        complete_one(&mut engine, "ja");
         assert!(!engine.is_completed(instance_key));
 
         // when the second branch completes, the join fires and the instance ends
-        let final_events = engine
-            .apply_command(Command::complete_job(job_of_type(&engine, "jb")))
-            .unwrap();
+        let final_events = complete_one(&mut engine, "jb");
         assert!(engine.is_completed(instance_key));
         assert!(final_events.contains(&Event::ProcessInstanceCompleted { instance_key }));
         // exactly one ProcessInstanceCompleted across the whole run
@@ -850,6 +1028,134 @@ mod tests {
     }
 
     #[test]
+    fn should_reject_completing_a_job_that_was_never_activated() {
+        // given an instance parked on a service task with a created (but
+        // un-activated) job
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        // when it is completed without being activated first
+        let err = engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap_err();
+
+        // then it is rejected
+        assert_eq!(err, EngineError::JobNotActivated { job_key });
+    }
+
+    #[test]
+    fn should_lock_an_activated_job_until_its_deadline() {
+        // given an instance parked on a service task
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+
+        // when worker A activates the job at t=0 for 1000ms
+        let activated = engine.activate_jobs("payment", "A", 10, 1_000, 0);
+        assert_eq!(activated.len(), 1);
+        assert_eq!(activated[0].worker, "A");
+        assert_eq!(activated[0].deadline, 1_000);
+
+        // then a second activation before the deadline gets nothing
+        assert!(engine
+            .activate_jobs("payment", "B", 10, 1_000, 500)
+            .is_empty());
+
+        // and once the lock has expired the job is activatable again
+        let reactivated = engine.activate_jobs("payment", "B", 10, 1_000, 1_500);
+        assert_eq!(reactivated.len(), 1);
+        assert_eq!(reactivated[0].worker, "B");
+    }
+
+    #[test]
+    fn should_let_a_previous_worker_complete_after_re_activation() {
+        // given worker A activated the job, then its lock expired and worker B
+        // re-activated it (e.g. A's work outran the activation window)
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+        let reactivated = engine.activate_jobs("payment", "B", 10, 1_000, 1_500);
+        assert_eq!(reactivated[0].key, job_key);
+
+        // when the slow worker A finally completes the job by key
+        engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap();
+
+        // then completion succeeds and the instance finishes
+        assert!(engine.is_completed(instance_key));
+
+        // and B can no longer complete the already-completed job
+        let err = engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap_err();
+        assert_eq!(err, EngineError::JobNotActive { job_key });
+    }
+
+    #[test]
+    fn should_expire_locks_on_tick() {
+        // given an activated (locked) job
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+        assert!(engine.pending_jobs().is_empty());
+
+        // when a tick runs after the deadline
+        engine.expire_jobs(2_000);
+
+        // then the job is activatable again
+        assert_eq!(engine.pending_jobs().len(), 1);
+        assert_eq!(engine.pending_jobs()[0].key, job_key);
+    }
+
+    #[test]
+    fn should_dispatch_jobs_to_a_callback_worker() {
+        // given an instance parked on a service task
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // when a callback worker polls and handles the job
+        let mut seen = Vec::new();
+        let handled = engine.poll_jobs("payment", "cb", 10, 60_000, 0, |job| {
+            seen.push(job.job_type.clone());
+            Some(HashMap::new())
+        });
+
+        // then the job was dispatched and completed, finishing the instance
+        assert_eq!(handled, 1);
+        assert_eq!(seen, ["payment"]);
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
     fn should_be_deterministic_and_replayable() {
         let run = || {
             let mut engine = Engine::new();
@@ -865,6 +1171,11 @@ mod tests {
                     .unwrap(),
             );
             let job_key = engine.pending_jobs()[0].key;
+            all.extend(
+                engine
+                    .apply_command(Command::activate_jobs("payment", "worker-1", 1, 60_000, 0))
+                    .unwrap(),
+            );
             all.extend(
                 engine
                     .apply_command(Command::complete_job(job_key))
