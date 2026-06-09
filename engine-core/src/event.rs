@@ -27,11 +27,16 @@ pub enum Event {
     },
 
     /// A new process instance was created (carries a single token at its start
-    /// event) with its initial variables.
+    /// event) with its initial variables. `created_at` is the logical instant
+    /// the instance was started, carried on the command (the engine never reads
+    /// a wall clock); it is the instance's start date. Defaulted to `0` so
+    /// journals written before this field existed still replay.
     ProcessInstanceCreated {
         instance_key: Key,
         process_id: String,
         variables: HashMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        created_at: u64,
     },
 
     /// Variables were merged into a process instance.

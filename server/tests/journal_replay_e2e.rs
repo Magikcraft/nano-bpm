@@ -452,3 +452,38 @@ fn create_instance_accepts_the_default_tenant_id() {
 
     server.shutdown();
 }
+
+#[test]
+fn a_created_instance_reports_a_real_start_date() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Regression: the clock-free engine did not record a start time, so every
+    // process instance was projected with the Unix epoch
+    // (`1970-01-01T00:00:00Z`) as its start date. The server now stamps the
+    // creating command's wall-clock instant onto the instance, so the search
+    // projection must report a present-day timestamp.
+    let server = ServerProcess::boot(&journal);
+    let key = create_demo_instance(&server);
+
+    let (status, body) = server.request("POST", &path("/process-instances/search"), Some(r#"{}"#));
+    assert_eq!(status, 200, "search failed: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    let item = json["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|i| i["processInstanceKey"].as_str() == Some(key.as_str()))
+        })
+        .expect("created instance present in search results");
+
+    let start_date = item["startDate"].as_str().expect("startDate is a string");
+    assert!(
+        !start_date.starts_with("1970"),
+        "start date must be the real creation time, not the epoch: {start_date}"
+    );
+
+    server.shutdown();
+}

@@ -306,6 +306,7 @@ impl Engine {
                 instance_key,
                 process_id,
                 variables,
+                created_at: self.now,
             },
         );
         queue.push_back(Step::Activate {

@@ -1240,12 +1240,17 @@ fn process_instance_result(
         ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
     };
 
+    let start_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        instance.created_at as i64,
+    )
+    .unwrap_or_else(epoch);
+
     models::ProcessInstanceResult::new(
         process_definition_id,
         types::Nullable::Null,
         version,
         types::Nullable::Null,
-        epoch(),
+        start_date,
         types::Nullable::Null,
         state_enum,
         !instance.incidents.is_empty(),

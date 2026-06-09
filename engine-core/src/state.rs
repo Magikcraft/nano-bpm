@@ -83,6 +83,11 @@ pub struct ProcessInstance {
     pub key: Key,
     pub process_id: String,
     pub state: ProcessInstanceState,
+    /// The logical instant the instance was started (the `created_at` carried on
+    /// the creating command), in milliseconds since the Unix epoch. This is the
+    /// instance's start date. `0` for instances created before the engine
+    /// recorded a start time.
+    pub created_at: u64,
     /// Currently-active element instances, keyed by element-instance key. An
     /// element instance is "active" from `ACTIVATED` until `COMPLETED`; a service
     /// task therefore stays here while its job is pending, as does a token parked
@@ -385,6 +390,7 @@ pub fn apply(state: &mut State, event: &Event) {
             instance_key,
             process_id,
             variables,
+            created_at,
         } => {
             state.instances.insert(
                 *instance_key,
@@ -392,6 +398,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     key: *instance_key,
                     process_id: process_id.clone(),
                     state: ProcessInstanceState::Active,
+                    created_at: *created_at,
                     active: HashMap::new(),
                     variables: variables.clone(),
                     join_counts: HashMap::new(),
