@@ -418,6 +418,7 @@ impl Engine {
                             instance_key,
                             element_instance_key,
                             element_id,
+                            kind: state::IncidentKind::JobNoRetries,
                             reason: error_message,
                             job_key: Some(job_key),
                         },
@@ -499,6 +500,7 @@ impl Engine {
                                 instance_key,
                                 element_instance_key,
                                 element_id: task_element_id,
+                                kind: state::IncidentKind::UnhandledError,
                                 reason,
                                 job_key: None,
                             },
@@ -748,6 +750,7 @@ impl Engine {
                     instance_key,
                     element_instance_key,
                     element_id: element_id.clone(),
+                    kind: state::IncidentKind::NoMatchingSequenceFlow,
                     reason: format!(
                         "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
                     ),

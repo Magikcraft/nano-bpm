@@ -87,6 +87,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   error-handling path; an unmatched error raises an incident instead. The job is
   consumed either way (`JobState::Errored`) and, like the other transitions,
   throwing requires prior activation.
+- **Incidents** are first-class records with a key (`State::incidents`), raised
+  when a token cannot proceed: a job exhausted its retries, an exclusive gateway
+  matched no flow, or a thrown error went uncaught (`IncidentKind`). A
+  job-incident links back to its job. Recovery mirrors Camunda: `UpdateJobRetries`
+  restores a parked job's retries, then `ResolveIncident` clears the incident and
+  returns the job to the activatable pool (resolution is rejected while the job
+  still has no retries). Gateway/uncaught-error incidents carry no job link and
+  simply clear.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
 

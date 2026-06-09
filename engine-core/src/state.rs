@@ -99,6 +99,19 @@ pub struct ProcessInstance {
     pub incidents: Vec<Key>,
 }
 
+/// Why an incident was raised. Maps to a recovery story and to the REST
+/// `errorType` taxonomy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncidentKind {
+    /// A job exhausted its retries (`FailJob` with 0 left). Recoverable by
+    /// updating retries and resolving.
+    JobNoRetries,
+    /// An exclusive gateway found no matching outgoing sequence flow.
+    NoMatchingSequenceFlow,
+    /// A thrown business error was not caught by any boundary event.
+    UnhandledError,
+}
+
 /// A raised incident: a token parked because something went wrong (a job
 /// exhausted its retries, an exclusive gateway matched no flow, or a thrown
 /// business error went uncaught). Incidents are resolved with
@@ -110,6 +123,8 @@ pub struct Incident {
     /// The parked element instance the incident sits on.
     pub element_instance_key: Key,
     pub element_id: ElementId,
+    /// What went wrong.
+    pub kind: IncidentKind,
     /// Human-readable explanation of why the incident was raised.
     pub reason: String,
     /// The job whose retry exhaustion caused this incident, if any. Only
@@ -346,6 +361,7 @@ pub fn apply(state: &mut State, event: &Event) {
             instance_key,
             element_instance_key,
             element_id,
+            kind,
             reason,
             job_key,
         } => {
@@ -356,6 +372,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     instance_key: *instance_key,
                     element_instance_key: *element_instance_key,
                     element_id: element_id.clone(),
+                    kind: *kind,
                     reason: reason.clone(),
                     job_key: *job_key,
                 },

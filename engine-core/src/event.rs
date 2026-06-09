@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::model::{ElementId, ProcessDefinition, Value};
-use crate::state::Key;
+use crate::state::{IncidentKind, Key};
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
@@ -145,6 +145,7 @@ pub enum Event {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+        kind: IncidentKind,
         reason: String,
         job_key: Option<Key>,
     },
