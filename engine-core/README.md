@@ -30,7 +30,10 @@ For a *nano*, embeddable engine the Camunda 8 model wins decisively:
    (see the `should_be_deterministic_and_replayable` test).
 3. **Persistence is optional and pluggable.** The engine holds state in memory
    and emits a replayable event log; back it with a WAL, `redb`, `sled` or
-   SQLite — or nothing at all.
+   SQLite — or nothing at all. `Engine::replay(events)` reconstructs state (and
+   the key generator) from a recorded log; enable the off-by-default `serde`
+   feature to (de)serialize events for an on-disk journal. The server ships one
+   (set `NANOBPMN_JOURNAL`); see the repo `README.md`.
 4. **It matches the rest of nanobpmn.** The generated REST layer *is* the
    Camunda 8 v2 API, so an engine speaking C8 semantics wires straight behind it.
 
@@ -40,8 +43,9 @@ copy.
 
 ## Why it runs on phones (and in the browser)
 
-`engine-core` has **zero dependencies and uses only `std`**. The same crate
-compiles for:
+`engine-core` has **zero dependencies and uses only `std`** by default (the
+optional `serde` feature adds `serde` only when a host opts into event
+(de)serialization). The same crate compiles for:
 
 - native servers (`x86_64` / `aarch64`),
 - **iOS** (`aarch64-apple-ios`) and **Android** (`aarch64-linux-android`),

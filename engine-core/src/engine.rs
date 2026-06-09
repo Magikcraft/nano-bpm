@@ -78,6 +78,34 @@ impl Engine {
         &self.state
     }
 
+    /// Rebuilds an engine by replaying a recorded event log.
+    ///
+    /// State is reconstructed through the applier ([`state::apply`]) — the same
+    /// path used at runtime — and the key generator is advanced past every key
+    /// the log assigned, so commands applied after recovery never mint a key
+    /// that collides with a replayed one. The clock resets to `0`; timestamps
+    /// are carried on the events themselves, so history (e.g. incident
+    /// `created_at`) is preserved, and the next command sets the clock again.
+    ///
+    /// This is the durability primitive: a host persists the events returned by
+    /// [`Engine::apply_command_at`] and, on restart, feeds them back here.
+    pub fn replay<I>(events: I) -> Self
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        let mut state = State::new();
+        let mut max_key: Key = 0;
+        for event in events {
+            max_key = max_key.max(event.max_key());
+            state::apply(&mut state, &event);
+        }
+        Self {
+            state,
+            next_key: max_key,
+            now: 0,
+        }
+    }
+
     /// Looks up a process instance.
     pub fn instance(&self, key: Key) -> Option<&state::ProcessInstance> {
         self.state.instances.get(&key)
@@ -2176,5 +2204,67 @@ mod tests {
             state::apply(&mut replayed, event);
         }
         assert_eq!(&replayed, engine_a.state());
+    }
+
+    #[test]
+    fn should_recover_state_and_key_generator_via_replay() {
+        // given a run that deploys, starts an instance, and raises an incident
+        let (engine_a, log) = {
+            let mut engine = Engine::new();
+            let mut log = Vec::new();
+            log.extend(
+                engine
+                    .apply_command(Command::DeployProcess(linear_with_task()))
+                    .unwrap(),
+            );
+            log.extend(
+                engine
+                    .apply_command(Command::create_instance("order"))
+                    .unwrap(),
+            );
+            let job_key = engine.pending_jobs()[0].key;
+            engine
+                .apply_command(Command::activate_jobs("payment", "w", 1, 60_000, 0))
+                .unwrap();
+            // fail with no retries -> parks the job and raises an incident
+            log.extend(
+                engine
+                    .apply_command_at(Command::fail_job(job_key, 0, "boom"), 1_234)
+                    .unwrap(),
+            );
+            (engine, log)
+        };
+
+        // when the durable log is replayed into a fresh engine
+        // (activation events are volatile and intentionally not part of `log`)
+        let mut recovered = Engine::replay(log);
+
+        // then state matches (modulo the volatile activation: the replayed job
+        // is parked Failed, identical to the original after fail)
+        let orig_incident = engine_a.active_incidents()[0];
+        let rec_incident = recovered.active_incidents()[0];
+        assert_eq!(rec_incident.key, orig_incident.key);
+        assert_eq!(rec_incident.created_at, 1_234);
+        assert_eq!(rec_incident.kind, state::IncidentKind::JobNoRetries);
+
+        // and the key generator resumes past every replayed key: a new instance
+        // mints a strictly higher key than anything in the recovered log
+        let max_existing = recovered
+            .state()
+            .instances
+            .keys()
+            .chain(recovered.state().jobs.keys())
+            .chain(recovered.state().incidents.keys())
+            .copied()
+            .max()
+            .unwrap();
+        let events = recovered
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let new_instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert!(
+            new_instance_key > max_existing,
+            "new key {new_instance_key} must exceed replayed max {max_existing}"
+        );
     }
 }

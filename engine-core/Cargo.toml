@@ -6,10 +6,16 @@ publish = false
 description = "Minimal, embeddable BPMN execution core: a deterministic single-writer command/event/applier state machine (Camunda 8 / Zeebe-style), with zero dependencies so it builds for server, mobile (iOS/Android via FFI) and wasm targets."
 license = "Apache-2.0"
 
-# Intentionally dependency-free: std-only so the same crate compiles for
-# aarch64-apple-ios, aarch64-linux-android and wasm32 without pulling a DB,
+# Intentionally dependency-free by default: std-only so the same crate compiles
+# for aarch64-apple-ios, aarch64-linux-android and wasm32 without pulling a DB,
 # async runtime or networking. Persistence is a caller concern (replay the log).
+# The optional `serde` feature derives (de)serialization on the event log and
+# model so a host can persist and replay it; it is off by default.
 [dependencies]
+serde = { version = "1", optional = true, features = ["derive"] }
+
+[features]
+serde = ["dep:serde"]
 
 [lib]
 name = "nanobpmn_engine_core"

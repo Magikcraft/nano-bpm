@@ -13,6 +13,7 @@ use crate::state::{IncidentKind, Key};
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Event {
     /// A process definition was registered as part of a deployment. The engine
     /// assigns the `deployment_key` (shared by every resource in the same
@@ -198,5 +199,78 @@ impl Event {
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. } => None,
         }
+    }
+
+    /// The highest [`Key`] this event references in any field.
+    ///
+    /// Replay uses the maximum across the whole log to restore the engine's key
+    /// generator past every key the original run assigned, so newly minted keys
+    /// never collide with replayed ones. (Keys are only ever minted by the
+    /// engine and stamped onto events, so the log is an exact record of them —
+    /// including transient ones like completed element-instance keys that no
+    /// longer appear in final state.)
+    pub fn max_key(&self) -> Key {
+        let mut m = self.instance_key().unwrap_or(0);
+        match self {
+            Event::ProcessDeployed {
+                deployment_key,
+                process_definition_key,
+                ..
+            } => m = m.max(*deployment_key).max(*process_definition_key),
+            Event::ElementActivating {
+                element_instance_key,
+                ..
+            }
+            | Event::ElementActivated {
+                element_instance_key,
+                ..
+            }
+            | Event::ElementCompleting {
+                element_instance_key,
+                ..
+            }
+            | Event::ElementCompleted {
+                element_instance_key,
+                ..
+            }
+            | Event::ParallelJoinOpened {
+                element_instance_key,
+                ..
+            } => m = m.max(*element_instance_key),
+            Event::JobCreated {
+                job_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*job_key).max(*element_instance_key),
+            Event::JobActivated { job_key, .. }
+            | Event::JobLockExpired { job_key, .. }
+            | Event::JobFailed { job_key, .. }
+            | Event::JobErrorThrown { job_key, .. }
+            | Event::JobCompleted { job_key, .. }
+            | Event::JobRetriesUpdated { job_key, .. } => m = m.max(*job_key),
+            Event::IncidentRaised {
+                incident_key,
+                element_instance_key,
+                job_key,
+                ..
+            } => {
+                m = m.max(*incident_key).max(*element_instance_key);
+                if let Some(j) = job_key {
+                    m = m.max(*j);
+                }
+            }
+            Event::IncidentResolved {
+                incident_key,
+                job_key,
+                ..
+            } => {
+                m = m.max(*incident_key);
+                if let Some(j) = job_key {
+                    m = m.max(*j);
+                }
+            }
+            _ => {}
+        }
+        m
     }
 }

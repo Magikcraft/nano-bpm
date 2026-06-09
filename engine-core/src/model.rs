@@ -17,6 +17,7 @@ pub type ElementId = String;
 /// (A real engine would carry arbitrary JSON; that is an intentional extension
 /// point.)
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Bool(bool),
     Int(i64),
@@ -28,6 +29,7 @@ pub enum Value {
 /// Only equality is supported — deliberately not a FEEL expression engine. New
 /// operators plug in here.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Condition {
     /// True when the variable exists and equals `value`.
     Equals { variable: String, value: Value },
@@ -44,6 +46,7 @@ impl Condition {
 
 /// An outgoing sequence flow: a target element and an optional guard condition.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SequenceFlow {
     pub to: ElementId,
     /// `None` means an unconditional flow. On an exclusive gateway an
@@ -57,6 +60,7 @@ pub struct SequenceFlow {
 /// behaviour in `engine::process_step` — the rest of the architecture is
 /// unaffected.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ElementKind {
     /// A none start event. Pass-through: activates then immediately completes.
     StartEvent,
@@ -89,6 +93,7 @@ pub enum ElementKind {
 
 /// A single BPMN flow node and its outgoing sequence flows.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Element {
     pub id: ElementId,
     pub kind: ElementKind,
@@ -99,6 +104,7 @@ pub struct Element {
 /// An executable process definition: a set of [`Element`]s plus the id of the
 /// single start event where new instances begin.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessDefinition {
     pub id: String,
     pub elements: HashMap<ElementId, Element>,

@@ -103,6 +103,7 @@ pub struct ProcessInstance {
 /// Why an incident was raised. Maps to a recovery story and to the REST
 /// `errorType` taxonomy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IncidentKind {
     /// A job exhausted its retries (`FailJob` with 0 left). Recoverable by
     /// updating retries and resolving.
