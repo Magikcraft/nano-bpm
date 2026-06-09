@@ -123,6 +123,7 @@ impl Engine {
                     element_id: job.element_id.clone(),
                     worker: worker.clone(),
                     deadline: *deadline,
+                    retries: job.retries,
                     variables: self.variables(job.instance_key),
                 }),
                 _ => None,
@@ -266,7 +267,10 @@ impl Engine {
                     .jobs
                     .get(&job_key)
                     .ok_or(EngineError::JobNotFound { job_key })?;
-                if job.state == state::JobState::Completed {
+                if matches!(
+                    job.state,
+                    state::JobState::Completed | state::JobState::Failed
+                ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
                 // Completion is by key alone, but a job must have been activated
@@ -355,6 +359,54 @@ impl Engine {
                         Event::JobLockExpired {
                             job_key,
                             instance_key,
+                        },
+                    );
+                }
+            }
+
+            Command::FailJob {
+                job_key,
+                retries,
+                error_message,
+            } => {
+                let job = self
+                    .state
+                    .jobs
+                    .get(&job_key)
+                    .ok_or(EngineError::JobNotFound { job_key })?;
+                if matches!(
+                    job.state,
+                    state::JobState::Completed | state::JobState::Failed
+                ) {
+                    return Err(EngineError::JobNotActive { job_key });
+                }
+                // Like completion, failing a job requires that it was activated.
+                if !job.activated {
+                    return Err(EngineError::JobNotActivated { job_key });
+                }
+                let instance_key = job.instance_key;
+                let element_instance_key = job.element_instance_key;
+                let element_id = job.element_id.clone();
+                let retries = retries.max(0);
+
+                self.emit(
+                    &mut log,
+                    Event::JobFailed {
+                        job_key,
+                        instance_key,
+                        retries,
+                    },
+                );
+                // No retries left: park the job and raise an incident so the
+                // instance stops making progress on this token.
+                if retries == 0 {
+                    self.emit(
+                        &mut log,
+                        Event::IncidentRaised {
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            reason: error_message,
                         },
                     );
                 }
@@ -713,10 +765,11 @@ pub enum EngineError {
     NoStartEvent { process_id: String },
     /// `CompleteJob` referenced a job key that does not exist.
     JobNotFound { job_key: Key },
-    /// `CompleteJob` referenced a job that has already been completed.
+    /// `CompleteJob`/`FailJob` referenced a job that is not in a state where it
+    /// can be acted on (already completed, or failed with an incident raised).
     JobNotActive { job_key: Key },
-    /// `CompleteJob` referenced a job that has never been activated. A job must
-    /// be activated at least once before it can be completed.
+    /// `CompleteJob`/`FailJob` referenced a job that has never been activated. A
+    /// job must be activated at least once before it can be completed or failed.
     JobNotActivated { job_key: Key },
 }
 
@@ -734,12 +787,12 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::JobNotFound { job_key } => write!(f, "no job with key {job_key}"),
             EngineError::JobNotActive { job_key } => {
-                write!(f, "job {job_key} has already been completed")
+                write!(f, "job {job_key} is not in a state that can be acted on")
             }
             EngineError::JobNotActivated { job_key } => {
                 write!(
                     f,
-                    "job {job_key} must be activated before it can be completed"
+                    "job {job_key} must be activated before it can be completed or failed"
                 )
             }
         }
@@ -761,15 +814,18 @@ pub struct ActivatedJob {
     pub worker: String,
     /// Logical instant at which the activation lock expires.
     pub deadline: u64,
+    /// Remaining retries for this job.
+    pub retries: i32,
     /// A snapshot of the instance's variables at activation time.
     pub variables: HashMap<String, Value>,
 }
 
 /// Whether a job can be activated at the logical instant `now`: it is created
 /// (never activated, or its lock was released) or its current lock has expired.
+/// Failed (incident-parked) and completed jobs are never activatable.
 fn job_activatable(job: &state::Job, now: u64) -> bool {
     match job.state {
-        state::JobState::Completed => false,
+        state::JobState::Completed | state::JobState::Failed => false,
         state::JobState::Created => true,
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
@@ -1056,6 +1112,86 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::IncidentRaised { .. })));
         assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
+    }
+
+    #[test]
+    fn should_re_activate_a_failed_job_that_still_has_retries() {
+        // given an activated job
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+
+        // when the worker fails it with retries remaining
+        engine
+            .apply_command(Command::fail_job(job_key, 2, "transient error"))
+            .unwrap();
+
+        // then no incident is raised and the job is activatable again
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+        assert_eq!(engine.pending_jobs().len(), 1);
+        let reactivated = engine.activate_jobs("payment", "B", 10, 60_000, 1);
+        assert_eq!(reactivated.len(), 1);
+        assert_eq!(reactivated[0].key, job_key);
+        assert_eq!(reactivated[0].retries, 2);
+    }
+
+    #[test]
+    fn should_raise_an_incident_when_a_job_fails_with_no_retries_left() {
+        // given an activated job
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+
+        // when the worker fails it with no retries left
+        let events = engine
+            .apply_command(Command::fail_job(job_key, 0, "boom"))
+            .unwrap();
+
+        // then an incident is raised, the job parks, and it is not activatable
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::IncidentRaised { reason, .. } if reason == "boom"
+        )));
+        assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
+        assert!(engine.pending_jobs().is_empty());
+        assert!(engine
+            .activate_jobs("payment", "B", 10, 60_000, 100)
+            .is_empty());
+
+        // and the parked job can no longer be completed
+        let err = engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap_err();
+        assert_eq!(err, EngineError::JobNotActive { job_key });
+    }
+
+    #[test]
+    fn should_reject_failing_a_job_that_was_never_activated() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        let err = engine
+            .apply_command(Command::fail_job(job_key, 1, "nope"))
+            .unwrap_err();
+        assert_eq!(err, EngineError::JobNotActivated { job_key });
     }
 
     #[test]

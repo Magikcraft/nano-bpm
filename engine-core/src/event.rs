@@ -111,6 +111,14 @@ pub enum Event {
     /// A job's activation lock expired (its `deadline` passed); it becomes
     /// activatable again. Emitted by an `ExpireJobs` tick.
     JobLockExpired { job_key: Key, instance_key: Key },
+    /// A worker reported that a job failed, setting its remaining `retries`. With
+    /// retries left the job becomes activatable again; with none it parks and an
+    /// [`Event::IncidentRaised`] follows.
+    JobFailed {
+        job_key: Key,
+        instance_key: Key,
+        retries: i32,
+    },
     /// A job was completed.
     JobCompleted { job_key: Key, instance_key: Key },
 
@@ -147,6 +155,7 @@ impl Event {
             | Event::JobCreated { instance_key, .. }
             | Event::JobActivated { instance_key, .. }
             | Event::JobLockExpired { instance_key, .. }
+            | Event::JobFailed { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),

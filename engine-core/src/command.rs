@@ -45,6 +45,14 @@ pub enum Command {
     /// `now`, making it activatable again. A periodic "tick" the host drives;
     /// keeps lock expiry deterministic and out of the engine's clock.
     ExpireJobs { now: u64 },
+    /// Report that a job failed, setting its remaining `retries`. With retries
+    /// left the job becomes activatable again; with none an incident is raised
+    /// and the job parks. `error_message` is recorded as the incident reason.
+    FailJob {
+        job_key: Key,
+        retries: i32,
+        error_message: String,
+    },
 }
 
 impl Command {
@@ -78,6 +86,15 @@ impl Command {
     /// Convenience constructor for a `CompleteJob` that sets variables.
     pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::CompleteJob { job_key, variables }
+    }
+
+    /// Convenience constructor for a `FailJob`.
+    pub fn fail_job(job_key: Key, retries: i32, error_message: impl Into<String>) -> Self {
+        Command::FailJob {
+            job_key,
+            retries,
+            error_message: error_message.into(),
+        }
     }
 
     /// Convenience constructor for an `ActivateJobs` request.

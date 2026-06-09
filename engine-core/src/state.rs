@@ -30,6 +30,10 @@ pub enum JobState {
     /// Activated and locked to a worker until its `deadline`. While locked it
     /// cannot be activated by another worker, but completion is by key alone.
     Activated,
+    /// Failed with no retries left: an incident was raised and the job is parked.
+    /// It is neither activatable nor completable until the incident is resolved
+    /// (incident resolution is not yet modelled).
+    Failed,
     /// Completed by a worker.
     Completed,
 }
@@ -56,7 +60,14 @@ pub struct Job {
     /// what lets a slow worker still complete a job whose lock expired and was
     /// re-activated by someone else.
     pub activated: bool,
+    /// Remaining retries. Set to [`DEFAULT_JOB_RETRIES`] when the job is created
+    /// and updated by `FailJob`. A failure that drops it to zero raises an
+    /// incident and parks the job ([`JobState::Failed`]).
+    pub retries: i32,
 }
+
+/// Retries a job starts with when first created.
+pub const DEFAULT_JOB_RETRIES: i32 = 3;
 
 /// A running (or completed) process instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,6 +252,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     worker: None,
                     deadline: None,
                     activated: false,
+                    retries: DEFAULT_JOB_RETRIES,
                 },
             );
         }
@@ -266,6 +278,23 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.worker = None;
                     job.deadline = None;
                 }
+            }
+        }
+
+        Event::JobFailed {
+            job_key, retries, ..
+        } => {
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                job.retries = *retries;
+                job.worker = None;
+                job.deadline = None;
+                // With retries left the job returns to the activatable pool; with
+                // none it parks (an incident is raised alongside this event).
+                job.state = if *retries > 0 {
+                    JobState::Created
+                } else {
+                    JobState::Failed
+                };
             }
         }
 
