@@ -13,8 +13,14 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   resources and deploys them, assigning each process a key and a per-id version.
 - `POST /v2/process-instances` (`createProcessInstance`, by `processDefinitionId`)
   starts a real instance and returns its engine-assigned key.
-- `POST /v2/jobs/{jobKey}/completion` (`completeJob`) completes the job and
-  resumes the token.
+- `POST /v2/jobs/activation` (`activateJobs`) activates available jobs of a type,
+  locking each to the worker until `now + timeout`; supports Camunda-style
+  long-polling via `requestTimeout` (a waiting request wakes as soon as a job
+  becomes available).
+- `POST /v2/jobs/{jobKey}/completion` (`completeJob`) completes a job and resumes
+  the token. A job must have been activated first; completing an un-activated job
+  returns `409`. Completion is by key alone (no worker check), so a slow worker
+  whose lock expired can still complete the job — first completion wins.
 
 A demo process (`processDefinitionId: "demo"`, a single service task) is
 pre-deployed at server startup, but you can also deploy your own `.bpmn` files
@@ -157,7 +163,13 @@ $ curl -s -X POST localhost:18080/v2/process-instances \
     -d '{"processDefinitionId":"shipping"}'
 {"processDefinitionId":"shipping",...,"processInstanceKey":"5",...}
 
-# Engine-backed: complete the resulting job -> 204, token resumes, instance ends
+# Engine-backed: activate the job parked on the service task -> locked to "w1"
+$ curl -s -X POST localhost:18080/v2/jobs/activation \
+    -H 'Authorization: Bearer x' -H 'Content-Type: application/json' \
+    -d '{"type":"ship","worker":"w1","timeout":60000,"maxJobsToActivate":10}'
+{"jobs":[{"type":"ship",...,"jobKey":"8","deadline":...,...}]}
+
+# Engine-backed: complete the activated job -> 204, token resumes, instance ends
 $ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:18080/v2/jobs/8/completion \
     -H 'Authorization: Bearer x' -H 'Content-Type: application/json' -d '{}'
 204

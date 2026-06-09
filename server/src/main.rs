@@ -13,25 +13,35 @@ mod stub_impls;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::Multipart;
 use axum::response::Response;
-use camunda_gateway_rest::{apis, models};
+use camunda_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
-use nanobpmn_engine_core::{Command, Engine, EngineError, Event, ProcessBuilder};
+use nanobpmn_engine_core::{
+    ActivatedJob, Command, Engine, EngineError, Event, ProcessBuilder, Value,
+};
+
+/// Default long-poll window (ms) when a client passes `requestTimeout` 0.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
 /// The single type that implements every generated API trait.
 ///
 /// It owns an embedded [`Engine`] (the `engine-core` crate) behind a mutex.
 /// Most operations are still 501 stubs (see the generated `stub_impls` module);
-/// a few — process-instance creation and job completion — are wired to the
-/// engine via the inherent methods below and routed from the stub generator's
-/// override table.
+/// a few — process-instance creation, job activation, and job completion — are
+/// wired to the engine via the inherent methods below and routed from the stub
+/// generator's override table.
 #[derive(Clone)]
 pub struct ServerImpl {
     engine: Arc<Mutex<Engine>>,
+    /// Notified whenever new jobs may have become activatable, so long-polling
+    /// `activateJobs` requests can wake immediately instead of waiting out their
+    /// full timeout.
+    jobs_available: Arc<tokio::sync::Notify>,
 }
 
 impl Default for ServerImpl {
@@ -52,6 +62,7 @@ impl Default for ServerImpl {
             .expect("deploy demo process");
         Self {
             engine: Arc::new(Mutex::new(engine)),
+            jobs_available: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -108,6 +119,9 @@ impl ServerImpl {
                     Vec::new(),
                     camunda_gateway_rest::types::Nullable::Null,
                 );
+                // Starting an instance parks it on its first service task, so new
+                // jobs may now be activatable: wake any long-pollers.
+                self.jobs_available.notify_waiters();
                 Ok(Resp::Status200_TheProcessInstanceWasCreated(result))
             }
             Err(EngineError::ProcessNotFound { process_id }) => {
@@ -147,7 +161,12 @@ impl ServerImpl {
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
         match engine.apply_command(Command::complete_job(job_key)) {
-            Ok(_) => Ok(Resp::Status204_TheJobWasCompletedSuccessfully),
+            Ok(_) => {
+                // Completing a job may advance the token onto a following service
+                // task, creating a new activatable job: wake any long-pollers.
+                self.jobs_available.notify_waiters();
+                Ok(Resp::Status204_TheJobWasCompletedSuccessfully)
+            }
             Err(EngineError::JobNotFound { job_key }) => {
                 Ok(Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
                     "Job not found",
@@ -160,6 +179,13 @@ impl ServerImpl {
                     "Job not active",
                     409,
                     format!("Job {job_key} is not active and cannot be completed."),
+                )),
+            ),
+            Err(EngineError::JobNotActivated { job_key }) => Ok(
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job not activated",
+                    409,
+                    format!("Job {job_key} has not been activated and cannot be completed."),
                 )),
             ),
             Err(e) => Ok(
@@ -312,8 +338,148 @@ impl ServerImpl {
             tenant_id,
             deployments,
         );
+        // Deployments don't create jobs, but a freshly available process means a
+        // later createProcessInstance can; nothing to notify here.
         Ok(Resp::Status200_TheResourcesAreDeployed(result))
     }
+
+    async fn activate_jobs_impl(
+        &self,
+        body: &models::JobActivationRequest,
+    ) -> Result<apis::job::ActivateJobsResponse, ()> {
+        use apis::job::ActivateJobsResponse as Resp;
+
+        let job_type = body.r_type.clone();
+        let worker = body.worker.clone().unwrap_or_else(|| "default".to_string());
+        let max_jobs = body.max_jobs_to_activate.max(0) as usize;
+        let timeout = body.timeout.max(0) as u64;
+
+        // Long-poll window: None/0 -> default; >0 -> that window; <0 -> no waiting.
+        let request_timeout = body.request_timeout.unwrap_or(0);
+        let long_poll_until = if request_timeout < 0 {
+            None
+        } else if request_timeout == 0 {
+            Some(Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS))
+        } else {
+            Some(Duration::from_millis(request_timeout as u64))
+        };
+        let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
+
+        loop {
+            let jobs = self.try_activate(&job_type, &worker, max_jobs, timeout);
+            if !jobs.is_empty() {
+                return Ok(Resp::Status200_TheListOfActivatedJobs(
+                    models::JobActivationResult::new(jobs),
+                ));
+            }
+
+            // No jobs right now. Either return immediately (long polling off) or
+            // wait until either new jobs are signalled or the window elapses.
+            match deadline {
+                None => {
+                    return Ok(Resp::Status200_TheListOfActivatedJobs(
+                        models::JobActivationResult::new(Vec::new()),
+                    ));
+                }
+                Some(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    if now >= deadline {
+                        return Ok(Resp::Status200_TheListOfActivatedJobs(
+                            models::JobActivationResult::new(Vec::new()),
+                        ));
+                    }
+                    // Wait for a wake-up or the remaining window, then retry.
+                    let notified = self.jobs_available.notified();
+                    let _ = tokio::time::timeout(deadline - now, notified).await;
+                }
+            }
+        }
+    }
+
+    /// Locks the engine, activates up to `max_jobs` jobs of `job_type`, and maps
+    /// them into the generated REST result type. Synchronous: never `.await`s
+    /// while holding the engine mutex.
+    fn try_activate(
+        &self,
+        job_type: &str,
+        worker: &str,
+        max_jobs: usize,
+        timeout: u64,
+    ) -> Vec<models::ActivatedJobResult> {
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let now = now_millis();
+        let activated = engine.activate_jobs(job_type, worker, max_jobs, timeout, now);
+        activated
+            .into_iter()
+            .map(|job| activated_job_result(&engine, job))
+            .collect()
+    }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch. The engine is
+/// clock-free; the server owns the real clock and feeds it logical instants.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,
+/// resolving process-definition identity from engine state.
+fn activated_job_result(engine: &Engine, job: ActivatedJob) -> models::ActivatedJobResult {
+    let (process_id, version, process_definition_key) = engine
+        .instance(job.instance_key)
+        .and_then(|instance| engine.state().processes.get(&instance.process_id))
+        .map(|deployed| {
+            (
+                deployed.definition.id.clone(),
+                deployed.version,
+                deployed.key.to_string(),
+            )
+        })
+        .unwrap_or_else(|| (String::new(), 1, String::new()));
+
+    models::ActivatedJobResult::new(
+        job.job_type,
+        process_id,
+        version,
+        job.element_id,
+        std::collections::HashMap::new(),
+        job.worker,
+        0,
+        job.deadline as i64,
+        to_object_map(job.variables),
+        "<default>".to_string(),
+        models::JobKey(job.key.to_string()),
+        models::ProcessInstanceKey(job.instance_key.to_string()),
+        models::ProcessDefinitionKey(process_definition_key),
+        models::ElementInstanceKey(job.element_instance_key.to_string()),
+        models::JobKindEnum::BpmnElement,
+        models::JobListenerEventTypeEnum::Unspecified,
+        camunda_gateway_rest::types::Nullable::Null,
+        Vec::new(),
+        camunda_gateway_rest::types::Nullable::Null,
+        0,
+    )
+}
+
+/// Converts engine variables into the generated `Object` (JSON) map used by the
+/// REST models.
+fn to_object_map(
+    variables: std::collections::HashMap<String, Value>,
+) -> std::collections::HashMap<String, types::Object> {
+    variables
+        .into_iter()
+        .map(|(name, value)| {
+            let json = match value {
+                Value::Bool(b) => serde_json::Value::Bool(b),
+                Value::Int(i) => serde_json::Value::Number(i.into()),
+                Value::Str(s) => serde_json::Value::String(s),
+            };
+            (name, types::Object(json))
+        })
+        .collect()
 }
 
 /// Maps the stub `Err(())` returned by every operation to `501 Not Implemented`.

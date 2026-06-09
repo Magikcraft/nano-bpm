@@ -68,6 +68,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 - A **service task** rests in `ACTIVATED` after creating a job, and only advances
   to `COMPLETING` when a `CompleteJob` command arrives. This is how asynchronous
   work is modelled with no background thread.
+- **Job activation** mirrors Camunda 8: a worker activates available jobs of a
+  type (`ActivateJobs`), locking each until `now + timeout`. A job must be
+  activated before it can be completed. Locks expire — either lazily on the next
+  activation or via an explicit `ExpireJobs` tick — making the job activatable
+  again. Completion is by key alone (no worker check), so a slow worker whose
+  lock expired and whose job was re-activated by another worker can still
+  complete it; the first completion wins. The engine is **clock-free**: the
+  caller supplies `now` (a logical instant) on `ActivateJobs`/`ExpireJobs`.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
 
@@ -117,8 +125,9 @@ let events = engine
 let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
 assert!(!engine.is_completed(instance_key)); // parked on the service task
 
-let job_key = engine.pending_jobs()[0].key;
-engine.apply_command(Command::CompleteJob { job_key }).unwrap();
+// A worker activates the job (locking it for 30s) before completing it.
+let jobs = engine.activate_jobs("payment", "worker-1", 10, 30_000, 0);
+engine.apply_command(Command::complete_job(jobs[0].key)).unwrap();
 assert!(engine.is_completed(instance_key)); // token resumed, instance done
 ```
 
