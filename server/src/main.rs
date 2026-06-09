@@ -1375,7 +1375,37 @@ async fn main() {
         }
     };
 
+    // Capture handles for the background tick before `server` is moved into the
+    // router.
+    let tick_journal = server.journal.clone();
+    let tick_jobs_available = server.jobs_available.clone();
+
     let app = camunda_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
+
+    // Background "tick": drives the host clock into the engine so timers fire and
+    // activation locks expire without an inbound request. Timer firing is durable
+    // (journaled); lock expiry is volatile (not journaled). Wakes any long-polling
+    // activateJobs when a tick produced events (a fired timer may create jobs).
+    {
+        let journal = tick_journal;
+        let jobs_available = tick_jobs_available;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let now = now_millis();
+                let produced = {
+                    let mut journal = journal.lock().expect("engine mutex poisoned");
+                    let fired = journal.trigger_timers(now);
+                    journal.expire_jobs(now);
+                    !fired.is_empty()
+                };
+                if produced {
+                    jobs_available.notify_waiters();
+                }
+            }
+        });
+    }
 
     let port: u16 = std::env::var("PORT")
         .ok()

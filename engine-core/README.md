@@ -110,6 +110,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   one is rejected). `Engine::incidents()` returns the whole history;
   `Engine::active_incidents()` filters to open ones, and the per-instance active
   index (`ProcessInstance::incidents`) drives `hasIncident`.
+- **Timer intermediate catch events** park a token mid-flow until a deadline.
+  Reaching one arms a `Timer` (`due_at = now + duration`) and rests in
+  `ACTIVATED`; a host-driven `TriggerTimers { now }` tick fires every due timer,
+  releasing its token along the event's outgoing flow. Like job-lock expiry the
+  engine stays **clock-free** — the host supplies `now` on the tick. Timers are
+  durable (`TimerCreated`/`TimerTriggered` are journaled), so a parked timer
+  survives a restart and fires on the next due tick; a fired timer is retained so
+  it never re-fires.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
@@ -134,14 +142,17 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **error boundary events** (a worker `throwError` caught by a matching boundary,
 > interrupting the task and routing to its error-handling path),
 > **exclusive (XOR) gateways** (condition-based routing with a default flow,
-> raising an incident when nothing matches) and **parallel (AND) gateways**
-> (split takes all branches; join synchronises them). Instances carry simple
+> raising an incident when nothing matches), **parallel (AND) gateways**
+> (split takes all branches; join synchronises them) and **timer intermediate
+> catch events** (a token parks until its `timeDuration` elapses, fired by a
+> host clock tick). Instances carry simple
 > variables (`Bool`/`Int`/`Str`) used by gateway conditions. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
-> that same subset (including `boundaryEvent`/`errorEventDefinition`) via the
+> that same subset (including `boundaryEvent`/`errorEventDefinition` and
+> `intermediateCatchEvent`/`timerEventDefinition`) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
-> Intermediate events, timers and sub-processes are intended extension points —
+> Sub-processes and non-timer intermediate events are intended extension points —
 > new element kinds plug into `process_step` without touching the architecture.
 
 ## Usage

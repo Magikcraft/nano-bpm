@@ -105,9 +105,20 @@ Job **activation locks are intentionally not journaled** — they are volatile
 lease state. A restart forfeits every lock, returning uncompleted jobs to the
 activatable pool, so a worker simply re-activates after recovery. Everything
 durable (deployments, instances, element progress, jobs, incidents, variables,
-completion) survives. The `serde` (de)serialization lives behind an off-by-
-default `serde` feature on `engine-core`, so the engine stays dependency-free
-for mobile/wasm embedders that don't need persistence.
+completion, **armed timers**) survives. The `serde` (de)serialization lives
+behind an off-by-default `serde` feature on `engine-core`, so the engine stays
+dependency-free for mobile/wasm embedders that don't need persistence.
+
+### Background tick (timers and lock expiry)
+
+The engine reads no wall clock; the host drives time in. The server runs a
+single background task (every 500 ms) that feeds `now` into the engine via two
+ticks: `TriggerTimers` fires every due **timer intermediate catch event**
+(durable — journaled), and `ExpireJobs` releases activation locks past their
+deadline (volatile — not journaled). When a timer fires it may unblock
+downstream work, so the tick wakes any long-polling `activateJobs`. A timer
+parked before a restart is recovered by replay and fired by the first due tick
+afterwards.
 
 ## Two crates
 

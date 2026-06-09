@@ -124,6 +124,23 @@ impl Journal {
             .activate_jobs(job_type, worker, max_jobs, timeout, now)
     }
 
+    /// Fires every due timer at logical instant `now`, journaling the resulting
+    /// events (timers are durable business facts). Mirrors
+    /// [`Engine::trigger_timers`]; returns the events produced (empty if none
+    /// were due).
+    pub fn trigger_timers(&mut self, now: u64) -> Vec<Event> {
+        let events = self.engine.trigger_timers(now);
+        self.persist(&events);
+        events
+    }
+
+    /// Releases expired activation locks at logical instant `now`, **without**
+    /// journaling: like activation, lock expiry is volatile lease state. Mirrors
+    /// [`Engine::expire_jobs`].
+    pub fn expire_jobs(&mut self, now: u64) {
+        self.engine.expire_jobs(now);
+    }
+
     /// Read-only access to the underlying engine (for projections that take an
     /// `&Engine`).
     pub fn engine(&self) -> &Engine {
