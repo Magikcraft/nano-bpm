@@ -51,6 +51,15 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   be a process instance or an active element instance). Use it to correct the
   data behind a gateway/condition incident, then `resolveIncident` re-evaluates
   and the token proceeds. `local` is accepted but has no effect (single scope).
+- `POST /v2/messages/publication` (`publishMessage`) and
+  `POST /v2/messages/correlation` (`correlateMessage`) deliver a message to any
+  open subscription whose name and correlation key match, releasing a **message
+  intermediate catch event**'s token or interrupting an activity via an
+  **interrupting message boundary event** (merging the message's variables into
+  the instance first). Messages are **not buffered** (no TTL/dedup): with no
+  match the message is dropped. `publishMessage` always returns `200` with the
+  minted `messageKey`; `correlateMessage` returns `404` when nothing correlates
+  (and otherwise `200` with the first correlated `processInstanceKey`).
 
 Read endpoints make engine state observable:
 

@@ -273,3 +273,45 @@ fn a_fresh_journal_starts_empty() {
 
     server.shutdown();
 }
+
+#[test]
+fn publishing_a_message_with_no_subscription_returns_a_key() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // nanobpmn does not buffer messages: publishing one nobody is waiting for
+    // still mints a message key and succeeds (the message is simply dropped).
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = server.request(
+        "POST",
+        &path("/messages/publication"),
+        Some(r#"{"name":"nobody-home","correlationKey":"X"}"#),
+    );
+    assert_eq!(status, 200, "publish should succeed: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).expect("publish response is JSON");
+    assert!(
+        json["messageKey"].as_str().is_some_and(|k| !k.is_empty()),
+        "publish must return a message key: {body}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn correlating_a_message_with_no_subscription_returns_404() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Unlike publish, correlate reports 404 when nothing matches, so callers can
+    // distinguish "delivered" from "no open subscription".
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = server.request(
+        "POST",
+        &path("/messages/correlation"),
+        Some(r#"{"name":"nobody-home","correlationKey":"X"}"#),
+    );
+    assert_eq!(status, 404, "correlate with no match must be 404: {body}");
+
+    server.shutdown();
+}

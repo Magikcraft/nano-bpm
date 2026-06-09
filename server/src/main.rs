@@ -561,6 +561,97 @@ impl ServerImpl {
         }
     }
 
+    /// Publishes a message and correlates it to any matching open subscriptions.
+    /// nanobpmn does not buffer messages (no TTL/dedup): the message is minted,
+    /// correlated to every matching open subscription, then dropped. Always
+    /// returns 200 with the minted message key.
+    async fn publish_message_impl(
+        &self,
+        body: &models::MessagePublicationRequest,
+    ) -> Result<apis::message::PublishMessageResponse, ()> {
+        use apis::message::PublishMessageResponse as Resp;
+
+        let correlation_key = body.correlation_key.clone().unwrap_or_default();
+        let variables = body
+            .variables
+            .as_ref()
+            .map(from_object_map)
+            .unwrap_or_default();
+
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
+        let events = engine
+            .apply_command_at(
+                Command::correlate_message_with(body.name.clone(), correlation_key, variables),
+                now_millis(),
+            )
+            .expect("CorrelateMessage never fails");
+        let message_key = message_key_of(&events);
+        drop(engine);
+
+        // Correlation may have advanced a token onto a service task, creating a
+        // new activatable job: wake any long-pollers.
+        self.jobs_available.notify_waiters();
+
+        let result = models::MessagePublicationResult::new(
+            "<default>".to_string(),
+            models::MessageKey(message_key.to_string()),
+        );
+        Ok(Resp::Status200_TheMessageWasPublished(result))
+    }
+
+    /// Correlates a message to a matching open subscription. Unlike
+    /// [`Self::publish_message_impl`], returns 404 when nothing correlates, and
+    /// reports the first correlated process instance.
+    async fn correlate_message_impl(
+        &self,
+        body: &models::MessageCorrelationRequest,
+    ) -> Result<apis::message::CorrelateMessageResponse, ()> {
+        use apis::message::CorrelateMessageResponse as Resp;
+
+        let correlation_key = body.correlation_key.clone().unwrap_or_default();
+        let variables = body
+            .variables
+            .as_ref()
+            .map(from_object_map)
+            .unwrap_or_default();
+
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
+        let events = engine
+            .apply_command_at(
+                Command::correlate_message_with(body.name.clone(), correlation_key, variables),
+                now_millis(),
+            )
+            .expect("CorrelateMessage never fails");
+        let message_key = message_key_of(&events);
+        let correlated_instance = events.iter().find_map(|e| match e {
+            Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        });
+        drop(engine);
+
+        match correlated_instance {
+            Some(instance_key) => {
+                // Correlation may have advanced a token onto a service task,
+                // creating a new activatable job: wake any long-pollers.
+                self.jobs_available.notify_waiters();
+                let result = models::MessageCorrelationResult::new(
+                    "<default>".to_string(),
+                    models::MessageKey(message_key.to_string()),
+                    models::ProcessInstanceKey(instance_key.to_string()),
+                );
+                Ok(Resp::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(result))
+            }
+            None => Ok(Resp::Status404_NotFound(problem(
+                "Message not correlated",
+                404,
+                format!(
+                    "No open subscription matched message '{}' with the given correlation key.",
+                    body.name
+                ),
+            ))),
+        }
+    }
+
     async fn get_incident_impl(
         &self,
         path_params: &models::GetIncidentPathParams,
@@ -1313,6 +1404,18 @@ fn from_object_map(
             (name.clone(), value)
         })
         .collect()
+}
+
+/// The minted message key from a `CorrelateMessage`'s events: the heading
+/// [`Event::MessagePublished`] always carries it.
+fn message_key_of(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::MessagePublished { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .expect("CorrelateMessage always emits MessagePublished")
 }
 
 /// Maps the stub `Err(())` returned by every operation to `501 Not Implemented`.
