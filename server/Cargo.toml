@@ -22,3 +22,15 @@ tracing-subscriber = "0.3"
 
 [dev-dependencies]
 serde_json = "1"
+
+# Optimized for a small production binary. `strip` removes ~8 MB of symbols;
+# fat LTO + a single codegen unit let the linker drop dead code across crate
+# boundaries; `panic = "abort"` removes the unwinding tables and landing pads
+# (the server treats a panic as fatal anyway). opt-level stays at 3 so request
+# handling keeps its speed.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+
