@@ -125,6 +125,69 @@ def fix_pagination_disambiguation(models: str) -> tuple[str, list[str]]:
     return models, applied
 
 
+def fix_html_escaped_regex_patterns(models: str) -> tuple[str, int]:
+    """Unescape HTML entities the generator emits inside regex patterns.
+
+    rust-axum's templates HTML-escape the OpenAPI `pattern` keyword, so a spec
+    pattern such as `^(<default>|[\\w\\.\\-]{1,31})$` is emitted as the literal
+    Rust string `^(&lt;default&gt;|[\\w\\.\\-]{1,31})$`. The compiled
+    `regex::Regex` then matches the seven characters `&lt;` instead of `<`, so
+    legitimately valid values fail validation with a 400 — most visibly the
+    `tenantId` value `<default>`, which is sent on nearly every request.
+
+    Unescape the entities back to their literal characters, but *only* inside
+    `regex::Regex::new("...")` string literals so nothing else is touched. The
+    handled entities (`&lt;` `&gt;` `&#x3D;` `&amp;`) never expand to a `"` or
+    `\\`, so they cannot break the surrounding Rust string literal.
+    """
+    entities = {"&lt;": "<", "&gt;": ">", "&#x3D;": "=", "&amp;": "&"}
+    count = 0
+
+    def unescape(match: re.Match) -> str:
+        nonlocal count
+        literal = match.group(0)
+        new = literal
+        for entity, char in entities.items():
+            new = new.replace(entity, char)
+        if new != literal:
+            count += 1
+        return new
+
+    # Match a `regex::Regex::new("...")` call, allowing escaped chars (e.g. `\\w`)
+    # inside the string literal.
+    pattern = re.compile(r'regex::Regex::new\("(?:[^"\\]|\\.)*"\)')
+    models = pattern.sub(unescape, models)
+    return models, count
+
+
+def fix_default_tenant_xss_false_positive(models: str) -> tuple[str, int]:
+    """Allow the `<default>` tenant sentinel past the generated XSS guard.
+
+    rust-axum decorates string fields with a custom validator,
+    `check_xss_string`, whose body is `if ammonia::is_html(v) { Err } else
+    { Ok }`. Camunda uses the literal alias `<default>` as the default tenant
+    id, and `ammonia::is_html("<default>")` is `true` (it parses as a stray
+    HTML tag). Every request carrying `tenantId: "<default>"` — the common
+    case — therefore fails XSS validation with a 400.
+
+    Inject an early `Ok` for the exact `<default>` sentinel so the otherwise
+    desirable XSS guard still applies to all real input. The match is anchored
+    on the unique function signature, so it patches the one definition only.
+    """
+    needle = (
+        "pub fn check_xss_string(v: &str) "
+        "-> std::result::Result<(), validator::ValidationError> {\n"
+    )
+    guard = (
+        '    if v == "<default>" {\n'
+        "        return std::result::Result::Ok(());\n"
+        "    }\n"
+    )
+    if needle not in models or guard in models:
+        return models, 0
+    return models.replace(needle, needle + guard, 1), 1
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <generated-crate-dir>", file=sys.stderr)
@@ -141,6 +204,8 @@ def main(argv: list[str]) -> int:
     models, datetime_count = fix_oneof_datetime_variant(models)
     models, optional_props = fix_optional_discriminators(models)
     models, pagination_structs = fix_pagination_disambiguation(models)
+    models, regex_count = fix_html_escaped_regex_patterns(models)
+    models, xss_count = fix_default_tenant_xss_false_positive(models)
 
     models_path.write_text(models, encoding="utf-8")
 
@@ -154,6 +219,8 @@ def main(argv: list[str]) -> int:
         print(f"  pagination structs disambiguated: {', '.join(pagination_structs)}")
     else:
         print("  pagination structs disambiguated: none")
+    print(f"  HTML-escaped regex patterns unescaped: {regex_count}")
+    print(f"  default-tenant XSS false positive fixed: {xss_count}")
     return 0
 
 

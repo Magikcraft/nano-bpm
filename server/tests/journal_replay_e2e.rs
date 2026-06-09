@@ -430,3 +430,25 @@ fn a_message_start_event_creates_and_replays_a_process_instance() {
 
     server.shutdown();
 }
+
+#[test]
+fn create_instance_accepts_the_default_tenant_id() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Regression: the generated tenantId validation regex had HTML-escaped
+    // delimiters (`&lt;default&gt;`), so the literal default-tenant alias
+    // `<default>` failed validation with a 400. A request carrying it must now
+    // be accepted (the demo process is pre-seeded).
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"demo","tenantId":"<default>"}"#),
+    );
+    assert_eq!(status, 200, "<default> tenant must be accepted: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    assert!(json["processInstanceKey"].as_str().is_some());
+
+    server.shutdown();
+}
