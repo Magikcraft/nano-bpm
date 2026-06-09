@@ -57,13 +57,28 @@ Read endpoints make engine state observable:
 - `GET /v2/process-instances/{processInstanceKey}` (`getProcessInstance`) —
   reports state (`ACTIVE`/`COMPLETED`) and `hasIncident`.
 - `GET /v2/incidents/{incidentKey}` (`getIncident`) and
-  `POST /v2/incidents/search` (`searchIncidents`, filterable by a single
-  `processInstanceKey`) — expose incidents (active **and** resolved, since
-  resolved records are retained as an audit trail; each reports its `state`,
-  `ACTIVE` or `RESOLVED`), including the `incidentKey`
+  `POST /v2/incidents/search` (`searchIncidents`) — expose incidents (active
+  **and** resolved, since resolved records are retained as an audit trail; each
+  reports its `state`, `ACTIVE` or `RESOLVED`), including the `incidentKey`
   needed to resolve them. `errorType` reflects the cause (`JOB_NO_RETRIES`,
-  `CONDITION_ERROR`, `UNHANDLED_ERROR_EVENT`). Timestamps are reported as the
-  Unix epoch since the engine is clock-free.
+  `CONDITION_ERROR`, `UNHANDLED_ERROR_EVENT`).
+- `POST /v2/process-instances/search` (`searchProcessInstances`) and
+  `POST /v2/jobs/search` (`searchJobs`) round out the read surface.
+
+All three search endpoints implement the full v2 query contract:
+
+- **Filters** use the advanced operator algebra — `$eq`, `$neq`, `$exists`,
+  `$in`, `$notIn`, and `$like` (with `*`/`?` wildcards) — in addition to plain
+  scalar equality. Examples: `state: {$in: ["FAILED", "ERROR_THROWN"]}`,
+  `type: {$like: "pay*"}`, `processInstanceKey: {$exists: true}`.
+- **Sort** accepts multiple `{field, order}` clauses applied in order, with the
+  entity key as a deterministic final tiebreak.
+- **Pagination** supports all four request shapes: `{limit}`, offset
+  `{from, limit}`, forward cursor `{after, limit}`, and backward cursor
+  `{before, limit}`. Responses carry `totalItems` plus `startCursor`/`endCursor`
+  (opaque, padding-free base64 of the entity key) for stable cursor walks.
+
+Timestamps are reported as the Unix epoch since the engine is clock-free.
 
 A demo process (`processDefinitionId: "demo"`, a single service task) is
 pre-deployed at server startup, but you can also deploy your own `.bpmn` files
@@ -241,9 +256,12 @@ The per-tag trait impls are generated into `server/src/stub_impls.rs` by
 2. **Generate** — `openapi-generator-cli` (Docker, version-pinned) emits the
    crate into `generated/`.
 3. **Post-process** (`postprocess-generated.py`) — deterministically patches
-   known `rust-axum` code-generation bugs so the crate compiles (an invalid
-   `oneOf` date-time enum variant, and discriminator helpers for optional
-   `type` fields).
+   known `rust-axum` code-generation bugs so the crate compiles and behaves
+   correctly (an invalid `oneOf` date-time enum variant, discriminator helpers
+   for optional `type` fields, and `#[serde(deny_unknown_fields)]` on the four
+   pagination structs so the untagged `SearchQueryPageRequest` can disambiguate
+   limit/offset/forward-cursor/backward-cursor requests instead of always
+   collapsing to limit pagination).
 4. **Stub impls** (`gen-stub-server.py`) — parses the generated trait
    definitions and emits `server/src/stub_impls.rs`.
 

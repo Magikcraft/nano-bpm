@@ -10,6 +10,7 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 mod stub_impls;
+mod query;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -588,40 +589,233 @@ impl ServerImpl {
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
         use apis::incident::SearchIncidentsResponse as Resp;
 
-        // The POC supports the common recovery query: filter by a single
-        // processInstanceKey (a basic value). Any other filter is ignored and
-        // all incidents are returned.
-        let by_instance: Option<u64> = body
-            .as_ref()
-            .and_then(|q| q.filter.as_ref())
-            .and_then(|f| f.process_instance_key.as_ref())
-            .and_then(|p| match p {
-                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k) => k.0.parse().ok(),
-                _ => None,
-            });
-
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let engine = self.engine.lock().expect("engine mutex poisoned");
         let state = engine.state();
-        let mut items: Vec<models::IncidentResult> = engine
+
+        // Apply the filter algebra over each incident's string projections.
+        let mut matched: Vec<&Incident> = engine
             .incidents()
             .into_iter()
-            .filter(|inc| by_instance.is_none_or(|k| inc.instance_key == k))
-            .map(|inc| incident_result(state, inc))
+            .filter(|inc| match filter {
+                None => true,
+                Some(f) => {
+                    let process_definition_key = state
+                        .instances
+                        .get(&inc.instance_key)
+                        .and_then(|i| state.processes.get(&i.process_id))
+                        .map(|d| d.key.to_string())
+                        .unwrap_or_default();
+                    query::match_basic_string(
+                        &f.incident_key,
+                        &inc.key.to_string(),
+                    ) && query::match_process_instance_key(
+                        &f.process_instance_key,
+                        &inc.instance_key.to_string(),
+                    ) && query::match_element_instance_key(
+                        &f.element_instance_key,
+                        &inc.element_instance_key.to_string(),
+                    ) && query::match_process_definition_key(
+                        &f.process_definition_key,
+                        &process_definition_key,
+                    ) && match &f.job_key {
+                        None => true,
+                        some => query::match_job_key(
+                            some,
+                            &inc.job_key.map(|k| k.to_string()).unwrap_or_default(),
+                        ),
+                    } && query::match_incident_state(
+                        &f.state,
+                        &incident_state_enum(inc.state).to_string(),
+                    ) && query::match_incident_error_type(
+                        &f.error_type,
+                        &incident_error_type_enum(inc.kind).to_string(),
+                    ) && query::match_string(&f.element_id, &inc.element_id)
+                        && query::match_string(&f.error_message, &inc.reason)
+                }
+            })
             .collect();
-        // Deterministic order by incident key.
-        items.sort_by(|a, b| a.incident_key.0.cmp(&b.incident_key.0));
 
-        let total = items.len() as i64;
+        // Sort: known fields, defaulting to incidentKey; entity key tiebreaks.
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::IncidentSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |inc, field| match field {
+                "creationTime" => query::SortVal::Num(inc.created_at as i64),
+                "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
+                "errorType" => {
+                    query::SortVal::Str(incident_error_type_enum(inc.kind).to_string())
+                }
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "elementId" => query::SortVal::Str(inc.element_id.clone()),
+                _ => query::SortVal::Num(inc.key as i64),
+            },
+            |inc| inc.key,
+        );
+
+        let sorted: Vec<(u64, models::IncidentResult)> = matched
+            .into_iter()
+            .map(|inc| (inc.key, incident_result(state, inc)))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+
         Ok(Resp::Status200_TheIncidentSearchResult(
-            models::IncidentSearchQueryResult::new(
-                models::SearchQueryPageResponse {
-                    total_items: total,
-                    has_more_total_items: false,
-                    start_cursor: types::Nullable::Null,
-                    end_cursor: types::Nullable::Null,
-                },
-                items,
-            ),
+            models::IncidentSearchQueryResult::new(page.response, page.items),
+        ))
+    }
+
+    async fn search_process_instances_impl(
+        &self,
+        body: &Option<models::ProcessInstanceSearchQuery>,
+    ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
+        use apis::process_instance::SearchProcessInstancesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let state = engine.state();
+
+        let mut matched: Vec<&ProcessInstance> = state
+            .instances
+            .values()
+            .filter(|inst| match filter {
+                None => true,
+                Some(f) => {
+                    let (definition_id, definition_key) = state
+                        .processes
+                        .get(&inst.process_id)
+                        .map(|d| (d.definition.id.clone(), d.key.to_string()))
+                        .unwrap_or_else(|| (inst.process_id.clone(), String::new()));
+                    let state_str = process_instance_state_enum(inst.state).to_string();
+                    query::match_process_instance_key(
+                        &f.process_instance_key,
+                        &inst.key.to_string(),
+                    ) && query::match_process_definition_key(
+                        &f.process_definition_key,
+                        &definition_key,
+                    ) && query::match_string(&f.process_definition_id, &definition_id)
+                        && query::match_process_instance_state(&f.state, &state_str)
+                        && f.has_incident
+                            .is_none_or(|want| want != inst.incidents.is_empty())
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ProcessInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |inst, field| match field {
+                "processDefinitionId" => query::SortVal::Str(
+                    state
+                        .processes
+                        .get(&inst.process_id)
+                        .map(|d| d.definition.id.clone())
+                        .unwrap_or_else(|| inst.process_id.clone()),
+                ),
+                "processDefinitionKey" => query::SortVal::Num(
+                    state
+                        .processes
+                        .get(&inst.process_id)
+                        .map(|d| d.key as i64)
+                        .unwrap_or(0),
+                ),
+                "state" => {
+                    query::SortVal::Str(process_instance_state_enum(inst.state).to_string())
+                }
+                _ => query::SortVal::Num(inst.key as i64),
+            },
+            |inst| inst.key,
+        );
+
+        let sorted: Vec<(u64, models::ProcessInstanceResult)> = matched
+            .into_iter()
+            .map(|inst| (inst.key, process_instance_result(state, inst)))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+
+        Ok(Resp::Status200_TheProcessInstanceSearchResult(
+            models::ProcessInstanceSearchQueryResult::new(page.response, page.items),
+        ))
+    }
+
+    async fn search_jobs_impl(
+        &self,
+        body: &Option<models::JobSearchQuery>,
+    ) -> Result<apis::job::SearchJobsResponse, ()> {
+        use apis::job::SearchJobsResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let state = engine.state();
+
+        let mut matched: Vec<&nanobpmn_engine_core::Job> = state
+            .jobs
+            .values()
+            .filter(|job| match filter {
+                None => true,
+                Some(f) => {
+                    let definition_key = state
+                        .instances
+                        .get(&job.instance_key)
+                        .and_then(|i| state.processes.get(&i.process_id))
+                        .map(|d| d.key.to_string())
+                        .unwrap_or_default();
+                    query::match_job_key(&f.job_key, &job.key.to_string())
+                        && query::match_process_instance_key(
+                            &f.process_instance_key,
+                            &job.instance_key.to_string(),
+                        )
+                        && query::match_process_definition_key(
+                            &f.process_definition_key,
+                            &definition_key,
+                        )
+                        && query::match_element_instance_key(
+                            &f.element_instance_key,
+                            &job.element_instance_key.to_string(),
+                        )
+                        && query::match_string(&f.r_type, &job.job_type)
+                        && query::match_string(&f.element_id, &job.element_id)
+                        && query::match_job_state(
+                            &f.state,
+                            &job_state_enum(job.state).to_string(),
+                        )
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::JobSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |job, field| match field {
+                "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
+                "elementId" => query::SortVal::Str(job.element_id.clone()),
+                "type" => query::SortVal::Str(job.job_type.clone()),
+                "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
+                "retries" => query::SortVal::Num(job.retries as i64),
+                _ => query::SortVal::Num(job.key as i64),
+            },
+            |job| job.key,
+        );
+
+        let sorted: Vec<(u64, models::JobSearchResult)> = matched
+            .into_iter()
+            .map(|job| (job.key, job_search_result(state, job)))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+
+        Ok(Resp::Status200_TheJobSearchResult(
+            models::JobSearchQueryResult::new(page.response, page.items),
         ))
     }
 
@@ -859,6 +1053,23 @@ fn epoch() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch is valid")
 }
 
+/// Maps an engine [`IncidentKind`] to the REST `errorType` taxonomy.
+fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum {
+    match kind {
+        IncidentKind::JobNoRetries => models::IncidentErrorTypeEnum::JobNoRetries,
+        IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
+        IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
+    }
+}
+
+/// Maps an engine [`IncidentState`] to the REST incident `state` enum.
+fn incident_state_enum(state: IncidentState) -> models::IncidentStateEnum {
+    match state {
+        IncidentState::Active => models::IncidentStateEnum::Active,
+        IncidentState::Resolved => models::IncidentStateEnum::Resolved,
+    }
+}
+
 /// Projects an engine [`Incident`] into the generated `IncidentResult`,
 /// resolving process-definition identity from engine state.
 fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult {
@@ -869,11 +1080,7 @@ fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult
         .map(|dep| (dep.definition.id.clone(), dep.key.to_string()))
         .unwrap_or_else(|| (String::new(), "-1".to_string()));
 
-    let error_type = match incident.kind {
-        IncidentKind::JobNoRetries => models::IncidentErrorTypeEnum::JobNoRetries,
-        IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
-        IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
-    };
+    let error_type = incident_error_type_enum(incident.kind);
     let job_key = match incident.job_key {
         Some(k) => types::Nullable::Present(models::JobKey(k.to_string())),
         None => types::Nullable::Null,
@@ -883,10 +1090,7 @@ fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult
     )
     .unwrap_or_else(epoch);
 
-    let incident_state = match incident.state {
-        IncidentState::Active => models::IncidentStateEnum::Active,
-        IncidentState::Resolved => models::IncidentStateEnum::Resolved,
-    };
+    let incident_state = incident_state_enum(incident.state);
 
     models::IncidentResult::new(
         process_definition_id,
@@ -942,6 +1146,78 @@ fn process_instance_result(
         types::Nullable::Null,
         Vec::new(),
         types::Nullable::Null,
+    )
+}
+
+/// Maps an engine [`ProcessInstanceState`] to the REST state enum.
+fn process_instance_state_enum(
+    state: ProcessInstanceState,
+) -> models::ProcessInstanceStateEnum {
+    match state {
+        ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
+        ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
+    }
+}
+
+/// Maps an engine [`nanobpmn_engine_core::JobState`] to the REST job state enum.
+/// The engine's transient `Activated` (locked to a worker) has no distinct wire
+/// state, so it projects to `CREATED` like any other activatable job.
+fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum {
+    use nanobpmn_engine_core::JobState;
+    match state {
+        JobState::Created | JobState::Activated => models::JobStateEnum::Created,
+        JobState::Failed => models::JobStateEnum::Failed,
+        JobState::Errored => models::JobStateEnum::ErrorThrown,
+        JobState::Completed => models::JobStateEnum::Completed,
+    }
+}
+
+/// Projects an engine [`nanobpmn_engine_core::Job`] into the generated
+/// `JobSearchResult`, resolving process-definition identity from engine state.
+fn job_search_result(
+    state: &State,
+    job: &nanobpmn_engine_core::Job,
+) -> models::JobSearchResult {
+    let (process_definition_id, process_definition_key) = state
+        .instances
+        .get(&job.instance_key)
+        .and_then(|i| state.processes.get(&i.process_id))
+        .map(|d| (d.definition.id.clone(), d.key.to_string()))
+        .unwrap_or_else(|| (String::new(), String::new()));
+
+    let deadline = match job.deadline {
+        Some(ms) => chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+            .map(types::Nullable::Present)
+            .unwrap_or(types::Nullable::Null),
+        None => types::Nullable::Null,
+    };
+
+    models::JobSearchResult::new(
+        std::collections::HashMap::new(),
+        deadline,
+        types::Nullable::Null,
+        types::Nullable::Present(job.element_id.clone()),
+        models::ElementInstanceKey(job.element_instance_key.to_string()),
+        types::Nullable::Null,
+        types::Nullable::Null,
+        types::Nullable::Null,
+        false,
+        types::Nullable::Null,
+        models::JobKey(job.key.to_string()),
+        models::JobKindEnum::BpmnElement,
+        models::JobListenerEventTypeEnum::Unspecified,
+        process_definition_id,
+        models::ProcessDefinitionKey(process_definition_key),
+        models::ProcessInstanceKey(job.instance_key.to_string()),
+        types::Nullable::Null,
+        job.retries,
+        job_state_enum(job.state),
+        "<default>".to_string(),
+        job.job_type.clone(),
+        job.worker.clone().unwrap_or_default(),
+        types::Nullable::Null,
+        types::Nullable::Null,
+        0,
     )
 }
 
