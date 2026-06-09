@@ -104,7 +104,7 @@ impl ServerImpl {
         };
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::create_instance(process_id.clone())) {
+        match engine.apply_command_at(Command::create_instance(process_id.clone()), now_millis()) {
             Ok(events) => {
                 let instance_key = events
                     .iter()
@@ -172,7 +172,8 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::complete_job_with(job_key, variables)) {
+        match engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
+        {
             Ok(_) => {
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
@@ -235,7 +236,9 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::fail_job(job_key, retries, error_message)) {
+        match engine
+            .apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
+        {
             Ok(_) => {
                 // Failing with retries left returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -299,11 +302,10 @@ impl ServerImpl {
         };
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::throw_job_error(
-            job_key,
-            body.error_code.clone(),
-            error_message,
-        )) {
+        match engine.apply_command_at(
+            Command::throw_job_error(job_key, body.error_code.clone(), error_message),
+            now_millis(),
+        ) {
             Ok(_) => {
                 // A caught error can route the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
@@ -369,7 +371,9 @@ impl ServerImpl {
         };
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::update_job_retries(job_key, retries)) {
+        match engine
+            .apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
+        {
             Ok(_) => Ok(Resp::Status204_TheJobWasUpdatedSuccessfully),
             Err(EngineError::JobNotFound { job_key }) => {
                 Ok(Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
@@ -418,7 +422,7 @@ impl ServerImpl {
         };
 
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::resolve_incident(incident_key)) {
+        match engine.apply_command_at(Command::resolve_incident(incident_key), now_millis()) {
             Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -794,7 +798,8 @@ fn now_millis() -> u64 {
 }
 
 /// A placeholder timestamp. The clock-free engine does not record wall-clock
-/// times for instances or incidents, so read projections report the Unix epoch.
+/// times for process instances, so their read projections report the Unix
+/// epoch. (Incidents do carry a real `created_at` fed in at command time.)
 fn epoch() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch is valid")
 }
@@ -818,13 +823,17 @@ fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult
         Some(k) => types::Nullable::Present(models::JobKey(k.to_string())),
         None => types::Nullable::Null,
     };
+    let creation_time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        incident.created_at as i64,
+    )
+    .unwrap_or_else(epoch);
 
     models::IncidentResult::new(
         process_definition_id,
         error_type,
         incident.reason.clone(),
         incident.element_id.clone(),
-        epoch(),
+        creation_time,
         models::IncidentStateEnum::Active,
         "<default>".to_string(),
         models::IncidentKey(incident.key.to_string()),
