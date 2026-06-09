@@ -22,8 +22,8 @@ use camunda_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, Incident, IncidentKind, ProcessBuilder,
-    ProcessInstance, ProcessInstanceState, State, Value,
+    ActivatedJob, Command, Engine, EngineError, Event, Incident, IncidentKind, IncidentState,
+    ProcessBuilder, ProcessInstance, ProcessInstanceState, State, Value,
 };
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
@@ -402,6 +402,7 @@ impl ServerImpl {
     async fn resolve_incident_impl(
         &self,
         path_params: &models::ResolveIncidentPathParams,
+        body: &Option<models::IncidentResolutionRequest>,
     ) -> Result<apis::incident::ResolveIncidentResponse, ()> {
         use apis::incident::ResolveIncidentResponse as Resp;
 
@@ -421,8 +422,14 @@ impl ServerImpl {
             }
         };
 
+        let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+        let command = Command::ResolveIncident {
+            incident_key,
+            operation_reference,
+        };
+
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command_at(Command::resolve_incident(incident_key), now_millis()) {
+        match engine.apply_command_at(command, now_millis()) {
             Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -876,13 +883,18 @@ fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult
     )
     .unwrap_or_else(epoch);
 
+    let incident_state = match incident.state {
+        IncidentState::Active => models::IncidentStateEnum::Active,
+        IncidentState::Resolved => models::IncidentStateEnum::Resolved,
+    };
+
     models::IncidentResult::new(
         process_definition_id,
         error_type,
         incident.reason.clone(),
         incident.element_id.clone(),
         creation_time,
-        models::IncidentStateEnum::Active,
+        incident_state,
         "<default>".to_string(),
         models::IncidentKey(incident.key.to_string()),
         models::ProcessDefinitionKey(process_definition_key),

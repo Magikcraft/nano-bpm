@@ -40,7 +40,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("job", "fail_job"): "self.fail_job_impl(path_params, body).await",
     ("job", "throw_job_error"): "self.throw_job_error_impl(path_params, body).await",
     ("job", "update_job"): "self.update_job_impl(path_params, body).await",
-    ("incident", "resolve_incident"): "self.resolve_incident_impl(path_params).await",
+    ("incident", "resolve_incident"): "self.resolve_incident_impl(path_params, body).await",
     ("incident", "get_incident"): "self.get_incident_impl(path_params).await",
     ("incident", "search_incidents"): "self.search_incidents_impl(body).await",
     ("process_instance", "get_process_instance"): "self.get_process_instance_impl(path_params).await",

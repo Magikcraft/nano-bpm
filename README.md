@@ -43,7 +43,9 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   re-evaluates the gateway; an uncaught-error incident re-creates the
   service-task job. If the retry fails again, a fresh incident is raised.
   Incidents now carry a real `creationTime` (the server feeds the engine its
-  clock at command time).
+  clock at command time). Resolving accepts an optional `operationReference`
+  (recorded on the retained record for audit) and returns `409` if the incident
+  is already resolved.
 - `PUT /v2/element-instances/{elementInstanceKey}/variables`
   (`createElementInstanceVariables`) merges variables into a scope (the key may
   be a process instance or an active element instance). Use it to correct the
@@ -56,7 +58,9 @@ Read endpoints make engine state observable:
   reports state (`ACTIVE`/`COMPLETED`) and `hasIncident`.
 - `GET /v2/incidents/{incidentKey}` (`getIncident`) and
   `POST /v2/incidents/search` (`searchIncidents`, filterable by a single
-  `processInstanceKey`) — expose open incidents, including the `incidentKey`
+  `processInstanceKey`) — expose incidents (active **and** resolved, since
+  resolved records are retained as an audit trail; each reports its `state`,
+  `ACTIVE` or `RESOLVED`), including the `incidentKey`
   needed to resolve them. `errorType` reflects the cause (`JOB_NO_RETRIES`,
   `CONDITION_ERROR`, `UNHANDLED_ERROR_EVENT`). Timestamps are reported as the
   Unix epoch since the engine is clock-free.
