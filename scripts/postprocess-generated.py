@@ -94,6 +94,37 @@ def fix_optional_discriminators(models: str) -> tuple[str, list[str]]:
     return models, applied
 
 
+def fix_pagination_disambiguation(models: str) -> tuple[str, list[str]]:
+    """Add `#[serde(deny_unknown_fields)]` to the four pagination structs.
+
+    `SearchQueryPageRequest` is an untagged `oneOf` of `LimitPagination`,
+    `OffsetPagination`, `CursorForwardPagination`, and `CursorBackwardPagination`,
+    all of which have only optional fields. Without `deny_unknown_fields`, serde's
+    untagged deserialization matches the first variant (`LimitPagination`) for any
+    object that merely contains `limit`, silently dropping `after`/`before`/
+    `from`. That makes cursor and offset pagination unreachable through the typed
+    model. Denying unknown fields lets each request disambiguate to the variant
+    whose exact field set it matches.
+    """
+    structs = [
+        "LimitPagination",
+        "OffsetPagination",
+        "CursorForwardPagination",
+        "CursorBackwardPagination",
+    ]
+    applied: list[str] = []
+    for name in structs:
+        needle = f"pub struct {name} {{"
+        idx = models.find(needle)
+        if idx == -1:
+            continue
+        if models[:idx].rstrip().endswith("deny_unknown_fields)]"):
+            continue
+        models = models[:idx] + "#[serde(deny_unknown_fields)]\n" + models[idx:]
+        applied.append(name)
+    return models, applied
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <generated-crate-dir>", file=sys.stderr)
@@ -109,6 +140,7 @@ def main(argv: list[str]) -> int:
 
     models, datetime_count = fix_oneof_datetime_variant(models)
     models, optional_props = fix_optional_discriminators(models)
+    models, pagination_structs = fix_pagination_disambiguation(models)
 
     models_path.write_text(models, encoding="utf-8")
 
@@ -118,6 +150,10 @@ def main(argv: list[str]) -> int:
         print(f"  optional discriminators fixed: {', '.join(optional_props)}")
     else:
         print("  optional discriminators fixed: none")
+    if pagination_structs:
+        print(f"  pagination structs disambiguated: {', '.join(pagination_structs)}")
+    else:
+        print("  pagination structs disambiguated: none")
     return 0
 
 
