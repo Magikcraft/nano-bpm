@@ -16,11 +16,16 @@
 //! * `process` (one or more per file) with its `id`.
 //! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `exclusiveGateway`,
 //!   `parallelGateway`.
+//! * `boundaryEvent` with `attachedToRef` and a nested `errorEventDefinition`
+//!   `errorRef`, resolved against definitions-level `error` elements
+//!   (`<error id="…" errorCode="…">`) into an error boundary event.
 //! * A service task's job type is taken from a nested
 //!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id.
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is parsed as a simple equality
 //!   (`= var = "literal"`); anything else becomes an unconditional flow.
+
+use std::collections::HashMap;
 
 use crate::model::{Condition, ProcessBuilder, ProcessDefinition, Value};
 
@@ -38,6 +43,9 @@ pub enum ParseError {
     /// A parsed process failed validation (e.g. no/many start events, dangling
     /// flow). Carries the underlying [`crate::BuildError`] message.
     InvalidProcess { process_id: String, reason: String },
+    /// A `boundaryEvent` was missing `attachedToRef`, or its
+    /// `errorEventDefinition` referenced an `error` that was not declared.
+    InvalidBoundaryEvent { process_id: String, reason: String },
 }
 
 impl std::fmt::Display for ParseError {
@@ -52,6 +60,12 @@ impl std::fmt::Display for ParseError {
             ParseError::NoProcess => write!(f, "no <process> element found"),
             ParseError::InvalidProcess { process_id, reason } => {
                 write!(f, "invalid process {process_id}: {reason}")
+            }
+            ParseError::InvalidBoundaryEvent { process_id, reason } => {
+                write!(
+                    f,
+                    "invalid boundary event in process {process_id}: {reason}"
+                )
             }
         }
     }
@@ -88,6 +102,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // Index of the sequence flow currently being read (to attach a condition).
     let mut cur_flow: Option<usize> = None;
     let mut condition_text: Option<String> = None;
+    // The boundary event currently being read (to attach its errorEventDefinition).
+    let mut cur_boundary: Option<PendingBoundary> = None;
+    // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
+    let mut errors: HashMap<String, String> = HashMap::new();
 
     for token in &tokens {
         match token {
@@ -100,6 +118,14 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     "process" => {
                         let id = attr(attrs, "id").ok_or(ParseError::ProcessWithoutId)?;
                         current = Some(ProcessAcc::new(id.to_string()));
+                    }
+                    // Definitions-level error declarations live outside <process>.
+                    "error" => {
+                        if let (Some(id), Some(code)) =
+                            (attr(attrs, "id"), attr(attrs, "errorCode"))
+                        {
+                            errors.insert(id.to_string(), code.to_string());
+                        }
                     }
                     tag if current.is_some() => {
                         let acc = current.as_mut().expect("current process set");
@@ -120,6 +146,25 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
                                 if !self_closing {
                                     cur_service_task = idx;
+                                }
+                            }
+                            "boundaryEvent" => {
+                                // Buffered until we see (or don't) an
+                                // errorEventDefinition; only error boundaries
+                                // are supported, others are ignored.
+                                if let Some(id) = attr(attrs, "id") {
+                                    cur_boundary = Some(PendingBoundary {
+                                        id: id.to_string(),
+                                        attached_to: attr(attrs, "attachedToRef")
+                                            .map(str::to_string),
+                                        error_ref: None,
+                                    });
+                                }
+                            }
+                            "errorEventDefinition" => {
+                                if let Some(boundary) = cur_boundary.as_mut() {
+                                    boundary.error_ref =
+                                        Some(attr(attrs, "errorRef").unwrap_or("").to_string());
                                 }
                             }
                             "taskDefinition" => {
@@ -157,8 +202,17 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     }
                     cur_service_task = None;
                     cur_flow = None;
+                    cur_boundary = None;
                 }
                 "serviceTask" => cur_service_task = None,
+                "boundaryEvent" => {
+                    // Only boundaries with an errorEventDefinition are kept.
+                    if let (Some(acc), Some(boundary)) = (current.as_mut(), cur_boundary.take()) {
+                        if boundary.error_ref.is_some() {
+                            acc.boundaries.push(boundary);
+                        }
+                    }
+                }
                 "conditionExpression" => {
                     if let (Some(acc), Some(idx), Some(text)) =
                         (current.as_mut(), cur_flow, condition_text.take())
@@ -176,7 +230,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
         return Err(ParseError::NoProcess);
     }
 
-    processes.into_iter().map(ProcessAcc::build).collect()
+    processes
+        .into_iter()
+        .map(|acc| acc.build(&errors))
+        .collect()
 }
 
 /// A flow node collected while scanning, before it becomes an [`crate::Element`].
@@ -203,11 +260,21 @@ struct FlowAcc {
     condition: Option<Condition>,
 }
 
+/// A boundary event collected while scanning, before its `errorRef` is
+/// resolved to an error code at build time.
+#[derive(Clone)]
+struct PendingBoundary {
+    id: String,
+    attached_to: Option<String>,
+    error_ref: Option<String>,
+}
+
 /// Accumulates the nodes and flows of one `<process>` as it is scanned.
 struct ProcessAcc {
     id: String,
     nodes: Vec<NodeAcc>,
     flows: Vec<FlowAcc>,
+    boundaries: Vec<PendingBoundary>,
 }
 
 impl ProcessAcc {
@@ -216,6 +283,7 @@ impl ProcessAcc {
             id,
             nodes: Vec::new(),
             flows: Vec::new(),
+            boundaries: Vec::new(),
         }
     }
 
@@ -241,7 +309,10 @@ impl ProcessAcc {
     }
 
     /// Assembles the [`ProcessDefinition`] via [`ProcessBuilder`].
-    fn build(self) -> Result<ProcessDefinition, ParseError> {
+    ///
+    /// `errors` maps definitions-level `<error>` ids to their codes, used to
+    /// resolve each boundary event's `errorRef`.
+    fn build(self, errors: &HashMap<String, String>) -> Result<ProcessDefinition, ParseError> {
         let mut builder = ProcessBuilder::new(self.id.clone());
         for node in self.nodes {
             builder = match node.kind {
@@ -254,6 +325,29 @@ impl ProcessAcc {
                     builder.service_task(node.id, job_type)
                 }
             };
+        }
+        for boundary in self.boundaries {
+            let attached_to =
+                boundary
+                    .attached_to
+                    .ok_or_else(|| ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!("boundary event {} has no attachedToRef", boundary.id),
+                    })?;
+            // An errorRef is always present here (only error boundaries are
+            // collected). Resolve it against the declared errors; an empty or
+            // unknown ref is an error since it could never be caught.
+            let error_ref = boundary.error_ref.unwrap_or_default();
+            let error_code = errors.get(&error_ref).cloned().ok_or_else(|| {
+                ParseError::InvalidBoundaryEvent {
+                    process_id: self.id.clone(),
+                    reason: format!(
+                        "boundary event {} references unknown error '{error_ref}'",
+                        boundary.id
+                    ),
+                }
+            })?;
+            builder = builder.error_boundary_event(boundary.id, attached_to, error_code);
         }
         for flow in self.flows {
             let (source, target) = match (flow.source, flow.target) {
@@ -664,6 +758,71 @@ mod tests {
 
         // then
         assert!(matches!(err, ParseError::InvalidProcess { .. }));
+    }
+
+    #[test]
+    fn should_parse_an_error_boundary_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="charge-card" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="done" />
+              <bpmn:boundaryEvent id="declined" attachedToRef="charge">
+                <bpmn:errorEventDefinition errorRef="Error_1" />
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="refunded" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="done" />
+              <bpmn:sequenceFlow id="f2" sourceRef="declined" targetRef="refunded" />
+            </bpmn:process>
+            <bpmn:error id="Error_1" name="Declined" errorCode="CARD_DECLINED" />
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("declined").unwrap().kind,
+            ElementKind::ErrorBoundaryEvent {
+                attached_to: "charge".to_string(),
+                error_code: "CARD_DECLINED".to_string(),
+            }
+        );
+        let boundary = def.element("declined").unwrap();
+        assert!(boundary.outgoing.iter().any(|f| f.to == "refunded"));
+    }
+
+    #[test]
+    fn should_reject_a_boundary_event_referencing_an_unknown_error() {
+        // given
+        let xml = r#"
+          <definitions>
+            <process id="p">
+              <startEvent id="s" />
+              <serviceTask id="t" />
+              <endEvent id="e" />
+              <boundaryEvent id="b" attachedToRef="t">
+                <errorEventDefinition errorRef="missing" />
+              </boundaryEvent>
+              <endEvent id="caught" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="t" />
+              <sequenceFlow id="f1" sourceRef="t" targetRef="e" />
+              <sequenceFlow id="f2" sourceRef="b" targetRef="caught" />
+            </process>
+          </definitions>"#;
+
+        // when
+        let err = parse_bpmn(xml).unwrap_err();
+
+        // then
+        assert!(matches!(err, ParseError::InvalidBoundaryEvent { .. }));
     }
 
     #[test]
