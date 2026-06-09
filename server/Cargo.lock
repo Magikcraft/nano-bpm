@@ -204,6 +204,7 @@ dependencies = [
  "camunda-gateway-rest",
  "headers",
  "http",
+ "nanobpmn-engine-core",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -870,6 +871,10 @@ dependencies = [
  "spin",
  "version_check",
 ]
+
+[[package]]
+name = "nanobpmn-engine-core"
+version = "0.1.0"
 
 [[package]]
 name = "new_debug_unreachable"

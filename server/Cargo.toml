@@ -7,6 +7,7 @@ description = "Stub server for the generated Camunda Orchestration Cluster REST 
 
 [dependencies]
 camunda-gateway-rest = { path = "../generated" }
+nanobpmn-engine-core = { path = "../engine-core" }
 async-trait = "0.1"
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
