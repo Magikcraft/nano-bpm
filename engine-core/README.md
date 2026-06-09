@@ -87,14 +87,20 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   error-handling path; an unmatched error raises an incident instead. The job is
   consumed either way (`JobState::Errored`) and, like the other transitions,
   throwing requires prior activation.
-- **Incidents** are first-class records with a key (`State::incidents`), raised
-  when a token cannot proceed: a job exhausted its retries, an exclusive gateway
-  matched no flow, or a thrown error went uncaught (`IncidentKind`). A
-  job-incident links back to its job. Recovery mirrors Camunda: `UpdateJobRetries`
-  restores a parked job's retries, then `ResolveIncident` clears the incident and
-  returns the job to the activatable pool (resolution is rejected while the job
-  still has no retries). Gateway/uncaught-error incidents carry no job link and
-  simply clear.
+- **Incidents** are first-class records with a key (`State::incidents`) and a
+  `created_at` timestamp, raised when a token cannot proceed: a job exhausted its
+  retries, an exclusive gateway matched no flow, or a thrown error went uncaught
+  (`IncidentKind`). A job-incident links back to its job. Recovery mirrors
+  Camunda: `ResolveIncident` **retries the failed work** rather than merely
+  clearing the record. A job-incident returns the parked job to the activatable
+  pool (after `UpdateJobRetries` restores its retries; resolution is rejected
+  while it still has none). A gateway incident re-evaluates the gateway against
+  the current variables. An uncaught-error incident re-creates the service-task
+  job. If the retry fails again, a fresh incident is raised by the same code
+  paths that raised the original.
+- The engine reads **no wall clock**: the host supplies `now` to
+  `apply_command_at`, and timestamped events (e.g. a raised incident) carry it,
+  so replay reconstructs identical timestamps.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
 

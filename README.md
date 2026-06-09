@@ -36,9 +36,14 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   job — used to recover a job parked on a no-retries incident (timeout updates
   are not modelled).
 - `POST /v2/incidents/{incidentKey}/resolution` (`resolveIncident`) resolves an
-  incident. For a job-incident the parked job (which must have retries again)
-  returns to the activatable pool, so the recovery loop is: `failJob`(0) →
-  `updateJob`(retries) → `resolveIncident` → re-activate → `completeJob`.
+  incident by **retrying the failed work**, not just clearing the record. A
+  job-incident returns the parked job (which must have retries again) to the
+  activatable pool — recovery loop: `failJob`(0) → `updateJob`(retries) →
+  `resolveIncident` → re-activate → `completeJob`. A gateway incident
+  re-evaluates the gateway; an uncaught-error incident re-creates the
+  service-task job. If the retry fails again, a fresh incident is raised.
+  Incidents now carry a real `creationTime` (the server feeds the engine its
+  clock at command time).
 
 Read endpoints make engine state observable:
 

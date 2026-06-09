@@ -131,6 +131,11 @@ pub struct Incident {
     /// job-incidents (`Some`) can be recovered by updating retries and
     /// resolving; gateway/uncaught-error incidents carry `None`.
     pub job_key: Option<Key>,
+    /// The logical instant at which the incident was raised, in the same units
+    /// the host feeds the engine as `now` (Unix epoch milliseconds on the
+    /// server). Sourced from the command's clock, recorded on the event, and so
+    /// preserved exactly on replay.
+    pub created_at: u64,
 }
 
 /// A deployed process definition together with the identity the engine assigned
@@ -364,6 +369,7 @@ pub fn apply(state: &mut State, event: &Event) {
             kind,
             reason,
             job_key,
+            created_at,
         } => {
             state.incidents.insert(
                 *incident_key,
@@ -375,6 +381,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     kind: *kind,
                     reason: reason.clone(),
                     job_key: *job_key,
+                    created_at: *created_at,
                 },
             );
             if let Some(instance) = state.instances.get_mut(instance_key) {

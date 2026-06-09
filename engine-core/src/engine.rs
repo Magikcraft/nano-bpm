@@ -28,6 +28,13 @@ pub struct Engine {
     /// Source of monotonic keys. The single-writer loop makes plain increments
     /// deterministic.
     next_key: Key,
+    /// The clock reading for the command currently being processed, in the units
+    /// the host supplies (Unix epoch milliseconds on the server). Set at the top
+    /// of [`Engine::apply_command_at`] and read where the engine stamps a
+    /// timestamp onto an event (e.g. when an incident is raised). The engine
+    /// never reads a wall clock itself; replay is unaffected because the
+    /// timestamp is carried on the event.
+    now: u64,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -46,6 +53,14 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Create a fresh job for an already-active service-task element instance.
+    /// Used to retry a parked service task when its incident is resolved (the
+    /// element instance stays active throughout; only a new job is minted).
+    CreateJob {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
 }
 
 impl Engine {
@@ -54,6 +69,7 @@ impl Engine {
         Self {
             state: State::new(),
             next_key: 0,
+            now: 0,
         }
     }
 
@@ -113,9 +129,10 @@ impl Engine {
         now: u64,
     ) -> Vec<ActivatedJob> {
         let events = self
-            .apply_command(Command::activate_jobs(
-                job_type, worker, max_jobs, timeout, now,
-            ))
+            .apply_command_at(
+                Command::activate_jobs(job_type, worker, max_jobs, timeout, now),
+                now,
+            )
             .expect("ActivateJobs never fails");
         events
             .iter()
@@ -145,7 +162,7 @@ impl Engine {
     /// `now`. The host drives this periodically (a "tick"); the engine itself
     /// never reads a clock.
     pub fn expire_jobs(&mut self, now: u64) {
-        self.apply_command(Command::ExpireJobs { now })
+        self.apply_command_at(Command::ExpireJobs { now }, now)
             .expect("ExpireJobs never fails");
     }
 
@@ -227,12 +244,26 @@ impl Engine {
             .unwrap_or(1)
     }
 
-    /// Applies a command, returning the ordered list of events it produced.
+    /// Applies a command using the engine's current clock reading (see
+    /// [`Engine::apply_command_at`]). Tests and hosts that do not need accurate
+    /// timestamps can use this; the default clock is `0`.
+    pub fn apply_command(&mut self, command: Command) -> Result<Vec<Event>, EngineError> {
+        self.apply_command_at(command, self.now)
+    }
+
+    /// Applies a command, returning the ordered list of events it produced,
+    /// stamping any timestamped events (e.g. raised incidents) with `now`.
     ///
     /// This is the engine's single writer: it runs to quiescence before
     /// returning, so on success the returned events are the complete record of
-    /// everything that happened.
-    pub fn apply_command(&mut self, command: Command) -> Result<Vec<Event>, EngineError> {
+    /// everything that happened. `now` is the host's clock reading for this
+    /// command; the engine never reads a wall clock itself.
+    pub fn apply_command_at(
+        &mut self,
+        command: Command,
+        now: u64,
+    ) -> Result<Vec<Event>, EngineError> {
+        self.now = now;
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
 
@@ -421,6 +452,7 @@ impl Engine {
                             kind: state::IncidentKind::JobNoRetries,
                             reason: error_message,
                             job_key: Some(job_key),
+                            created_at: self.now,
                         },
                     );
                 }
@@ -503,6 +535,7 @@ impl Engine {
                                 kind: state::IncidentKind::UnhandledError,
                                 reason,
                                 job_key: None,
+                                created_at: self.now,
                             },
                         );
                     }
@@ -542,6 +575,9 @@ impl Engine {
                     .get(&incident_key)
                     .ok_or(EngineError::IncidentNotFound { incident_key })?;
                 let instance_key = incident.instance_key;
+                let element_instance_key = incident.element_instance_key;
+                let element_id = incident.element_id.clone();
+                let kind = incident.kind;
                 let job_key = incident.job_key;
                 // A job-incident can only be resolved once the parked job has
                 // retries again; otherwise it would immediately re-fail.
@@ -564,6 +600,33 @@ impl Engine {
                         job_key,
                     },
                 );
+                // Resolution retries the failed work rather than merely clearing
+                // the record. If the retry fails again a fresh incident is raised
+                // by the same code paths that raised the original.
+                match kind {
+                    // Job exhausted its retries: the applier already returned the
+                    // job to the activatable pool, so a worker retries it via the
+                    // normal activate/complete path. Nothing more to enqueue.
+                    state::IncidentKind::JobNoRetries => {}
+                    // Exclusive gateway matched no flow: re-evaluate the gateway
+                    // against the (possibly updated) variables.
+                    state::IncidentKind::NoMatchingSequenceFlow => {
+                        queue.push_back(Step::Complete {
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                        });
+                    }
+                    // Uncaught business error: re-create a job for the still-active
+                    // service task so a worker can attempt it again.
+                    state::IncidentKind::UnhandledError => {
+                        queue.push_back(Step::CreateJob {
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                        });
+                    }
+                }
             }
         }
 
@@ -599,6 +662,11 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.complete(instance_key, element_instance_key, element_id),
+            Step::CreateJob {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => self.create_job_for(instance_key, element_instance_key, element_id),
         }
     }
 
@@ -698,6 +766,35 @@ impl Engine {
         (events, followups)
     }
 
+    /// Mints a fresh job for an already-active service-task element instance.
+    /// Used by incident resolution to retry a parked service task: the element
+    /// instance is left untouched (it stays active) and a new job is created in
+    /// the `Created` (activatable) state so a worker can attempt it again. A
+    /// no-op if the element is not (or is no longer) a service task.
+    fn create_job_for(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    ) -> (Vec<Event>, Vec<Step>) {
+        match self.element_kind(instance_key, &element_id) {
+            Some(ElementKind::ServiceTask { job_type }) => {
+                let job_key = self.mint_key();
+                (
+                    vec![Event::JobCreated {
+                        job_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        job_type,
+                    }],
+                    Vec::new(),
+                )
+            }
+            _ => (Vec::new(), Vec::new()),
+        }
+    }
+
     /// Exclusive gateway: take exactly one outgoing flow — the first whose
     /// condition holds (an unconditional flow is the default). If none qualifies,
     /// raise an incident and park the token.
@@ -755,6 +852,7 @@ impl Engine {
                         "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
                     ),
                     job_key: None,
+                    created_at: self.now,
                 }];
                 (events, Vec::new())
             }
@@ -1456,9 +1554,11 @@ mod tests {
     }
 
     #[test]
-    fn should_clear_a_gateway_incident_on_resolution_without_reactivating_a_job() {
-        // A non-job incident (no matching exclusive flow) carries no job_key and
-        // resolves directly.
+    fn should_re_raise_a_gateway_incident_when_resolution_still_finds_no_flow() {
+        // A non-job incident (no matching exclusive flow) is resolved by
+        // re-evaluating the gateway. With the variables unchanged it still
+        // matches nothing, so resolution retries the work and a *fresh* incident
+        // is raised — the token stays parked rather than silently vanishing.
         let def = ProcessBuilder::new("strict")
             .start_event("s")
             .exclusive_gateway("g")
@@ -1481,17 +1581,97 @@ mod tests {
             .apply_command(Command::create_instance_with("strict", vars))
             .unwrap();
         let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
-        let incident_key = engine.incidents()[0].key;
-        assert!(engine.incident(incident_key).unwrap().job_key.is_none());
+        let original = engine.incidents()[0].key;
+        assert!(engine.incident(original).unwrap().job_key.is_none());
 
-        // when resolved
+        // when resolved (the gateway is re-evaluated)
         engine
+            .apply_command(Command::resolve_incident(original))
+            .unwrap();
+
+        // then the original incident is gone but a new one replaces it, and the
+        // instance has still not completed.
+        assert!(engine.incident(original).is_none());
+        let incidents = engine.incidents();
+        assert_eq!(incidents.len(), 1);
+        assert_ne!(incidents[0].key, original);
+        assert_eq!(incidents[0].kind, state::IncidentKind::NoMatchingSequenceFlow);
+        assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
+        assert!(!engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_retry_the_service_task_when_an_unhandled_error_incident_is_resolved() {
+        // given a service task whose worker threw an uncaught business error,
+        // parking the token on an unhandled-error incident
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+        let raised = engine
+            .apply_command(Command::throw_job_error(job_key, "BOOM", "no boundary"))
+            .unwrap();
+        let incident_key = raised
+            .iter()
+            .find_map(|e| match e {
+                Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .unwrap();
+        assert!(engine.pending_jobs().is_empty());
+
+        // when the incident is resolved
+        let resolved = engine
             .apply_command(Command::resolve_incident(incident_key))
             .unwrap();
 
-        // then the incident record is gone
+        // then a fresh job is created for the still-active service task, and a
+        // worker can activate and complete it to drive the instance home.
+        assert!(resolved
+            .iter()
+            .any(|e| matches!(e, Event::JobCreated { .. })));
         assert!(engine.incident(incident_key).is_none());
-        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+        assert_eq!(engine.pending_jobs().len(), 1);
+        let retry = engine.activate_jobs("payment", "B", 1, 60_000, 100);
+        assert_eq!(retry.len(), 1);
+        assert_ne!(retry[0].key, job_key);
+        engine
+            .apply_command(Command::complete_job(retry[0].key))
+            .unwrap();
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_stamp_an_incident_with_the_command_clock() {
+        // given a parked job-incident raised at a known instant
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+
+        // when failed with no retries at now = 1_700_000_000_000
+        let raised = engine
+            .apply_command_at(Command::fail_job(job_key, 0, "boom"), 1_700_000_000_000)
+            .unwrap();
+        let incident_key = raised
+            .iter()
+            .find_map(|e| match e {
+                Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .unwrap();
+
+        // then the incident records that instant
+        assert_eq!(engine.incident(incident_key).unwrap().created_at, 1_700_000_000_000);
     }
 
     fn process_with_error_boundary() -> ProcessDefinition {

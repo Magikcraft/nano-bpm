@@ -140,6 +140,8 @@ pub enum Event {
     /// An incident was raised (e.g. an exclusive gateway found no matching flow,
     /// or a job exhausted its retries); the token is parked until the incident
     /// is resolved. `job_key` is `Some` only for recoverable job-incidents.
+    /// `created_at` is the logical instant the incident was raised, carried on
+    /// the event so replay reconstructs the same timestamp.
     IncidentRaised {
         incident_key: Key,
         instance_key: Key,
@@ -148,9 +150,11 @@ pub enum Event {
         kind: IncidentKind,
         reason: String,
         job_key: Option<Key>,
+        created_at: u64,
     },
-    /// An incident was resolved. For a job-incident (`job_key` is `Some`) the
-    /// parked job returns to the activatable pool.
+    /// An incident was resolved; the engine then retries the work that failed
+    /// (see [`crate::Command::ResolveIncident`]). For a job-incident (`job_key`
+    /// is `Some`) the parked job returns to the activatable pool.
     IncidentResolved {
         incident_key: Key,
         instance_key: Key,

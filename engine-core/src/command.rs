@@ -65,9 +65,11 @@ pub enum Command {
     /// no-retries incident before resolving that incident. Does not by itself
     /// unblock the job — the incident must still be resolved.
     UpdateJobRetries { job_key: Key, retries: i32 },
-    /// Resolve an open incident. For a job-incident, the parked job (which must
-    /// have retries left) returns to the activatable pool so a worker can retry
-    /// it.
+    /// Resolve an open incident by retrying the work that failed. A job-incident
+    /// returns the parked job (which must have retries left) to the activatable
+    /// pool; an exclusive-gateway incident re-evaluates the gateway against the
+    /// current variables; an uncaught-error incident re-creates the service-task
+    /// job. If the retry fails again a fresh incident is raised.
     ResolveIncident { incident_key: Key },
 }
 
