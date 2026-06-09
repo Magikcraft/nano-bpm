@@ -453,6 +453,54 @@ impl ServerImpl {
         }
     }
 
+    /// `PUT /v2/element-instances/{elementInstanceKey}/variables` — merge
+    /// variables into a scope so an operator can correct the data behind an
+    /// incident before resolving it. The path key may be the process instance
+    /// key or an element instance key; both resolve to nano's single
+    /// instance-level scope (so `local` is accepted but has no effect).
+    async fn create_element_instance_variables_impl(
+        &self,
+        path_params: &models::CreateElementInstanceVariablesPathParams,
+        body: &models::SetVariableRequest,
+    ) -> Result<apis::element_instance::CreateElementInstanceVariablesResponse, ()> {
+        use apis::element_instance::CreateElementInstanceVariablesResponse as Resp;
+
+        let scope_key: u64 = match path_params.element_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid key",
+                    400,
+                    format!(
+                        "Element instance key '{}' is not a valid key.",
+                        path_params.element_instance_key
+                    ),
+                )));
+            }
+        };
+
+        let variables = from_object_map(&body.variables);
+
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis()) {
+            Ok(_) => Ok(Resp::Status204_TheVariablesWereUpdated),
+            Err(EngineError::ScopeNotFound { scope_key }) => {
+                Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Scope not found",
+                    400,
+                    format!("No process or element instance with key {scope_key}."),
+                )))
+            }
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
     async fn get_process_instance_impl(
         &self,
         path_params: &models::GetProcessInstancePathParams,
