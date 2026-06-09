@@ -209,6 +209,69 @@ impl ServerImpl {
         }
     }
 
+    async fn fail_job_impl(
+        &self,
+        path_params: &models::FailJobPathParams,
+        body: &Option<models::JobFailRequest>,
+    ) -> Result<apis::job::FailJobResponse, ()> {
+        use apis::job::FailJobResponse as Resp;
+
+        let job_key: u64 = match path_params.job_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
+                    "Job not found",
+                    404,
+                    format!("Job key '{}' is not a valid key.", path_params.job_key),
+                )));
+            }
+        };
+
+        let retries = body.as_ref().and_then(|b| b.retries).unwrap_or(0);
+        let error_message = body
+            .as_ref()
+            .and_then(|b| b.error_message.clone())
+            .unwrap_or_default();
+
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.apply_command(Command::fail_job(job_key, retries, error_message)) {
+            Ok(_) => {
+                // Failing with retries left returns the job to the activatable
+                // pool, so wake any long-pollers.
+                self.jobs_available.notify_waiters();
+                Ok(Resp::Status204_TheJobIsFailed)
+            }
+            Err(EngineError::JobNotFound { job_key }) => {
+                Ok(Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
+                    "Job not found",
+                    404,
+                    format!("No job with key {job_key}."),
+                )))
+            }
+            Err(EngineError::JobNotActive { job_key }) => Ok(
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(problem(
+                    "Job in wrong state",
+                    409,
+                    format!("Job {job_key} cannot be failed in its current state."),
+                )),
+            ),
+            Err(EngineError::JobNotActivated { job_key }) => Ok(
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(problem(
+                    "Job not activated",
+                    409,
+                    format!("Job {job_key} has not been activated and cannot be failed."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
     async fn create_deployment_impl(
         &self,
         mut body: Multipart,
@@ -458,7 +521,7 @@ fn activated_job_result(engine: &Engine, job: ActivatedJob) -> models::Activated
         job.element_id,
         std::collections::HashMap::new(),
         job.worker,
-        0,
+        job.retries,
         job.deadline as i64,
         to_object_map(job.variables),
         "<default>".to_string(),

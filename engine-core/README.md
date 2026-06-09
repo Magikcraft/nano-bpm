@@ -76,6 +76,11 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   lock expired and whose job was re-activated by another worker can still
   complete it; the first completion wins. The engine is **clock-free**: the
   caller supplies `now` (a logical instant) on `ActivateJobs`/`ExpireJobs`.
+- **Job failure** (`FailJob`) sets a job's remaining retries. With retries left
+  the job returns to the activatable pool; with none it parks (`JobState::Failed`)
+  and an **incident** is raised on the instance — the same incident mechanism an
+  exclusive gateway uses when no flow matches. Jobs start with a default retry
+  count and, like completion, failing requires prior activation.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
 

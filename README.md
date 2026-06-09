@@ -18,9 +18,14 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   long-polling via `requestTimeout` (a waiting request wakes as soon as a job
   becomes available).
 - `POST /v2/jobs/{jobKey}/completion` (`completeJob`) completes a job and resumes
-  the token. A job must have been activated first; completing an un-activated job
-  returns `409`. Completion is by key alone (no worker check), so a slow worker
-  whose lock expired can still complete the job — first completion wins.
+  the token, merging any returned variables into the instance (so worker output
+  drives downstream gateway routing). A job must have been activated first;
+  completing an un-activated job returns `409`. Completion is by key alone (no
+  worker check), so a slow worker whose lock expired can still complete the job —
+  first completion wins.
+- `POST /v2/jobs/{jobKey}/failure` (`failJob`) sets a job's remaining retries.
+  With retries left the job returns to the activatable pool; with none an
+  incident is raised and the job parks (no longer activatable or completable).
 
 A demo process (`processDefinitionId: "demo"`, a single service task) is
 pre-deployed at server startup, but you can also deploy your own `.bpmn` files
