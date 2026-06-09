@@ -154,11 +154,15 @@ pub enum Event {
     },
     /// An incident was resolved; the engine then retries the work that failed
     /// (see [`crate::Command::ResolveIncident`]). For a job-incident (`job_key`
-    /// is `Some`) the parked job returns to the activatable pool.
+    /// is `Some`) the parked job returns to the activatable pool. The record is
+    /// retained (transitioned to `Resolved`) with `resolved_at` and any
+    /// `operation_reference` for audit.
     IncidentResolved {
         incident_key: Key,
         instance_key: Key,
         job_key: Option<Key>,
+        resolved_at: u64,
+        operation_reference: Option<i64>,
     },
 
     /// The last token of a process instance was consumed; the instance is done.

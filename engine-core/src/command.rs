@@ -69,8 +69,12 @@ pub enum Command {
     /// returns the parked job (which must have retries left) to the activatable
     /// pool; an exclusive-gateway incident re-evaluates the gateway against the
     /// current variables; an uncaught-error incident re-creates the service-task
-    /// job. If the retry fails again a fresh incident is raised.
-    ResolveIncident { incident_key: Key },
+    /// job. If the retry fails again a fresh incident is raised. The resolved
+    /// record is retained for audit, tagged with `operation_reference` if given.
+    ResolveIncident {
+        incident_key: Key,
+        operation_reference: Option<i64>,
+    },
     /// Merge variables into a scope before, typically, resolving an incident so
     /// the retried work sees the corrected data. `scope_key` may be a process
     /// instance key or an element instance key; both resolve to the owning
@@ -141,9 +145,22 @@ impl Command {
         Command::UpdateJobRetries { job_key, retries }
     }
 
-    /// Convenience constructor for a `ResolveIncident`.
+    /// Convenience constructor for a `ResolveIncident` with no operation
+    /// reference.
     pub fn resolve_incident(incident_key: Key) -> Self {
-        Command::ResolveIncident { incident_key }
+        Command::ResolveIncident {
+            incident_key,
+            operation_reference: None,
+        }
+    }
+
+    /// Convenience constructor for a `ResolveIncident` tagged with an operation
+    /// reference for audit.
+    pub fn resolve_incident_with(incident_key: Key, operation_reference: i64) -> Self {
+        Command::ResolveIncident {
+            incident_key,
+            operation_reference: Some(operation_reference),
+        }
     }
 
     /// Convenience constructor for a `SetVariables`.

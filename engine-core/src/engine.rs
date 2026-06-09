@@ -96,14 +96,26 @@ impl Engine {
         self.state.jobs.get(&key)
     }
 
-    /// Looks up an open incident.
+    /// Looks up an incident by key, whether active or resolved (resolved records
+    /// are retained for audit).
     pub fn incident(&self, key: Key) -> Option<&state::Incident> {
         self.state.incidents.get(&key)
     }
 
-    /// All currently-open incidents.
+    /// All incidents ever raised, active and resolved (resolved records are
+    /// retained as an audit trail). Filter by [`state::Incident::state`] for a
+    /// specific lifecycle state.
     pub fn incidents(&self) -> Vec<&state::Incident> {
         self.state.incidents.values().collect()
+    }
+
+    /// Only the currently-active (open) incidents.
+    pub fn active_incidents(&self) -> Vec<&state::Incident> {
+        self.state
+            .incidents
+            .values()
+            .filter(|i| i.state == state::IncidentState::Active)
+            .collect()
     }
 
     /// All jobs currently awaiting activation (created, or with an expired lock).
@@ -568,12 +580,23 @@ impl Engine {
                 );
             }
 
-            Command::ResolveIncident { incident_key } => {
+            Command::ResolveIncident {
+                incident_key,
+                operation_reference,
+            } => {
                 let incident = self
                     .state
                     .incidents
                     .get(&incident_key)
                     .ok_or(EngineError::IncidentNotFound { incident_key })?;
+                // Only an active incident can be resolved; a retained (resolved)
+                // record is history, not a live parked token.
+                if incident.state != state::IncidentState::Active {
+                    return Err(EngineError::IncidentNotResolvable {
+                        incident_key,
+                        reason: "incident is already resolved".to_string(),
+                    });
+                }
                 let instance_key = incident.instance_key;
                 let element_instance_key = incident.element_instance_key;
                 let element_id = incident.element_id.clone();
@@ -598,6 +621,8 @@ impl Engine {
                         incident_key,
                         instance_key,
                         job_key,
+                        resolved_at: self.now,
+                        operation_reference,
                     },
                 );
                 // Resolution retries the failed work rather than merely clearing
@@ -1567,11 +1592,14 @@ mod tests {
             .apply_command(Command::resolve_incident(incident_key))
             .unwrap();
 
-        // then the incident clears and the job is activatable again
+        // then the incident is retained as resolved and the job is activatable again
         assert!(resolved
             .iter()
             .any(|e| matches!(e, Event::IncidentResolved { .. })));
-        assert!(engine.incident(incident_key).is_none());
+        assert_eq!(
+            engine.incident(incident_key).unwrap().state,
+            state::IncidentState::Resolved
+        );
         assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
 
         // and a worker can pick it up and drive the instance to completion
@@ -1628,13 +1656,16 @@ mod tests {
             .apply_command(Command::resolve_incident(original))
             .unwrap();
 
-        // then the original incident is gone but a new one replaces it, and the
-        // instance has still not completed.
-        assert!(engine.incident(original).is_none());
-        let incidents = engine.incidents();
-        assert_eq!(incidents.len(), 1);
-        assert_ne!(incidents[0].key, original);
-        assert_eq!(incidents[0].kind, state::IncidentKind::NoMatchingSequenceFlow);
+        // then the original incident is retained as resolved and a new active one
+        // replaces it, and the instance has still not completed.
+        assert_eq!(
+            engine.incident(original).unwrap().state,
+            state::IncidentState::Resolved
+        );
+        let active = engine.active_incidents();
+        assert_eq!(active.len(), 1);
+        assert_ne!(active[0].key, original);
+        assert_eq!(active[0].kind, state::IncidentKind::NoMatchingSequenceFlow);
         assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
         assert!(!engine.is_completed(instance_key));
     }
@@ -1677,8 +1708,12 @@ mod tests {
             .apply_command(Command::resolve_incident(incident_key))
             .unwrap();
 
-        // then the gateway re-evaluates, matches, and the instance completes
-        assert!(engine.incident(incident_key).is_none());
+        // then the gateway re-evaluates, matches, and the instance completes; the
+        // incident is retained as resolved
+        assert_eq!(
+            engine.incident(incident_key).unwrap().state,
+            state::IncidentState::Resolved
+        );
         assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
         assert!(engine.is_completed(instance_key));
     }
@@ -1759,7 +1794,10 @@ mod tests {
         assert!(resolved
             .iter()
             .any(|e| matches!(e, Event::JobCreated { .. })));
-        assert!(engine.incident(incident_key).is_none());
+        assert_eq!(
+            engine.incident(incident_key).unwrap().state,
+            state::IncidentState::Resolved
+        );
         assert_eq!(engine.pending_jobs().len(), 1);
         let retry = engine.activate_jobs("payment", "B", 1, 60_000, 100);
         assert_eq!(retry.len(), 1);
@@ -1796,6 +1834,59 @@ mod tests {
 
         // then the incident records that instant
         assert_eq!(engine.incident(incident_key).unwrap().created_at, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn should_retain_a_resolved_incident_as_an_audit_record() {
+        // given a parked job-incident
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+        let raised = engine
+            .apply_command(Command::fail_job(job_key, 0, "boom"))
+            .unwrap();
+        let incident_key = raised
+            .iter()
+            .find_map(|e| match e {
+                Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .unwrap();
+        engine
+            .apply_command(Command::update_job_retries(job_key, 2))
+            .unwrap();
+
+        // when resolved with an operation reference at a known instant
+        engine
+            .apply_command_at(
+                Command::resolve_incident_with(incident_key, 4242),
+                1_700_000_000_500,
+            )
+            .unwrap();
+
+        // then the record is retained as resolved with audit metadata
+        let incident = engine.incident(incident_key).unwrap();
+        assert_eq!(incident.state, state::IncidentState::Resolved);
+        assert_eq!(incident.resolved_at, Some(1_700_000_000_500));
+        assert_eq!(incident.operation_reference, Some(4242));
+        // and it no longer counts as active, so the instance has no open incident
+        assert!(engine.active_incidents().is_empty());
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+
+        // and resolving it again is rejected (already resolved)
+        let err = engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::IncidentNotResolvable { incident_key: k, .. } if k == incident_key
+        ));
     }
 
     fn process_with_error_boundary() -> ProcessDefinition {

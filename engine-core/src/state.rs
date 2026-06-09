@@ -93,9 +93,10 @@ pub struct ProcessInstance {
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
     pub join_instances: HashMap<ElementId, Key>,
-    /// Keys of incidents currently raised on this instance (parked tokens). The
-    /// full records live in [`State::incidents`]; resolving an incident removes
-    /// its key from here.
+    /// Keys of incidents currently **active** on this instance (parked tokens).
+    /// The full records live in [`State::incidents`] and are retained after
+    /// resolution; resolving an incident removes its key from this active index
+    /// (so `hasIncident` reflects only open incidents).
     pub incidents: Vec<Key>,
 }
 
@@ -110,6 +111,16 @@ pub enum IncidentKind {
     NoMatchingSequenceFlow,
     /// A thrown business error was not caught by any boundary event.
     UnhandledError,
+}
+
+/// Lifecycle state of an incident. Incidents are retained after resolution (as
+/// `Resolved`) so they remain queryable as an audit trail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncidentState {
+    /// Raised and parking a token; awaiting resolution.
+    Active,
+    /// Resolved: the failed work was retried. The record is kept for history.
+    Resolved,
 }
 
 /// A raised incident: a token parked because something went wrong (a job
@@ -136,6 +147,14 @@ pub struct Incident {
     /// server). Sourced from the command's clock, recorded on the event, and so
     /// preserved exactly on replay.
     pub created_at: u64,
+    /// Lifecycle state. `Active` while parking a token; `Resolved` once the
+    /// failed work has been retried (the record is retained for audit).
+    pub state: IncidentState,
+    /// The logical instant at which the incident was resolved, if it has been.
+    pub resolved_at: Option<u64>,
+    /// A caller-supplied reference recorded against the resolution for
+    /// traceability (the REST `operationReference`), if any.
+    pub operation_reference: Option<i64>,
 }
 
 /// A deployed process definition together with the identity the engine assigned
@@ -158,7 +177,8 @@ pub struct State {
     pub processes: HashMap<String, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
-    /// All currently-open incidents, keyed by incident key.
+    /// All incidents ever raised, keyed by incident key, retained after
+    /// resolution as an audit trail (each carries its [`IncidentState`]).
     pub incidents: HashMap<Key, Incident>,
 }
 
@@ -382,6 +402,9 @@ pub fn apply(state: &mut State, event: &Event) {
                     reason: reason.clone(),
                     job_key: *job_key,
                     created_at: *created_at,
+                    state: IncidentState::Active,
+                    resolved_at: None,
+                    operation_reference: None,
                 },
             );
             if let Some(instance) = state.instances.get_mut(instance_key) {
@@ -401,8 +424,18 @@ pub fn apply(state: &mut State, event: &Event) {
             incident_key,
             instance_key,
             job_key,
+            resolved_at,
+            operation_reference,
         } => {
-            state.incidents.remove(incident_key);
+            // Retain the record as an audit trail: transition it to Resolved
+            // rather than dropping it.
+            if let Some(incident) = state.incidents.get_mut(incident_key) {
+                incident.state = IncidentState::Resolved;
+                incident.resolved_at = Some(*resolved_at);
+                incident.operation_reference = *operation_reference;
+            }
+            // Remove it from the instance's *active* index so `hasIncident`
+            // reflects only open incidents.
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.incidents.retain(|k| k != incident_key);
             }

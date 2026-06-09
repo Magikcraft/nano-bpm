@@ -98,6 +98,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   the current variables. An uncaught-error incident re-creates the service-task
   job. If the retry fails again, a fresh incident is raised by the same code
   paths that raised the original.
+- **Incident lifecycle** is auditable: incidents carry an `IncidentState`
+  (`Active`/`Resolved`). Resolving transitions the record to `Resolved` —
+  stamping `resolved_at` (from the host clock) and any `operation_reference` —
+  and **retains it** rather than deleting it, so the read APIs expose a full
+  history. Only `Active` incidents can be resolved (re-resolving a `Resolved`
+  one is rejected). `Engine::incidents()` returns the whole history;
+  `Engine::active_incidents()` filters to open ones, and the per-instance active
+  index (`ProcessInstance::incidents`) drives `hasIncident`.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
