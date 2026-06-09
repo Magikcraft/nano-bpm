@@ -3,7 +3,9 @@
 //! A [`Command`] expresses *intent*. The engine decides whether and how to honour
 //! it, emitting [`crate::Event`]s. Commands never mutate state directly.
 
-use crate::model::ProcessDefinition;
+use std::collections::HashMap;
+
+use crate::model::{ProcessDefinition, Value};
 use crate::state::Key;
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
@@ -11,8 +13,50 @@ use crate::state::Key;
 pub enum Command {
     /// Register a process definition so instances of it can be created.
     DeployProcess(ProcessDefinition),
-    /// Start a new instance of a previously deployed process.
-    CreateInstance { process_id: String },
-    /// Report that the work for a job has finished, resuming the parked token.
-    CompleteJob { job_key: Key },
+    /// Start a new instance of a previously deployed process, seeding it with the
+    /// given variables (used by exclusive-gateway conditions).
+    CreateInstance {
+        process_id: String,
+        variables: HashMap<String, Value>,
+    },
+    /// Report that the work for a job has finished, optionally merging variables
+    /// into the instance before the token resumes.
+    CompleteJob {
+        job_key: Key,
+        variables: HashMap<String, Value>,
+    },
+}
+
+impl Command {
+    /// Convenience constructor for a `CreateInstance` with no variables.
+    pub fn create_instance(process_id: impl Into<String>) -> Self {
+        Command::CreateInstance {
+            process_id: process_id.into(),
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Convenience constructor for a `CreateInstance` with variables.
+    pub fn create_instance_with(
+        process_id: impl Into<String>,
+        variables: HashMap<String, Value>,
+    ) -> Self {
+        Command::CreateInstance {
+            process_id: process_id.into(),
+            variables,
+        }
+    }
+
+    /// Convenience constructor for a `CompleteJob` with no variables.
+    pub fn complete_job(job_key: Key) -> Self {
+        Command::CompleteJob {
+            job_key,
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Convenience constructor for a `CompleteJob` that sets variables.
+    pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
+        Command::CompleteJob { job_key, variables }
+    }
 }

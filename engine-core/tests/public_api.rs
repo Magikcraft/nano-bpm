@@ -24,9 +24,7 @@ fn two_service_tasks_complete_in_order() {
         .expect("deploy");
 
     let created = engine
-        .apply_command(Command::CreateInstance {
-            process_id: "fulfilment".into(),
-        })
+        .apply_command(Command::create_instance("fulfilment"))
         .expect("create");
     let instance_key = created.iter().find_map(Event::instance_key).unwrap();
 
@@ -38,7 +36,7 @@ fn two_service_tasks_complete_in_order() {
     // Complete the first job -> token advances to the second task.
     let first = engine.pending_jobs()[0].key;
     engine
-        .apply_command(Command::CompleteJob { job_key: first })
+        .apply_command(Command::complete_job(first))
         .expect("complete first");
     assert_eq!(engine.pending_jobs().len(), 1);
     assert_eq!(engine.pending_jobs()[0].job_type, "logistics");
@@ -47,7 +45,7 @@ fn two_service_tasks_complete_in_order() {
     // Complete the second job -> instance finishes.
     let second = engine.pending_jobs()[0].key;
     let events = engine
-        .apply_command(Command::CompleteJob { job_key: second })
+        .apply_command(Command::complete_job(second))
         .expect("complete second");
     assert!(engine.is_completed(instance_key));
     assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));

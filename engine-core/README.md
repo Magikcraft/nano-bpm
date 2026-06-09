@@ -81,10 +81,13 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 | `state.rs` | `State` and `apply()` — the **sole** mutator of state. |
 | `engine.rs` | `Engine::apply_command` — the single-writer loop and the processor. |
 
-> **Scope.** This is a POC: the model supports start events, service tasks and
-> end events with sequence flows. Gateways, intermediate events, timers,
-> sub-processes and BPMN 2.0 XML parsing are intended extension points — new
-> element kinds plug into `process_step` without touching the architecture.
+> **Scope.** This is a POC. The model supports start/end events, service tasks,
+> **exclusive (XOR) gateways** (condition-based routing with a default flow,
+> raising an incident when nothing matches) and **parallel (AND) gateways**
+> (split takes all branches; join synchronises them). Instances carry simple
+> variables (`Bool`/`Int`/`Str`) used by gateway conditions. Intermediate events,
+> timers, sub-processes and BPMN 2.0 XML parsing are intended extension points —
+> new element kinds plug into `process_step` without touching the architecture.
 
 ## Usage
 

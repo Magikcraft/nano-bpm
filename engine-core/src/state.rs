@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::event::Event;
-use crate::model::{ElementId, ProcessDefinition};
+use crate::model::{ElementId, ProcessDefinition, Value};
 
 /// A monotonically increasing identifier for instances, element instances and
 /// jobs. (Zeebe encodes the partition id into keys; nano just increments.)
@@ -50,9 +50,20 @@ pub struct ProcessInstance {
     pub state: ProcessInstanceState,
     /// Currently-active element instances, keyed by element-instance key. An
     /// element instance is "active" from `ACTIVATED` until `COMPLETED`; a service
-    /// task therefore stays here while its job is pending. When this becomes
-    /// empty the instance has no remaining tokens and is complete.
+    /// task therefore stays here while its job is pending, as does a token parked
+    /// on an incident. When this becomes empty the instance has no remaining
+    /// tokens and is complete.
     pub active: HashMap<Key, ElementId>,
+    /// Process variables (used by exclusive-gateway conditions).
+    pub variables: HashMap<String, Value>,
+    /// For each open parallel-gateway join: how many incoming tokens have
+    /// arrived so far.
+    pub join_counts: HashMap<ElementId, usize>,
+    /// For each open parallel-gateway join: the element instance accumulating
+    /// the arriving tokens.
+    pub join_instances: HashMap<ElementId, Key>,
+    /// Reasons of incidents raised on this instance (parked tokens).
+    pub incidents: Vec<String>,
 }
 
 /// The complete working state of the engine.
@@ -81,6 +92,7 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::ProcessInstanceCreated {
             instance_key,
             process_id,
+            variables,
         } => {
             state.instances.insert(
                 *instance_key,
@@ -89,8 +101,23 @@ pub fn apply(state: &mut State, event: &Event) {
                     process_id: process_id.clone(),
                     state: ProcessInstanceState::Active,
                     active: HashMap::new(),
+                    variables: variables.clone(),
+                    join_counts: HashMap::new(),
+                    join_instances: HashMap::new(),
+                    incidents: Vec::new(),
                 },
             );
+        }
+
+        Event::VariablesUpdated {
+            instance_key,
+            variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                for (k, v) in variables {
+                    instance.variables.insert(k.clone(), v.clone());
+                }
+            }
         }
 
         // ACTIVATING/COMPLETING are transient transitions with no state change.
@@ -122,6 +149,37 @@ pub fn apply(state: &mut State, event: &Event) {
         // activate/complete of the elements they connect.
         Event::SequenceFlowTaken { .. } => {}
 
+        Event::ParallelJoinOpened {
+            instance_key,
+            element_instance_key,
+            element_id,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .join_instances
+                    .insert(element_id.clone(), *element_instance_key);
+            }
+        }
+
+        Event::ParallelJoinTokenArrived {
+            instance_key,
+            element_id,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                *instance.join_counts.entry(element_id.clone()).or_insert(0) += 1;
+            }
+        }
+
+        Event::ParallelJoinReset {
+            instance_key,
+            element_id,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.join_counts.remove(element_id);
+                instance.join_instances.remove(element_id);
+            }
+        }
+
         Event::JobCreated {
             job_key,
             instance_key,
@@ -142,9 +200,19 @@ pub fn apply(state: &mut State, event: &Event) {
             );
         }
 
-        Event::JobCompleted { job_key } => {
+        Event::JobCompleted { job_key, .. } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Completed;
+            }
+        }
+
+        Event::IncidentRaised {
+            instance_key,
+            reason,
+            ..
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.incidents.push(reason.clone());
             }
         }
 

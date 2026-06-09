@@ -52,7 +52,7 @@
 //!
 //! engine.apply_command(Command::DeployProcess(process)).unwrap();
 //! let events = engine
-//!     .apply_command(Command::CreateInstance { process_id: "order".into() })
+//!     .apply_command(Command::create_instance("order"))
 //!     .unwrap();
 //!
 //! // The instance is parked on the service task, waiting for its job.
@@ -64,7 +64,7 @@
 //!
 //! // A worker completes the job; the token resumes and the instance finishes.
 //! let job_key = engine.pending_jobs()[0].key;
-//! engine.apply_command(Command::CompleteJob { job_key }).unwrap();
+//! engine.apply_command(Command::complete_job(job_key)).unwrap();
 //! assert!(engine.is_completed(instance_key));
 //! ```
 
@@ -77,5 +77,8 @@ mod state;
 pub use command::Command;
 pub use engine::{Engine, EngineError};
 pub use event::Event;
-pub use model::{Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition};
+pub use model::{
+    BuildError, Condition, Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition,
+    SequenceFlow, Value,
+};
 pub use state::{Job, JobState, Key, ProcessInstance, ProcessInstanceState, State};

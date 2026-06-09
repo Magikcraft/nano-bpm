@@ -5,7 +5,9 @@
 //! carries enough data to rebuild state, the event stream is a replayable log —
 //! persist it however you like and replay to recover.
 
-use crate::model::{ElementId, ProcessDefinition};
+use std::collections::HashMap;
+
+use crate::model::{ElementId, ProcessDefinition, Value};
 use crate::state::Key;
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
@@ -16,10 +18,17 @@ pub enum Event {
     ProcessDeployed { process: ProcessDefinition },
 
     /// A new process instance was created (carries a single token at its start
-    /// event).
+    /// event) with its initial variables.
     ProcessInstanceCreated {
         instance_key: Key,
         process_id: String,
+        variables: HashMap<String, Value>,
+    },
+
+    /// Variables were merged into a process instance.
+    VariablesUpdated {
+        instance_key: Key,
+        variables: HashMap<String, Value>,
     },
 
     /// An element instance entered `ACTIVATING`.
@@ -54,6 +63,25 @@ pub enum Event {
         to: ElementId,
     },
 
+    /// A parallel-gateway join element instance was opened on the first arriving
+    /// token; subsequent tokens accumulate against it.
+    ParallelJoinOpened {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
+    /// A token arrived at an open parallel-gateway join.
+    ParallelJoinTokenArrived {
+        instance_key: Key,
+        element_id: ElementId,
+    },
+    /// A parallel-gateway join fired (all incoming tokens present); its counters
+    /// are cleared.
+    ParallelJoinReset {
+        instance_key: Key,
+        element_id: ElementId,
+    },
+
     /// A job was created for a service task; the token now rests until the job
     /// is completed.
     JobCreated {
@@ -64,7 +92,16 @@ pub enum Event {
         job_type: String,
     },
     /// A job was completed.
-    JobCompleted { job_key: Key },
+    JobCompleted { job_key: Key, instance_key: Key },
+
+    /// An incident was raised (e.g. an exclusive gateway found no matching flow);
+    /// the token is parked until the incident is resolved.
+    IncidentRaised {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        reason: String,
+    },
 
     /// The last token of a process instance was consumed; the instance is done.
     ProcessInstanceCompleted { instance_key: Key },
@@ -78,14 +115,20 @@ impl Event {
     pub fn instance_key(&self) -> Option<Key> {
         match self {
             Event::ProcessInstanceCreated { instance_key, .. }
+            | Event::VariablesUpdated { instance_key, .. }
             | Event::ElementActivating { instance_key, .. }
             | Event::ElementActivated { instance_key, .. }
             | Event::ElementCompleting { instance_key, .. }
             | Event::ElementCompleted { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
+            | Event::ParallelJoinOpened { instance_key, .. }
+            | Event::ParallelJoinTokenArrived { instance_key, .. }
+            | Event::ParallelJoinReset { instance_key, .. }
             | Event::JobCreated { instance_key, .. }
+            | Event::JobCompleted { instance_key, .. }
+            | Event::IncidentRaised { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
-            Event::ProcessDeployed { .. } | Event::JobCompleted { .. } => None,
+            Event::ProcessDeployed { .. } => None,
         }
     }
 }
