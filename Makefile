@@ -26,6 +26,11 @@ build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate 
 	cd $(GENERATED_DIR) && cargo build
 	cd $(PROJECT_ROOT)/server && cargo build
 
+.PHONY: release
+release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimized production server binary
+	cd $(PROJECT_ROOT)/server && cargo build --release
+	@echo "Built $(PROJECT_ROOT)/server/target/release/camunda-gateway-rest-server"
+
 .PHONY: run
 run: $(STUB_IMPLS) ## Run the stub server (PORT overrides the default 8080)
 	cd $(PROJECT_ROOT)/server && cargo run

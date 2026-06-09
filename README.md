@@ -226,6 +226,10 @@ make generate
 # Generate if needed, then compile both crates
 make build
 
+# Build the optimized production server binary
+make release
+# -> server/target/release/camunda-gateway-rest-server
+
 # Run the stub server (defaults to port 8080; override with PORT)
 make run
 PORT=18080 make run
@@ -237,6 +241,21 @@ make fmt
 # Remove all generated artifacts
 make clean
 ```
+
+`make release` produces a single self-contained binary at
+`server/target/release/camunda-gateway-rest-server`. Run it directly,
+configuring it through the environment — `PORT` for the listen port and
+`NANOBPMN_JOURNAL` for the durable event-log path (see
+[Durability](#durability-event-log-replay)):
+
+```bash
+NANOBPMN_JOURNAL=/var/lib/nanobpmn/nanobpmn.journal PORT=8080 \
+  ./server/target/release/camunda-gateway-rest-server
+```
+
+> The generated REST layer under `generated/` is a build dependency, so
+> `make release` runs `make generate` first if needed (which requires Docker).
+> Once generated, the binary itself has no runtime dependency on Docker.
 
 ## Engine (`engine-core`)
 
