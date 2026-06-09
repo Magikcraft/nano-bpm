@@ -71,6 +71,14 @@ pub enum Command {
     /// current variables; an uncaught-error incident re-creates the service-task
     /// job. If the retry fails again a fresh incident is raised.
     ResolveIncident { incident_key: Key },
+    /// Merge variables into a scope before, typically, resolving an incident so
+    /// the retried work sees the corrected data. `scope_key` may be a process
+    /// instance key or an element instance key; both resolve to the owning
+    /// instance, since nano keeps a single instance-level variable scope.
+    SetVariables {
+        scope_key: Key,
+        variables: HashMap<String, Value>,
+    },
 }
 
 impl Command {
@@ -136,6 +144,14 @@ impl Command {
     /// Convenience constructor for a `ResolveIncident`.
     pub fn resolve_incident(incident_key: Key) -> Self {
         Command::ResolveIncident { incident_key }
+    }
+
+    /// Convenience constructor for a `SetVariables`.
+    pub fn set_variables(scope_key: Key, variables: HashMap<String, Value>) -> Self {
+        Command::SetVariables {
+            scope_key,
+            variables,
+        }
     }
 
     /// Convenience constructor for an `ActivateJobs` request.

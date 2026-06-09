@@ -98,6 +98,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   the current variables. An uncaught-error incident re-creates the service-task
   job. If the retry fails again, a fresh incident is raised by the same code
   paths that raised the original.
+- **Variables** can be merged into a scope with `SetVariables` (the scope key may
+  be a process instance or any active element instance — nano keeps a single
+  instance-level scope). Typically used to correct the data behind a gateway
+  incident before resolving it, so the re-evaluation on resolution succeeds.
 - The engine reads **no wall clock**: the host supplies `now` to
   `apply_command_at`, and timestamped events (e.g. a raised incident) carry it,
   so replay reconstructs identical timestamps.

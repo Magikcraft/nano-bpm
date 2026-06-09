@@ -44,6 +44,11 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   service-task job. If the retry fails again, a fresh incident is raised.
   Incidents now carry a real `creationTime` (the server feeds the engine its
   clock at command time).
+- `PUT /v2/element-instances/{elementInstanceKey}/variables`
+  (`createElementInstanceVariables`) merges variables into a scope (the key may
+  be a process instance or an active element instance). Use it to correct the
+  data behind a gateway/condition incident, then `resolveIncident` re-evaluates
+  and the token proceeds. `local` is accepted but has no effect (single scope).
 
 Read endpoints make engine state observable:
 

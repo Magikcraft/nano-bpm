@@ -628,6 +628,24 @@ impl Engine {
                     }
                 }
             }
+
+            Command::SetVariables {
+                scope_key,
+                variables,
+            } => {
+                let instance_key = self
+                    .resolve_scope(scope_key)
+                    .ok_or(EngineError::ScopeNotFound { scope_key })?;
+                if !variables.is_empty() {
+                    self.emit(
+                        &mut log,
+                        Event::VariablesUpdated {
+                            instance_key,
+                            variables,
+                        },
+                    );
+                }
+            }
         }
 
         self.run(&mut log, queue);
@@ -1017,6 +1035,21 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Resolves a variable scope key to the process instance that owns it. The
+    /// key may be the process instance itself or any of its active element
+    /// instances; nano keeps a single instance-level variable scope, so both map
+    /// to the same instance.
+    fn resolve_scope(&self, scope_key: Key) -> Option<Key> {
+        if self.state.instances.contains_key(&scope_key) {
+            return Some(scope_key);
+        }
+        self.state
+            .instances
+            .values()
+            .find(|i| i.active.contains_key(&scope_key))
+            .map(|i| i.key)
+    }
+
     fn join_eik(&self, instance_key: Key, element_id: &str) -> Option<Key> {
         self.state
             .instances
@@ -1056,6 +1089,9 @@ pub enum EngineError {
     /// `ResolveIncident` referenced a job-incident whose job still has no
     /// retries; the retries must be updated before it can be resolved.
     IncidentNotResolvable { incident_key: Key, reason: String },
+    /// `SetVariables` referenced a scope key that is neither a process instance
+    /// nor any active element instance.
+    ScopeNotFound { scope_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -1088,6 +1124,9 @@ impl std::fmt::Display for EngineError {
                 reason,
             } => {
                 write!(f, "incident {incident_key} cannot be resolved: {reason}")
+            }
+            EngineError::ScopeNotFound { scope_key } => {
+                write!(f, "no variable scope with key {scope_key}")
             }
         }
     }
@@ -1598,6 +1637,91 @@ mod tests {
         assert_eq!(incidents[0].kind, state::IncidentKind::NoMatchingSequenceFlow);
         assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
         assert!(!engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_recover_a_gateway_incident_after_fixing_variables() {
+        // given an exclusive gateway parked on a no-matching-flow incident
+        let def = ProcessBuilder::new("strict")
+            .start_event("s")
+            .exclusive_gateway("g")
+            .end_event("yes_end")
+            .connect("s", "g")
+            .connect_when(
+                "g",
+                "yes_end",
+                Condition::Equals {
+                    variable: "d".into(),
+                    value: Value::Bool(true),
+                },
+            )
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let vars = HashMap::from([("d".to_string(), Value::Int(7))]);
+        let created = engine
+            .apply_command(Command::create_instance_with("strict", vars))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let incident_key = engine.incidents()[0].key;
+
+        // when the operator fixes the variable then resolves the incident
+        engine
+            .apply_command(Command::set_variables(
+                instance_key,
+                HashMap::from([("d".to_string(), Value::Bool(true))]),
+            ))
+            .unwrap();
+        engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap();
+
+        // then the gateway re-evaluates, matches, and the instance completes
+        assert!(engine.incident(incident_key).is_none());
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_set_variables_via_an_element_instance_scope_key() {
+        // given a service task parked with a known element instance key
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let element_instance_key = engine.pending_jobs()[0].element_instance_key;
+        let instance_key = engine.pending_jobs()[0].instance_key;
+
+        // when variables are set against the element instance key (not the
+        // process instance key)
+        engine
+            .apply_command(Command::set_variables(
+                element_instance_key,
+                HashMap::from([("x".to_string(), Value::Int(42))]),
+            ))
+            .unwrap();
+
+        // then they land in the owning instance's single variable scope
+        assert_eq!(
+            engine.instance(instance_key).unwrap().variables.get("x"),
+            Some(&Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn should_reject_setting_variables_on_an_unknown_scope() {
+        let mut engine = Engine::new();
+        let err = engine
+            .apply_command(Command::set_variables(
+                404,
+                HashMap::from([("x".to_string(), Value::Int(1))]),
+            ))
+            .unwrap_err();
+        assert_eq!(err, EngineError::ScopeNotFound { scope_key: 404 });
     }
 
     #[test]
