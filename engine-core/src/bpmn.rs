@@ -16,9 +16,16 @@
 //! * `process` (one or more per file) with its `id`.
 //! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `exclusiveGateway`,
 //!   `parallelGateway`.
+//! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
+//!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * `boundaryEvent` with `attachedToRef` and a nested `errorEventDefinition`
 //!   `errorRef`, resolved against definitions-level `error` elements
-//!   (`<error id="…" errorCode="…">`) into an error boundary event.
+//!   (`<error id="…" errorCode="…">`) into an error boundary event; or a nested
+//!   `timerEventDefinition` (timer boundary); or a nested `messageEventDefinition`
+//!   (message boundary).
+//! * Definitions-level `message` elements (`<message id="…" name="…">`) with a
+//!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
+//!   catch/boundary events via `messageRef`.
 //! * A service task's job type is taken from a nested
 //!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id.
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
@@ -46,6 +53,10 @@ pub enum ParseError {
     /// A `boundaryEvent` was missing `attachedToRef`, or its
     /// `errorEventDefinition` referenced an `error` that was not declared.
     InvalidBoundaryEvent { process_id: String, reason: String },
+    /// A message event (`intermediateCatchEvent`/`boundaryEvent` with a
+    /// `messageEventDefinition`) referenced a `message` that was not declared, or
+    /// the declared message had no `zeebe:subscription correlationKey`.
+    InvalidMessageEvent { process_id: String, reason: String },
 }
 
 impl std::fmt::Display for ParseError {
@@ -66,6 +77,9 @@ impl std::fmt::Display for ParseError {
                     f,
                     "invalid boundary event in process {process_id}: {reason}"
                 )
+            }
+            ParseError::InvalidMessageEvent { process_id, reason } => {
+                write!(f, "invalid message event in process {process_id}: {reason}")
             }
         }
     }
@@ -104,12 +118,17 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut condition_text: Option<String> = None;
     // The boundary event currently being read (to attach its errorEventDefinition).
     let mut cur_boundary: Option<PendingBoundary> = None;
-    // Index of the timer intermediate catch event currently being read, and a
-    // buffer for its nested `timeDuration` text while inside that element.
-    let mut cur_timer_catch: Option<usize> = None;
+    // Index of the intermediate catch event currently being read (timer or
+    // message), and a buffer for its nested `timeDuration` text while inside it.
+    let mut cur_intermediate: Option<usize> = None;
     let mut duration_text: Option<String> = None;
     // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
     let mut errors: HashMap<String, String> = HashMap::new();
+    // Definitions-level `<message id=… name=…>` declarations, with the
+    // correlation-key variable from a nested `zeebe:subscription`: id -> decl.
+    let mut messages: HashMap<String, MessageDecl> = HashMap::new();
+    // Id of the `<message>` currently being read (to attach its subscription).
+    let mut cur_message: Option<String> = None;
 
     for token in &tokens {
         match token {
@@ -129,6 +148,34 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             (attr(attrs, "id"), attr(attrs, "errorCode"))
                         {
                             errors.insert(id.to_string(), code.to_string());
+                        }
+                    }
+                    // Definitions-level message declarations also live outside
+                    // <process>; the correlation key arrives via a nested
+                    // zeebe:subscription.
+                    "message" => {
+                        if let Some(id) = attr(attrs, "id") {
+                            messages.insert(
+                                id.to_string(),
+                                MessageDecl {
+                                    name: attr(attrs, "name").unwrap_or(id).to_string(),
+                                    correlation_key: None,
+                                },
+                            );
+                            if !self_closing {
+                                cur_message = Some(id.to_string());
+                            }
+                        }
+                    }
+                    // zeebe:subscription correlationKey, nested in the current
+                    // message's extensionElements.
+                    "subscription" => {
+                        if let (Some(mid), Some(expr)) =
+                            (cur_message.as_ref(), attr(attrs, "correlationKey"))
+                        {
+                            if let Some(decl) = messages.get_mut(mid) {
+                                decl.correlation_key = parse_correlation_key(expr);
+                            }
                         }
                     }
                     tag if current.is_some() => {
@@ -164,6 +211,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                             .map(str::to_string),
                                         error_ref: None,
                                         timer_duration_millis: None,
+                                        message_ref: None,
                                     });
                                 }
                             }
@@ -171,6 +219,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 if let Some(boundary) = cur_boundary.as_mut() {
                                     boundary.error_ref =
                                         Some(attr(attrs, "errorRef").unwrap_or("").to_string());
+                                }
+                            }
+                            "messageEventDefinition" => {
+                                // On an intermediate catch event or a boundary
+                                // event, marks it a message event referencing a
+                                // definitions-level <message>.
+                                let message_ref =
+                                    attr(attrs, "messageRef").unwrap_or("").to_string();
+                                if let Some(idx) = cur_intermediate {
+                                    acc.nodes[idx].message_ref = Some(message_ref);
+                                } else if let Some(boundary) = cur_boundary.as_mut() {
+                                    boundary.message_ref = Some(message_ref);
                                 }
                             }
                             "taskDefinition" => {
@@ -188,13 +248,13 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "intermediateCatchEvent" => {
-                                let idx = acc.add_node(attrs, NodeKind::TimerCatch);
+                                let idx = acc.add_node(attrs, NodeKind::IntermediateCatch);
                                 if !self_closing {
-                                    cur_timer_catch = idx;
+                                    cur_intermediate = idx;
                                 }
                             }
                             "timeDuration"
-                                if cur_timer_catch.is_some() || cur_boundary.is_some() =>
+                                if cur_intermediate.is_some() || cur_boundary.is_some() =>
                             {
                                 duration_text = Some(String::new());
                             }
@@ -223,15 +283,19 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_service_task = None;
                     cur_flow = None;
                     cur_boundary = None;
-                    cur_timer_catch = None;
+                    cur_intermediate = None;
                     duration_text = None;
                 }
                 "serviceTask" => cur_service_task = None,
+                "message" => cur_message = None,
                 "boundaryEvent" => {
-                    // Keep error boundaries (errorEventDefinition) and timer
-                    // boundaries (timerEventDefinition); ignore the rest.
+                    // Keep error boundaries (errorEventDefinition), timer
+                    // boundaries (timerEventDefinition) and message boundaries
+                    // (messageEventDefinition); ignore the rest.
                     if let (Some(acc), Some(boundary)) = (current.as_mut(), cur_boundary.take()) {
-                        if boundary.error_ref.is_some() || boundary.timer_duration_millis.is_some()
+                        if boundary.error_ref.is_some()
+                            || boundary.timer_duration_millis.is_some()
+                            || boundary.message_ref.is_some()
                         {
                             acc.boundaries.push(boundary);
                         }
@@ -244,11 +308,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         acc.flows[idx].condition = parse_condition(&text);
                     }
                 }
-                "intermediateCatchEvent" => cur_timer_catch = None,
+                "intermediateCatchEvent" => cur_intermediate = None,
                 "timeDuration" => {
                     if let Some(text) = duration_text.take() {
                         let millis = parse_iso8601_duration(&text);
-                        if let (Some(acc), Some(idx)) = (current.as_mut(), cur_timer_catch) {
+                        if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
                             // An intermediate catch event's duration.
                             acc.nodes[idx].duration_millis = millis;
                         } else if let Some(boundary) = cur_boundary.as_mut() {
@@ -269,7 +333,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
 
     processes
         .into_iter()
-        .map(|acc| acc.build(&errors))
+        .map(|acc| acc.build(&errors, &messages))
         .collect()
 }
 
@@ -282,6 +346,9 @@ struct NodeAcc {
     /// For timer intermediate catch events: the parsed timer duration in
     /// milliseconds (from a nested `timerEventDefinition`/`timeDuration`).
     duration_millis: Option<u64>,
+    /// For message intermediate catch events: the `messageRef` of a nested
+    /// `messageEventDefinition`, resolved to a name/correlation key at build.
+    message_ref: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -291,7 +358,7 @@ enum NodeKind {
     Service,
     Exclusive,
     Parallel,
-    TimerCatch,
+    IntermediateCatch,
 }
 
 /// A sequence flow collected while scanning.
@@ -303,13 +370,24 @@ struct FlowAcc {
 
 /// A boundary event collected while scanning. An `error_ref` (resolved to an
 /// error code at build time) makes it an error boundary; a `timer_duration_millis`
-/// makes it an interrupting timer boundary. A boundary with neither is ignored.
+/// makes it an interrupting timer boundary; a `message_ref` (resolved to a
+/// message name/correlation key) makes it an interrupting message boundary. A
+/// boundary with none of these is ignored.
 #[derive(Clone)]
 struct PendingBoundary {
     id: String,
     attached_to: Option<String>,
     error_ref: Option<String>,
     timer_duration_millis: Option<u64>,
+    message_ref: Option<String>,
+}
+
+/// A definitions-level `<message>` declaration: its `name` and the instance
+/// variable named by a nested `zeebe:subscription correlationKey`.
+#[derive(Clone)]
+struct MessageDecl {
+    name: String,
+    correlation_key: Option<String>,
 }
 
 /// Accumulates the nodes and flows of one `<process>` as it is scanned.
@@ -338,6 +416,7 @@ impl ProcessAcc {
             kind,
             job_type: None,
             duration_millis: None,
+            message_ref: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -355,8 +434,14 @@ impl ProcessAcc {
     /// Assembles the [`ProcessDefinition`] via [`ProcessBuilder`].
     ///
     /// `errors` maps definitions-level `<error>` ids to their codes, used to
-    /// resolve each boundary event's `errorRef`.
-    fn build(self, errors: &HashMap<String, String>) -> Result<ProcessDefinition, ParseError> {
+    /// resolve each boundary event's `errorRef`. `messages` maps `<message>` ids
+    /// to their name and correlation-key variable, used to resolve message
+    /// intermediate catch and boundary events.
+    fn build(
+        self,
+        errors: &HashMap<String, String>,
+        messages: &HashMap<String, MessageDecl>,
+    ) -> Result<ProcessDefinition, ParseError> {
         let mut builder = ProcessBuilder::new(self.id.clone());
         for node in self.nodes {
             builder = match node.kind {
@@ -368,9 +453,36 @@ impl ProcessAcc {
                     let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
                     builder.service_task(node.id, job_type)
                 }
-                NodeKind::TimerCatch => {
-                    let duration_millis = node.duration_millis.unwrap_or(0);
-                    builder.timer_intermediate_catch_event(node.id, duration_millis)
+                NodeKind::IntermediateCatch => {
+                    // A messageRef makes it a message catch; otherwise it is a
+                    // timer catch carrying a (possibly zero) duration.
+                    if let Some(message_ref) = node.message_ref {
+                        let decl = messages.get(&message_ref).ok_or_else(|| {
+                            ParseError::InvalidMessageEvent {
+                                process_id: self.id.clone(),
+                                reason: format!(
+                                    "intermediate catch event {} references unknown message '{message_ref}'",
+                                    node.id
+                                ),
+                            }
+                        })?;
+                        let correlation_key = decl.correlation_key.clone().ok_or_else(|| {
+                            ParseError::InvalidMessageEvent {
+                                process_id: self.id.clone(),
+                                reason: format!(
+                                    "message '{message_ref}' has no zeebe:subscription correlationKey"
+                                ),
+                            }
+                        })?;
+                        builder.message_intermediate_catch_event(
+                            node.id,
+                            decl.name.clone(),
+                            correlation_key,
+                        )
+                    } else {
+                        let duration_millis = node.duration_millis.unwrap_or(0);
+                        builder.timer_intermediate_catch_event(node.id, duration_millis)
+                    }
                 }
             };
         }
@@ -382,10 +494,35 @@ impl ProcessAcc {
                         process_id: self.id.clone(),
                         reason: format!("boundary event {} has no attachedToRef", boundary.id),
                     })?;
-            // A timer boundary carries a duration; otherwise it is an error
-            // boundary whose errorRef must resolve to a declared error.
+            // Resolve the boundary's flavour: timer (duration), message
+            // (messageRef), or error (errorRef -> declared error).
             if let Some(duration_millis) = boundary.timer_duration_millis {
                 builder = builder.timer_boundary_event(boundary.id, attached_to, duration_millis);
+            } else if let Some(message_ref) = boundary.message_ref {
+                let decl =
+                    messages
+                        .get(&message_ref)
+                        .ok_or_else(|| ParseError::InvalidMessageEvent {
+                            process_id: self.id.clone(),
+                            reason: format!(
+                                "boundary event {} references unknown message '{message_ref}'",
+                                boundary.id
+                            ),
+                        })?;
+                let correlation_key = decl.correlation_key.clone().ok_or_else(|| {
+                    ParseError::InvalidMessageEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "message '{message_ref}' has no zeebe:subscription correlationKey"
+                        ),
+                    }
+                })?;
+                builder = builder.message_boundary_event(
+                    boundary.id,
+                    attached_to,
+                    decl.name.clone(),
+                    correlation_key,
+                );
             } else {
                 let error_ref = boundary.error_ref.unwrap_or_default();
                 let error_code = errors.get(&error_ref).cloned().ok_or_else(|| {
@@ -522,6 +659,19 @@ fn parse_literal(literal: &str) -> Value {
         return Value::Int(n);
     }
     Value::Str(literal.to_string())
+}
+
+/// Parses a `zeebe:subscription correlationKey` expression into the name of an
+/// instance variable: strips the leading FEEL `=` marker and trims. Returns
+/// `None` if the result is empty.
+fn parse_correlation_key(raw: &str) -> Option<String> {
+    let expr = raw.trim();
+    let expr = expr.strip_prefix('=').unwrap_or(expr).trim();
+    if expr.is_empty() {
+        None
+    } else {
+        Some(expr.to_string())
+    }
 }
 
 /// The local part of a possibly-namespaced XML name (`bpmn:process` -> `process`).
@@ -1026,5 +1176,106 @@ mod tests {
                 value: Value::Bool(true),
             })
         );
+    }
+
+    #[test]
+    fn should_parse_a_message_intermediate_catch_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:intermediateCatchEvent id="await">
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:intermediateCatchEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="await" />
+              <bpmn:sequenceFlow id="f1" sourceRef="await" targetRef="e" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="payment-received">
+              <bpmn:extensionElements>
+                <zeebe:subscription correlationKey="=orderId" />
+              </bpmn:extensionElements>
+            </bpmn:message>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("await").unwrap().kind,
+            ElementKind::MessageIntermediateCatchEvent {
+                message_name: "payment-received".to_string(),
+                correlation_key: "orderId".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_a_message_boundary_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge" />
+              <bpmn:endEvent id="done" />
+              <bpmn:boundaryEvent id="cancel" attachedToRef="charge">
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="aborted" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="done" />
+              <bpmn:sequenceFlow id="f2" sourceRef="cancel" targetRef="aborted" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="order-cancelled">
+              <bpmn:extensionElements>
+                <zeebe:subscription correlationKey="=orderId" />
+              </bpmn:extensionElements>
+            </bpmn:message>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("cancel").unwrap().kind,
+            ElementKind::MessageBoundaryEvent {
+                attached_to: "charge".to_string(),
+                message_name: "order-cancelled".to_string(),
+                correlation_key: "orderId".to_string(),
+            }
+        );
+        let boundary = def.element("cancel").unwrap();
+        assert!(boundary.outgoing.iter().any(|f| f.to == "aborted"));
+    }
+
+    #[test]
+    fn should_reject_a_message_event_referencing_an_unknown_message() {
+        // given
+        let xml = r#"
+          <definitions>
+            <process id="p">
+              <startEvent id="s" />
+              <intermediateCatchEvent id="await">
+                <messageEventDefinition messageRef="missing" />
+              </intermediateCatchEvent>
+              <endEvent id="e" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="await" />
+              <sequenceFlow id="f1" sourceRef="await" targetRef="e" />
+            </process>
+          </definitions>"#;
+
+        // when
+        let err = parse_bpmn(xml).unwrap_err();
+
+        // then
+        assert!(matches!(err, ParseError::InvalidMessageEvent { .. }));
     }
 }

@@ -88,6 +88,18 @@ pub enum Command {
         scope_key: Key,
         variables: HashMap<String, Value>,
     },
+    /// Publish a message and correlate it to every open subscription whose
+    /// message name and correlation key match. A message intermediate catch
+    /// event resumes its parked token; an interrupting message boundary event
+    /// interrupts its activity. The message's `variables` are merged into each
+    /// correlated instance before its token advances. Messages are **not
+    /// buffered**: a message with no matching open subscription is simply
+    /// dropped (no TTL, no dedup).
+    CorrelateMessage {
+        message_name: String,
+        correlation_key: String,
+        variables: HashMap<String, Value>,
+    },
 }
 
 impl Command {
@@ -190,6 +202,32 @@ impl Command {
             max_jobs,
             timeout,
             now,
+        }
+    }
+
+    /// Convenience constructor for a `CorrelateMessage` with no variables.
+    pub fn correlate_message(
+        message_name: impl Into<String>,
+        correlation_key: impl Into<String>,
+    ) -> Self {
+        Command::CorrelateMessage {
+            message_name: message_name.into(),
+            correlation_key: correlation_key.into(),
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Convenience constructor for a `CorrelateMessage` that carries variables to
+    /// merge into each correlated instance.
+    pub fn correlate_message_with(
+        message_name: impl Into<String>,
+        correlation_key: impl Into<String>,
+        variables: HashMap<String, Value>,
+    ) -> Self {
+        Command::CorrelateMessage {
+            message_name: message_name.into(),
+            correlation_key: correlation_key.into(),
+            variables,
         }
     }
 }

@@ -221,6 +221,39 @@ impl Engine {
         self.state.timers.values().collect()
     }
 
+    /// Publishes a message and correlates it to every open subscription whose
+    /// name and correlation key match, merging the message `variables` into each
+    /// correlated instance. Like [`Engine::trigger_timers`], the host drives
+    /// this; the engine never reads a clock. Returns the events produced — the
+    /// heading [`Event::MessagePublished`] (always) plus an
+    /// [`Event::MessageCorrelated`] per correlated subscription. Mirrors applying
+    /// a [`Command::CorrelateMessage`].
+    pub fn correlate_message(
+        &mut self,
+        message_name: impl Into<String>,
+        correlation_key: impl Into<String>,
+        variables: HashMap<String, Value>,
+        now: u64,
+    ) -> Vec<Event> {
+        self.apply_command_at(
+            Command::correlate_message_with(message_name, correlation_key, variables),
+            now,
+        )
+        .expect("CorrelateMessage never fails")
+    }
+
+    /// All open and settled message subscriptions (correlated/cancelled ones are
+    /// retained). Filter by [`state::MessageSubscription::state`] for only-open
+    /// subscriptions.
+    pub fn message_subscriptions(&self) -> Vec<&state::MessageSubscription> {
+        self.state.message_subscriptions.values().collect()
+    }
+
+    /// Looks up a message subscription by key, whether open or settled.
+    pub fn message_subscription(&self, key: Key) -> Option<&state::MessageSubscription> {
+        self.state.message_subscriptions.get(&key)
+    }
+
     /// Activates jobs of `job_type` and dispatches each to `handler` — the
     /// **callback** worker API for embedded use. Whatever variables the handler
     /// returns complete the job (by key); returning `None` leaves the job locked.
@@ -547,6 +580,12 @@ impl Engine {
                             for event in self.cancel_boundary_timers_on(element_instance_key) {
                                 self.emit(&mut log, event);
                             }
+                            // Disarm any boundary message subscriptions on it too.
+                            for event in
+                                self.cancel_boundary_message_subscriptions_on(element_instance_key)
+                            {
+                                self.emit(&mut log, event);
+                            }
                             queue.push_back(Step::Activate {
                                 instance_key,
                                 element_id: boundary_element_id,
@@ -670,8 +709,13 @@ impl Engine {
                             },
                         );
                         // An error boundary interrupting the task also disarms any
-                        // timer boundaries on it.
+                        // timer boundaries and message subscriptions on it.
                         for event in self.cancel_boundary_timers_on(element_instance_key) {
+                            self.emit(&mut log, event);
+                        }
+                        for event in
+                            self.cancel_boundary_message_subscriptions_on(element_instance_key)
+                        {
                             self.emit(&mut log, event);
                         }
                         queue.push_back(Step::Activate {
@@ -821,6 +865,136 @@ impl Engine {
                     );
                 }
             }
+
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                variables,
+            } => {
+                // Always mint a message key (Zeebe records every published
+                // message); it is returned to the host and, carried on the
+                // MessagePublished event, restores the key generator on replay.
+                let message_key = self.mint_key();
+                self.emit(
+                    &mut log,
+                    Event::MessagePublished {
+                        message_key,
+                        message_name: message_name.clone(),
+                        correlation_key: correlation_key.clone(),
+                    },
+                );
+
+                // Correlate to every matching open subscription, deterministic by
+                // subscription key. Messages are not buffered: with no match the
+                // message is simply dropped.
+                let mut matched: Vec<Key> = self
+                    .state
+                    .message_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.state == state::MessageSubscriptionState::Open
+                            && s.message_name == message_name
+                            && s.correlation_key == correlation_key
+                    })
+                    .map(|s| s.key)
+                    .collect();
+                matched.sort_unstable();
+
+                for subscription_key in matched {
+                    // A boundary correlation earlier in this batch may have
+                    // interrupted an activity that cancelled this subscription;
+                    // re-check it is still open.
+                    let subscription = match self.state.message_subscriptions.get(&subscription_key)
+                    {
+                        Some(s) if s.state == state::MessageSubscriptionState::Open => s,
+                        _ => continue,
+                    };
+                    let instance_key = subscription.instance_key;
+                    let element_instance_key = subscription.element_instance_key;
+                    let element_id = subscription.element_id.clone();
+                    let kind = subscription.kind.clone();
+
+                    self.emit(
+                        &mut log,
+                        Event::MessageCorrelated {
+                            subscription_key,
+                            message_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id: element_id.clone(),
+                        },
+                    );
+                    // The message's variables (if any) are merged into the
+                    // correlated instance before its token advances.
+                    if !variables.is_empty() {
+                        self.emit(
+                            &mut log,
+                            Event::VariablesUpdated {
+                                instance_key,
+                                variables: variables.clone(),
+                            },
+                        );
+                    }
+
+                    match kind {
+                        // Catch event: completing it resumes the token along its
+                        // own outgoing flow.
+                        state::MessageSubscriptionKind::IntermediateCatch => {
+                            queue.push_back(Step::Complete {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        }
+                        // Boundary subscription: interrupt the attached activity
+                        // (cancel its job and disarm any sibling boundary timers
+                        // and message subscriptions), then run the boundary
+                        // event's outgoing flow. `element_instance_key`/
+                        // `element_id` are the activity here.
+                        state::MessageSubscriptionKind::InterruptingBoundary {
+                            boundary_element_id,
+                        } => {
+                            if let Some(job_key) = self.active_job_on(element_instance_key) {
+                                self.emit(
+                                    &mut log,
+                                    Event::JobCanceled {
+                                        job_key,
+                                        instance_key,
+                                    },
+                                );
+                            }
+                            self.emit(
+                                &mut log,
+                                Event::ElementCompleting {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id: element_id.clone(),
+                                },
+                            );
+                            self.emit(
+                                &mut log,
+                                Event::ElementCompleted {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                },
+                            );
+                            for event in self.cancel_boundary_timers_on(element_instance_key) {
+                                self.emit(&mut log, event);
+                            }
+                            for event in
+                                self.cancel_boundary_message_subscriptions_on(element_instance_key)
+                            {
+                                self.emit(&mut log, event);
+                            }
+                            queue.push_back(Step::Activate {
+                                instance_key,
+                                element_id: boundary_element_id,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         self.run(&mut log, queue);
@@ -917,6 +1091,26 @@ impl Engine {
                         },
                     });
                 }
+                // Open a subscription for every attached message boundary event;
+                // correlating a matching message later interrupts this task.
+                for (boundary_id, message_name, correlation_key) in
+                    self.attached_message_boundaries(instance_key, &element_id)
+                {
+                    let subscription_key = self.mint_key();
+                    let correlation_value =
+                        self.resolve_correlation_value(instance_key, &correlation_key);
+                    events.push(Event::MessageSubscriptionCreated {
+                        subscription_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        message_name,
+                        correlation_key: correlation_value,
+                        kind: state::MessageSubscriptionKind::InterruptingBoundary {
+                            boundary_element_id: boundary_id,
+                        },
+                    });
+                }
             }
             // A timer intermediate catch event arms a timer and parks the token;
             // a clock tick (TriggerTimers) releases it once the timer is due.
@@ -929,6 +1123,25 @@ impl Engine {
                     element_id,
                     due_at: self.now.saturating_add(duration_millis),
                     kind: state::TimerKind::IntermediateCatch,
+                });
+            }
+            // A message intermediate catch event opens a subscription and parks
+            // the token; a matching CorrelateMessage releases it.
+            Some(ElementKind::MessageIntermediateCatchEvent {
+                message_name,
+                correlation_key,
+            }) => {
+                let subscription_key = self.mint_key();
+                let correlation_value =
+                    self.resolve_correlation_value(instance_key, &correlation_key);
+                events.push(Event::MessageSubscriptionCreated {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    message_name,
+                    correlation_key: correlation_value,
+                    kind: state::MessageSubscriptionKind::IntermediateCatch,
                 });
             }
             // Pass-through elements (events, exclusive gateway, parallel split)
@@ -975,8 +1188,9 @@ impl Engine {
             },
         ];
         // If this element was an activity guarded by interrupting boundary timers,
-        // completing it normally disarms them.
+        // completing it normally disarms them (and any boundary message subs).
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
+        events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -1295,6 +1509,79 @@ impl Engine {
             .collect()
     }
 
+    /// All interrupting message boundary events attached to `activity_id`, as
+    /// `(boundary_id, message_name, correlation_key)` sorted by boundary id (so
+    /// arming is deterministic). Empty when the activity has no message
+    /// boundaries.
+    fn attached_message_boundaries(
+        &self,
+        instance_key: Key,
+        activity_id: &str,
+    ) -> Vec<(ElementId, String, String)> {
+        let Some(process) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(ElementId, String, String)> = process
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                ElementKind::MessageBoundaryEvent {
+                    attached_to,
+                    message_name,
+                    correlation_key,
+                } if attached_to == activity_id => {
+                    Some((e.id.clone(), message_name.clone(), correlation_key.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Cancels every open boundary message subscription resting on
+    /// `element_instance_key`, returning the `MessageSubscriptionCanceled`
+    /// events. Called when the guarded activity leaves the flow another way (it
+    /// completed normally or a different boundary interrupted it), so a stale
+    /// subscription never correlates later.
+    fn cancel_boundary_message_subscriptions_on(&self, element_instance_key: Key) -> Vec<Event> {
+        let mut subs: Vec<&state::MessageSubscription> = self
+            .state
+            .message_subscriptions
+            .values()
+            .filter(|s| {
+                s.element_instance_key == element_instance_key
+                    && s.state == state::MessageSubscriptionState::Open
+                    && matches!(
+                        s.kind,
+                        state::MessageSubscriptionKind::InterruptingBoundary { .. }
+                    )
+            })
+            .collect();
+        subs.sort_by_key(|s| s.key);
+        subs.into_iter()
+            .map(|s| Event::MessageSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Resolves the correlation value a subscription captures at open time: the
+    /// stringified value of the instance variable named `correlation_key`. A
+    /// missing variable yields the empty string (matching the REST default
+    /// `correlationKey` of `""`).
+    fn resolve_correlation_value(&self, instance_key: Key, correlation_key: &str) -> String {
+        self.state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.variables.get(correlation_key))
+            .map(value_to_string)
+            .unwrap_or_default()
+    }
+
     fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))
@@ -1432,6 +1719,18 @@ pub struct ActivatedJob {
     pub retries: i32,
     /// A snapshot of the instance's variables at activation time.
     pub variables: HashMap<String, Value>,
+}
+
+/// Stringifies a [`Value`] for use as a message correlation key. Strings pass
+/// through unquoted; numbers and booleans use their natural rendering. This is
+/// how an instance variable's value becomes the subscription's correlation key,
+/// matched against the REST `correlationKey` string.
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::Str(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => b.to_string(),
+    }
 }
 
 /// Whether a job can be activated at the logical instant `now`: it is created
@@ -1674,6 +1973,269 @@ mod tests {
         assert!(recovered.is_completed(instance_key));
         let job = recovered.state().jobs.values().next().unwrap();
         assert_eq!(job.state, state::JobState::Canceled);
+    }
+
+    /// start -> await (message catch "payment-received", correlationKey orderId)
+    ///       -> end
+    fn process_with_message_catch() -> ProcessDefinition {
+        ProcessBuilder::new("await-payment")
+            .start_event("start")
+            .message_intermediate_catch_event("await", "payment-received", "orderId")
+            .end_event("end")
+            .connect("start", "await")
+            .connect("await", "end")
+            .build()
+            .unwrap()
+    }
+
+    fn vars(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn should_park_on_message_catch_then_correlate() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_catch()))
+            .unwrap();
+
+        // Create an instance whose orderId resolves the correlation value "A".
+        let events = engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str("A".into()))]),
+            ))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The token parks on the catch event, opening one open subscription.
+        assert!(!engine.is_completed(instance_key));
+        let subs = engine.message_subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].state, state::MessageSubscriptionState::Open);
+        assert_eq!(subs[0].message_name, "payment-received");
+        assert_eq!(subs[0].correlation_key, "A");
+
+        // A non-matching correlation key correlates nothing.
+        let fired = engine.correlate_message("payment-received", "B", HashMap::new(), 0);
+        assert!(!fired
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+        assert!(!engine.is_completed(instance_key));
+
+        // The matching message releases the token and completes the instance.
+        let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+        assert!(fired
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(
+            engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Correlated
+        );
+
+        // A repeat message never correlates the now-settled subscription twice.
+        let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+        assert!(!fired
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    }
+
+    #[test]
+    fn should_publish_a_message_with_no_subscription() {
+        let mut engine = Engine::new();
+        // With nothing subscribed, a published message is minted and dropped.
+        let fired = engine.correlate_message("nobody-home", "X", HashMap::new(), 0);
+        assert_eq!(fired.len(), 1);
+        assert!(matches!(fired[0], Event::MessagePublished { .. }));
+        assert!(engine.message_subscriptions().is_empty());
+    }
+
+    #[test]
+    fn should_merge_message_variables_on_correlation() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_catch()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str("A".into()))]),
+            ))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        engine.correlate_message(
+            "payment-received",
+            "A",
+            vars(&[("amount", Value::Int(42))]),
+            0,
+        );
+
+        // The message payload is merged into the correlated instance's variables.
+        assert_eq!(
+            engine.state().instances[&instance_key]
+                .variables
+                .get("amount"),
+            Some(&Value::Int(42))
+        );
+    }
+
+    #[test]
+    fn should_correlate_only_the_instance_with_the_matching_key() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_catch()))
+            .unwrap();
+        let a = engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str("A".into()))]),
+            ))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        let b = engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str("B".into()))]),
+            ))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+
+        // Correlating "A" releases only instance A; B stays parked.
+        engine.correlate_message("payment-received", "A", HashMap::new(), 0);
+        assert!(engine.is_completed(a));
+        assert!(!engine.is_completed(b));
+    }
+
+    #[test]
+    fn should_recover_an_open_message_subscription_via_replay() {
+        let mut engine = Engine::new();
+        let mut log = Vec::new();
+        log.extend(
+            engine
+                .apply_command(Command::DeployProcess(process_with_message_catch()))
+                .unwrap(),
+        );
+        log.extend(
+            engine
+                .apply_command(Command::create_instance_with(
+                    "await-payment",
+                    vars(&[("orderId", Value::Str("A".into()))]),
+                ))
+                .unwrap(),
+        );
+
+        // Replay: the open subscription and its parked token survive.
+        let mut recovered = Engine::replay(log);
+        let subs = recovered.message_subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].state, state::MessageSubscriptionState::Open);
+        let instance_key = subs[0].instance_key;
+        assert!(!recovered.is_completed(instance_key));
+
+        // The recovered engine correlates the message and completes the instance.
+        recovered.correlate_message("payment-received", "A", HashMap::new(), 0);
+        assert!(recovered.is_completed(instance_key));
+    }
+
+    /// start -> charge (service task, interrupting message boundary "cancel"
+    ///          correlating on orderId) -> done
+    ///                       \--(message)--> aborted
+    fn process_with_message_boundary() -> ProcessDefinition {
+        ProcessBuilder::new("cancellable")
+            .start_event("start")
+            .service_task("charge", "payment")
+            .message_boundary_event("cancel", "charge", "order-cancelled", "orderId")
+            .end_event("done")
+            .end_event("aborted")
+            .connect("start", "charge")
+            .connect("charge", "done")
+            .connect("cancel", "aborted")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_fire_an_interrupting_message_boundary_and_cancel_the_job() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_boundary()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance_with(
+                "cancellable",
+                vars(&[("orderId", Value::Str("A".into()))]),
+            ))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The token parks on the service task; a job and a boundary subscription
+        // are created.
+        assert_eq!(engine.pending_jobs().len(), 1);
+        let job_key = engine.pending_jobs()[0].key;
+        assert_eq!(engine.message_subscriptions().len(), 1);
+
+        // Correlating the boundary message interrupts the task: the job is
+        // cancelled, the boundary's outgoing flow runs, the instance completes.
+        let fired = engine.correlate_message("order-cancelled", "A", HashMap::new(), 0);
+        assert_eq!(
+            engine.state().jobs[&job_key].state,
+            state::JobState::Canceled
+        );
+        assert!(fired
+            .iter()
+            .any(|e| matches!(e, Event::JobCanceled { job_key: k, .. } if *k == job_key)));
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "cancel" && to == "aborted"
+        )));
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(
+            engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Correlated
+        );
+    }
+
+    #[test]
+    fn should_cancel_a_message_boundary_subscription_when_the_job_completes_first() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_boundary()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance_with(
+                "cancellable",
+                vars(&[("orderId", Value::Str("A".into()))]),
+            ))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        // Completing the job before any message arrives takes the normal flow and
+        // cancels the boundary subscription.
+        engine.activate_jobs("payment", "w", 1, 60_000, 0);
+        engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap();
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(
+            engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Canceled
+        );
+
+        // A later message for the (now cancelled) subscription correlates nothing.
+        let fired = engine.correlate_message("order-cancelled", "A", HashMap::new(), 0);
+        assert!(!fired
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
     }
 
     #[test]

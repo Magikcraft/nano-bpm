@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::model::{ElementId, ProcessDefinition, Value};
-use crate::state::{IncidentKind, Key, TimerKind};
+use crate::state::{IncidentKind, Key, MessageSubscriptionKind, TimerKind};
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
@@ -204,6 +204,53 @@ pub enum Event {
     /// A job was cancelled because its activity was interrupted by a boundary
     /// event firing.
     JobCanceled { job_key: Key, instance_key: Key },
+
+    /// A message was published. In nano messages are not buffered, so this
+    /// records no durable state; it carries the minted `message_key` (returned to
+    /// the host and used to restore the key generator on replay) and heads the
+    /// [`Event::MessageCorrelated`] events the same command produced.
+    MessagePublished {
+        message_key: Key,
+        message_name: String,
+        correlation_key: String,
+    },
+    /// A message subscription was opened: either on a message intermediate catch
+    /// event (the token rests on it) or as an interrupting message boundary on an
+    /// activity (the activity runs as normal until a message is correlated).
+    /// `correlation_key` is the resolved correlation value captured at open time,
+    /// carried on the event so replay reconstructs the subscription exactly.
+    MessageSubscriptionCreated {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        message_name: String,
+        correlation_key: String,
+        kind: MessageSubscriptionKind,
+    },
+    /// A published message correlated to an open subscription. For an
+    /// intermediate catch event its token is released along the event's outgoing
+    /// flow; for an interrupting boundary the attached activity is interrupted and
+    /// the boundary's outgoing flow runs (the job-cancellation, element-completion
+    /// and sequence-flow events follow). `message_key` ties it back to the
+    /// [`Event::MessagePublished`] that produced it.
+    MessageCorrelated {
+        subscription_key: Key,
+        message_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
+    /// An open message subscription was cancelled before correlating because the
+    /// element it guarded left the flow first (e.g. a boundary subscription whose
+    /// activity completed normally, or a sibling boundary subscription when
+    /// another boundary on the same activity fired).
+    MessageSubscriptionCanceled {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
 }
 
 impl Event {
@@ -236,8 +283,11 @@ impl Event {
             | Event::TimerTriggered { instance_key, .. }
             | Event::TimerCanceled { instance_key, .. }
             | Event::JobCanceled { instance_key, .. }
+            | Event::MessageSubscriptionCreated { instance_key, .. }
+            | Event::MessageCorrelated { instance_key, .. }
+            | Event::MessageSubscriptionCanceled { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
-            Event::ProcessDeployed { .. } => None,
+            Event::ProcessDeployed { .. } | Event::MessagePublished { .. } => None,
         }
     }
 
@@ -325,6 +375,28 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*timer_key).max(*element_instance_key),
+            Event::MessagePublished { message_key, .. } => m = m.max(*message_key),
+            Event::MessageSubscriptionCreated {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Event::MessageSubscriptionCanceled {
+                subscription_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*subscription_key).max(*element_instance_key),
+            Event::MessageCorrelated {
+                subscription_key,
+                message_key,
+                element_instance_key,
+                ..
+            } => {
+                m = m
+                    .max(*subscription_key)
+                    .max(*message_key)
+                    .max(*element_instance_key)
+            }
             _ => {}
         }
         m

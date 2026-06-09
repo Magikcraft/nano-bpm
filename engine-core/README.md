@@ -127,6 +127,26 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   boundary) first, the armed boundary timer is **disarmed** (`TimerState::Canceled`)
   so it never fires. `JobCanceled`/`TimerCanceled` are journaled, so both outcomes
   survive a restart.
+- **Message intermediate catch events** park a token mid-flow until a matching
+  message is correlated. Reaching one opens a `MessageSubscription` keyed by the
+  message name and a **correlation value** — the stringified value of the named
+  instance variable captured at open time. A host-driven `CorrelateMessage
+  { message_name, correlation_key, variables }` (the engine's `correlate_message`
+  helper, or the REST `publishMessage`/`correlateMessage` endpoints) releases the
+  token of every matching open subscription along the event's outgoing flow,
+  merging the message's variables into the instance first. Like timers the engine
+  stays **clock-free** and the message flow is durable
+  (`MessagePublished`/`MessageSubscriptionCreated`/`MessageCorrelated` are
+  journaled), so a parked subscription survives a restart and a settled one is
+  retained so it never re-correlates. Messages are **not buffered** — with no
+  matching open subscription the message is simply dropped (no TTL/dedup).
+- **Interrupting message boundary events** attach a subscription to a service
+  task. When the task activates a subscription is opened; if a matching message is
+  correlated before the job is done, the engine **cancels the job**, interrupts
+  the activity, and routes the token out the boundary's outgoing flow. If the job
+  instead completes (or the task is interrupted another way) first, the open
+  subscription is **cancelled** (`MessageSubscriptionState::Canceled`) so it never
+  correlates. Both outcomes are journaled and survive a restart.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
@@ -154,16 +174,21 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > it fires first, cancels the job and routes the token out the boundary),
 > **exclusive (XOR) gateways** (condition-based routing with a default flow,
 > raising an incident when nothing matches), **parallel (AND) gateways**
-> (split takes all branches; join synchronises them) and **timer intermediate
+> (split takes all branches; join synchronises them), **timer intermediate
 > catch events** (a token parks until its `timeDuration` elapses, fired by a
-> host clock tick). Instances carry simple
-> variables (`Bool`/`Int`/`Str`) used by gateway conditions. Processes can be
+> host clock tick) and **message events** — **message intermediate catch events**
+> (a token parks until a matching message is correlated) and **interrupting
+> message boundary events** (a message that, correlated first, cancels the job and
+> routes the token out the boundary). Instances carry simple
+> variables (`Bool`/`Int`/`Str`) used by gateway conditions and message
+> correlation. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
-> that same subset (including `boundaryEvent`/`errorEventDefinition` and
-> `intermediateCatchEvent`/`timerEventDefinition`) via the
+> that same subset (including `boundaryEvent`/`errorEventDefinition`,
+> `intermediateCatchEvent`/`timerEventDefinition` and
+> `messageEventDefinition`/`zeebe:subscription`) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
-> Sub-processes and non-timer intermediate events are intended extension points —
+> Sub-processes and non-interrupting events are intended extension points —
 > new element kinds plug into `process_step` without touching the architecture.
 
 ## Usage

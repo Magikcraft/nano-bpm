@@ -108,6 +108,33 @@ pub enum ElementKind {
         /// How long after the activity activates the timer fires.
         duration_millis: u64,
     },
+    /// A message intermediate catch event. On activation it opens a message
+    /// subscription keyed by `message_name` and a correlation value (the
+    /// stringified value of the instance variable named `correlation_key`), and
+    /// the token rests on it; the token resumes along the event's outgoing flow
+    /// once a [`crate::Command::CorrelateMessage`] with a matching name and
+    /// correlation value arrives.
+    MessageIntermediateCatchEvent {
+        /// The BPMN message name this event subscribes to.
+        message_name: String,
+        /// Name of the instance variable whose value identifies the instance to
+        /// correlate to (the subscription's correlation key).
+        correlation_key: String,
+    },
+    /// An interrupting message boundary event attached to an activity (here, a
+    /// service task). It has no incoming sequence flow; instead a message
+    /// subscription is opened when the activity activates, and when a matching
+    /// message is correlated the activity is interrupted (its token and any job
+    /// cancelled) and the token runs along this event's outgoing flow.
+    MessageBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// The BPMN message name this event subscribes to.
+        message_name: String,
+        /// Name of the instance variable whose value identifies the instance to
+        /// correlate to (the subscription's correlation key).
+        correlation_key: String,
+    },
 }
 
 /// A single BPMN flow node and its outgoing sequence flows.
@@ -265,6 +292,50 @@ impl ProcessBuilder {
             ElementKind::TimerBoundaryEvent {
                 attached_to: attached_to.into(),
                 duration_millis,
+            },
+        )
+    }
+
+    /// Adds a message intermediate catch event named `message_name`, correlating
+    /// on the instance variable named `correlation_key`. The token rests on it
+    /// until a [`crate::Command::CorrelateMessage`] with a matching name and
+    /// correlation value arrives, then resumes along its outgoing flow.
+    pub fn message_intermediate_catch_event(
+        self,
+        id: impl Into<String>,
+        message_name: impl Into<String>,
+        correlation_key: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::MessageIntermediateCatchEvent {
+                message_name: message_name.into(),
+                correlation_key: correlation_key.into(),
+            },
+        )
+    }
+
+    /// Adds an interrupting message boundary event attached to `attached_to`,
+    /// subscribing to `message_name` and correlating on the instance variable
+    /// named `correlation_key`. A subscription is opened when the activity
+    /// activates; when a matching message is correlated the activity is
+    /// interrupted and the token runs along this event's outgoing flow. Connect
+    /// its outgoing flow(s) with [`connect`] to route the handling path.
+    ///
+    /// [`connect`]: ProcessBuilder::connect
+    pub fn message_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        message_name: impl Into<String>,
+        correlation_key: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::MessageBoundaryEvent {
+                attached_to: attached_to.into(),
+                message_name: message_name.into(),
+                correlation_key: correlation_key.into(),
             },
         )
     }

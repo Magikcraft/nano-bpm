@@ -216,6 +216,65 @@ pub struct Timer {
     pub kind: TimerKind,
 }
 
+/// Lifecycle state of a message subscription.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MessageSubscriptionState {
+    /// Open and waiting: a matching correlated message releases its token.
+    Open,
+    /// Correlated: a matching message arrived and released its token. Retained
+    /// so it is not correlated twice.
+    Correlated,
+    /// Cancelled before correlation because the element it guarded left the flow
+    /// first (e.g. a boundary subscription whose activity completed, or a sibling
+    /// boundary subscription when another boundary on the same activity fired).
+    /// Retained for audit; never correlates.
+    Canceled,
+}
+
+/// What a message subscription guards, which decides what correlating it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MessageSubscriptionKind {
+    /// A message intermediate catch event: the subscription's
+    /// `element_instance_key` is the catch event itself, and correlating
+    /// completes it, resuming the token along the event's outgoing flow.
+    IntermediateCatch,
+    /// An interrupting message boundary event attached to an activity: the
+    /// subscription's `element_instance_key`/`element_id` are the *attached
+    /// activity*, and correlating cancels the activity (and any job parked on it)
+    /// and takes the boundary event's outgoing flow.
+    InterruptingBoundary {
+        /// Id of the boundary event whose outgoing flow runs when a message is
+        /// correlated.
+        boundary_element_id: ElementId,
+    },
+}
+
+/// An open message subscription holding a token on a message catch element until
+/// a matching message is correlated. A [`crate::Command::CorrelateMessage`] whose
+/// name and correlation key match an open subscription releases its token (an
+/// intermediate catch) or interrupts its activity (an interrupting boundary).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageSubscription {
+    pub key: Key,
+    pub instance_key: Key,
+    /// The element instance the token rests on while waiting: the catch event
+    /// itself for an intermediate subscription, or the attached activity for a
+    /// boundary subscription.
+    pub element_instance_key: Key,
+    pub element_id: ElementId,
+    /// The BPMN message name this subscription waits for.
+    pub message_name: String,
+    /// The resolved correlation value: the stringified value of the instance
+    /// variable the catch element correlates on, captured when the subscription
+    /// opened. A message correlates only when its `correlation_key` equals this.
+    pub correlation_key: String,
+    pub state: MessageSubscriptionState,
+    /// What the subscription guards, and so what correlating it does.
+    pub kind: MessageSubscriptionKind,
+}
+
 /// A deployed process definition together with the identity the engine assigned
 /// it at deploy time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +302,11 @@ pub struct State {
     /// (transitioned to [`TimerState::Triggered`]) so a clock tick never fires
     /// it twice.
     pub timers: HashMap<Key, Timer>,
+    /// Open and settled message subscriptions, keyed by subscription key. A
+    /// correlated subscription is retained (transitioned to
+    /// [`MessageSubscriptionState::Correlated`]) so a later message never
+    /// correlates it twice.
+    pub message_subscriptions: HashMap<Key, MessageSubscription>,
 }
 
 impl State {
@@ -558,6 +622,52 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Canceled;
                 job.worker = None;
                 job.deadline = None;
+            }
+        }
+
+        // Publishing a message is, in nano, a transient fact: messages are not
+        // buffered, so there is nothing to record. The event exists only to mint
+        // a deterministic message key (carried to the host for its response and
+        // restored on replay) and to head the events a correlation produced.
+        Event::MessagePublished { .. } => {}
+
+        Event::MessageSubscriptionCreated {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            message_name,
+            correlation_key,
+            kind,
+        } => {
+            state.message_subscriptions.insert(
+                *subscription_key,
+                MessageSubscription {
+                    key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    message_name: message_name.clone(),
+                    correlation_key: correlation_key.clone(),
+                    state: MessageSubscriptionState::Open,
+                    kind: kind.clone(),
+                },
+            );
+        }
+
+        Event::MessageCorrelated {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
+                subscription.state = MessageSubscriptionState::Correlated;
+            }
+        }
+
+        Event::MessageSubscriptionCanceled {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
+                subscription.state = MessageSubscriptionState::Canceled;
             }
         }
     }

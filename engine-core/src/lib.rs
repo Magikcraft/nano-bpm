@@ -85,6 +85,7 @@ pub use model::{
     SequenceFlow, Value,
 };
 pub use state::{
-    DeployedProcess, Incident, IncidentKind, IncidentState, Job, JobState, Key, ProcessInstance,
+    DeployedProcess, Incident, IncidentKind, IncidentState, Job, JobState, Key,
+    MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
     ProcessInstanceState, State, Timer, TimerKind, TimerState,
 };
