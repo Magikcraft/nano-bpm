@@ -14,8 +14,16 @@ use crate::state::Key;
 /// the order in which they occurred.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
-    /// A process definition was registered.
-    ProcessDeployed { process: ProcessDefinition },
+    /// A process definition was registered as part of a deployment. The engine
+    /// assigns the `deployment_key` (shared by every resource in the same
+    /// deployment), a unique `process_definition_key`, and a `version` that
+    /// increments per process id across deployments.
+    ProcessDeployed {
+        deployment_key: Key,
+        process_definition_key: Key,
+        version: i32,
+        process: ProcessDefinition,
+    },
 
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables.

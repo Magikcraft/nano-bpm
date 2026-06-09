@@ -66,10 +66,24 @@ pub struct ProcessInstance {
     pub incidents: Vec<String>,
 }
 
+/// A deployed process definition together with the identity the engine assigned
+/// it at deploy time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeployedProcess {
+    /// Unique key for this specific process definition (and version).
+    pub key: Key,
+    /// Version number, incremented per process id across deployments (starts 1).
+    pub version: i32,
+    /// The static, executable definition.
+    pub definition: ProcessDefinition,
+}
+
 /// The complete working state of the engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct State {
-    pub processes: HashMap<String, ProcessDefinition>,
+    /// Latest deployed version of each process, keyed by BPMN process id. New
+    /// instances created by id start the latest version.
+    pub processes: HashMap<String, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
 }
@@ -85,8 +99,20 @@ impl State {
 /// state; the processor never mutates [`State`] directly.
 pub fn apply(state: &mut State, event: &Event) {
     match event {
-        Event::ProcessDeployed { process } => {
-            state.processes.insert(process.id.clone(), process.clone());
+        Event::ProcessDeployed {
+            process_definition_key,
+            version,
+            process,
+            ..
+        } => {
+            state.processes.insert(
+                process.id.clone(),
+                DeployedProcess {
+                    key: *process_definition_key,
+                    version: *version,
+                    definition: process.clone(),
+                },
+            );
         }
 
         Event::ProcessInstanceCreated {

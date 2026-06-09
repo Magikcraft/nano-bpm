@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::command::Command;
 use crate::event::Event;
-use crate::model::{ElementKind, SequenceFlow, Value};
+use crate::model::{ElementKind, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
 /// An embeddable BPMN engine instance.
@@ -94,6 +94,50 @@ impl Engine {
         self.next_key
     }
 
+    /// Validates and registers a batch of process definitions as one deployment.
+    ///
+    /// All processes are validated first, so the deployment is atomic: if any is
+    /// invalid, none are emitted. Each process is assigned a unique
+    /// process-definition key and a per-id version (latest known + 1).
+    fn deploy(
+        &mut self,
+        log: &mut Vec<Event>,
+        processes: Vec<ProcessDefinition>,
+    ) -> Result<(), EngineError> {
+        for process in &processes {
+            if !process.elements.contains_key(&process.start_event) {
+                return Err(EngineError::NoStartEvent {
+                    process_id: process.id.clone(),
+                });
+            }
+        }
+
+        let deployment_key = self.mint_key();
+        for process in processes {
+            let version = self.next_version(&process.id);
+            let process_definition_key = self.mint_key();
+            self.emit(
+                log,
+                Event::ProcessDeployed {
+                    deployment_key,
+                    process_definition_key,
+                    version,
+                    process,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// The version that the next deployment of `process_id` will receive.
+    fn next_version(&self, process_id: &str) -> i32 {
+        self.state
+            .processes
+            .get(process_id)
+            .map(|p| p.version + 1)
+            .unwrap_or(1)
+    }
+
     /// Applies a command, returning the ordered list of events it produced.
     ///
     /// This is the engine's single writer: it runs to quiescence before
@@ -105,12 +149,11 @@ impl Engine {
 
         match command {
             Command::DeployProcess(process) => {
-                if !process.elements.contains_key(&process.start_event) {
-                    return Err(EngineError::NoStartEvent {
-                        process_id: process.id,
-                    });
-                }
-                self.emit(&mut log, Event::ProcessDeployed { process });
+                self.deploy(&mut log, vec![process])?;
+            }
+
+            Command::DeployResources(processes) => {
+                self.deploy(&mut log, processes)?;
             }
 
             Command::CreateInstance {
@@ -122,7 +165,7 @@ impl Engine {
                         process_id: process_id.clone(),
                     }
                 })?;
-                let start_event = process.start_event.clone();
+                let start_event = process.definition.start_event.clone();
 
                 let instance_key = self.mint_key();
                 self.emit(
@@ -468,7 +511,10 @@ impl Engine {
 
     fn process_of_instance(&self, instance_key: Key) -> Option<&crate::model::ProcessDefinition> {
         let instance = self.state.instances.get(&instance_key)?;
-        self.state.processes.get(&instance.process_id)
+        self.state
+            .processes
+            .get(&instance.process_id)
+            .map(|p| &p.definition)
     }
 
     fn element_kind(&self, instance_key: Key, element_id: &str) -> Option<ElementKind> {

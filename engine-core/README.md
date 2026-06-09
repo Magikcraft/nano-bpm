@@ -85,9 +85,13 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **exclusive (XOR) gateways** (condition-based routing with a default flow,
 > raising an incident when nothing matches) and **parallel (AND) gateways**
 > (split takes all branches; join synchronises them). Instances carry simple
-> variables (`Bool`/`Int`/`Str`) used by gateway conditions. Intermediate events,
-> timers, sub-processes and BPMN 2.0 XML parsing are intended extension points —
-> new element kinds plug into `process_step` without touching the architecture.
+> variables (`Bool`/`Int`/`Str`) used by gateway conditions. Processes can be
+> built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
+> that same subset via the [`bpmn`] module (`bpmn::parse_bpmn`), a tiny
+> dependency-free scanner. Deployments assign a per-id **version** and a unique
+> process-definition key. Intermediate events, timers and sub-processes are
+> intended extension points — new element kinds plug into `process_step` without
+> touching the architecture.
 
 ## Usage
 

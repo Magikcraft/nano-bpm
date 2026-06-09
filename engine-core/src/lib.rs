@@ -74,6 +74,8 @@ mod event;
 mod model;
 mod state;
 
+pub mod bpmn;
+
 pub use command::Command;
 pub use engine::{Engine, EngineError};
 pub use event::Event;
@@ -81,4 +83,6 @@ pub use model::{
     BuildError, Condition, Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition,
     SequenceFlow, Value,
 };
-pub use state::{Job, JobState, Key, ProcessInstance, ProcessInstanceState, State};
+pub use state::{
+    DeployedProcess, Job, JobState, Key, ProcessInstance, ProcessInstanceState, State,
+};

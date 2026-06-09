@@ -11,8 +11,13 @@ use crate::state::Key;
 /// An instruction submitted to [`crate::Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// Register a process definition so instances of it can be created.
+    /// Register a single process definition. Deployed under its own deployment
+    /// key; equivalent to a [`Command::DeployResources`] with one process.
     DeployProcess(ProcessDefinition),
+    /// Atomically register one or more process definitions as a single
+    /// deployment. All processes share one deployment key; each is assigned its
+    /// own process-definition key and a per-id version.
+    DeployResources(Vec<ProcessDefinition>),
     /// Start a new instance of a previously deployed process, seeding it with the
     /// given variables (used by exclusive-gateway conditions).
     CreateInstance {
