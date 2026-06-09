@@ -6,18 +6,20 @@ Rust REST layer (models + `axum` router + service traits) from it, plus a
 runnable stub server.
 
 No backend services are wired into *most* of the REST layer: operations respond
-with `501 Not Implemented`. Two operations are now backed by the embedded
+with `501 Not Implemented`. A few operations are now backed by the embedded
 **`engine-core`** BPMN engine as a proof of the REST → engine path:
 
+- `POST /v2/deployments` (`createDeployment`) parses the uploaded BPMN 2.0 XML
+  resources and deploys them, assigning each process a key and a per-id version.
 - `POST /v2/process-instances` (`createProcessInstance`, by `processDefinitionId`)
   starts a real instance and returns its engine-assigned key.
 - `POST /v2/jobs/{jobKey}/completion` (`completeJob`) completes the job and
   resumes the token.
 
 A demo process (`processDefinitionId: "demo"`, a single service task) is
-pre-deployed at server startup so these can be exercised immediately. Engine
-errors map to real status codes (`400`/`404`/`409`); everything else is still
-`501`.
+pre-deployed at server startup, but you can also deploy your own `.bpmn` files
+through the deployment endpoint. Engine and parse errors map to real status
+codes (`400`/`404`/`409`); everything else is still `501`.
 
 ## Two crates
 
@@ -136,20 +138,27 @@ See [`engine-core/README.md`](engine-core/README.md) for the architecture.
 The `server/` crate wires the generated REST layer into a runnable `axum` server.
 Most operations return `Err(())`, which the server's `ErrorHandler` maps to a
 `501 Not Implemented` response, so the whole API surface is routable end to end.
-Two operations are backed by the embedded `engine-core` engine (see above):
+A few operations are backed by the embedded `engine-core` engine (see above):
 
 ```console
 $ PORT=18080 make run
 ... listening on http://0.0.0.0:18080/v2
 
-# Engine-backed: start the pre-deployed "demo" process -> real instance key
+# Engine-backed: deploy a BPMN file -> process is parsed and versioned
+$ curl -s -X POST localhost:18080/v2/deployments \
+    -H 'Authorization: Bearer x' -F 'resources=@order.bpmn'
+{"deploymentKey":"3","tenantId":"<default>","deployments":[{"processDefinition":
+  {"processDefinitionId":"shipping","processDefinitionVersion":1,
+   "resourceName":"order.bpmn","processDefinitionKey":"4",...},...}]}
+
+# Engine-backed: start an instance of the just-deployed process
 $ curl -s -X POST localhost:18080/v2/process-instances \
     -H 'Authorization: Bearer x' -H 'Content-Type: application/json' \
-    -d '{"processDefinitionId":"demo"}'
-{"processDefinitionId":"demo",...,"processInstanceKey":"1",...}
+    -d '{"processDefinitionId":"shipping"}'
+{"processDefinitionId":"shipping",...,"processInstanceKey":"5",...}
 
 # Engine-backed: complete the resulting job -> 204, token resumes, instance ends
-$ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:18080/v2/jobs/4/completion \
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:18080/v2/jobs/8/completion \
     -H 'Authorization: Bearer x' -H 'Content-Type: application/json' -d '{}'
 204
 
@@ -162,8 +171,8 @@ $ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:18080/v2/process-in
 The `ServerImpl` type (which owns the embedded engine), authentication, error
 glue, and the engine-backed handlers live in `server/src/main.rs` (committed).
 The per-tag trait impls are generated into `server/src/stub_impls.rs` by
-`gen-stub-server.py`, which routes the two wired operations to the handlers via
-its `OVERRIDES` table and stubs everything else.
+`gen-stub-server.py`, which routes the wired operations to the handlers via its
+`OVERRIDES` table and stubs everything else.
 
 ## Generation pipeline
 

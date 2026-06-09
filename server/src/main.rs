@@ -15,9 +15,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
+use axum::extract::Multipart;
 use axum::response::Response;
 use camunda_gateway_rest::{apis, models};
 use http::StatusCode;
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{Command, Engine, EngineError, Event, ProcessBuilder};
 
 /// The single type that implements every generated API trait.
@@ -168,6 +170,149 @@ impl ServerImpl {
                 )),
             ),
         }
+    }
+
+    async fn create_deployment_impl(
+        &self,
+        mut body: Multipart,
+    ) -> Result<apis::resource::CreateDeploymentResponse, ()> {
+        use apis::resource::CreateDeploymentResponse as Resp;
+
+        // Drain the multipart body first: reading fields is async and we must not
+        // hold the engine lock across an `.await`.
+        let mut resources: Vec<(String, String)> = Vec::new();
+        let mut tenant_id = "<default>".to_string();
+        loop {
+            match body.next_field().await {
+                Ok(Some(field)) => {
+                    let name = field.name().unwrap_or_default().to_string();
+                    let file_name = field.file_name().map(str::to_string);
+                    match field.bytes().await {
+                        Ok(bytes) => {
+                            if name == "tenantId" {
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    let text = text.trim();
+                                    if !text.is_empty() {
+                                        tenant_id = text.to_string();
+                                    }
+                                }
+                            } else {
+                                match String::from_utf8(bytes.to_vec()) {
+                                    Ok(xml) => {
+                                        let resource_name = file_name.unwrap_or_else(|| {
+                                            format!("resource-{}.bpmn", resources.len())
+                                        });
+                                        resources.push((resource_name, xml));
+                                    }
+                                    Err(_) => {
+                                        return Ok(Resp::Status400_TheProvidedDataIsNotValid(
+                                            problem(
+                                                "Invalid resource",
+                                                400,
+                                                "A deployment resource was not valid UTF-8 BPMN XML.".to_string(),
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                                "Invalid request",
+                                400,
+                                format!("Could not read a deployment resource: {e}."),
+                            )));
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid request",
+                        400,
+                        format!("Malformed multipart request: {e}."),
+                    )));
+                }
+            }
+        }
+
+        if resources.is_empty() {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "No resources",
+                400,
+                "At least one deployment resource is required.".to_string(),
+            )));
+        }
+
+        // Parse every resource up front so the deployment is all-or-nothing.
+        let mut processes = Vec::new();
+        let mut resource_names: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (resource_name, xml) in &resources {
+            match parse_bpmn(xml) {
+                Ok(defs) => {
+                    for def in defs {
+                        resource_names.insert(def.id.clone(), resource_name.clone());
+                        processes.push(def);
+                    }
+                }
+                Err(e) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid BPMN",
+                        400,
+                        format!("Failed to parse '{resource_name}': {e}."),
+                    )));
+                }
+            }
+        }
+
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let events = match engine.apply_command(Command::DeployResources(processes)) {
+            Ok(events) => events,
+            Err(e) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid deployment",
+                    400,
+                    e.to_string(),
+                )));
+            }
+        };
+
+        let mut deployment_key = String::new();
+        let mut deployments = Vec::new();
+        for event in &events {
+            if let Event::ProcessDeployed {
+                deployment_key: dk,
+                process_definition_key,
+                version,
+                process,
+            } = event
+            {
+                deployment_key = dk.to_string();
+                let resource_name = resource_names.get(&process.id).cloned().unwrap_or_default();
+                let process_result = models::DeploymentProcessResult::new(
+                    process.id.clone(),
+                    *version,
+                    resource_name,
+                    tenant_id.clone(),
+                    models::ProcessDefinitionKey(process_definition_key.to_string()),
+                );
+                deployments.push(models::DeploymentMetadataResult::new(
+                    camunda_gateway_rest::types::Nullable::Present(process_result),
+                    camunda_gateway_rest::types::Nullable::Null,
+                    camunda_gateway_rest::types::Nullable::Null,
+                    camunda_gateway_rest::types::Nullable::Null,
+                    camunda_gateway_rest::types::Nullable::Null,
+                ));
+            }
+        }
+
+        let result = models::DeploymentResult::new(
+            models::DeploymentKey(deployment_key),
+            tenant_id,
+            deployments,
+        );
+        Ok(Resp::Status200_TheResourcesAreDeployed(result))
     }
 }
 
