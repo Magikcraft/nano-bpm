@@ -60,6 +60,24 @@ threads, no locks, no networking and no database. On a phone you embed
 FFI surfaces coarse (submit a command, drain the events) rather than chatty, and
 build with `opt-level = "z"` + LTO to keep the binary small.
 
+### The FFI surface
+
+`src/ffi.rs` (behind the off-by-default **`ffi`** feature) is exactly such a
+coarse C-ABI: `nbpmn_engine_new`/`_free`, `nbpmn_alloc`/`_free` for passing
+bytes across the boundary, and a handful of operations — `nbpmn_deploy_bpmn`,
+`nbpmn_create_instance`, `nbpmn_correlate_message`, `nbpmn_trigger_timers`,
+`nbpmn_is_completed`, `nbpmn_instance_count`. Each submits one command and
+returns a scalar summary (a key, an event count, a flag); none can unwind across
+the boundary. The same functions back a UniFFI layer on mobile and the wasm
+exports in a browser.
+
+The crate is `crate-type = ["lib", "cdylib"]`, so building with `--features ffi`
+emits a loadable artifact. `make engine-wasm-ffi` builds it for
+`wasm32-unknown-unknown` and runs `scripts/verify-wasm-ffi.mjs`, which asserts
+every `nbpmn_*` symbol is exported and then instantiates the `.wasm` (no imports
+needed) to drive a real deploy → create → complete cycle — proving the FFI wasm
+build works end to end.
+
 ## The execution model
 
 Every BPMN element instance walks the same lifecycle, mirroring Zeebe:
@@ -184,6 +202,7 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 | `event.rs` | `Event` — immutable facts; a replayable log. |
 | `state.rs` | `State` and `apply()` — the **sole** mutator of state. |
 | `engine.rs` | `Engine::apply_command` — the single-writer loop and the processor. |
+| `ffi.rs` | Coarse C-ABI surface for FFI/wasm embedders (feature `ffi`). |
 
 > **Scope.** This is a POC. The model supports start/end events, service tasks,
 > **error boundary events** (a worker `throwError` caught by a matching boundary,
@@ -246,5 +265,10 @@ assert!(engine.is_completed(instance_key)); // token resumed, instance done
 
 ```bash
 cargo test                              # unit + integration + doctests
+cargo test --features ffi               # also exercise the C-ABI surface
 cargo build --target wasm32-unknown-unknown
+
+# Build the FFI cdylib for wasm32 and verify its exports + a round-trip
+# (from the repo root; needs the wasm32 target and node):
+make engine-wasm-ffi
 ```

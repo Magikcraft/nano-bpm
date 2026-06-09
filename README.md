@@ -203,7 +203,10 @@ nanobpmn/
     │   ├── command.rs             # Command enum (engine inputs)
     │   ├── event.rs               # Event enum (engine facts)
     │   ├── state.rs               # State + apply() — the sole mutator
-    │   └── engine.rs              # single-writer loop + processor
+    │   ├── state.rs               # State + apply() — the sole mutator
+    │   ├── engine.rs              # single-writer loop + processor
+    │   └── ffi.rs                 # coarse C-ABI surface (feature "ffi")
+    ├── scripts/verify-wasm-ffi.mjs # asserts the wasm FFI exports + a round-trip
     └── tests/public_api.rs
 ```
 
@@ -266,9 +269,13 @@ code generation:
 make engine-test    # unit + integration + doc tests
 make engine-build   # debug build
 make engine-wasm    # prove it compiles for wasm32 (needs the wasm32 target)
+make engine-wasm-ffi # build the FFI cdylib for wasm32 + verify exports & a round-trip (needs node)
 ```
 
-See [`engine-core/README.md`](engine-core/README.md) for the architecture.
+See [`engine-core/README.md`](engine-core/README.md) for the architecture. The
+engine also exposes a coarse C-ABI (`src/ffi.rs`, behind the `ffi` feature) for
+embedding via UniFFI on mobile or as wasm exports in a browser; `make
+engine-wasm-ffi` proves that wasm/FFI build end to end.
 
 ## Stub server
 

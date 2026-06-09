@@ -77,6 +77,9 @@ mod state;
 
 pub mod bpmn;
 
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 pub use command::Command;
 pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;

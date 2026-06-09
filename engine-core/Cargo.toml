@@ -16,7 +16,14 @@ serde = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 serde = ["dep:serde"]
+# Exposes the coarse C-ABI surface in `ffi.rs` (paired with the `cdylib`
+# crate-type below) so a non-Rust host can embed the engine via FFI/wasm.
+ffi = []
 
 [lib]
 name = "nanobpmn_engine_core"
 path = "src/lib.rs"
+# `lib` for Rust consumers and the test/bench harness; `cdylib` so a C/Swift/
+# Kotlin host or the `wasm32-unknown-unknown` target gets a loadable artifact
+# exporting the `ffi` functions (built with `--features ffi`).
+crate-type = ["lib", "cdylib"]

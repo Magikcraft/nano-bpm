@@ -51,6 +51,11 @@ engine-test: ## Test the engine-core crate (unit + integration + doctests)
 engine-wasm: ## Build engine-core for wasm32 (portability check; needs the wasm32 target)
 	cd $(ENGINE_DIR) && cargo build --target wasm32-unknown-unknown
 
+.PHONY: engine-wasm-ffi
+engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (needs the wasm32 target + node)
+	cd $(ENGINE_DIR) && cargo build --release --features ffi --target wasm32-unknown-unknown
+	node $(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs
+
 .PHONY: fmt
 fmt: $(GENERATED_DIR)/Cargo.toml ## Format the generated crate, the stub server and engine-core
 	cd $(GENERATED_DIR) && cargo fmt
