@@ -59,7 +59,16 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   the instance first). Messages are **not buffered** (no TTL/dedup): with no
   match the message is dropped. `publishMessage` always returns `200` with the
   minted `messageKey`; `correlateMessage` returns `404` when nothing correlates
-  (and otherwise `200` with the first correlated `processInstanceKey`).
+  (and otherwise `200` with the first correlated `processInstanceKey`). A
+  **message start event** also correlates here: a matching `correlateMessage`
+  **creates a new instance** (seeded with the message's variables) and returns its
+  `processInstanceKey`.
+- **Event-triggered instance creation.** Deploying a process whose start event is
+  a **message start event** opens a process-level subscription (a matching
+  `correlateMessage` creates an instance), and a **timer start event** arms a
+  process-level timer fired by the background tick — a one-shot `timeDuration` runs
+  once, a recurring `timeCycle` (`R/PT…`) creates an instance every interval. Both
+  are journaled, so the subscription/schedule survives a restart.
 
 Read endpoints make engine state observable:
 
@@ -122,8 +131,9 @@ dependency-free for mobile/wasm embedders that don't need persistence.
 
 The engine reads no wall clock; the host drives time in. The server runs a
 single background task (every 500 ms) that feeds `now` into the engine via two
-ticks: `TriggerTimers` fires every due **timer intermediate catch event** and
-**interrupting timer boundary event** (durable — journaled), and `ExpireJobs`
+ticks: `TriggerTimers` fires every due **timer intermediate catch event**,
+**interrupting timer boundary event** and **timer start event** (durable —
+journaled), and `ExpireJobs`
 releases activation locks past their deadline (volatile — not journaled). When a timer fires it may unblock
 downstream work, so the tick wakes any long-polling `activateJobs`. A timer
 parked before a restart is recovered by replay and fired by the first due tick

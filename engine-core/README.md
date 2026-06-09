@@ -147,6 +147,24 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   instead completes (or the task is interrupted another way) first, the open
   subscription is **cancelled** (`MessageSubscriptionState::Canceled`) so it never
   correlates. Both outcomes are journaled and survive a restart.
+- **Message start events** create a new process instance when a matching message
+  arrives. Deploying a process whose start event carries a
+  `messageEventDefinition` opens a **process-level** `MessageStartSubscription`
+  keyed by the message name (not a per-instance subscription). A `CorrelateMessage`
+  whose name matches then **creates a fresh instance**, seeding it with the
+  message's variables, and runs it from the start event. The subscription is
+  journaled (`MessageStartSubscriptionCreated`), so it survives a restart and keeps
+  starting instances; the REST `correlateMessage` reports the new instance's key.
+- **Timer start events** create instances on a schedule, with **no triggering
+  command**. Deploying a process whose start event carries a `timerEventDefinition`
+  arms a process-level `StartTimer` (`due_at = now + interval`, journaled as
+  `ProcessStartTimerArmed`). A host-driven `TriggerTimers { now }` tick fires every
+  due start timer, **creating a new instance** and running it from the start event.
+  A **cycle** (`timeCycle` `R/PT…`) **re-arms** for the next interval
+  (`ProcessStartTimerFired { next_due_at: Some(_) }`); a **one-shot**
+  (`timeDuration`) is retained with no due time (`next_due_at: None`) so it never
+  fires again. Like all timers the engine stays **clock-free** and the schedule is
+  durable across restarts.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
@@ -179,13 +197,16 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > host clock tick) and **message events** — **message intermediate catch events**
 > (a token parks until a matching message is correlated) and **interrupting
 > message boundary events** (a message that, correlated first, cancels the job and
-> routes the token out the boundary). Instances carry simple
+> routes the token out the boundary) — and **event-triggered instance creation**:
+> **message start events** (a matching message creates a new instance) and
+> **timer start events** (a one-shot `timeDuration` or recurring `timeCycle`
+> creates instances on a host clock tick). Instances carry simple
 > variables (`Bool`/`Int`/`Str`) used by gateway conditions and message
 > correlation. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
 > that same subset (including `boundaryEvent`/`errorEventDefinition`,
-> `intermediateCatchEvent`/`timerEventDefinition` and
-> `messageEventDefinition`/`zeebe:subscription`) via the
+> `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/
+> `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
 > Sub-processes and non-interrupting events are intended extension points —

@@ -288,6 +288,33 @@ impl Engine {
         self.next_key
     }
 
+    /// Creates a fresh process instance and queues its start event for
+    /// activation. Shared by `CreateInstance`, message-start correlation, and
+    /// timer-start firing.
+    fn start_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        process_id: String,
+        start_event: ElementId,
+        variables: HashMap<String, Value>,
+    ) -> Key {
+        let instance_key = self.mint_key();
+        self.emit(
+            log,
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                variables,
+            },
+        );
+        queue.push_back(Step::Activate {
+            instance_key,
+            element_id: start_event,
+        });
+        instance_key
+    }
+
     /// Validates and registers a batch of process definitions as one deployment.
     ///
     /// All processes are validated first, so the deployment is atomic: if any is
@@ -310,6 +337,12 @@ impl Engine {
         for process in processes {
             let version = self.next_version(&process.id);
             let process_definition_key = self.mint_key();
+            let process_id = process.id.clone();
+            let start_element_id = process.start_event.clone();
+            let start_kind = process
+                .elements
+                .get(&process.start_event)
+                .map(|e| e.kind.clone());
             self.emit(
                 log,
                 Event::ProcessDeployed {
@@ -319,6 +352,39 @@ impl Engine {
                     process,
                 },
             );
+            match start_kind {
+                Some(ElementKind::MessageStartEvent { message_name }) => {
+                    self.emit(
+                        log,
+                        Event::MessageStartSubscriptionCreated {
+                            process_definition_key,
+                            process_id,
+                            message_name,
+                            start_element_id,
+                        },
+                    );
+                }
+                Some(ElementKind::TimerStartEvent {
+                    interval_millis,
+                    repeating,
+                }) => {
+                    let timer_key = self.mint_key();
+                    let due_at = self.now.saturating_add(interval_millis);
+                    self.emit(
+                        log,
+                        Event::ProcessStartTimerArmed {
+                            timer_key,
+                            process_definition_key,
+                            process_id,
+                            start_element_id,
+                            due_at,
+                            interval_millis,
+                            repeating,
+                        },
+                    );
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -374,20 +440,7 @@ impl Engine {
                     }
                 })?;
                 let start_event = process.definition.start_event.clone();
-
-                let instance_key = self.mint_key();
-                self.emit(
-                    &mut log,
-                    Event::ProcessInstanceCreated {
-                        instance_key,
-                        process_id,
-                        variables,
-                    },
-                );
-                queue.push_back(Step::Activate {
-                    instance_key,
-                    element_id: start_event,
-                });
+                self.start_instance(&mut log, &mut queue, process_id, start_event, variables);
             }
 
             Command::CompleteJob { job_key, variables } => {
@@ -592,6 +645,50 @@ impl Engine {
                             });
                         }
                     }
+                }
+
+                // Process-level start timers: fire every due one (deterministic
+                // by key), creating a new instance. A cycle re-arms for the next
+                // interval; a one-shot is retained with no due time so it never
+                // fires again.
+                let mut due_starts: Vec<Key> = self
+                    .state
+                    .start_timers
+                    .values()
+                    .filter(|t| t.due_at.is_some_and(|d| d <= now))
+                    .map(|t| t.timer_key)
+                    .collect();
+                due_starts.sort_unstable();
+                for timer_key in due_starts {
+                    let timer = match self.state.start_timers.get(&timer_key) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    let process_id = timer.process_id.clone();
+                    let start_element_id = timer.start_element_id.clone();
+                    let due_at = match timer.due_at {
+                        Some(d) => d,
+                        None => continue,
+                    };
+                    let next_due_at = if timer.repeating {
+                        Some(due_at.saturating_add(timer.interval_millis))
+                    } else {
+                        None
+                    };
+                    self.emit(
+                        &mut log,
+                        Event::ProcessStartTimerFired {
+                            timer_key,
+                            next_due_at,
+                        },
+                    );
+                    self.start_instance(
+                        &mut log,
+                        &mut queue,
+                        process_id,
+                        start_element_id,
+                        HashMap::new(),
+                    );
                 }
             }
 
@@ -993,6 +1090,28 @@ impl Engine {
                             });
                         }
                     }
+                }
+
+                // Message start events: a matching message also creates a new
+                // instance of every process subscribed at the process level.
+                // Deterministic by process-definition key. The message's
+                // variables seed the new instance.
+                let mut started: Vec<(String, ElementId)> = self
+                    .state
+                    .message_start_subscriptions
+                    .values()
+                    .filter(|s| s.message_name == message_name)
+                    .map(|s| (s.process_id.clone(), s.start_element_id.clone()))
+                    .collect();
+                started.sort_unstable();
+                for (process_id, start_element_id) in started {
+                    self.start_instance(
+                        &mut log,
+                        &mut queue,
+                        process_id,
+                        start_element_id,
+                        variables.clone(),
+                    );
                 }
             }
         }
@@ -3258,5 +3377,208 @@ mod tests {
             new_instance_key > max_existing,
             "new key {new_instance_key} must exceed replayed max {max_existing}"
         );
+    }
+
+    // ---- message start events ----
+
+    /// (message "order-placed") --> start -> end
+    fn process_with_message_start() -> ProcessDefinition {
+        ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_open_a_message_start_subscription_at_deploy() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_start()))
+            .unwrap();
+
+        // Deploy opens a process-level subscription but creates no instance.
+        assert_eq!(engine.state().message_start_subscriptions.len(), 1);
+        assert!(engine.state().instances.is_empty());
+        let sub = &engine.state().message_start_subscriptions["order-placed"];
+        assert_eq!(sub.process_id, "order-flow");
+        assert_eq!(sub.start_element_id, "start");
+    }
+
+    #[test]
+    fn should_create_an_instance_when_a_message_start_correlates() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_start()))
+            .unwrap();
+
+        // A non-matching message creates nothing.
+        engine.correlate_message("other", "", HashMap::new(), 0);
+        assert!(engine.state().instances.is_empty());
+
+        // The matching message creates and runs a fresh instance to completion,
+        // seeding it with the message's variables.
+        let fired =
+            engine.correlate_message("order-placed", "", vars(&[("amount", Value::Int(7))]), 0);
+        let instance_key = fired
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            engine.state().instances[&instance_key]
+                .variables
+                .get("amount"),
+            Some(&Value::Int(7))
+        );
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_create_one_instance_per_matching_message_start() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_start()))
+            .unwrap();
+
+        // Each matching message creates a distinct instance.
+        engine.correlate_message("order-placed", "", HashMap::new(), 0);
+        engine.correlate_message("order-placed", "", HashMap::new(), 0);
+        assert_eq!(engine.state().instances.len(), 2);
+    }
+
+    #[test]
+    fn should_recover_a_message_start_subscription_via_replay() {
+        let mut engine = Engine::new();
+        let log = engine
+            .apply_command(Command::DeployProcess(process_with_message_start()))
+            .unwrap();
+
+        // Replay: the process-level subscription survives and still fires.
+        let mut recovered = Engine::replay(log);
+        assert_eq!(recovered.state().message_start_subscriptions.len(), 1);
+        let fired = recovered.correlate_message("order-placed", "", HashMap::new(), 0);
+        let instance_key = fired.iter().find_map(|e| e.instance_key()).unwrap();
+        assert!(recovered.is_completed(instance_key));
+    }
+
+    // ---- timer start events ----
+
+    /// (timer, one-shot PT10S) --> start -> end
+    fn process_with_timer_start_once() -> ProcessDefinition {
+        ProcessBuilder::new("delayed-start")
+            .timer_start_event_once("start", 10_000)
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .unwrap()
+    }
+
+    /// (timer, cycle every 10S) --> start -> end
+    fn process_with_timer_start_cycle() -> ProcessDefinition {
+        ProcessBuilder::new("recurring-start")
+            .timer_start_event_cycle("start", 10_000)
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_arm_a_start_timer_at_deploy() {
+        let mut engine = Engine::new();
+        // Deploy at t=1000: the start timer is armed for 1000 + 10000 = 11000.
+        engine
+            .apply_command_at(
+                Command::DeployProcess(process_with_timer_start_once()),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(engine.state().start_timers.len(), 1);
+        let timer = engine.state().start_timers.values().next().unwrap();
+        assert_eq!(timer.due_at, Some(11_000));
+        assert!(engine.state().instances.is_empty());
+    }
+
+    #[test]
+    fn should_fire_a_one_shot_start_timer_exactly_once() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(
+                Command::DeployProcess(process_with_timer_start_once()),
+                1_000,
+            )
+            .unwrap();
+
+        // A tick before the due instant creates nothing.
+        assert!(engine.trigger_timers(10_999).is_empty());
+        assert!(engine.state().instances.is_empty());
+
+        // At the due instant the timer fires and creates one instance; the timer
+        // is retained but has no due time, so it never fires again.
+        let fired = engine.trigger_timers(11_000);
+        let instance_key = fired.iter().find_map(|e| e.instance_key()).unwrap();
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(engine.state().instances.len(), 1);
+        let timer = engine.state().start_timers.values().next().unwrap();
+        assert_eq!(timer.due_at, None);
+
+        // A later tick fires nothing more.
+        assert!(engine.trigger_timers(100_000).is_empty());
+        assert_eq!(engine.state().instances.len(), 1);
+    }
+
+    #[test]
+    fn should_re_arm_a_cycle_start_timer_after_each_fire() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command_at(
+                Command::DeployProcess(process_with_timer_start_cycle()),
+                1_000,
+            )
+            .unwrap();
+
+        // First fire at 11000 creates an instance and re-arms for 21000.
+        engine.trigger_timers(11_000);
+        assert_eq!(engine.state().instances.len(), 1);
+        let timer = engine.state().start_timers.values().next().unwrap();
+        assert_eq!(timer.due_at, Some(21_000));
+
+        // Second fire at 21000 creates another and re-arms for 31000.
+        engine.trigger_timers(21_000);
+        assert_eq!(engine.state().instances.len(), 2);
+        let timer = engine.state().start_timers.values().next().unwrap();
+        assert_eq!(timer.due_at, Some(31_000));
+    }
+
+    #[test]
+    fn should_recover_an_armed_start_timer_via_replay() {
+        let mut engine = Engine::new();
+        let log = engine
+            .apply_command_at(
+                Command::DeployProcess(process_with_timer_start_once()),
+                1_000,
+            )
+            .unwrap();
+
+        // Replay: the armed start timer survives and still fires on the next tick.
+        let mut recovered = Engine::replay(log);
+        assert_eq!(recovered.state().start_timers.len(), 1);
+        assert_eq!(
+            recovered
+                .state()
+                .start_timers
+                .values()
+                .next()
+                .unwrap()
+                .due_at,
+            Some(11_000)
+        );
+        let fired = recovered.trigger_timers(11_000);
+        let instance_key = fired.iter().find_map(|e| e.instance_key()).unwrap();
+        assert!(recovered.is_completed(instance_key));
     }
 }

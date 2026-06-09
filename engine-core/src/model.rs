@@ -135,6 +135,42 @@ pub enum ElementKind {
         /// correlate to (the subscription's correlation key).
         correlation_key: String,
     },
+    /// A message start event. It has no incoming sequence flow; instead the
+    /// engine opens a process-level subscription at deploy time, and a
+    /// [`crate::Command::CorrelateMessage`] with a matching `message_name`
+    /// **creates a new instance** (the message's variables become the instance's
+    /// variables), which then runs along this event's outgoing flow. Behaves as a
+    /// pass-through once an instance starts.
+    MessageStartEvent {
+        /// The BPMN message name that triggers a new instance.
+        message_name: String,
+    },
+    /// A timer start event. It has no incoming sequence flow; instead the engine
+    /// arms a process-level timer at deploy time (first due `interval_millis`
+    /// after deployment). When a clock tick ([`crate::Command::TriggerTimers`])
+    /// finds it due, a **new instance** is created and runs along this event's
+    /// outgoing flow. A `repeating` timer (a BPMN cycle) re-arms for another
+    /// `interval_millis`; a one-shot (a BPMN duration) fires exactly once.
+    TimerStartEvent {
+        /// The delay from deployment to the first fire, and — when `repeating` —
+        /// the period between subsequent fires, in the host's clock units.
+        interval_millis: u64,
+        /// Whether the timer re-arms after firing (a cycle) or fires once.
+        repeating: bool,
+    },
+}
+
+impl ElementKind {
+    /// Whether this is a start-event kind (none, message or timer start). A
+    /// process has exactly one such element — its [`ProcessDefinition::start_event`].
+    pub fn is_start_event(&self) -> bool {
+        matches!(
+            self,
+            ElementKind::StartEvent
+                | ElementKind::MessageStartEvent { .. }
+                | ElementKind::TimerStartEvent { .. }
+        )
+    }
 }
 
 /// A single BPMN flow node and its outgoing sequence flows.
@@ -215,6 +251,45 @@ impl ProcessBuilder {
     /// Adds a none start event.
     pub fn start_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::StartEvent)
+    }
+
+    /// Adds a message start event: a [`crate::Command::CorrelateMessage`] with a
+    /// matching `message_name` creates a new instance starting here.
+    pub fn message_start_event(
+        self,
+        id: impl Into<String>,
+        message_name: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::MessageStartEvent {
+                message_name: message_name.into(),
+            },
+        )
+    }
+
+    /// Adds a one-shot timer start event: a single instance is created
+    /// `duration_millis` after the process deploys.
+    pub fn timer_start_event_once(self, id: impl Into<String>, duration_millis: u64) -> Self {
+        self.add(
+            id,
+            ElementKind::TimerStartEvent {
+                interval_millis: duration_millis,
+                repeating: false,
+            },
+        )
+    }
+
+    /// Adds a recurring timer start event (a BPMN cycle): a new instance is
+    /// created every `interval_millis`, the first one that long after deploy.
+    pub fn timer_start_event_cycle(self, id: impl Into<String>, interval_millis: u64) -> Self {
+        self.add(
+            id,
+            ElementKind::TimerStartEvent {
+                interval_millis,
+                repeating: true,
+            },
+        )
     }
 
     /// Adds a none end event.
@@ -401,7 +476,7 @@ impl ProcessBuilder {
 
         let starts: Vec<&Element> = elements
             .values()
-            .filter(|e| e.kind == ElementKind::StartEvent)
+            .filter(|e| e.kind.is_start_event())
             .collect();
         let start_event = match starts.as_slice() {
             [single] => single.id.clone(),

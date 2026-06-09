@@ -275,6 +275,44 @@ pub struct MessageSubscription {
     pub kind: MessageSubscriptionKind,
 }
 
+/// A process-level subscription on a **message start event**: a correlating
+/// message whose name matches creates a new instance of `process_id` (starting
+/// at `start_element_id`). Unlike a [`MessageSubscription`] it is not bound to an
+/// instance and never settles — it stays open for the life of the deployment,
+/// minting a new instance on every matching message. Keyed in [`State`] by
+/// message name; re-deploying a process with the same start message replaces it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageStartSubscription {
+    /// The definition (and version) whose instances this start event creates.
+    pub process_definition_key: Key,
+    pub process_id: String,
+    /// The BPMN message name that triggers a new instance.
+    pub message_name: String,
+    /// The start event element a new instance begins at.
+    pub start_element_id: ElementId,
+}
+
+/// A process-level **timer start event**: an armed timer that creates a new
+/// instance of `process_id` when it becomes due. A `repeating` timer (a BPMN
+/// cycle) re-arms for another `interval_millis` after each fire; a one-shot (a
+/// BPMN duration) fires exactly once and is then retained as `due_at = None`.
+/// Keyed in [`State`] by its own `timer_key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartTimer {
+    pub timer_key: Key,
+    /// The definition (and version) whose instances this start event creates.
+    pub process_definition_key: Key,
+    pub process_id: String,
+    /// The start event element a new instance begins at.
+    pub start_element_id: ElementId,
+    /// The instant the timer is next due, or `None` once a one-shot has fired.
+    pub due_at: Option<u64>,
+    /// The period between fires (and the initial delay), in the host's clock units.
+    pub interval_millis: u64,
+    /// Whether the timer re-arms after firing (a cycle) or fires once.
+    pub repeating: bool,
+}
+
 /// A deployed process definition together with the identity the engine assigned
 /// it at deploy time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,6 +345,13 @@ pub struct State {
     /// [`MessageSubscriptionState::Correlated`]) so a later message never
     /// correlates it twice.
     pub message_subscriptions: HashMap<Key, MessageSubscription>,
+    /// Process-level message start subscriptions, keyed by message name. A
+    /// correlating message whose name matches creates a new instance.
+    pub message_start_subscriptions: HashMap<String, MessageStartSubscription>,
+    /// Process-level timer start events, keyed by timer key. Each creates a new
+    /// instance when due; a cycle re-arms, a one-shot is retained with
+    /// `due_at = None`.
+    pub start_timers: HashMap<Key, StartTimer>,
 }
 
 impl State {
@@ -668,6 +713,59 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key,
+            process_id,
+            message_name,
+            start_element_id,
+        } => {
+            // Keyed by message name: re-deploying a process with the same start
+            // message replaces the older version's subscription.
+            state.message_start_subscriptions.insert(
+                message_name.clone(),
+                MessageStartSubscription {
+                    process_definition_key: *process_definition_key,
+                    process_id: process_id.clone(),
+                    message_name: message_name.clone(),
+                    start_element_id: start_element_id.clone(),
+                },
+            );
+        }
+
+        Event::ProcessStartTimerArmed {
+            timer_key,
+            process_definition_key,
+            process_id,
+            start_element_id,
+            due_at,
+            interval_millis,
+            repeating,
+        } => {
+            state.start_timers.insert(
+                *timer_key,
+                StartTimer {
+                    timer_key: *timer_key,
+                    process_definition_key: *process_definition_key,
+                    process_id: process_id.clone(),
+                    start_element_id: start_element_id.clone(),
+                    due_at: Some(*due_at),
+                    interval_millis: *interval_millis,
+                    repeating: *repeating,
+                },
+            );
+        }
+
+        Event::ProcessStartTimerFired {
+            timer_key,
+            next_due_at,
+        } => {
+            if let Some(start_timer) = state.start_timers.get_mut(timer_key) {
+                // A cycle re-arms (next_due_at is Some); a one-shot is retained
+                // with due_at = None so a later tick never re-fires it.
+                start_timer.due_at = *next_due_at;
             }
         }
     }

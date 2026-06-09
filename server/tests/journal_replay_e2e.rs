@@ -197,6 +197,55 @@ fn create_demo_instance(server: &ServerProcess) -> String {
         .to_string()
 }
 
+/// Deploys a single BPMN resource via the multipart `/deployments` endpoint,
+/// returning `(status, body)`. A minimal hand-rolled `multipart/form-data`
+/// request keeps the test client dependency-free.
+fn deploy_bpmn(port: u16, xml: &str) -> (u16, String) {
+    let boundary = "----nanobpmnE2EBoundary";
+    let body = format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"resource\"; filename=\"process.bpmn\"\r\n\
+         Content-Type: text/xml\r\n\
+         \r\n\
+         {xml}\r\n\
+         --{boundary}--\r\n"
+    );
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for deploy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    let request = format!(
+        "POST {} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: multipart/form-data; boundary={boundary}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        path("/deployments"),
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write deploy request");
+    stream.flush().expect("flush deploy request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read deploy response");
+    let raw = String::from_utf8_lossy(&raw);
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("parse status line");
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
 #[test]
 fn process_instance_survives_a_restart() {
     let scratch = ScratchDir::new();
@@ -312,6 +361,72 @@ fn correlating_a_message_with_no_subscription_returns_404() {
         Some(r#"{"name":"nobody-home","correlationKey":"X"}"#),
     );
     assert_eq!(status, 404, "correlate with no match must be 404: {body}");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_message_start_event_creates_and_replays_a_process_instance() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // A deployed message start event opens a process-level subscription; a
+    // matching correlateMessage creates a brand-new instance (no prior
+    // createProcessInstance call) and reports its key.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="on-order" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:messageEventDefinition messageRef="Message_1" />
+    </bpmn:startEvent>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="end" />
+  </bpmn:process>
+  <bpmn:message id="Message_1" name="order-placed" />
+</bpmn:definitions>"#;
+
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(status, 200, "deploy should succeed: {body}");
+
+    // Correlating the start message creates an instance and returns its key.
+    let (status, body) = server.request(
+        "POST",
+        &path("/messages/correlation"),
+        Some(r#"{"name":"order-placed","correlationKey":""}"#),
+    );
+    assert_eq!(status, 200, "message start should correlate: {body}");
+    let json: serde_json::Value =
+        serde_json::from_str(&body).expect("correlation response is JSON");
+    let instance_key = json["processInstanceKey"]
+        .as_str()
+        .expect("processInstanceKey present")
+        .to_string();
+    assert!(!instance_key.is_empty());
+    server.shutdown();
+
+    // After a restart the subscription is recovered from the journal, so a
+    // second message creates another, distinct instance.
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = server.request(
+        "POST",
+        &path("/messages/correlation"),
+        Some(r#"{"name":"order-placed","correlationKey":""}"#),
+    );
+    assert_eq!(
+        status, 200,
+        "recovered subscription should still fire: {body}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&body).expect("correlation response is JSON");
+    let second_key = json["processInstanceKey"]
+        .as_str()
+        .expect("processInstanceKey present")
+        .to_string();
+    assert_ne!(
+        instance_key, second_key,
+        "each message starts a new instance"
+    );
 
     server.shutdown();
 }

@@ -122,6 +122,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // message), and a buffer for its nested `timeDuration` text while inside it.
     let mut cur_intermediate: Option<usize> = None;
     let mut duration_text: Option<String> = None;
+    // Index of the start event currently being read (to attach a nested
+    // messageEventDefinition or timerEventDefinition), and a buffer for a timer
+    // start event's nested `timeCycle` text while inside it.
+    let mut cur_start: Option<usize> = None;
+    let mut cycle_text: Option<String> = None;
     // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
     let mut errors: HashMap<String, String> = HashMap::new();
     // Definitions-level `<message id=… name=…>` declarations, with the
@@ -182,7 +187,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         let acc = current.as_mut().expect("current process set");
                         match tag {
                             "startEvent" => {
-                                acc.add_node(attrs, NodeKind::Start);
+                                let idx = acc.add_node(attrs, NodeKind::Start);
+                                if !self_closing {
+                                    cur_start = idx;
+                                }
                             }
                             "endEvent" => {
                                 acc.add_node(attrs, NodeKind::End);
@@ -231,6 +239,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     acc.nodes[idx].message_ref = Some(message_ref);
                                 } else if let Some(boundary) = cur_boundary.as_mut() {
                                     boundary.message_ref = Some(message_ref);
+                                } else if let Some(idx) = cur_start {
+                                    acc.nodes[idx].message_ref = Some(message_ref);
                                 }
                             }
                             "taskDefinition" => {
@@ -254,9 +264,14 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "timeDuration"
-                                if cur_intermediate.is_some() || cur_boundary.is_some() =>
+                                if cur_intermediate.is_some()
+                                    || cur_boundary.is_some()
+                                    || cur_start.is_some() =>
                             {
                                 duration_text = Some(String::new());
+                            }
+                            "timeCycle" if cur_start.is_some() => {
+                                cycle_text = Some(String::new());
                             }
                             "conditionExpression" if cur_flow.is_some() => {
                                 condition_text = Some(String::new());
@@ -274,6 +289,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 if let Some(buf) = duration_text.as_mut() {
                     buf.push_str(text);
                 }
+                if let Some(buf) = cycle_text.as_mut() {
+                    buf.push_str(text);
+                }
             }
             Token::End { name } => match local_name(name) {
                 "process" => {
@@ -285,8 +303,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_boundary = None;
                     cur_intermediate = None;
                     duration_text = None;
+                    cur_start = None;
+                    cycle_text = None;
                 }
                 "serviceTask" => cur_service_task = None,
+                "startEvent" => cur_start = None,
                 "message" => cur_message = None,
                 "boundaryEvent" => {
                     // Keep error boundaries (errorEventDefinition), timer
@@ -318,6 +339,19 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         } else if let Some(boundary) = cur_boundary.as_mut() {
                             // A timer boundary event's duration.
                             boundary.timer_duration_millis = millis;
+                        } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                            // A one-shot timer start event's duration.
+                            acc.nodes[idx].duration_millis = millis;
+                            acc.nodes[idx].timer_repeating = Some(false);
+                        }
+                    }
+                }
+                "timeCycle" => {
+                    if let Some(text) = cycle_text.take() {
+                        if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                            // A recurring timer start event's cycle.
+                            acc.nodes[idx].duration_millis = parse_iso8601_cycle(&text);
+                            acc.nodes[idx].timer_repeating = Some(true);
                         }
                     }
                 }
@@ -349,6 +383,9 @@ struct NodeAcc {
     /// For message intermediate catch events: the `messageRef` of a nested
     /// `messageEventDefinition`, resolved to a name/correlation key at build.
     message_ref: Option<String>,
+    /// For timer start events: whether the timer recurs (a `timeCycle`) or is
+    /// one-shot (a `timeDuration`). `None` on a plain none start event.
+    timer_repeating: Option<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -417,6 +454,7 @@ impl ProcessAcc {
             job_type: None,
             duration_millis: None,
             message_ref: None,
+            timer_repeating: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -445,7 +483,32 @@ impl ProcessAcc {
         let mut builder = ProcessBuilder::new(self.id.clone());
         for node in self.nodes {
             builder = match node.kind {
-                NodeKind::Start => builder.start_event(node.id),
+                NodeKind::Start => {
+                    // A messageRef makes it a message start; a timer_repeating
+                    // flag makes it a timer start (cycle or one-shot); otherwise
+                    // a plain none start event.
+                    if let Some(message_ref) = node.message_ref {
+                        let decl = messages.get(&message_ref).ok_or_else(|| {
+                            ParseError::InvalidMessageEvent {
+                                process_id: self.id.clone(),
+                                reason: format!(
+                                    "start event {} references unknown message '{message_ref}'",
+                                    node.id
+                                ),
+                            }
+                        })?;
+                        builder.message_start_event(node.id, decl.name.clone())
+                    } else if let Some(repeating) = node.timer_repeating {
+                        let interval_millis = node.duration_millis.unwrap_or(0);
+                        if repeating {
+                            builder.timer_start_event_cycle(node.id, interval_millis)
+                        } else {
+                            builder.timer_start_event_once(node.id, interval_millis)
+                        }
+                    } else {
+                        builder.start_event(node.id)
+                    }
+                }
                 NodeKind::End => builder.end_event(node.id),
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
@@ -604,6 +667,21 @@ fn parse_iso8601_duration(raw: &str) -> Option<u64> {
         return None;
     }
     Some(total_millis)
+}
+
+/// Parses an ISO-8601 repeating interval (a BPMN `timeCycle`, e.g. `R/PT1H` or
+/// `R5/PT1H`) into the interval in milliseconds. The `Rn` repetition-count
+/// prefix is accepted but ignored (the engine repeats unboundedly). A bare
+/// duration without the `R[n]/` prefix is also accepted. Returns `None` if the
+/// interval portion is not a recognisable duration.
+fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    let interval = match s.split_once('/') {
+        Some((repeat, interval)) if repeat.starts_with('R') => interval,
+        Some(_) => return None,
+        None => s,
+    };
+    parse_iso8601_duration(interval)
 }
 
 /// Parses a FEEL-ish `conditionExpression` body into a [`Condition`].
@@ -1277,5 +1355,102 @@ mod tests {
 
         // then
         assert!(matches!(err, ParseError::InvalidMessageEvent { .. }));
+    }
+
+    #[test]
+    fn should_parse_iso8601_cycles() {
+        assert_eq!(parse_iso8601_cycle("R/PT10S"), Some(10_000));
+        assert_eq!(parse_iso8601_cycle("R5/PT1H"), Some(3_600_000));
+        assert_eq!(parse_iso8601_cycle(" R/PT1M30S "), Some(90_000));
+        assert_eq!(parse_iso8601_cycle("PT10S"), Some(10_000));
+        assert_eq!(parse_iso8601_cycle("PT10S/R"), None);
+        assert_eq!(parse_iso8601_cycle("R/bogus"), None);
+    }
+
+    #[test]
+    fn should_parse_a_message_start_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s">
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="order-placed" />
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("s").unwrap().kind,
+            ElementKind::MessageStartEvent {
+                message_name: "order-placed".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_a_one_shot_timer_start_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s">
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT10S</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("s").unwrap().kind,
+            ElementKind::TimerStartEvent {
+                interval_millis: 10_000,
+                repeating: false,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_a_recurring_timer_start_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s">
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeCycle>R/PT1H</bpmn:timeCycle>
+                </bpmn:timerEventDefinition>
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("s").unwrap().kind,
+            ElementKind::TimerStartEvent {
+                interval_millis: 3_600_000,
+                repeating: true,
+            }
+        );
     }
 }

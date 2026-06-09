@@ -251,6 +251,35 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// A process-level message start subscription was opened at deploy time: a
+    /// later [`Event::MessagePublished`] with a matching `message_name` creates a
+    /// new instance of `process_id`. Carried on the log so replay reconstructs
+    /// the subscription.
+    MessageStartSubscriptionCreated {
+        process_definition_key: Key,
+        process_id: String,
+        message_name: String,
+        start_element_id: ElementId,
+    },
+    /// A process-level timer start event was armed at deploy time, first due at
+    /// `due_at`. When it fires a new instance of `process_id` is created.
+    ProcessStartTimerArmed {
+        timer_key: Key,
+        process_definition_key: Key,
+        process_id: String,
+        start_element_id: ElementId,
+        due_at: u64,
+        interval_millis: u64,
+        repeating: bool,
+    },
+    /// A process-level timer start event fired (a `ProcessInstanceCreated` and
+    /// the new instance's flow events follow). `next_due_at` is `Some` for a
+    /// cycle (the timer re-arms for that instant) and `None` for a one-shot (it
+    /// is retained, never to fire again).
+    ProcessStartTimerFired {
+        timer_key: Key,
+        next_due_at: Option<u64>,
+    },
 }
 
 impl Event {
@@ -287,7 +316,11 @@ impl Event {
             | Event::MessageCorrelated { instance_key, .. }
             | Event::MessageSubscriptionCanceled { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
-            Event::ProcessDeployed { .. } | Event::MessagePublished { .. } => None,
+            Event::ProcessDeployed { .. }
+            | Event::MessagePublished { .. }
+            | Event::MessageStartSubscriptionCreated { .. }
+            | Event::ProcessStartTimerArmed { .. }
+            | Event::ProcessStartTimerFired { .. } => None,
         }
     }
 
@@ -397,6 +430,16 @@ impl Event {
                     .max(*message_key)
                     .max(*element_instance_key)
             }
+            Event::MessageStartSubscriptionCreated {
+                process_definition_key,
+                ..
+            } => m = m.max(*process_definition_key),
+            Event::ProcessStartTimerArmed {
+                timer_key,
+                process_definition_key,
+                ..
+            } => m = m.max(*timer_key).max(*process_definition_key),
+            Event::ProcessStartTimerFired { timer_key, .. } => m = m.max(*timer_key),
             _ => {}
         }
         m

@@ -623,8 +623,13 @@ impl ServerImpl {
             )
             .expect("CorrelateMessage never fails");
         let message_key = message_key_of(&events);
+        // A message correlates either to an existing instance's open subscription
+        // (MessageCorrelated) or, via a message start event, by creating a new
+        // instance (ProcessInstanceCreated). Either way it correlated to an
+        // instance; report the first matched instance key.
         let correlated_instance = events.iter().find_map(|e| match e {
             Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
         drop(engine);
