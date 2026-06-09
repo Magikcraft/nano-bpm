@@ -247,14 +247,27 @@ make clean
 
 `make release` produces a single self-contained binary at
 `server/target/release/nanobpm-gateway-rest-server`. Run it directly,
-configuring it through the environment — `PORT` for the listen port and
+configuring it through the environment — `PORT` for the listen port,
 `NANOBPMN_JOURNAL` for the durable event-log path (see
-[Durability](#durability-event-log-replay)):
+[Durability](#durability-event-log-replay)), and `DEBUG_REST` to log requests:
 
 ```bash
 NANOBPMN_JOURNAL=/var/lib/nanobpmn/nanobpmn.journal PORT=8080 \
   ./server/target/release/nanobpm-gateway-rest-server
 ```
+
+Set `DEBUG_REST=1` (or `true`/`yes`/`on`) to log every REST request and
+response — method, URI, status, latency, and a preview of both bodies — which
+is handy when inspecting what a client is sending:
+
+```text
+INFO rest: --> POST /v2/process-instances [53 bytes] {"processDefinitionId":"demo","tenantId":"<default>"}
+INFO rest: <-- POST /v2/process-instances 200 OK (39.7ms) [180 bytes] {"processInstanceKey":"3", …}
+```
+
+> The bodies are buffered to be logged, so leave `DEBUG_REST` off in
+> production; it is unset (silent) by default.
+
 
 > The generated REST layer under `generated/` is a build dependency, so
 > `make release` runs `make generate` first if needed (which requires Docker).

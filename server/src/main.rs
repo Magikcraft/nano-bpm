@@ -1558,10 +1558,74 @@ impl apis::ApiAuthBasic for ServerImpl {
     }
 }
 
+/// Maximum number of body bytes rendered in a `DEBUG_REST` log line. Larger
+/// bodies are truncated in the log; the full body still reaches the handler.
+const REST_LOG_BODY_PREVIEW: usize = 4096;
+
+/// Whether `DEBUG_REST` requests verbose REST request/response logging. Accepts
+/// the usual truthy spellings (`1`, `true`, `yes`, `on`); unset or anything
+/// else leaves it off.
+fn debug_rest_enabled() -> bool {
+    std::env::var("DEBUG_REST")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Renders a body as a single-line, length-prefixed preview for logging,
+/// truncating long payloads and collapsing newlines so each request stays on
+/// one log line. An empty body renders as the empty string.
+fn body_preview(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let shown = bytes.len().min(REST_LOG_BODY_PREVIEW);
+    let text = String::from_utf8_lossy(&bytes[..shown])
+        .replace('\n', " ")
+        .replace('\r', "");
+    let ellipsis = if bytes.len() > shown { "…" } else { "" };
+    format!(" [{} bytes] {text}{ellipsis}", bytes.len())
+}
+
+/// axum middleware, mounted only when `DEBUG_REST` is enabled, that logs each
+/// REST request and its response (method, URI, status, latency, and a preview
+/// of both bodies). Bodies are buffered so they can be logged and then handed
+/// on unchanged — intentionally opt-in, since buffering defeats streaming.
+async fn log_rest(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    tracing::info!(target: "rest", "--> {method} {uri}{}", body_preview(&bytes));
+    let req = axum::extract::Request::from_parts(parts, Body::from(bytes));
+
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let elapsed = started.elapsed();
+
+    let status = resp.status();
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    tracing::info!(
+        target: "rest",
+        "<-- {method} {uri} {status} ({elapsed:.1?}){}",
+        body_preview(&bytes)
+    );
+    Response::from_parts(parts, Body::from(bytes))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
-
     // Persist the engine's event log when NANOBPMN_JOURNAL points at a file, so
     // state survives a restart; otherwise run purely in memory (ephemeral).
     let server = match std::env::var("NANOBPMN_JOURNAL") {
@@ -1588,7 +1652,12 @@ async fn main() {
     let tick_journal = server.journal.clone();
     let tick_jobs_available = server.jobs_available.clone();
 
-    let app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
+    let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
+
+    if debug_rest_enabled() {
+        app = app.layer(axum::middleware::from_fn(log_rest));
+        tracing::info!("DEBUG_REST enabled: logging every REST request and response");
+    }
 
     // Background "tick": drives the host clock into the engine so timers fire and
     // activation locks expire without an inbound request. Timer firing is durable
