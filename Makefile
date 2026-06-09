@@ -30,6 +30,10 @@ build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate 
 run: $(STUB_IMPLS) ## Run the stub server (PORT overrides the default 8080)
 	cd $(PROJECT_ROOT)/server && cargo run
 
+.PHONY: server-test
+server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server (incl. journal-replay e2e tests)
+	cd $(PROJECT_ROOT)/server && cargo test
+
 .PHONY: engine-build
 engine-build: ## Build the embeddable BPMN engine-core crate (no Docker, no codegen)
 	cd $(ENGINE_DIR) && cargo build
