@@ -340,6 +340,114 @@ impl ServerImpl {
         }
     }
 
+    async fn update_job_impl(
+        &self,
+        path_params: &models::UpdateJobPathParams,
+        body: &models::JobUpdateRequest,
+    ) -> Result<apis::job::UpdateJobResponse, ()> {
+        use apis::job::UpdateJobResponse as Resp;
+
+        let job_key: u64 = match path_params.job_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
+                    "Job not found",
+                    404,
+                    format!("Job key '{}' is not a valid key.", path_params.job_key),
+                )));
+            }
+        };
+
+        // The POC only acts on the retries part of the changeset (timeout
+        // updates are not modelled). A changeset without retries is a no-op.
+        let retries = match body.changeset.retries.as_ref() {
+            Some(types::Nullable::Present(r)) => *r,
+            _ => {
+                return Ok(Resp::Status204_TheJobWasUpdatedSuccessfully);
+            }
+        };
+
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.apply_command(Command::update_job_retries(job_key, retries)) {
+            Ok(_) => Ok(Resp::Status204_TheJobWasUpdatedSuccessfully),
+            Err(EngineError::JobNotFound { job_key }) => {
+                Ok(Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
+                    "Job not found",
+                    404,
+                    format!("No job with key {job_key}."),
+                )))
+            }
+            Err(EngineError::JobNotActive { job_key }) => Ok(
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job in wrong state",
+                    409,
+                    format!("Job {job_key} is terminal and its retries cannot be updated."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
+    async fn resolve_incident_impl(
+        &self,
+        path_params: &models::ResolveIncidentPathParams,
+    ) -> Result<apis::incident::ResolveIncidentResponse, ()> {
+        use apis::incident::ResolveIncidentResponse as Resp;
+
+        let incident_key: u64 = match path_params.incident_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(
+                    problem(
+                        "Incident not found",
+                        404,
+                        format!(
+                            "Incident key '{}' is not a valid key.",
+                            path_params.incident_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.apply_command(Command::resolve_incident(incident_key)) {
+            Ok(_) => {
+                // Resolving a job-incident returns the job to the activatable
+                // pool, so wake any long-pollers.
+                self.jobs_available.notify_waiters();
+                Ok(Resp::Status204_TheIncidentIsMarkedAsResolved)
+            }
+            Err(EngineError::IncidentNotFound { incident_key }) => Ok(
+                Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(problem(
+                    "Incident not found",
+                    404,
+                    format!("No incident with key {incident_key}."),
+                )),
+            ),
+            Err(EngineError::IncidentNotResolvable { reason, .. }) => Ok(
+                Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
+                    "Incident not resolvable",
+                    409,
+                    reason,
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
     async fn create_deployment_impl(
         &self,
         mut body: Multipart,
