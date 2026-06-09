@@ -119,6 +119,14 @@ pub enum Event {
         instance_key: Key,
         retries: i32,
     },
+    /// A worker threw a business error from a job. The job is consumed; either a
+    /// matching error boundary event interrupts the activity, or an
+    /// [`Event::IncidentRaised`] follows when no boundary catches `error_code`.
+    JobErrorThrown {
+        job_key: Key,
+        instance_key: Key,
+        error_code: String,
+    },
     /// A job was completed.
     JobCompleted { job_key: Key, instance_key: Key },
 
@@ -156,6 +164,7 @@ impl Event {
             | Event::JobActivated { instance_key, .. }
             | Event::JobLockExpired { instance_key, .. }
             | Event::JobFailed { instance_key, .. }
+            | Event::JobErrorThrown { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),

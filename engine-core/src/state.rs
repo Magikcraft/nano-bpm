@@ -34,6 +34,9 @@ pub enum JobState {
     /// It is neither activatable nor completable until the incident is resolved
     /// (incident resolution is not yet modelled).
     Failed,
+    /// Consumed by a thrown business error: the job is terminal (the error was
+    /// either caught by a boundary event or raised an incident).
+    Errored,
     /// Completed by a worker.
     Completed,
 }
@@ -295,6 +298,14 @@ pub fn apply(state: &mut State, event: &Event) {
                 } else {
                     JobState::Failed
                 };
+            }
+        }
+
+        Event::JobErrorThrown { job_key, .. } => {
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                job.state = JobState::Errored;
+                job.worker = None;
+                job.deadline = None;
             }
         }
 

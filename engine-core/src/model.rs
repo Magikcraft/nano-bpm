@@ -75,6 +75,16 @@ pub enum ElementKind {
     /// join (more than one incoming flow) it waits for a token on every incoming
     /// flow before producing one outgoing token.
     ParallelGateway,
+    /// An error boundary event attached to an activity (here, a service task).
+    /// It has no incoming sequence flow; instead it is triggered when a job
+    /// throws a business error whose code matches `error_code`, interrupting the
+    /// activity and routing the token along the boundary event's outgoing flows.
+    ErrorBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// The BPMN error code this boundary event catches.
+        error_code: String,
+    },
 }
 
 /// A single BPMN flow node and its outgoing sequence flows.
@@ -178,6 +188,26 @@ impl ProcessBuilder {
     /// Adds a parallel (AND) gateway.
     pub fn parallel_gateway(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::ParallelGateway)
+    }
+
+    /// Adds an error boundary event attached to `attached_to`, catching the BPMN
+    /// error `error_code`. Connect its outgoing flow(s) with [`connect`] to route
+    /// the error-handling path.
+    ///
+    /// [`connect`]: ProcessBuilder::connect
+    pub fn error_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        error_code: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ErrorBoundaryEvent {
+                attached_to: attached_to.into(),
+                error_code: error_code.into(),
+            },
+        )
     }
 
     /// Adds an unconditional sequence flow from `from` to `to`.

@@ -53,6 +53,14 @@ pub enum Command {
         retries: i32,
         error_message: String,
     },
+    /// Throw a business error from a job. If the job's activity has a matching
+    /// error boundary event it is interrupted and the error-handling path runs;
+    /// otherwise an incident is raised. The job is consumed either way.
+    ThrowJobError {
+        job_key: Key,
+        error_code: String,
+        error_message: String,
+    },
 }
 
 impl Command {
@@ -93,6 +101,19 @@ impl Command {
         Command::FailJob {
             job_key,
             retries,
+            error_message: error_message.into(),
+        }
+    }
+
+    /// Convenience constructor for a `ThrowJobError`.
+    pub fn throw_job_error(
+        job_key: Key,
+        error_code: impl Into<String>,
+        error_message: impl Into<String>,
+    ) -> Self {
+        Command::ThrowJobError {
+            job_key,
+            error_code: error_code.into(),
             error_message: error_message.into(),
         }
     }

@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::command::Command;
 use crate::event::Event;
-use crate::model::{ElementKind, ProcessDefinition, SequenceFlow, Value};
+use crate::model::{ElementId, ElementKind, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
 /// An embeddable BPMN engine instance.
@@ -269,7 +269,7 @@ impl Engine {
                     .ok_or(EngineError::JobNotFound { job_key })?;
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Failed
+                    state::JobState::Completed | state::JobState::Failed | state::JobState::Errored
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -376,7 +376,7 @@ impl Engine {
                     .ok_or(EngineError::JobNotFound { job_key })?;
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Failed
+                    state::JobState::Completed | state::JobState::Failed | state::JobState::Errored
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -409,6 +409,85 @@ impl Engine {
                             reason: error_message,
                         },
                     );
+                }
+            }
+
+            Command::ThrowJobError {
+                job_key,
+                error_code,
+                error_message,
+            } => {
+                let job = self
+                    .state
+                    .jobs
+                    .get(&job_key)
+                    .ok_or(EngineError::JobNotFound { job_key })?;
+                if matches!(
+                    job.state,
+                    state::JobState::Completed | state::JobState::Failed | state::JobState::Errored
+                ) {
+                    return Err(EngineError::JobNotActive { job_key });
+                }
+                if !job.activated {
+                    return Err(EngineError::JobNotActivated { job_key });
+                }
+                let instance_key = job.instance_key;
+                let element_instance_key = job.element_instance_key;
+                let task_element_id = job.element_id.clone();
+
+                // The job is consumed by the thrown error either way.
+                self.emit(
+                    &mut log,
+                    Event::JobErrorThrown {
+                        job_key,
+                        instance_key,
+                        error_code: error_code.clone(),
+                    },
+                );
+
+                match self.find_error_boundary(instance_key, &task_element_id, &error_code) {
+                    // Caught: interrupt the service task (complete its element
+                    // instance without taking its normal outgoing flow) and run
+                    // the boundary event's error-handling path.
+                    Some(boundary_id) => {
+                        self.emit(
+                            &mut log,
+                            Event::ElementCompleting {
+                                instance_key,
+                                element_instance_key,
+                                element_id: task_element_id.clone(),
+                            },
+                        );
+                        self.emit(
+                            &mut log,
+                            Event::ElementCompleted {
+                                instance_key,
+                                element_instance_key,
+                                element_id: task_element_id,
+                            },
+                        );
+                        queue.push_back(Step::Activate {
+                            instance_key,
+                            element_id: boundary_id,
+                        });
+                    }
+                    // Unhandled: the token parks on an incident.
+                    None => {
+                        let reason = if error_message.is_empty() {
+                            format!("unhandled BPMN error '{error_code}'")
+                        } else {
+                            format!("unhandled BPMN error '{error_code}': {error_message}")
+                        };
+                        self.emit(
+                            &mut log,
+                            Event::IncidentRaised {
+                                instance_key,
+                                element_instance_key,
+                                element_id: task_element_id,
+                                reason,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -716,6 +795,30 @@ impl Engine {
             .map(|e| e.kind.clone())
     }
 
+    /// Finds the error boundary event attached to `task_element_id` that catches
+    /// `error_code`, if any. When several match (a malformed model), the one with
+    /// the smallest id is chosen so selection stays deterministic.
+    fn find_error_boundary(
+        &self,
+        instance_key: Key,
+        task_element_id: &str,
+        error_code: &str,
+    ) -> Option<ElementId> {
+        let process = self.process_of_instance(instance_key)?;
+        process
+            .elements
+            .values()
+            .filter(|e| match &e.kind {
+                ElementKind::ErrorBoundaryEvent {
+                    attached_to,
+                    error_code: ec,
+                } => attached_to == task_element_id && ec == error_code,
+                _ => false,
+            })
+            .map(|e| e.id.clone())
+            .min()
+    }
+
     fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))
@@ -825,7 +928,7 @@ pub struct ActivatedJob {
 /// Failed (incident-parked) and completed jobs are never activatable.
 fn job_activatable(job: &state::Job, now: u64) -> bool {
     match job.state {
-        state::JobState::Completed | state::JobState::Failed => false,
+        state::JobState::Completed | state::JobState::Failed | state::JobState::Errored => false,
         state::JobState::Created => true,
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
@@ -1190,6 +1293,105 @@ mod tests {
 
         let err = engine
             .apply_command(Command::fail_job(job_key, 1, "nope"))
+            .unwrap_err();
+        assert_eq!(err, EngineError::JobNotActivated { job_key });
+    }
+
+    fn process_with_error_boundary() -> ProcessDefinition {
+        // s -> charge(task) --normal--> done
+        //              \--(error CARD_DECLINED)--> boundary -> declined
+        ProcessBuilder::new("payment")
+            .start_event("s")
+            .service_task("charge", "payment")
+            .error_boundary_event("boundary", "charge", "CARD_DECLINED")
+            .end_event("done")
+            .end_event("declined")
+            .connect("s", "charge")
+            .connect("charge", "done")
+            .connect("boundary", "declined")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_route_to_an_error_boundary_when_a_job_throws_a_matching_error() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_error_boundary()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("payment"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
+
+        // when the worker throws the caught business error
+        let events = engine
+            .apply_command(Command::throw_job_error(
+                job_key,
+                "CARD_DECLINED",
+                "card was declined",
+            ))
+            .unwrap();
+
+        // then the activity is interrupted and the error path runs to completion
+        assert!(engine.is_completed(instance_key));
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "boundary" && to == "declined"
+        )));
+        // the task's normal outgoing flow was NOT taken
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )));
+        // and the job is consumed: it cannot be completed afterwards
+        let err = engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap_err();
+        assert_eq!(err, EngineError::JobNotActive { job_key });
+    }
+
+    #[test]
+    fn should_raise_an_incident_when_a_thrown_error_is_unhandled() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_error_boundary()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("payment"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
+
+        // when the worker throws an error no boundary catches
+        let events = engine
+            .apply_command(Command::throw_job_error(job_key, "UNKNOWN", "boom"))
+            .unwrap();
+
+        // then an incident is raised and the instance does not complete
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::IncidentRaised { reason, .. } if reason.contains("UNKNOWN")
+        )));
+        assert!(!engine.is_completed(instance_key));
+        assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
+    }
+
+    #[test]
+    fn should_reject_throwing_an_error_from_a_job_that_was_never_activated() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_error_boundary()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("payment"))
+            .unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        let err = engine
+            .apply_command(Command::throw_job_error(job_key, "CARD_DECLINED", "x"))
             .unwrap_err();
         assert_eq!(err, EngineError::JobNotActivated { job_key });
     }
