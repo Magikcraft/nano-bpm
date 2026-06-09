@@ -22,7 +22,8 @@ use camunda_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, ProcessBuilder, Value,
+    ActivatedJob, Command, Engine, EngineError, Event, Incident, IncidentKind, ProcessBuilder,
+    ProcessInstance, ProcessInstanceState, State, Value,
 };
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
@@ -448,6 +449,123 @@ impl ServerImpl {
         }
     }
 
+    async fn get_process_instance_impl(
+        &self,
+        path_params: &models::GetProcessInstancePathParams,
+    ) -> Result<apis::process_instance::GetProcessInstanceResponse, ()> {
+        use apis::process_instance::GetProcessInstanceResponse as Resp;
+
+        let key: u64 = match path_params.process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
+                        "Process instance not found",
+                        404,
+                        format!(
+                            "Process instance key '{}' is not a valid key.",
+                            path_params.process_instance_key
+                        ),
+                    )),
+                );
+            }
+        };
+
+        let engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.instance(key) {
+            Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
+                process_instance_result(engine.state(), instance),
+            )),
+            None => Ok(
+                Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    format!("No process instance with key {key}."),
+                )),
+            ),
+        }
+    }
+
+    async fn get_incident_impl(
+        &self,
+        path_params: &models::GetIncidentPathParams,
+    ) -> Result<apis::incident::GetIncidentResponse, ()> {
+        use apis::incident::GetIncidentResponse as Resp;
+
+        let key: u64 = match path_params.incident_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheIncidentWithTheGivenKeyWasNotFound(
+                    problem(
+                        "Incident not found",
+                        404,
+                        format!(
+                            "Incident key '{}' is not a valid key.",
+                            path_params.incident_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        let engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.incident(key) {
+            Some(incident) => Ok(Resp::Status200_TheIncidentIsSuccessfullyReturned(
+                incident_result(engine.state(), incident),
+            )),
+            None => Ok(Resp::Status404_TheIncidentWithTheGivenKeyWasNotFound(
+                problem(
+                    "Incident not found",
+                    404,
+                    format!("No incident with key {key}."),
+                ),
+            )),
+        }
+    }
+
+    async fn search_incidents_impl(
+        &self,
+        body: &Option<models::IncidentSearchQuery>,
+    ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
+        use apis::incident::SearchIncidentsResponse as Resp;
+
+        // The POC supports the common recovery query: filter by a single
+        // processInstanceKey (a basic value). Any other filter is ignored and
+        // all incidents are returned.
+        let by_instance: Option<u64> = body
+            .as_ref()
+            .and_then(|q| q.filter.as_ref())
+            .and_then(|f| f.process_instance_key.as_ref())
+            .and_then(|p| match p {
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(k) => k.0.parse().ok(),
+                _ => None,
+            });
+
+        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let state = engine.state();
+        let mut items: Vec<models::IncidentResult> = engine
+            .incidents()
+            .into_iter()
+            .filter(|inc| by_instance.is_none_or(|k| inc.instance_key == k))
+            .map(|inc| incident_result(state, inc))
+            .collect();
+        // Deterministic order by incident key.
+        items.sort_by(|a, b| a.incident_key.0.cmp(&b.incident_key.0));
+
+        let total = items.len() as i64;
+        Ok(Resp::Status200_TheIncidentSearchResult(
+            models::IncidentSearchQueryResult::new(
+                models::SearchQueryPageResponse {
+                    total_items: total,
+                    has_more_total_items: false,
+                    start_cursor: types::Nullable::Null,
+                    end_cursor: types::Nullable::Null,
+                },
+                items,
+            ),
+        ))
+    }
+
     async fn create_deployment_impl(
         &self,
         mut body: Multipart,
@@ -673,6 +791,89 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// A placeholder timestamp. The clock-free engine does not record wall-clock
+/// times for instances or incidents, so read projections report the Unix epoch.
+fn epoch() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch is valid")
+}
+
+/// Projects an engine [`Incident`] into the generated `IncidentResult`,
+/// resolving process-definition identity from engine state.
+fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult {
+    let (process_definition_id, process_definition_key) = state
+        .instances
+        .get(&incident.instance_key)
+        .and_then(|inst| state.processes.get(&inst.process_id))
+        .map(|dep| (dep.definition.id.clone(), dep.key.to_string()))
+        .unwrap_or_else(|| (String::new(), "-1".to_string()));
+
+    let error_type = match incident.kind {
+        IncidentKind::JobNoRetries => models::IncidentErrorTypeEnum::JobNoRetries,
+        IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
+        IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
+    };
+    let job_key = match incident.job_key {
+        Some(k) => types::Nullable::Present(models::JobKey(k.to_string())),
+        None => types::Nullable::Null,
+    };
+
+    models::IncidentResult::new(
+        process_definition_id,
+        error_type,
+        incident.reason.clone(),
+        incident.element_id.clone(),
+        epoch(),
+        models::IncidentStateEnum::Active,
+        "<default>".to_string(),
+        models::IncidentKey(incident.key.to_string()),
+        models::ProcessDefinitionKey(process_definition_key),
+        models::ProcessInstanceKey(incident.instance_key.to_string()),
+        types::Nullable::Null,
+        models::ElementInstanceKey(incident.element_instance_key.to_string()),
+        job_key,
+    )
+}
+
+/// Projects an engine [`ProcessInstance`] into the generated
+/// `ProcessInstanceResult`, resolving process-definition identity from state.
+fn process_instance_result(
+    state: &State,
+    instance: &ProcessInstance,
+) -> models::ProcessInstanceResult {
+    let deployed = state.processes.get(&instance.process_id);
+    let process_definition_id = deployed
+        .map(|d| d.definition.id.clone())
+        .unwrap_or_else(|| instance.process_id.clone());
+    let version = deployed.map(|d| d.version).unwrap_or(0);
+    let process_definition_key = deployed
+        .map(|d| d.key.to_string())
+        .unwrap_or_else(|| "-1".into());
+
+    let state_enum = match instance.state {
+        ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
+        ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
+    };
+
+    models::ProcessInstanceResult::new(
+        process_definition_id,
+        types::Nullable::Null,
+        version,
+        types::Nullable::Null,
+        epoch(),
+        types::Nullable::Null,
+        state_enum,
+        !instance.incidents.is_empty(),
+        "<default>".to_string(),
+        models::ProcessInstanceKey(instance.key.to_string()),
+        models::ProcessDefinitionKey(process_definition_key),
+        types::Nullable::Null,
+        types::Nullable::Null,
+        types::Nullable::Null,
+        Vec::new(),
+        types::Nullable::Null,
+    )
 }
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,

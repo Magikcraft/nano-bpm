@@ -32,6 +32,24 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   (e.g. a refund/compensation flow); otherwise an incident is raised. The job is
   consumed either way. Returns `404` for an unknown or un-activated job and
   `409` if the job is no longer active.
+- `PATCH /v2/jobs/{jobKey}` (`updateJob`) applies the changeset's `retries` to a
+  job — used to recover a job parked on a no-retries incident (timeout updates
+  are not modelled).
+- `POST /v2/incidents/{incidentKey}/resolution` (`resolveIncident`) resolves an
+  incident. For a job-incident the parked job (which must have retries again)
+  returns to the activatable pool, so the recovery loop is: `failJob`(0) →
+  `updateJob`(retries) → `resolveIncident` → re-activate → `completeJob`.
+
+Read endpoints make engine state observable:
+
+- `GET /v2/process-instances/{processInstanceKey}` (`getProcessInstance`) —
+  reports state (`ACTIVE`/`COMPLETED`) and `hasIncident`.
+- `GET /v2/incidents/{incidentKey}` (`getIncident`) and
+  `POST /v2/incidents/search` (`searchIncidents`, filterable by a single
+  `processInstanceKey`) — expose open incidents, including the `incidentKey`
+  needed to resolve them. `errorType` reflects the cause (`JOB_NO_RETRIES`,
+  `CONDITION_ERROR`, `UNHANDLED_ERROR_EVENT`). Timestamps are reported as the
+  Unix epoch since the engine is clock-free.
 
 A demo process (`processDefinitionId: "demo"`, a single service task) is
 pre-deployed at server startup, but you can also deploy your own `.bpmn` files
