@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Path to the compiled server binary, provided by Cargo for integration tests.
-const SERVER_BIN: &str = env!("CARGO_BIN_EXE_camunda-gateway-rest-server");
+const SERVER_BIN: &str = env!("CARGO_BIN_EXE_nanobpm-gateway-rest-server");
 
 /// The generated REST layer mounts every route under this base path.
 const BASE_PATH: &str = "/v2";

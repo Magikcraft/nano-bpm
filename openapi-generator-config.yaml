@@ -7,7 +7,7 @@
 #   * an axum router that extracts requests and dispatches to the trait impl
 #
 # No backend services are wired here; consumers implement the traits.
-packageName: camunda-gateway-rest
+packageName: nanobpm-gateway-rest
 packageVersion: 0.1.0
 # Disable doc generation noise; the spec is the source of truth.
 hideGenerationTimestamp: true

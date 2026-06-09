@@ -1,12 +1,12 @@
 [package]
-name = "camunda-gateway-rest-server"
+name = "nanobpm-gateway-rest-server"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Stub server for the generated Camunda Orchestration Cluster REST layer (no backends wired)."
+description = "NanoBPM gateway: stub server for the generated Camunda 8 Orchestration Cluster v2 REST layer, wired to the embedded nanobpmn engine."
 
 [dependencies]
-camunda-gateway-rest = { path = "../generated" }
+nanobpm-gateway-rest = { path = "../generated" }
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart"] }

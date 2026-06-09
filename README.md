@@ -160,7 +160,7 @@ rationale for following the Camunda 8 (Zeebe) model rather than the Camunda 7 PV
 The REST layer is generated with [OpenAPI Generator](https://openapi-generator.tech)
 using its [`rust-axum`](https://openapi-generator.tech/docs/generators/rust-axum)
 server generator (run via Docker, version-pinned). It produces a self-contained
-library crate (`camunda-gateway-rest`) with:
+library crate (`nanobpm-gateway-rest`) with:
 
 - **`src/models.rs`** — serde structs for every schema in the spec.
 - **`src/apis/`** — one trait per API tag, with one async method per operation.
@@ -231,7 +231,7 @@ make build
 
 # Build the optimized production server binary
 make release
-# -> server/target/release/camunda-gateway-rest-server
+# -> server/target/release/nanobpm-gateway-rest-server
 
 # Run the stub server (defaults to port 8080; override with PORT)
 make run
@@ -246,14 +246,14 @@ make clean
 ```
 
 `make release` produces a single self-contained binary at
-`server/target/release/camunda-gateway-rest-server`. Run it directly,
+`server/target/release/nanobpm-gateway-rest-server`. Run it directly,
 configuring it through the environment — `PORT` for the listen port and
 `NANOBPMN_JOURNAL` for the durable event-log path (see
 [Durability](#durability-event-log-replay)):
 
 ```bash
 NANOBPMN_JOURNAL=/var/lib/nanobpmn/nanobpmn.journal PORT=8080 \
-  ./server/target/release/camunda-gateway-rest-server
+  ./server/target/release/nanobpm-gateway-rest-server
 ```
 
 > The generated REST layer under `generated/` is a build dependency, so

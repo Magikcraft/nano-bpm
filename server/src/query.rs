@@ -9,7 +9,7 @@
 //! enums to their wire spelling (their `Display`), and string fields to
 //! themselves.
 
-use camunda_gateway_rest::{models, types};
+use nanobpm_gateway_rest::{models, types};
 
 /// The advanced-filter operators, normalised to string comparisons. `None`
 /// fields are simply not constrained.

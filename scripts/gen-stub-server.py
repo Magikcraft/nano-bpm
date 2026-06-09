@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate stub trait implementations for the generated REST layer.
 
-The rust-axum router (`camunda_gateway_rest::server::new`) requires a single type
+The rust-axum router (`nanobpm_gateway_rest::server::new`) requires a single type
 that implements every per-tag API trait. Writing those impls by hand (hundreds of
 methods) is infeasible and would rot whenever the spec changes, so this script
 derives them from the generated trait definitions in
@@ -64,7 +64,7 @@ use async_trait::async_trait;
 use axum::extract::*;
 use axum_extra::extract::CookieJar;
 use bytes::Bytes;
-use camunda_gateway_rest::{apis, models, types::*};
+use nanobpm_gateway_rest::{apis, models, types::*};
 use headers::Host;
 use http::Method;
 

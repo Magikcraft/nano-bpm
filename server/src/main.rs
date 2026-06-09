@@ -1,6 +1,6 @@
 //! Stub server for the generated Orchestration Cluster REST layer.
 //!
-//! This binary wires the generated `camunda_gateway_rest` REST layer (models,
+//! This binary wires the generated `nanobpm_gateway_rest` REST layer (models,
 //! routes, and per-tag service traits) into a runnable `axum` server. No backend
 //! services are connected yet: every operation is implemented as a stub that
 //! responds with `501 Not Implemented`.
@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::extract::Multipart;
 use axum::response::Response;
-use camunda_gateway_rest::{apis, models, types};
+use nanobpm_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
@@ -134,7 +134,7 @@ impl ServerImpl {
                     models::ProcessDefinitionKey(process_id),
                     models::ProcessInstanceKey(instance_key.to_string()),
                     Vec::new(),
-                    camunda_gateway_rest::types::Nullable::Null,
+                    nanobpm_gateway_rest::types::Nullable::Null,
                 );
                 // Starting an instance parks it on its first service task, so new
                 // jobs may now be activatable: wake any long-pollers.
@@ -1126,11 +1126,11 @@ impl ServerImpl {
                     models::ProcessDefinitionKey(process_definition_key.to_string()),
                 );
                 deployments.push(models::DeploymentMetadataResult::new(
-                    camunda_gateway_rest::types::Nullable::Present(process_result),
-                    camunda_gateway_rest::types::Nullable::Null,
-                    camunda_gateway_rest::types::Nullable::Null,
-                    camunda_gateway_rest::types::Nullable::Null,
-                    camunda_gateway_rest::types::Nullable::Null,
+                    nanobpm_gateway_rest::types::Nullable::Present(process_result),
+                    nanobpm_gateway_rest::types::Nullable::Null,
+                    nanobpm_gateway_rest::types::Nullable::Null,
+                    nanobpm_gateway_rest::types::Nullable::Null,
+                    nanobpm_gateway_rest::types::Nullable::Null,
                 ));
             }
         }
@@ -1464,9 +1464,9 @@ fn activated_job_result(engine: &Engine, job: ActivatedJob) -> models::Activated
         models::ElementInstanceKey(job.element_instance_key.to_string()),
         models::JobKindEnum::BpmnElement,
         models::JobListenerEventTypeEnum::Unspecified,
-        camunda_gateway_rest::types::Nullable::Null,
+        nanobpm_gateway_rest::types::Nullable::Null,
         Vec::new(),
-        camunda_gateway_rest::types::Nullable::Null,
+        nanobpm_gateway_rest::types::Nullable::Null,
         0,
     )
 }
@@ -1588,7 +1588,7 @@ async fn main() {
     let tick_journal = server.journal.clone();
     let tick_jobs_available = server.jobs_available.clone();
 
-    let app = camunda_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
+    let app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
 
     // Background "tick": drives the host clock into the engine so timers fire and
     // activation locks expire without an inbound request. Timer firing is durable
@@ -1626,8 +1626,8 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
     tracing::info!(
-        "Camunda gateway REST stub server listening on http://{addr}{}",
-        camunda_gateway_rest::BASE_PATH
+        "NanoBPM gateway REST stub server listening on http://{addr}{}",
+        nanobpm_gateway_rest::BASE_PATH
     );
 
     axum::serve(listener, app)
