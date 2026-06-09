@@ -272,6 +272,74 @@ impl ServerImpl {
         }
     }
 
+    async fn throw_job_error_impl(
+        &self,
+        path_params: &models::ThrowJobErrorPathParams,
+        body: &models::JobErrorRequest,
+    ) -> Result<apis::job::ThrowJobErrorResponse, ()> {
+        use apis::job::ThrowJobErrorResponse as Resp;
+
+        let job_key: u64 = match path_params.job_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                        "Job not found",
+                        404,
+                        format!("Job key '{}' is not a valid key.", path_params.job_key),
+                    )),
+                );
+            }
+        };
+
+        let error_message = match body.error_message.as_ref() {
+            Some(types::Nullable::Present(msg)) => msg.clone(),
+            _ => String::new(),
+        };
+
+        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        match engine.apply_command(Command::throw_job_error(
+            job_key,
+            body.error_code.clone(),
+            error_message,
+        )) {
+            Ok(_) => {
+                // A caught error can route the token onto a following service
+                // task, creating a new activatable job: wake any long-pollers.
+                self.jobs_available.notify_waiters();
+                Ok(Resp::Status204_AnErrorIsThrownForTheJob)
+            }
+            Err(EngineError::JobNotFound { job_key }) => Ok(
+                Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                    "Job not found",
+                    404,
+                    format!("No job with key {job_key}."),
+                )),
+            ),
+            Err(EngineError::JobNotActivated { job_key }) => Ok(
+                Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                    "Job not activated",
+                    404,
+                    format!("Job {job_key} has not been activated and cannot throw an error."),
+                )),
+            ),
+            Err(EngineError::JobNotActive { job_key }) => Ok(
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job in wrong state",
+                    409,
+                    format!("Job {job_key} is not active and cannot throw an error."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
     async fn create_deployment_impl(
         &self,
         mut body: Multipart,

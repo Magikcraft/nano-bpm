@@ -81,6 +81,12 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   and an **incident** is raised on the instance — the same incident mechanism an
   exclusive gateway uses when no flow matches. Jobs start with a default retry
   count and, like completion, failing requires prior activation.
+- **Business errors** (`ThrowJobError`) let a worker raise a named error from a
+  job. If the job's service task has an **error boundary event** with a matching
+  `errorCode`, the task is interrupted and the boundary's outgoing flow runs the
+  error-handling path; an unmatched error raises an incident instead. The job is
+  consumed either way (`JobState::Errored`) and, like the other transitions,
+  throwing requires prior activation.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
 
@@ -95,16 +101,18 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 | `engine.rs` | `Engine::apply_command` — the single-writer loop and the processor. |
 
 > **Scope.** This is a POC. The model supports start/end events, service tasks,
+> **error boundary events** (a worker `throwError` caught by a matching boundary,
+> interrupting the task and routing to its error-handling path),
 > **exclusive (XOR) gateways** (condition-based routing with a default flow,
 > raising an incident when nothing matches) and **parallel (AND) gateways**
 > (split takes all branches; join synchronises them). Instances carry simple
 > variables (`Bool`/`Int`/`Str`) used by gateway conditions. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
-> that same subset via the [`bpmn`] module (`bpmn::parse_bpmn`), a tiny
-> dependency-free scanner. Deployments assign a per-id **version** and a unique
-> process-definition key. Intermediate events, timers and sub-processes are
-> intended extension points — new element kinds plug into `process_step` without
-> touching the architecture.
+> that same subset (including `boundaryEvent`/`errorEventDefinition`) via the
+> [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
+> Deployments assign a per-id **version** and a unique process-definition key.
+> Intermediate events, timers and sub-processes are intended extension points —
+> new element kinds plug into `process_step` without touching the architecture.
 
 ## Usage
 

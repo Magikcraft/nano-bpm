@@ -26,6 +26,12 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
 - `POST /v2/jobs/{jobKey}/failure` (`failJob`) sets a job's remaining retries.
   With retries left the job returns to the activatable pool; with none an
   incident is raised and the job parks (no longer activatable or completable).
+- `POST /v2/jobs/{jobKey}/error` (`throwError`) raises a business error from a
+  job. If the job's service task has an error boundary event with a matching
+  `errorCode`, the task is interrupted and the boundary's outgoing path runs
+  (e.g. a refund/compensation flow); otherwise an incident is raised. The job is
+  consumed either way. Returns `404` for an unknown or un-activated job and
+  `409` if the job is no longer active.
 
 A demo process (`processDefinitionId: "demo"`, a single service task) is
 pre-deployed at server startup, but you can also deploy your own `.bpmn` files
