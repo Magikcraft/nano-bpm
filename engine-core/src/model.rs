@@ -95,6 +95,19 @@ pub enum ElementKind {
     /// ([`crate::Command::TriggerTimers`]) finds the timer due. `duration_millis`
     /// is in the same units the host feeds the engine as `now`.
     TimerIntermediateCatchEvent { duration_millis: u64 },
+    /// An interrupting timer boundary event attached to an activity (here, a
+    /// service task). It has no incoming sequence flow; instead a timer is armed
+    /// when the activity activates, and when the timer becomes due
+    /// ([`crate::Command::TriggerTimers`]) the activity is interrupted (its token
+    /// and any job cancelled) and the token runs along this event's outgoing
+    /// flow. `duration_millis` is in the same units the host feeds the engine as
+    /// `now`.
+    TimerBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// How long after the activity activates the timer fires.
+        duration_millis: u64,
+    },
 }
 
 /// A single BPMN flow node and its outgoing sequence flows.
@@ -232,6 +245,28 @@ impl ProcessBuilder {
         duration_millis: u64,
     ) -> Self {
         self.add(id, ElementKind::TimerIntermediateCatchEvent { duration_millis })
+    }
+
+    /// Adds an interrupting timer boundary event attached to `attached_to`. A
+    /// timer is armed for `duration_millis` (in the host's clock units) when the
+    /// activity activates; when it fires the activity is interrupted and the
+    /// token runs along this event's outgoing flow. Connect its outgoing flow(s)
+    /// with [`connect`] to route the timeout-handling path.
+    ///
+    /// [`connect`]: ProcessBuilder::connect
+    pub fn timer_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        duration_millis: u64,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::TimerBoundaryEvent {
+                attached_to: attached_to.into(),
+                duration_millis,
+            },
+        )
     }
 
     /// Adds an unconditional sequence flow from `from` to `to`.

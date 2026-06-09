@@ -86,5 +86,5 @@ pub use model::{
 };
 pub use state::{
     DeployedProcess, Incident, IncidentKind, IncidentState, Job, JobState, Key, ProcessInstance,
-    ProcessInstanceState, State, Timer, TimerState,
+    ProcessInstanceState, State, Timer, TimerKind, TimerState,
 };

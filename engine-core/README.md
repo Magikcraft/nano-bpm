@@ -118,6 +118,15 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   durable (`TimerCreated`/`TimerTriggered` are journaled), so a parked timer
   survives a restart and fires on the next due tick; a fired timer is retained so
   it never re-fires.
+- **Interrupting timer boundary events** attach a deadline to a service task. When
+  the task activates, its boundary timer is armed (`due_at = now + duration`); if
+  the timer fires before the job is done, the engine **cancels the job**
+  (`JobState::Canceled`, terminal — no longer activatable/completable), interrupts
+  the activity, and routes the token out the boundary's outgoing flow. If the job
+  instead completes (or the task is interrupted another way, e.g. an error
+  boundary) first, the armed boundary timer is **disarmed** (`TimerState::Canceled`)
+  so it never fires. `JobCanceled`/`TimerCanceled` are journaled, so both outcomes
+  survive a restart.
 - **Variables** can be merged into a scope with `SetVariables` (the scope key may
   be a process instance or any active element instance — nano keeps a single
   instance-level scope). Typically used to correct the data behind a gateway
@@ -141,6 +150,8 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > **Scope.** This is a POC. The model supports start/end events, service tasks,
 > **error boundary events** (a worker `throwError` caught by a matching boundary,
 > interrupting the task and routing to its error-handling path),
+> **interrupting timer boundary events** (a deadline on a service task that, when
+> it fires first, cancels the job and routes the token out the boundary),
 > **exclusive (XOR) gateways** (condition-based routing with a default flow,
 > raising an incident when nothing matches), **parallel (AND) gateways**
 > (split takes all branches; join synchronises them) and **timer intermediate

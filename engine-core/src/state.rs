@@ -38,6 +38,10 @@ pub enum JobState {
     /// Consumed by a thrown business error: the job is terminal (the error was
     /// either caught by a boundary event or raised an incident).
     Errored,
+    /// Cancelled because its activity was interrupted by a boundary event (here,
+    /// an interrupting timer boundary event firing). Terminal: the job is neither
+    /// activatable nor completable.
+    Canceled,
     /// Completed by a worker.
     Completed,
 }
@@ -166,6 +170,29 @@ pub enum TimerState {
     Created,
     /// Fired: its token has been released. Retained so it is not re-fired.
     Triggered,
+    /// Cancelled before firing because the element it guarded left the flow
+    /// first (e.g. a boundary timer whose activity completed, or a sibling
+    /// boundary timer when another boundary on the same activity fired).
+    /// Retained for audit; never fires.
+    Canceled,
+}
+
+/// What a timer guards, which decides what firing it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TimerKind {
+    /// A timer intermediate catch event: the timer's `element_instance_key` is
+    /// the catch event itself, and firing completes it, resuming the token along
+    /// the event's outgoing flow.
+    IntermediateCatch,
+    /// An interrupting timer boundary event attached to an activity: the timer's
+    /// `element_instance_key`/`element_id` are the *attached activity*, and
+    /// firing cancels the activity (and any job parked on it) and takes the
+    /// boundary event's outgoing flow.
+    InterruptingBoundary {
+        /// Id of the boundary event whose outgoing flow runs when the timer fires.
+        boundary_element_id: ElementId,
+    },
 }
 
 /// An armed timer holding a token on a timer intermediate catch event until its
@@ -175,7 +202,9 @@ pub enum TimerState {
 pub struct Timer {
     pub key: Key,
     pub instance_key: Key,
-    /// The catch-event element instance the token rests on while waiting.
+    /// The element instance the token rests on while waiting: the catch event
+    /// itself for an intermediate timer, or the attached activity for a boundary
+    /// timer.
     pub element_instance_key: Key,
     pub element_id: ElementId,
     /// The logical instant at which the timer becomes due, in the host's clock
@@ -183,6 +212,8 @@ pub struct Timer {
     /// [`crate::Event::TimerCreated`] event, so replay reconstructs it exactly.
     pub due_at: u64,
     pub state: TimerState,
+    /// What the timer guards, and so what firing it does.
+    pub kind: TimerKind,
 }
 
 /// A deployed process definition together with the identity the engine assigned
@@ -494,6 +525,7 @@ pub fn apply(state: &mut State, event: &Event) {
             element_instance_key,
             element_id,
             due_at,
+            kind,
         } => {
             state.timers.insert(
                 *timer_key,
@@ -504,6 +536,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     element_id: element_id.clone(),
                     due_at: *due_at,
                     state: TimerState::Created,
+                    kind: kind.clone(),
                 },
             );
         }
@@ -511,6 +544,20 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::TimerTriggered { timer_key, .. } => {
             if let Some(timer) = state.timers.get_mut(timer_key) {
                 timer.state = TimerState::Triggered;
+            }
+        }
+
+        Event::TimerCanceled { timer_key, .. } => {
+            if let Some(timer) = state.timers.get_mut(timer_key) {
+                timer.state = TimerState::Canceled;
+            }
+        }
+
+        Event::JobCanceled { job_key, .. } => {
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                job.state = JobState::Canceled;
+                job.worker = None;
+                job.deadline = None;
             }
         }
     }

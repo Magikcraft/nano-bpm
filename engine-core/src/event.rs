@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use crate::model::{ElementId, ProcessDefinition, Value};
-use crate::state::{IncidentKind, Key};
+use crate::state::{IncidentKind, Key, TimerKind};
 
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
@@ -169,24 +169,41 @@ pub enum Event {
     /// The last token of a process instance was consumed; the instance is done.
     ProcessInstanceCompleted { instance_key: Key },
 
-    /// A timer was armed on a timer intermediate catch event; the token rests on
-    /// it until the timer is due. `due_at` is the logical instant it fires,
-    /// carried on the event so replay reconstructs it exactly.
+    /// A timer was armed: either on a timer intermediate catch event (the token
+    /// rests on it) or as an interrupting boundary timer on an activity (the
+    /// activity runs as normal until the timer fires). `due_at` is the logical
+    /// instant it fires and `kind` records what it guards, both carried on the
+    /// event so replay reconstructs the timer exactly.
     TimerCreated {
         timer_key: Key,
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
         due_at: u64,
+        kind: TimerKind,
     },
-    /// A due timer fired; its token is released along the catch event's outgoing
-    /// flow (the element-completion and sequence-flow events follow).
+    /// A due timer fired. For an intermediate catch event its token is released
+    /// along the event's outgoing flow; for an interrupting boundary timer the
+    /// attached activity is interrupted and the boundary's outgoing flow runs
+    /// (the job-cancellation, element-completion and sequence-flow events follow).
     TimerTriggered {
         timer_key: Key,
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// An armed timer was cancelled before firing because the element it guarded
+    /// left the flow first (e.g. a boundary timer whose activity completed
+    /// normally, or a sibling boundary timer when another fired).
+    TimerCanceled {
+        timer_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
+    /// A job was cancelled because its activity was interrupted by a boundary
+    /// event firing.
+    JobCanceled { job_key: Key, instance_key: Key },
 }
 
 impl Event {
@@ -217,6 +234,8 @@ impl Event {
             | Event::IncidentResolved { instance_key, .. }
             | Event::TimerCreated { instance_key, .. }
             | Event::TimerTriggered { instance_key, .. }
+            | Event::TimerCanceled { instance_key, .. }
+            | Event::JobCanceled { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. } => None,
         }
@@ -268,6 +287,7 @@ impl Event {
             | Event::JobFailed { job_key, .. }
             | Event::JobErrorThrown { job_key, .. }
             | Event::JobCompleted { job_key, .. }
+            | Event::JobCanceled { job_key, .. }
             | Event::JobRetriesUpdated { job_key, .. } => m = m.max(*job_key),
             Event::IncidentRaised {
                 incident_key,
@@ -296,6 +316,11 @@ impl Event {
                 ..
             } => m = m.max(*timer_key).max(*element_instance_key),
             Event::TimerTriggered {
+                timer_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*timer_key).max(*element_instance_key),
+            Event::TimerCanceled {
                 timer_key,
                 element_instance_key,
                 ..

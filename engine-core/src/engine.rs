@@ -365,7 +365,10 @@ impl Engine {
                     .ok_or(EngineError::JobNotFound { job_key })?;
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Failed | state::JobState::Errored
+                    state::JobState::Completed
+                        | state::JobState::Failed
+                        | state::JobState::Errored
+                        | state::JobState::Canceled
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -461,8 +464,10 @@ impl Engine {
             }
 
             Command::TriggerTimers { now } => {
-                // Fire every due timer (deterministic order by key), releasing
-                // each parked token along its catch event's outgoing flow.
+                // Fire every due timer (deterministic order by key). An
+                // intermediate catch resumes its parked token; an interrupting
+                // boundary timer interrupts its activity and routes out the
+                // boundary event.
                 let mut due: Vec<Key> = self
                     .state
                     .timers
@@ -472,10 +477,17 @@ impl Engine {
                     .collect();
                 due.sort_unstable();
                 for timer_key in due {
-                    let timer = self.state.timers.get(&timer_key).expect("due timer exists");
+                    // A boundary timer earlier in this batch may have interrupted
+                    // an activity that disarmed this one; re-check it is still due.
+                    let timer = match self.state.timers.get(&timer_key) {
+                        Some(t) if t.state == state::TimerState::Created => t,
+                        _ => continue,
+                    };
                     let instance_key = timer.instance_key;
                     let element_instance_key = timer.element_instance_key;
                     let element_id = timer.element_id.clone();
+                    let kind = timer.kind.clone();
+
                     self.emit(
                         &mut log,
                         Event::TimerTriggered {
@@ -485,13 +497,62 @@ impl Engine {
                             element_id: element_id.clone(),
                         },
                     );
-                    // The catch event is ACTIVATED and resting; completing it
-                    // takes its outgoing flow and resumes the token.
-                    queue.push_back(Step::Complete {
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                    });
+
+                    match kind {
+                        // Catch event: completing it resumes the token along its
+                        // own outgoing flow.
+                        state::TimerKind::IntermediateCatch => {
+                            queue.push_back(Step::Complete {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        }
+                        // Boundary timer: interrupt the attached activity (cancel
+                        // its job and disarm any sibling boundary timers), then run
+                        // the boundary event's outgoing flow. `element_instance_key`
+                        // / `element_id` are the activity here.
+                        state::TimerKind::InterruptingBoundary {
+                            boundary_element_id,
+                        } => {
+                            // Cancel the job parked on the activity, if any is
+                            // still in play.
+                            if let Some(job_key) = self.active_job_on(element_instance_key) {
+                                self.emit(
+                                    &mut log,
+                                    Event::JobCanceled {
+                                        job_key,
+                                        instance_key,
+                                    },
+                                );
+                            }
+                            // Interrupt the activity element instance.
+                            self.emit(
+                                &mut log,
+                                Event::ElementCompleting {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id: element_id.clone(),
+                                },
+                            );
+                            self.emit(
+                                &mut log,
+                                Event::ElementCompleted {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                },
+                            );
+                            // Disarm any sibling boundary timers on the activity.
+                            for event in self.cancel_boundary_timers_on(element_instance_key) {
+                                self.emit(&mut log, event);
+                            }
+                            queue.push_back(Step::Activate {
+                                instance_key,
+                                element_id: boundary_element_id,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -507,7 +568,10 @@ impl Engine {
                     .ok_or(EngineError::JobNotFound { job_key })?;
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Failed | state::JobState::Errored
+                    state::JobState::Completed
+                        | state::JobState::Failed
+                        | state::JobState::Errored
+                        | state::JobState::Canceled
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -560,7 +624,10 @@ impl Engine {
                     .ok_or(EngineError::JobNotFound { job_key })?;
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Failed | state::JobState::Errored
+                    state::JobState::Completed
+                        | state::JobState::Failed
+                        | state::JobState::Errored
+                        | state::JobState::Canceled
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -602,6 +669,11 @@ impl Engine {
                                 element_id: task_element_id,
                             },
                         );
+                        // An error boundary interrupting the task also disarms any
+                        // timer boundaries on it.
+                        for event in self.cancel_boundary_timers_on(element_instance_key) {
+                            self.emit(&mut log, event);
+                        }
                         queue.push_back(Step::Activate {
                             instance_key,
                             element_id: boundary_id,
@@ -642,7 +714,7 @@ impl Engine {
                 // completed/errored jobs are terminal.
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Errored
+                    state::JobState::Completed | state::JobState::Errored | state::JobState::Canceled
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -825,9 +897,26 @@ impl Engine {
                     job_key,
                     instance_key,
                     element_instance_key,
-                    element_id,
+                    element_id: element_id.clone(),
                     job_type,
                 });
+                // Arm an interrupting timer for every attached timer boundary
+                // event; firing one later interrupts this task.
+                for (boundary_id, duration_millis) in
+                    self.attached_timer_boundaries(instance_key, &element_id)
+                {
+                    let timer_key = self.mint_key();
+                    events.push(Event::TimerCreated {
+                        timer_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        due_at: self.now.saturating_add(duration_millis),
+                        kind: state::TimerKind::InterruptingBoundary {
+                            boundary_element_id: boundary_id,
+                        },
+                    });
+                }
             }
             // A timer intermediate catch event arms a timer and parks the token;
             // a clock tick (TriggerTimers) releases it once the timer is due.
@@ -839,6 +928,7 @@ impl Engine {
                     element_instance_key,
                     element_id,
                     due_at: self.now.saturating_add(duration_millis),
+                    kind: state::TimerKind::IntermediateCatch,
                 });
             }
             // Pass-through elements (events, exclusive gateway, parallel split)
@@ -884,6 +974,9 @@ impl Engine {
                 element_id: element_id.clone(),
             },
         ];
+        // If this element was an activity guarded by interrupting boundary timers,
+        // completing it normally disarms them.
+        events.extend(self.cancel_boundary_timers_on(element_instance_key));
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -1129,6 +1222,79 @@ impl Engine {
             .min()
     }
 
+    /// The key of a still-in-play job parked on `element_instance_key`, if any.
+    /// A job is "in play" until it is completed, errored or cancelled; this is
+    /// the job an interrupting boundary event cancels. At most one such job
+    /// exists per element instance.
+    fn active_job_on(&self, element_instance_key: Key) -> Option<Key> {
+        self.state
+            .jobs
+            .values()
+            .find(|j| {
+                j.element_instance_key == element_instance_key
+                    && !matches!(
+                        j.state,
+                        state::JobState::Completed
+                            | state::JobState::Errored
+                            | state::JobState::Canceled
+                    )
+            })
+            .map(|j| j.key)
+    }
+
+    /// All interrupting timer boundary events attached to `activity_id`, as
+    /// `(boundary_id, duration_millis)` sorted by boundary id (so arming is
+    /// deterministic). Empty when the activity has no timer boundaries.
+    fn attached_timer_boundaries(
+        &self,
+        instance_key: Key,
+        activity_id: &str,
+    ) -> Vec<(ElementId, u64)> {
+        let Some(process) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(ElementId, u64)> = process
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                ElementKind::TimerBoundaryEvent {
+                    attached_to,
+                    duration_millis,
+                } if attached_to == activity_id => Some((e.id.clone(), *duration_millis)),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Cancels every armed (`Created`) interrupting boundary timer resting on
+    /// `element_instance_key`, returning the `TimerCanceled` events. Called when
+    /// the guarded activity leaves the flow another way (it completed normally or
+    /// a different boundary interrupted it), so a stale timer never fires later.
+    fn cancel_boundary_timers_on(&self, element_instance_key: Key) -> Vec<Event> {
+        let mut timers: Vec<&state::Timer> = self
+            .state
+            .timers
+            .values()
+            .filter(|t| {
+                t.element_instance_key == element_instance_key
+                    && t.state == state::TimerState::Created
+                    && matches!(t.kind, state::TimerKind::InterruptingBoundary { .. })
+            })
+            .collect();
+        timers.sort_by_key(|t| t.key);
+        timers
+            .into_iter()
+            .map(|t| Event::TimerCanceled {
+                timer_key: t.key,
+                instance_key: t.instance_key,
+                element_instance_key: t.element_instance_key,
+                element_id: t.element_id.clone(),
+            })
+            .collect()
+    }
+
     fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))
@@ -1273,7 +1439,10 @@ pub struct ActivatedJob {
 /// Failed (incident-parked) and completed jobs are never activatable.
 fn job_activatable(job: &state::Job, now: u64) -> bool {
     match job.state {
-        state::JobState::Completed | state::JobState::Failed | state::JobState::Errored => false,
+        state::JobState::Completed
+        | state::JobState::Failed
+        | state::JobState::Errored
+        | state::JobState::Canceled => false,
         state::JobState::Created => true,
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
@@ -1396,6 +1565,115 @@ mod tests {
         // The recovered engine fires the timer on the next due tick.
         recovered.trigger_timers(6_000);
         assert!(recovered.is_completed(instance_key));
+    }
+
+    /// start -> charge (service task, PT5S interrupting timer boundary) -> done
+    ///                       \--(timer "timeout")--> escalated
+    fn process_with_timer_boundary() -> ProcessDefinition {
+        ProcessBuilder::new("ship")
+            .start_event("start")
+            .service_task("charge", "payment")
+            .timer_boundary_event("timeout", "charge", 5_000)
+            .end_event("done")
+            .end_event("escalated")
+            .connect("start", "charge")
+            .connect("charge", "done")
+            .connect("timeout", "escalated")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_fire_an_interrupting_timer_boundary_and_cancel_the_job() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_timer_boundary()))
+            .unwrap();
+
+        // Start at t=1000: the token parks on the service task, a job is created,
+        // and the boundary timer is armed for due_at = 6000.
+        let events = engine
+            .apply_command_at(Command::create_instance("ship"), 1_000)
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(engine.pending_jobs().len(), 1);
+        let job_key = engine.pending_jobs()[0].key;
+        assert_eq!(engine.timers().len(), 1);
+        assert_eq!(engine.timers()[0].due_at, 6_000);
+        assert!(!engine.is_completed(instance_key));
+
+        // A tick before the due instant does nothing.
+        assert!(engine.trigger_timers(5_999).is_empty());
+        assert!(!engine.is_completed(instance_key));
+
+        // At the due instant the timer interrupts the task: the job is cancelled,
+        // the boundary's outgoing flow runs, and the instance completes.
+        let fired = engine.trigger_timers(6_000);
+        assert_eq!(engine.state().jobs[&job_key].state, state::JobState::Canceled);
+        assert!(fired
+            .iter()
+            .any(|e| matches!(e, Event::JobCanceled { job_key: k, .. } if *k == job_key)));
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+        )));
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(engine.timers()[0].state, state::TimerState::Triggered);
+    }
+
+    #[test]
+    fn should_disarm_a_boundary_timer_when_the_job_completes_first() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_timer_boundary()))
+            .unwrap();
+        let events = engine
+            .apply_command_at(Command::create_instance("ship"), 1_000)
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        // Completing the job before the timer fires takes the normal flow and
+        // disarms the boundary timer.
+        engine.activate_jobs("payment", "w", 1, 60_000, 1_000);
+        engine
+            .apply_command_at(Command::complete_job(job_key), 2_000)
+            .unwrap();
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(engine.timers()[0].state, state::TimerState::Canceled);
+
+        // A later tick past the (now disarmed) due instant does nothing.
+        assert!(engine.trigger_timers(10_000).is_empty());
+        assert_eq!(engine.state().jobs[&job_key].state, state::JobState::Completed);
+    }
+
+    #[test]
+    fn should_recover_an_armed_boundary_timer_via_replay() {
+        let mut engine = Engine::new();
+        let mut log = Vec::new();
+        log.extend(
+            engine
+                .apply_command(Command::DeployProcess(process_with_timer_boundary()))
+                .unwrap(),
+        );
+        log.extend(
+            engine
+                .apply_command_at(Command::create_instance("ship"), 1_000)
+                .unwrap(),
+        );
+
+        // Replay: the armed boundary timer and its parked job survive.
+        let mut recovered = Engine::replay(log);
+        assert_eq!(recovered.timers().len(), 1);
+        assert_eq!(recovered.timers()[0].state, state::TimerState::Created);
+        let instance_key = recovered.timers()[0].instance_key;
+        assert!(!recovered.is_completed(instance_key));
+
+        // The recovered engine fires the boundary on the next due tick.
+        recovered.trigger_timers(6_000);
+        assert!(recovered.is_completed(instance_key));
+        let job = recovered.state().jobs.values().next().unwrap();
+        assert_eq!(job.state, state::JobState::Canceled);
     }
 
     #[test]

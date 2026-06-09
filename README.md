@@ -113,9 +113,9 @@ dependency-free for mobile/wasm embedders that don't need persistence.
 
 The engine reads no wall clock; the host drives time in. The server runs a
 single background task (every 500 ms) that feeds `now` into the engine via two
-ticks: `TriggerTimers` fires every due **timer intermediate catch event**
-(durable — journaled), and `ExpireJobs` releases activation locks past their
-deadline (volatile — not journaled). When a timer fires it may unblock
+ticks: `TriggerTimers` fires every due **timer intermediate catch event** and
+**interrupting timer boundary event** (durable — journaled), and `ExpireJobs`
+releases activation locks past their deadline (volatile — not journaled). When a timer fires it may unblock
 downstream work, so the tick wakes any long-polling `activateJobs`. A timer
 parked before a restart is recovered by replay and fired by the first due tick
 afterwards.

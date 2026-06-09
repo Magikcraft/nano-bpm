@@ -153,15 +153,17 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "boundaryEvent" => {
-                                // Buffered until we see (or don't) an
-                                // errorEventDefinition; only error boundaries
-                                // are supported, others are ignored.
+                                // Buffered until end: kept only if it carries an
+                                // errorEventDefinition (error boundary) or a
+                                // timerEventDefinition (interrupting timer
+                                // boundary); other boundaries are ignored.
                                 if let Some(id) = attr(attrs, "id") {
                                     cur_boundary = Some(PendingBoundary {
                                         id: id.to_string(),
                                         attached_to: attr(attrs, "attachedToRef")
                                             .map(str::to_string),
                                         error_ref: None,
+                                        timer_duration_millis: None,
                                     });
                                 }
                             }
@@ -191,7 +193,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     cur_timer_catch = idx;
                                 }
                             }
-                            "timeDuration" if cur_timer_catch.is_some() => {
+                            "timeDuration"
+                                if cur_timer_catch.is_some() || cur_boundary.is_some() =>
+                            {
                                 duration_text = Some(String::new());
                             }
                             "conditionExpression" if cur_flow.is_some() => {
@@ -224,9 +228,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 }
                 "serviceTask" => cur_service_task = None,
                 "boundaryEvent" => {
-                    // Only boundaries with an errorEventDefinition are kept.
+                    // Keep error boundaries (errorEventDefinition) and timer
+                    // boundaries (timerEventDefinition); ignore the rest.
                     if let (Some(acc), Some(boundary)) = (current.as_mut(), cur_boundary.take()) {
-                        if boundary.error_ref.is_some() {
+                        if boundary.error_ref.is_some() || boundary.timer_duration_millis.is_some()
+                        {
                             acc.boundaries.push(boundary);
                         }
                     }
@@ -240,10 +246,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 }
                 "intermediateCatchEvent" => cur_timer_catch = None,
                 "timeDuration" => {
-                    if let (Some(acc), Some(idx), Some(text)) =
-                        (current.as_mut(), cur_timer_catch, duration_text.take())
-                    {
-                        acc.nodes[idx].duration_millis = parse_iso8601_duration(&text);
+                    if let Some(text) = duration_text.take() {
+                        let millis = parse_iso8601_duration(&text);
+                        if let (Some(acc), Some(idx)) = (current.as_mut(), cur_timer_catch) {
+                            // An intermediate catch event's duration.
+                            acc.nodes[idx].duration_millis = millis;
+                        } else if let Some(boundary) = cur_boundary.as_mut() {
+                            // A timer boundary event's duration.
+                            boundary.timer_duration_millis = millis;
+                        }
                     }
                 }
                 "sequenceFlow" => cur_flow = None,
@@ -290,13 +301,15 @@ struct FlowAcc {
     condition: Option<Condition>,
 }
 
-/// A boundary event collected while scanning, before its `errorRef` is
-/// resolved to an error code at build time.
+/// A boundary event collected while scanning. An `error_ref` (resolved to an
+/// error code at build time) makes it an error boundary; a `timer_duration_millis`
+/// makes it an interrupting timer boundary. A boundary with neither is ignored.
 #[derive(Clone)]
 struct PendingBoundary {
     id: String,
     attached_to: Option<String>,
     error_ref: Option<String>,
+    timer_duration_millis: Option<u64>,
 }
 
 /// Accumulates the nodes and flows of one `<process>` as it is scanned.
@@ -369,20 +382,23 @@ impl ProcessAcc {
                         process_id: self.id.clone(),
                         reason: format!("boundary event {} has no attachedToRef", boundary.id),
                     })?;
-            // An errorRef is always present here (only error boundaries are
-            // collected). Resolve it against the declared errors; an empty or
-            // unknown ref is an error since it could never be caught.
-            let error_ref = boundary.error_ref.unwrap_or_default();
-            let error_code = errors.get(&error_ref).cloned().ok_or_else(|| {
-                ParseError::InvalidBoundaryEvent {
-                    process_id: self.id.clone(),
-                    reason: format!(
-                        "boundary event {} references unknown error '{error_ref}'",
-                        boundary.id
-                    ),
-                }
-            })?;
-            builder = builder.error_boundary_event(boundary.id, attached_to, error_code);
+            // A timer boundary carries a duration; otherwise it is an error
+            // boundary whose errorRef must resolve to a declared error.
+            if let Some(duration_millis) = boundary.timer_duration_millis {
+                builder = builder.timer_boundary_event(boundary.id, attached_to, duration_millis);
+            } else {
+                let error_ref = boundary.error_ref.unwrap_or_default();
+                let error_code = errors.get(&error_ref).cloned().ok_or_else(|| {
+                    ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "boundary event {} references unknown error '{error_ref}'",
+                            boundary.id
+                        ),
+                    }
+                })?;
+                builder = builder.error_boundary_event(boundary.id, attached_to, error_code);
+            }
         }
         for flow in self.flows {
             let (source, target) = match (flow.source, flow.target) {
@@ -925,6 +941,46 @@ mod tests {
         );
         let boundary = def.element("declined").unwrap();
         assert!(boundary.outgoing.iter().any(|f| f.to == "refunded"));
+    }
+
+    #[test]
+    fn should_parse_a_timer_boundary_event() {
+        // given
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="charge-card" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="done" />
+              <bpmn:boundaryEvent id="timeout" attachedToRef="charge">
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT5S</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="escalated" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="done" />
+              <bpmn:sequenceFlow id="f2" sourceRef="timeout" targetRef="escalated" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("timeout").unwrap().kind,
+            ElementKind::TimerBoundaryEvent {
+                attached_to: "charge".to_string(),
+                duration_millis: 5_000,
+            }
+        );
+        let boundary = def.element("timeout").unwrap();
+        assert!(boundary.outgoing.iter().any(|f| f.to == "escalated"));
     }
 
     #[test]
