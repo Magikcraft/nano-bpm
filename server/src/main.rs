@@ -144,7 +144,7 @@ impl ServerImpl {
     async fn complete_job_impl(
         &self,
         path_params: &models::CompleteJobPathParams,
-        _body: &Option<models::JobCompletionRequest>,
+        body: &Option<models::JobCompletionRequest>,
     ) -> Result<apis::job::CompleteJobResponse, ()> {
         use apis::job::CompleteJobResponse as Resp;
 
@@ -159,8 +159,19 @@ impl ServerImpl {
             }
         };
 
+        // Variables the worker returns are merged into the instance, so they can
+        // drive downstream gateway routing.
+        let variables = body
+            .as_ref()
+            .and_then(|b| b.variables.as_ref())
+            .and_then(|v| match v {
+                types::Nullable::Present(map) => Some(from_object_map(map)),
+                types::Nullable::Null => None,
+            })
+            .unwrap_or_default();
+
         let mut engine = self.engine.lock().expect("engine mutex poisoned");
-        match engine.apply_command(Command::complete_job(job_key)) {
+        match engine.apply_command(Command::complete_job_with(job_key, variables)) {
             Ok(_) => {
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
@@ -478,6 +489,27 @@ fn to_object_map(
                 Value::Str(s) => serde_json::Value::String(s),
             };
             (name, types::Object(json))
+        })
+        .collect()
+}
+
+/// Converts a REST `Object` (JSON) variable map into engine variables. The POC
+/// engine only models `Bool`/`Int`/`Str`; JSON booleans, integers, and strings
+/// map directly, and any richer JSON value is kept as its compact string form so
+/// routing on it stays deterministic.
+fn from_object_map(
+    variables: &std::collections::HashMap<String, types::Object>,
+) -> std::collections::HashMap<String, Value> {
+    variables
+        .iter()
+        .map(|(name, object)| {
+            let value = match &object.0 {
+                serde_json::Value::Bool(b) => Value::Bool(*b),
+                serde_json::Value::Number(n) if n.is_i64() => Value::Int(n.as_i64().unwrap()),
+                serde_json::Value::String(s) => Value::Str(s.clone()),
+                other => Value::Str(other.to_string()),
+            };
+            (name.clone(), value)
         })
         .collect()
 }

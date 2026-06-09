@@ -964,6 +964,58 @@ mod tests {
     }
 
     #[test]
+    fn should_route_on_variables_returned_by_a_completed_job() {
+        // s -> task(decide) -> g(xor): decision==yes -> approved ; else rejected
+        let def = ProcessBuilder::new("review")
+            .start_event("s")
+            .service_task("decide", "decision")
+            .exclusive_gateway("g")
+            .end_event("approved")
+            .end_event("rejected")
+            .connect("s", "decide")
+            .connect("decide", "g")
+            .connect_when(
+                "g",
+                "approved",
+                Condition::Equals {
+                    variable: "decision".into(),
+                    value: Value::Str("yes".into()),
+                },
+            )
+            .connect("g", "rejected")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("review"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // given the instance parked on the service task
+        assert!(!engine.is_completed(instance_key));
+
+        // when the worker completes the job, returning decision=yes
+        let job_key = engine.activate_jobs("decision", "w", 1, 60_000, 0)[0].key;
+        let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+        let events = engine
+            .apply_command(Command::complete_job_with(job_key, vars))
+            .unwrap();
+
+        // then the gateway routes on the returned variable to the approved branch
+        assert!(engine.is_completed(instance_key));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "approved"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "rejected"
+        )));
+    }
+
+    #[test]
     fn should_raise_incident_when_no_exclusive_flow_matches() {
         // Both flows are conditional; neither matches -> incident, token parked.
         let def = ProcessBuilder::new("strict")
