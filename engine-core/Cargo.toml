@@ -1,0 +1,16 @@
+[package]
+name = "nanobpmn-engine-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal, embeddable BPMN execution core: a deterministic single-writer command/event/applier state machine (Camunda 8 / Zeebe-style), with zero dependencies so it builds for server, mobile (iOS/Android via FFI) and wasm targets."
+license = "Apache-2.0"
+
+# Intentionally dependency-free: std-only so the same crate compiles for
+# aarch64-apple-ios, aarch64-linux-android and wasm32 without pulling a DB,
+# async runtime or networking. Persistence is a caller concern (replay the log).
+[dependencies]
+
+[lib]
+name = "nanobpmn_engine_core"
+path = "src/lib.rs"

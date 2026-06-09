@@ -1,0 +1,81 @@
+//! # nanobpmn-engine-core
+//!
+//! A minimal, embeddable BPMN execution core.
+//!
+//! The architecture is deliberately modelled on **Camunda 8 (Zeebe)** rather than
+//! Camunda 7's Process Virtual Machine, but with all of the distributed-systems
+//! machinery removed (no Raft, no partitions, no exporters, no gRPC, no RocksDB).
+//! What remains is the part that makes the engine correct and testable:
+//!
+//! * **Single writer.** All state changes flow through one sequential loop
+//!   ([`Engine::apply_command`]). There are no threads, no locks and no
+//!   optimistic-locking retries — an entire class of concurrency bugs simply
+//!   cannot occur.
+//! * **command → event → applier.** A [`Command`] is *decided* by a pure
+//!   processor that reads state and produces [`Event`]s plus follow-up work. The
+//!   [`state::apply`] function is the **only** code that mutates state. This makes
+//!   the engine deterministic: feed the same commands, get the same events.
+//! * **Event-sourced & replayable.** Events carry enough information to rebuild
+//!   state, so persistence is a caller concern — append the event log anywhere
+//!   (in-memory, WAL, `redb`, SQLite) and replay to recover.
+//! * **Zero dependencies, `std`-only.** The crate compiles unchanged for servers,
+//!   for iOS/Android (embed via FFI, e.g. UniFFI) and for `wasm32`.
+//!
+//! ## The element lifecycle
+//!
+//! Every BPMN element instance walks the same state machine, mirroring Zeebe:
+//!
+//! ```text
+//! ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACTIVATING(next)
+//! ```
+//!
+//! Pass-through elements (start/end events) traverse it in one burst. A
+//! [`ElementKind::ServiceTask`] rests in `ACTIVATED` after creating a job and only
+//! advances to `COMPLETING` when a [`Command::CompleteJob`] arrives — this is how
+//! asynchronous work is modelled without any background thread.
+//!
+//! ## Example
+//!
+//! ```
+//! use nanobpmn_engine_core::{Command, Engine, ProcessBuilder};
+//!
+//! let mut engine = Engine::new();
+//!
+//! let process = ProcessBuilder::new("order")
+//!     .start_event("start")
+//!     .service_task("charge", "payment")
+//!     .end_event("end")
+//!     .connect("start", "charge")
+//!     .connect("charge", "end")
+//!     .build()
+//!     .unwrap();
+//!
+//! engine.apply_command(Command::DeployProcess(process)).unwrap();
+//! let events = engine
+//!     .apply_command(Command::CreateInstance { process_id: "order".into() })
+//!     .unwrap();
+//!
+//! // The instance is parked on the service task, waiting for its job.
+//! let instance_key = events
+//!     .iter()
+//!     .find_map(|e| e.instance_key())
+//!     .unwrap();
+//! assert!(!engine.is_completed(instance_key));
+//!
+//! // A worker completes the job; the token resumes and the instance finishes.
+//! let job_key = engine.pending_jobs()[0].key;
+//! engine.apply_command(Command::CompleteJob { job_key }).unwrap();
+//! assert!(engine.is_completed(instance_key));
+//! ```
+
+mod command;
+mod engine;
+mod event;
+mod model;
+mod state;
+
+pub use command::Command;
+pub use engine::{Engine, EngineError};
+pub use event::Event;
+pub use model::{Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition};
+pub use state::{Job, JobState, Key, ProcessInstance, ProcessInstanceState, State};

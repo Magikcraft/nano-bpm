@@ -5,9 +5,26 @@ Cluster REST API. It bundles a copy of the OpenAPI specification and generates a
 Rust REST layer (models + `axum` router + service traits) from it, plus a
 runnable stub server.
 
-No backend services are wired: every operation responds with `501 Not
-Implemented`. The point of this project is the **generation pipeline** and the
-generated REST surface.
+No backend services are wired into the REST layer: every operation responds with
+`501 Not Implemented`. The project also contains **`engine-core/`**, an
+embeddable, dependency-free BPMN execution engine that the REST layer will
+eventually call.
+
+## Two crates
+
+nanobpmn is deliberately split so the execution engine stays embeddable
+(including on mobile via FFI and in the browser via wasm) while the REST layer
+remains a server-only concern:
+
+| Crate | What it is | Runs where |
+| --- | --- | --- |
+| **`engine-core/`** | The BPMN engine: a deterministic single-writer `command → event → applier` state machine. **Zero dependencies, `std`-only.** | Server, iOS/Android (FFI, e.g. UniFFI), `wasm32` |
+| **`server/`** + `generated/` | The Camunda 8 v2 REST API generated from `spec/`, with a stub server. | Server only |
+
+You would **not** run the HTTP server on a phone; there you embed `engine-core`
+directly and call it through generated bindings. See
+[`engine-core/README.md`](engine-core/README.md) for the architecture and the
+rationale for following the Camunda 8 (Zeebe) model rather than the Camunda 7 PVM.
 
 ## Approach
 
@@ -45,6 +62,22 @@ nanobpmn/
 └── generated/                     # generated library crate (git-ignored)
 ```
 
+The engine-core crate sits alongside these:
+
+```
+nanobpmn/
+└── engine-core/                   # embeddable BPMN engine (zero-dep, std-only)
+    ├── Cargo.toml
+    ├── src/
+    │   ├── lib.rs                 # crate docs + public API
+    │   ├── model.rs               # ProcessDefinition / Element + ProcessBuilder
+    │   ├── command.rs             # Command enum (engine inputs)
+    │   ├── event.rs               # Event enum (engine facts)
+    │   ├── state.rs               # State + apply() — the sole mutator
+    │   └── engine.rs              # single-writer loop + processor
+    └── tests/public_api.rs
+```
+
 The `generated/` crate, `build/`, and `server/src/stub_impls.rs` are **build
 artifacts** and are git-ignored. Regenerate them on demand with `make generate`.
 The `spec/` tree is the committed source of truth.
@@ -75,6 +108,19 @@ make fmt
 # Remove all generated artifacts
 make clean
 ```
+
+## Engine (`engine-core`)
+
+The embeddable BPMN engine builds and tests with plain `cargo` — no Docker, no
+code generation:
+
+```bash
+make engine-test    # unit + integration + doc tests
+make engine-build   # debug build
+make engine-wasm    # prove it compiles for wasm32 (needs the wasm32 target)
+```
+
+See [`engine-core/README.md`](engine-core/README.md) for the architecture.
 
 ## Stub server
 
