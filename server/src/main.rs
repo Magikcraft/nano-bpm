@@ -24,8 +24,8 @@ use camunda_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, Incident, IncidentKind, IncidentState,
-    ProcessBuilder, ProcessInstance, ProcessInstanceState, State, Value,
+    ActivatedJob, Command, DeployedProcess, Engine, EngineError, Event, Incident, IncidentKind,
+    IncidentState, ProcessBuilder, ProcessInstance, ProcessInstanceState, State, Value,
 };
 
 use crate::journal::Journal;
@@ -930,6 +930,76 @@ impl ServerImpl {
         ))
     }
 
+    /// Searches deployed process definitions. The engine keeps only the latest
+    /// version of each process id (in `state.processes`), so every entry is the
+    /// latest version; older versions are not retained and therefore not
+    /// searchable.
+    async fn search_process_definitions_impl(
+        &self,
+        body: &Option<models::ProcessDefinitionSearchQuery>,
+    ) -> Result<apis::process_definition::SearchProcessDefinitionsResponse, ()> {
+        use apis::process_definition::SearchProcessDefinitionsResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let engine = self.journal.lock().expect("engine mutex poisoned");
+        let state = engine.state();
+
+        let mut matched: Vec<&DeployedProcess> = state
+            .processes
+            .values()
+            .filter(|d| match filter {
+                None => true,
+                Some(f) => {
+                    let id = &d.definition.id;
+                    // The engine stores no display name, resource name, or
+                    // version tag, so those filters match against the best
+                    // available proxy (the id) or exclude when we hold no value.
+                    query::match_string(&f.name, id)
+                        && query::match_string(&f.process_definition_id, id)
+                        && f.process_definition_key
+                            .as_ref()
+                            .is_none_or(|k| k.0 == d.key.to_string())
+                        && f.version.is_none_or(|v| v == d.version)
+                        && f.resource_name
+                            .as_ref()
+                            .is_none_or(|r| *r == resource_name(id))
+                        && f.version_tag.is_none()
+                        && f.has_start_form.is_none_or(|want| !want)
+                        // Only latest versions are retained, so they are all
+                        // "latest"; an explicit `false` therefore matches none.
+                        && f.is_latest_version.is_none_or(|want| want)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ProcessDefinitionSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |d, field| match field {
+                "processDefinitionId" | "name" => {
+                    query::SortVal::Str(d.definition.id.clone())
+                }
+                "version" => query::SortVal::Num(d.version as i64),
+                _ => query::SortVal::Num(d.key as i64),
+            },
+            |d| d.key,
+        );
+
+        let sorted: Vec<(u64, models::ProcessDefinitionResult)> = matched
+            .into_iter()
+            .map(|d| (d.key, process_definition_result(d)))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+
+        Ok(Resp::Status200_TheProcessDefinitionSearchResult(
+            models::ProcessDefinitionSearchQueryResult::new(page.response, page.items),
+        ))
+    }
+
     async fn create_deployment_impl(
         &self,
         mut body: Multipart,
@@ -1262,6 +1332,30 @@ fn process_instance_result(
         types::Nullable::Null,
         Vec::new(),
         types::Nullable::Null,
+    )
+}
+
+/// A synthesized resource (file) name for a process id. The engine does not
+/// retain the original deployment resource name, so derive a stable `.bpmn`
+/// name from the id.
+fn resource_name(process_id: &str) -> String {
+    format!("{process_id}.bpmn")
+}
+
+/// Projects an engine [`DeployedProcess`] into the generated
+/// `ProcessDefinitionResult`. The engine stores no display name or version tag,
+/// so `name` mirrors the id and `versionTag` is null.
+fn process_definition_result(deployed: &DeployedProcess) -> models::ProcessDefinitionResult {
+    let id = deployed.definition.id.clone();
+    models::ProcessDefinitionResult::new(
+        types::Nullable::Present(id.clone()),
+        resource_name(&id),
+        deployed.version,
+        types::Nullable::Null,
+        id,
+        "<default>".to_string(),
+        models::ProcessDefinitionKey(deployed.key.to_string()),
+        false,
     )
 }
 

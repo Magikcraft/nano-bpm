@@ -487,3 +487,33 @@ fn a_created_instance_reports_a_real_start_date() {
 
     server.shutdown();
 }
+
+#[test]
+fn searching_process_definitions_returns_the_deployed_demo() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Regression: SearchProcessDefinitions was an unimplemented stub that
+    // returned 501. It now projects the engine's deployed definitions (the
+    // demo process is pre-seeded).
+    let server = ServerProcess::boot(&journal);
+    let (status, body) =
+        server.request("POST", &path("/process-definitions/search"), Some(r#"{}"#));
+    assert_eq!(status, 200, "definition search must succeed: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    let demo = json["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|i| i["processDefinitionId"].as_str() == Some("demo"))
+        })
+        .expect("demo definition present in search results");
+
+    assert_eq!(demo["version"].as_i64(), Some(1));
+    assert_eq!(demo["tenantId"].as_str(), Some("<default>"));
+    assert!(demo["processDefinitionKey"].as_str().is_some());
+
+    server.shutdown();
+}
