@@ -85,6 +85,30 @@ pre-deployed at server startup, but you can also deploy your own `.bpmn` files
 through the deployment endpoint. Engine and parse errors map to real status
 codes (`400`/`404`/`409`); everything else is still `501`.
 
+### Durability (event-log replay)
+
+The engine is in-memory but event-sourced: every command returns the complete,
+ordered list of events it produced, and replaying those events over a fresh
+state reconstructs it exactly. The server turns that into crash durability with
+an **append-only journal**. Set `NANOBPMN_JOURNAL` to a file path and every
+durable command's events are appended (newline-delimited JSON) and flushed
+before the response returns; on startup the log is replayed through
+`Engine::replay`, which also advances the key generator past every key the log
+assigned so post-recovery commands never collide with replayed ones. Without the
+env var the server runs purely in memory (ephemeral).
+
+```bash
+NANOBPMN_JOURNAL=./nanobpmn.journal PORT=8099 cargo run
+```
+
+Job **activation locks are intentionally not journaled** — they are volatile
+lease state. A restart forfeits every lock, returning uncompleted jobs to the
+activatable pool, so a worker simply re-activates after recovery. Everything
+durable (deployments, instances, element progress, jobs, incidents, variables,
+completion) survives. The `serde` (de)serialization lives behind an off-by-
+default `serde` feature on `engine-core`, so the engine stays dependency-free
+for mobile/wasm embedders that don't need persistence.
+
 ## Two crates
 
 nanobpmn is deliberately split so the execution engine stays embeddable

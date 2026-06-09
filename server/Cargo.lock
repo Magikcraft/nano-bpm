@@ -877,6 +877,9 @@ dependencies = [
 [[package]]
 name = "nanobpmn-engine-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "new_debug_unreachable"

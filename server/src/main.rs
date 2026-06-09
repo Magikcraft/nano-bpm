@@ -9,8 +9,9 @@
 //! (see scripts/gen-stub-server.py). This file owns only the stable pieces: the
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
-mod stub_impls;
+mod journal;
 mod query;
+mod stub_impls;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -27,45 +28,59 @@ use nanobpmn_engine_core::{
     ProcessBuilder, ProcessInstance, ProcessInstanceState, State, Value,
 };
 
+use crate::journal::Journal;
+
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
 /// The single type that implements every generated API trait.
 ///
-/// It owns an embedded [`Engine`] (the `engine-core` crate) behind a mutex.
-/// Most operations are still 501 stubs (see the generated `stub_impls` module);
-/// a few — process-instance creation, job activation, and job completion — are
-/// wired to the engine via the inherent methods below and routed from the stub
-/// generator's override table.
+/// It owns an embedded [`Engine`] (the `engine-core` crate), wrapped in a
+/// durable [`Journal`], behind a mutex. Most operations are still 501 stubs (see
+/// the generated `stub_impls` module); a few — process-instance creation, job
+/// activation, and job completion — are wired to the engine via the inherent
+/// methods below and routed from the stub generator's override table. Every
+/// durable command is appended to the journal so engine state survives a
+/// restart.
 #[derive(Clone)]
 pub struct ServerImpl {
-    engine: Arc<Mutex<Engine>>,
+    journal: Arc<Mutex<Journal>>,
     /// Notified whenever new jobs may have become activatable, so long-polling
     /// `activateJobs` requests can wake immediately instead of waiting out their
     /// full timeout.
     jobs_available: Arc<tokio::sync::Notify>,
 }
 
-impl Default for ServerImpl {
-    fn default() -> Self {
-        let mut engine = Engine::new();
-        // Pre-deploy a demo process so `createProcessInstance` (by id "demo")
-        // has something to start. A real build would deploy from BPMN XML.
-        let demo = ProcessBuilder::new("demo")
-            .start_event("start")
-            .service_task("work", "demo-work")
-            .end_event("end")
-            .connect("start", "work")
-            .connect("work", "end")
-            .build()
-            .expect("valid demo process");
-        engine
-            .apply_command(Command::DeployProcess(demo))
-            .expect("deploy demo process");
+impl ServerImpl {
+    /// Builds a server over `journal`, seeding the demo process only when the
+    /// journal is fresh (an existing log already carries its deployment, and
+    /// re-deploying would mint a spurious second version on every restart).
+    pub fn new(mut journal: Journal) -> Self {
+        if journal.is_fresh() {
+            // Pre-deploy a demo process so `createProcessInstance` (by id "demo")
+            // has something to start. A real build would deploy from BPMN XML.
+            let demo = ProcessBuilder::new("demo")
+                .start_event("start")
+                .service_task("work", "demo-work")
+                .end_event("end")
+                .connect("start", "work")
+                .connect("work", "end")
+                .build()
+                .expect("valid demo process");
+            journal
+                .apply_command(Command::DeployProcess(demo))
+                .expect("deploy demo process");
+        }
         Self {
-            engine: Arc::new(Mutex::new(engine)),
+            journal: Arc::new(Mutex::new(journal)),
             jobs_available: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+}
+
+impl Default for ServerImpl {
+    fn default() -> Self {
+        Self::new(Journal::in_memory())
     }
 }
 
@@ -104,7 +119,7 @@ impl ServerImpl {
             }
         };
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.apply_command_at(Command::create_instance(process_id.clone()), now_millis()) {
             Ok(events) => {
                 let instance_key = events
@@ -172,7 +187,7 @@ impl ServerImpl {
             })
             .unwrap_or_default();
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
         {
             Ok(_) => {
@@ -236,7 +251,7 @@ impl ServerImpl {
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine
             .apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
         {
@@ -302,7 +317,7 @@ impl ServerImpl {
             _ => String::new(),
         };
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.apply_command_at(
             Command::throw_job_error(job_key, body.error_code.clone(), error_message),
             now_millis(),
@@ -371,7 +386,7 @@ impl ServerImpl {
             }
         };
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine
             .apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
         {
@@ -429,7 +444,7 @@ impl ServerImpl {
             operation_reference,
         };
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.apply_command_at(command, now_millis()) {
             Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
@@ -489,7 +504,7 @@ impl ServerImpl {
 
         let variables = from_object_map(&body.variables);
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis()) {
             Ok(_) => Ok(Resp::Status204_TheVariablesWereUpdated),
             Err(EngineError::ScopeNotFound { scope_key }) => {
@@ -531,7 +546,7 @@ impl ServerImpl {
             }
         };
 
-        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.instance(key) {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
                 process_instance_result(engine.state(), instance),
@@ -568,7 +583,7 @@ impl ServerImpl {
             }
         };
 
-        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.incident(key) {
             Some(incident) => Ok(Resp::Status200_TheIncidentIsSuccessfullyReturned(
                 incident_result(engine.state(), incident),
@@ -590,7 +605,7 @@ impl ServerImpl {
         use apis::incident::SearchIncidentsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let engine = self.journal.lock().expect("engine mutex poisoned");
         let state = engine.state();
 
         // Apply the filter algebra over each incident's string projections.
@@ -675,7 +690,7 @@ impl ServerImpl {
         use apis::process_instance::SearchProcessInstancesResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let engine = self.journal.lock().expect("engine mutex poisoned");
         let state = engine.state();
 
         let mut matched: Vec<&ProcessInstance> = state
@@ -752,7 +767,7 @@ impl ServerImpl {
         use apis::job::SearchJobsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.engine.lock().expect("engine mutex poisoned");
+        let engine = self.journal.lock().expect("engine mutex poisoned");
         let state = engine.state();
 
         let mut matched: Vec<&nanobpmn_engine_core::Job> = state
@@ -913,7 +928,7 @@ impl ServerImpl {
             }
         }
 
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         let events = match engine.apply_command(Command::DeployResources(processes)) {
             Ok(events) => events,
             Err(e) => {
@@ -1027,12 +1042,12 @@ impl ServerImpl {
         max_jobs: usize,
         timeout: u64,
     ) -> Vec<models::ActivatedJobResult> {
-        let mut engine = self.engine.lock().expect("engine mutex poisoned");
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         let now = now_millis();
         let activated = engine.activate_jobs(job_type, worker, max_jobs, timeout, now);
         activated
             .into_iter()
-            .map(|job| activated_job_result(&engine, job))
+            .map(|job| activated_job_result(engine.engine(), job))
             .collect()
     }
 }
@@ -1339,8 +1354,28 @@ impl apis::ApiAuthBasic for ServerImpl {
 async fn main() {
     tracing_subscriber::fmt().init();
 
-    let app =
-        camunda_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(ServerImpl::default());
+    // Persist the engine's event log when NANOBPMN_JOURNAL points at a file, so
+    // state survives a restart; otherwise run purely in memory (ephemeral).
+    let server = match std::env::var("NANOBPMN_JOURNAL") {
+        Ok(path) if !path.is_empty() => {
+            let journal = Journal::open(&path)
+                .unwrap_or_else(|e| panic!("failed to open journal {path}: {e}"));
+            let recovered = !journal.is_fresh();
+            let server = ServerImpl::new(journal);
+            if recovered {
+                tracing::info!("recovered engine state by replaying journal at {path}");
+            } else {
+                tracing::info!("started a fresh journal at {path}");
+            }
+            server
+        }
+        _ => {
+            tracing::info!("no NANOBPMN_JOURNAL set; running in-memory (state is not persisted)");
+            ServerImpl::default()
+        }
+    };
+
+    let app = camunda_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
 
     let port: u16 = std::env::var("PORT")
         .ok()

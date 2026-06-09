@@ -5,3 +5,6 @@ target/
 
 # Generated stub trait implementations (produced by scripts/gen-stub-server.py).
 server/src/stub_impls.rs
+
+# Persistence journals written by the server (set via NANOBPMN_JOURNAL).
+*.journal
