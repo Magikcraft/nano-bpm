@@ -1184,6 +1184,7 @@ fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum
         JobState::Failed => models::JobStateEnum::Failed,
         JobState::Errored => models::JobStateEnum::ErrorThrown,
         JobState::Completed => models::JobStateEnum::Completed,
+        JobState::Canceled => models::JobStateEnum::Canceled,
     }
 }
 
