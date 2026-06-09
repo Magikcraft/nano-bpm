@@ -1,0 +1,7 @@
+# Build artifacts produced by scripts/generate.sh — regenerate with `make generate`.
+build/
+generated/
+target/
+
+# Generated stub trait implementations (produced by scripts/gen-stub-server.py).
+server/src/stub_impls.rs

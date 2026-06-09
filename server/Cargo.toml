@@ -1,0 +1,18 @@
+[package]
+name = "camunda-gateway-rest-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Stub server for the generated Camunda Orchestration Cluster REST layer (no backends wired)."
+
+[dependencies]
+camunda-gateway-rest = { path = "../generated" }
+async-trait = "0.1"
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
+bytes = "1"
+headers = "0.4"
+http = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"

@@ -1,0 +1,13 @@
+# OpenAPI Generator configuration for the Rust (rust-axum) REST layer.
+# Docs: https://openapi-generator.tech/docs/generators/rust-axum
+#
+# This generates a self-contained library crate exposing:
+#   * serde model structs for every schema in the spec
+#   * one Api trait per tag, with an async method per operation
+#   * an axum router that extracts requests and dispatches to the trait impl
+#
+# No backend services are wired here; consumers implement the traits.
+packageName: camunda-gateway-rest
+packageVersion: 0.1.0
+# Disable doc generation noise; the spec is the source of truth.
+hideGenerationTimestamp: true
