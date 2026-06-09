@@ -129,14 +129,31 @@ pub enum Event {
     },
     /// A job was completed.
     JobCompleted { job_key: Key, instance_key: Key },
+    /// A job's remaining retries were updated (e.g. by an operator recovering a
+    /// parked job before resolving its incident). Does not change job state.
+    JobRetriesUpdated {
+        job_key: Key,
+        instance_key: Key,
+        retries: i32,
+    },
 
-    /// An incident was raised (e.g. an exclusive gateway found no matching flow);
-    /// the token is parked until the incident is resolved.
+    /// An incident was raised (e.g. an exclusive gateway found no matching flow,
+    /// or a job exhausted its retries); the token is parked until the incident
+    /// is resolved. `job_key` is `Some` only for recoverable job-incidents.
     IncidentRaised {
+        incident_key: Key,
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
         reason: String,
+        job_key: Option<Key>,
+    },
+    /// An incident was resolved. For a job-incident (`job_key` is `Some`) the
+    /// parked job returns to the activatable pool.
+    IncidentResolved {
+        incident_key: Key,
+        instance_key: Key,
+        job_key: Option<Key>,
     },
 
     /// The last token of a process instance was consumed; the instance is done.
@@ -166,7 +183,9 @@ impl Event {
             | Event::JobFailed { instance_key, .. }
             | Event::JobErrorThrown { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
+            | Event::JobRetriesUpdated { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
+            | Event::IncidentResolved { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. } => None,
         }

@@ -80,6 +80,16 @@ impl Engine {
         self.state.jobs.get(&key)
     }
 
+    /// Looks up an open incident.
+    pub fn incident(&self, key: Key) -> Option<&state::Incident> {
+        self.state.incidents.get(&key)
+    }
+
+    /// All currently-open incidents.
+    pub fn incidents(&self) -> Vec<&state::Incident> {
+        self.state.incidents.values().collect()
+    }
+
     /// All jobs currently awaiting activation (created, or with an expired lock).
     pub fn pending_jobs(&self) -> Vec<&state::Job> {
         self.state
@@ -400,13 +410,16 @@ impl Engine {
                 // No retries left: park the job and raise an incident so the
                 // instance stops making progress on this token.
                 if retries == 0 {
+                    let incident_key = self.mint_key();
                     self.emit(
                         &mut log,
                         Event::IncidentRaised {
+                            incident_key,
                             instance_key,
                             element_instance_key,
                             element_id,
                             reason: error_message,
+                            job_key: Some(job_key),
                         },
                     );
                 }
@@ -478,17 +491,77 @@ impl Engine {
                         } else {
                             format!("unhandled BPMN error '{error_code}': {error_message}")
                         };
+                        let incident_key = self.mint_key();
                         self.emit(
                             &mut log,
                             Event::IncidentRaised {
+                                incident_key,
                                 instance_key,
                                 element_instance_key,
                                 element_id: task_element_id,
                                 reason,
+                                job_key: None,
                             },
                         );
                     }
                 }
+            }
+
+            Command::UpdateJobRetries { job_key, retries } => {
+                let job = self
+                    .state
+                    .jobs
+                    .get(&job_key)
+                    .ok_or(EngineError::JobNotFound { job_key })?;
+                // Retries are only meaningful while a job is still in play;
+                // completed/errored jobs are terminal.
+                if matches!(
+                    job.state,
+                    state::JobState::Completed | state::JobState::Errored
+                ) {
+                    return Err(EngineError::JobNotActive { job_key });
+                }
+                let instance_key = job.instance_key;
+                let retries = retries.max(0);
+                self.emit(
+                    &mut log,
+                    Event::JobRetriesUpdated {
+                        job_key,
+                        instance_key,
+                        retries,
+                    },
+                );
+            }
+
+            Command::ResolveIncident { incident_key } => {
+                let incident = self
+                    .state
+                    .incidents
+                    .get(&incident_key)
+                    .ok_or(EngineError::IncidentNotFound { incident_key })?;
+                let instance_key = incident.instance_key;
+                let job_key = incident.job_key;
+                // A job-incident can only be resolved once the parked job has
+                // retries again; otherwise it would immediately re-fail.
+                if let Some(job_key) = job_key {
+                    let retries = self.state.jobs.get(&job_key).map_or(0, |j| j.retries);
+                    if retries <= 0 {
+                        return Err(EngineError::IncidentNotResolvable {
+                            incident_key,
+                            reason: format!(
+                                "job {job_key} still has no retries; update its retries first"
+                            ),
+                        });
+                    }
+                }
+                self.emit(
+                    &mut log,
+                    Event::IncidentResolved {
+                        incident_key,
+                        instance_key,
+                        job_key,
+                    },
+                );
             }
         }
 
@@ -669,13 +742,16 @@ impl Engine {
             None => {
                 // The token stays active (parked on the incident) so the instance
                 // does not falsely complete.
+                let incident_key = self.mint_key();
                 let events = vec![Event::IncidentRaised {
+                    incident_key,
                     instance_key,
                     element_instance_key,
                     element_id: element_id.clone(),
                     reason: format!(
                         "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
                     ),
+                    job_key: None,
                 }];
                 (events, Vec::new())
             }
@@ -874,6 +950,11 @@ pub enum EngineError {
     /// `CompleteJob`/`FailJob` referenced a job that has never been activated. A
     /// job must be activated at least once before it can be completed or failed.
     JobNotActivated { job_key: Key },
+    /// `ResolveIncident` referenced an incident key that does not exist.
+    IncidentNotFound { incident_key: Key },
+    /// `ResolveIncident` referenced a job-incident whose job still has no
+    /// retries; the retries must be updated before it can be resolved.
+    IncidentNotResolvable { incident_key: Key, reason: String },
 }
 
 impl std::fmt::Display for EngineError {
@@ -897,6 +978,15 @@ impl std::fmt::Display for EngineError {
                     f,
                     "job {job_key} must be activated before it can be completed or failed"
                 )
+            }
+            EngineError::IncidentNotFound { incident_key } => {
+                write!(f, "no incident with key {incident_key}")
+            }
+            EngineError::IncidentNotResolvable {
+                incident_key,
+                reason,
+            } => {
+                write!(f, "incident {incident_key} cannot be resolved: {reason}")
             }
         }
     }
@@ -1295,6 +1385,110 @@ mod tests {
             .apply_command(Command::fail_job(job_key, 1, "nope"))
             .unwrap_err();
         assert_eq!(err, EngineError::JobNotActivated { job_key });
+    }
+
+    #[test]
+    fn should_recover_a_parked_job_by_updating_retries_and_resolving_its_incident() {
+        // given a job parked on a no-retries incident
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+        let raised = engine
+            .apply_command(Command::fail_job(job_key, 0, "boom"))
+            .unwrap();
+        let incident_key = raised
+            .iter()
+            .find_map(|e| match e {
+                Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+                _ => None,
+            })
+            .unwrap();
+
+        // when resolving before retries are restored, it is rejected
+        let err = engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EngineError::IncidentNotResolvable { incident_key: k, .. } if k == incident_key
+        ));
+
+        // when retries are updated and the incident resolved
+        engine
+            .apply_command(Command::update_job_retries(job_key, 2))
+            .unwrap();
+        let resolved = engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap();
+
+        // then the incident clears and the job is activatable again
+        assert!(resolved
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })));
+        assert!(engine.incident(incident_key).is_none());
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+
+        // and a worker can pick it up and drive the instance to completion
+        let job_key2 = engine.activate_jobs("payment", "B", 1, 60_000, 100)[0].key;
+        assert_eq!(job_key2, job_key);
+        engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap();
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_reject_resolving_an_unknown_incident() {
+        let mut engine = Engine::new();
+        let err = engine
+            .apply_command(Command::resolve_incident(999))
+            .unwrap_err();
+        assert_eq!(err, EngineError::IncidentNotFound { incident_key: 999 });
+    }
+
+    #[test]
+    fn should_clear_a_gateway_incident_on_resolution_without_reactivating_a_job() {
+        // A non-job incident (no matching exclusive flow) carries no job_key and
+        // resolves directly.
+        let def = ProcessBuilder::new("strict")
+            .start_event("s")
+            .exclusive_gateway("g")
+            .end_event("yes_end")
+            .connect("s", "g")
+            .connect_when(
+                "g",
+                "yes_end",
+                Condition::Equals {
+                    variable: "d".into(),
+                    value: Value::Bool(true),
+                },
+            )
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let vars = HashMap::from([("d".to_string(), Value::Int(7))]);
+        let created = engine
+            .apply_command(Command::create_instance_with("strict", vars))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let incident_key = engine.incidents()[0].key;
+        assert!(engine.incident(incident_key).unwrap().job_key.is_none());
+
+        // when resolved
+        engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap();
+
+        // then the incident record is gone
+        assert!(engine.incident(incident_key).is_none());
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
     }
 
     fn process_with_error_boundary() -> ProcessDefinition {

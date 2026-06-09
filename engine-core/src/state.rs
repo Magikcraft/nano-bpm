@@ -31,8 +31,9 @@ pub enum JobState {
     /// cannot be activated by another worker, but completion is by key alone.
     Activated,
     /// Failed with no retries left: an incident was raised and the job is parked.
-    /// It is neither activatable nor completable until the incident is resolved
-    /// (incident resolution is not yet modelled).
+    /// It is neither activatable nor completable. Updating its retries
+    /// ([`crate::Command::UpdateJobRetries`]) and then resolving the incident
+    /// ([`crate::Command::ResolveIncident`]) returns it to `Created`.
     Failed,
     /// Consumed by a thrown business error: the job is terminal (the error was
     /// either caught by a boundary event or raised an incident).
@@ -92,8 +93,29 @@ pub struct ProcessInstance {
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
     pub join_instances: HashMap<ElementId, Key>,
-    /// Reasons of incidents raised on this instance (parked tokens).
-    pub incidents: Vec<String>,
+    /// Keys of incidents currently raised on this instance (parked tokens). The
+    /// full records live in [`State::incidents`]; resolving an incident removes
+    /// its key from here.
+    pub incidents: Vec<Key>,
+}
+
+/// A raised incident: a token parked because something went wrong (a job
+/// exhausted its retries, an exclusive gateway matched no flow, or a thrown
+/// business error went uncaught). Incidents are resolved with
+/// [`crate::Command::ResolveIncident`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incident {
+    pub key: Key,
+    pub instance_key: Key,
+    /// The parked element instance the incident sits on.
+    pub element_instance_key: Key,
+    pub element_id: ElementId,
+    /// Human-readable explanation of why the incident was raised.
+    pub reason: String,
+    /// The job whose retry exhaustion caused this incident, if any. Only
+    /// job-incidents (`Some`) can be recovered by updating retries and
+    /// resolving; gateway/uncaught-error incidents carry `None`.
+    pub job_key: Option<Key>,
 }
 
 /// A deployed process definition together with the identity the engine assigned
@@ -116,6 +138,8 @@ pub struct State {
     pub processes: HashMap<String, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
+    /// All currently-open incidents, keyed by incident key.
+    pub incidents: HashMap<Key, Incident>,
 }
 
 impl State {
@@ -318,12 +342,54 @@ pub fn apply(state: &mut State, event: &Event) {
         }
 
         Event::IncidentRaised {
+            incident_key,
             instance_key,
+            element_instance_key,
+            element_id,
             reason,
-            ..
+            job_key,
         } => {
+            state.incidents.insert(
+                *incident_key,
+                Incident {
+                    key: *incident_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    reason: reason.clone(),
+                    job_key: *job_key,
+                },
+            );
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance.incidents.push(reason.clone());
+                instance.incidents.push(*incident_key);
+            }
+        }
+
+        Event::JobRetriesUpdated {
+            job_key, retries, ..
+        } => {
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                job.retries = *retries;
+            }
+        }
+
+        Event::IncidentResolved {
+            incident_key,
+            instance_key,
+            job_key,
+        } => {
+            state.incidents.remove(incident_key);
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.incidents.retain(|k| k != incident_key);
+            }
+            // A recoverable job-incident: return the parked job to the
+            // activatable pool so a worker can pick it up again.
+            if let Some(job_key) = job_key {
+                if let Some(job) = state.jobs.get_mut(job_key) {
+                    job.state = JobState::Created;
+                    job.worker = None;
+                    job.deadline = None;
+                }
             }
         }
 

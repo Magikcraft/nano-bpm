@@ -61,6 +61,14 @@ pub enum Command {
         error_code: String,
         error_message: String,
     },
+    /// Update a job's remaining retries. Used to recover a job parked on a
+    /// no-retries incident before resolving that incident. Does not by itself
+    /// unblock the job — the incident must still be resolved.
+    UpdateJobRetries { job_key: Key, retries: i32 },
+    /// Resolve an open incident. For a job-incident, the parked job (which must
+    /// have retries left) returns to the activatable pool so a worker can retry
+    /// it.
+    ResolveIncident { incident_key: Key },
 }
 
 impl Command {
@@ -116,6 +124,16 @@ impl Command {
             error_code: error_code.into(),
             error_message: error_message.into(),
         }
+    }
+
+    /// Convenience constructor for an `UpdateJobRetries`.
+    pub fn update_job_retries(job_key: Key, retries: i32) -> Self {
+        Command::UpdateJobRetries { job_key, retries }
+    }
+
+    /// Convenience constructor for a `ResolveIncident`.
+    pub fn resolve_incident(incident_key: Key) -> Self {
+        Command::ResolveIncident { incident_key }
     }
 
     /// Convenience constructor for an `ActivateJobs` request.
