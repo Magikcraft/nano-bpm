@@ -206,6 +206,21 @@ impl Engine {
             .expect("ExpireJobs never fails");
     }
 
+    /// Fires every armed timer whose due instant is at or before `now`, resuming
+    /// the token parked on each. Like [`Engine::expire_jobs`], the host drives
+    /// this periodically; the engine never reads a clock. Returns the events the
+    /// tick produced (empty when nothing was due).
+    pub fn trigger_timers(&mut self, now: u64) -> Vec<Event> {
+        self.apply_command_at(Command::TriggerTimers { now }, now)
+            .expect("TriggerTimers never fails")
+    }
+
+    /// All armed and fired timers (fired ones are retained so they never
+    /// re-fire). Filter by [`state::Timer::state`] for only-pending timers.
+    pub fn timers(&self) -> Vec<&state::Timer> {
+        self.state.timers.values().collect()
+    }
+
     /// Activates jobs of `job_type` and dispatches each to `handler` — the
     /// **callback** worker API for embedded use. Whatever variables the handler
     /// returns complete the job (by key); returning `None` leaves the job locked.
@@ -442,6 +457,41 @@ impl Engine {
                             instance_key,
                         },
                     );
+                }
+            }
+
+            Command::TriggerTimers { now } => {
+                // Fire every due timer (deterministic order by key), releasing
+                // each parked token along its catch event's outgoing flow.
+                let mut due: Vec<Key> = self
+                    .state
+                    .timers
+                    .values()
+                    .filter(|t| t.state == state::TimerState::Created && t.due_at <= now)
+                    .map(|t| t.key)
+                    .collect();
+                due.sort_unstable();
+                for timer_key in due {
+                    let timer = self.state.timers.get(&timer_key).expect("due timer exists");
+                    let instance_key = timer.instance_key;
+                    let element_instance_key = timer.element_instance_key;
+                    let element_id = timer.element_id.clone();
+                    self.emit(
+                        &mut log,
+                        Event::TimerTriggered {
+                            timer_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id: element_id.clone(),
+                        },
+                    );
+                    // The catch event is ACTIVATED and resting; completing it
+                    // takes its outgoing flow and resumes the token.
+                    queue.push_back(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
                 }
             }
 
@@ -777,6 +827,18 @@ impl Engine {
                     element_instance_key,
                     element_id,
                     job_type,
+                });
+            }
+            // A timer intermediate catch event arms a timer and parks the token;
+            // a clock tick (TriggerTimers) releases it once the timer is due.
+            Some(ElementKind::TimerIntermediateCatchEvent { duration_millis }) => {
+                let timer_key = self.mint_key();
+                events.push(Event::TimerCreated {
+                    timer_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    due_at: self.now.saturating_add(duration_millis),
                 });
             }
             // Pass-through elements (events, exclusive gateway, parallel split)
@@ -1244,6 +1306,96 @@ mod tests {
         engine
             .apply_command(Command::complete_job(job.key))
             .unwrap()
+    }
+
+    #[test]
+    fn should_park_on_timer_then_fire_when_due() {
+        // start -> charge (service task) -> wait (timer PT5S) -> end
+        let def = ProcessBuilder::new("delayed")
+            .start_event("start")
+            .service_task("charge", "payment")
+            .timer_intermediate_catch_event("wait", 5_000)
+            .end_event("end")
+            .connect("start", "charge")
+            .connect("charge", "wait")
+            .connect("wait", "end")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+        // create instance at t=1000, then run the job so the token reaches the timer.
+        let events = engine
+            .apply_command_at(Command::create_instance("delayed"), 1_000)
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        let job = engine
+            .activate_jobs("payment", "w", 1, 60_000, 1_000)
+            .into_iter()
+            .next()
+            .unwrap();
+        engine
+            .apply_command_at(Command::complete_job(job.key), 1_000)
+            .unwrap();
+
+        // Token now parked on the timer, armed for due_at = 1000 + 5000 = 6000.
+        assert!(!engine.is_completed(instance_key));
+        let timers = engine.timers();
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers[0].state, state::TimerState::Created);
+        assert_eq!(timers[0].due_at, 6_000);
+
+        // A tick before the due instant fires nothing.
+        let fired = engine.trigger_timers(5_999);
+        assert!(fired.is_empty());
+        assert!(!engine.is_completed(instance_key));
+
+        // A tick at/after the due instant fires the timer and completes the instance.
+        let fired = engine.trigger_timers(6_000);
+        assert!(fired
+            .iter()
+            .any(|e| matches!(e, Event::TimerTriggered { .. })));
+        assert!(engine.is_completed(instance_key));
+        assert!(fired.contains(&Event::ProcessInstanceCompleted { instance_key }));
+
+        // The timer is retained as Triggered so a later tick never re-fires it.
+        assert_eq!(engine.timers()[0].state, state::TimerState::Triggered);
+        assert!(engine.trigger_timers(10_000).is_empty());
+    }
+
+    #[test]
+    fn should_recover_parked_timer_via_replay() {
+        let def = ProcessBuilder::new("delayed")
+            .start_event("start")
+            .timer_intermediate_catch_event("wait", 5_000)
+            .end_event("end")
+            .connect("start", "wait")
+            .connect("wait", "end")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        let mut log = Vec::new();
+        log.extend(engine.apply_command(Command::DeployProcess(def)).unwrap());
+        log.extend(
+            engine
+                .apply_command_at(Command::create_instance("delayed"), 1_000)
+                .unwrap(),
+        );
+
+        // Replay the durable log into a fresh engine; the parked timer survives.
+        let mut recovered = Engine::replay(log);
+        let timers = recovered.timers();
+        assert_eq!(timers.len(), 1);
+        assert_eq!(timers[0].state, state::TimerState::Created);
+        let instance_key = timers[0].instance_key;
+        assert!(!recovered.is_completed(instance_key));
+
+        // The recovered engine fires the timer on the next due tick.
+        recovered.trigger_timers(6_000);
+        assert!(recovered.is_completed(instance_key));
     }
 
     #[test]

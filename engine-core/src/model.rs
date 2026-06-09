@@ -89,6 +89,12 @@ pub enum ElementKind {
         /// The BPMN error code this boundary event catches.
         error_code: String,
     },
+    /// A timer intermediate catch event. On activation it arms a timer due
+    /// `duration_millis` after the current clock and the token rests on it; the
+    /// token resumes along the event's outgoing flow once a clock tick
+    /// ([`crate::Command::TriggerTimers`]) finds the timer due. `duration_millis`
+    /// is in the same units the host feeds the engine as `now`.
+    TimerIntermediateCatchEvent { duration_millis: u64 },
 }
 
 /// A single BPMN flow node and its outgoing sequence flows.
@@ -214,6 +220,18 @@ impl ProcessBuilder {
                 error_code: error_code.into(),
             },
         )
+    }
+
+    /// Adds a timer intermediate catch event that holds the token for
+    /// `duration_millis` (in the host's clock units) before releasing it along
+    /// its outgoing flow. The token resumes when a clock tick
+    /// ([`crate::Command::TriggerTimers`]) finds the timer due.
+    pub fn timer_intermediate_catch_event(
+        self,
+        id: impl Into<String>,
+        duration_millis: u64,
+    ) -> Self {
+        self.add(id, ElementKind::TimerIntermediateCatchEvent { duration_millis })
     }
 
     /// Adds an unconditional sequence flow from `from` to `to`.

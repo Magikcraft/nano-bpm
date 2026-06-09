@@ -168,6 +168,25 @@ pub enum Event {
 
     /// The last token of a process instance was consumed; the instance is done.
     ProcessInstanceCompleted { instance_key: Key },
+
+    /// A timer was armed on a timer intermediate catch event; the token rests on
+    /// it until the timer is due. `due_at` is the logical instant it fires,
+    /// carried on the event so replay reconstructs it exactly.
+    TimerCreated {
+        timer_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        due_at: u64,
+    },
+    /// A due timer fired; its token is released along the catch event's outgoing
+    /// flow (the element-completion and sequence-flow events follow).
+    TimerTriggered {
+        timer_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
 }
 
 impl Event {
@@ -196,6 +215,8 @@ impl Event {
             | Event::JobRetriesUpdated { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
             | Event::IncidentResolved { instance_key, .. }
+            | Event::TimerCreated { instance_key, .. }
+            | Event::TimerTriggered { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. } => None,
         }
@@ -269,6 +290,16 @@ impl Event {
                     m = m.max(*j);
                 }
             }
+            Event::TimerCreated {
+                timer_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*timer_key).max(*element_instance_key),
+            Event::TimerTriggered {
+                timer_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*timer_key).max(*element_instance_key),
             _ => {}
         }
         m

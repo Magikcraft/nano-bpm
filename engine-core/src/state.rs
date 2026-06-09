@@ -158,6 +158,33 @@ pub struct Incident {
     pub operation_reference: Option<i64>,
 }
 
+/// Lifecycle state of a timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TimerState {
+    /// Armed and waiting: it fires once a clock tick finds it due.
+    Created,
+    /// Fired: its token has been released. Retained so it is not re-fired.
+    Triggered,
+}
+
+/// An armed timer holding a token on a timer intermediate catch event until its
+/// `due_at` instant passes. A clock tick ([`crate::Command::TriggerTimers`])
+/// fires every due timer, releasing its token along the event's outgoing flow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Timer {
+    pub key: Key,
+    pub instance_key: Key,
+    /// The catch-event element instance the token rests on while waiting.
+    pub element_instance_key: Key,
+    pub element_id: ElementId,
+    /// The logical instant at which the timer becomes due, in the host's clock
+    /// units (Unix epoch milliseconds on the server). Carried on the
+    /// [`crate::Event::TimerCreated`] event, so replay reconstructs it exactly.
+    pub due_at: u64,
+    pub state: TimerState,
+}
+
 /// A deployed process definition together with the identity the engine assigned
 /// it at deploy time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +208,10 @@ pub struct State {
     /// All incidents ever raised, keyed by incident key, retained after
     /// resolution as an audit trail (each carries its [`IncidentState`]).
     pub incidents: HashMap<Key, Incident>,
+    /// Armed and fired timers, keyed by timer key. A fired timer is retained
+    /// (transitioned to [`TimerState::Triggered`]) so a clock tick never fires
+    /// it twice.
+    pub timers: HashMap<Key, Timer>,
 }
 
 impl State {
@@ -454,6 +485,32 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::ProcessInstanceCompleted { instance_key } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
+            }
+        }
+
+        Event::TimerCreated {
+            timer_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            due_at,
+        } => {
+            state.timers.insert(
+                *timer_key,
+                Timer {
+                    key: *timer_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    due_at: *due_at,
+                    state: TimerState::Created,
+                },
+            );
+        }
+
+        Event::TimerTriggered { timer_key, .. } => {
+            if let Some(timer) = state.timers.get_mut(timer_key) {
+                timer.state = TimerState::Triggered;
             }
         }
     }

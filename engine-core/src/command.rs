@@ -45,6 +45,11 @@ pub enum Command {
     /// `now`, making it activatable again. A periodic "tick" the host drives;
     /// keeps lock expiry deterministic and out of the engine's clock.
     ExpireJobs { now: u64 },
+    /// Fire every armed timer whose `due_at` is at or before `now`, releasing the
+    /// token parked on its timer intermediate catch event along the event's
+    /// outgoing flow. A periodic "tick" the host drives; keeps timer firing
+    /// deterministic and out of the engine's clock.
+    TriggerTimers { now: u64 },
     /// Report that a job failed, setting its remaining `retries`. With retries
     /// left the job becomes activatable again; with none an incident is raised
     /// and the job parks. `error_message` is recorded as the incident reason.

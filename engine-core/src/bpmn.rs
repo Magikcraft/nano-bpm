@@ -104,6 +104,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut condition_text: Option<String> = None;
     // The boundary event currently being read (to attach its errorEventDefinition).
     let mut cur_boundary: Option<PendingBoundary> = None;
+    // Index of the timer intermediate catch event currently being read, and a
+    // buffer for its nested `timeDuration` text while inside that element.
+    let mut cur_timer_catch: Option<usize> = None;
+    let mut duration_text: Option<String> = None;
     // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
     let mut errors: HashMap<String, String> = HashMap::new();
 
@@ -181,6 +185,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     cur_flow = idx;
                                 }
                             }
+                            "intermediateCatchEvent" => {
+                                let idx = acc.add_node(attrs, NodeKind::TimerCatch);
+                                if !self_closing {
+                                    cur_timer_catch = idx;
+                                }
+                            }
+                            "timeDuration" if cur_timer_catch.is_some() => {
+                                duration_text = Some(String::new());
+                            }
                             "conditionExpression" if cur_flow.is_some() => {
                                 condition_text = Some(String::new());
                             }
@@ -194,6 +207,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 if let Some(buf) = condition_text.as_mut() {
                     buf.push_str(text);
                 }
+                if let Some(buf) = duration_text.as_mut() {
+                    buf.push_str(text);
+                }
             }
             Token::End { name } => match local_name(name) {
                 "process" => {
@@ -203,6 +219,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_service_task = None;
                     cur_flow = None;
                     cur_boundary = None;
+                    cur_timer_catch = None;
+                    duration_text = None;
                 }
                 "serviceTask" => cur_service_task = None,
                 "boundaryEvent" => {
@@ -218,6 +236,14 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         (current.as_mut(), cur_flow, condition_text.take())
                     {
                         acc.flows[idx].condition = parse_condition(&text);
+                    }
+                }
+                "intermediateCatchEvent" => cur_timer_catch = None,
+                "timeDuration" => {
+                    if let (Some(acc), Some(idx), Some(text)) =
+                        (current.as_mut(), cur_timer_catch, duration_text.take())
+                    {
+                        acc.nodes[idx].duration_millis = parse_iso8601_duration(&text);
                     }
                 }
                 "sequenceFlow" => cur_flow = None,
@@ -242,6 +268,9 @@ struct NodeAcc {
     kind: NodeKind,
     /// For service tasks: the resolved job type (defaults to the id at build).
     job_type: Option<String>,
+    /// For timer intermediate catch events: the parsed timer duration in
+    /// milliseconds (from a nested `timerEventDefinition`/`timeDuration`).
+    duration_millis: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +280,7 @@ enum NodeKind {
     Service,
     Exclusive,
     Parallel,
+    TimerCatch,
 }
 
 /// A sequence flow collected while scanning.
@@ -294,6 +324,7 @@ impl ProcessAcc {
             id: id.to_string(),
             kind,
             job_type: None,
+            duration_millis: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -323,6 +354,10 @@ impl ProcessAcc {
                 NodeKind::Service => {
                     let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
                     builder.service_task(node.id, job_type)
+                }
+                NodeKind::TimerCatch => {
+                    let duration_millis = node.duration_millis.unwrap_or(0);
+                    builder.timer_intermediate_catch_event(node.id, duration_millis)
                 }
             };
         }
@@ -368,6 +403,54 @@ impl ProcessAcc {
             reason: e.to_string(),
         })
     }
+}
+
+/// Parses an ISO-8601 duration (e.g. `PT5S`, `PT1M30S`, `PT2H`, `P1DT6H`,
+/// `P1W`) into milliseconds. Supports weeks, days, hours, minutes and seconds
+/// (the date-portion years/months are ambiguous in length and not supported).
+/// Returns `None` if the string is not a recognisable duration.
+fn parse_iso8601_duration(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    let s = s.strip_prefix('P')?;
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut total_millis: u64 = 0;
+    let mut in_time = false;
+    let mut num = String::new();
+    let mut saw_unit = false;
+
+    for c in s.chars() {
+        match c {
+            'T' => in_time = true,
+            '0'..='9' => num.push(c),
+            _ => {
+                if num.is_empty() {
+                    return None;
+                }
+                let value: u64 = num.parse().ok()?;
+                num.clear();
+                let millis = match (in_time, c) {
+                    (false, 'W') => value.checked_mul(7 * 24 * 60 * 60 * 1000),
+                    (false, 'D') => value.checked_mul(24 * 60 * 60 * 1000),
+                    (true, 'H') => value.checked_mul(60 * 60 * 1000),
+                    (true, 'M') => value.checked_mul(60 * 1000),
+                    (true, 'S') => value.checked_mul(1000),
+                    // 'M' before 'T' is months (unsupported) and 'Y' is years.
+                    _ => return None,
+                }?;
+                total_millis = total_millis.checked_add(millis)?;
+                saw_unit = true;
+            }
+        }
+    }
+
+    // Trailing digits without a unit, or no units at all, are invalid.
+    if !num.is_empty() || !saw_unit {
+        return None;
+    }
+    Some(total_millis)
 }
 
 /// Parses a FEEL-ish `conditionExpression` body into a [`Condition`].
@@ -637,6 +720,51 @@ mod tests {
     <bpmn:sequenceFlow id="f2" sourceRef="charge" targetRef="done" />
   </bpmn:process>
 </bpmn:definitions>"#;
+
+    #[test]
+    fn should_parse_a_timer_intermediate_catch_event() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="delayed">
+              <bpmn:startEvent id="s" />
+              <bpmn:intermediateCatchEvent id="wait">
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT1M30S</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:intermediateCatchEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="wait" />
+              <bpmn:sequenceFlow id="b" sourceRef="wait" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        assert_eq!(
+            def.element("wait").unwrap().kind,
+            ElementKind::TimerIntermediateCatchEvent {
+                duration_millis: 90_000
+            }
+        );
+        assert_eq!(def.element("wait").unwrap().outgoing[0].to, "e");
+    }
+
+    #[test]
+    fn should_parse_iso8601_durations() {
+        assert_eq!(parse_iso8601_duration("PT5S"), Some(5_000));
+        assert_eq!(parse_iso8601_duration("PT1M"), Some(60_000));
+        assert_eq!(parse_iso8601_duration("PT2H"), Some(7_200_000));
+        assert_eq!(parse_iso8601_duration("P1D"), Some(86_400_000));
+        assert_eq!(parse_iso8601_duration("P1W"), Some(604_800_000));
+        assert_eq!(parse_iso8601_duration("P1DT6H30M"), Some(109_800_000));
+        assert_eq!(parse_iso8601_duration(" PT10S "), Some(10_000));
+        // invalid / unsupported
+        assert_eq!(parse_iso8601_duration("5S"), None);
+        assert_eq!(parse_iso8601_duration("P"), None);
+        assert_eq!(parse_iso8601_duration("PT"), None);
+        assert_eq!(parse_iso8601_duration("P1Y"), None);
+        assert_eq!(parse_iso8601_duration("PT5"), None);
+    }
 
     #[test]
     fn should_parse_a_linear_process_with_a_service_task() {
