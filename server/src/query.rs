@@ -389,14 +389,25 @@ pub fn paginate<T>(
 ) -> Page<T> {
     let total = sorted.len() as i64;
 
+    // Per the search spec every `limit` defaults to 100 and is bounded to
+    // [1, 10000]; clamp so a missing, zero, or oversized limit can never
+    // materialize an unbounded page. The generated `limit` fields differ in
+    // width across pagination variants, so accept anything convertible to u64.
     let default_limit = 100usize;
+    const MAX_LIMIT: u64 = 10_000;
+    fn clamp_limit<T: Into<u64>>(limit: Option<T>, default: usize) -> usize {
+        match limit {
+            Some(l) => (l.into().clamp(1, MAX_LIMIT)) as usize,
+            None => default,
+        }
+    }
     let (start, limit, backward_before) = match page {
         Some(models::SearchQueryPageRequest::LimitPagination(p)) => {
-            (0usize, p.limit.map(|l| l as usize).unwrap_or(default_limit), None)
+            (0usize, clamp_limit(p.limit, default_limit), None)
         }
         Some(models::SearchQueryPageRequest::OffsetPagination(p)) => (
             p.from.map(|f| f as usize).unwrap_or(0),
-            p.limit.map(|l| l as usize).unwrap_or(default_limit),
+            clamp_limit(p.limit, default_limit),
             None,
         ),
         Some(models::SearchQueryPageRequest::CursorForwardPagination(p)) => {
@@ -404,12 +415,11 @@ pub fn paginate<T>(
             let start = after
                 .and_then(|k| sorted.iter().position(|(key, _)| *key == k).map(|i| i + 1))
                 .unwrap_or(0);
-            (start, p.limit.map(|l| l as usize).unwrap_or(default_limit), None)
+            (start, clamp_limit(p.limit, default_limit), None)
         }
         Some(models::SearchQueryPageRequest::CursorBackwardPagination(p)) => {
             let before = p.before.as_deref().and_then(decode_cursor);
-            let limit = p.limit.map(|l| l as usize).unwrap_or(default_limit);
-            (0usize, limit, before)
+            (0usize, clamp_limit(p.limit, default_limit), before)
         }
         None => (0usize, default_limit, None),
     };
@@ -546,6 +556,33 @@ mod tests {
             assert_eq!(decode_cursor(&c), Some(key));
         }
         assert_eq!(decode_cursor("not base64!!"), None);
+    }
+
+    #[test]
+    fn paginate_defaults_to_100_and_clamps_limit() {
+        let rows: Vec<(u64, u64)> = (0..500).map(|k| (k, k)).collect();
+
+        // No page request -> spec default of 100, full total reported.
+        let p = paginate(rows.clone(), None);
+        assert_eq!(p.items.len(), 100);
+        assert_eq!(p.response.total_items, 500);
+
+        // Explicit small limit is honored.
+        let req = models::SearchQueryPageRequest::LimitPagination(models::LimitPagination {
+            limit: Some(10),
+        });
+        let p = paginate(rows.clone(), Some(&req));
+        assert_eq!(p.items.len(), 10);
+        assert_eq!(p.response.total_items, 500);
+
+        // Oversized limit clamps to MAX_LIMIT (10000); only 500 rows exist.
+        let big: Vec<(u64, u64)> = (0..20_000).map(|k| (k, k)).collect();
+        let req = models::SearchQueryPageRequest::LimitPagination(models::LimitPagination {
+            limit: Some(u16::MAX),
+        });
+        let p = paginate(big, Some(&req));
+        assert_eq!(p.items.len(), 10_000);
+        assert_eq!(p.response.total_items, 20_000);
     }
 
     #[test]

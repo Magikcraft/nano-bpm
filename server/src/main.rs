@@ -940,14 +940,14 @@ impl ServerImpl {
             |inc| inc.key,
         );
 
-        let sorted: Vec<(u64, models::IncidentResult)> = matched
-            .into_iter()
-            .map(|inc| (inc.key, incident_result(inc)))
-            .collect();
+        let sorted: Vec<(u64, &readstore::IncidentRow)> =
+            matched.into_iter().map(|inc| (inc.key, inc)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::IncidentResult> =
+            page.items.into_iter().map(incident_result).collect();
 
         Ok(Resp::Status200_TheIncidentSearchResult(
-            models::IncidentSearchQueryResult::new(page.response, page.items),
+            models::IncidentSearchQueryResult::new(page.response, items),
         ))
     }
 
@@ -1001,14 +1001,16 @@ impl ServerImpl {
             |inst| inst.key,
         );
 
-        let sorted: Vec<(u64, models::ProcessInstanceResult)> = matched
-            .into_iter()
-            .map(|inst| (inst.key, process_instance_result(inst)))
-            .collect();
+        let sorted: Vec<(u64, &readstore::ProcessInstanceRow)> =
+            matched.into_iter().map(|inst| (inst.key, inst)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        // Build result models only for the returned page, never the whole
+        // (potentially very large) matched set.
+        let items: Vec<models::ProcessInstanceResult> =
+            page.items.into_iter().map(process_instance_result).collect();
 
         Ok(Resp::Status200_TheProcessInstanceSearchResult(
-            models::ProcessInstanceSearchQueryResult::new(page.response, page.items),
+            models::ProcessInstanceSearchQueryResult::new(page.response, items),
         ))
     }
 
@@ -1067,14 +1069,14 @@ impl ServerImpl {
             |job| job.key,
         );
 
-        let sorted: Vec<(u64, models::JobSearchResult)> = matched
-            .into_iter()
-            .map(|job| (job.key, job_search_result(job)))
-            .collect();
+        let sorted: Vec<(u64, &readstore::JobRow)> =
+            matched.into_iter().map(|job| (job.key, job)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::JobSearchResult> =
+            page.items.into_iter().map(job_search_result).collect();
 
         Ok(Resp::Status200_TheJobSearchResult(
-            models::JobSearchQueryResult::new(page.response, page.items),
+            models::JobSearchQueryResult::new(page.response, items),
         ))
     }
 
@@ -1135,14 +1137,17 @@ impl ServerImpl {
             |d| d.key,
         );
 
-        let sorted: Vec<(u64, models::ProcessDefinitionResult)> = matched
-            .into_iter()
-            .map(|d| (d.key, process_definition_result(d)))
-            .collect();
+        let sorted: Vec<(u64, &readstore::ProcessDefinitionRow)> =
+            matched.into_iter().map(|d| (d.key, d)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::ProcessDefinitionResult> = page
+            .items
+            .into_iter()
+            .map(process_definition_result)
+            .collect();
 
         Ok(Resp::Status200_TheProcessDefinitionSearchResult(
-            models::ProcessDefinitionSearchQueryResult::new(page.response, page.items),
+            models::ProcessDefinitionSearchQueryResult::new(page.response, items),
         ))
     }
 
