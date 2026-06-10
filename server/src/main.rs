@@ -70,7 +70,9 @@ impl ServerImpl {
                 .connect("work", "end")
                 .build()
                 .expect("valid demo process");
-            journal
+            // Seed durability is non-critical: a fresh journal re-seeds on every
+            // start, so we don't await the commit here.
+            let _ = journal
                 .apply_command(Command::DeployProcess(demo))
                 .expect("deploy demo process");
         }
@@ -106,83 +108,103 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
+        // Apply under the engine write lock inside a scope so the (non-Send) lock
+        // guard is dropped before we await durability. The block yields the
+        // response plus the commit to await (None on the error paths, which wrote
+        // nothing).
+        let (response, commit) = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
 
-        // The engine starts processes by BPMN process id. A creation-by-key
-        // request is resolved to its process id by looking up the deployed
-        // definition whose key matches; an unknown key is rejected as invalid
-        // input (the create endpoint has no 404 variant).
-        let process_id = match body {
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
-                b,
-            ) => b.process_definition_id.clone(),
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
-                b,
-            ) => {
-                let requested = &b.process_definition_key.0;
-                match engine
-                    .state()
-                    .processes
-                    .values()
-                    .find(|d| d.key.to_string() == *requested)
-                {
-                    Some(d) => d.definition.id.clone(),
-                    None => {
-                        return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                            "Process not found",
-                            400,
-                            format!("No deployed process with key '{requested}'."),
-                        )));
+            // The engine starts processes by BPMN process id. A creation-by-key
+            // request is resolved to its process id by looking up the deployed
+            // definition whose key matches; an unknown key is rejected as invalid
+            // input (the create endpoint has no 404 variant).
+            let process_id = match body {
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                    b,
+                ) => b.process_definition_id.clone(),
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
+                    b,
+                ) => {
+                    let requested = &b.process_definition_key.0;
+                    match engine
+                        .state()
+                        .processes
+                        .values()
+                        .find(|d| d.key.to_string() == *requested)
+                    {
+                        Some(d) => d.definition.id.clone(),
+                        None => {
+                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                                "Process not found",
+                                400,
+                                format!("No deployed process with key '{requested}'."),
+                            )));
+                        }
                     }
                 }
+            };
+
+            match engine
+                .apply_command_at(Command::create_instance(process_id.clone()), now_millis())
+            {
+                Ok((events, commit)) => {
+                    let instance_key = events
+                        .iter()
+                        .find_map(Event::instance_key)
+                        .expect("created instance has a key");
+                    // Project the real deployed key and version now that the
+                    // instance exists, so by-id and by-key requests report the
+                    // same definition identity.
+                    let (definition_key, version) = engine
+                        .state()
+                        .processes
+                        .get(&process_id)
+                        .map(|d| (d.key.to_string(), d.version))
+                        .unwrap_or_else(|| (process_id.clone(), 1));
+                    let result = models::CreateProcessInstanceResult::new(
+                        process_id.clone(),
+                        version,
+                        "<default>".to_string(),
+                        std::collections::HashMap::new(),
+                        models::ProcessDefinitionKey(definition_key),
+                        models::ProcessInstanceKey(instance_key.to_string()),
+                        Vec::new(),
+                        nanobpm_gateway_rest::types::Nullable::Null,
+                    );
+                    (
+                        Resp::Status200_TheProcessInstanceWasCreated(result),
+                        Some(commit),
+                    )
+                }
+                Err(EngineError::ProcessNotFound { process_id }) => (
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Process not found",
+                        400,
+                        format!("No deployed process with id '{process_id}'."),
+                    )),
+                    None,
+                ),
+                Err(e) => (
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        e.to_string(),
+                    )),
+                    None,
+                ),
             }
         };
 
-        match engine.apply_command_at(Command::create_instance(process_id.clone()), now_millis()) {
-            Ok(events) => {
-                let instance_key = events
-                    .iter()
-                    .find_map(Event::instance_key)
-                    .expect("created instance has a key");
-                // Project the real deployed key and version now that the
-                // instance exists, so by-id and by-key requests report the same
-                // definition identity.
-                let (definition_key, version) = engine
-                    .state()
-                    .processes
-                    .get(&process_id)
-                    .map(|d| (d.key.to_string(), d.version))
-                    .unwrap_or_else(|| (process_id.clone(), 1));
-                let result = models::CreateProcessInstanceResult::new(
-                    process_id.clone(),
-                    version,
-                    "<default>".to_string(),
-                    std::collections::HashMap::new(),
-                    models::ProcessDefinitionKey(definition_key),
-                    models::ProcessInstanceKey(instance_key.to_string()),
-                    Vec::new(),
-                    nanobpm_gateway_rest::types::Nullable::Null,
-                );
-                // Starting an instance parks it on its first service task, so new
-                // jobs may now be activatable: wake any long-pollers.
-                self.jobs_available.notify_waiters();
-                Ok(Resp::Status200_TheProcessInstanceWasCreated(result))
-            }
-            Err(EngineError::ProcessNotFound { process_id }) => {
-                Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Process not found",
-                    400,
-                    format!("No deployed process with id '{process_id}'."),
-                )))
-            }
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
+        // Block on durability before acknowledging: a returned 200 means the
+        // create is fsynced.
+        if let Some(commit) = commit {
+            commit.wait().await;
+            // Starting an instance parks it on its first service task, so new
+            // jobs may now be activatable: wake any long-pollers.
+            self.jobs_available.notify_waiters();
         }
+        Ok(response)
     }
 
     async fn complete_job_impl(
@@ -214,10 +236,13 @@ impl ServerImpl {
             })
             .unwrap_or_default();
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        match engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
-        {
-            Ok(_) => {
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.jobs_available.notify_waiters();
@@ -278,11 +303,13 @@ impl ServerImpl {
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        match engine
-            .apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
-        {
-            Ok(_) => {
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
                 // Failing with retries left returns the job to the activatable
                 // pool, so wake any long-pollers.
                 self.jobs_available.notify_waiters();
@@ -344,12 +371,16 @@ impl ServerImpl {
             _ => String::new(),
         };
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        match engine.apply_command_at(
-            Command::throw_job_error(job_key, body.error_code.clone(), error_message),
-            now_millis(),
-        ) {
-            Ok(_) => {
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(
+                Command::throw_job_error(job_key, body.error_code.clone(), error_message),
+                now_millis(),
+            )
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
                 // A caught error can route the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.jobs_available.notify_waiters();
@@ -413,11 +444,15 @@ impl ServerImpl {
             }
         };
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        match engine
-            .apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
-        {
-            Ok(_) => Ok(Resp::Status204_TheJobWasUpdatedSuccessfully),
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
+            }
             Err(EngineError::JobNotFound { job_key }) => {
                 Ok(Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
                     "Job not found",
@@ -471,9 +506,13 @@ impl ServerImpl {
             operation_reference,
         };
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        match engine.apply_command_at(command, now_millis()) {
-            Ok(_) => {
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(command, now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
                 self.jobs_available.notify_waiters();
@@ -531,9 +570,15 @@ impl ServerImpl {
 
         let variables = from_object_map(&body.variables);
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        match engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis()) {
-            Ok(_) => Ok(Resp::Status204_TheVariablesWereUpdated),
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheVariablesWereUpdated)
+            }
             Err(EngineError::ScopeNotFound { scope_key }) => {
                 Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "Scope not found",
@@ -645,15 +690,17 @@ impl ServerImpl {
             .map(from_object_map)
             .unwrap_or_default();
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        let events = engine
-            .apply_command_at(
-                Command::correlate_message_with(body.name.clone(), correlation_key, variables),
-                now_millis(),
-            )
-            .expect("CorrelateMessage never fails");
+        let (events, commit) = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine
+                .apply_command_at(
+                    Command::correlate_message_with(body.name.clone(), correlation_key, variables),
+                    now_millis(),
+                )
+                .expect("CorrelateMessage never fails")
+        };
         let message_key = message_key_of(&events);
-        drop(engine);
+        commit.wait().await;
 
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
@@ -682,13 +729,15 @@ impl ServerImpl {
             .map(from_object_map)
             .unwrap_or_default();
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        let events = engine
-            .apply_command_at(
-                Command::correlate_message_with(body.name.clone(), correlation_key, variables),
-                now_millis(),
-            )
-            .expect("CorrelateMessage never fails");
+        let (events, commit) = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine
+                .apply_command_at(
+                    Command::correlate_message_with(body.name.clone(), correlation_key, variables),
+                    now_millis(),
+                )
+                .expect("CorrelateMessage never fails")
+        };
         let message_key = message_key_of(&events);
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
@@ -699,7 +748,7 @@ impl ServerImpl {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
-        drop(engine);
+        commit.wait().await;
 
         match correlated_instance {
             Some(instance_key) => {
@@ -1161,15 +1210,17 @@ impl ServerImpl {
             }
         }
 
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        let events = match engine.apply_command(Command::DeployResources(processes)) {
-            Ok(events) => events,
-            Err(e) => {
-                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid deployment",
-                    400,
-                    e.to_string(),
-                )));
+        let (events, commit) = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            match engine.apply_command(Command::DeployResources(processes)) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid deployment",
+                        400,
+                        e.to_string(),
+                    )));
+                }
             }
         };
 
@@ -1209,6 +1260,7 @@ impl ServerImpl {
         );
         // Deployments don't create jobs, but a freshly available process means a
         // later createProcessInstance can; nothing to notify here.
+        commit.wait().await;
         Ok(Resp::Status200_TheResourcesAreDeployed(result))
     }
 
@@ -1741,7 +1793,7 @@ async fn main() {
                 let now = now_millis();
                 let produced = {
                     let mut journal = journal.write().expect("engine lock poisoned");
-                    let fired = journal.trigger_timers(now);
+                    let (fired, _commit) = journal.trigger_timers(now);
                     journal.expire_jobs(now);
                     !fired.is_empty()
                 };

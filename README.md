@@ -148,9 +148,26 @@ across cores. The engine itself is a **single writer**, so it sits behind a
 activation, the background tick) take the **write** lock and are serialized,
 while the read-only `search*`/`get*`/`topology` projections take the **read**
 lock and therefore run **concurrently across cores**. The lock is never held
-across an `.await`, and critical sections are short. Writes still flush the
-journal while holding the write lock, so a heavy write burst serializes on disk
-I/O; read-heavy load scales with the number of cores.
+across an `.await`, and critical sections are short. A write enqueues its events
+to the journal writer thread *under* the write lock (preserving command order),
+then releases the lock and `.await`s durability outside it, so disk I/O no longer
+serializes behind the engine lock; read-heavy load scales with the number of
+cores.
+
+### Durability (group-commit + fsync)
+
+The journal is owned by a dedicated `nanobpmn-journal-writer` thread. Each
+mutating command serializes its events and hands them to the writer over an
+ordered channel, receiving a `Commit` handle. The writer batches every queued
+request into a single `write_all` followed by one `sync_all` (**fsync**), then
+acks each batched command — amortizing the fsync cost across concurrent writes
+(**group commit**). A handler only returns its success status *after* its
+`Commit` resolves, i.e. after the events are durably on disk, so a `200`/`204`
+means "persisted and will survive a crash". If a journal write ever fails the
+writer aborts the process rather than serve state that outran the durable log;
+on restart the log replays to re-derive consistent state. Fire-and-forget
+internal writes (the background timer tick, startup seeding) drop the `Commit`,
+since replay re-derives their effects.
 
 > [!NOTE]
 > This uses `std::sync::RwLock`, whose fairness is platform-dependent and can

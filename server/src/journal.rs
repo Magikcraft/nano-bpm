@@ -3,9 +3,12 @@
 //! The engine itself is in-memory and event-sourced ([`Engine::apply_command_at`]
 //! returns the complete, ordered list of events a command produced). This
 //! [`Journal`] wraps the engine and persists those events to a newline-delimited
-//! JSON log, flushing before each call returns, so anything the server
-//! acknowledged survives a restart. On startup the log is replayed through
-//! [`Engine::replay`] to reconstruct state and the key generator.
+//! JSON log. Writes are handed to a dedicated background thread that
+//! **group-commits** — batching every concurrently in-flight command into a
+//! single `write` + `fsync` — and a command is acknowledged only once its events
+//! are fsynced, so anything the server returns `200` for survives a crash. On
+//! startup the log is replayed through [`Engine::replay`] to reconstruct state
+//! and the key generator.
 //!
 //! **Activation locks are deliberately not journaled.** Job activation
 //! (`activateJobs`) and lock expiry are *volatile lease state*: a crash forfeits
@@ -14,21 +17,98 @@
 //! semantic — after a restart, workers simply re-activate.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
 use nanobpmn_engine_core::{
     ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, ProcessInstance, State,
 };
+use tokio::sync::oneshot;
+
+/// A durable-write request handed to the background journal writer: the
+/// newline-terminated, serialized bytes for one command's events, plus a
+/// one-shot sender signalled once those bytes are fsynced to disk.
+struct WriteRequest {
+    bytes: Vec<u8>,
+    ack: oneshot::Sender<()>,
+}
+
+/// A handle to the durability of a single write. Awaiting [`Commit::wait`]
+/// resolves once the command's events have been group-committed (written and
+/// fsynced) by the background writer thread. A `Ready` commit is already durable
+/// (an in-memory journal, or a command that produced no events).
+#[must_use = "await the commit to guarantee the write is durable before responding"]
+pub struct Commit(CommitInner);
+
+enum CommitInner {
+    Ready,
+    Pending(oneshot::Receiver<()>),
+}
+
+impl Commit {
+    fn ready() -> Self {
+        Commit(CommitInner::Ready)
+    }
+
+    /// Waits until the write backing this commit has been fsynced. If the writer
+    /// thread is gone (shutdown), it resolves immediately rather than hanging.
+    pub async fn wait(self) {
+        if let CommitInner::Pending(rx) = self.0 {
+            let _ = rx.await;
+        }
+    }
+}
 
 /// The engine plus its durable event log.
 pub struct Journal {
     engine: Engine,
-    /// `None` for an in-memory (non-persistent) journal.
-    writer: Option<BufWriter<File>>,
+    /// `None` for an in-memory (non-persistent) journal; otherwise the channel to
+    /// the background writer thread that owns the log file.
+    writer: Option<Sender<WriteRequest>>,
+    /// Joined on drop so any not-yet-acked writes are flushed before the journal
+    /// goes away (matters for synchronous callers that never await the commit).
+    writer_thread: Option<JoinHandle<()>>,
     /// `true` when the journal started with no prior log, so the host knows it
     /// should seed any initial deployments.
     fresh: bool,
+}
+
+/// The background journal writer: blocks for the next request, drains every
+/// other request already queued, then **group-commits** the whole batch in a
+/// single `write` + `fsync` before signalling each command's commit. Batching
+/// amortizes one fsync across all concurrently in-flight writes.
+///
+/// A write or fsync failure is unrecoverable — the in-memory engine has already
+/// advanced past the durable log — so the process is aborted rather than risk
+/// acknowledging or serving non-durable state (mirrors the previous
+/// panic-on-I/O-error contract).
+fn writer_loop(mut file: File, rx: Receiver<WriteRequest>) {
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+        }
+
+        let mut buf = Vec::new();
+        for req in &batch {
+            buf.extend_from_slice(&req.bytes);
+        }
+
+        if let Err(e) = file.write_all(&buf).and_then(|()| file.sync_all()) {
+            tracing::error!(
+                "journal write failed: {e}; aborting to avoid serving non-durable state"
+            );
+            std::process::abort();
+        }
+
+        for req in batch {
+            // The receiver is gone for fire-and-forget writes (the background
+            // tick and startup seeding never await their commit); that's fine.
+            let _ = req.ack.send(());
+        }
+    }
 }
 
 impl Journal {
@@ -38,12 +118,14 @@ impl Journal {
         Self {
             engine: Engine::new(),
             writer: None,
+            writer_thread: None,
             fresh: true,
         }
     }
 
     /// Opens (creating if absent) the journal at `path`, replaying any existing
-    /// log to reconstruct engine state, then positions the writer to append.
+    /// log to reconstruct engine state, then spawns the background writer thread
+    /// positioned to append.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
         let mut engine = Engine::new();
@@ -67,9 +149,16 @@ impl Journal {
         }
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let (tx, rx) = mpsc::channel::<WriteRequest>();
+        let writer_thread = thread::Builder::new()
+            .name("nanobpmn-journal-writer".into())
+            .spawn(move || writer_loop(file, rx))
+            .expect("spawn journal writer thread");
+
         Ok(Self {
             engine,
-            writer: Some(BufWriter::new(file)),
+            writer: Some(tx),
+            writer_thread: Some(writer_thread),
             fresh,
         })
     }
@@ -79,35 +168,53 @@ impl Journal {
         self.fresh
     }
 
-    /// Appends and flushes a batch of durable events.
-    fn persist(&mut self, events: &[Event]) {
-        if let Some(writer) = self.writer.as_mut() {
-            for event in events {
-                let line = serde_json::to_string(event).expect("event serializes");
-                writeln!(writer, "{line}").expect("journal append");
-            }
-            writer.flush().expect("journal flush");
+    /// Serializes `events` and hands them to the background writer, returning a
+    /// [`Commit`] that resolves once they are fsynced. Empty batches and
+    /// in-memory journals are already durable, so they return a ready commit.
+    fn persist(&self, events: &[Event]) -> Commit {
+        let Some(writer) = self.writer.as_ref() else {
+            return Commit::ready();
+        };
+        if events.is_empty() {
+            return Commit::ready();
+        }
+
+        let mut bytes = Vec::new();
+        for event in events {
+            let line = serde_json::to_string(event).expect("event serializes");
+            bytes.extend_from_slice(line.as_bytes());
+            bytes.push(b'\n');
+        }
+
+        let (ack, rx) = oneshot::channel();
+        match writer.send(WriteRequest { bytes, ack }) {
+            Ok(()) => Commit(CommitInner::Pending(rx)),
+            // The writer thread is gone (shutting down); treat as already settled
+            // so callers never hang.
+            Err(_) => Commit::ready(),
         }
     }
 
     /// Applies a durable command at logical instant `now`, journaling its events
-    /// on success. Mirrors [`Engine::apply_command_at`].
+    /// on success. Returns the events and a [`Commit`] the caller should await
+    /// (outside any lock) before acknowledging the request. Mirrors
+    /// [`Engine::apply_command_at`].
     pub fn apply_command_at(
         &mut self,
         command: Command,
         now: u64,
-    ) -> Result<Vec<Event>, EngineError> {
+    ) -> Result<(Vec<Event>, Commit), EngineError> {
         let events = self.engine.apply_command_at(command, now)?;
-        self.persist(&events);
-        Ok(events)
+        let commit = self.persist(&events);
+        Ok((events, commit))
     }
 
     /// Applies a durable command using the engine's current clock, journaling its
     /// events on success. Mirrors [`Engine::apply_command`].
-    pub fn apply_command(&mut self, command: Command) -> Result<Vec<Event>, EngineError> {
+    pub fn apply_command(&mut self, command: Command) -> Result<(Vec<Event>, Commit), EngineError> {
         let events = self.engine.apply_command(command)?;
-        self.persist(&events);
-        Ok(events)
+        let commit = self.persist(&events);
+        Ok((events, commit))
     }
 
     /// Activates jobs **without** journaling: activation locks are volatile lease
@@ -127,11 +234,11 @@ impl Journal {
     /// Fires every due timer at logical instant `now`, journaling the resulting
     /// events (timers are durable business facts). Mirrors
     /// [`Engine::trigger_timers`]; returns the events produced (empty if none
-    /// were due).
-    pub fn trigger_timers(&mut self, now: u64) -> Vec<Event> {
+    /// were due) and their [`Commit`].
+    pub fn trigger_timers(&mut self, now: u64) -> (Vec<Event>, Commit) {
         let events = self.engine.trigger_timers(now);
-        self.persist(&events);
-        events
+        let commit = self.persist(&events);
+        (events, commit)
     }
 
     /// Releases expired activation locks at logical instant `now`, **without**
@@ -166,6 +273,17 @@ impl Journal {
     }
 }
 
+impl Drop for Journal {
+    fn drop(&mut self) {
+        // Close the channel so the writer thread drains any remaining requests
+        // and exits, then join it to guarantee fire-and-forget writes hit disk.
+        self.writer = None;
+        if let Some(handle) = self.writer_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,8 +311,10 @@ mod tests {
         let instance_key = {
             let mut journal = Journal::open(&path).unwrap();
             assert!(journal.is_fresh());
-            journal.apply_command(Command::DeployProcess(demo())).unwrap();
-            let events = journal
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (events, _) = journal
                 .apply_command(Command::create_instance("demo"))
                 .unwrap();
             events.iter().find_map(|e| e.instance_key()).unwrap()
