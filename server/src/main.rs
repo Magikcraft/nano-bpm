@@ -181,10 +181,10 @@ impl ServerImpl {
             // request is resolved to its process id by looking up the deployed
             // definition whose key matches; an unknown key is rejected as invalid
             // input (the create endpoint has no 404 variant).
-            let process_id = match body {
+            let (process_id, variables) = match body {
                 models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
                     b,
-                ) => b.process_definition_id.clone(),
+                ) => (b.process_definition_id.clone(), b.variables.as_ref()),
                 models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
                     b,
                 ) => {
@@ -195,7 +195,7 @@ impl ServerImpl {
                         .values()
                         .find(|d| d.key.to_string() == *requested)
                     {
-                        Some(d) => d.definition.id.clone(),
+                        Some(d) => (d.definition.id.clone(), b.variables.as_ref()),
                         None => {
                             return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                                 "Process not found",
@@ -206,10 +206,13 @@ impl ServerImpl {
                     }
                 }
             };
+            // Seed the root variable scope with any variables on the request.
+            let variables = variables.map(from_object_map).unwrap_or_default();
 
-            match engine
-                .apply_command_at(Command::create_instance(process_id.clone()), now_millis())
-            {
+            match engine.apply_command_at(
+                Command::create_instance_with(process_id.clone(), variables),
+                now_millis(),
+            ) {
                 Ok((events, commit)) => {
                     let instance_key = events
                         .iter()

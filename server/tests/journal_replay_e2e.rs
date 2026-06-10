@@ -974,3 +974,29 @@ fn activation_empty_fetch_variable_returns_all_variables() {
 
     server.shutdown();
 }
+
+#[test]
+fn create_instance_variables_flow_through_to_activated_jobs() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // Variables supplied on the create request seed the root scope, so an
+    // activated demo-work job carries them.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"demo","variables":{"a":1,"b":2,"c":3}}"#),
+    );
+    assert_eq!(status, 200, "create with variables failed: {body}");
+
+    let vars = activate_demo_job_variables(&server, None);
+    let obj = vars.as_object().expect("variables is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["a", "b", "c"], "created variables present on job");
+    assert_eq!(obj["a"].as_i64(), Some(1));
+    assert_eq!(obj["b"].as_i64(), Some(2));
+    assert_eq!(obj["c"].as_i64(), Some(3));
+
+    server.shutdown();
+}
