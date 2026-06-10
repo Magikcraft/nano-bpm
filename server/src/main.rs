@@ -11,9 +11,12 @@
 
 mod journal;
 mod query;
+mod readstore;
 mod stub_impls;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,11 +27,12 @@ use nanobpm_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, DeployedProcess, Engine, EngineError, Event, Incident, IncidentKind,
-    IncidentState, ProcessBuilder, ProcessInstance, ProcessInstanceState, State, Value,
+    ActivatedJob, Command, Engine, EngineError, Event, IncidentKind, IncidentState, ProcessBuilder,
+    ProcessInstanceState, Value,
 };
 
 use crate::journal::Journal;
+use crate::readstore::ReadStore;
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
@@ -48,6 +52,9 @@ const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 #[derive(Clone)]
 pub struct ServerImpl {
     journal: Arc<RwLock<Journal>>,
+    /// The read model. All `search*`/`get*` queries are answered from here
+    /// (eventually consistent), never from hot engine state.
+    store: Arc<ReadStore>,
     /// Notified whenever new jobs may have become activatable, so long-polling
     /// `activateJobs` requests can wake immediately instead of waiting out their
     /// full timeout.
@@ -55,10 +62,12 @@ pub struct ServerImpl {
 }
 
 impl ServerImpl {
-    /// Builds a server over `journal`, seeding the demo process only when the
-    /// journal is fresh (an existing log already carries its deployment, and
-    /// re-deploying would mint a spurious second version on every restart).
-    pub fn new(mut journal: Journal) -> Self {
+    /// Builds a server over `journal` and its read `store`, seeding the demo
+    /// process only when the journal is fresh (an existing log already carries
+    /// its deployment, and re-deploying would mint a spurious second version on
+    /// every restart). The `journal`'s exporter must already be wired so the
+    /// seed deployment is projected into the store.
+    pub fn new(mut journal: Journal, store: Arc<ReadStore>) -> Self {
         if journal.is_fresh() {
             // Pre-deploy a demo process so `createProcessInstance` (by id "demo")
             // has something to start. A real build would deploy from BPMN XML.
@@ -78,6 +87,7 @@ impl ServerImpl {
         }
         Self {
             journal: Arc::new(RwLock::new(journal)),
+            store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -85,8 +95,60 @@ impl ServerImpl {
 
 impl Default for ServerImpl {
     fn default() -> Self {
-        Self::new(Journal::in_memory())
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        build_server(Journal::in_memory(), store)
     }
+}
+
+/// Wires the read-model exporter onto `journal`, builds the [`ServerImpl`] (which
+/// seeds the demo process when the journal is fresh — that deployment is then
+/// forwarded to the exporter), and spawns the background exporter thread. The
+/// exporter must be set before `ServerImpl::new` so the seed deployment is
+/// projected; the thread is spawned after so it can hold the server's journal
+/// handle for hot-state eviction.
+fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
+    let (tx, rx) = mpsc::channel::<Vec<Event>>();
+    journal.set_exporter(tx);
+    let server = ServerImpl::new(journal, store.clone());
+    spawn_exporter(rx, store, server.journal.clone());
+    server
+}
+
+/// Spawns the read-model exporter thread. It drains the channel (batching every
+/// queued command's events), projects the batch into the read store, then evicts
+/// any now-completed instances from hot engine state under the journal write
+/// lock. The thread exits when the channel closes (all `ServerImpl` clones and
+/// the journal are dropped).
+fn spawn_exporter(
+    rx: mpsc::Receiver<Vec<Event>>,
+    store: Arc<ReadStore>,
+    journal: Arc<RwLock<Journal>>,
+) {
+    std::thread::Builder::new()
+        .name("nanobpmn-exporter".into())
+        .spawn(move || {
+            while let Ok(first) = rx.recv() {
+                let mut batch = first;
+                while let Ok(next) = rx.try_recv() {
+                    batch.extend(next);
+                }
+                let completed = match store.export(&batch) {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        tracing::error!("read-model export failed: {e}");
+                        continue;
+                    }
+                };
+                if !completed.is_empty() {
+                    let mut journal = journal.write().expect("engine lock poisoned");
+                    for key in completed {
+                        journal.evict_instance(key);
+                    }
+                    journal.shrink();
+                }
+            }
+        })
+        .expect("spawn read-model exporter thread");
 }
 
 impl AsRef<ServerImpl> for ServerImpl {
@@ -618,10 +680,10 @@ impl ServerImpl {
             }
         };
 
-        let engine = self.journal.read().expect("engine lock poisoned");
-        match engine.instance(key) {
+        let result = self.store.process_instance(key);
+        match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
-                process_instance_result(engine.state(), instance),
+                process_instance_result(&instance),
             )),
             None => Ok(
                 Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
@@ -795,10 +857,10 @@ impl ServerImpl {
             }
         };
 
-        let engine = self.journal.read().expect("engine lock poisoned");
-        match engine.incident(key) {
+        let result = self.store.incident(key);
+        match result {
             Some(incident) => Ok(Resp::Status200_TheIncidentIsSuccessfullyReturned(
-                incident_result(engine.state(), incident),
+                incident_result(&incident),
             )),
             None => Ok(Resp::Status404_TheIncidentWithTheGivenKeyWasNotFound(
                 problem(
@@ -817,22 +879,16 @@ impl ServerImpl {
         use apis::incident::SearchIncidentsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.journal.read().expect("engine lock poisoned");
-        let state = engine.state();
+        let incidents = self.store.incidents();
 
-        // Apply the filter algebra over each incident's string projections.
-        let mut matched: Vec<&Incident> = engine
-            .incidents()
-            .into_iter()
+        // Apply the filter algebra over each incident's string projections. The
+        // process-definition identity is denormalized onto the row at projection
+        // time, so no cross-entity lookup is needed here.
+        let mut matched: Vec<&readstore::IncidentRow> = incidents
+            .iter()
             .filter(|inc| match filter {
                 None => true,
                 Some(f) => {
-                    let process_definition_key = state
-                        .instances
-                        .get(&inc.instance_key)
-                        .and_then(|i| state.processes.get(&i.process_id))
-                        .map(|d| d.key.to_string())
-                        .unwrap_or_default();
                     query::match_basic_string(
                         &f.incident_key,
                         &inc.key.to_string(),
@@ -844,7 +900,7 @@ impl ServerImpl {
                         &inc.element_instance_key.to_string(),
                     ) && query::match_process_definition_key(
                         &f.process_definition_key,
-                        &process_definition_key,
+                        &inc.process_definition_key,
                     ) && match &f.job_key {
                         None => true,
                         some => query::match_job_key(
@@ -872,7 +928,7 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inc, field| match field {
-                "creationTime" => query::SortVal::Num(inc.created_at as i64),
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
                 "errorType" => {
                     query::SortVal::Str(incident_error_type_enum(inc.kind).to_string())
@@ -886,7 +942,7 @@ impl ServerImpl {
 
         let sorted: Vec<(u64, models::IncidentResult)> = matched
             .into_iter()
-            .map(|inc| (inc.key, incident_result(state, inc)))
+            .map(|inc| (inc.key, incident_result(inc)))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
 
@@ -902,31 +958,23 @@ impl ServerImpl {
         use apis::process_instance::SearchProcessInstancesResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.journal.read().expect("engine lock poisoned");
-        let state = engine.state();
+        let instances = self.store.process_instances();
 
-        let mut matched: Vec<&ProcessInstance> = state
-            .instances
-            .values()
+        let mut matched: Vec<&readstore::ProcessInstanceRow> = instances
+            .iter()
             .filter(|inst| match filter {
                 None => true,
                 Some(f) => {
-                    let (definition_id, definition_key) = state
-                        .processes
-                        .get(&inst.process_id)
-                        .map(|d| (d.definition.id.clone(), d.key.to_string()))
-                        .unwrap_or_else(|| (inst.process_id.clone(), String::new()));
                     let state_str = process_instance_state_enum(inst.state).to_string();
                     query::match_process_instance_key(
                         &f.process_instance_key,
                         &inst.key.to_string(),
                     ) && query::match_process_definition_key(
                         &f.process_definition_key,
-                        &definition_key,
-                    ) && query::match_string(&f.process_definition_id, &definition_id)
+                        &inst.process_definition_key,
+                    ) && query::match_string(&f.process_definition_id, &inst.process_definition_id)
                         && query::match_process_instance_state(&f.state, &state_str)
-                        && f.has_incident
-                            .is_none_or(|want| want != inst.incidents.is_empty())
+                        && f.has_incident.is_none_or(|want| want == inst.has_incident)
                 }
             })
             .collect();
@@ -939,20 +987,12 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inst, field| match field {
-                "processDefinitionId" => query::SortVal::Str(
-                    state
-                        .processes
-                        .get(&inst.process_id)
-                        .map(|d| d.definition.id.clone())
-                        .unwrap_or_else(|| inst.process_id.clone()),
-                ),
-                "processDefinitionKey" => query::SortVal::Num(
-                    state
-                        .processes
-                        .get(&inst.process_id)
-                        .map(|d| d.key as i64)
-                        .unwrap_or(0),
-                ),
+                "processDefinitionId" => {
+                    query::SortVal::Str(inst.process_definition_id.clone())
+                }
+                "processDefinitionKey" => {
+                    query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
+                }
                 "state" => {
                     query::SortVal::Str(process_instance_state_enum(inst.state).to_string())
                 }
@@ -963,7 +1003,7 @@ impl ServerImpl {
 
         let sorted: Vec<(u64, models::ProcessInstanceResult)> = matched
             .into_iter()
-            .map(|inst| (inst.key, process_instance_result(state, inst)))
+            .map(|inst| (inst.key, process_instance_result(inst)))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
 
@@ -979,21 +1019,13 @@ impl ServerImpl {
         use apis::job::SearchJobsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.journal.read().expect("engine lock poisoned");
-        let state = engine.state();
+        let jobs = self.store.jobs();
 
-        let mut matched: Vec<&nanobpmn_engine_core::Job> = state
-            .jobs
-            .values()
+        let mut matched: Vec<&readstore::JobRow> = jobs
+            .iter()
             .filter(|job| match filter {
                 None => true,
                 Some(f) => {
-                    let definition_key = state
-                        .instances
-                        .get(&job.instance_key)
-                        .and_then(|i| state.processes.get(&i.process_id))
-                        .map(|d| d.key.to_string())
-                        .unwrap_or_default();
                     query::match_job_key(&f.job_key, &job.key.to_string())
                         && query::match_process_instance_key(
                             &f.process_instance_key,
@@ -1001,7 +1033,7 @@ impl ServerImpl {
                         )
                         && query::match_process_definition_key(
                             &f.process_definition_key,
-                            &definition_key,
+                            &job.process_definition_key,
                         )
                         && query::match_element_instance_key(
                             &f.element_instance_key,
@@ -1037,7 +1069,7 @@ impl ServerImpl {
 
         let sorted: Vec<(u64, models::JobSearchResult)> = matched
             .into_iter()
-            .map(|job| (job.key, job_search_result(state, job)))
+            .map(|job| (job.key, job_search_result(job)))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
 
@@ -1057,16 +1089,14 @@ impl ServerImpl {
         use apis::process_definition::SearchProcessDefinitionsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let engine = self.journal.read().expect("engine lock poisoned");
-        let state = engine.state();
+        let definitions = self.store.process_definitions();
 
-        let mut matched: Vec<&DeployedProcess> = state
-            .processes
-            .values()
+        let mut matched: Vec<&readstore::ProcessDefinitionRow> = definitions
+            .iter()
             .filter(|d| match filter {
                 None => true,
                 Some(f) => {
-                    let id = &d.definition.id;
+                    let id = &d.process_id;
                     // The engine stores no display name, resource name, or
                     // version tag, so those filters match against the best
                     // available proxy (the id) or exclude when we hold no value.
@@ -1097,7 +1127,7 @@ impl ServerImpl {
             &sort,
             |d, field| match field {
                 "processDefinitionId" | "name" => {
-                    query::SortVal::Str(d.definition.id.clone())
+                    query::SortVal::Str(d.process_id.clone())
                 }
                 "version" => query::SortVal::Num(d.version as i64),
                 _ => query::SortVal::Num(d.key as i64),
@@ -1371,15 +1401,11 @@ fn incident_state_enum(state: IncidentState) -> models::IncidentStateEnum {
     }
 }
 
-/// Projects an engine [`Incident`] into the generated `IncidentResult`,
-/// resolving process-definition identity from engine state.
-fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult {
-    let (process_definition_id, process_definition_key) = state
-        .instances
-        .get(&incident.instance_key)
-        .and_then(|inst| state.processes.get(&inst.process_id))
-        .map(|dep| (dep.definition.id.clone(), dep.key.to_string()))
-        .unwrap_or_else(|| (String::new(), "-1".to_string()));
+/// Projects an [`IncidentRow`] into the generated `IncidentResult`. The
+/// process-definition identity is denormalized onto the row at projection time.
+fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentResult {
+    let process_definition_id = incident.process_definition_id.clone();
+    let process_definition_key = incident.process_definition_key.clone();
 
     let error_type = incident_error_type_enum(incident.kind);
     let job_key = match incident.job_key {
@@ -1387,7 +1413,7 @@ fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult
         None => types::Nullable::Null,
     };
     let creation_time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        incident.created_at as i64,
+        incident.created_at_ms as i64,
     )
     .unwrap_or_else(epoch);
 
@@ -1410,28 +1436,18 @@ fn incident_result(state: &State, incident: &Incident) -> models::IncidentResult
     )
 }
 
-/// Projects an engine [`ProcessInstance`] into the generated
-/// `ProcessInstanceResult`, resolving process-definition identity from state.
+/// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
 fn process_instance_result(
-    state: &State,
-    instance: &ProcessInstance,
+    instance: &readstore::ProcessInstanceRow,
 ) -> models::ProcessInstanceResult {
-    let deployed = state.processes.get(&instance.process_id);
-    let process_definition_id = deployed
-        .map(|d| d.definition.id.clone())
-        .unwrap_or_else(|| instance.process_id.clone());
-    let version = deployed.map(|d| d.version).unwrap_or(0);
-    let process_definition_key = deployed
-        .map(|d| d.key.to_string())
-        .unwrap_or_else(|| "-1".into());
+    let process_definition_id = instance.process_definition_id.clone();
+    let version = instance.version;
+    let process_definition_key = instance.process_definition_key.clone();
 
-    let state_enum = match instance.state {
-        ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
-        ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
-    };
+    let state_enum = process_instance_state_enum(instance.state);
 
     let start_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        instance.created_at as i64,
+        instance.start_date_ms as i64,
     )
     .unwrap_or_else(epoch);
 
@@ -1443,7 +1459,7 @@ fn process_instance_result(
         start_date,
         types::Nullable::Null,
         state_enum,
-        !instance.incidents.is_empty(),
+        instance.has_incident,
         "<default>".to_string(),
         models::ProcessInstanceKey(instance.key.to_string()),
         models::ProcessDefinitionKey(process_definition_key),
@@ -1462,11 +1478,13 @@ fn resource_name(process_id: &str) -> String {
     format!("{process_id}.bpmn")
 }
 
-/// Projects an engine [`DeployedProcess`] into the generated
+/// Projects a [`ProcessDefinitionRow`] into the generated
 /// `ProcessDefinitionResult`. The engine stores no display name or version tag,
 /// so `name` mirrors the id and `versionTag` is null.
-fn process_definition_result(deployed: &DeployedProcess) -> models::ProcessDefinitionResult {
-    let id = deployed.definition.id.clone();
+fn process_definition_result(
+    deployed: &readstore::ProcessDefinitionRow,
+) -> models::ProcessDefinitionResult {
+    let id = deployed.process_id.clone();
     models::ProcessDefinitionResult::new(
         types::Nullable::Present(id.clone()),
         resource_name(&id),
@@ -1503,20 +1521,13 @@ fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum
     }
 }
 
-/// Projects an engine [`nanobpmn_engine_core::Job`] into the generated
-/// `JobSearchResult`, resolving process-definition identity from engine state.
-fn job_search_result(
-    state: &State,
-    job: &nanobpmn_engine_core::Job,
-) -> models::JobSearchResult {
-    let (process_definition_id, process_definition_key) = state
-        .instances
-        .get(&job.instance_key)
-        .and_then(|i| state.processes.get(&i.process_id))
-        .map(|d| (d.definition.id.clone(), d.key.to_string()))
-        .unwrap_or_else(|| (String::new(), String::new()));
+/// Projects a [`JobRow`] into the generated `JobSearchResult`. The
+/// process-definition identity is denormalized onto the row at projection time.
+fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
+    let process_definition_id = job.process_definition_id.clone();
+    let process_definition_key = job.process_definition_key.clone();
 
-    let deadline = match job.deadline {
+    let deadline = match job.deadline_ms {
         Some(ms) => chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
             .map(types::Nullable::Present)
             .unwrap_or(types::Nullable::Null),
@@ -1746,24 +1757,70 @@ async fn log_rest(req: axum::extract::Request, next: axum::middleware::Next) -> 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
-    // Persist the engine's event log when NANOBPMN_JOURNAL points at a file, so
-    // state survives a restart; otherwise run purely in memory (ephemeral).
-    let server = match std::env::var("NANOBPMN_JOURNAL") {
-        Ok(path) if !path.is_empty() => {
-            let journal = Journal::open(&path)
-                .unwrap_or_else(|e| panic!("failed to open journal {path}: {e}"));
+    // Resolve where the journal (durable event log) and read-model database live.
+    let (journal_path, db_path) = resolve_data_paths();
+
+    let server = match journal_path {
+        Some(journal_path) => {
+            // Persistent run: the read store is a derived projection of the
+            // journal, so reconcile it against the log before serving. Open the
+            // store, replay any journal events the store has not yet projected
+            // (a full rebuild on a fresh/reset store), then open the journal
+            // (which replays into the engine) and wire the live exporter.
+            let store = Arc::new(
+                ReadStore::open(db_path.as_deref())
+                    .unwrap_or_else(|e| panic!("failed to open read store: {e}")),
+            );
+            let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                panic!("failed to read journal {}: {e}", journal_path.display())
+            });
+            let mut pos = store.exported_position();
+            if pos > events.len() {
+                // The store is ahead of the log (truncated/corrupt journal):
+                // rebuild from scratch.
+                store.reset().expect("reset read store");
+                pos = 0;
+            }
+            if pos < events.len() {
+                store
+                    .export(&events[pos..])
+                    .expect("catch up read model from journal");
+            }
+
+            let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
+                panic!("failed to open journal {}: {e}", journal_path.display())
+            });
             let recovered = !journal.is_fresh();
-            let server = ServerImpl::new(journal);
+            let server = build_server(journal, store);
+
+            // The read model now has every completed instance, so shed them from
+            // hot engine state to bound memory.
+            {
+                let mut journal = server.journal.write().expect("engine lock poisoned");
+                let evicted = journal.evict_completed();
+                if evicted > 0 {
+                    tracing::info!("evicted {evicted} completed instance(s) from hot state");
+                }
+            }
+
             if recovered {
-                tracing::info!("recovered engine state by replaying journal at {path}");
+                tracing::info!(
+                    "recovered engine state by replaying journal at {}",
+                    journal_path.display()
+                );
             } else {
-                tracing::info!("started a fresh journal at {path}");
+                tracing::info!("started a fresh journal at {}", journal_path.display());
             }
             server
         }
-        _ => {
-            tracing::info!("no NANOBPMN_JOURNAL set; running in-memory (state is not persisted)");
-            ServerImpl::default()
+        None => {
+            tracing::info!(
+                "no journal configured; running in-memory (state is not persisted)"
+            );
+            let store = Arc::new(
+                ReadStore::open(db_path.as_deref()).expect("open in-memory read store"),
+            );
+            build_server(Journal::in_memory(), store)
         }
     };
 
@@ -1814,6 +1871,16 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
+    // The actual bound port (may differ from `port` when `PORT=0`, i.e. the OS
+    // assigns a free one). Print it on stdout so a supervising process (the e2e
+    // harness) can learn it without racing on a pre-reserved port.
+    let local_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(port);
+    println!("LISTENING_PORT={local_port}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     tracing::info!(
         "NanoBPM gateway REST stub server listening on http://{addr}{}",
         nanobpm_gateway_rest::BASE_PATH
@@ -1828,4 +1895,41 @@ async fn main() {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutdown signal received");
+}
+
+/// Resolves the journal and read-model database paths from the environment.
+///
+/// - `NANOBPMN_DATA_DIR=<dir>` co-locates both under one directory:
+///   `<dir>/journal.jsonl` and `<dir>/read-model.sqlite` (the directory is
+///   created if absent).
+/// - Otherwise `NANOBPMN_JOURNAL=<file>` (back-compat) selects the journal; the
+///   database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`
+///   next to the journal.
+/// - With neither set, both are `None`: an in-memory journal and an in-memory
+///   (`:memory:`) read store (nothing is persisted).
+fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
+    if let Ok(dir) = std::env::var("NANOBPMN_DATA_DIR")
+        && !dir.is_empty()
+    {
+        let dir = PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            panic!("failed to create data dir {}: {e}", dir.display());
+        }
+        return (
+            Some(dir.join("journal.jsonl")),
+            Some(dir.join("read-model.sqlite")),
+        );
+    }
+
+    match std::env::var("NANOBPMN_JOURNAL") {
+        Ok(path) if !path.is_empty() => {
+            let journal = PathBuf::from(path);
+            let db = match std::env::var("NANOBPMN_READ_DB") {
+                Ok(db) if !db.is_empty() => PathBuf::from(db),
+                _ => journal.with_file_name("read-model.sqlite"),
+            };
+            (Some(journal), Some(db))
+        }
+        _ => (None, None),
+    }
 }

@@ -70,6 +70,10 @@ pub struct Journal {
     /// Joined on drop so any not-yet-acked writes are flushed before the journal
     /// goes away (matters for synchronous callers that never await the commit).
     writer_thread: Option<JoinHandle<()>>,
+    /// Channel to the read-model exporter thread, if one is wired. Every command's
+    /// journaled events are forwarded here (under the engine write lock, so the
+    /// exporter sees them in command order) to be projected into the read store.
+    exporter: Option<Sender<Vec<Event>>>,
     /// `true` when the journal started with no prior log, so the host knows it
     /// should seed any initial deployments.
     fresh: bool,
@@ -119,8 +123,29 @@ impl Journal {
             engine: Engine::new(),
             writer: None,
             writer_thread: None,
+            exporter: None,
             fresh: true,
         }
+    }
+
+    /// Reads and deserializes every event from the journal log at `path` (an
+    /// empty vec if the file does not exist). Shared by [`Journal::open`] (to
+    /// replay into the engine) and the boot-time read-model catch-up.
+    pub fn read_events(path: impl AsRef<Path>) -> io::Result<Vec<Event>> {
+        let path = path.as_ref();
+        let mut events = Vec::new();
+        if path.exists() {
+            for line in BufReader::new(File::open(path)?).lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let event: Event = serde_json::from_str(&line)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                events.push(event);
+            }
+        }
+        Ok(events)
     }
 
     /// Opens (creating if absent) the journal at `path`, replaying any existing
@@ -131,21 +156,10 @@ impl Journal {
         let mut engine = Engine::new();
         let mut fresh = true;
 
-        if path.exists() {
-            let mut events = Vec::new();
-            for line in BufReader::new(File::open(path)?).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: Event = serde_json::from_str(&line)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                events.push(event);
-            }
-            if !events.is_empty() {
-                engine = Engine::replay(events);
-                fresh = false;
-            }
+        let events = Self::read_events(path)?;
+        if !events.is_empty() {
+            engine = Engine::replay(events);
+            fresh = false;
         }
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -159,8 +173,33 @@ impl Journal {
             engine,
             writer: Some(tx),
             writer_thread: Some(writer_thread),
+            exporter: None,
             fresh,
         })
+    }
+
+    /// Wires the read-model exporter channel. Set before any command is applied
+    /// (including demo seeding) so every journaled event is projected.
+    pub fn set_exporter(&mut self, exporter: Sender<Vec<Event>>) {
+        self.exporter = Some(exporter);
+    }
+
+    /// Evicts a completed instance and everything it owns from hot state once the
+    /// read model has it. Mirrors [`Engine::evict_instance`].
+    pub fn evict_instance(&mut self, key: Key) -> bool {
+        self.engine.evict_instance(key)
+    }
+
+    /// Evicts every completed instance from hot state (used after a boot replay,
+    /// once the read model is caught up). Mirrors [`Engine::evict_completed`].
+    pub fn evict_completed(&mut self) -> usize {
+        self.engine.evict_completed()
+    }
+
+    /// Shrinks the hot-state maps so evicted capacity is returned. Mirrors
+    /// [`Engine::shrink`].
+    pub fn shrink(&mut self) {
+        self.engine.shrink();
     }
 
     /// Whether the journal started empty (no prior log).
@@ -172,12 +211,20 @@ impl Journal {
     /// [`Commit`] that resolves once they are fsynced. Empty batches and
     /// in-memory journals are already durable, so they return a ready commit.
     fn persist(&self, events: &[Event]) -> Commit {
-        let Some(writer) = self.writer.as_ref() else {
-            return Commit::ready();
-        };
         if events.is_empty() {
             return Commit::ready();
         }
+
+        // Forward to the read-model exporter (in command order: this runs under
+        // the engine write lock). Independent of disk persistence, so the
+        // in-memory journal still feeds an in-memory read store.
+        if let Some(exporter) = self.exporter.as_ref() {
+            let _ = exporter.send(events.to_vec());
+        }
+
+        let Some(writer) = self.writer.as_ref() else {
+            return Commit::ready();
+        };
 
         let mut bytes = Vec::new();
         for event in events {

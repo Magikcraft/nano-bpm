@@ -33,7 +33,7 @@ For a *nano*, embeddable engine the Camunda 8 model wins decisively:
    SQLite — or nothing at all. `Engine::replay(events)` reconstructs state (and
    the key generator) from a recorded log; enable the off-by-default `serde`
    feature to (de)serialize events for an on-disk journal. The server ships one
-   (set `NANOBPMN_JOURNAL`); see the repo `README.md`.
+   (set `NANOBPMN_DATA_DIR`); see the repo `README.md`.
 4. **It matches the rest of nanobpmn.** The generated REST layer *is* the
    Camunda 8 v2 API, so an engine speaking C8 semantics wires straight behind it.
 
@@ -192,6 +192,17 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   so replay reconstructs identical timestamps.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
+- **Bounded hot state (optional eviction).** By default the engine retains
+  completed instances forever — `is_completed`, `instance`, and the read APIs all
+  keep working — which is ideal for an embedder that queries the engine directly.
+  A host that instead projects history into a separate read model can call
+  `Engine::evict_instance(key)` (drops a *completed* instance and everything it
+  owns: jobs, timers, subscriptions, incidents) or `Engine::evict_completed()`
+  (sweeps all completed instances and `shrink`s the maps) to keep the resident
+  footprint tracking only in-flight work. Eviction is always opt-in and never
+  touches active instances or non-instance state (deployed definitions, message-
+  start and timer-start subscriptions). The server uses this behind its SQLite
+  read model; see the repo `README.md`.
 
 ### Pieces
 

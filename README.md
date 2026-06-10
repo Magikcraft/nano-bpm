@@ -176,6 +176,52 @@ since replay re-derives their effects.
 > `parking_lot::RwLock`, or publish a periodic read snapshot so reads never
 > contend with the writer at all.
 
+### Read model (CQRS, eventual consistency)
+
+The engine's hot state holds only what execution needs. If every completed
+process instance, job and incident stayed there forever, resident memory would
+grow without bound under sustained load (and never come back down). nanobpmn
+follows the Camunda 8 / Operate split — a **command side** and a separate
+**read side** — collapsed into a single binary:
+
+- **Command side** — the engine + journal. It runs in-memory and is the single
+  writer. Once an instance's history is durably recorded in the read model, the
+  engine **evicts** the completed instance and everything it owns (jobs, timers,
+  subscriptions, incidents) from hot state, so the footprint tracks *in-flight*
+  work rather than all history. (Eviction is opt-in: `engine-core` keeps
+  completed instances by default so embedders' audit/query code keeps working.)
+- **Read side** — an embedded **SQLite read store**. A background
+  `nanobpmn-exporter` thread streams the journal's event log into it (in command
+  order, via the same under-the-write-lock hand-off the journal writer uses),
+  projecting events into denormalized `process_definitions` / `process_instances`
+  / `jobs` / `incidents` tables. **Every `search*`/`get*` query is served from
+  SQLite**, never from hot engine state — which is what makes eviction possible.
+
+The read model is a pure **derived projection** of the journal, so it needs no
+durability of its own: on boot the server replays any journal events the store
+has not yet projected (tracked by an `exported_position` cursor; a fresh or
+schema-mismatched store rebuilds from scratch), then evicts completed instances
+from the recovered hot state.
+
+Because the exporter is asynchronous, reads are **eventually consistent**: a
+`search`/`get` issued in the instant after a write may briefly not observe it
+(typically sub-millisecond). This mirrors Camunda 8's Operate read channel.
+
+> [!NOTE]
+> Activation locks are volatile and **not journaled**, so `activateJobs` /
+> lock-expiry never reach the read store. A `searchJobs` result therefore
+> reflects durable state: an activated job shows as `CREATED` without a worker
+> or deadline. This is deliberate — the read model reports what survives a crash.
+
+**Configuration.** Reads and writes share a data layout resolved from the
+environment:
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_DATA_DIR=<dir>` | Co-locates both under one directory: `<dir>/journal.jsonl` + `<dir>/read-model.sqlite` (created if absent). |
+| `NANOBPMN_JOURNAL=<file>` | Back-compat: selects the journal file; the database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`. |
+| *(neither set)* | Fully in-memory: an ephemeral journal and a `:memory:` read store. Nothing is persisted. |
+
 ## Two crates
 
 nanobpmn is deliberately split so the execution engine stays embeddable
@@ -285,11 +331,13 @@ make clean
 `make release` produces a single self-contained binary at
 `server/target/release/nanobpm-gateway-rest-server`. Run it directly,
 configuring it through the environment — `PORT` for the listen port,
-`NANOBPMN_JOURNAL` for the durable event-log path (see
-[Durability](#durability-event-log-replay)), and `DEBUG_REST` to log requests:
+`NANOBPMN_DATA_DIR` for the durable event-log + read-model directory (see
+[Durability](#durability-event-log-replay) and
+[Read model](#read-model-cqrs-eventual-consistency)), and `DEBUG_REST` to log
+requests:
 
 ```bash
-NANOBPMN_JOURNAL=/var/lib/nanobpmn/nanobpmn.journal PORT=8080 \
+NANOBPMN_DATA_DIR=/var/lib/nanobpmn PORT=8080 \
   ./server/target/release/nanobpm-gateway-rest-server
 ```
 

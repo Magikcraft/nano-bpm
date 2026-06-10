@@ -119,6 +119,66 @@ impl Engine {
         )
     }
 
+    /// Evicts a *completed* process instance and every entity it owns (jobs,
+    /// timers, message subscriptions, incidents) from hot state, returning
+    /// `true` if it was evicted. Process-level message-start subscriptions and
+    /// timer-start events, and deployed definitions, are retained (they are not
+    /// instance-scoped). No-op for an unknown or still-active instance.
+    ///
+    /// The engine keeps completed instances by default (so `is_completed`,
+    /// `instance`, and the audit trail keep working). A host that has durably
+    /// projected the instance's history into a separate read model can call
+    /// this to keep hot state bounded to only in-flight work — the engine then
+    /// never needs a completed instance again, because no command can target
+    /// one (its jobs are settled, its timers fired, its subscriptions closed).
+    pub fn evict_instance(&mut self, key: Key) -> bool {
+        if !self.is_completed(key) {
+            return false;
+        }
+        self.state.instances.remove(&key);
+        self.state.jobs.retain(|_, j| j.instance_key != key);
+        self.state.timers.retain(|_, t| t.instance_key != key);
+        self.state
+            .message_subscriptions
+            .retain(|_, s| s.instance_key != key);
+        self.state.incidents.retain(|_, i| i.instance_key != key);
+        true
+    }
+
+    /// Evicts every completed instance (see [`Engine::evict_instance`]) and
+    /// shrinks the backing maps so freed capacity is returned. Returns the
+    /// number of instances evicted. Intended to run once after a boot replay,
+    /// when the read model is already caught up, so recovered hot state holds
+    /// only in-flight instances rather than the whole history.
+    pub fn evict_completed(&mut self) -> usize {
+        let done: Vec<Key> = self
+            .state
+            .instances
+            .iter()
+            .filter(|(_, i)| i.state == ProcessInstanceState::Completed)
+            .map(|(k, _)| *k)
+            .collect();
+        for key in &done {
+            self.evict_instance(*key);
+        }
+        if !done.is_empty() {
+            self.shrink();
+        }
+        done.len()
+    }
+
+    /// Shrinks the capacity of the hot-state maps to fit their live contents,
+    /// returning memory freed by eviction back to the allocator. (Rust maps
+    /// never shrink on their own, so removal alone does not lower the resident
+    /// footprint until this is called.)
+    pub fn shrink(&mut self) {
+        self.state.instances.shrink_to_fit();
+        self.state.jobs.shrink_to_fit();
+        self.state.timers.shrink_to_fit();
+        self.state.message_subscriptions.shrink_to_fit();
+        self.state.incidents.shrink_to_fit();
+    }
+
     /// Looks up a job.
     pub fn job(&self, key: Key) -> Option<&state::Job> {
         self.state.jobs.get(&key)
@@ -3581,5 +3641,77 @@ mod tests {
         let fired = recovered.trigger_timers(11_000);
         let instance_key = fired.iter().find_map(|e| e.instance_key()).unwrap();
         assert!(recovered.is_completed(instance_key));
+    }
+
+    #[test]
+    fn evicts_only_completed_instances_and_what_they_own() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        // One instance that we drive to completion, and one left in-flight
+        // (parked on its service-task job).
+        let done = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        complete_one(&mut engine, "payment");
+        assert!(engine.is_completed(done));
+
+        let live = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        assert!(!engine.is_completed(live));
+        // The live instance still owns an activatable job.
+        assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
+
+        // Evicting an active instance is a no-op.
+        assert!(!engine.evict_instance(live));
+        assert!(engine.instance(live).is_some());
+
+        // Evicting the completed one removes it and its jobs.
+        assert!(engine.evict_instance(done));
+        assert!(engine.instance(done).is_none());
+        assert!(!engine.state().jobs.values().any(|j| j.instance_key == done));
+
+        // The in-flight instance and its job are untouched, and the deployed
+        // definition (not instance-scoped) is retained.
+        assert!(engine.instance(live).is_some());
+        assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
+        assert_eq!(engine.state().processes.len(), 1);
+    }
+
+    #[test]
+    fn evict_completed_sweeps_every_finished_instance() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        for _ in 0..3 {
+            engine
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+            complete_one(&mut engine, "payment");
+        }
+        // A fourth instance left in-flight.
+        let live = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+
+        assert_eq!(engine.state().instances.len(), 4);
+        let evicted = engine.evict_completed();
+        assert_eq!(evicted, 3);
+        assert_eq!(engine.state().instances.len(), 1);
+        assert!(engine.instance(live).is_some());
     }
 }

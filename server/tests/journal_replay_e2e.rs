@@ -11,8 +11,8 @@
 //! freshly allocated port, so runs never collide with each other or leak state
 //! between them.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,15 +55,33 @@ impl Drop for ScratchDir {
     }
 }
 
-/// Reserves an OS-assigned free TCP port, then releases it so the spawned server
-/// can bind it. There is a tiny race between release and re-bind, but a fresh
-/// port per boot keeps tests independent and avoids `TIME_WAIT` collisions.
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("reserve port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+/// Reads the `LISTENING_PORT=<n>` line the server prints on stdout once it has
+/// bound its OS-assigned port. A background reader thread keeps the pipe drained
+/// and bridges a `recv_timeout`, so a server that dies before binding surfaces as
+/// a timeout rather than a hang.
+fn read_listening_port(child: &mut Child) -> u16 {
+    let stdout = child.stdout.take().expect("server stdout is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // EOF (process exited) or read error.
+                Ok(_) => {
+                    if let Some(rest) = line.trim().strip_prefix("LISTENING_PORT=")
+                        && let Ok(port) = rest.parse::<u16>()
+                    {
+                        let _ = tx.send(port);
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("server never reported its listening port")
 }
 
 /// A running server child process. Killed and reaped on drop, so a panicking
@@ -75,17 +93,20 @@ struct ServerProcess {
 
 impl ServerProcess {
     /// Boots the server over `journal`, waits until it answers HTTP, and returns
-    /// the handle. Output is suppressed to keep test logs clean.
+    /// the handle. The server binds an **OS-assigned** port (`PORT=0`) and
+    /// reports it back on stdout, so each test gets a unique port with no
+    /// reserve-then-rebind race. Output is otherwise suppressed to keep test
+    /// logs clean.
     fn boot(journal: &Path) -> Self {
-        let port = free_port();
-        let child = Command::new(SERVER_BIN)
+        let mut child = Command::new(SERVER_BIN)
             .env("NANOBPMN_JOURNAL", journal)
-            .env("PORT", port.to_string())
-            .stdout(Stdio::null())
+            .env("PORT", "0")
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn server binary");
 
+        let port = read_listening_port(&mut child);
         let server = Self { child, port };
         server.wait_until_ready();
         server
@@ -114,6 +135,28 @@ impl ServerProcess {
             .unwrap_or_else(|| panic!("{method} {path} failed: connection error"))
     }
 
+    /// Polls `method path` until `accept(status, body)` holds or a short deadline
+    /// elapses, returning the last response. All `search*`/`get*` queries are
+    /// served from the asynchronously-updated read model, so a read issued
+    /// immediately after a write may briefly not observe it; this bridges that
+    /// eventual-consistency window deterministically.
+    fn request_until(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        accept: impl Fn(u16, &str) -> bool,
+    ) -> (u16, String) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (status, resp) = self.request(method, path, body);
+            if accept(status, &resp) || Instant::now() >= deadline {
+                return (status, resp);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// Stops the server and waits for it to exit, surfacing failures explicitly
     /// rather than relying on the drop guard.
     fn shutdown(mut self) {
@@ -136,6 +179,22 @@ impl Drop for ServerProcess {
 /// Builds a full route under the generated REST base path.
 fn path(suffix: &str) -> String {
     format!("{BASE_PATH}{suffix}")
+}
+
+/// Whether a process-definition search response body contains the `demo`
+/// definition. Used to poll the eventually-consistent read model until the
+/// seeded demo deployment has been projected.
+fn body_has_demo_definition(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|j| {
+            j["items"].as_array().map(|items| {
+                items
+                    .iter()
+                    .any(|i| i["processDefinitionId"].as_str() == Some("demo"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Minimal HTTP/1.1 client: sends one request with `Connection: close` and reads
@@ -255,10 +314,11 @@ fn process_instance_survives_a_restart() {
     let server = ServerProcess::boot(&journal);
     let instance_key = create_demo_instance(&server);
 
-    let (status, _) = server.request(
+    let (status, _) = server.request_until(
         "GET",
         &path(&format!("/process-instances/{instance_key}")),
         None,
+        |status, _| status == 200,
     );
     assert_eq!(status, 200, "instance should be visible before restart");
 
@@ -267,10 +327,11 @@ fn process_instance_survives_a_restart() {
     let restarted = ServerProcess::boot(&journal);
 
     // Then: the instance is recovered by replaying the journal.
-    let (status, body) = restarted.request(
+    let (status, body) = restarted.request_until(
         "GET",
         &path(&format!("/process-instances/{instance_key}")),
         None,
+        |status, _| status == 200,
     );
     assert_eq!(status, 200, "instance must survive the restart: {body}");
 
@@ -299,8 +360,12 @@ fn the_demo_process_is_not_re_seeded_on_restart() {
         "post-restart instance must get a fresh key"
     );
     for key in [&first_key, &second_key] {
-        let (status, _) =
-            restarted.request("GET", &path(&format!("/process-instances/{key}")), None);
+        let (status, _) = restarted.request_until(
+            "GET",
+            &path(&format!("/process-instances/{key}")),
+            None,
+            |status, _| status == 200,
+        );
         assert_eq!(
             status, 200,
             "instance {key} should be present after restart"
@@ -466,7 +531,24 @@ fn a_created_instance_reports_a_real_start_date() {
     let server = ServerProcess::boot(&journal);
     let key = create_demo_instance(&server);
 
-    let (status, body) = server.request("POST", &path("/process-instances/search"), Some(r#"{}"#));
+    let (status, body) = server.request_until(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{}"#),
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| {
+                        j["items"].as_array().map(|items| {
+                            items
+                                .iter()
+                                .any(|i| i["processInstanceKey"].as_str() == Some(key.as_str()))
+                        })
+                    })
+                    .unwrap_or(false)
+        },
+    );
     assert_eq!(status, 200, "search failed: {body}");
 
     let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
@@ -497,8 +579,12 @@ fn searching_process_definitions_returns_the_deployed_demo() {
     // returned 501. It now projects the engine's deployed definitions (the
     // demo process is pre-seeded).
     let server = ServerProcess::boot(&journal);
-    let (status, body) =
-        server.request("POST", &path("/process-definitions/search"), Some(r#"{}"#));
+    let (status, body) = server.request_until(
+        "POST",
+        &path("/process-definitions/search"),
+        Some(r#"{}"#),
+        |status, body| status == 200 && body_has_demo_definition(body),
+    );
     assert_eq!(status, 200, "definition search must succeed: {body}");
 
     let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
@@ -529,8 +615,12 @@ fn create_instance_accepts_a_process_definition_key() {
     // start an instance by that key.
     let server = ServerProcess::boot(&journal);
 
-    let (status, body) =
-        server.request("POST", &path("/process-definitions/search"), Some(r#"{}"#));
+    let (status, body) = server.request_until(
+        "POST",
+        &path("/process-definitions/search"),
+        Some(r#"{}"#),
+        |status, body| status == 200 && body_has_demo_definition(body),
+    );
     assert_eq!(status, 200, "definition search must succeed: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
     let demo_key = json["items"]
@@ -638,9 +728,15 @@ fn concurrent_reads_and_writes_stay_consistent() {
     assert_eq!(unique.len(), keys.len(), "instance keys must be unique");
 
     // Every created instance is individually retrievable (state is consistent).
+    // Reads are served from the asynchronously-updated read model, so poll each
+    // until the exporter has projected it.
     for key in &keys {
-        let (status, body) =
-            server.request("GET", &path(&format!("/process-instances/{key}")), None);
+        let (status, body) = server.request_until(
+            "GET",
+            &path(&format!("/process-instances/{key}")),
+            None,
+            |status, _| status == 200,
+        );
         assert_eq!(status, 200, "instance {key} must be retrievable: {body}");
     }
 
