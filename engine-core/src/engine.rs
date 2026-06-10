@@ -132,7 +132,11 @@ impl Engine {
     /// never needs a completed instance again, because no command can target
     /// one (its jobs are settled, its timers fired, its subscriptions closed).
     pub fn evict_instance(&mut self, key: Key) -> bool {
-        if !self.is_completed(key) {
+        let terminal = matches!(
+            self.state.instances.get(&key).map(|i| i.state),
+            Some(ProcessInstanceState::Completed | ProcessInstanceState::Terminated)
+        );
+        if !terminal {
             return false;
         }
         self.state.instances.remove(&key);
@@ -155,7 +159,12 @@ impl Engine {
             .state
             .instances
             .iter()
-            .filter(|(_, i)| i.state == ProcessInstanceState::Completed)
+            .filter(|(_, i)| {
+                matches!(
+                    i.state,
+                    ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+                )
+            })
             .map(|(k, _)| *k)
             .collect();
         for key in &done {
@@ -1175,6 +1184,92 @@ impl Engine {
                     );
                 }
             }
+
+            Command::CancelInstance { instance_key } => {
+                // Only an active instance can be cancelled. An unknown key, or one
+                // that has already completed/terminated, is rejected so the caller
+                // gets a clean 404.
+                match self.state.instances.get(&instance_key) {
+                    Some(instance) if instance.state == ProcessInstanceState::Active => {}
+                    _ => return Err(EngineError::InstanceNotFound { instance_key }),
+                }
+
+                // Discard every token: cancel the instance's in-play jobs, armed
+                // timers and open message subscriptions. Collected and ordered by
+                // key first so the event sequence is deterministic.
+                let mut jobs: Vec<&state::Job> = self
+                    .state
+                    .jobs
+                    .values()
+                    .filter(|j| {
+                        j.instance_key == instance_key
+                            && matches!(
+                                j.state,
+                                state::JobState::Created
+                                    | state::JobState::Activated
+                                    | state::JobState::Failed
+                            )
+                    })
+                    .collect();
+                jobs.sort_unstable_by_key(|j| j.key);
+                let job_cancels: Vec<Event> = jobs
+                    .iter()
+                    .map(|j| Event::JobCanceled {
+                        job_key: j.key,
+                        instance_key,
+                    })
+                    .collect();
+
+                let mut timers: Vec<&state::Timer> = self
+                    .state
+                    .timers
+                    .values()
+                    .filter(|t| {
+                        t.instance_key == instance_key && t.state == state::TimerState::Created
+                    })
+                    .collect();
+                timers.sort_unstable_by_key(|t| t.key);
+                let timer_cancels: Vec<Event> = timers
+                    .iter()
+                    .map(|t| Event::TimerCanceled {
+                        timer_key: t.key,
+                        instance_key,
+                        element_instance_key: t.element_instance_key,
+                        element_id: t.element_id.clone(),
+                    })
+                    .collect();
+
+                let mut subs: Vec<&state::MessageSubscription> = self
+                    .state
+                    .message_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.instance_key == instance_key
+                            && s.state == state::MessageSubscriptionState::Open
+                    })
+                    .collect();
+                subs.sort_unstable_by_key(|s| s.key);
+                let sub_cancels: Vec<Event> = subs
+                    .iter()
+                    .map(|s| Event::MessageSubscriptionCanceled {
+                        subscription_key: s.key,
+                        instance_key,
+                        element_instance_key: s.element_instance_key,
+                        element_id: s.element_id.clone(),
+                    })
+                    .collect();
+
+                for event in job_cancels {
+                    self.emit(&mut log, event);
+                }
+                for event in timer_cancels {
+                    self.emit(&mut log, event);
+                }
+                for event in sub_cancels {
+                    self.emit(&mut log, event);
+                }
+                self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
+            }
         }
 
         self.run(&mut log, queue);
@@ -1840,6 +1935,9 @@ pub enum EngineError {
     /// `SetVariables` referenced a scope key that is neither a process instance
     /// nor any active element instance.
     ScopeNotFound { scope_key: Key },
+    /// `CancelInstance` referenced a process instance that does not exist or is
+    /// no longer active (already completed or terminated).
+    InstanceNotFound { instance_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -1875,6 +1973,9 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::ScopeNotFound { scope_key } => {
                 write!(f, "no variable scope with key {scope_key}")
+            }
+            EngineError::InstanceNotFound { instance_key } => {
+                write!(f, "no active process instance with key {instance_key}")
             }
         }
     }
@@ -3713,5 +3814,233 @@ mod tests {
         assert_eq!(evicted, 3);
         assert_eq!(engine.state().instances.len(), 1);
         assert!(engine.instance(live).is_some());
+    }
+
+    // ---- cancel process instance ----
+
+    #[test]
+    fn cancel_terminates_instance_and_cancels_its_job() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let instance_key = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+
+        // Token parked on the service-task job.
+        let job_key = engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.instance_key == instance_key)
+            .unwrap()
+            .key;
+        assert!(!engine.is_completed(instance_key));
+
+        let events = engine
+            .apply_command(Command::cancel_instance(instance_key))
+            .unwrap();
+
+        // The job is cancelled and the instance is terminated (not completed).
+        assert!(events.contains(&Event::JobCanceled {
+            job_key,
+            instance_key
+        }));
+        assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key }));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+        assert_eq!(
+            engine.instance(instance_key).unwrap().state,
+            ProcessInstanceState::Terminated
+        );
+        assert!(engine.instance(instance_key).unwrap().active.is_empty());
+        assert_eq!(engine.job(job_key).unwrap().state, state::JobState::Canceled);
+    }
+
+    #[test]
+    fn cancel_disarms_a_parked_timer() {
+        let def = ProcessBuilder::new("delayed")
+            .start_event("start")
+            .timer_intermediate_catch_event("wait", 5_000)
+            .end_event("end")
+            .connect("start", "wait")
+            .connect("wait", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let instance_key = engine
+            .apply_command_at(Command::create_instance("delayed"), 1_000)
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        assert_eq!(engine.timers()[0].state, state::TimerState::Created);
+
+        engine
+            .apply_command(Command::cancel_instance(instance_key))
+            .unwrap();
+
+        // The armed timer is cancelled, so a later due tick fires nothing.
+        assert_eq!(engine.timers()[0].state, state::TimerState::Canceled);
+        assert!(engine.trigger_timers(6_000).is_empty());
+        assert_eq!(
+            engine.instance(instance_key).unwrap().state,
+            ProcessInstanceState::Terminated
+        );
+    }
+
+    #[test]
+    fn cancel_disarms_an_open_message_subscription() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_catch()))
+            .unwrap();
+        let instance_key = engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str("o-1".into()))]),
+            ))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        assert_eq!(
+            engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Open
+        );
+
+        engine
+            .apply_command(Command::cancel_instance(instance_key))
+            .unwrap();
+
+        assert_eq!(
+            engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Canceled
+        );
+        assert_eq!(
+            engine.instance(instance_key).unwrap().state,
+            ProcessInstanceState::Terminated
+        );
+    }
+
+    #[test]
+    fn cancel_closes_an_active_incident() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let instance_key = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        // Drive the job to a no-retries incident.
+        let job = engine
+            .activate_jobs("payment", "w", 1, 60_000, 0)
+            .into_iter()
+            .next()
+            .unwrap();
+        engine
+            .apply_command(Command::fail_job(job.key, 0, "boom"))
+            .unwrap();
+        assert_eq!(engine.active_incidents().len(), 1);
+
+        engine
+            .apply_command(Command::cancel_instance(instance_key))
+            .unwrap();
+
+        // The incident is closed and the parked job is cancelled.
+        assert!(engine.active_incidents().is_empty());
+        assert_eq!(engine.job(job.key).unwrap().state, state::JobState::Canceled);
+        assert_eq!(
+            engine.instance(instance_key).unwrap().state,
+            ProcessInstanceState::Terminated
+        );
+    }
+
+    #[test]
+    fn cancel_rejects_unknown_or_finished_instances() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        // Unknown key.
+        assert_eq!(
+            engine.apply_command(Command::cancel_instance(999)),
+            Err(EngineError::InstanceNotFound { instance_key: 999 })
+        );
+
+        // A completed instance can no longer be cancelled.
+        let done = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        complete_one(&mut engine, "payment");
+        assert!(engine.is_completed(done));
+        assert_eq!(
+            engine.apply_command(Command::cancel_instance(done)),
+            Err(EngineError::InstanceNotFound { instance_key: done })
+        );
+
+        // And cancelling twice fails the second time.
+        let live = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        engine
+            .apply_command(Command::cancel_instance(live))
+            .unwrap();
+        assert_eq!(
+            engine.apply_command(Command::cancel_instance(live)),
+            Err(EngineError::InstanceNotFound { instance_key: live })
+        );
+    }
+
+    #[test]
+    fn cancel_survives_replay() {
+        let mut engine = Engine::new();
+        let mut log = Vec::new();
+        log.extend(
+            engine
+                .apply_command(Command::DeployProcess(linear_with_task()))
+                .unwrap(),
+        );
+        let instance_key = {
+            let events = engine
+                .apply_command(Command::create_instance("order"))
+                .unwrap();
+            let k = events.iter().find_map(|e| e.instance_key()).unwrap();
+            log.extend(events);
+            k
+        };
+        log.extend(
+            engine
+                .apply_command(Command::cancel_instance(instance_key))
+                .unwrap(),
+        );
+
+        let recovered = Engine::replay(log);
+        assert_eq!(
+            recovered.instance(instance_key).unwrap().state,
+            ProcessInstanceState::Terminated
+        );
+        assert!(recovered.instance(instance_key).unwrap().active.is_empty());
+        assert!(recovered
+            .state()
+            .jobs
+            .values()
+            .all(|j| j.state == state::JobState::Canceled));
     }
 }

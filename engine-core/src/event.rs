@@ -174,6 +174,13 @@ pub enum Event {
     /// The last token of a process instance was consumed; the instance is done.
     ProcessInstanceCompleted { instance_key: Key },
 
+    /// A process instance was cancelled by an operator: every token was
+    /// discarded and the instance transitions to `Terminated` (it did not
+    /// complete normally). The resource-cancellation events this command
+    /// produced (`JobCanceled`, `TimerCanceled`, `MessageSubscriptionCanceled`)
+    /// precede it; this event closes any still-active incident on the instance.
+    ProcessInstanceTerminated { instance_key: Key },
+
     /// A timer was armed: either on a timer intermediate catch event (the token
     /// rests on it) or as an interrupting boundary timer on an activity (the
     /// activity runs as normal until the timer fires). `due_at` is the logical
@@ -320,7 +327,8 @@ impl Event {
             | Event::MessageSubscriptionCreated { instance_key, .. }
             | Event::MessageCorrelated { instance_key, .. }
             | Event::MessageSubscriptionCanceled { instance_key, .. }
-            | Event::ProcessInstanceCompleted { instance_key } => Some(*instance_key),
+            | Event::ProcessInstanceCompleted { instance_key }
+            | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::MessagePublished { .. }
             | Event::MessageStartSubscriptionCreated { .. }

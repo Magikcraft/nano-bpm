@@ -269,6 +269,56 @@ impl ServerImpl {
         Ok(response)
     }
 
+    /// `POST /v2/process-instances/{processInstanceKey}/cancellation` — cancel a
+    /// running instance: discard every token (cancel pending jobs, disarm timers
+    /// and message subscriptions, close any active incident) and transition the
+    /// instance to `TERMINATED`. An unknown or already-finished instance is a 404.
+    async fn cancel_process_instance_impl(
+        &self,
+        path_params: &models::CancelProcessInstancePathParams,
+    ) -> Result<apis::process_instance::CancelProcessInstanceResponse, ()> {
+        use apis::process_instance::CancelProcessInstanceResponse as Resp;
+
+        let instance_key: u64 = match path_params.process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    format!(
+                        "Process instance key '{}' is not a valid key.",
+                        path_params.process_instance_key
+                    ),
+                )));
+            }
+        };
+
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheProcessInstanceIsCanceled)
+            }
+            Err(EngineError::InstanceNotFound { instance_key }) => {
+                Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    format!("No active process instance with key {instance_key}."),
+                )))
+            }
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
     async fn complete_job_impl(
         &self,
         path_params: &models::CompleteJobPathParams,
@@ -1509,6 +1559,7 @@ fn process_instance_state_enum(
     match state {
         ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
         ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
+        ProcessInstanceState::Terminated => models::ProcessInstanceStateEnum::Terminated,
     }
 }
 

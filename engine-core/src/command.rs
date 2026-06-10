@@ -100,6 +100,12 @@ pub enum Command {
         correlation_key: String,
         variables: HashMap<String, Value>,
     },
+    /// Cancel a running process instance. Every token is discarded: pending jobs
+    /// are cancelled, armed timers and open message subscriptions are cancelled,
+    /// and any active incident is closed. The instance transitions to
+    /// `Terminated` (it does *not* complete). Only an active instance can be
+    /// cancelled; an unknown or already-finished instance is rejected.
+    CancelInstance { instance_key: Key },
 }
 
 impl Command {
@@ -229,5 +235,10 @@ impl Command {
             correlation_key: correlation_key.into(),
             variables,
         }
+    }
+
+    /// Convenience constructor for a `CancelInstance`.
+    pub fn cancel_instance(instance_key: Key) -> Self {
+        Command::CancelInstance { instance_key }
     }
 }

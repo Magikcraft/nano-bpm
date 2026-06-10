@@ -82,11 +82,13 @@ fn instance_state_code(s: ProcessInstanceState) -> i64 {
     match s {
         ProcessInstanceState::Active => 0,
         ProcessInstanceState::Completed => 1,
+        ProcessInstanceState::Terminated => 2,
     }
 }
 fn instance_state_from(code: i64) -> ProcessInstanceState {
     match code {
         1 => ProcessInstanceState::Completed,
+        2 => ProcessInstanceState::Terminated,
         _ => ProcessInstanceState::Active,
     }
 }
@@ -288,7 +290,9 @@ impl ReadStore {
         let tx = conn.transaction()?;
         let mut completed = Vec::new();
         for event in events {
-            if let Event::ProcessInstanceCompleted { instance_key } = event {
+            if let Event::ProcessInstanceCompleted { instance_key }
+            | Event::ProcessInstanceTerminated { instance_key } = event
+            {
                 completed.push(*instance_key);
             }
             project(&tx, event)?;
@@ -511,6 +515,26 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 params![
                     *instance_key as i64,
                     instance_state_code(ProcessInstanceState::Completed)
+                ],
+            )?;
+        }
+
+        Event::ProcessInstanceTerminated { instance_key } => {
+            tx.execute(
+                "UPDATE process_instances SET state = ?2, has_incident = 0 WHERE key = ?1",
+                params![
+                    *instance_key as i64,
+                    instance_state_code(ProcessInstanceState::Terminated)
+                ],
+            )?;
+            // Close any incident still active on the terminated instance, so it
+            // no longer surfaces as open in incident search.
+            tx.execute(
+                "UPDATE incidents SET state = ?2 WHERE instance_key = ?1 AND state = ?3",
+                params![
+                    *instance_key as i64,
+                    incident_state_code(IncidentState::Resolved),
+                    incident_state_code(IncidentState::Active),
                 ],
             )?;
         }

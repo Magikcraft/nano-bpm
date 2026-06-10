@@ -19,6 +19,9 @@ pub type Key = u64;
 pub enum ProcessInstanceState {
     Active,
     Completed,
+    /// Cancelled by an operator before completing: every token was discarded.
+    /// Terminal, like `Completed`, but reached via [`crate::Command::CancelInstance`].
+    Terminated,
 }
 
 /// Lifecycle state of a job.
@@ -632,6 +635,25 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::ProcessInstanceCompleted { instance_key } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
+            }
+        }
+
+        Event::ProcessInstanceTerminated { instance_key } => {
+            // Close any incident still active on the instance: with the instance
+            // gone the parked tokens are gone too, so `hasIncident` must clear.
+            // The resource cancellations (jobs/timers/subscriptions) were emitted
+            // as their own events ahead of this one.
+            if let Some(instance) = state.instances.get(instance_key) {
+                for incident_key in instance.incidents.clone() {
+                    if let Some(incident) = state.incidents.get_mut(&incident_key) {
+                        incident.state = IncidentState::Resolved;
+                    }
+                }
+            }
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.state = ProcessInstanceState::Terminated;
+                instance.active.clear();
+                instance.incidents.clear();
             }
         }
 

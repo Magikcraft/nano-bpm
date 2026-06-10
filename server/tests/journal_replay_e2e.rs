@@ -781,3 +781,107 @@ fn topology_reports_a_single_broker_cluster() {
 
     server.shutdown();
 }
+
+#[test]
+fn canceling_a_process_instance_terminates_it() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Given: a parked demo instance (waiting on its service-task job), visible in
+    // the eventually-consistent read model as ACTIVE.
+    let server = ServerProcess::boot(&journal);
+    let instance_key = create_demo_instance(&server);
+
+    let (status, _) = server.request_until(
+        "GET",
+        &path(&format!("/process-instances/{instance_key}")),
+        None,
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["state"].as_str().map(|s| s == "ACTIVE"))
+                    .unwrap_or(false)
+        },
+    );
+    assert_eq!(status, 200, "instance should be ACTIVE before cancellation");
+
+    // When: the instance is cancelled.
+    let (status, body) = server.request(
+        "POST",
+        &path(&format!("/process-instances/{instance_key}/cancellation")),
+        Some("{}"),
+    );
+    assert_eq!(status, 204, "cancellation must return 204: {body}");
+
+    // Then: the read model eventually reports it TERMINATED.
+    let (status, body) = server.request_until(
+        "GET",
+        &path(&format!("/process-instances/{instance_key}")),
+        None,
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["state"].as_str().map(|s| s == "TERMINATED"))
+                    .unwrap_or(false)
+        },
+    );
+    assert_eq!(status, 200, "instance must be TERMINATED: {body}");
+
+    // And: cancelling it again is a 404 (no longer an active instance).
+    let (status, _) = server.request(
+        "POST",
+        &path(&format!("/process-instances/{instance_key}/cancellation")),
+        Some("{}"),
+    );
+    assert_eq!(status, 404, "cancelling a terminated instance must 404");
+
+    // And: cancelling an unknown key is a 404.
+    let (status, _) = server.request(
+        "POST",
+        &path("/process-instances/999999/cancellation"),
+        Some("{}"),
+    );
+    assert_eq!(status, 404, "cancelling an unknown instance must 404");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_canceled_process_instance_stays_terminated_after_restart() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Given: a created-then-cancelled instance.
+    let server = ServerProcess::boot(&journal);
+    let instance_key = create_demo_instance(&server);
+    let (status, _) = server.request(
+        "POST",
+        &path(&format!("/process-instances/{instance_key}/cancellation")),
+        Some("{}"),
+    );
+    assert_eq!(status, 204, "cancellation must return 204");
+
+    // When: the server is restarted over the same journal (replaying the
+    // CancelInstance command).
+    server.shutdown();
+    let restarted = ServerProcess::boot(&journal);
+
+    // Then: the recovered instance is still TERMINATED.
+    let (status, body) = restarted.request_until(
+        "GET",
+        &path(&format!("/process-instances/{instance_key}")),
+        None,
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["state"].as_str().map(|s| s == "TERMINATED"))
+                    .unwrap_or(false)
+        },
+    );
+    assert_eq!(status, 200, "cancellation must survive the restart: {body}");
+
+    restarted.shutdown();
+}
