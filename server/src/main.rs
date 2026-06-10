@@ -103,35 +103,59 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
-        // The POC engine starts processes by BPMN process id only.
+        let mut engine = self.journal.lock().expect("engine mutex poisoned");
+
+        // The engine starts processes by BPMN process id. A creation-by-key
+        // request is resolved to its process id by looking up the deployed
+        // definition whose key matches; an unknown key is rejected as invalid
+        // input (the create endpoint has no 404 variant).
         let process_id = match body {
             models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
                 b,
             ) => b.process_definition_id.clone(),
             models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
-                _,
+                b,
             ) => {
-                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Unsupported",
-                    400,
-                    "Starting by processDefinitionKey is not supported by the nanobpmn engine; use processDefinitionId.".to_string(),
-                )));
+                let requested = &b.process_definition_key.0;
+                match engine
+                    .state()
+                    .processes
+                    .values()
+                    .find(|d| d.key.to_string() == *requested)
+                {
+                    Some(d) => d.definition.id.clone(),
+                    None => {
+                        return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                            "Process not found",
+                            400,
+                            format!("No deployed process with key '{requested}'."),
+                        )));
+                    }
+                }
             }
         };
 
-        let mut engine = self.journal.lock().expect("engine mutex poisoned");
         match engine.apply_command_at(Command::create_instance(process_id.clone()), now_millis()) {
             Ok(events) => {
                 let instance_key = events
                     .iter()
                     .find_map(Event::instance_key)
                     .expect("created instance has a key");
+                // Project the real deployed key and version now that the
+                // instance exists, so by-id and by-key requests report the same
+                // definition identity.
+                let (definition_key, version) = engine
+                    .state()
+                    .processes
+                    .get(&process_id)
+                    .map(|d| (d.key.to_string(), d.version))
+                    .unwrap_or_else(|| (process_id.clone(), 1));
                 let result = models::CreateProcessInstanceResult::new(
                     process_id.clone(),
-                    1,
+                    version,
                     "<default>".to_string(),
                     std::collections::HashMap::new(),
-                    models::ProcessDefinitionKey(process_id),
+                    models::ProcessDefinitionKey(definition_key),
                     models::ProcessInstanceKey(instance_key.to_string()),
                     Vec::new(),
                     nanobpm_gateway_rest::types::Nullable::Null,

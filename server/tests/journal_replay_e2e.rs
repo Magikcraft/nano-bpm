@@ -519,6 +519,63 @@ fn searching_process_definitions_returns_the_deployed_demo() {
 }
 
 #[test]
+fn create_instance_accepts_a_process_definition_key() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Starting by processDefinitionKey was previously rejected with a 400. The
+    // server now resolves the key to its deployed definition and starts it. We
+    // first discover the demo definition's key via the search endpoint, then
+    // start an instance by that key.
+    let server = ServerProcess::boot(&journal);
+
+    let (status, body) =
+        server.request("POST", &path("/process-definitions/search"), Some(r#"{}"#));
+    assert_eq!(status, 200, "definition search must succeed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    let demo_key = json["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|i| i["processDefinitionId"].as_str() == Some("demo"))
+        })
+        .and_then(|i| i["processDefinitionKey"].as_str())
+        .expect("demo definition key present")
+        .to_string();
+
+    let create_body = format!(r#"{{"processDefinitionKey":"{demo_key}"}}"#);
+    let (status, body) = server.request("POST", &path("/process-instances"), Some(&create_body));
+    assert_eq!(status, 200, "create by key must succeed: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    assert_eq!(json["processDefinitionId"].as_str(), Some("demo"));
+    assert_eq!(
+        json["processDefinitionKey"].as_str(),
+        Some(demo_key.as_str())
+    );
+    assert!(json["processInstanceKey"].as_str().is_some());
+
+    server.shutdown();
+}
+
+#[test]
+fn create_instance_rejects_an_unknown_process_definition_key() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionKey":"999999999"}"#),
+    );
+    assert_eq!(status, 400, "unknown key must be rejected: {body}");
+
+    server.shutdown();
+}
+
+#[test]
 fn topology_reports_a_single_broker_cluster() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();
