@@ -576,6 +576,78 @@ fn create_instance_rejects_an_unknown_process_definition_key() {
 }
 
 #[test]
+fn concurrent_reads_and_writes_stay_consistent() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // The engine sits behind a read/write lock: writes serialize, reads run in
+    // parallel. Hammer the server from many threads with a mix of reads
+    // (process-definition search) and writes (create instance) to prove the
+    // locking neither deadlocks nor corrupts state, and that every request is
+    // served. Each created instance must be retrievable afterwards.
+    let server = ServerProcess::boot(&journal);
+
+    const READERS: usize = 8;
+    const WRITERS: usize = 4;
+    const WRITES_PER_THREAD: usize = 10;
+
+    let created = std::sync::Mutex::new(Vec::<String>::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..READERS {
+            scope.spawn(|| {
+                for _ in 0..25 {
+                    let (status, body) =
+                        server.request("POST", &path("/process-definitions/search"), Some(r#"{}"#));
+                    assert_eq!(status, 200, "concurrent read must succeed: {body}");
+                }
+            });
+        }
+        for _ in 0..WRITERS {
+            scope.spawn(|| {
+                for _ in 0..WRITES_PER_THREAD {
+                    let (status, body) = server.request(
+                        "POST",
+                        &path("/process-instances"),
+                        Some(r#"{"processDefinitionId":"demo"}"#),
+                    );
+                    assert_eq!(status, 200, "concurrent write must succeed: {body}");
+                    let json: serde_json::Value =
+                        serde_json::from_str(&body).expect("create response is JSON");
+                    let key = json["processInstanceKey"]
+                        .as_str()
+                        .expect("instance key present")
+                        .to_string();
+                    created.lock().unwrap().push(key);
+                }
+            });
+        }
+    });
+
+    let keys = created.into_inner().unwrap();
+    assert_eq!(
+        keys.len(),
+        WRITERS * WRITES_PER_THREAD,
+        "every write produced an instance"
+    );
+
+    // Keys are minted by a single writer, so they must all be unique.
+    let mut unique = keys.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), keys.len(), "instance keys must be unique");
+
+    // Every created instance is individually retrievable (state is consistent).
+    for key in &keys {
+        let (status, body) =
+            server.request("GET", &path(&format!("/process-instances/{key}")), None);
+        assert_eq!(status, 200, "instance {key} must be retrievable: {body}");
+    }
+
+    server.shutdown();
+}
+
+#[test]
 fn topology_reports_a_single_broker_cluster() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();

@@ -139,6 +139,26 @@ downstream work, so the tick wakes any long-polling `activateJobs`. A timer
 parked before a restart is recovered by replay and fired by the first due tick
 afterwards.
 
+### Concurrency (read/write lock)
+
+The server runs on a multi-threaded Tokio runtime (one worker per core), so
+connection handling, HTTP parsing and JSON (de)serialization already spread
+across cores. The engine itself is a **single writer**, so it sits behind a
+`RwLock`: mutating operations (create instance, complete/fail job, deploy, job
+activation, the background tick) take the **write** lock and are serialized,
+while the read-only `search*`/`get*`/`topology` projections take the **read**
+lock and therefore run **concurrently across cores**. The lock is never held
+across an `.await`, and critical sections are short. Writes still flush the
+journal while holding the write lock, so a heavy write burst serializes on disk
+I/O; read-heavy load scales with the number of cores.
+
+> [!NOTE]
+> This uses `std::sync::RwLock`, whose fairness is platform-dependent and can
+> favour readers. If sustained read saturation ever starves writers (including
+> the background tick) in your deployment, switch to a writer-fair lock such as
+> `parking_lot::RwLock`, or publish a periodic read snapshot so reads never
+> contend with the writer at all.
+
 ## Two crates
 
 nanobpmn is deliberately split so the execution engine stays embeddable
