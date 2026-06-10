@@ -517,3 +517,42 @@ fn searching_process_definitions_returns_the_deployed_demo() {
 
     server.shutdown();
 }
+
+#[test]
+fn topology_reports_a_single_broker_cluster() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // nanobpmn is a single-writer, single-partition embedded engine, so the
+    // topology endpoint advertises a one-broker, one-partition cluster with this
+    // gateway as the healthy leader of partition 1.
+    let server = ServerProcess::boot(&journal);
+    let (status, body) = server.request("GET", &path("/topology"), None);
+    assert_eq!(status, 200, "topology must succeed: {body}");
+
+    let json: serde_json::Value = serde_json::from_str(&body).expect("topology response is JSON");
+    assert_eq!(json["clusterSize"].as_i64(), Some(1));
+    assert_eq!(json["partitionsCount"].as_i64(), Some(1));
+    assert_eq!(json["replicationFactor"].as_i64(), Some(1));
+    assert!(
+        json["gatewayVersion"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()),
+        "gatewayVersion must be reported"
+    );
+
+    let brokers = json["brokers"].as_array().expect("brokers is an array");
+    assert_eq!(brokers.len(), 1, "exactly one broker");
+    let broker = &brokers[0];
+    assert_eq!(broker["nodeId"].as_i64(), Some(0));
+
+    let partitions = broker["partitions"]
+        .as_array()
+        .expect("partitions is an array");
+    assert_eq!(partitions.len(), 1, "exactly one partition");
+    assert_eq!(partitions[0]["partitionId"].as_i64(), Some(1));
+    assert_eq!(partitions[0]["role"].as_str(), Some("leader"));
+    assert_eq!(partitions[0]["health"].as_str(), Some("healthy"));
+
+    server.shutdown();
+}

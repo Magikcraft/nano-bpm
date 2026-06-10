@@ -561,6 +561,46 @@ impl ServerImpl {
         }
     }
 
+    /// Reports the cluster topology. nanobpmn is a single-writer, single-partition
+    /// embedded engine, so it always advertises a one-broker, one-partition cluster
+    /// with this gateway acting as the healthy leader of partition 1. The broker and
+    /// gateway versions both report the server crate version.
+    async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
+        use apis::cluster::GetTopologyResponse as Resp;
+
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let port: i32 = std::env::var("PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8080);
+
+        let partition = models::Partition {
+            partition_id: 1,
+            role: "leader".to_string(),
+            health: "healthy".to_string(),
+        };
+
+        let broker = models::BrokerInfo {
+            node_id: 0,
+            host: "0.0.0.0".to_string(),
+            port,
+            partitions: vec![partition],
+            version: version.clone(),
+        };
+
+        let topology = models::TopologyResponse {
+            brokers: vec![broker],
+            cluster_id: types::Nullable::Null,
+            cluster_size: 1,
+            partitions_count: 1,
+            replication_factor: 1,
+            gateway_version: version,
+            last_completed_change_id: String::new(),
+        };
+
+        Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology))
+    }
+
     /// Publishes a message and correlates it to any matching open subscriptions.
     /// nanobpmn does not buffer messages (no TTL/dedup): the message is minted,
     /// correlated to every matching open subscription, then dropped. Always
