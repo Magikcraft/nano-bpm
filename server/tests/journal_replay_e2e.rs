@@ -885,3 +885,92 @@ fn a_canceled_process_instance_stays_terminated_after_restart() {
 
     restarted.shutdown();
 }
+
+/// Activates one `demo-work` job, returning its `variables` object as JSON.
+/// `fetch` is the optional `fetchVariable` projection list.
+fn activate_demo_job_variables(
+    server: &ServerProcess,
+    fetch: Option<&[&str]>,
+) -> serde_json::Value {
+    let fetch_field = match fetch {
+        Some(names) => {
+            let list = names
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#","fetchVariable":[{list}]"#)
+        }
+        None => String::new(),
+    };
+    let body = format!(
+        r#"{{"type":"demo-work","maxJobsToActivate":1,"timeout":60000,"requestTimeout":-1{fetch_field}}}"#
+    );
+    let (status, resp) = server.request("POST", &path("/jobs/activation"), Some(&body));
+    assert_eq!(status, 200, "activation failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("activation response is JSON");
+    let jobs = json["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "exactly one job should activate: {resp}");
+    jobs[0]["variables"].clone()
+}
+
+/// Creates a demo instance and seeds three instance-scope variables on it, so an
+/// activated `demo-work` job carries `{a, b, c}`.
+fn create_demo_instance_with_vars(server: &ServerProcess) -> String {
+    let instance_key = create_demo_instance(server);
+    let (status, body) = server.request(
+        "PUT",
+        &path(&format!("/element-instances/{instance_key}/variables")),
+        Some(r#"{"variables":{"a":1,"b":2,"c":3}}"#),
+    );
+    assert_eq!(status, 204, "setting variables failed: {body}");
+    instance_key
+}
+
+#[test]
+fn activation_fetch_variable_returns_only_named_variables() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+    create_demo_instance_with_vars(&server);
+
+    // fetchVariable = [a, c] projects only those two; b is omitted.
+    let vars = activate_demo_job_variables(&server, Some(&["a", "c"]));
+    let obj = vars.as_object().expect("variables is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["a", "c"], "only fetched variables returned");
+    assert_eq!(obj["a"].as_i64(), Some(1));
+    assert_eq!(obj["c"].as_i64(), Some(3));
+
+    server.shutdown();
+}
+
+#[test]
+fn activation_without_fetch_variable_returns_all_variables() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+    create_demo_instance_with_vars(&server);
+
+    // No fetchVariable: every visible variable is returned.
+    let vars = activate_demo_job_variables(&server, None);
+    let obj = vars.as_object().expect("variables is an object");
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["a", "b", "c"], "all variables returned");
+
+    server.shutdown();
+}
+
+#[test]
+fn activation_empty_fetch_variable_returns_all_variables() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+    create_demo_instance_with_vars(&server);
+
+    // An empty fetchVariable list behaves like "fetch all" per the API spec.
+    let vars = activate_demo_job_variables(&server, Some(&[]));
+    let obj = vars.as_object().expect("variables is an object");
+    assert_eq!(obj.len(), 3, "empty list returns all variables: {vars}");
+
+    server.shutdown();
+}

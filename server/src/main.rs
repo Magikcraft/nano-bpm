@@ -1360,6 +1360,15 @@ impl ServerImpl {
         let max_jobs = body.max_jobs_to_activate.max(0) as usize;
         let timeout = body.timeout.max(0) as u64;
 
+        // Optional projection of the job's variables: an empty or absent list
+        // returns every visible variable, a non-empty list returns only the named
+        // ones (names not present are simply omitted).
+        let fetch_variable = body
+            .fetch_variable
+            .as_ref()
+            .filter(|names| !names.is_empty())
+            .cloned();
+
         // Long-poll window: None/0 -> default; >0 -> that window; <0 -> no waiting.
         let request_timeout = body.request_timeout.unwrap_or(0);
         let long_poll_until = if request_timeout < 0 {
@@ -1372,7 +1381,13 @@ impl ServerImpl {
         let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
 
         loop {
-            let jobs = self.try_activate(&job_type, &worker, max_jobs, timeout);
+            let jobs = self.try_activate(
+                &job_type,
+                &worker,
+                max_jobs,
+                timeout,
+                fetch_variable.as_deref(),
+            );
             if !jobs.is_empty() {
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
@@ -1412,13 +1427,14 @@ impl ServerImpl {
         worker: &str,
         max_jobs: usize,
         timeout: u64,
+        fetch_variable: Option<&[String]>,
     ) -> Vec<models::ActivatedJobResult> {
         let mut engine = self.journal.write().expect("engine lock poisoned");
         let now = now_millis();
         let activated = engine.activate_jobs(job_type, worker, max_jobs, timeout, now);
         activated
             .into_iter()
-            .map(|job| activated_job_result(engine.engine(), job))
+            .map(|job| activated_job_result(engine.engine(), job, fetch_variable))
             .collect()
     }
 }
@@ -1620,8 +1636,14 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
 }
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,
-/// resolving process-definition identity from engine state.
-fn activated_job_result(engine: &Engine, job: ActivatedJob) -> models::ActivatedJobResult {
+/// resolving process-definition identity from engine state. When `fetch_variable`
+/// is `Some`, only the named variables are returned; `None` returns all of the
+/// job's visible variables.
+fn activated_job_result(
+    engine: &Engine,
+    job: ActivatedJob,
+    fetch_variable: Option<&[String]>,
+) -> models::ActivatedJobResult {
     let (process_id, version, process_definition_key) = engine
         .instance(job.instance_key)
         .and_then(|instance| engine.state().processes.get(&instance.process_id))
@@ -1634,6 +1656,15 @@ fn activated_job_result(engine: &Engine, job: ActivatedJob) -> models::Activated
         })
         .unwrap_or_else(|| (String::new(), 1, String::new()));
 
+    let variables = match fetch_variable {
+        Some(names) => job
+            .variables
+            .into_iter()
+            .filter(|(name, _)| names.iter().any(|n| n == name))
+            .collect(),
+        None => job.variables,
+    };
+
     models::ActivatedJobResult::new(
         job.job_type,
         process_id,
@@ -1643,7 +1674,7 @@ fn activated_job_result(engine: &Engine, job: ActivatedJob) -> models::Activated
         job.worker,
         job.retries,
         job.deadline as i64,
-        to_object_map(job.variables),
+        to_object_map(variables),
         "<default>".to_string(),
         models::JobKey(job.key.to_string()),
         models::ProcessInstanceKey(job.instance_key.to_string()),
