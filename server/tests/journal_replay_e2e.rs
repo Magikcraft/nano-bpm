@@ -774,6 +774,133 @@ fn create_instance_accepts_the_default_tenant_id() {
 }
 
 #[test]
+fn variables_set_on_an_instance_are_searchable_and_fetchable() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // Seed an instance with three instance-scope variables {a:1, b:2, c:3}.
+    let instance_key = create_demo_instance_with_vars(&server);
+
+    // The read model is eventually consistent, so wait until all three variables
+    // have been projected for the instance.
+    let search_body = format!(r#"{{"filter":{{"processInstanceKey":"{instance_key}"}}}}"#);
+    let (status, resp) = server.request_until(
+        "POST",
+        &path("/variables/search"),
+        Some(&search_body),
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["items"].as_array().map(|items| items.len() >= 3))
+                    .unwrap_or(false)
+        },
+    );
+    assert_eq!(status, 200, "variable search failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("search response is JSON");
+    let items = json["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 3, "three variables for the instance: {resp}");
+
+    // Each variable's scopeKey equals its processInstanceKey (nano keeps a single
+    // instance-level scope), the tenant is the default, and short values are not
+    // truncated. Integer values render bare in the serialized-JSON value string.
+    let mut names: Vec<&str> = Vec::new();
+    for it in items {
+        assert_eq!(it["processInstanceKey"].as_str(), Some(instance_key.as_str()));
+        assert_eq!(it["scopeKey"], it["processInstanceKey"]);
+        assert_eq!(it["tenantId"].as_str(), Some("<default>"));
+        assert_eq!(it["isTruncated"].as_bool(), Some(false));
+        names.push(it["name"].as_str().expect("name"));
+    }
+    names.sort_unstable();
+    assert_eq!(names, vec!["a", "b", "c"]);
+
+    // Filtering by name returns just that variable with its serialized value.
+    let (status, resp) = server.request(
+        "POST",
+        &path("/variables/search"),
+        Some(&format!(
+            r#"{{"filter":{{"processInstanceKey":"{instance_key}","name":"b"}}}}"#
+        )),
+    );
+    assert_eq!(status, 200, "filtered search failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "one variable named b: {resp}");
+    assert_eq!(items[0]["value"].as_str(), Some("2"));
+
+    // Fetch that variable by its (read-model) key; getVariable returns the full
+    // value and the same identity.
+    let var_key = items[0]["variableKey"].as_str().expect("variableKey");
+    let (status, body) = server.request("GET", &path(&format!("/variables/{var_key}")), None);
+    assert_eq!(status, 200, "get variable failed: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("get response is JSON");
+    assert_eq!(v["name"].as_str(), Some("b"));
+    assert_eq!(v["value"].as_str(), Some("2"));
+    assert_eq!(v["processInstanceKey"].as_str(), Some(instance_key.as_str()));
+    assert_eq!(v["scopeKey"].as_str(), Some(instance_key.as_str()));
+
+    // An unknown variable key 404s.
+    let (status, _) = server.request("GET", &path("/variables/99999999999"), None);
+    assert_eq!(status, 404, "unknown variable key should 404");
+
+    server.shutdown();
+}
+
+#[test]
+fn searched_variables_survive_a_restart() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Seed variables, then confirm they were projected before stopping.
+    let instance_key = {
+        let server = ServerProcess::boot(&journal);
+        let key = create_demo_instance_with_vars(&server);
+        let body = format!(r#"{{"filter":{{"processInstanceKey":"{key}"}}}}"#);
+        server.request_until(
+            "POST",
+            &path("/variables/search"),
+            Some(&body),
+            |status, body| {
+                status == 200
+                    && serde_json::from_str::<serde_json::Value>(body)
+                        .ok()
+                        .and_then(|j| j["items"].as_array().map(|items| items.len() >= 3))
+                        .unwrap_or(false)
+            },
+        );
+        server.shutdown();
+        key
+    };
+
+    // Restart: the read model is rebuilt by replaying the journal, so the
+    // variables remain searchable.
+    let restarted = ServerProcess::boot(&journal);
+    let body = format!(r#"{{"filter":{{"processInstanceKey":"{instance_key}"}}}}"#);
+    let (status, resp) = restarted.request_until(
+        "POST",
+        &path("/variables/search"),
+        Some(&body),
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["items"].as_array().map(|items| items.len() >= 3))
+                    .unwrap_or(false)
+        },
+    );
+    assert_eq!(status, 200, "post-restart variable search failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        json["items"].as_array().unwrap().len(),
+        3,
+        "all three variables survive a restart: {resp}"
+    );
+
+    restarted.shutdown();
+}
+
+#[test]
 fn a_created_instance_reports_a_real_start_date() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();

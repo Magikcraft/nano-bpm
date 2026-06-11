@@ -88,8 +88,15 @@ Read endpoints make engine state observable:
   `CONDITION_ERROR`, `UNHANDLED_ERROR_EVENT`).
 - `POST /v2/process-instances/search` (`searchProcessInstances`) and
   `POST /v2/jobs/search` (`searchJobs`) round out the read surface.
+- `POST /v2/variables/search` (`searchVariables`) and
+  `GET /v2/variables/{variableKey}` (`getVariable`) — expose instance variables.
+  nano keeps a single instance-level scope, so every variable's `scopeKey`
+  equals its `processInstanceKey`. Values are reported as serialized JSON
+  (a string `text` as `"text"`, numbers/booleans bare); `searchVariables`
+  truncates long values unless `truncateValues=false` and flags `isTruncated`.
+  Variable keys are assigned by the read model (the engine does not mint them).
 
-All three search endpoints implement the full v2 query contract:
+All search endpoints implement the full v2 query contract:
 
 - **Filters** use the advanced operator algebra — `$eq`, `$neq`, `$exists`,
   `$in`, `$notIn`, and `$like` (with `*`/`?` wildcards) — in addition to plain
@@ -202,8 +209,9 @@ follows the Camunda 8 / Operate split — a **command side** and a separate
   `nanobpmn-exporter` thread streams the journal's event log into it (in command
   order, via the same under-the-write-lock hand-off the journal writer uses),
   projecting events into denormalized `process_definitions` / `process_instances`
-  / `jobs` / `incidents` tables. **Every `search*`/`get*` query is served from
-  SQLite**, never from hot engine state — which is what makes eviction possible.
+  / `jobs` / `incidents` / `variables` tables. **Every `search*`/`get*` query is
+  served from SQLite**, never from hot engine state — which is what makes eviction
+  possible.
 
 The read model is a pure **derived projection** of the journal, so it needs no
 durability of its own: on boot the server replays any journal events the store

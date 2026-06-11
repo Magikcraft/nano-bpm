@@ -1133,6 +1133,109 @@ impl ServerImpl {
         ))
     }
 
+    /// Searches variables in the read model. nano keeps a single instance-level
+    /// scope, so every variable's `scopeKey` equals its `processInstanceKey`.
+    async fn search_variables_impl(
+        &self,
+        query_params: &models::SearchVariablesQueryParams,
+        body: &Option<models::VariableSearchQuery>,
+    ) -> Result<apis::variable::SearchVariablesResponse, ()> {
+        use apis::variable::SearchVariablesResponse as Resp;
+
+        // `truncateValues` defaults to true: long values are truncated and the
+        // result flags `isTruncated`.
+        let truncate = query_params.truncate_values.unwrap_or(true);
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let vars = self.store.variables();
+
+        let mut matched: Vec<&readstore::VariableRow> = vars
+            .iter()
+            .filter(|v| match filter {
+                None => true,
+                Some(f) => {
+                    let tenant_ok =
+                        f.tenant_id.as_ref().is_none_or(|t| t == "<default>");
+                    let truncated = value_is_truncated(&v.value, truncate);
+                    tenant_ok
+                        && query::match_string(&f.name, &v.name)
+                        && query::match_string(&f.value, &v.value)
+                        && query::match_variable_key(&f.variable_key, &v.key.to_string())
+                        && query::match_scope_key(&f.scope_key, &v.scope_key.to_string())
+                        && query::match_process_instance_key(
+                            &f.process_instance_key,
+                            &v.instance_key.to_string(),
+                        )
+                        && f.is_truncated.is_none_or(|want| want == truncated)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::VariableSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |v, field| match field {
+                "name" => query::SortVal::Str(v.name.clone()),
+                "value" => query::SortVal::Str(v.value.clone()),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                "scopeKey" => query::SortVal::Num(v.scope_key as i64),
+                "processInstanceKey" => query::SortVal::Num(v.instance_key as i64),
+                _ => query::SortVal::Num(v.key as i64),
+            },
+            |v| v.key,
+        );
+
+        let sorted: Vec<(u64, &readstore::VariableRow)> =
+            matched.into_iter().map(|v| (v.key, v)).collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::VariableSearchResult> = page
+            .items
+            .into_iter()
+            .map(|v| variable_search_result(v, truncate))
+            .collect();
+
+        Ok(Resp::Status200_TheVariableSearchResult(
+            models::VariableSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    /// Returns a single variable by its (read-model assigned) key, with its full
+    /// untruncated value.
+    async fn get_variable_impl(
+        &self,
+        path_params: &models::GetVariablePathParams,
+    ) -> Result<apis::variable::GetVariableResponse, ()> {
+        use apis::variable::GetVariableResponse as Resp;
+
+        let key: u64 = match path_params.variable_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(problem(
+                    "Variable not found",
+                    404,
+                    format!(
+                        "Variable key '{}' is not a valid key.",
+                        path_params.variable_key
+                    ),
+                )));
+            }
+        };
+
+        match self.store.variable(key) {
+            Some(v) => Ok(Resp::Status200_TheVariableIsSuccessfullyReturned(
+                variable_result(&v),
+            )),
+            None => Ok(Resp::Status404_NotFound(problem(
+                "Variable not found",
+                404,
+                format!("No variable with key {key}."),
+            ))),
+        }
+    }
+
     /// Searches deployed process definitions. The engine keeps only the latest
     /// version of each process id (in `state.processes`), so every entry is the
     /// latest version; older versions are not retained and therefore not
@@ -1568,6 +1671,63 @@ fn process_definition_result(
         "<default>".to_string(),
         models::ProcessDefinitionKey(deployed.key.to_string()),
         false,
+    )
+}
+
+/// The byte length beyond which a variable value is truncated in search results
+/// (when `truncateValues` is on). Mirrors the order of magnitude of Camunda's
+/// variable value preview; nano's typical values are far shorter.
+const VARIABLE_VALUE_PREVIEW_LEN: usize = 8192;
+
+/// Whether `value` would be truncated given the current `truncate` setting.
+fn value_is_truncated(value: &str, truncate: bool) -> bool {
+    truncate && value.len() > VARIABLE_VALUE_PREVIEW_LEN
+}
+
+/// Truncates `value` to the preview length on a char boundary when `truncate` is
+/// on, returning the (possibly shortened) value and whether it was truncated.
+fn truncate_value(value: &str, truncate: bool) -> (String, bool) {
+    if value_is_truncated(value, truncate) {
+        let mut end = VARIABLE_VALUE_PREVIEW_LEN;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        (value[..end].to_string(), true)
+    } else {
+        (value.to_string(), false)
+    }
+}
+
+/// Projects a [`VariableRow`] into the generated `VariableSearchResult`, applying
+/// value truncation per the request's `truncateValues` setting.
+fn variable_search_result(
+    v: &readstore::VariableRow,
+    truncate: bool,
+) -> models::VariableSearchResult {
+    let (value, is_truncated) = truncate_value(&v.value, truncate);
+    models::VariableSearchResult::new(
+        v.name.clone(),
+        "<default>".to_string(),
+        models::VariableKey(v.key.to_string()),
+        models::ScopeKey(v.scope_key.to_string()),
+        models::ProcessInstanceKey(v.instance_key.to_string()),
+        types::Nullable::Null,
+        value,
+        is_truncated,
+    )
+}
+
+/// Projects a [`VariableRow`] into the generated `VariableResult` (single-get),
+/// always carrying the full untruncated value.
+fn variable_result(v: &readstore::VariableRow) -> models::VariableResult {
+    models::VariableResult::new(
+        v.name.clone(),
+        "<default>".to_string(),
+        models::VariableKey(v.key.to_string()),
+        models::ScopeKey(v.scope_key.to_string()),
+        models::ProcessInstanceKey(v.instance_key.to_string()),
+        types::Nullable::Null,
+        v.value.clone(),
     )
 }
 

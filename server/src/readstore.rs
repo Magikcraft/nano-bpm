@@ -24,12 +24,13 @@ use std::sync::Mutex;
 
 use nanobpmn_engine_core::{
     DEFAULT_JOB_RETRIES, Event, IncidentKind, IncidentState, JobState, Key, ProcessInstanceState,
+    Value,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped whenever the schema or projection changes; a stored database with a
 /// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
@@ -74,6 +75,16 @@ CREATE TABLE incidents (
     process_definition_key TEXT NOT NULL
 );
 CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+CREATE TABLE variables (
+    key                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_key           INTEGER NOT NULL,
+    scope_key              INTEGER NOT NULL,
+    name                   TEXT NOT NULL,
+    value                  TEXT NOT NULL,
+    process_definition_id  TEXT NOT NULL,
+    process_definition_key TEXT NOT NULL,
+    UNIQUE(scope_key, name)
+);
 ";
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
@@ -189,6 +200,18 @@ pub struct ProcessDefinitionRow {
     pub version: i32,
 }
 
+pub struct VariableRow {
+    pub key: Key,
+    pub instance_key: Key,
+    pub scope_key: Key,
+    pub name: String,
+    /// The variable's value as a serialized-JSON string (e.g. `"text"`, `42`,
+    /// `true`), mirroring Camunda's wire representation.
+    pub value: String,
+    pub process_definition_id: String,
+    pub process_definition_key: String,
+}
+
 /// The read model. Wraps a single SQLite connection behind a mutex: SQLite
 /// serializes writes anyway, and this keeps the projection (exporter thread) and
 /// the queries (request handlers) on one shared database — including for the
@@ -235,6 +258,7 @@ impl ReadStore {
              DROP TABLE IF EXISTS process_instances;
              DROP TABLE IF EXISTS jobs;
              DROP TABLE IF EXISTS incidents;
+             DROP TABLE IF EXISTS variables;
              DROP TABLE IF EXISTS meta;",
         )?;
         conn.execute_batch(SCHEMA)?;
@@ -274,6 +298,7 @@ impl ReadStore {
                  DROP TABLE IF EXISTS process_instances;
                  DROP TABLE IF EXISTS jobs;
                  DROP TABLE IF EXISTS incidents;
+                 DROP TABLE IF EXISTS variables;
                  DROP TABLE IF EXISTS meta;",
             )?;
         }
@@ -388,6 +413,30 @@ impl ReadStore {
             .expect("query process_definitions");
         rows.filter_map(Result::ok).collect()
     }
+
+    pub fn variables(&self) -> Vec<VariableRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, instance_key, scope_key, name, value, \
+                 process_definition_id, process_definition_key FROM variables",
+            )
+            .expect("prepare variables");
+        let rows = stmt.query_map([], map_variable).expect("query variables");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    pub fn variable(&self, key: Key) -> Option<VariableRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT key, instance_key, scope_key, name, value, \
+             process_definition_id, process_definition_key FROM variables WHERE key = ?1",
+            params![key as i64],
+            map_variable,
+        )
+        .optional()
+        .expect("query variable")
+    }
 }
 
 fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
@@ -435,6 +484,74 @@ fn map_incident(r: &rusqlite::Row) -> rusqlite::Result<IncidentRow> {
     })
 }
 
+fn map_variable(r: &rusqlite::Row) -> rusqlite::Result<VariableRow> {
+    Ok(VariableRow {
+        key: r.get::<_, i64>(0)? as Key,
+        instance_key: r.get::<_, i64>(1)? as Key,
+        scope_key: r.get::<_, i64>(2)? as Key,
+        name: r.get(3)?,
+        value: r.get(4)?,
+        process_definition_id: r.get(5)?,
+        process_definition_key: r.get(6)?,
+    })
+}
+
+/// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
+/// the wire: strings are JSON-quoted (so a string `myValue` becomes `"myValue"`),
+/// integers and booleans render bare.
+fn json_value(value: &Value) -> String {
+    match value {
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Str(s) => {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => {
+                        out.push_str(&format!("\\u{:04x}", c as u32));
+                    }
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+    }
+}
+
+/// Upserts a batch of variables into the single instance-level scope (nano keeps
+/// one scope per instance, so `scopeKey == processInstanceKey`). Names are sorted
+/// so the autoincrement variable keys are assigned deterministically on a rebuild
+/// (a `VariablesUpdated`/`ProcessInstanceCreated` event carries an unordered map).
+/// An already-known name keeps its key and has its value overwritten.
+fn upsert_variables(
+    tx: &rusqlite::Transaction,
+    instance_key: Key,
+    variables: &std::collections::HashMap<String, Value>,
+) -> rusqlite::Result<()> {
+    if variables.is_empty() {
+        return Ok(());
+    }
+    let (def_id, def_key) = instance_def(tx, instance_key);
+    let mut entries: Vec<(&String, &Value)> = variables.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, value) in entries {
+        tx.execute(
+            "INSERT INTO variables (instance_key, scope_key, name, value, \
+             process_definition_id, process_definition_key) VALUES (?1, ?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(scope_key, name) DO UPDATE SET value = excluded.value",
+            params![instance_key as i64, name, json_value(value), def_id, def_key],
+        )?;
+    }
+    Ok(())
+}
+
 /// The process-definition identity (`process_definition_id`,
 /// `process_definition_key`) carried by an instance row, used to denormalize
 /// jobs and incidents onto their owning definition. Defaults to empty values
@@ -477,7 +594,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             instance_key,
             process_id,
             created_at,
-            ..
+            variables,
         } => {
             // Resolve the deployed identity now (defaults mirror
             // `process_instance_result` when no definition is on record).
@@ -507,6 +624,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     *created_at as i64,
                 ],
             )?;
+            // Variables the instance was created with (the process-instance row
+            // exists now, so the scope's denormalized definition resolves).
+            upsert_variables(tx, *instance_key, variables)?;
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
@@ -711,6 +831,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     params![*job_key as i64, job_state_code(JobState::Created)],
                 )?;
             }
+        }
+
+        Event::VariablesUpdated {
+            instance_key,
+            variables,
+        } => {
+            upsert_variables(tx, *instance_key, variables)?;
         }
 
         // Events with no queryable read-model projection.

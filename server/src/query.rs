@@ -238,6 +238,31 @@ pub fn match_job_key(filter: &Option<models::JobKeyFilterProperty>, value: &str)
     }
 }
 
+/// Matches a `VariableKeyFilterProperty` against a key's decimal string.
+pub fn match_variable_key(
+    filter: &Option<models::VariableKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::VariableKeyFilterProperty::VariableKey(k)) => k.0 == value,
+        Some(models::VariableKeyFilterProperty::AdvancedVariableKeyFilter(a)) => {
+            ops!(a, |k: &models::VariableKey| k.0.clone()).matches(Some(value))
+        }
+    }
+}
+
+/// Matches a `ScopeKeyFilterProperty` against a key's decimal string.
+pub fn match_scope_key(filter: &Option<models::ScopeKeyFilterProperty>, value: &str) -> bool {
+    match filter {
+        None => true,
+        Some(models::ScopeKeyFilterProperty::ScopeKey(k)) => k.0 == value,
+        Some(models::ScopeKeyFilterProperty::AdvancedScopeKeyFilter(a)) => {
+            ops!(a, |k: &models::ScopeKey| k.0.clone()).matches(Some(value))
+        }
+    }
+}
+
 /// Matches an `IncidentStateFilterProperty` against a state's wire spelling.
 pub fn match_incident_state(
     filter: &Option<models::IncidentStateFilterProperty>,
