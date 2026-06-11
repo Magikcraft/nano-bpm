@@ -227,6 +227,12 @@ impl ServerImpl {
                         .get(&process_id)
                         .map(|d| (d.key.to_string(), d.version))
                         .unwrap_or_else(|| (process_id.clone(), 1));
+                    // An auto-completing process (no wait states) finishes
+                    // synchronously within this create command; a process that
+                    // parks on a job/timer/etc. is still running. `processCompleted`
+                    // tells the caller whether the returned variables are the
+                    // authoritative final result.
+                    let process_completed = engine.engine().is_completed(instance_key);
                     let result = models::CreateProcessInstanceResult::new(
                         process_id.clone(),
                         version,
@@ -236,6 +242,7 @@ impl ServerImpl {
                         models::ProcessInstanceKey(instance_key.to_string()),
                         Vec::new(),
                         nanobpm_gateway_rest::types::Nullable::Null,
+                        process_completed,
                     );
                     (
                         Resp::Status200_TheProcessInstanceWasCreated(result),

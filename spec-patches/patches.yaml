@@ -1,0 +1,41 @@
+# Local overlays applied to the build copy of the OpenAPI spec.
+#
+# The upstream spec under spec/ is kept byte-for-byte identical to the Camunda
+# Orchestration Cluster release it tracks, so it can be updated by simply
+# replacing those files. Any project-specific additions live here and are
+# applied by scripts/preprocess-spec.py while it sanitizes spec/ into build/spec.
+#
+# Each entry targets a file (path relative to spec/) and a dotted path inside the
+# parsed YAML, then either:
+#   merge:  <mapping>   deep-merges a mapping additively (e.g. add a property)
+#   append: <list>      appends items to a list node (e.g. a `required` array),
+#                       de-duplicated.
+
+# --- createProcessInstance: processCompleted -------------------------------
+#
+# nanobpmn extends CreateProcessInstanceResult with `processCompleted`. With the
+# await-completion flag, the create request can block until the instance either
+# completes (variables are then authoritative) or the request times out. Unlike
+# Camunda 8 (which returns 504 on timeout), nanobpmn always returns 200 with the
+# processInstanceKey; `processCompleted` tells the caller whether the returned
+# variables are the final result or whether they should poll by key.
+#
+# Marking it `required` makes the generated Rust field a plain `bool` (not an
+# Option), so the server must always populate it.
+- file: process-instances.yaml
+  target: components.schemas.CreateProcessInstanceResult.properties
+  merge:
+    processCompleted:
+      type: boolean
+      description: |
+        Whether the process instance had completed by the time this response was
+        produced. When true, the returned variables are the authoritative final
+        result. When false, the instance is still running (e.g. the await timed
+        out or completion was not awaited); poll for the outcome using
+        processInstanceKey.
+      example: true
+
+- file: process-instances.yaml
+  target: components.schemas.CreateProcessInstanceResult.required
+  append:
+    - processCompleted

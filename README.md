@@ -258,7 +258,8 @@ rationale for following the Camunda 8 (Zeebe) model rather than the Camunda 7 PV
 
 The REST layer is generated with [OpenAPI Generator](https://openapi-generator.tech)
 using its [`rust-axum`](https://openapi-generator.tech/docs/generators/rust-axum)
-server generator (run via Docker, version-pinned). It produces a self-contained
+server generator (run from the version-pinned `openapi-generator-cli` JAR via
+the local Java runtime — no Docker required). It produces a self-contained
 library crate (`nanobpm-gateway-rest`) with:
 
 - **`src/models.rs`** — serde structs for every schema in the spec.
@@ -273,12 +274,14 @@ library crate (`nanobpm-gateway-rest`) with:
 nanobpmn/
 ├── Makefile                       # generate / build / run / fmt / clippy / clean
 ├── openapi-generator-config.yaml  # generator configuration
-├── spec/                          # bundled OpenAPI spec (source of truth)
+├── spec/                          # bundled OpenAPI spec (upstream, source of truth)
 │   ├── rest-api.yaml              # entrypoint ($refs the sibling files)
 │   └── *.yaml
+├── spec-patches/                  # local overlays applied to the build copy
+│   └── patches.yaml               # project-specific spec additions (spec/ stays pristine)
 ├── scripts/
 │   ├── generate.sh                # end-to-end generation pipeline
-│   ├── preprocess-spec.py         # sanitizes a temp copy of the spec
+│   ├── preprocess-spec.py         # sanitizes + overlays a temp copy of the spec
 │   ├── postprocess-generated.py   # patches known rust-axum generator bugs
 │   └── gen-stub-server.py         # generates the server's stub trait impls
 ├── server/                        # runnable stub server (binary crate)
@@ -286,7 +289,7 @@ nanobpmn/
 │   └── src/
 │       ├── main.rs                # ServerImpl, auth/error glue, bootstrap
 │       └── stub_impls.rs          # generated trait impls (git-ignored)
-├── build/                         # temp sanitized spec (git-ignored)
+├── build/                         # temp sanitized spec + cached generator JAR (git-ignored)
 └── generated/                     # generated library crate (git-ignored)
 ```
 
@@ -315,9 +318,11 @@ The `spec/` tree is the committed source of truth.
 
 ## Requirements
 
-- Docker (to run the pinned `openapi-generator-cli` image)
+- A Java runtime (JRE/JDK 11+) — runs the pinned `openapi-generator-cli` JAR,
+  which is downloaded once into `build/tools/` (no Docker, no global install)
 - A Rust toolchain (`cargo`, `rustfmt`)
 - Python 3 with PyYAML (for the spec pre-processing step)
+- `curl` or `wget` (to fetch the generator JAR on first run)
 
 ## Usage
 
@@ -371,8 +376,10 @@ INFO rest: <-- POST /v2/process-instances 200 OK (39.7ms) [180 bytes] {"processI
 
 
 > The generated REST layer under `generated/` is a build dependency, so
-> `make release` runs `make generate` first if needed (which requires Docker).
-> Once generated, the binary itself has no runtime dependency on Docker.
+> `make release` runs `make generate` first if needed (which downloads and runs
+> the `openapi-generator-cli` JAR with local Java — no Docker).
+> Once generated, the binary itself has no build- or run-time external
+> dependencies.
 
 ## Engine (`engine-core`)
 
@@ -445,10 +452,13 @@ The per-tag trait impls are generated into `server/src/stub_impls.rs` by
 1. **Preprocess** (`preprocess-spec.py`) — the bundled spec in `spec/` is never
    edited. It is copied into `build/spec/`, where a few constructs that the beta
    `rust-axum` generator cannot handle are sanitized (currently: schema-less
-   request bodies such as `content: { application/json: {} }`). Files that need
-   no change are copied verbatim to keep the transform minimal.
-2. **Generate** — `openapi-generator-cli` (Docker, version-pinned) emits the
-   crate into `generated/`.
+   request bodies such as `content: { application/json: {} }`), and any local
+   overlays from `spec-patches/patches.yaml` are applied (see
+   [Local spec overlays](#local-spec-overlays)). Files that need no change are
+   copied verbatim to keep the transform minimal.
+2. **Generate** — the version-pinned `openapi-generator-cli` JAR (downloaded once
+   into `build/tools/` and run with local Java — no Docker) emits the crate into
+   `generated/`.
 3. **Post-process** (`postprocess-generated.py`) — deterministically patches
    known `rust-axum` code-generation bugs so the crate compiles and behaves
    correctly (an invalid `oneOf` date-time enum variant, discriminator helpers
@@ -464,3 +474,27 @@ The per-tag trait impls are generated into `server/src/stub_impls.rs` by
 `spec/` is a copy of the Camunda v2 OpenAPI spec
 (`zeebe/gateway-protocol/src/main/proto/v2` in `camunda/camunda`). To refresh it,
 replace the files under `spec/` and run `make generate`.
+
+## Local spec overlays
+
+`spec/` is kept byte-for-byte identical to the upstream Camunda release so it can
+be refreshed by simply replacing files. Project-specific additions to the API
+contract live separately in `spec-patches/patches.yaml` and are applied to the
+build copy (`build/spec/`) during preprocessing — `spec/` is never mutated.
+
+Each overlay entry names a `file` (relative to `spec/`) and a dotted `target`
+path inside it, then either deep-`merge`s a mapping or `append`s items to a list:
+
+```yaml
+- file: process-instances.yaml
+  target: components.schemas.CreateProcessInstanceResult.properties
+  merge:
+    processCompleted: { type: boolean, description: "…" }
+- file: process-instances.yaml
+  target: components.schemas.CreateProcessInstanceResult.required
+  append: [processCompleted]
+```
+
+This is how nanobpmn adds the `processCompleted` flag to
+`CreateProcessInstanceResult` (it reports whether the returned variables are the
+authoritative final result) without forking the upstream spec.

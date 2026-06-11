@@ -12,7 +12,7 @@ ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 .DEFAULT_GOAL := build
 
 .PHONY: generate
-generate: ## Generate the Rust REST layer + server stub impls from spec/ (requires Docker)
+generate: ## Generate the Rust REST layer + server stub impls from spec/ (needs local Java)
 	./scripts/generate.sh
 
 $(GENERATED_DIR)/Cargo.toml:
