@@ -6,7 +6,7 @@
 //! produce [`ProcessDefinition`]s); here processes are built programmatically via
 //! [`ProcessBuilder`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Serde default for boundary-event `interrupting` flags: older serialized
 /// definitions (before non-interrupting boundaries existed) carried only
@@ -21,34 +21,98 @@ pub type ElementId = String;
 
 /// A process variable value.
 ///
-/// A minimal, hashable value type — enough for exclusive-gateway conditions.
-/// (A real engine would carry arbitrary JSON; that is an intentional extension
-/// point.)
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A JSON-like value type spanning what FEEL operates over: `null`, booleans,
+/// numbers (integers kept distinct from decimals so integral values round-trip
+/// exactly), strings, lists and contexts (maps). Numbers compare numerically
+/// across `Int`/`Double` inside the FEEL evaluator; the derived `PartialEq` here
+/// is structural (used by event/state equality), so `Int(3) != Double(3.0)`
+/// structurally — callers needing FEEL semantics go through [`crate::feel`].
+///
+/// `Eq` is implemented by hand (rather than derived) so the many `#[derive(Eq)]`
+/// log/state types that embed a `Value` keep compiling despite the `f64` payload.
+/// This is sound because the evaluator never produces `NaN` (FEEL maps invalid
+/// arithmetic to `Null`), so reflexivity holds for every value we actually store.
+#[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
+    /// The FEEL `null` (and the result of an unresolved variable or a failed
+    /// computation).
+    Null,
     Bool(bool),
+    /// An integral number. Kept distinct from [`Value::Double`] so whole numbers
+    /// round-trip without acquiring a fractional rendering.
     Int(i64),
+    /// A non-integral number.
+    Double(f64),
     Str(String),
+    /// An ordered list (FEEL list).
+    List(Vec<Value>),
+    /// A context (FEEL map): an ordered set of named entries.
+    Map(BTreeMap<String, Value>),
 }
 
-/// A boolean guard on a sequence flow, evaluated against process variables.
+impl Eq for Value {}
+
+impl Value {
+    /// The number this value holds, if it is numeric (`Int` or `Double`).
+    pub fn as_f64(&self) -> Option<f64> {        match self {
+            Value::Int(i) => Some(*i as f64),
+            Value::Double(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Builds a numeric value, narrowing to [`Value::Int`] when the number is a
+    /// finite integer and to [`Value::Null`] when it is not finite (FEEL has no
+    /// infinity/NaN). This keeps integral arithmetic results rendering cleanly.
+    pub fn number(n: f64) -> Value {
+        if !n.is_finite() {
+            return Value::Null;
+        }
+        if n.fract() == 0.0 && n.abs() < i64::MAX as f64 {
+            Value::Int(n as i64)
+        } else {
+            Value::Double(n)
+        }
+    }
+}
+
+/// Renders an `f64` the FEEL way: a finite integral value drops the fractional
+/// part (`2.0` -> `"2"`), everything else uses the shortest round-trip form.
+pub(crate) fn format_double(d: f64) -> String {
+    if d.is_finite() && d.fract() == 0.0 && d.abs() < i64::MAX as f64 {
+        (d as i64).to_string()
+    } else {
+        d.to_string()
+    }
+}
+
+/// A boolean guard on a sequence flow: a FEEL expression evaluated against the
+/// instance variables (the conditionExpression body, e.g. `= amount > 10`).
 ///
-/// Only equality is supported — deliberately not a FEEL expression engine. New
-/// operators plug in here.
+/// The full FEEL grammar supported by [`crate::feel`] applies — comparisons,
+/// arithmetic, boolean logic, member access — not just equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Condition {
-    /// True when the variable exists and equals `value`.
-    Equals { variable: String, value: Value },
+pub struct Condition {
+    /// The raw FEEL expression. A single leading `=` marker is optional (it is
+    /// stripped by the evaluator).
+    pub expression: String,
 }
 
 impl Condition {
-    /// Evaluates the condition against a set of variables.
-    pub fn eval(&self, variables: &HashMap<String, Value>) -> bool {
-        match self {
-            Condition::Equals { variable, value } => variables.get(variable) == Some(value),
+    /// Wraps a raw FEEL expression as a sequence-flow condition.
+    pub fn new(expression: impl Into<String>) -> Self {
+        Condition {
+            expression: expression.into(),
         }
+    }
+
+    /// Evaluates the condition against a set of variables, returning the FEEL
+    /// error on a parse/type failure or a non-boolean result. The exclusive
+    /// gateway turns such an error into an `ExpressionEvaluation` incident.
+    pub fn eval(&self, variables: &HashMap<String, Value>) -> Result<bool, crate::feel::FeelError> {
+        crate::feel::eval_bool(&self.expression, variables)
     }
 }
 
@@ -586,18 +650,18 @@ impl ProcessBuilder {
     }
 
     /// Adds a conditional sequence flow from `from` to `to`, taken (on an
-    /// exclusive gateway) only when `condition` holds.
+    /// exclusive gateway) only when the FEEL `expression` evaluates to `true`.
     pub fn connect_when(
         mut self,
         from: impl Into<String>,
         to: impl Into<String>,
-        condition: Condition,
+        expression: impl Into<String>,
     ) -> Self {
         self.edges.push((
             from.into(),
             SequenceFlow {
                 to: to.into(),
-                condition: Some(condition),
+                condition: Some(Condition::new(expression)),
             },
         ));
         self

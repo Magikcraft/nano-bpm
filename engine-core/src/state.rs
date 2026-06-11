@@ -128,6 +128,10 @@ pub enum IncidentKind {
     JobNoRetries,
     /// An exclusive gateway found no matching outgoing sequence flow.
     NoMatchingSequenceFlow,
+    /// A sequence-flow condition (or other expression) failed to evaluate to the
+    /// expected type — a FEEL parse error, a type error, or a non-boolean
+    /// condition result.
+    ExpressionEvaluation,
     /// A thrown business error was not caught by any boundary event.
     UnhandledError,
 }

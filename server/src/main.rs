@@ -1695,6 +1695,7 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
     match kind {
         IncidentKind::JobNoRetries => models::IncidentErrorTypeEnum::JobNoRetries,
         IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
+        IncidentKind::ExpressionEvaluation => models::IncidentErrorTypeEnum::ExtractValueError,
         IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
     }
 }
@@ -1988,36 +1989,66 @@ fn to_object_map(
 ) -> std::collections::HashMap<String, types::Object> {
     variables
         .into_iter()
-        .map(|(name, value)| {
-            let json = match value {
-                Value::Bool(b) => serde_json::Value::Bool(b),
-                Value::Int(i) => serde_json::Value::Number(i.into()),
-                Value::Str(s) => serde_json::Value::String(s),
-            };
-            (name, types::Object(json))
-        })
+        .map(|(name, value)| (name, types::Object(value_to_json(&value))))
         .collect()
 }
 
-/// Converts a REST `Object` (JSON) variable map into engine variables. The POC
-/// engine only models `Bool`/`Int`/`Str`; JSON booleans, integers, and strings
-/// map directly, and any richer JSON value is kept as its compact string form so
-/// routing on it stays deterministic.
+/// Converts a REST `Object` (JSON) variable map into engine variables.
 fn from_object_map(
     variables: &std::collections::HashMap<String, types::Object>,
 ) -> std::collections::HashMap<String, Value> {
     variables
         .iter()
-        .map(|(name, object)| {
-            let value = match &object.0 {
-                serde_json::Value::Bool(b) => Value::Bool(*b),
-                serde_json::Value::Number(n) if n.is_i64() => Value::Int(n.as_i64().unwrap()),
-                serde_json::Value::String(s) => Value::Str(s.clone()),
-                other => Value::Str(other.to_string()),
-            };
-            (name.clone(), value)
-        })
+        .map(|(name, object)| (name.clone(), json_to_value(&object.0)))
         .collect()
+}
+
+/// Converts a JSON value into the engine [`Value`] tree, preserving numbers
+/// (integral vs. decimal), lists and objects so FEEL can operate on them.
+pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else {
+                Value::number(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => Value::Str(s.clone()),
+        serde_json::Value::Array(items) => {
+            Value::List(items.iter().map(json_to_value).collect())
+        }
+        serde_json::Value::Object(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Converts an engine [`Value`] tree back into JSON for the REST wire.
+pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Double(d) => serde_json::Number::from_f64(*d)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Str(s) => serde_json::Value::String(s.clone()),
+        Value::List(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        }
+        Value::Map(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect(),
+        ),
+    }
 }
 
 /// The minted message key from a `CorrelateMessage`'s events: the heading

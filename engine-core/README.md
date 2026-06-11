@@ -90,9 +90,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 - A **service task** rests in `ACTIVATED` after creating a job, and only advances
   to `COMPLETING` when a `CompleteJob` command arrives. This is how asynchronous
   work is modelled with no background thread. A task's job type may be a FEEL
-  variable reference (`type="=jobType"`); it is resolved at job-creation time to
-  the value of the named instance variable (an unresolved reference falls back to
-  the literal text).
+  expression (`type="=jobType"`, `type='="worker-" + region'`); it is evaluated
+  against the instance variables at job-creation time (an expression that cannot
+  be evaluated falls back to the literal text).
 - **Job activation** mirrors Camunda 8: a worker activates available jobs of a
   type (`ActivateJobs`), locking each until `now + timeout`. A job must be
   activated before it can be completed. Locks expire — either lazily on the next
@@ -114,8 +114,8 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   throwing requires prior activation.
 - **Incidents** are first-class records with a key (`State::incidents`) and a
   `created_at` timestamp, raised when a token cannot proceed: a job exhausted its
-  retries, an exclusive gateway matched no flow, or a thrown error went uncaught
-  (`IncidentKind`). A job-incident links back to its job. Recovery mirrors
+  retries, an exclusive gateway matched no flow, a sequence-flow condition failed
+  to evaluate, or a thrown error went uncaught (`IncidentKind`). A job-incident links back to its job. Recovery mirrors
   Camunda: `ResolveIncident` **retries the failed work** rather than merely
   clearing the record. A job-incident returns the parked job to the activatable
   pool (after `UpdateJobRetries` restores its retries; resolution is rejected
@@ -246,8 +246,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > interrupting the task and routing to its error-handling path),
 > **interrupting timer boundary events** (a deadline on a service task that, when
 > it fires first, cancels the job and routes the token out the boundary),
-> **exclusive (XOR) gateways** (condition-based routing with a default flow,
-> raising an incident when nothing matches), **parallel (AND) gateways**
+> **exclusive (XOR) gateways** (FEEL condition-based routing with a default flow,
+> raising an incident when nothing matches or a condition fails to evaluate),
+> **parallel (AND) gateways**
 > (split takes all branches; join synchronises them), **timer intermediate
 > catch events** (a token parks until its `timeDuration` elapses, fired by a
 > host clock tick) and **message events** — **message intermediate catch events**
@@ -264,9 +265,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > token scope whose inner flow runs to its own end before the sub-process routes
 > on, with **error, timer and message boundary events** attached to the
 > sub-process — an interrupting one terminates the whole inner scope and routes to
-> its handler). Instances carry
-> simple variables (`Bool`/`Int`/`Str`) used by gateway conditions and message
-> correlation. Processes can be
+> its handler). Instances carry JSON-like variables (`null`, booleans, numbers,
+> strings, lists and contexts) evaluated by an in-house FEEL engine ([`feel`])
+> for gateway conditions, job types and message correlation. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
 > that same subset (including `subProcess`, `boundaryEvent`/`errorEventDefinition`,
 > `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/

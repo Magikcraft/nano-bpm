@@ -76,6 +76,7 @@ mod model;
 mod state;
 
 pub mod bpmn;
+pub mod feel;
 
 #[cfg(feature = "ffi")]
 pub mod ffi;
@@ -83,6 +84,7 @@ pub mod ffi;
 pub use command::Command;
 pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;
+pub use feel::FeelError;
 pub use model::{
     BuildError, Condition, Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition,
     SequenceFlow, Value,

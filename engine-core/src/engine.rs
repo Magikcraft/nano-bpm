@@ -1016,9 +1016,11 @@ impl Engine {
                     // job to the activatable pool, so a worker retries it via the
                     // normal activate/complete path. Nothing more to enqueue.
                     state::IncidentKind::JobNoRetries => {}
-                    // Exclusive gateway matched no flow: re-evaluate the gateway
-                    // against the (possibly updated) variables.
-                    state::IncidentKind::NoMatchingSequenceFlow => {
+                    // Exclusive gateway matched no flow, or a condition failed to
+                    // evaluate: re-evaluate the gateway against the (possibly
+                    // updated) variables.
+                    state::IncidentKind::NoMatchingSequenceFlow
+                    | state::IncidentKind::ExpressionEvaluation => {
                         queue.push_back(Step::Complete {
                             instance_key,
                             element_instance_key,
@@ -1617,13 +1619,46 @@ impl Engine {
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
         let variables = self.variables(instance_key);
-        let selected =
-            self.outgoing(instance_key, &element_id)
-                .into_iter()
-                .find(|flow| match &flow.condition {
-                    None => true,
-                    Some(c) => c.eval(&variables),
-                });
+        let mut selected = None;
+        let mut eval_error: Option<String> = None;
+        for flow in self.outgoing(instance_key, &element_id) {
+            match &flow.condition {
+                None => {
+                    selected = Some(flow);
+                    break;
+                }
+                Some(condition) => match condition.eval(&variables) {
+                    Ok(true) => {
+                        selected = Some(flow);
+                        break;
+                    }
+                    Ok(false) => continue,
+                    Err(err) => {
+                        eval_error = Some(format!(
+                            "failed to evaluate condition '{}' at exclusive gateway \
+                             '{element_id}': {}",
+                            condition.expression, err.0
+                        ));
+                        break;
+                    }
+                },
+            }
+        }
+
+        if let Some(reason) = eval_error {
+            let incident_key = self.mint_key();
+            let events = vec![Event::IncidentRaised {
+                incident_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind: state::IncidentKind::ExpressionEvaluation,
+                reason,
+                job_key: None,
+                created_at: self.now,
+            }];
+            return (events, Vec::new());
+        }
 
         match selected {
             Some(flow) => {
@@ -2248,17 +2283,18 @@ impl Engine {
             .collect()
     }
 
-    /// Resolves the correlation value a subscription captures at open time: the
-    /// stringified value of the instance variable named `correlation_key`. A
-    /// missing variable yields the empty string (matching the REST default
-    /// `correlationKey` of `""`).
+    /// Resolves the correlation value a subscription captures at open time by
+    /// evaluating the stored `correlation_key` FEEL expression against the
+    /// instance variables (a bare name like `orderId` is just a variable
+    /// reference; `order.id` reads a context member). A missing variable, an
+    /// empty key, or an evaluation error yields the empty string (matching the
+    /// REST default `correlationKey` of `""`).
     fn resolve_correlation_value(&self, instance_key: Key, correlation_key: &str) -> String {
-        self.state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.variables.get(correlation_key))
-            .map(value_to_string)
-            .unwrap_or_default()
+        if correlation_key.is_empty() {
+            return String::new();
+        }
+        let vars = self.variables(instance_key);
+        crate::feel::eval_string(correlation_key, &vars).unwrap_or_default()
     }
 
     fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
@@ -2292,23 +2328,18 @@ impl Engine {
     /// variable) falls back to the literal text — nano has no FEEL evaluator to
     /// raise an incident, and the literal at least surfaces the misconfiguration.
     /// Resolves a service task's job type at job-creation time. A static type is
-    /// returned verbatim. A FEEL variable reference (a leading `=`, e.g.
-    /// `=jobType`) is resolved to the value of the named instance variable;
-    /// strings are used as-is, ints/bools are stringified. An unresolved
-    /// reference (missing variable) falls back to the literal text — nano has no
-    /// FEEL evaluator and does not raise an incident here.
+    /// returned verbatim. A FEEL expression (a leading `=`, e.g. `=jobType` or
+    /// `="worker-" + region`) is evaluated against the instance variables via
+    /// [`crate::feel`], expecting a string-like result. An expression that fails
+    /// to evaluate (parse error, unresolved variable, non-string result) falls
+    /// back to the literal text — nano does not raise an incident here.
     fn resolve_job_type(&self, instance_key: Key, job_type: &str) -> String {
         let trimmed = job_type.trim();
-        let Some(expr) = trimmed.strip_prefix('=') else {
+        if !trimmed.starts_with('=') {
             return job_type.to_string();
-        };
-        let name = expr.trim();
-        match self.variables(instance_key).get(name) {
-            Some(Value::Str(s)) => s.clone(),
-            Some(Value::Int(i)) => i.to_string(),
-            Some(Value::Bool(b)) => b.to_string(),
-            None => job_type.to_string(),
         }
+        let vars = self.variables(instance_key);
+        crate::feel::eval_string(trimmed, &vars).unwrap_or_else(|_| job_type.to_string())
     }
 
     /// Resolves a variable scope key to the process instance that owns it. The
@@ -2435,18 +2466,6 @@ pub struct ActivatedJob {
     pub variables: HashMap<String, Value>,
 }
 
-/// Stringifies a [`Value`] for use as a message correlation key. Strings pass
-/// through unquoted; numbers and booleans use their natural rendering. This is
-/// how an instance variable's value becomes the subscription's correlation key,
-/// matched against the REST `correlationKey` string.
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::Str(s) => s.clone(),
-        Value::Int(i) => i.to_string(),
-        Value::Bool(b) => b.to_string(),
-    }
-}
-
 /// Whether a job can be activated at the logical instant `now`: it is created
 /// (never activated, or its lock was released) or its current lock has expired.
 /// Failed (incident-parked) and completed jobs are never activatable.
@@ -2464,7 +2483,7 @@ fn job_activatable(job: &state::Job, now: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Condition, ProcessBuilder, ProcessDefinition};
+    use crate::model::{ProcessBuilder, ProcessDefinition};
 
     fn linear_with_task() -> ProcessDefinition {
         ProcessBuilder::new("order")
@@ -3190,10 +3209,7 @@ mod tests {
             .connect_when(
                 "g",
                 "approved",
-                Condition::Equals {
-                    variable: "decision".into(),
-                    value: Value::Str("yes".into()),
-                },
+                r#"decision = "yes""#,
             )
             .connect("g", "rejected")
             .build()
@@ -3245,6 +3261,60 @@ mod tests {
     }
 
     #[test]
+    fn should_route_exclusive_gateway_on_a_numeric_feel_comparison() {
+        // A richer FEEL condition than equality: amount > 100 -> big ; else small.
+        let def = ProcessBuilder::new("amounts")
+            .start_event("s")
+            .exclusive_gateway("g")
+            .end_event("big")
+            .end_event("small")
+            .connect("s", "g")
+            .connect_when("g", "big", "amount > 100")
+            .connect("g", "small")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+        let vars = HashMap::from([("amount".to_string(), Value::Int(250))]);
+        let events = engine
+            .apply_command(Command::create_instance_with("amounts", vars))
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "big"
+        )));
+    }
+
+    #[test]
+    fn should_raise_an_expression_incident_when_a_condition_cannot_evaluate() {
+        // The condition compares a string variable to a number — a FEEL type
+        // error — so the gateway raises an ExpressionEvaluation incident rather
+        // than silently treating the flow as not taken.
+        let def = ProcessBuilder::new("typed")
+            .start_event("s")
+            .exclusive_gateway("g")
+            .end_event("yes_end")
+            .connect("s", "g")
+            .connect_when("g", "yes_end", "name > 10")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+        let vars = HashMap::from([("name".to_string(), Value::Str("ann".into()))]);
+        let created = engine
+            .apply_command(Command::create_instance_with("typed", vars))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        let active = engine.active_incidents();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
+        assert!(!engine.is_completed(instance_key));
+    }
+
+    #[test]
     fn should_route_on_variables_returned_by_a_completed_job() {
         // s -> task(decide) -> g(xor): decision==yes -> approved ; else rejected
         let def = ProcessBuilder::new("review")
@@ -3258,10 +3328,7 @@ mod tests {
             .connect_when(
                 "g",
                 "approved",
-                Condition::Equals {
-                    variable: "decision".into(),
-                    value: Value::Str("yes".into()),
-                },
+                r#"decision = "yes""#,
             )
             .connect("g", "rejected")
             .build()
@@ -3308,18 +3375,12 @@ mod tests {
             .connect_when(
                 "g",
                 "yes_end",
-                Condition::Equals {
-                    variable: "d".into(),
-                    value: Value::Bool(true),
-                },
+                "d = true",
             )
             .connect_when(
                 "g",
                 "no_end",
-                Condition::Equals {
-                    variable: "d".into(),
-                    value: Value::Bool(false),
-                },
+                "d = false",
             )
             .build()
             .unwrap();
@@ -3501,10 +3562,7 @@ mod tests {
             .connect_when(
                 "g",
                 "yes_end",
-                Condition::Equals {
-                    variable: "d".into(),
-                    value: Value::Bool(true),
-                },
+                "d = true",
             )
             .build()
             .unwrap();
@@ -3548,10 +3606,7 @@ mod tests {
             .connect_when(
                 "g",
                 "yes_end",
-                Condition::Equals {
-                    variable: "d".into(),
-                    value: Value::Bool(true),
-                },
+                "d = true",
             )
             .build()
             .unwrap();

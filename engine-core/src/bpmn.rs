@@ -33,16 +33,19 @@
 //!   catch/boundary events via `messageRef`.
 //! * A service task's job type is taken from a nested
 //!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id. A
-//!   FEEL variable reference (`type="=jobType"`) is resolved at job-creation
-//!   time to the value of the named instance variable; an unresolved reference
-//!   falls back to the literal text (no incident is raised).
+//!   FEEL expression (`type="=jobType"`, `type='="worker-" + region'`) is
+//!   evaluated against the instance variables at job-creation time via
+//!   [`crate::feel`]; an expression that cannot be evaluated falls back to the
+//!   literal text (no incident is raised).
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
-//!   `conditionExpression` whose FEEL body is parsed as a simple equality
-//!   (`= var = "literal"`); anything else becomes an unconditional flow.
+//!   `conditionExpression` whose FEEL body is stored verbatim and evaluated by
+//!   [`crate::feel`] at the exclusive gateway (comparisons, arithmetic, boolean
+//!   logic, member access — not just equality). A condition that fails to
+//!   evaluate to a boolean raises an `ExpressionEvaluation` incident.
 
 use std::collections::HashMap;
 
-use crate::model::{Condition, ProcessBuilder, ProcessDefinition, Value};
+use crate::model::{ProcessBuilder, ProcessDefinition};
 
 /// An error encountered while parsing BPMN XML.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,7 +358,12 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     if let (Some(acc), Some(idx), Some(text)) =
                         (current.as_mut(), cur_flow, condition_text.take())
                     {
-                        acc.flows[idx].condition = parse_condition(&text);
+                        let trimmed = text.trim();
+                        acc.flows[idx].condition = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
                     }
                 }
                 "intermediateCatchEvent" => cur_intermediate = None,
@@ -439,7 +447,7 @@ enum NodeKind {
 struct FlowAcc {
     source: Option<String>,
     target: Option<String>,
-    condition: Option<Condition>,
+    condition: Option<String>,
 }
 
 /// A boundary event collected while scanning. An `error_ref` (resolved to an
@@ -701,7 +709,7 @@ impl ProcessAcc {
                 }
             };
             builder = match flow.condition {
-                Some(condition) => builder.connect_when(source, target, condition),
+                Some(expression) => builder.connect_when(source, target, expression),
                 None => builder.connect(source, target),
             };
         }
@@ -773,61 +781,6 @@ fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
         None => s,
     };
     parse_iso8601_duration(interval)
-}
-
-/// Parses a FEEL-ish `conditionExpression` body into a [`Condition`].
-///
-/// Recognises a single equality such as `= shipping = "express"`,
-/// `=amount == 10` or `=approved = true`. The leading `=` FEEL marker is
-/// optional and `=`/`==` are both accepted. Anything it cannot parse yields
-/// `None`, i.e. an unconditional flow.
-fn parse_condition(raw: &str) -> Option<Condition> {
-    let expr = raw.trim();
-    // Strip the leading FEEL `=` marker, taking care not to eat a `==` operator.
-    let expr = if expr.starts_with("==") {
-        expr
-    } else {
-        expr.strip_prefix('=').unwrap_or(expr)
-    }
-    .trim();
-
-    // Split on the first `==` or `=` operator.
-    let (lhs, rhs) = if let Some(pos) = expr.find("==") {
-        (&expr[..pos], &expr[pos + 2..])
-    } else {
-        let pos = expr.find('=')?;
-        (&expr[..pos], &expr[pos + 1..])
-    };
-
-    let variable = lhs.trim();
-    let literal = rhs.trim();
-    if variable.is_empty() || literal.is_empty() {
-        return None;
-    }
-
-    Some(Condition::Equals {
-        variable: variable.to_string(),
-        value: parse_literal(literal),
-    })
-}
-
-/// Parses a FEEL literal into a [`Value`]: quoted → string, `true`/`false` →
-/// bool, integer → int, otherwise an unquoted string.
-fn parse_literal(literal: &str) -> Value {
-    if (literal.starts_with('"') && literal.ends_with('"') && literal.len() >= 2)
-        || (literal.starts_with('\'') && literal.ends_with('\'') && literal.len() >= 2)
-    {
-        return Value::Str(literal[1..literal.len() - 1].to_string());
-    }
-    match literal {
-        "true" => return Value::Bool(true),
-        "false" => return Value::Bool(false),
-        _ => {}
-    }
-    if let Ok(n) = literal.parse::<i64>() {
-        return Value::Int(n);
-    }
-    Value::Str(literal.to_string())
 }
 
 /// Parses a `zeebe:subscription correlationKey` expression into the name of an
@@ -1038,6 +991,7 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Condition;
     use crate::model::ElementKind;
 
     const ORDER_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1172,10 +1126,7 @@ mod tests {
         let to_yes = gw.outgoing.iter().find(|f| f.to == "yes").unwrap();
         assert_eq!(
             to_yes.condition,
-            Some(Condition::Equals {
-                variable: "decision".to_string(),
-                value: Value::Str("yes".to_string()),
-            })
+            Some(Condition::new(r#"= decision = "yes""#))
         );
         let to_no = gw.outgoing.iter().find(|f| f.to == "no").unwrap();
         assert_eq!(to_no.condition, None);
@@ -1328,25 +1279,6 @@ mod tests {
 
         // then
         assert!(matches!(err, ParseError::InvalidBoundaryEvent { .. }));
-    }
-
-    #[test]
-    fn should_parse_integer_and_boolean_literals() {
-        // given / when / then
-        assert_eq!(
-            parse_condition("= n == 7"),
-            Some(Condition::Equals {
-                variable: "n".to_string(),
-                value: Value::Int(7),
-            })
-        );
-        assert_eq!(
-            parse_condition("=flag = true"),
-            Some(Condition::Equals {
-                variable: "flag".to_string(),
-                value: Value::Bool(true),
-            })
-        );
     }
 
     #[test]

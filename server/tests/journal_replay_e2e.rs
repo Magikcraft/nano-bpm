@@ -1530,3 +1530,48 @@ fn feel_variable_reference_job_type_resolves_at_job_creation() {
 
     server.shutdown();
 }
+
+#[test]
+fn feel_gateway_condition_routes_end_to_end() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // An exclusive gateway with a non-equality FEEL condition (amount > 100).
+    // The "big" branch ends the process; the default branch parks on a service
+    // task. With amount = 250 the process should complete synchronously under
+    // awaitCompletion, proving the FEEL expression evaluated on the server.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <bpmn:process id="feel-route" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:exclusiveGateway id="g" />
+    <bpmn:endEvent id="big" />
+    <bpmn:serviceTask id="work"><bpmn:extensionElements><zeebe:taskDefinition type="manual" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="small" />
+    <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="g" />
+    <bpmn:sequenceFlow id="f1" sourceRef="g" targetRef="big">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">= amount &gt; 100</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f2" sourceRef="g" targetRef="work" />
+    <bpmn:sequenceFlow id="f3" sourceRef="work" targetRef="small" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(status, 200, "feel-route model should deploy: {body}");
+
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"feel-route","awaitCompletion":true,"requestTimeout":8000,"variables":{"amount":250}}"#),
+    );
+    assert_eq!(status, 200, "await-completion create failed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    assert_eq!(
+        json["processCompleted"].as_bool(),
+        Some(true),
+        "amount > 100 should route to the completing branch: {body}"
+    );
+
+    server.shutdown();
+}

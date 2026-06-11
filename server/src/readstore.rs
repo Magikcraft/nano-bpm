@@ -143,12 +143,14 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::JobNoRetries => 0,
         IncidentKind::NoMatchingSequenceFlow => 1,
         IncidentKind::UnhandledError => 2,
+        IncidentKind::ExpressionEvaluation => 3,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
     match code {
         1 => IncidentKind::NoMatchingSequenceFlow,
         2 => IncidentKind::UnhandledError,
+        3 => IncidentKind::ExpressionEvaluation,
         _ => IncidentKind::JobNoRetries,
     }
 }
@@ -516,31 +518,9 @@ fn map_variable(r: &rusqlite::Row) -> rusqlite::Result<VariableRow> {
 
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
 /// the wire: strings are JSON-quoted (so a string `myValue` becomes `"myValue"`),
-/// integers and booleans render bare.
+/// numbers and booleans render bare, and lists/objects render as JSON.
 fn json_value(value: &Value) -> String {
-    match value {
-        Value::Bool(b) => b.to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Str(s) => {
-            let mut out = String::with_capacity(s.len() + 2);
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c if (c as u32) < 0x20 => {
-                        out.push_str(&format!("\\u{:04x}", c as u32));
-                    }
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-            out
-        }
-    }
+    crate::value_to_json(value).to_string()
 }
 
 /// Upserts a batch of variables into the single instance-level scope (nano keeps
