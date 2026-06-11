@@ -32,7 +32,10 @@
 //!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
 //!   catch/boundary events via `messageRef`.
 //! * A service task's job type is taken from a nested
-//!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id.
+//!   `zeebe:taskDefinition type="…"`; if absent it defaults to the task id. A
+//!   FEEL variable reference (`type="=jobType"`) is resolved at job-creation
+//!   time to the value of the named instance variable; an unresolved reference
+//!   falls back to the literal text (no incident is raised).
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is parsed as a simple equality
 //!   (`= var = "literal"`); anything else becomes an unconditional flow.

@@ -89,7 +89,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 - **Pass-through elements** (start/end events) traverse it in one burst.
 - A **service task** rests in `ACTIVATED` after creating a job, and only advances
   to `COMPLETING` when a `CompleteJob` command arrives. This is how asynchronous
-  work is modelled with no background thread.
+  work is modelled with no background thread. A task's job type may be a FEEL
+  variable reference (`type="=jobType"`); it is resolved at job-creation time to
+  the value of the named instance variable (an unresolved reference falls back to
+  the literal text).
 - **Job activation** mirrors Camunda 8: a worker activates available jobs of a
   type (`ActivateJobs`), locking each until `now + timeout`. A job must be
   activated before it can be completed. Locks expire — either lazily on the next

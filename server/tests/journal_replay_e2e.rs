@@ -1465,3 +1465,68 @@ fn await_completion_times_out_without_completing_a_wait_state() {
 
     server.shutdown();
 }
+
+#[test]
+fn feel_variable_reference_job_type_resolves_at_job_creation() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // The service task type is a FEEL variable reference (type="=jobType"), as
+    // emitted by Camunda Modeler. The job must be created with the *resolved*
+    // value of the jobType variable, so a worker subscribing to that value can
+    // activate it.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="dynamic-type" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="=jobType" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(status, 200, "dynamic-type model should deploy: {body}");
+
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"dynamic-type","variables":{"jobType":"payment-x"}}"#),
+    );
+    assert_eq!(status, 200, "create with jobType variable failed: {body}");
+
+    // The literal expression must NOT be a job type.
+    let (status, resp) = server.request(
+        "POST",
+        &path("/jobs/activation"),
+        Some(r#"{"type":"=jobType","maxJobsToActivate":5,"timeout":60000,"requestTimeout":-1}"#),
+    );
+    assert_eq!(status, 200, "activation by literal failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("activation JSON");
+    assert!(
+        json["jobs"].as_array().expect("jobs array").is_empty(),
+        "literal expression must not activate any job: {resp}"
+    );
+
+    // The resolved value activates the job.
+    let (status, resp) = server.request(
+        "POST",
+        &path("/jobs/activation"),
+        Some(r#"{"type":"payment-x","maxJobsToActivate":5,"timeout":60000,"requestTimeout":-1}"#),
+    );
+    assert_eq!(status, 200, "activation by resolved type failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("activation JSON");
+    let jobs = json["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "resolved type activates the job: {resp}");
+    assert_eq!(
+        jobs[0]["type"].as_str(),
+        Some("payment-x"),
+        "activated job reports the resolved type: {resp}"
+    );
+
+    server.shutdown();
+}

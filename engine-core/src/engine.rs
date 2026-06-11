@@ -1447,6 +1447,7 @@ impl Engine {
             // A service task creates a job and parks the token.
             Some(ElementKind::ServiceTask { job_type }) => {
                 let job_key = self.mint_key();
+                let job_type = self.resolve_job_type(instance_key, &job_type);
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -1590,6 +1591,7 @@ impl Engine {
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask { job_type }) => {
                 let job_key = self.mint_key();
+                let job_type = self.resolve_job_type(instance_key, &job_type);
                 (
                     vec![Event::JobCreated {
                         job_key,
@@ -2278,6 +2280,35 @@ impl Engine {
             .get(&instance_key)
             .map(|i| i.variables.clone())
             .unwrap_or_default()
+    }
+
+    /// Resolves a service task's job type against the instance's variables.
+    ///
+    /// A static type (`"payment"`) is returned verbatim. A FEEL expression
+    /// (`"=jobType"`, as emitted by the Camunda modeler) is treated as a simple
+    /// variable reference: the leading `=` is stripped and the named variable's
+    /// value supplies the type, so the job is created with the runtime type a
+    /// worker actually subscribes to. An unresolvable expression (no such
+    /// variable) falls back to the literal text — nano has no FEEL evaluator to
+    /// raise an incident, and the literal at least surfaces the misconfiguration.
+    /// Resolves a service task's job type at job-creation time. A static type is
+    /// returned verbatim. A FEEL variable reference (a leading `=`, e.g.
+    /// `=jobType`) is resolved to the value of the named instance variable;
+    /// strings are used as-is, ints/bools are stringified. An unresolved
+    /// reference (missing variable) falls back to the literal text — nano has no
+    /// FEEL evaluator and does not raise an incident here.
+    fn resolve_job_type(&self, instance_key: Key, job_type: &str) -> String {
+        let trimmed = job_type.trim();
+        let Some(expr) = trimmed.strip_prefix('=') else {
+            return job_type.to_string();
+        };
+        let name = expr.trim();
+        match self.variables(instance_key).get(name) {
+            Some(Value::Str(s)) => s.clone(),
+            Some(Value::Int(i)) => i.to_string(),
+            Some(Value::Bool(b)) => b.to_string(),
+            None => job_type.to_string(),
+        }
     }
 
     /// Resolves a variable scope key to the process instance that owns it. The
@@ -4196,6 +4227,58 @@ mod tests {
                 process_id: "missing".into()
             }
         );
+    }
+
+    #[test]
+    fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
+        // given a process whose service task type is a FEEL variable reference
+        let def = ProcessBuilder::new("dynamic")
+            .start_event("start")
+            .service_task("work", "=jobType")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+        // when an instance is created with jobType bound to a concrete value
+        let mut vars = HashMap::new();
+        vars.insert("jobType".to_string(), Value::Str("payment".to_string()));
+        engine
+            .apply_command(Command::create_instance_with("dynamic", vars))
+            .unwrap();
+
+        // then the created job carries the resolved type, not the literal "=jobType"
+        let jobs = engine.pending_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, "payment");
+        // and it is activatable by the resolved type
+        assert_eq!(engine.activate_jobs("payment", "w", 10, 1_000, 0).len(), 1);
+    }
+
+    #[test]
+    fn should_fall_back_to_literal_when_job_type_variable_is_missing() {
+        // given the same process but no jobType variable provided
+        let def = ProcessBuilder::new("dynamic")
+            .start_event("start")
+            .service_task("work", "=jobType")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        engine
+            .apply_command(Command::create_instance("dynamic"))
+            .unwrap();
+
+        // then the unresolved expression falls back to the literal text (no panic)
+        let jobs = engine.pending_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, "=jobType");
     }
 
     #[test]
