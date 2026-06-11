@@ -146,7 +146,11 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   so it never fires. `JobCanceled`/`TimerCanceled` are journaled, so both outcomes
   survive a restart. A **non-interrupting** timer boundary
   (`cancelActivity="false"`) instead leaves the activity (and its job) running and
-  spawns a new parallel token along the boundary's outgoing flow when it fires.
+  spawns a new parallel token along the boundary's outgoing flow when it fires. A
+  **cycle** non-interrupting timer boundary (`timeCycle` `R/PT…`) **re-arms**
+  itself for the next interval on every fire (`due_at += interval`), spawning a
+  parallel token each time, until the activity completes (which disarms the
+  pending timer).
 - **Message intermediate catch events** park a token mid-flow until a matching
   message is correlated. Reaching one opens a `MessageSubscription` keyed by the
   message name and a **correlation value** — the stringified value of the named
@@ -205,7 +209,12 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   interrupting **error boundary event** attached to the sub-process catches an
   error thrown by any inner activity (the error propagates up enclosing scopes),
   terminates the whole inner scope (cancelling its jobs/timers/subscriptions) and
-  routes the token out the boundary's outgoing flow.
+  routes the token out the boundary's outgoing flow. **Timer and message boundary
+  events** can also attach to a sub-process (not just a service task): they arm
+  when the sub-process activates, and an **interrupting** one tears down the whole
+  inner scope (like the error boundary) before routing out the boundary, while a
+  **non-interrupting** one spawns a parallel token and leaves the inner scope
+  running.
 - **Bounded hot state (optional eviction).** By default the engine retains
   completed instances forever — `is_completed`, `instance`, and the read APIs all
   keep working — which is ideal for an embedder that queries the engine directly.
@@ -243,14 +252,16 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > message boundary events** (a message that, correlated first, cancels the job and
 > routes the token out the boundary) — **non-interrupting timer and message
 > boundary events** (`cancelActivity="false"`: the activity keeps running and a
-> parallel token is spawned out the boundary on each fire), and
+> parallel token is spawned out the boundary on each fire, and a `timeCycle`
+> timer boundary **re-arms** for the next interval on every fire), and
 > **event-triggered instance creation**:
 > **message start events** (a matching message creates a new instance) and
 > **timer start events** (a one-shot `timeDuration` or recurring `timeCycle`
 > creates instances on a host clock tick), and **embedded sub-processes** (a
 > token scope whose inner flow runs to its own end before the sub-process routes
-> on, with an interrupting **error boundary event** attached to the sub-process
-> terminating the whole inner scope and routing to its handler). Instances carry
+> on, with **error, timer and message boundary events** attached to the
+> sub-process — an interrupting one terminates the whole inner scope and routes to
+> its handler). Instances carry
 > simple variables (`Bool`/`Int`/`Str`) used by gateway conditions and message
 > correlation. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
@@ -259,9 +270,8 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
-> Deeper sub-process nesting and re-arming (cycle) non-interrupting timers are
-> intended extension points — new element kinds plug into `process_step` without
-> touching the
+> Deeper sub-process nesting is an intended extension point — new element kinds
+> plug into `process_step` without touching the
 > architecture.
 
 ## Usage

@@ -115,12 +115,19 @@ pub enum ElementKind {
     TimerBoundaryEvent {
         /// Id of the activity this boundary event is attached to.
         attached_to: ElementId,
-        /// How long after the activity activates the timer fires.
+        /// How long after the activity activates the timer fires; for a
+        /// `repeating` (cycle) timer this is also the period between fires.
         duration_millis: u64,
         /// Whether firing interrupts the activity (`true`, the default for older
         /// definitions) or spawns a parallel token and leaves it running.
         #[cfg_attr(feature = "serde", serde(default = "default_true"))]
         interrupting: bool,
+        /// Whether the timer re-arms after firing (a BPMN `timeCycle`) or fires
+        /// once (a `timeDuration`). Only meaningful for non-interrupting timers —
+        /// an interrupting timer cancels its activity on the first fire, so it
+        /// never re-arms.
+        #[cfg_attr(feature = "serde", serde(default))]
+        repeating: bool,
     },
     /// A message intermediate catch event. On activation it opens a message
     /// subscription keyed by `message_name` and a correlation value (the
@@ -440,6 +447,7 @@ impl ProcessBuilder {
                 attached_to: attached_to.into(),
                 duration_millis,
                 interrupting: true,
+                repeating: false,
             },
         )
     }
@@ -463,6 +471,32 @@ impl ProcessBuilder {
                 attached_to: attached_to.into(),
                 duration_millis,
                 interrupting: false,
+                repeating: false,
+            },
+        )
+    }
+
+    /// Adds a non-interrupting **cycle** timer boundary event attached to
+    /// `attached_to`. Like [`non_interrupting_timer_boundary_event`], but the
+    /// timer re-arms for another `interval_millis` after each fire, so it spawns a
+    /// parallel token every interval while the activity runs. Connect its outgoing
+    /// flow(s) with [`connect`] to route the side path.
+    ///
+    /// [`connect`]: ProcessBuilder::connect
+    /// [`non_interrupting_timer_boundary_event`]: ProcessBuilder::non_interrupting_timer_boundary_event
+    pub fn non_interrupting_timer_cycle_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        interval_millis: u64,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::TimerBoundaryEvent {
+                attached_to: attached_to.into(),
+                duration_millis: interval_millis,
+                interrupting: false,
+                repeating: true,
             },
         )
     }

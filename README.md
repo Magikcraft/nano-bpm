@@ -59,6 +59,8 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
   intermediate catch event**'s token, interrupting an activity via an
   **interrupting message boundary event**, or spawning a parallel token via a
   **non-interrupting message boundary event** while the activity keeps running
+  (such boundary events attach to a service task **or an embedded sub-process** —
+  an interrupting one on a sub-process tears down its whole inner scope)
   (merging the message's variables into
   the instance first). Messages are **not buffered** (no TTL/dedup): with no
   match the message is dropped. `publishMessage` always returns `200` with the
@@ -136,7 +138,9 @@ dependency-free for mobile/wasm embedders that don't need persistence.
 The engine reads no wall clock; the host drives time in. The server runs a
 single background task (every 500 ms) that feeds `now` into the engine via two
 ticks: `TriggerTimers` fires every due **timer intermediate catch event**,
-**timer boundary event** (interrupting or non-interrupting) and **timer start
+**timer boundary event** (interrupting or non-interrupting, on a service task or
+embedded sub-process; a `timeCycle` non-interrupting boundary **re-arms** for the
+next interval on each fire) and **timer start
 event** (durable — journaled), and `ExpireJobs`
 releases activation locks past their deadline (volatile — not journaled). When a timer fires it may unblock
 downstream work, so the tick wakes any long-polling `activateJobs`. A timer

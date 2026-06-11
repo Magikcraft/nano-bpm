@@ -657,6 +657,101 @@ fn a_non_interrupting_message_boundary_deploys_and_spawns_a_parallel_token() {
 }
 
 #[test]
+fn an_interrupting_message_boundary_on_a_subprocess_tears_down_the_inner_scope() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // An interrupting message boundary attached to an embedded sub-process must
+    // deploy and, on a matching message, cancel the inner job, tear down the
+    // whole inner scope, and route the token out the boundary onto the abort
+    // path (the normal "done" flow is NOT taken).
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="cancellable-sub" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="sub_start" />
+      <bpmn:serviceTask id="inner">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="inner-work" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="sub_end" />
+      <bpmn:sequenceFlow id="i0" sourceRef="sub_start" targetRef="inner" />
+      <bpmn:sequenceFlow id="i1" sourceRef="inner" targetRef="sub_end" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="cancel" attachedToRef="sub">
+      <bpmn:messageEventDefinition messageRef="Message_1" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="abort">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="abort-flow" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="aborted" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="sub" />
+    <bpmn:sequenceFlow id="f1" sourceRef="sub" targetRef="done" />
+    <bpmn:sequenceFlow id="f2" sourceRef="cancel" targetRef="abort" />
+    <bpmn:sequenceFlow id="f3" sourceRef="abort" targetRef="aborted" />
+  </bpmn:process>
+  <bpmn:message id="Message_1" name="order-cancelled">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=orderId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+</bpmn:definitions>"#;
+
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(
+        status, 200,
+        "sub-process message-boundary model should deploy: {body}"
+    );
+
+    // Start an instance; the token parks on the inner service task and the
+    // boundary subscription opens on the sub-process.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"cancellable-sub"}"#),
+    );
+    assert_eq!(status, 200, "create instance failed: {body}");
+    let inner_key = activate_one_job(&server, "inner-work");
+
+    // Correlate the boundary message: it interrupts the whole sub-process and
+    // routes onto the abort path.
+    let (status, body) = server.request(
+        "POST",
+        &path("/messages/correlation"),
+        Some(r#"{"name":"order-cancelled","correlationKey":""}"#),
+    );
+    assert_eq!(
+        status, 200,
+        "correlating the boundary message failed: {body}"
+    );
+
+    // The abort-flow job is now activatable; the cancelled inner job cannot be
+    // re-activated (the inner scope was torn down), so no inner-work job remains.
+    let abort_key = activate_one_job(&server, "abort-flow");
+    assert_ne!(abort_key, inner_key, "a distinct abort-flow job was created");
+    let (status, resp) = server.request(
+        "POST",
+        &path("/jobs/activation"),
+        Some(r#"{"type":"inner-work","maxJobsToActivate":1,"timeout":60000,"requestTimeout":-1}"#),
+    );
+    assert_eq!(status, 200, "activation request failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("activation response is JSON");
+    assert_eq!(
+        json["jobs"].as_array().expect("jobs array").len(),
+        0,
+        "the inner job was cancelled by the interrupting boundary: {resp}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
 fn create_instance_accepts_the_default_tenant_id() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();

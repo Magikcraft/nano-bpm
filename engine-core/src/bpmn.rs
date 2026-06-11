@@ -237,6 +237,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                             .map(str::to_string),
                                         error_ref: None,
                                         timer_duration_millis: None,
+                                        timer_repeating: false,
                                         message_ref: None,
                                         interrupting: attr(attrs, "cancelActivity")
                                             != Some("false"),
@@ -290,7 +291,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             {
                                 duration_text = Some(String::new());
                             }
-                            "timeCycle" if cur_start.is_some() => {
+                            "timeCycle" if cur_start.is_some() || cur_boundary.is_some() => {
                                 cycle_text = Some(String::new());
                             }
                             "conditionExpression" if cur_flow.is_some() => {
@@ -377,6 +378,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // A recurring timer start event's cycle.
                             acc.nodes[idx].duration_millis = parse_iso8601_cycle(&text);
                             acc.nodes[idx].timer_repeating = Some(true);
+                        } else if let Some(boundary) = cur_boundary.as_mut() {
+                            // A recurring (cycle) timer boundary event.
+                            boundary.timer_duration_millis = parse_iso8601_cycle(&text);
+                            boundary.timer_repeating = true;
                         }
                     }
                 }
@@ -446,6 +451,7 @@ struct PendingBoundary {
     attached_to: Option<String>,
     error_ref: Option<String>,
     timer_duration_millis: Option<u64>,
+    timer_repeating: bool,
     message_ref: Option<String>,
     interrupting: bool,
 }
@@ -618,7 +624,15 @@ impl ProcessAcc {
             // (messageRef), or error (errorRef -> declared error).
             if let Some(duration_millis) = boundary.timer_duration_millis {
                 builder = if boundary.interrupting {
+                    // An interrupting timer fires once and cancels its activity,
+                    // so a cycle is treated as a one-shot at the interval.
                     builder.timer_boundary_event(boundary.id, attached_to, duration_millis)
+                } else if boundary.timer_repeating {
+                    builder.non_interrupting_timer_cycle_boundary_event(
+                        boundary.id,
+                        attached_to,
+                        duration_millis,
+                    )
                 } else {
                     builder.non_interrupting_timer_boundary_event(
                         boundary.id,
@@ -1280,6 +1294,7 @@ mod tests {
                 attached_to: "charge".to_string(),
                 duration_millis: 5_000,
                 interrupting: true,
+                repeating: false,
             }
         );
         let boundary = def.element("timeout").unwrap();
@@ -1454,6 +1469,7 @@ mod tests {
                 attached_to: "charge".to_string(),
                 duration_millis: 5_000,
                 interrupting: false,
+                repeating: false,
             }
         );
         assert_eq!(
@@ -1463,6 +1479,44 @@ mod tests {
                 message_name: "reminder".to_string(),
                 correlation_key: "orderId".to_string(),
                 interrupting: false,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_a_non_interrupting_cycle_timer_boundary_event() {
+        // given: a service task with a non-interrupting timer boundary whose
+        // timerEventDefinition carries a timeCycle (a repeating interval).
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge" />
+              <bpmn:endEvent id="done" />
+              <bpmn:boundaryEvent id="tick" attachedToRef="charge" cancelActivity="false">
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeCycle>R/PT5S</bpmn:timeCycle>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="ticked" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="done" />
+              <bpmn:sequenceFlow id="f2" sourceRef="tick" targetRef="ticked" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: it is a non-interrupting, repeating timer boundary at 5s.
+        assert_eq!(
+            def.element("tick").unwrap().kind,
+            ElementKind::TimerBoundaryEvent {
+                attached_to: "charge".to_string(),
+                duration_millis: 5_000,
+                interrupting: false,
+                repeating: true,
             }
         );
     }

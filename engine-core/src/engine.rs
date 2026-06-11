@@ -646,6 +646,7 @@ impl Engine {
                     let instance_key = timer.instance_key;
                     let element_instance_key = timer.element_instance_key;
                     let element_id = timer.element_id.clone();
+                    let due_at = timer.due_at;
                     let kind = timer.kind.clone();
 
                     self.emit(
@@ -668,68 +669,59 @@ impl Engine {
                                 element_id,
                             });
                         }
-                        // Boundary timer: interrupt the attached activity (cancel
-                        // its job and disarm any sibling boundary timers), then run
-                        // the boundary event's outgoing flow. `element_instance_key`
-                        // / `element_id` are the activity here.
+                        // Boundary timer: interrupt the attached activity (a
+                        // service task or sub-process) and run the boundary
+                        // event's outgoing flow. `element_instance_key`/
+                        // `element_id` are the activity here.
                         state::TimerKind::InterruptingBoundary {
                             boundary_element_id,
                         } => {
-                            // Cancel the job parked on the activity, if any is
-                            // still in play.
-                            if let Some(job_key) = self.active_job_on(element_instance_key) {
-                                self.emit(
-                                    &mut log,
-                                    Event::JobCanceled {
-                                        job_key,
-                                        instance_key,
-                                    },
-                                );
-                            }
-                            // Interrupt the activity element instance.
-                            self.emit(
+                            let scope = self.scope_of(instance_key, element_instance_key);
+                            self.interrupt_activity_via_boundary(
                                 &mut log,
-                                Event::ElementCompleting {
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id: element_id.clone(),
-                                },
+                                instance_key,
+                                element_instance_key,
+                                &element_id,
                             );
-                            self.emit(
-                                &mut log,
-                                Event::ElementCompleted {
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id,
-                                },
-                            );
-                            // Disarm any sibling boundary timers on the activity.
-                            for event in self.cancel_boundary_timers_on(element_instance_key) {
-                                self.emit(&mut log, event);
-                            }
-                            // Disarm any boundary message subscriptions on it too.
-                            for event in
-                                self.cancel_boundary_message_subscriptions_on(element_instance_key)
-                            {
-                                self.emit(&mut log, event);
-                            }
                             queue.push_back(Step::Activate {
                                 instance_key,
                                 element_id: boundary_element_id,
-                                scope: self.scope_of(instance_key, element_instance_key),
+                                scope,
                             });
                         }
                         // Non-interrupting boundary timer: leave the activity (and
                         // its job) running and spawn a parallel token along the
                         // boundary event's outgoing flow, in the activity's scope.
+                        // A repeating (cycle) timer re-arms for the next interval.
                         state::TimerKind::NonInterruptingBoundary {
                             boundary_element_id,
                         } => {
                             queue.push_back(Step::Activate {
                                 instance_key,
-                                element_id: boundary_element_id,
+                                element_id: boundary_element_id.clone(),
                                 scope: self.scope_of(instance_key, element_instance_key),
                             });
+                            if let Some(ElementKind::TimerBoundaryEvent {
+                                duration_millis,
+                                repeating: true,
+                                ..
+                            }) = self.element_kind(instance_key, &boundary_element_id)
+                            {
+                                let next_timer_key = self.mint_key();
+                                self.emit(
+                                    &mut log,
+                                    Event::TimerCreated {
+                                        timer_key: next_timer_key,
+                                        instance_key,
+                                        element_instance_key,
+                                        element_id: element_id.clone(),
+                                        due_at: due_at.saturating_add(duration_millis),
+                                        kind: state::TimerKind::NonInterruptingBoundary {
+                                            boundary_element_id,
+                                        },
+                                    },
+                                );
+                            }
                         }
                     }
                 }
@@ -1144,50 +1136,23 @@ impl Engine {
                             });
                         }
                         // Boundary subscription: interrupt the attached activity
-                        // (cancel its job and disarm any sibling boundary timers
-                        // and message subscriptions), then run the boundary
+                        // (a service task or sub-process), then run the boundary
                         // event's outgoing flow. `element_instance_key`/
                         // `element_id` are the activity here.
                         state::MessageSubscriptionKind::InterruptingBoundary {
                             boundary_element_id,
                         } => {
-                            if let Some(job_key) = self.active_job_on(element_instance_key) {
-                                self.emit(
-                                    &mut log,
-                                    Event::JobCanceled {
-                                        job_key,
-                                        instance_key,
-                                    },
-                                );
-                            }
-                            self.emit(
+                            let scope = self.scope_of(instance_key, element_instance_key);
+                            self.interrupt_activity_via_boundary(
                                 &mut log,
-                                Event::ElementCompleting {
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id: element_id.clone(),
-                                },
+                                instance_key,
+                                element_instance_key,
+                                &element_id,
                             );
-                            self.emit(
-                                &mut log,
-                                Event::ElementCompleted {
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id,
-                                },
-                            );
-                            for event in self.cancel_boundary_timers_on(element_instance_key) {
-                                self.emit(&mut log, event);
-                            }
-                            for event in
-                                self.cancel_boundary_message_subscriptions_on(element_instance_key)
-                            {
-                                self.emit(&mut log, event);
-                            }
                             queue.push_back(Step::Activate {
                                 instance_key,
                                 element_id: boundary_element_id,
-                                scope: self.scope_of(instance_key, element_instance_key),
+                                scope,
                             });
                         }
                         // Non-interrupting boundary subscription: leave the
@@ -1489,60 +1454,12 @@ impl Engine {
                     element_id: element_id.clone(),
                     job_type,
                 });
-                // Arm a timer for every attached timer boundary event; firing
-                // one later interrupts this task (interrupting) or spawns a
-                // parallel token beside it (non-interrupting).
-                for (boundary_id, duration_millis, interrupting) in
-                    self.attached_timer_boundaries(instance_key, &element_id)
-                {
-                    let timer_key = self.mint_key();
-                    let kind = if interrupting {
-                        state::TimerKind::InterruptingBoundary {
-                            boundary_element_id: boundary_id,
-                        }
-                    } else {
-                        state::TimerKind::NonInterruptingBoundary {
-                            boundary_element_id: boundary_id,
-                        }
-                    };
-                    events.push(Event::TimerCreated {
-                        timer_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        due_at: self.now.saturating_add(duration_millis),
-                        kind,
-                    });
-                }
-                // Open a subscription for every attached message boundary event;
-                // correlating a matching message later interrupts this task
-                // (interrupting) or spawns a parallel token beside it
-                // (non-interrupting).
-                for (boundary_id, message_name, correlation_key, interrupting) in
-                    self.attached_message_boundaries(instance_key, &element_id)
-                {
-                    let subscription_key = self.mint_key();
-                    let correlation_value =
-                        self.resolve_correlation_value(instance_key, &correlation_key);
-                    let kind = if interrupting {
-                        state::MessageSubscriptionKind::InterruptingBoundary {
-                            boundary_element_id: boundary_id,
-                        }
-                    } else {
-                        state::MessageSubscriptionKind::NonInterruptingBoundary {
-                            boundary_element_id: boundary_id,
-                        }
-                    };
-                    events.push(Event::MessageSubscriptionCreated {
-                        subscription_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        message_name,
-                        correlation_key: correlation_value,
-                        kind,
-                    });
-                }
+                // Arm timers/subscriptions for every attached boundary event.
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                ));
             }
             // A timer intermediate catch event arms a timer and parks the token;
             // a clock tick (TriggerTimers) releases it once the timer is due.
@@ -1582,6 +1499,13 @@ impl Engine {
             // `complete_drained_subprocesses`) or is interrupted by an error
             // boundary.
             Some(ElementKind::SubProcess { start_event }) => {
+                // A sub-process can also carry timer/message boundary events;
+                // arm them just like a service task's.
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                ));
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -2078,6 +2002,126 @@ impl Engine {
     /// All interrupting timer boundary events attached to `activity_id`, as
     /// `(boundary_id, duration_millis)` sorted by boundary id (so arming is
     /// deterministic). Empty when the activity has no timer boundaries.
+    /// Arms a timer and/or opens a subscription for every boundary event
+    /// attached to `element_id` (a service task or sub-process), returning the
+    /// `TimerCreated`/`MessageSubscriptionCreated` events. Firing one later
+    /// interrupts the activity (interrupting) or spawns a parallel token beside
+    /// it (non-interrupting).
+    fn arm_boundary_events(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+        for (boundary_id, duration_millis, interrupting) in
+            self.attached_timer_boundaries(instance_key, element_id)
+        {
+            let timer_key = self.mint_key();
+            let kind = if interrupting {
+                state::TimerKind::InterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            } else {
+                state::TimerKind::NonInterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            };
+            events.push(Event::TimerCreated {
+                timer_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                due_at: self.now.saturating_add(duration_millis),
+                kind,
+            });
+        }
+        for (boundary_id, message_name, correlation_key, interrupting) in
+            self.attached_message_boundaries(instance_key, element_id)
+        {
+            let subscription_key = self.mint_key();
+            let correlation_value = self.resolve_correlation_value(instance_key, &correlation_key);
+            let kind = if interrupting {
+                state::MessageSubscriptionKind::InterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            } else {
+                state::MessageSubscriptionKind::NonInterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            };
+            events.push(Event::MessageSubscriptionCreated {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                message_name,
+                correlation_key: correlation_value,
+                kind,
+            });
+        }
+        events
+    }
+
+    /// Whether `element_id` is an embedded sub-process (interrupting it must tear
+    /// down its whole inner token scope, not just cancel a job).
+    fn is_subprocess(&self, instance_key: Key, element_id: &str) -> bool {
+        matches!(
+            self.element_kind(instance_key, element_id),
+            Some(ElementKind::SubProcess { .. })
+        )
+    }
+
+    /// Interrupts the activity `element_instance_key`/`element_id` because an
+    /// interrupting timer or message boundary fired on it: tears down the work it
+    /// owns, completes its element instance, and disarms any sibling boundaries.
+    /// A service task's job is cancelled; a sub-process's whole inner token scope
+    /// is terminated. The caller then routes the boundary's outgoing flow.
+    fn interrupt_activity_via_boundary(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) {
+        if self.is_subprocess(instance_key, element_id) {
+            // Cancel every job/timer/subscription inside the sub-process and
+            // complete its inner element instances first.
+            self.terminate_subprocess_scope(log, instance_key, element_instance_key);
+        } else if let Some(job_key) = self.active_job_on(element_instance_key) {
+            self.emit(
+                log,
+                Event::JobCanceled {
+                    job_key,
+                    instance_key,
+                },
+            );
+        }
+        self.emit(
+            log,
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+            },
+        );
+        self.emit(
+            log,
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+            },
+        );
+        // Disarm any sibling boundary timers and message subscriptions on it.
+        for event in self.cancel_boundary_timers_on(element_instance_key) {
+            self.emit(log, event);
+        }
+        for event in self.cancel_boundary_message_subscriptions_on(element_instance_key) {
+            self.emit(log, event);
+        }
+    }
+
     fn attached_timer_boundaries(
         &self,
         instance_key: Key,
@@ -2094,6 +2138,7 @@ impl Engine {
                     attached_to,
                     duration_millis,
                     interrupting,
+                    repeating: _,
                 } if attached_to == activity_id => {
                     Some((e.id.clone(), *duration_millis, *interrupting))
                 }
@@ -3921,6 +3966,222 @@ mod tests {
         )));
         assert!(!engine.is_completed(instance_key));
         assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
+    }
+
+    /// start -> charge (service task, PT5S NON-interrupting CYCLE timer boundary
+    ///                   "tick") -> done
+    ///                       \--(timer, every 5s)--> ticked
+    fn process_with_non_interrupting_cycle_timer_boundary() -> ProcessDefinition {
+        ProcessBuilder::new("ticker")
+            .start_event("start")
+            .service_task("charge", "payment")
+            .non_interrupting_timer_cycle_boundary_event("tick", "charge", 5_000)
+            .end_event("done")
+            .end_event("ticked")
+            .connect("start", "charge")
+            .connect("charge", "done")
+            .connect("tick", "ticked")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_re_arm_a_non_interrupting_cycle_timer_boundary_on_every_fire() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                process_with_non_interrupting_cycle_timer_boundary(),
+            ))
+            .unwrap();
+        let events = engine
+            .apply_command_at(Command::create_instance("ticker"), 1_000)
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+        assert_eq!(engine.timers()[0].due_at, 6_000);
+
+        // First fire at t=6000: spawns a token to "ticked", does not cancel the
+        // job, and re-arms a fresh timer due at 11000 (6000 + 5000).
+        let fired = engine.trigger_timers(6_000);
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "tick" && to == "ticked"
+        )));
+        assert_eq!(engine.state().jobs[&job_key].state, state::JobState::Created);
+        let armed: Vec<u64> = engine
+            .timers()
+            .iter()
+            .filter(|t| t.state == state::TimerState::Created)
+            .map(|t| t.due_at)
+            .collect();
+        assert_eq!(
+            armed,
+            vec![11_000],
+            "a fresh timer is armed for the next interval"
+        );
+        assert!(!engine.is_completed(instance_key));
+
+        // Second fire at t=11000: fires again and re-arms for 16000.
+        let fired = engine.trigger_timers(11_000);
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "tick" && to == "ticked"
+        )));
+        let armed: Vec<u64> = engine
+            .timers()
+            .iter()
+            .filter(|t| t.state == state::TimerState::Created)
+            .map(|t| t.due_at)
+            .collect();
+        assert_eq!(armed, vec![16_000]);
+
+        // Completing the job runs the normal flow and disarms the pending timer.
+        engine.activate_jobs("payment", "w", 1, 60_000, 0);
+        engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap();
+        assert!(engine.is_completed(instance_key));
+        assert!(engine
+            .timers()
+            .iter()
+            .all(|t| t.state != state::TimerState::Created));
+    }
+
+    /// start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done
+    ///          sub --(PT5S interrupting timer boundary)--> escalated
+    fn process_with_subprocess_timer_boundary() -> ProcessDefinition {
+        ProcessBuilder::new("sub-timer")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .service_task("inner", "work")
+            .contained_in("inner", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .timer_boundary_event("timeout", "sub", 5_000)
+            .end_event("done")
+            .end_event("escalated")
+            .connect("start", "sub")
+            .connect("sub_start", "inner")
+            .connect("inner", "sub_end")
+            .connect("sub", "done")
+            .connect("timeout", "escalated")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_interrupt_an_embedded_subprocess_via_a_timer_boundary() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                process_with_subprocess_timer_boundary(),
+            ))
+            .unwrap();
+        let created = engine
+            .apply_command_at(Command::create_instance("sub-timer"), 1_000)
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The token parks on the inner task; the boundary timer is armed on the
+        // sub-process for due_at = 6000.
+        let job_key = engine.pending_jobs()[0].key;
+        assert_eq!(engine.pending_jobs()[0].job_type, "work");
+        assert!(engine
+            .timers()
+            .iter()
+            .any(|t| t.due_at == 6_000 && t.element_id == "sub"));
+
+        // At the due instant the timer interrupts the WHOLE sub-process: the
+        // inner job is cancelled, the inner task and sub-process complete without
+        // taking the normal flow, and the boundary routes to "escalated".
+        let fired = engine.trigger_timers(6_000);
+        assert_eq!(
+            engine.state().jobs[&job_key].state,
+            state::JobState::Canceled
+        );
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        )));
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "timeout" && to == "escalated"
+        )));
+        assert!(!fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )));
+        assert!(engine.is_completed(instance_key));
+    }
+
+    /// start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done
+    ///          sub --(interrupting message boundary "cancel" on orderId)--> aborted
+    fn process_with_subprocess_message_boundary() -> ProcessDefinition {
+        ProcessBuilder::new("sub-msg")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .service_task("inner", "work")
+            .contained_in("inner", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .message_boundary_event("cancel", "sub", "order-cancelled", "orderId")
+            .end_event("done")
+            .end_event("aborted")
+            .connect("start", "sub")
+            .connect("sub_start", "inner")
+            .connect("inner", "sub_end")
+            .connect("sub", "done")
+            .connect("cancel", "aborted")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_interrupt_an_embedded_subprocess_via_a_message_boundary() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                process_with_subprocess_message_boundary(),
+            ))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "sub-msg",
+                vars(&[("orderId", Value::Str("A".into()))]),
+            ))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+        assert!(engine
+            .message_subscriptions()
+            .iter()
+            .any(|s| s.element_id == "sub"));
+
+        // Correlating the boundary message interrupts the whole sub-process: the
+        // inner job is cancelled, the inner task and sub-process complete, and the
+        // boundary routes to "aborted" instead of the normal flow.
+        let fired = engine.correlate_message("order-cancelled", "A", HashMap::new(), 0);
+        assert_eq!(
+            engine.state().jobs[&job_key].state,
+            state::JobState::Canceled
+        );
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        )));
+        assert!(fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "cancel" && to == "aborted"
+        )));
+        assert!(!fired.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )));
+        assert!(engine.is_completed(instance_key));
     }
 
     #[test]
