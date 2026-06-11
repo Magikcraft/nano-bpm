@@ -37,6 +37,11 @@ use crate::readstore::ReadStore;
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
+/// Default window (ms) an `awaitCompletion` create request waits for the process
+/// instance to finish when `requestTimeout` is absent or 0. On expiry the
+/// request still returns 200 with `processCompleted=false` and the instance key.
+const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
+
 /// The single type that implements every generated API trait.
 ///
 /// It owns an embedded [`Engine`] (the `engine-core` crate), wrapped in a
@@ -59,6 +64,11 @@ pub struct ServerImpl {
     /// `activateJobs` requests can wake immediately instead of waiting out their
     /// full timeout.
     jobs_available: Arc<tokio::sync::Notify>,
+    /// Notified by the read-model exporter after every projected batch, so an
+    /// `awaitCompletion` create request can wake the moment its instance reaches
+    /// a terminal state (the exporter is the single point through which all
+    /// completion/termination events flow).
+    instances_changed: Arc<tokio::sync::Notify>,
 }
 
 impl ServerImpl {
@@ -89,6 +99,7 @@ impl ServerImpl {
             journal: Arc::new(RwLock::new(journal)),
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
+            instances_changed: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -110,7 +121,12 @@ fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
     let (tx, rx) = mpsc::channel::<Vec<Event>>();
     journal.set_exporter(tx);
     let server = ServerImpl::new(journal, store.clone());
-    spawn_exporter(rx, store, server.journal.clone());
+    spawn_exporter(
+        rx,
+        store,
+        server.journal.clone(),
+        server.instances_changed.clone(),
+    );
     server
 }
 
@@ -123,6 +139,7 @@ fn spawn_exporter(
     rx: mpsc::Receiver<Vec<Event>>,
     store: Arc<ReadStore>,
     journal: Arc<RwLock<Journal>>,
+    instances_changed: Arc<tokio::sync::Notify>,
 ) {
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
@@ -139,6 +156,10 @@ fn spawn_exporter(
                         continue;
                     }
                 };
+                // The read store now reflects this batch; wake any
+                // `awaitCompletion` requests so they can observe a terminal
+                // state. notify_waiters() is a no-op when nobody is waiting.
+                instances_changed.notify_waiters();
                 if !completed.is_empty() {
                     let mut journal = journal.write().expect("engine lock poisoned");
                     for key in completed {
@@ -170,11 +191,23 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
+        // Pull the await-completion controls (shared by both creation variants).
+        // When `awaitCompletion` is set, the request blocks until the instance
+        // reaches a terminal state or `requestTimeout` elapses.
+        let (await_completion, fetch_variables, request_timeout) = match body {
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                (b.await_completion, b.fetch_variables.as_ref(), b.request_timeout)
+            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                (b.await_completion, b.fetch_variables.as_ref(), b.request_timeout)
+            }
+        };
+        let await_completion = await_completion.unwrap_or(false);
+
         // Apply under the engine write lock inside a scope so the (non-Send) lock
-        // guard is dropped before we await durability. The block yields the
-        // response plus the commit to await (None on the error paths, which wrote
-        // nothing).
-        let (response, commit) = {
+        // guard is dropped before we await. The block yields the success fields
+        // plus the commit to await; error paths return early (nothing written).
+        let (process_id, version, definition_key, instance_key, sync_completed, commit) = {
             let mut engine = self.journal.write().expect("engine lock poisoned");
 
             // The engine starts processes by BPMN process id. A creation-by-key
@@ -229,54 +262,143 @@ impl ServerImpl {
                         .unwrap_or_else(|| (process_id.clone(), 1));
                     // An auto-completing process (no wait states) finishes
                     // synchronously within this create command; a process that
-                    // parks on a job/timer/etc. is still running. `processCompleted`
-                    // tells the caller whether the returned variables are the
-                    // authoritative final result.
-                    let process_completed = engine.engine().is_completed(instance_key);
-                    let result = models::CreateProcessInstanceResult::new(
-                        process_id.clone(),
-                        version,
-                        "<default>".to_string(),
-                        std::collections::HashMap::new(),
-                        models::ProcessDefinitionKey(definition_key),
-                        models::ProcessInstanceKey(instance_key.to_string()),
-                        Vec::new(),
-                        nanobpm_gateway_rest::types::Nullable::Null,
-                        process_completed,
-                    );
+                    // parks on a job/timer/etc. is still running.
+                    let sync_completed = engine.engine().is_completed(instance_key);
                     (
-                        Resp::Status200_TheProcessInstanceWasCreated(result),
-                        Some(commit),
+                        process_id,
+                        version,
+                        definition_key,
+                        instance_key,
+                        sync_completed,
+                        commit,
                     )
                 }
-                Err(EngineError::ProcessNotFound { process_id }) => (
-                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                Err(EngineError::ProcessNotFound { process_id }) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                         "Process not found",
                         400,
                         format!("No deployed process with id '{process_id}'."),
-                    )),
-                    None,
-                ),
-                Err(e) => (
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Internal error",
-                        500,
-                        e.to_string(),
-                    )),
-                    None,
-                ),
+                    )));
+                }
+                Err(e) => {
+                    return Ok(
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Internal error",
+                            500,
+                            e.to_string(),
+                        )),
+                    );
+                }
             }
         };
 
         // Block on durability before acknowledging: a returned 200 means the
         // create is fsynced.
-        if let Some(commit) = commit {
-            commit.wait().await;
-            // Starting an instance parks it on its first service task, so new
-            // jobs may now be activatable: wake any long-pollers.
-            self.jobs_available.notify_waiters();
-        }
-        Ok(response)
+        commit.wait().await;
+        // Starting an instance parks it on its first service task, so new jobs
+        // may now be activatable: wake any long-pollers.
+        self.jobs_available.notify_waiters();
+
+        // Resolve the final response. Without awaitCompletion we report whatever
+        // completion state held synchronously and return no variables. With it,
+        // we wait (off the engine lock) for the read model to show a terminal
+        // state, then return the root-scope variables; on timeout we still return
+        // 200 with the instance key and processCompleted=false (a deliberate
+        // deviation from Camunda's 504, so callers can poll by key).
+        let (variables_out, process_completed) = if await_completion {
+            self.await_process_completion(instance_key, fetch_variables, request_timeout)
+                .await
+        } else {
+            (std::collections::HashMap::new(), sync_completed)
+        };
+
+        let result = models::CreateProcessInstanceResult::new(
+            process_id,
+            version,
+            "<default>".to_string(),
+            variables_out,
+            models::ProcessDefinitionKey(definition_key),
+            models::ProcessInstanceKey(instance_key.to_string()),
+            Vec::new(),
+            nanobpm_gateway_rest::types::Nullable::Null,
+            process_completed,
+        );
+        Ok(Resp::Status200_TheProcessInstanceWasCreated(result))
+    }
+
+    /// Waits for a created instance to reach a terminal state, returning its
+    /// root-scope variables (filtered by `fetch_variables` when non-empty) and
+    /// whether it completed. Never holds the engine lock: it observes the read
+    /// model and is woken by the exporter via `instances_changed`. On timeout it
+    /// returns `(empty, false)` — the caller still gets a 200 with the key.
+    async fn await_process_completion(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        fetch_variables: Option<&Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> (std::collections::HashMap<String, types::Object>, bool) {
+        // requestTimeout is in ms; 0 / absent / negative => server default.
+        let timeout_ms = match request_timeout {
+            Some(ms) if ms > 0 => ms as u64,
+            _ => DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS,
+        };
+
+        let wait = async {
+            loop {
+                // Register the wake intent *before* reading, so a completion that
+                // lands between the read and the await is not lost.
+                let notified = self.instances_changed.notified();
+                if let Some(row) = self.store.process_instance(instance_key) {
+                    match row.state {
+                        ProcessInstanceState::Completed => return true,
+                        // Terminated/canceled instances never complete; stop
+                        // waiting and report not-completed.
+                        ProcessInstanceState::Terminated => return false,
+                        ProcessInstanceState::Active => {}
+                    }
+                }
+                notified.await;
+            }
+        };
+
+        let completed = matches!(
+            tokio::time::timeout(Duration::from_millis(timeout_ms), wait).await,
+            Ok(true)
+        );
+
+        let variables = if completed {
+            self.root_scope_variables(instance_key, fetch_variables)
+        } else {
+            std::collections::HashMap::new()
+        };
+        (variables, completed)
+    }
+
+    /// Builds the root-scope variable map for an instance from the read model,
+    /// optionally restricted to the names in `fetch_variables` (when non-empty).
+    fn root_scope_variables(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        fetch_variables: Option<&Vec<String>>,
+    ) -> std::collections::HashMap<String, types::Object> {
+        let wanted: Option<std::collections::HashSet<&str>> = match fetch_variables {
+            Some(names) if !names.is_empty() => {
+                Some(names.iter().map(String::as_str).collect())
+            }
+            _ => None,
+        };
+        self.store
+            .instance_variables(instance_key)
+            .into_iter()
+            // Only the root scope (scope == the instance itself) is "visible in
+            // the root scope" per the API contract.
+            .filter(|v| v.scope_key == instance_key)
+            .filter(|v| wanted.as_ref().is_none_or(|w| w.contains(v.name.as_str())))
+            .map(|v| {
+                let value = serde_json::from_str(&v.value).unwrap_or(serde_json::Value::Null);
+                (v.name, types::Object(value))
+            })
+            .collect()
     }
 
     /// `POST /v2/process-instances/{processInstanceKey}/cancellation` — cancel a

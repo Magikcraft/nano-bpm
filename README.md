@@ -11,8 +11,17 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
 
 - `POST /v2/deployments` (`createDeployment`) parses the uploaded BPMN 2.0 XML
   resources and deploys them, assigning each process a key and a per-id version.
-- `POST /v2/process-instances` (`createProcessInstance`, by `processDefinitionId`)
-  starts a real instance and returns its engine-assigned key.
+- `POST /v2/process-instances` (`createProcessInstance`, by `processDefinitionId`
+  or `processDefinitionKey`) starts a real instance and returns its
+  engine-assigned key. Variables supplied on the request seed the root scope.
+  With `awaitCompletion: true` the request blocks (off the engine write lock)
+  until the instance reaches a terminal state or `requestTimeout` ms elapse
+  (default 5s). The response carries a `processCompleted` flag: when `true`, the
+  returned `variables` (optionally narrowed by `fetchVariables`) are the
+  authoritative final result; when `false`, the instance is still running.
+  **Deviation from Camunda:** on timeout nanobpmn returns `200` with
+  `processCompleted: false` and the `processInstanceKey` (so the caller can poll)
+  rather than Camunda's `504`.
 - `POST /v2/jobs/activation` (`activateJobs`) activates available jobs of a type,
   locking each to the worker until `now + timeout`; supports Camunda-style
   long-polling via `requestTimeout` (a waiting request wakes as soon as a job

@@ -1382,3 +1382,86 @@ fn create_instance_variables_flow_through_to_activated_jobs() {
 
     server.shutdown();
 }
+
+#[test]
+fn await_completion_returns_variables_when_the_process_completes() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // A process with no wait states completes synchronously when created.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="autodone" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f" sourceRef="s" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(status, 200, "auto-completing model should deploy: {body}");
+
+    // awaitCompletion blocks until the instance finishes; it does so immediately.
+    // fetchVariables restricts the returned root-scope variables to just "x".
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(
+            r#"{"processDefinitionId":"autodone","awaitCompletion":true,"requestTimeout":8000,"variables":{"x":7,"y":9},"fetchVariables":["x"]}"#,
+        ),
+    );
+    assert_eq!(status, 200, "await-completion create failed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    assert_eq!(
+        json["processCompleted"].as_bool(),
+        Some(true),
+        "process should report completed: {body}"
+    );
+    assert!(
+        json["processInstanceKey"].as_str().is_some(),
+        "instance key present: {body}"
+    );
+    let vars = json["variables"].as_object().expect("variables object");
+    let keys: Vec<&str> = vars.keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["x"], "only fetched variable returned: {body}");
+    assert_eq!(vars["x"].as_i64(), Some(7), "fetched value is authoritative");
+
+    server.shutdown();
+}
+
+#[test]
+fn await_completion_times_out_without_completing_a_wait_state() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // The demo process parks on a service task, so it never completes on its own.
+    // A short requestTimeout makes awaitCompletion give up and return 200 with
+    // processCompleted=false and the instance key (so the caller can poll) — a
+    // deliberate deviation from Camunda's 504 timeout response.
+    let started = Instant::now();
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"demo","awaitCompletion":true,"requestTimeout":300}"#),
+    );
+    assert_eq!(status, 200, "timed-out await must still be 200: {body}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "request should have blocked for about the timeout window"
+    );
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    assert_eq!(
+        json["processCompleted"].as_bool(),
+        Some(false),
+        "wait-state process must report not completed: {body}"
+    );
+    assert!(
+        json["processInstanceKey"].as_str().is_some(),
+        "instance key present for polling: {body}"
+    );
+    assert!(
+        json["variables"].as_object().is_some_and(|v| v.is_empty()),
+        "no variables when not completed: {body}"
+    );
+
+    server.shutdown();
+}

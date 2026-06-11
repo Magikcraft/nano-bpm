@@ -437,6 +437,24 @@ impl ReadStore {
         .optional()
         .expect("query variable")
     }
+
+    /// Returns every variable belonging to a process instance, ordered by name
+    /// for deterministic results. Used to assemble the variable payload returned
+    /// by an `awaitCompletion` create request.
+    pub fn instance_variables(&self, instance_key: Key) -> Vec<VariableRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, instance_key, scope_key, name, value, \
+                 process_definition_id, process_definition_key FROM variables \
+                 WHERE instance_key = ?1 ORDER BY name",
+            )
+            .expect("prepare instance variables");
+        let rows = stmt
+            .query_map(params![instance_key as i64], map_variable)
+            .expect("query instance variables");
+        rows.filter_map(Result::ok).collect()
+    }
 }
 
 fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
