@@ -207,6 +207,16 @@ pub enum TimerKind {
         /// Id of the boundary event whose outgoing flow runs when the timer fires.
         boundary_element_id: ElementId,
     },
+    /// A non-interrupting timer boundary event attached to an activity: like
+    /// [`InterruptingBoundary`], but firing leaves the activity (and its job)
+    /// running and merely spawns a parallel token along the boundary event's
+    /// outgoing flow.
+    ///
+    /// [`InterruptingBoundary`]: TimerKind::InterruptingBoundary
+    NonInterruptingBoundary {
+        /// Id of the boundary event whose outgoing flow runs when the timer fires.
+        boundary_element_id: ElementId,
+    },
 }
 
 /// An armed timer holding a token on a timer intermediate catch event until its
@@ -259,6 +269,18 @@ pub enum MessageSubscriptionKind {
     /// activity*, and correlating cancels the activity (and any job parked on it)
     /// and takes the boundary event's outgoing flow.
     InterruptingBoundary {
+        /// Id of the boundary event whose outgoing flow runs when a message is
+        /// correlated.
+        boundary_element_id: ElementId,
+    },
+    /// A non-interrupting message boundary event attached to an activity: like
+    /// [`InterruptingBoundary`], but correlating leaves the activity (and its
+    /// job) running and merely spawns a parallel token along the boundary event's
+    /// outgoing flow. The subscription stays open, so every matching message
+    /// spawns another token.
+    ///
+    /// [`InterruptingBoundary`]: MessageSubscriptionKind::InterruptingBoundary
+    NonInterruptingBoundary {
         /// Id of the boundary event whose outgoing flow runs when a message is
         /// correlated.
         boundary_element_id: ElementId,
@@ -747,7 +769,14 @@ pub fn apply(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
-                subscription.state = MessageSubscriptionState::Correlated;
+                // A non-interrupting boundary subscription stays open so every
+                // matching message spawns another token; all others settle.
+                if !matches!(
+                    subscription.kind,
+                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                ) {
+                    subscription.state = MessageSubscriptionState::Correlated;
+                }
             }
         }
 

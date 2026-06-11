@@ -584,6 +584,79 @@ fn activate_one_job(server: &ServerProcess, job_type: &str) -> String {
 }
 
 #[test]
+fn a_non_interrupting_message_boundary_deploys_and_spawns_a_parallel_token() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // A non-interrupting message boundary (cancelActivity="false") must deploy
+    // and, on a matching message, spawn a parallel token down its side path
+    // WITHOUT cancelling the main service task — both jobs stay activatable.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="notifiable" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="charge">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="main-work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="notify" attachedToRef="charge" cancelActivity="false">
+      <bpmn:messageEventDefinition messageRef="Message_1" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="remind">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="notify-work" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="notified" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="charge" />
+    <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="done" />
+    <bpmn:sequenceFlow id="f2" sourceRef="notify" targetRef="remind" />
+    <bpmn:sequenceFlow id="f3" sourceRef="remind" targetRef="notified" />
+  </bpmn:process>
+  <bpmn:message id="Message_1" name="reminder">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=orderId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+</bpmn:definitions>"#;
+
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(
+        status, 200,
+        "non-interrupting boundary model should deploy: {body}"
+    );
+
+    // Start an instance; the token parks on the main service task and the
+    // boundary subscription opens (orderId unset, so its correlation value is "").
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"notifiable"}"#),
+    );
+    assert_eq!(status, 200, "create instance failed: {body}");
+
+    // Correlate the boundary message: it spawns a parallel token down the side
+    // path without interrupting the main task.
+    let (status, body) = server.request(
+        "POST",
+        &path("/messages/correlation"),
+        Some(r#"{"name":"reminder","correlationKey":""}"#),
+    );
+    assert_eq!(status, 200, "correlating the boundary message failed: {body}");
+
+    // Both paths now have an activatable job: the spawned notify-work job AND the
+    // still-running main-work job (the task was not cancelled).
+    let notify_key = activate_one_job(&server, "notify-work");
+    let main_key = activate_one_job(&server, "main-work");
+    assert_ne!(notify_key, main_key, "distinct jobs for the parallel paths");
+
+    server.shutdown();
+}
+
+#[test]
 fn create_instance_accepts_the_default_tenant_id() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();

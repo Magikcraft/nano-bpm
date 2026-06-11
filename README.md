@@ -56,8 +56,10 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
 - `POST /v2/messages/publication` (`publishMessage`) and
   `POST /v2/messages/correlation` (`correlateMessage`) deliver a message to any
   open subscription whose name and correlation key match, releasing a **message
-  intermediate catch event**'s token or interrupting an activity via an
-  **interrupting message boundary event** (merging the message's variables into
+  intermediate catch event**'s token, interrupting an activity via an
+  **interrupting message boundary event**, or spawning a parallel token via a
+  **non-interrupting message boundary event** while the activity keeps running
+  (merging the message's variables into
   the instance first). Messages are **not buffered** (no TTL/dedup): with no
   match the message is dropped. `publishMessage` always returns `200` with the
   minted `messageKey`; `correlateMessage` returns `404` when nothing correlates
@@ -134,8 +136,8 @@ dependency-free for mobile/wasm embedders that don't need persistence.
 The engine reads no wall clock; the host drives time in. The server runs a
 single background task (every 500 ms) that feeds `now` into the engine via two
 ticks: `TriggerTimers` fires every due **timer intermediate catch event**,
-**interrupting timer boundary event** and **timer start event** (durable —
-journaled), and `ExpireJobs`
+**timer boundary event** (interrupting or non-interrupting) and **timer start
+event** (durable — journaled), and `ExpireJobs`
 releases activation locks past their deadline (volatile — not journaled). When a timer fires it may unblock
 downstream work, so the tick wakes any long-polling `activateJobs`. A timer
 parked before a restart is recovered by replay and fired by the first due tick

@@ -25,7 +25,9 @@
 //!   `errorRef`, resolved against definitions-level `error` elements
 //!   (`<error id="…" errorCode="…">`) into an error boundary event; or a nested
 //!   `timerEventDefinition` (timer boundary); or a nested `messageEventDefinition`
-//!   (message boundary).
+//!   (message boundary). `cancelActivity="false"` makes a timer or message
+//!   boundary **non-interrupting** (the activity keeps running and a parallel
+//!   token is spawned on each fire); the default is interrupting.
 //! * Definitions-level `message` elements (`<message id="…" name="…">`) with a
 //!   nested `zeebe:subscription correlationKey="=var"`, referenced by message
 //!   catch/boundary events via `messageRef`.
@@ -223,9 +225,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             }
                             "boundaryEvent" => {
                                 // Buffered until end: kept only if it carries an
-                                // errorEventDefinition (error boundary) or a
-                                // timerEventDefinition (interrupting timer
-                                // boundary); other boundaries are ignored.
+                                // errorEventDefinition (error boundary), a
+                                // timerEventDefinition (timer boundary) or a
+                                // messageEventDefinition (message boundary).
+                                // `cancelActivity="false"` marks it
+                                // non-interrupting (default interrupting).
                                 if let Some(id) = attr(attrs, "id") {
                                     cur_boundary = Some(PendingBoundary {
                                         id: id.to_string(),
@@ -234,6 +238,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         error_ref: None,
                                         timer_duration_millis: None,
                                         message_ref: None,
+                                        interrupting: attr(attrs, "cancelActivity")
+                                            != Some("false"),
                                     });
                                 }
                             }
@@ -430,9 +436,10 @@ struct FlowAcc {
 
 /// A boundary event collected while scanning. An `error_ref` (resolved to an
 /// error code at build time) makes it an error boundary; a `timer_duration_millis`
-/// makes it an interrupting timer boundary; a `message_ref` (resolved to a
-/// message name/correlation key) makes it an interrupting message boundary. A
-/// boundary with none of these is ignored.
+/// makes it a timer boundary; a `message_ref` (resolved to a message
+/// name/correlation key) makes it a message boundary. `interrupting` reflects the
+/// BPMN `cancelActivity` attribute (default `true`); error boundaries are always
+/// interrupting. A boundary with none of these is ignored.
 #[derive(Clone)]
 struct PendingBoundary {
     id: String,
@@ -440,6 +447,7 @@ struct PendingBoundary {
     error_ref: Option<String>,
     timer_duration_millis: Option<u64>,
     message_ref: Option<String>,
+    interrupting: bool,
 }
 
 /// A definitions-level `<message>` declaration: its `name` and the instance
@@ -609,7 +617,15 @@ impl ProcessAcc {
             // Resolve the boundary's flavour: timer (duration), message
             // (messageRef), or error (errorRef -> declared error).
             if let Some(duration_millis) = boundary.timer_duration_millis {
-                builder = builder.timer_boundary_event(boundary.id, attached_to, duration_millis);
+                builder = if boundary.interrupting {
+                    builder.timer_boundary_event(boundary.id, attached_to, duration_millis)
+                } else {
+                    builder.non_interrupting_timer_boundary_event(
+                        boundary.id,
+                        attached_to,
+                        duration_millis,
+                    )
+                };
             } else if let Some(message_ref) = boundary.message_ref {
                 let decl =
                     messages
@@ -629,12 +645,21 @@ impl ProcessAcc {
                         ),
                     }
                 })?;
-                builder = builder.message_boundary_event(
-                    boundary.id,
-                    attached_to,
-                    decl.name.clone(),
-                    correlation_key,
-                );
+                builder = if boundary.interrupting {
+                    builder.message_boundary_event(
+                        boundary.id,
+                        attached_to,
+                        decl.name.clone(),
+                        correlation_key,
+                    )
+                } else {
+                    builder.non_interrupting_message_boundary_event(
+                        boundary.id,
+                        attached_to,
+                        decl.name.clone(),
+                        correlation_key,
+                    )
+                };
             } else {
                 let error_ref = boundary.error_ref.unwrap_or_default();
                 let error_code = errors.get(&error_ref).cloned().ok_or_else(|| {
@@ -1254,6 +1279,7 @@ mod tests {
             ElementKind::TimerBoundaryEvent {
                 attached_to: "charge".to_string(),
                 duration_millis: 5_000,
+                interrupting: true,
             }
         );
         let boundary = def.element("timeout").unwrap();
@@ -1377,10 +1403,68 @@ mod tests {
                 attached_to: "charge".to_string(),
                 message_name: "order-cancelled".to_string(),
                 correlation_key: "orderId".to_string(),
+                interrupting: true,
             }
         );
         let boundary = def.element("cancel").unwrap();
         assert!(boundary.outgoing.iter().any(|f| f.to == "aborted"));
+    }
+
+    #[test]
+    fn should_parse_non_interrupting_timer_and_message_boundary_events() {
+        // given: a service task with a non-interrupting timer boundary and a
+        // non-interrupting message boundary (both cancelActivity="false").
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge" />
+              <bpmn:endEvent id="done" />
+              <bpmn:boundaryEvent id="remind" attachedToRef="charge" cancelActivity="false">
+                <bpmn:timerEventDefinition>
+                  <bpmn:timeDuration>PT5S</bpmn:timeDuration>
+                </bpmn:timerEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:boundaryEvent id="notify" attachedToRef="charge" cancelActivity="false">
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="reminded" />
+              <bpmn:endEvent id="notified" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="done" />
+              <bpmn:sequenceFlow id="f2" sourceRef="remind" targetRef="reminded" />
+              <bpmn:sequenceFlow id="f3" sourceRef="notify" targetRef="notified" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="reminder">
+              <bpmn:extensionElements>
+                <zeebe:subscription correlationKey="=orderId" />
+              </bpmn:extensionElements>
+            </bpmn:message>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: both boundaries parse as non-interrupting.
+        assert_eq!(
+            def.element("remind").unwrap().kind,
+            ElementKind::TimerBoundaryEvent {
+                attached_to: "charge".to_string(),
+                duration_millis: 5_000,
+                interrupting: false,
+            }
+        );
+        assert_eq!(
+            def.element("notify").unwrap().kind,
+            ElementKind::MessageBoundaryEvent {
+                attached_to: "charge".to_string(),
+                message_name: "reminder".to_string(),
+                correlation_key: "orderId".to_string(),
+                interrupting: false,
+            }
+        );
     }
 
     #[test]

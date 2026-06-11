@@ -8,6 +8,14 @@
 
 use std::collections::HashMap;
 
+/// Serde default for boundary-event `interrupting` flags: older serialized
+/// definitions (before non-interrupting boundaries existed) carried only
+/// interrupting boundaries, so a missing field deserializes as `true`.
+#[cfg(feature = "serde")]
+fn default_true() -> bool {
+    true
+}
+
 /// Identifier of a BPMN element (the BPMN `id` attribute), e.g. `"start"`.
 pub type ElementId = String;
 
@@ -95,18 +103,24 @@ pub enum ElementKind {
     /// ([`crate::Command::TriggerTimers`]) finds the timer due. `duration_millis`
     /// is in the same units the host feeds the engine as `now`.
     TimerIntermediateCatchEvent { duration_millis: u64 },
-    /// An interrupting timer boundary event attached to an activity (here, a
-    /// service task). It has no incoming sequence flow; instead a timer is armed
-    /// when the activity activates, and when the timer becomes due
-    /// ([`crate::Command::TriggerTimers`]) the activity is interrupted (its token
-    /// and any job cancelled) and the token runs along this event's outgoing
-    /// flow. `duration_millis` is in the same units the host feeds the engine as
-    /// `now`.
+    /// A timer boundary event attached to an activity (here, a service task). It
+    /// has no incoming sequence flow; instead a timer is armed when the activity
+    /// activates, and when the timer becomes due
+    /// ([`crate::Command::TriggerTimers`]) it fires once. An `interrupting` timer
+    /// interrupts the activity (its token and any job cancelled) and routes the
+    /// token along this event's outgoing flow; a non-interrupting one
+    /// (`interrupting == false`) leaves the activity running and spawns a new
+    /// parallel token along the outgoing flow instead. `duration_millis` is in
+    /// the same units the host feeds the engine as `now`.
     TimerBoundaryEvent {
         /// Id of the activity this boundary event is attached to.
         attached_to: ElementId,
         /// How long after the activity activates the timer fires.
         duration_millis: u64,
+        /// Whether firing interrupts the activity (`true`, the default for older
+        /// definitions) or spawns a parallel token and leaves it running.
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+        interrupting: bool,
     },
     /// A message intermediate catch event. On activation it opens a message
     /// subscription keyed by `message_name` and a correlation value (the
@@ -121,11 +135,14 @@ pub enum ElementKind {
         /// correlate to (the subscription's correlation key).
         correlation_key: String,
     },
-    /// An interrupting message boundary event attached to an activity (here, a
-    /// service task). It has no incoming sequence flow; instead a message
-    /// subscription is opened when the activity activates, and when a matching
-    /// message is correlated the activity is interrupted (its token and any job
-    /// cancelled) and the token runs along this event's outgoing flow.
+    /// A message boundary event attached to an activity (here, a service task).
+    /// It has no incoming sequence flow; instead a message subscription is opened
+    /// when the activity activates. An `interrupting` boundary, when a matching
+    /// message is correlated, interrupts the activity (its token and any job
+    /// cancelled) and runs the token along this event's outgoing flow; a
+    /// non-interrupting one (`interrupting == false`) leaves the activity running
+    /// and spawns a new parallel token along the outgoing flow for every matching
+    /// message (its subscription stays open).
     MessageBoundaryEvent {
         /// Id of the activity this boundary event is attached to.
         attached_to: ElementId,
@@ -134,6 +151,10 @@ pub enum ElementKind {
         /// Name of the instance variable whose value identifies the instance to
         /// correlate to (the subscription's correlation key).
         correlation_key: String,
+        /// Whether firing interrupts the activity (`true`, the default for older
+        /// definitions) or spawns a parallel token and leaves it running.
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+        interrupting: bool,
     },
     /// A message start event. It has no incoming sequence flow; instead the
     /// engine opens a process-level subscription at deploy time, and a
@@ -418,6 +439,30 @@ impl ProcessBuilder {
             ElementKind::TimerBoundaryEvent {
                 attached_to: attached_to.into(),
                 duration_millis,
+                interrupting: true,
+            },
+        )
+    }
+
+    /// Adds a non-interrupting timer boundary event attached to `attached_to`. A
+    /// timer is armed for `duration_millis` (in the host's clock units) when the
+    /// activity activates; when it fires the activity keeps running and a new
+    /// parallel token is spawned along this event's outgoing flow. Connect its
+    /// outgoing flow(s) with [`connect`] to route the side path.
+    ///
+    /// [`connect`]: ProcessBuilder::connect
+    pub fn non_interrupting_timer_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        duration_millis: u64,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::TimerBoundaryEvent {
+                attached_to: attached_to.into(),
+                duration_millis,
+                interrupting: false,
             },
         )
     }
@@ -462,6 +507,34 @@ impl ProcessBuilder {
                 attached_to: attached_to.into(),
                 message_name: message_name.into(),
                 correlation_key: correlation_key.into(),
+                interrupting: true,
+            },
+        )
+    }
+
+    /// Adds a non-interrupting message boundary event attached to `attached_to`,
+    /// subscribing to `message_name` and correlating on the instance variable
+    /// named `correlation_key`. A subscription is opened when the activity
+    /// activates; for every matching message correlated the activity keeps
+    /// running and a new parallel token is spawned along this event's outgoing
+    /// flow (the subscription stays open). Connect its outgoing flow(s) with
+    /// [`connect`] to route the side path.
+    ///
+    /// [`connect`]: ProcessBuilder::connect
+    pub fn non_interrupting_message_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        message_name: impl Into<String>,
+        correlation_key: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::MessageBoundaryEvent {
+                attached_to: attached_to.into(),
+                message_name: message_name.into(),
+                correlation_key: correlation_key.into(),
+                interrupting: false,
             },
         )
     }

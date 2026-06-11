@@ -144,7 +144,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   instead completes (or the task is interrupted another way, e.g. an error
   boundary) first, the armed boundary timer is **disarmed** (`TimerState::Canceled`)
   so it never fires. `JobCanceled`/`TimerCanceled` are journaled, so both outcomes
-  survive a restart.
+  survive a restart. A **non-interrupting** timer boundary
+  (`cancelActivity="false"`) instead leaves the activity (and its job) running and
+  spawns a new parallel token along the boundary's outgoing flow when it fires.
 - **Message intermediate catch events** park a token mid-flow until a matching
   message is correlated. Reaching one opens a `MessageSubscription` keyed by the
   message name and a **correlation value** — the stringified value of the named
@@ -164,7 +166,11 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   the activity, and routes the token out the boundary's outgoing flow. If the job
   instead completes (or the task is interrupted another way) first, the open
   subscription is **cancelled** (`MessageSubscriptionState::Canceled`) so it never
-  correlates. Both outcomes are journaled and survive a restart.
+  correlates. Both outcomes are journaled and survive a restart. A
+  **non-interrupting** message boundary (`cancelActivity="false"`) instead leaves
+  the activity (and its job) running and spawns a new parallel token along the
+  boundary's outgoing flow for **every** matching message — its subscription stays
+  open rather than settling.
 - **Message start events** create a new process instance when a matching message
   arrives. Deploying a process whose start event carries a
   `messageEventDefinition` opens a **process-level** `MessageStartSubscription`
@@ -235,7 +241,10 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > host clock tick) and **message events** — **message intermediate catch events**
 > (a token parks until a matching message is correlated) and **interrupting
 > message boundary events** (a message that, correlated first, cancels the job and
-> routes the token out the boundary) — and **event-triggered instance creation**:
+> routes the token out the boundary) — **non-interrupting timer and message
+> boundary events** (`cancelActivity="false"`: the activity keeps running and a
+> parallel token is spawned out the boundary on each fire), and
+> **event-triggered instance creation**:
 > **message start events** (a matching message creates a new instance) and
 > **timer start events** (a one-shot `timeDuration` or recurring `timeCycle`
 > creates instances on a host clock tick), and **embedded sub-processes** (a
@@ -250,8 +259,9 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
-> Deeper sub-process nesting and non-interrupting events are intended extension
-> points — new element kinds plug into `process_step` without touching the
+> Deeper sub-process nesting and re-arming (cycle) non-interrupting timers are
+> intended extension points — new element kinds plug into `process_step` without
+> touching the
 > architecture.
 
 ## Usage
