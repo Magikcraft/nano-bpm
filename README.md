@@ -29,9 +29,11 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
 - `POST /v2/jobs/{jobKey}/error` (`throwError`) raises a business error from a
   job. If the job's service task has an error boundary event with a matching
   `errorCode`, the task is interrupted and the boundary's outgoing path runs
-  (e.g. a refund/compensation flow); otherwise an incident is raised. The job is
-  consumed either way. Returns `404` for an unknown or un-activated job and
-  `409` if the job is no longer active.
+  (e.g. a refund/compensation flow); otherwise the error propagates up any
+  enclosing **embedded sub-process** to a sub-process error boundary (which
+  terminates the whole sub-process scope), and if still uncaught an incident is
+  raised. The job is consumed either way. Returns `404` for an unknown or
+  un-activated job and `409` if the job is no longer active.
 - `PATCH /v2/jobs/{jobKey}` (`updateJob`) applies the changeset's `retries` to a
   job — used to recover a job parked on a no-retries incident (timeout updates
   are not modelled).

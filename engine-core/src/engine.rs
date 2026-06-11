@@ -45,6 +45,9 @@ enum Step {
     Activate {
         instance_key: Key,
         element_id: String,
+        /// The enclosing sub-process element instance this activation runs in,
+        /// or `0` for the process-level (root) scope.
+        scope: Key,
     },
     /// Run an already-activated element through `COMPLETING -> COMPLETED` and take
     /// its outgoing sequence flows.
@@ -381,6 +384,7 @@ impl Engine {
         queue.push_back(Step::Activate {
             instance_key,
             element_id: start_event,
+            scope: 0,
         });
         instance_key
     }
@@ -712,6 +716,7 @@ impl Engine {
                             queue.push_back(Step::Activate {
                                 instance_key,
                                 element_id: boundary_element_id,
+                                scope: self.scope_of(instance_key, element_instance_key),
                             });
                         }
                     }
@@ -854,40 +859,53 @@ impl Engine {
                     },
                 );
 
-                match self.find_error_boundary(instance_key, &task_element_id, &error_code) {
-                    // Caught: interrupt the service task (complete its element
-                    // instance without taking its normal outgoing flow) and run
-                    // the boundary event's error-handling path.
-                    Some(boundary_id) => {
+                match self.find_catching_error_boundary(
+                    instance_key,
+                    &task_element_id,
+                    element_instance_key,
+                    &error_code,
+                ) {
+                    // Caught: interrupt the catching activity (the throwing task
+                    // itself, or an enclosing sub-process) and run the boundary
+                    // event's error-handling path.
+                    Some((boundary_id, caught_eik, caught_element_id)) => {
+                        // Capture the catching activity's scope before completing
+                        // it (completion clears its scope entry); the boundary
+                        // event runs in that same scope.
+                        let boundary_scope = self.scope_of(instance_key, caught_eik);
+                        // When caught at an enclosing sub-process, terminate its
+                        // whole inner scope (including the throwing task) first.
+                        if caught_eik != element_instance_key {
+                            self.terminate_subprocess_scope(&mut log, instance_key, caught_eik);
+                        }
                         self.emit(
                             &mut log,
                             Event::ElementCompleting {
                                 instance_key,
-                                element_instance_key,
-                                element_id: task_element_id.clone(),
+                                element_instance_key: caught_eik,
+                                element_id: caught_element_id.clone(),
                             },
                         );
                         self.emit(
                             &mut log,
                             Event::ElementCompleted {
                                 instance_key,
-                                element_instance_key,
-                                element_id: task_element_id,
+                                element_instance_key: caught_eik,
+                                element_id: caught_element_id,
                             },
                         );
-                        // An error boundary interrupting the task also disarms any
-                        // timer boundaries and message subscriptions on it.
-                        for event in self.cancel_boundary_timers_on(element_instance_key) {
+                        // An error boundary interrupting the activity also disarms
+                        // any timer boundaries and message subscriptions on it.
+                        for event in self.cancel_boundary_timers_on(caught_eik) {
                             self.emit(&mut log, event);
                         }
-                        for event in
-                            self.cancel_boundary_message_subscriptions_on(element_instance_key)
-                        {
+                        for event in self.cancel_boundary_message_subscriptions_on(caught_eik) {
                             self.emit(&mut log, event);
                         }
                         queue.push_back(Step::Activate {
                             instance_key,
                             element_id: boundary_id,
+                            scope: boundary_scope,
                         });
                     }
                     // Unhandled: the token parks on an incident.
@@ -1157,6 +1175,7 @@ impl Engine {
                             queue.push_back(Step::Activate {
                                 instance_key,
                                 element_id: boundary_element_id,
+                                scope: self.scope_of(instance_key, element_instance_key),
                             });
                         }
                     }
@@ -1280,15 +1299,102 @@ impl Engine {
     /// Drains the work queue, applying events and enqueuing follow-up steps until
     /// the instance is quiescent.
     fn run(&mut self, log: &mut Vec<Event>, mut queue: VecDeque<Step>) {
-        while let Some(step) = queue.pop_front() {
-            let (events, followups) = self.process_step(step);
-            for event in events {
-                self.emit(log, event);
+        loop {
+            while let Some(step) = queue.pop_front() {
+                let (events, followups) = self.process_step(step);
+                for event in events {
+                    self.emit(log, event);
+                }
+                for f in followups {
+                    queue.push_back(f);
+                }
             }
-            for f in followups {
-                queue.push_back(f);
+            // The queue is drained. Any embedded sub-process whose inner scope has
+            // emptied completes now and routes along its outgoing flow; that may
+            // enqueue more work (and, in turn, drain an enclosing sub-process), so
+            // loop until nothing more completes.
+            let followups = self.complete_drained_subprocesses(log);
+            if followups.is_empty() {
+                break;
+            }
+            queue.extend(followups);
+        }
+    }
+
+    /// Completes every active sub-process element instance whose inner token
+    /// scope has drained (no remaining child element instances), emitting its
+    /// completion events and returning the follow-up activations for its outgoing
+    /// flows. Deterministic in `(instance_key, element_instance_key)` order.
+    fn complete_drained_subprocesses(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
+        let mut drained: Vec<(Key, Key, ElementId)> = Vec::new();
+        for instance in self.state.instances.values() {
+            if instance.state != ProcessInstanceState::Active {
+                continue;
+            }
+            let Some(process) = self.state.processes.get(&instance.process_id) else {
+                continue;
+            };
+            for (eik, element_id) in &instance.active {
+                let is_subprocess = matches!(
+                    process.definition.element(element_id).map(|e| &e.kind),
+                    Some(ElementKind::SubProcess { .. })
+                );
+                if !is_subprocess {
+                    continue;
+                }
+                let has_child = instance.scopes.values().any(|parent| parent == eik);
+                if !has_child {
+                    drained.push((instance.key, *eik, element_id.clone()));
+                }
             }
         }
+        drained.sort();
+
+        let mut followups = Vec::new();
+        for (instance_key, eik, element_id) in drained {
+            // The sub-process completes in its own (parent) scope, captured before
+            // its scope entry is cleared by `ElementCompleted`.
+            let scope = self.scope_of(instance_key, eik);
+            self.emit(
+                log,
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id: element_id.clone(),
+                },
+            );
+            self.emit(
+                log,
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id: element_id.clone(),
+                },
+            );
+            // Completing normally disarms any boundary timers/subscriptions on it.
+            for event in self.cancel_boundary_timers_on(eik) {
+                self.emit(log, event);
+            }
+            for event in self.cancel_boundary_message_subscriptions_on(eik) {
+                self.emit(log, event);
+            }
+            for flow in self.outgoing(instance_key, &element_id) {
+                self.emit(
+                    log,
+                    Event::SequenceFlowTaken {
+                        instance_key,
+                        from: element_id.clone(),
+                        to: flow.to.clone(),
+                    },
+                );
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: flow.to,
+                    scope,
+                });
+            }
+        }
+        followups
     }
 
     /// The processor: decides the events and follow-up work for one lifecycle
@@ -1298,7 +1404,8 @@ impl Engine {
             Step::Activate {
                 instance_key,
                 element_id,
-            } => self.activate(instance_key, element_id),
+                scope,
+            } => self.activate(instance_key, element_id, scope),
             Step::Complete {
                 instance_key,
                 element_instance_key,
@@ -1312,7 +1419,12 @@ impl Engine {
         }
     }
 
-    fn activate(&mut self, instance_key: Key, element_id: String) -> (Vec<Event>, Vec<Step>) {
+    fn activate(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         let kind = self.element_kind(instance_key, &element_id);
 
         // A parallel gateway with more than one incoming flow is a join: it
@@ -1320,7 +1432,7 @@ impl Engine {
         if matches!(kind, Some(ElementKind::ParallelGateway))
             && self.incoming_count(instance_key, &element_id) > 1
         {
-            return self.arrive_at_parallel_join(instance_key, element_id);
+            return self.arrive_at_parallel_join(instance_key, element_id, scope);
         }
 
         let element_instance_key = self.mint_key();
@@ -1334,6 +1446,7 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id: element_id.clone(),
+                scope,
             },
         ];
         let mut followups = Vec::new();
@@ -1419,6 +1532,18 @@ impl Engine {
                     kind: state::MessageSubscriptionKind::IntermediateCatch,
                 });
             }
+            // An embedded sub-process opens a token scope: it activates its inner
+            // start event inside its own scope (this element instance) and rests
+            // while the inner flow runs. It completes once the scope drains (see
+            // `complete_drained_subprocesses`) or is interrupted by an error
+            // boundary.
+            Some(ElementKind::SubProcess { start_event }) => {
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: start_event,
+                    scope: element_instance_key,
+                });
+            }
             // Pass-through elements (events, exclusive gateway, parallel split)
             // complete immediately; routing happens at completion.
             Some(_) => {
@@ -1467,6 +1592,7 @@ impl Engine {
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         let mut followups = Vec::new();
+        let scope = self.scope_of(instance_key, element_instance_key);
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
                 instance_key,
@@ -1476,6 +1602,7 @@ impl Engine {
             followups.push(Step::Activate {
                 instance_key,
                 element_id: flow.to,
+                scope,
             });
         }
         (events, followups)
@@ -1550,6 +1677,7 @@ impl Engine {
                 let followups = vec![Step::Activate {
                     instance_key,
                     element_id: flow.to,
+                    scope: self.scope_of(instance_key, element_instance_key),
                 }];
                 (events, followups)
             }
@@ -1581,6 +1709,7 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_id: String,
+        scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
         let threshold = self.incoming_count(instance_key, &element_id);
         let already_open = self.join_eik(instance_key, &element_id).is_some();
@@ -1601,6 +1730,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: eik,
                 element_id: element_id.clone(),
+                scope,
             });
             events.push(Event::ParallelJoinOpened {
                 instance_key,
@@ -1640,6 +1770,7 @@ impl Engine {
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: flow.to,
+                    scope,
                 });
             }
         }
@@ -1709,6 +1840,175 @@ impl Engine {
             })
             .map(|e| e.id.clone())
             .min()
+    }
+
+    /// The element instance of the embedded sub-process that encloses
+    /// `element_instance_key`, or `0` if it lives in the process-level scope.
+    fn scope_of(&self, instance_key: Key, element_instance_key: Key) -> Key {
+        self.state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.scopes.get(&element_instance_key).copied())
+            .unwrap_or(0)
+    }
+
+    /// The element id of an active element instance, if it is still active.
+    fn element_id_of_instance(&self, instance_key: Key, element_instance_key: Key) -> Option<ElementId> {
+        self.state
+            .instances
+            .get(&instance_key)?
+            .active
+            .get(&element_instance_key)
+            .cloned()
+    }
+
+    /// Finds the error boundary that catches `error_code` thrown from the
+    /// activity `from_element_id` (element instance `from_eik`), propagating up
+    /// enclosing sub-process scopes until one is found. Returns
+    /// `(boundary_id, caught_element_instance_key, caught_element_id)` — the
+    /// boundary event and the activity it is attached to (the throwing task
+    /// itself or an enclosing sub-process).
+    fn find_catching_error_boundary(
+        &self,
+        instance_key: Key,
+        from_element_id: &str,
+        from_eik: Key,
+        error_code: &str,
+    ) -> Option<(ElementId, Key, ElementId)> {
+        let mut element_id = from_element_id.to_string();
+        let mut eik = from_eik;
+        loop {
+            if let Some(boundary_id) =
+                self.find_error_boundary(instance_key, &element_id, error_code)
+            {
+                return Some((boundary_id, eik, element_id));
+            }
+            // Propagate to the enclosing sub-process, if any.
+            let parent = self.scope_of(instance_key, eik);
+            if parent == 0 {
+                return None;
+            }
+            element_id = self.element_id_of_instance(instance_key, parent)?;
+            eik = parent;
+        }
+    }
+
+    /// Every element instance transitively contained in the sub-process scope
+    /// `scope_eik`, sorted by key for deterministic processing.
+    fn scope_descendants(&self, instance_key: Key, scope_eik: Key) -> Vec<Key> {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        let mut stack = vec![scope_eik];
+        while let Some(parent) = stack.pop() {
+            for (child, p) in &instance.scopes {
+                if *p == parent {
+                    result.push(*child);
+                    stack.push(*child);
+                }
+            }
+        }
+        result.sort_unstable();
+        result
+    }
+
+    /// Terminates a sub-process scope: cancels every in-play job, armed timer and
+    /// open subscription on each element instance inside `scope_eik` (and nested
+    /// scopes) and completes those element instances. The sub-process element
+    /// instance itself is left for the caller to complete. Used when an
+    /// interrupting error boundary catches an error inside the sub-process.
+    fn terminate_subprocess_scope(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        scope_eik: Key,
+    ) {
+        for eik in self.scope_descendants(instance_key, scope_eik) {
+            let element_id = self
+                .element_id_of_instance(instance_key, eik)
+                .unwrap_or_default();
+            if let Some(job_key) = self.active_job_on(eik) {
+                self.emit(
+                    log,
+                    Event::JobCanceled {
+                        job_key,
+                        instance_key,
+                    },
+                );
+            }
+            for event in self.cancel_all_timers_on(eik) {
+                self.emit(log, event);
+            }
+            for event in self.cancel_all_subscriptions_on(eik) {
+                self.emit(log, event);
+            }
+            self.emit(
+                log,
+                Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id: element_id.clone(),
+                },
+            );
+            self.emit(
+                log,
+                Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id,
+                },
+            );
+        }
+    }
+
+    /// Cancels every armed (`Created`) timer resting on `element_instance_key`,
+    /// regardless of kind, returning the `TimerCanceled` events (sorted by key).
+    /// Used to tear down a sub-process scope on interruption.
+    fn cancel_all_timers_on(&self, element_instance_key: Key) -> Vec<Event> {
+        let mut timers: Vec<&state::Timer> = self
+            .state
+            .timers
+            .values()
+            .filter(|t| {
+                t.element_instance_key == element_instance_key
+                    && t.state == state::TimerState::Created
+            })
+            .collect();
+        timers.sort_by_key(|t| t.key);
+        timers
+            .into_iter()
+            .map(|t| Event::TimerCanceled {
+                timer_key: t.key,
+                instance_key: t.instance_key,
+                element_instance_key: t.element_instance_key,
+                element_id: t.element_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Cancels every open subscription resting on `element_instance_key`,
+    /// regardless of kind, returning the `MessageSubscriptionCanceled` events
+    /// (sorted by key). Used to tear down a sub-process scope on interruption.
+    fn cancel_all_subscriptions_on(&self, element_instance_key: Key) -> Vec<Event> {
+        let mut subs: Vec<&state::MessageSubscription> = self
+            .state
+            .message_subscriptions
+            .values()
+            .filter(|s| {
+                s.element_instance_key == element_instance_key
+                    && s.state == state::MessageSubscriptionState::Open
+            })
+            .collect();
+        subs.sort_by_key(|s| s.key);
+        subs.into_iter()
+            .map(|s| Event::MessageSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            })
+            .collect()
     }
 
     /// The key of a still-in-play job parked on `element_instance_key`, if any.
@@ -3287,6 +3587,150 @@ mod tests {
             .apply_command(Command::throw_job_error(job_key, "CARD_DECLINED", "x"))
             .unwrap_err();
         assert_eq!(err, EngineError::JobNotActivated { job_key });
+    }
+
+    /// start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done
+    ///                               (sub catches BUSINESS_ERROR)
+    ///          sub --(error boundary)--> sad(sad-flow) -> sad_end
+    fn process_with_subprocess_error_boundary() -> ProcessDefinition {
+        ProcessBuilder::new("sub-error")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .service_task("inner", "work")
+            .contained_in("inner", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .error_boundary_event("boundary", "sub", "BUSINESS_ERROR")
+            .service_task("sad", "sad-flow")
+            .end_event("done")
+            .end_event("sad_end")
+            .connect("start", "sub")
+            .connect("sub_start", "inner")
+            .connect("inner", "sub_end")
+            .connect("sub", "done")
+            .connect("boundary", "sad")
+            .connect("sad", "sad_end")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_run_an_embedded_subprocess_to_completion_on_the_happy_path() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                process_with_subprocess_error_boundary(),
+            ))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("sub-error"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The token enters the sub-process and parks on its inner service task.
+        assert!(!engine.is_completed(instance_key));
+        assert_eq!(engine.pending_jobs().len(), 1);
+        assert_eq!(engine.pending_jobs()[0].job_type, "work");
+
+        // Completing the inner job drains the sub-process scope, which then
+        // routes out its normal outgoing flow to the outer end event.
+        let events = complete_one(&mut engine, "work");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "sub" && to == "done"
+        )));
+        assert!(engine.is_completed(instance_key));
+        assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+    }
+
+    #[test]
+    fn should_interrupt_an_embedded_subprocess_via_its_error_boundary() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                process_with_subprocess_error_boundary(),
+            ))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("sub-error"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
+
+        // The inner job throws a business error the sub-process boundary catches.
+        let events = engine
+            .apply_command(Command::throw_job_error(job_key, "BUSINESS_ERROR", "boom"))
+            .unwrap();
+
+        // The whole sub-process is interrupted: its inner task instance is
+        // completed (terminated), the sub-process completes without taking its
+        // normal flow, and the boundary routes to the sad-flow path.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "inner"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "boundary" && to == "sad"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "done"
+        )));
+        // The interrupted inner job is consumed and cannot be completed.
+        let err = engine
+            .apply_command(Command::complete_job(job_key))
+            .unwrap_err();
+        assert_eq!(err, EngineError::JobNotActive { job_key });
+
+        // The instance is not yet complete: it is parked on the sad-flow task.
+        assert!(!engine.is_completed(instance_key));
+        let sad = complete_one(&mut engine, "sad-flow");
+        assert!(sad.contains(&Event::ProcessInstanceCompleted { instance_key }));
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_raise_an_incident_when_a_subprocess_error_is_unhandled() {
+        // A sub-process with no error boundary: an error thrown inside is
+        // unhandled and parks on an incident (the instance does not complete).
+        let def = ProcessBuilder::new("sub-plain")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .service_task("inner", "work")
+            .contained_in("inner", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .end_event("done")
+            .connect("start", "sub")
+            .connect("sub_start", "inner")
+            .connect("inner", "sub_end")
+            .connect("sub", "done")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("sub-plain"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
+
+        let events = engine
+            .apply_command(Command::throw_job_error(job_key, "BOOM", "kaboom"))
+            .unwrap();
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::IncidentRaised { reason, .. } if reason.contains("BOOM")
+        )));
+        assert!(!engine.is_completed(instance_key));
+        assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
     }
 
     #[test]

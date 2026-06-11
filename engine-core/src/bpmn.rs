@@ -16,6 +16,9 @@
 //! * `process` (one or more per file) with its `id`.
 //! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `exclusiveGateway`,
 //!   `parallelGateway`.
+//! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
+//!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
+//!   interrupting error boundary on the sub-process.
 //! * `intermediateCatchEvent` with a nested `timerEventDefinition`/`timeDuration`
 //!   (timer catch) or a nested `messageEventDefinition` (message catch).
 //! * `boundaryEvent` with `attachedToRef` and a nested `errorEventDefinition`
@@ -207,6 +210,17 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     cur_service_task = idx;
                                 }
                             }
+                            "subProcess" => {
+                                // An embedded sub-process: register it, then push
+                                // its scope so nested nodes are tagged as
+                                // contained in it until its end tag.
+                                acc.add_node(attrs, NodeKind::SubProcess);
+                                if let Some(id) = attr(attrs, "id") {
+                                    if !self_closing {
+                                        acc.scope_stack.push(id.to_string());
+                                    }
+                                }
+                            }
                             "boundaryEvent" => {
                                 // Buffered until end: kept only if it carries an
                                 // errorEventDefinition (error boundary) or a
@@ -307,6 +321,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cycle_text = None;
                 }
                 "serviceTask" => cur_service_task = None,
+                "subProcess" => {
+                    if let Some(acc) = current.as_mut() {
+                        acc.scope_stack.pop();
+                    }
+                }
                 "startEvent" => cur_start = None,
                 "message" => cur_message = None,
                 "boundaryEvent" => {
@@ -386,6 +405,9 @@ struct NodeAcc {
     /// For timer start events: whether the timer recurs (a `timeCycle`) or is
     /// one-shot (a `timeDuration`). `None` on a plain none start event.
     timer_repeating: Option<bool>,
+    /// Id of the embedded sub-process containing this node, or `None` at the
+    /// process level. Set from the scope stack as the node is scanned.
+    parent: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -396,6 +418,7 @@ enum NodeKind {
     Exclusive,
     Parallel,
     IntermediateCatch,
+    SubProcess,
 }
 
 /// A sequence flow collected while scanning.
@@ -433,6 +456,8 @@ struct ProcessAcc {
     nodes: Vec<NodeAcc>,
     flows: Vec<FlowAcc>,
     boundaries: Vec<PendingBoundary>,
+    /// Stack of open embedded sub-process ids, used to scope nested nodes.
+    scope_stack: Vec<String>,
 }
 
 impl ProcessAcc {
@@ -442,6 +467,7 @@ impl ProcessAcc {
             nodes: Vec::new(),
             flows: Vec::new(),
             boundaries: Vec::new(),
+            scope_stack: Vec::new(),
         }
     }
 
@@ -455,6 +481,7 @@ impl ProcessAcc {
             duration_millis: None,
             message_ref: None,
             timer_repeating: None,
+            parent: self.scope_stack.last().cloned(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -481,7 +508,17 @@ impl ProcessAcc {
         messages: &HashMap<String, MessageDecl>,
     ) -> Result<ProcessDefinition, ParseError> {
         let mut builder = ProcessBuilder::new(self.id.clone());
+        // Map each sub-process to its inner start event (a start node whose
+        // parent is the sub-process).
+        let sub_starts: HashMap<String, String> = self
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Start))
+            .filter_map(|n| n.parent.clone().map(|p| (p, n.id.clone())))
+            .collect();
         for node in self.nodes {
+            let node_id = node.id.clone();
+            let parent = node.parent.clone();
             builder = match node.kind {
                 NodeKind::Start => {
                     // A messageRef makes it a message start; a timer_repeating
@@ -547,7 +584,19 @@ impl ProcessAcc {
                         builder.timer_intermediate_catch_event(node.id, duration_millis)
                     }
                 }
+                NodeKind::SubProcess => {
+                    let start = sub_starts.get(&node.id).cloned().ok_or_else(|| {
+                        ParseError::InvalidProcess {
+                            process_id: self.id.clone(),
+                            reason: format!("sub-process {} has no start event", node.id),
+                        }
+                    })?;
+                    builder.sub_process(node.id, start)
+                }
             };
+            if let Some(parent) = parent {
+                builder = builder.contained_in(node_id, parent);
+            }
         }
         for boundary in self.boundaries {
             let attached_to =
@@ -1452,5 +1501,80 @@ mod tests {
                 repeating: true,
             }
         );
+    }
+
+    #[test]
+    fn should_parse_an_embedded_subprocess_with_an_error_boundary() {
+        // given a process whose embedded sub-process has its own start/task/end
+        // and an interrupting error boundary attached to the sub-process.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="start" />
+              <bpmn:subProcess id="sub">
+                <bpmn:startEvent id="sub_start" />
+                <bpmn:serviceTask id="inner">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="work" />
+                  </bpmn:extensionElements>
+                </bpmn:serviceTask>
+                <bpmn:endEvent id="sub_end" />
+                <bpmn:sequenceFlow id="i0" sourceRef="sub_start" targetRef="inner" />
+                <bpmn:sequenceFlow id="i1" sourceRef="inner" targetRef="sub_end" />
+              </bpmn:subProcess>
+              <bpmn:boundaryEvent id="boundary" attachedToRef="sub">
+                <bpmn:errorEventDefinition errorRef="Error_1" />
+              </bpmn:boundaryEvent>
+              <bpmn:serviceTask id="sad">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="sad-flow" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="done" />
+              <bpmn:endEvent id="sad_end" />
+              <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="sub" />
+              <bpmn:sequenceFlow id="f1" sourceRef="sub" targetRef="done" />
+              <bpmn:sequenceFlow id="f2" sourceRef="boundary" targetRef="sad" />
+              <bpmn:sequenceFlow id="f3" sourceRef="sad" targetRef="sad_end" />
+            </bpmn:process>
+            <bpmn:error id="Error_1" name="Business" errorCode="BUSINESS_ERROR" />
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then the process-level start event is the outer one, and the
+        // sub-process points at its inner start.
+        assert_eq!(def.start_event, "start");
+        assert_eq!(
+            def.element("sub").unwrap().kind,
+            ElementKind::SubProcess {
+                start_event: "sub_start".to_string(),
+            }
+        );
+        // The inner nodes are tagged as contained in the sub-process; the outer
+        // ones are not.
+        assert_eq!(
+            def.element("inner").unwrap().parent.as_deref(),
+            Some("sub")
+        );
+        assert_eq!(def.element("sub_start").unwrap().parent.as_deref(), Some("sub"));
+        assert_eq!(def.element("sub").unwrap().parent, None);
+        assert_eq!(def.element("start").unwrap().parent, None);
+        // The error boundary is attached to the sub-process and routes to sad-flow.
+        assert_eq!(
+            def.element("boundary").unwrap().kind,
+            ElementKind::ErrorBoundaryEvent {
+                attached_to: "sub".to_string(),
+                error_code: "BUSINESS_ERROR".to_string(),
+            }
+        );
+        assert!(def
+            .element("sub")
+            .unwrap()
+            .outgoing
+            .iter()
+            .any(|f| f.to == "done"));
     }
 }

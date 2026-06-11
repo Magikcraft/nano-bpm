@@ -97,6 +97,12 @@ pub struct ProcessInstance {
     /// on an incident. When this becomes empty the instance has no remaining
     /// tokens and is complete.
     pub active: HashMap<Key, ElementId>,
+    /// Maps each active element instance to the element instance of the embedded
+    /// sub-process that encloses it. Element instances in the process-level
+    /// (root) scope are absent. Used to detect when a sub-process scope has
+    /// drained (all its inner tokens consumed) and to terminate a scope when an
+    /// error boundary interrupts it.
+    pub scopes: HashMap<Key, Key>,
     /// Process variables (used by exclusive-gateway conditions).
     pub variables: HashMap<String, Value>,
     /// For each open parallel-gateway join: how many incoming tokens have
@@ -403,6 +409,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: ProcessInstanceState::Active,
                     created_at: *created_at,
                     active: HashMap::new(),
+                    scopes: HashMap::new(),
                     variables: variables.clone(),
                     join_counts: HashMap::new(),
                     join_instances: HashMap::new(),
@@ -429,11 +436,16 @@ pub fn apply(state: &mut State, event: &Event) {
             instance_key,
             element_instance_key,
             element_id,
+            scope,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
                     .active
                     .insert(*element_instance_key, element_id.clone());
+                // A non-zero scope records the enclosing sub-process instance.
+                if *scope != 0 {
+                    instance.scopes.insert(*element_instance_key, *scope);
+                }
             }
         }
 
@@ -444,6 +456,7 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
+                instance.scopes.remove(element_instance_key);
             }
         }
 
@@ -653,6 +666,7 @@ pub fn apply(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Terminated;
                 instance.active.clear();
+                instance.scopes.clear();
                 instance.incidents.clear();
             }
         }

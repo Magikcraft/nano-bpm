@@ -192,6 +192,14 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   so replay reconstructs identical timestamps.
 - A process **instance completes** when its last token is consumed (its set of
   active element instances becomes empty).
+- An **embedded sub-process** opens a token *scope*: activating it activates its
+  inner start event inside the scope, and the sub-process element instance rests
+  while the inner flow runs. When the inner scope drains (its last inner token is
+  consumed) the sub-process completes and routes along its outgoing flow. An
+  interrupting **error boundary event** attached to the sub-process catches an
+  error thrown by any inner activity (the error propagates up enclosing scopes),
+  terminates the whole inner scope (cancelling its jobs/timers/subscriptions) and
+  routes the token out the boundary's outgoing flow.
 - **Bounded hot state (optional eviction).** By default the engine retains
   completed instances forever — `is_completed`, `instance`, and the read APIs all
   keep working — which is ideal for an embedder that queries the engine directly.
@@ -230,17 +238,21 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
 > routes the token out the boundary) — and **event-triggered instance creation**:
 > **message start events** (a matching message creates a new instance) and
 > **timer start events** (a one-shot `timeDuration` or recurring `timeCycle`
-> creates instances on a host clock tick). Instances carry simple
-> variables (`Bool`/`Int`/`Str`) used by gateway conditions and message
+> creates instances on a host clock tick), and **embedded sub-processes** (a
+> token scope whose inner flow runs to its own end before the sub-process routes
+> on, with an interrupting **error boundary event** attached to the sub-process
+> terminating the whole inner scope and routing to its handler). Instances carry
+> simple variables (`Bool`/`Int`/`Str`) used by gateway conditions and message
 > correlation. Processes can be
 > built programmatically with [`ProcessBuilder`] or parsed from BPMN 2.0 XML for
-> that same subset (including `boundaryEvent`/`errorEventDefinition`,
+> that same subset (including `subProcess`, `boundaryEvent`/`errorEventDefinition`,
 > `intermediateCatchEvent`/`timerEventDefinition`, `messageEventDefinition`/
 > `zeebe:subscription` and `startEvent` message/timer definitions) via the
 > [`bpmn`] module (`bpmn::parse_bpmn`), a tiny dependency-free scanner.
 > Deployments assign a per-id **version** and a unique process-definition key.
-> Sub-processes and non-interrupting events are intended extension points —
-> new element kinds plug into `process_step` without touching the architecture.
+> Deeper sub-process nesting and non-interrupting events are intended extension
+> points — new element kinds plug into `process_step` without touching the
+> architecture.
 
 ## Usage
 

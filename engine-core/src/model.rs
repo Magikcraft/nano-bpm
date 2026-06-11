@@ -158,6 +158,21 @@ pub enum ElementKind {
         /// Whether the timer re-arms after firing (a cycle) or fires once.
         repeating: bool,
     },
+    /// An embedded sub-process: a container holding its own flow (its inner
+    /// elements carry [`Element::parent`] equal to this element's id). On
+    /// activation it opens a token scope and activates its inner start event
+    /// ([`start_event`]); the sub-process element instance rests while the inner
+    /// flow runs. When the inner flow drains (its last inner token is consumed)
+    /// the sub-process completes and routes along its outgoing flow. An
+    /// interrupting error boundary event attached to it terminates the whole
+    /// inner scope and routes along the boundary's outgoing flow instead.
+    ///
+    /// [`start_event`]: ElementKind::SubProcess::start_event
+    SubProcess {
+        /// Id of the sub-process's inner (none) start event, where its token
+        /// scope begins.
+        start_event: ElementId,
+    },
 }
 
 impl ElementKind {
@@ -181,6 +196,12 @@ pub struct Element {
     pub kind: ElementKind,
     /// Outgoing sequence flows, in declaration order.
     pub outgoing: Vec<SequenceFlow>,
+    /// Id of the embedded sub-process that contains this element, or `None` for
+    /// elements at the process level. Used to scope tokens and to pick the
+    /// process-level start event. Defaulted to `None` so models serialized
+    /// before sub-processes existed still load.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parent: Option<ElementId>,
 }
 
 /// An executable process definition: a set of [`Element`]s plus the id of the
@@ -227,6 +248,10 @@ pub struct ProcessBuilder {
     id: String,
     elements: Vec<Element>,
     edges: Vec<(ElementId, SequenceFlow)>,
+    /// Recorded `(child, parent sub-process)` containment, applied in [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    parents: Vec<(ElementId, ElementId)>,
 }
 
 impl ProcessBuilder {
@@ -236,6 +261,7 @@ impl ProcessBuilder {
             id: id.into(),
             elements: Vec::new(),
             edges: Vec::new(),
+            parents: Vec::new(),
         }
     }
 
@@ -244,6 +270,7 @@ impl ProcessBuilder {
             id: id.into(),
             kind,
             outgoing: Vec::new(),
+            parent: None,
         });
         self
     }
@@ -315,6 +342,30 @@ impl ProcessBuilder {
     /// Adds a parallel (AND) gateway.
     pub fn parallel_gateway(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::ParallelGateway)
+    }
+
+    /// Adds an embedded sub-process whose inner token scope begins at
+    /// `start_event` (the id of its inner none start event). Add the inner flow
+    /// nodes/flows normally and mark each as [`contained_in`] this sub-process;
+    /// connect the sub-process's own outgoing flow with [`connect`].
+    ///
+    /// [`contained_in`]: ProcessBuilder::contained_in
+    /// [`connect`]: ProcessBuilder::connect
+    pub fn sub_process(self, id: impl Into<String>, start_event: impl Into<String>) -> Self {
+        self.add(
+            id,
+            ElementKind::SubProcess {
+                start_event: start_event.into(),
+            },
+        )
+    }
+
+    /// Records that `child` is contained in the embedded sub-process `parent`.
+    /// Inner elements must be declared this way so their tokens are scoped to the
+    /// sub-process and so the process-level start event can be identified.
+    pub fn contained_in(mut self, child: impl Into<String>, parent: impl Into<String>) -> Self {
+        self.parents.push((child.into(), parent.into()));
+        self
     }
 
     /// Adds an error boundary event attached to `attached_to`, catching the BPMN
@@ -474,9 +525,31 @@ impl ProcessBuilder {
             source.outgoing.push(flow.clone());
         }
 
+        // Apply sub-process containment.
+        for (child, parent) in &self.parents {
+            if !elements.contains_key(parent) {
+                return Err(BuildError::UnknownParent {
+                    child: child.clone(),
+                    parent: parent.clone(),
+                });
+            }
+            match elements.get_mut(child) {
+                Some(element) => element.parent = Some(parent.clone()),
+                None => {
+                    return Err(BuildError::UnknownChild {
+                        child: child.clone(),
+                        parent: parent.clone(),
+                    })
+                }
+            }
+        }
+
+        // The process-level start event is the unique start event that is not
+        // contained in any sub-process (sub-process inner start events have a
+        // parent and start their own scope, not the instance).
         let starts: Vec<&Element> = elements
             .values()
-            .filter(|e| e.kind.is_start_event())
+            .filter(|e| e.kind.is_start_event() && e.parent.is_none())
             .collect();
         let start_event = match starts.as_slice() {
             [single] => single.id.clone(),
@@ -500,6 +573,10 @@ pub enum BuildError {
     UnknownFlowTarget { from: ElementId, to: ElementId },
     NoStartEvent,
     MultipleStartEvents,
+    /// A `contained_in` referenced a sub-process element that does not exist.
+    UnknownParent { child: ElementId, parent: ElementId },
+    /// A `contained_in` referenced a child element that does not exist.
+    UnknownChild { child: ElementId, parent: ElementId },
 }
 
 impl std::fmt::Display for BuildError {
@@ -520,6 +597,12 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::NoStartEvent => write!(f, "process has no start event"),
             BuildError::MultipleStartEvents => write!(f, "process has more than one start event"),
+            BuildError::UnknownParent { child, parent } => {
+                write!(f, "element {child} is contained in unknown sub-process {parent}")
+            }
+            BuildError::UnknownChild { child, parent } => {
+                write!(f, "unknown element {child} declared as contained in sub-process {parent}")
+            }
         }
     }
 }

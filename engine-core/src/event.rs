@@ -56,6 +56,13 @@ pub enum Event {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+        /// The element instance of the enclosing embedded sub-process this
+        /// instance lives in, or `0` for the process-level (root) scope. Used to
+        /// track token scopes for sub-process completion and interruption.
+        /// Defaulted to `0` so journals written before sub-processes existed
+        /// still replay.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Key,
     },
     /// An element instance entered `COMPLETING`.
     ElementCompleting {

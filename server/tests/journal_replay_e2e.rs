@@ -497,6 +497,93 @@ fn a_message_start_event_creates_and_replays_a_process_instance() {
 }
 
 #[test]
+fn an_embedded_subprocess_error_boundary_deploys_and_routes() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path());
+
+    // Regression: a model with an embedded sub-process and an interrupting error
+    // boundary attached to it failed to parse (the sub-process element kind did
+    // not exist), so the deployment was rejected. It must now deploy, and the
+    // BUSINESS_ERROR thrown inside the sub-process must be caught by the boundary
+    // and routed onto the sad-flow path.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="throw-bpmn-error" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="sub_start" />
+      <bpmn:serviceTask id="inner">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="inner-work" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:endEvent id="sub_end" />
+      <bpmn:sequenceFlow id="i0" sourceRef="sub_start" targetRef="inner" />
+      <bpmn:sequenceFlow id="i1" sourceRef="inner" targetRef="sub_end" />
+    </bpmn:subProcess>
+    <bpmn:boundaryEvent id="boundary" attachedToRef="sub">
+      <bpmn:errorEventDefinition errorRef="Error_1" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="sad">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="sad-flow" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:endEvent id="sad_end" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="sub" />
+    <bpmn:sequenceFlow id="f1" sourceRef="sub" targetRef="done" />
+    <bpmn:sequenceFlow id="f2" sourceRef="boundary" targetRef="sad" />
+    <bpmn:sequenceFlow id="f3" sourceRef="sad" targetRef="sad_end" />
+  </bpmn:process>
+  <bpmn:error id="Error_1" name="Business" errorCode="BUSINESS_ERROR" />
+</bpmn:definitions>"#;
+
+    let (status, body) = deploy_bpmn(server.port, xml);
+    assert_eq!(status, 200, "sub-process model should deploy: {body}");
+
+    // Start an instance; the token parks on the inner service task.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"throw-bpmn-error"}"#),
+    );
+    assert_eq!(status, 200, "create instance failed: {body}");
+
+    // Activate the inner job and throw the business error the boundary catches.
+    let job_key = activate_one_job(&server, "inner-work");
+    let (status, body) = server.request(
+        "POST",
+        &path(&format!("/jobs/{job_key}/error")),
+        Some(r#"{"errorCode":"BUSINESS_ERROR"}"#),
+    );
+    assert_eq!(status, 204, "throwing the caught error failed: {body}");
+
+    // The interruption routed to the sad-flow task: its job is now activatable.
+    let sad_key = activate_one_job(&server, "sad-flow");
+    assert_ne!(sad_key, job_key, "a distinct sad-flow job was created");
+
+    server.shutdown();
+}
+
+/// Activates exactly one job of `job_type` (no long-poll) and returns its key.
+fn activate_one_job(server: &ServerProcess, job_type: &str) -> String {
+    let body = format!(
+        r#"{{"type":"{job_type}","maxJobsToActivate":1,"timeout":60000,"requestTimeout":-1}}"#
+    );
+    let (status, resp) = server.request("POST", &path("/jobs/activation"), Some(&body));
+    assert_eq!(status, 200, "activation failed: {resp}");
+    let json: serde_json::Value = serde_json::from_str(&resp).expect("activation response is JSON");
+    let jobs = json["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "exactly one {job_type} job should activate: {resp}");
+    jobs[0]["jobKey"]
+        .as_str()
+        .expect("jobKey present")
+        .to_string()
+}
+
+#[test]
 fn create_instance_accepts_the_default_tenant_id() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();
