@@ -95,11 +95,18 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   be evaluated falls back to the literal text).
 - A **user task** (`<bpmn:userTask>` with a `<zeebe:userTask/>`, i.e. a native
   Zeebe user task) rests in `ACTIVATED` after the engine creates the task, and
-  advances only when an `AssignUserTask` / `CompleteUserTask` command arrives.
-  Unlike jobs there is no worker lock or retries: a task is `Created`, then
-  optionally assigned, then `Completed` (or `Canceled` when its instance is
-  terminated). Completion merges its variables and resumes the token, exactly
-  like `CompleteJob`.
+  advances only when a `CompleteUserTask` command arrives. Unlike jobs there is
+  no worker lock or retries: a task is `Created`, then `Completed` (or
+  `Canceled` when its instance is terminated). The assignment, scheduling and
+  priority expressions declared on the element (`zeebe:assignmentDefinition`,
+  `zeebe:taskSchedule`, `zeebe:priorityDefinition`) are resolved against the
+  instance variables (FEEL or literal) at creation. While `Created` the task may
+  be assigned (`AssignUserTask`, honouring `allowOverride`), unassigned
+  (`UnassignUserTask`) and have its candidate groups/users, due/follow-up date
+  and priority changed (`UpdateUserTask`). Completion merges its variables and
+  resumes the token, exactly like `CompleteJob`. (Task listeners and their
+  transient states — `ASSIGNING`/`UPDATING`/`COMPLETING` etc. — are not modelled:
+  without listener job workers the transitions are atomic.)
 - **Job activation** mirrors Camunda 8: a worker activates available jobs of a
   type (`ActivateJobs`), locking each until `now + timeout`. A job must be
   activated before it can be completed. Locks expire — either lazily on the next

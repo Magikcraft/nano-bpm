@@ -126,6 +126,32 @@ pub struct SequenceFlow {
     pub condition: Option<Condition>,
 }
 
+/// The (raw, un-evaluated) assignment, scheduling and priority expressions
+/// declared on a `userTask` BPMN element via its Zeebe extension elements
+/// (`zeebe:assignmentDefinition`, `zeebe:taskSchedule`, `zeebe:priorityDefinition`).
+///
+/// Each value may be a literal or a FEEL expression (a string beginning with
+/// `=`). They are resolved against the instance variables when the user task is
+/// created. `candidate_groups`/`candidate_users` are either a static
+/// comma-separated list or a FEEL expression yielding a list (or comma string).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct UserTaskProps {
+    /// Raw assignee expression (`zeebe:assignmentDefinition assignee`).
+    pub assignee: Option<String>,
+    /// Raw candidate-groups expression (`zeebe:assignmentDefinition candidateGroups`).
+    pub candidate_groups: Option<String>,
+    /// Raw candidate-users expression (`zeebe:assignmentDefinition candidateUsers`).
+    pub candidate_users: Option<String>,
+    /// Raw due-date expression (`zeebe:taskSchedule dueDate`).
+    pub due_date: Option<String>,
+    /// Raw follow-up-date expression (`zeebe:taskSchedule followUpDate`).
+    pub follow_up_date: Option<String>,
+    /// Raw priority expression (`zeebe:priorityDefinition priority`); defaults to
+    /// `50` when absent or unresolvable.
+    pub priority: Option<String>,
+}
+
 /// The kind of a BPMN flow node.
 ///
 /// The set is intentionally small. New element types plug in here and gain
@@ -146,8 +172,11 @@ pub enum ElementKind {
     /// human claims and completes; the token rests until the user task is
     /// completed ([`crate::Command::CompleteUserTask`]). Unlike a service task it
     /// is not activated by a job worker — it is assigned and completed directly
-    /// through the user-task API.
-    UserTask,
+    /// through the user-task API. The fields carry the *raw* (un-evaluated)
+    /// assignment, scheduling and priority expressions declared on the BPMN
+    /// element; they are resolved against the instance variables (FEEL or literal)
+    /// when the task is created.
+    UserTask(UserTaskProps),
     /// An exclusive (XOR) gateway: takes exactly one outgoing flow, chosen by
     /// evaluating flow conditions in order (first match wins; an unconditional
     /// flow is the default). Tokens pass through independently — there is no
@@ -440,7 +469,13 @@ impl ProcessBuilder {
     /// Adds a (native) user task: on activation it creates a user task that a
     /// human claims and completes through the user-task API.
     pub fn user_task(self, id: impl Into<String>) -> Self {
-        self.add(id, ElementKind::UserTask)
+        self.add(id, ElementKind::UserTask(UserTaskProps::default()))
+    }
+
+    /// Adds a (native) user task with the given assignment/scheduling/priority
+    /// expressions (as declared on the BPMN element's Zeebe extension elements).
+    pub fn user_task_with(self, id: impl Into<String>, props: UserTaskProps) -> Self {
+        self.add(id, ElementKind::UserTask(props))
     }
 
     /// Adds a parallel (AND) gateway.

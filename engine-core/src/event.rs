@@ -152,18 +152,39 @@ pub enum Event {
     /// A user task was created for a `userTask` element; the token now rests
     /// until the task is completed. `created_at` is the logical instant it was
     /// created, carried on the event so replay reconstructs the same timestamp.
+    /// The assignment/scheduling/priority attributes are the *resolved* values
+    /// (FEEL evaluated against the instance variables, or literals) declared on
+    /// the BPMN element. `assignee` is `None` when no assignee was declared.
     UserTaskCreated {
         user_task_key: Key,
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
         created_at: u64,
+        assignee: Option<String>,
+        candidate_groups: Vec<String>,
+        candidate_users: Vec<String>,
+        due_date: Option<String>,
+        follow_up_date: Option<String>,
+        priority: i32,
     },
     /// A user task's assignee was set (or cleared, when `assignee` is `None`).
     UserTaskAssigned {
         user_task_key: Key,
         instance_key: Key,
         assignee: Option<String>,
+    },
+    /// A user task's attributes were changed via the update endpoint. Each field
+    /// is `Some` only when that attribute was part of the changeset; an empty
+    /// list or empty/`None` date resets the attribute.
+    UserTaskUpdated {
+        user_task_key: Key,
+        instance_key: Key,
+        candidate_groups: Option<Vec<String>>,
+        candidate_users: Option<Vec<String>>,
+        due_date: Option<Option<String>>,
+        follow_up_date: Option<Option<String>>,
+        priority: Option<i32>,
     },
     /// A user task was completed; the parked token resumes along the task's
     /// outgoing flow.
@@ -354,6 +375,7 @@ impl Event {
             | Event::JobRetriesUpdated { instance_key, .. }
             | Event::UserTaskCreated { instance_key, .. }
             | Event::UserTaskAssigned { instance_key, .. }
+            | Event::UserTaskUpdated { instance_key, .. }
             | Event::UserTaskCompleted { instance_key, .. }
             | Event::UserTaskCanceled { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
@@ -497,6 +519,7 @@ impl Event {
                 ..
             } => m = m.max(*user_task_key).max(*element_instance_key),
             Event::UserTaskAssigned { user_task_key, .. }
+            | Event::UserTaskUpdated { user_task_key, .. }
             | Event::UserTaskCompleted { user_task_key, .. }
             | Event::UserTaskCanceled { user_task_key, .. } => m = m.max(*user_task_key),
             _ => {}

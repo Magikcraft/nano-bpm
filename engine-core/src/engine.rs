@@ -570,7 +570,33 @@ impl Engine {
             Command::AssignUserTask {
                 user_task_key,
                 assignee,
+                allow_override,
             } => {
+                let task = self
+                    .state
+                    .user_tasks
+                    .get(&user_task_key)
+                    .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotActive { user_task_key });
+                }
+                // Mirror Camunda: when override is disallowed and the task is
+                // already assigned, reject so it must be unassigned first.
+                if !allow_override && task.assignee.is_some() {
+                    return Err(EngineError::UserTaskAlreadyAssigned { user_task_key });
+                }
+                let instance_key = task.instance_key;
+                self.emit(
+                    &mut log,
+                    Event::UserTaskAssigned {
+                        user_task_key,
+                        instance_key,
+                        assignee: Some(assignee),
+                    },
+                );
+            }
+
+            Command::UnassignUserTask { user_task_key } => {
                 let task = self
                     .state
                     .user_tasks
@@ -585,7 +611,39 @@ impl Engine {
                     Event::UserTaskAssigned {
                         user_task_key,
                         instance_key,
-                        assignee,
+                        assignee: None,
+                    },
+                );
+            }
+
+            Command::UpdateUserTask {
+                user_task_key,
+                changeset,
+            } => {
+                let task = self
+                    .state
+                    .user_tasks
+                    .get(&user_task_key)
+                    .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotActive { user_task_key });
+                }
+                let instance_key = task.instance_key;
+                // Normalise empty-string dates to "reset" (None), matching the
+                // REST contract ("Reset by providing an empty String").
+                let normalize = |d: Option<String>| -> Option<String> {
+                    d.filter(|s| !s.is_empty())
+                };
+                self.emit(
+                    &mut log,
+                    Event::UserTaskUpdated {
+                        user_task_key,
+                        instance_key,
+                        candidate_groups: changeset.candidate_groups,
+                        candidate_users: changeset.candidate_users,
+                        due_date: changeset.due_date.map(normalize),
+                        follow_up_date: changeset.follow_up_date.map(normalize),
+                        priority: changeset.priority,
                     },
                 );
             }
@@ -1549,15 +1607,37 @@ impl Engine {
                 ));
             }
             // A user task creates a user task record and parks the token; a
-            // CompleteUserTask releases it.
-            Some(ElementKind::UserTask) => {
+            // CompleteUserTask releases it. The assignment/scheduling/priority
+            // expressions declared on the element are resolved against the
+            // instance variables at creation time.
+            Some(ElementKind::UserTask(props)) => {
                 let user_task_key = self.mint_key();
+                let assignee = self
+                    .resolve_user_task_string(instance_key, props.assignee.as_deref())
+                    .filter(|s| !s.is_empty());
+                let candidate_groups =
+                    self.resolve_user_task_list(instance_key, props.candidate_groups.as_deref());
+                let candidate_users =
+                    self.resolve_user_task_list(instance_key, props.candidate_users.as_deref());
+                let due_date = self
+                    .resolve_user_task_string(instance_key, props.due_date.as_deref())
+                    .filter(|s| !s.is_empty());
+                let follow_up_date = self
+                    .resolve_user_task_string(instance_key, props.follow_up_date.as_deref())
+                    .filter(|s| !s.is_empty());
+                let priority = self.resolve_user_task_priority(instance_key, props.priority.as_deref());
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
                     element_instance_key,
                     element_id: element_id.clone(),
                     created_at: self.now,
+                    assignee,
+                    candidate_groups,
+                    candidate_users,
+                    due_date,
+                    follow_up_date,
+                    priority,
                 });
                 events.extend(self.arm_boundary_events(
                     instance_key,
@@ -2443,6 +2523,86 @@ impl Engine {
         crate::feel::eval_string(trimmed, &vars).unwrap_or_else(|_| job_type.to_string())
     }
 
+    /// Resolves a user-task string attribute (assignee, due/follow-up date)
+    /// declared on the BPMN element. A literal is returned verbatim; a FEEL
+    /// expression (leading `=`) is evaluated against the instance variables,
+    /// falling back to the literal text when it cannot be evaluated. `None` (the
+    /// attribute was not declared) resolves to `None`.
+    fn resolve_user_task_string(
+        &self,
+        instance_key: Key,
+        raw: Option<&str>,
+    ) -> Option<String> {
+        let raw = raw?;
+        let trimmed = raw.trim();
+        if !trimmed.starts_with('=') {
+            return Some(raw.to_string());
+        }
+        let vars = self.variables(instance_key);
+        Some(crate::feel::eval_string(trimmed, &vars).unwrap_or_else(|_| raw.to_string()))
+    }
+
+    /// Resolves a user-task candidate list (groups or users). A literal is a
+    /// comma-separated list. A FEEL expression (leading `=`) is evaluated against
+    /// the instance variables; a list result yields its string items, a string
+    /// result is split on commas, anything else (or a failure) yields an empty
+    /// list. `None` resolves to an empty list.
+    fn resolve_user_task_list(&self, instance_key: Key, raw: Option<&str>) -> Vec<String> {
+        let Some(raw) = raw else {
+            return Vec::new();
+        };
+        let trimmed = raw.trim();
+        let split = |s: &str| -> Vec<String> {
+            s.split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        if !trimmed.starts_with('=') {
+            return split(raw);
+        }
+        let vars = self.variables(instance_key);
+        match crate::feel::eval(trimmed, &vars) {
+            Ok(Value::List(items)) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Str(s) => Some(s),
+                    Value::Int(i) => Some(i.to_string()),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Ok(Value::Str(s)) => split(&s),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Resolves a user-task priority expression. A literal integer or a FEEL
+    /// expression yielding a number is clamped to `0..=100`; anything
+    /// unresolvable (or absent) defaults to `50`.
+    fn resolve_user_task_priority(&self, instance_key: Key, raw: Option<&str>) -> i32 {
+        const DEFAULT_PRIORITY: i32 = 50;
+        let Some(raw) = raw else {
+            return DEFAULT_PRIORITY;
+        };
+        let trimmed = raw.trim();
+        let value = if let Some(expr) = trimmed.strip_prefix('=') {
+            let vars = self.variables(instance_key);
+            match crate::feel::eval(expr, &vars) {
+                Ok(Value::Int(i)) => i as i32,
+                Ok(Value::Double(d)) => d as i32,
+                _ => return DEFAULT_PRIORITY,
+            }
+        } else {
+            match trimmed.parse::<i32>() {
+                Ok(i) => i,
+                Err(_) => return DEFAULT_PRIORITY,
+            }
+        };
+        value.clamp(0, 100)
+    }
+
     /// Resolves a variable scope key to the process instance that owns it. The
     /// key may be the process instance itself or any of its active element
     /// instances; nano keeps a single instance-level variable scope, so both map
@@ -2509,6 +2669,9 @@ pub enum EngineError {
     /// `AssignUserTask`/`CompleteUserTask` referenced a user task that is not in
     /// a state where it can be acted on (already completed or cancelled).
     UserTaskNotActive { user_task_key: Key },
+    /// `AssignUserTask` with `allow_override = false` targeted a user task that
+    /// already has an assignee; it must be unassigned first.
+    UserTaskAlreadyAssigned { user_task_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -2555,6 +2718,12 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "user task {user_task_key} is not in a state that can be acted on"
+                )
+            }
+            EngineError::UserTaskAlreadyAssigned { user_task_key } => {
+                write!(
+                    f,
+                    "user task {user_task_key} is already assigned; unassign it before assigning again"
                 )
             }
         }
@@ -3492,6 +3661,201 @@ mod tests {
             engine.apply_command(Command::complete_user_task(user_task_key)),
             Err(EngineError::UserTaskNotActive { .. })
         ));
+    }
+
+    #[test]
+    fn should_create_a_user_task_with_resolved_attributes() {
+        use crate::model::UserTaskProps;
+        // A user task declaring assignee/candidates/dates/priority, partly via
+        // FEEL expressions evaluated against the instance variables.
+        let def = ProcessBuilder::new("approval")
+            .start_event("start")
+            .user_task_with(
+                "review",
+                UserTaskProps {
+                    assignee: Some("=requester".to_string()),
+                    candidate_groups: Some("ops,finance".to_string()),
+                    candidate_users: Some("=reviewers".to_string()),
+                    due_date: Some("2025-01-01T00:00:00Z".to_string()),
+                    follow_up_date: None,
+                    priority: Some("=urgency".to_string()),
+                },
+            )
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+        let vars = HashMap::from([
+            ("requester".to_string(), Value::Str("alice".to_string())),
+            (
+                "reviewers".to_string(),
+                Value::List(vec![
+                    Value::Str("bob".to_string()),
+                    Value::Str("carol".to_string()),
+                ]),
+            ),
+            ("urgency".to_string(), Value::Int(80)),
+        ]);
+        let created = engine
+            .apply_command(Command::CreateInstance {
+                process_id: "approval".to_string(),
+                variables: vars,
+            })
+            .unwrap();
+        let user_task_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+                _ => None,
+            })
+            .expect("user task created");
+
+        let task = &engine.state().user_tasks[&user_task_key];
+        assert_eq!(task.assignee.as_deref(), Some("alice"));
+        assert_eq!(task.candidate_groups, vec!["ops", "finance"]);
+        assert_eq!(task.candidate_users, vec!["bob", "carol"]);
+        assert_eq!(task.due_date.as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(task.follow_up_date, None);
+        assert_eq!(task.priority, 80);
+    }
+
+    #[test]
+    fn should_default_user_task_priority_to_fifty() {
+        let def = ProcessBuilder::new("approval")
+            .start_event("start")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("approval"))
+            .unwrap();
+        let user_task_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(engine.state().user_tasks[&user_task_key].priority, 50);
+    }
+
+    #[test]
+    fn should_reject_reassigning_an_assigned_task_without_override() {
+        let def = ProcessBuilder::new("approval")
+            .start_event("start")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("approval"))
+            .unwrap();
+        let user_task_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+                _ => None,
+            })
+            .unwrap();
+
+        // First assignment succeeds.
+        engine
+            .apply_command(Command::assign_user_task(user_task_key, "alice"))
+            .unwrap();
+        // A non-override reassignment is rejected while assigned.
+        assert!(matches!(
+            engine.apply_command(Command::AssignUserTask {
+                user_task_key,
+                assignee: "bob".to_string(),
+                allow_override: false,
+            }),
+            Err(EngineError::UserTaskAlreadyAssigned { .. })
+        ));
+        // Unassigning then assigning again works.
+        engine
+            .apply_command(Command::unassign_user_task(user_task_key))
+            .unwrap();
+        assert_eq!(engine.state().user_tasks[&user_task_key].assignee, None);
+        engine
+            .apply_command(Command::AssignUserTask {
+                user_task_key,
+                assignee: "bob".to_string(),
+                allow_override: false,
+            })
+            .unwrap();
+        assert_eq!(
+            engine.state().user_tasks[&user_task_key].assignee.as_deref(),
+            Some("bob")
+        );
+    }
+
+    #[test]
+    fn should_update_user_task_attributes_via_changeset() {
+        use crate::UserTaskChangeset;
+        let def = ProcessBuilder::new("approval")
+            .start_event("start")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("approval"))
+            .unwrap();
+        let user_task_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+                _ => None,
+            })
+            .unwrap();
+
+        engine
+            .apply_command(Command::update_user_task(
+                user_task_key,
+                UserTaskChangeset {
+                    candidate_groups: Some(vec!["ops".to_string()]),
+                    candidate_users: None,
+                    due_date: Some(Some("2025-06-01T00:00:00Z".to_string())),
+                    follow_up_date: None,
+                    priority: Some(20),
+                },
+            ))
+            .unwrap();
+
+        let task = &engine.state().user_tasks[&user_task_key];
+        assert_eq!(task.candidate_groups, vec!["ops"]);
+        assert_eq!(task.due_date.as_deref(), Some("2025-06-01T00:00:00Z"));
+        assert_eq!(task.priority, 20);
+
+        // Resetting the due date with an empty string clears it.
+        engine
+            .apply_command(Command::update_user_task(
+                user_task_key,
+                UserTaskChangeset {
+                    due_date: Some(Some(String::new())),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        assert_eq!(engine.state().user_tasks[&user_task_key].due_date, None);
     }
 
     #[test]

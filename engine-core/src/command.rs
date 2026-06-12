@@ -31,11 +31,25 @@ pub enum Command {
         job_key: Key,
         variables: HashMap<String, Value>,
     },
-    /// Assign (or, with `assignee: None`, unassign) a user task. The task must be
-    /// in the `Created` state.
+    /// Assign a user task to `assignee`. The task must be in the `Created` state.
+    /// When `allow_override` is `false` and the task already has an assignee, the
+    /// command is rejected (the task must be unassigned first) — this mirrors
+    /// Camunda's group-queue race-prevention semantics.
     AssignUserTask {
         user_task_key: Key,
-        assignee: Option<String>,
+        assignee: String,
+        allow_override: bool,
+    },
+    /// Clear a user task's assignee. The task must be in the `Created` state.
+    UnassignUserTask {
+        user_task_key: Key,
+    },
+    /// Update a user task's attributes (candidate groups/users, due/follow-up
+    /// date, priority). The task must be in the `Created` state. Each field of
+    /// the changeset is `Some` only when that attribute is being changed.
+    UpdateUserTask {
+        user_task_key: Key,
+        changeset: UserTaskChangeset,
     },
     /// Complete a user task, optionally merging `variables` into the instance
     /// before the parked token resumes. The task must be in the `Created` state.
@@ -120,6 +134,34 @@ pub enum Command {
     CancelInstance { instance_key: Key },
 }
 
+/// The attributes that an [`Command::UpdateUserTask`] may change. Each field is
+/// `Some` only when the caller is changing that attribute; `None` leaves it
+/// untouched. An empty list or an empty/`None` date *resets* the attribute.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserTaskChangeset {
+    /// New candidate groups (empty list clears them).
+    pub candidate_groups: Option<Vec<String>>,
+    /// New candidate users (empty list clears them).
+    pub candidate_users: Option<Vec<String>>,
+    /// New due date; `Some(None)` (or `Some("")`-normalised to `None`) clears it.
+    pub due_date: Option<Option<String>>,
+    /// New follow-up date; `Some(None)` clears it.
+    pub follow_up_date: Option<Option<String>>,
+    /// New priority (0..=100).
+    pub priority: Option<i32>,
+}
+
+impl UserTaskChangeset {
+    /// Returns `true` when the changeset would not change any attribute.
+    pub fn is_empty(&self) -> bool {
+        self.candidate_groups.is_none()
+            && self.candidate_users.is_none()
+            && self.due_date.is_none()
+            && self.follow_up_date.is_none()
+            && self.priority.is_none()
+    }
+}
+
 impl Command {
     /// Convenience constructor for a `CreateInstance` with no variables.
     pub fn create_instance(process_id: impl Into<String>) -> Self {
@@ -153,11 +195,25 @@ impl Command {
         Command::CompleteJob { job_key, variables }
     }
 
-    /// Convenience constructor for an `AssignUserTask`.
+    /// Convenience constructor for an `AssignUserTask` (allowing override).
     pub fn assign_user_task(user_task_key: Key, assignee: impl Into<String>) -> Self {
         Command::AssignUserTask {
             user_task_key,
-            assignee: Some(assignee.into()),
+            assignee: assignee.into(),
+            allow_override: true,
+        }
+    }
+
+    /// Convenience constructor for an `UnassignUserTask`.
+    pub fn unassign_user_task(user_task_key: Key) -> Self {
+        Command::UnassignUserTask { user_task_key }
+    }
+
+    /// Convenience constructor for an `UpdateUserTask`.
+    pub fn update_user_task(user_task_key: Key, changeset: UserTaskChangeset) -> Self {
+        Command::UpdateUserTask {
+            user_task_key,
+            changeset,
         }
     }
 

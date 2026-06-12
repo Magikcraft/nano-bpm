@@ -30,7 +30,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped whenever the schema or projection changes; a stored database with a
 /// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
@@ -82,6 +82,11 @@ CREATE TABLE user_tasks (
     element_id             TEXT NOT NULL,
     state                  INTEGER NOT NULL,
     assignee               TEXT,
+    candidate_groups       TEXT NOT NULL DEFAULT '[]',
+    candidate_users        TEXT NOT NULL DEFAULT '[]',
+    due_date               TEXT,
+    follow_up_date         TEXT,
+    priority               INTEGER NOT NULL DEFAULT 50,
     created_at_ms          INTEGER NOT NULL,
     process_definition_id  TEXT NOT NULL,
     process_definition_key TEXT NOT NULL,
@@ -216,6 +221,11 @@ pub struct UserTaskRow {
     pub element_id: String,
     pub state: UserTaskState,
     pub assignee: Option<String>,
+    pub candidate_groups: Vec<String>,
+    pub candidate_users: Vec<String>,
+    pub due_date: Option<String>,
+    pub follow_up_date: Option<String>,
+    pub priority: i32,
     pub created_at_ms: u64,
     pub process_definition_id: String,
     pub process_definition_key: String,
@@ -420,7 +430,8 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, state, \
-                 assignee, created_at_ms, process_definition_id, process_definition_key, \
+                 assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+                 priority, created_at_ms, process_definition_id, process_definition_key, \
                  process_definition_version \
                  FROM user_tasks",
             )
@@ -545,6 +556,8 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
 }
 
 fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
+    let candidate_groups: String = r.get(6)?;
+    let candidate_users: String = r.get(7)?;
     Ok(UserTaskRow {
         key: r.get::<_, i64>(0)? as Key,
         instance_key: r.get::<_, i64>(1)? as Key,
@@ -552,10 +565,15 @@ fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
         element_id: r.get(3)?,
         state: user_task_state_from(r.get(4)?),
         assignee: r.get(5)?,
-        created_at_ms: r.get::<_, i64>(6)? as u64,
-        process_definition_id: r.get(7)?,
-        process_definition_key: r.get(8)?,
-        process_definition_version: r.get(9)?,
+        candidate_groups: serde_json::from_str(&candidate_groups).unwrap_or_default(),
+        candidate_users: serde_json::from_str(&candidate_users).unwrap_or_default(),
+        due_date: r.get(8)?,
+        follow_up_date: r.get(9)?,
+        priority: r.get(10)?,
+        created_at_ms: r.get::<_, i64>(11)? as u64,
+        process_definition_id: r.get(12)?,
+        process_definition_key: r.get(13)?,
+        process_definition_version: r.get(14)?,
     })
 }
 
@@ -850,14 +868,23 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             element_instance_key,
             element_id,
             created_at,
+            assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
             let version = instance_version(tx, *instance_key);
+            let groups = serde_json::to_string(candidate_groups).unwrap_or_else(|_| "[]".into());
+            let users = serde_json::to_string(candidate_users).unwrap_or_else(|_| "[]".into());
             tx.execute(
                 "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
-                 state, assignee, created_at_ms, process_definition_id, process_definition_key, \
+                 state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+                 priority, created_at_ms, process_definition_id, process_definition_key, \
                  process_definition_version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state",
                 params![
                     *user_task_key as i64,
@@ -865,6 +892,12 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     *element_instance_key as i64,
                     element_id,
                     user_task_state_code(UserTaskState::Created),
+                    assignee,
+                    groups,
+                    users,
+                    due_date,
+                    follow_up_date,
+                    *priority,
                     *created_at as i64,
                     def_id,
                     def_key,
@@ -882,6 +915,49 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 "UPDATE user_tasks SET assignee = ?2 WHERE key = ?1",
                 params![*user_task_key as i64, assignee],
             )?;
+        }
+
+        Event::UserTaskUpdated {
+            user_task_key,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+            ..
+        } => {
+            if let Some(groups) = candidate_groups {
+                let json = serde_json::to_string(groups).unwrap_or_else(|_| "[]".into());
+                tx.execute(
+                    "UPDATE user_tasks SET candidate_groups = ?2 WHERE key = ?1",
+                    params![*user_task_key as i64, json],
+                )?;
+            }
+            if let Some(users) = candidate_users {
+                let json = serde_json::to_string(users).unwrap_or_else(|_| "[]".into());
+                tx.execute(
+                    "UPDATE user_tasks SET candidate_users = ?2 WHERE key = ?1",
+                    params![*user_task_key as i64, json],
+                )?;
+            }
+            if let Some(due) = due_date {
+                tx.execute(
+                    "UPDATE user_tasks SET due_date = ?2 WHERE key = ?1",
+                    params![*user_task_key as i64, due],
+                )?;
+            }
+            if let Some(follow_up) = follow_up_date {
+                tx.execute(
+                    "UPDATE user_tasks SET follow_up_date = ?2 WHERE key = ?1",
+                    params![*user_task_key as i64, follow_up],
+                )?;
+            }
+            if let Some(p) = priority {
+                tx.execute(
+                    "UPDATE user_tasks SET priority = ?2 WHERE key = ?1",
+                    params![*user_task_key as i64, p],
+                )?;
+            }
         }
 
         Event::UserTaskCompleted { user_task_key, .. } => {

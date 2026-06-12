@@ -81,13 +81,13 @@ pub mod feel;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
-pub use command::Command;
+pub use command::{Command, UserTaskChangeset};
 pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
     BuildError, Condition, Element, ElementId, ElementKind, ProcessBuilder, ProcessDefinition,
-    SequenceFlow, Value,
+    SequenceFlow, UserTaskProps, Value,
 };
 pub use state::{
     DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind, IncidentState, Job, JobState,

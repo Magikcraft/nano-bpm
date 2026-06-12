@@ -1352,7 +1352,17 @@ impl ServerImpl {
         };
 
         let assignee = body.assignee.clone().unwrap_or_default();
-        let command = Command::assign_user_task(user_task_key, assignee);
+        // Per the v2 contract, assignment overrides an existing assignee unless
+        // the caller explicitly opts out with allowOverride = false.
+        let allow_override = match &body.allow_override {
+            Some(types::Nullable::Present(v)) => *v,
+            _ => true,
+        };
+        let command = Command::AssignUserTask {
+            user_task_key,
+            assignee,
+            allow_override,
+        };
         let result = {
             let mut engine = self.journal.write().expect("engine lock poisoned");
             engine.apply_command_at(command, now_millis())
@@ -1376,6 +1386,16 @@ impl ServerImpl {
                     "User task not active",
                     409,
                     format!("User task {user_task_key} is not active and cannot be assigned."),
+                )),
+            ),
+            Err(EngineError::UserTaskAlreadyAssigned { user_task_key }) => Ok(
+                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "User task already assigned",
+                    409,
+                    format!(
+                        "User task {user_task_key} is already assigned; unassign it before \
+                         assigning again."
+                    ),
                 )),
             ),
             Err(e) => Ok(
@@ -1449,6 +1469,205 @@ impl ServerImpl {
                     "User task not active",
                     409,
                     format!("User task {user_task_key} is not active and cannot be completed."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
+    /// Returns a single user task from the read model by key.
+    async fn get_user_task_impl(
+        &self,
+        path_params: &models::GetUserTaskPathParams,
+    ) -> Result<apis::user_task::GetUserTaskResponse, ()> {
+        use apis::user_task::GetUserTaskResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!(
+                            "User task key '{}' is not a valid key.",
+                            path_params.user_task_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        match self
+            .store
+            .user_tasks()
+            .iter()
+            .find(|t| t.key == user_task_key)
+        {
+            Some(task) => Ok(Resp::Status200_TheUserTaskIsSuccessfullyReturned(
+                user_task_result(task),
+            )),
+            None => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem(
+                    "User task not found",
+                    404,
+                    format!("No user task with key {user_task_key}."),
+                ),
+            )),
+        }
+    }
+
+    /// Clears a user task's assignee.
+    async fn unassign_user_task_impl(
+        &self,
+        path_params: &models::UnassignUserTaskPathParams,
+    ) -> Result<apis::user_task::UnassignUserTaskResponse, ()> {
+        use apis::user_task::UnassignUserTaskResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!(
+                            "User task key '{}' is not a valid key.",
+                            path_params.user_task_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        let command = Command::unassign_user_task(user_task_key);
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(command, now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheUserTaskWasUnassignedSuccessfully)
+            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => {
+                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    ),
+                ))
+            }
+            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "User task not active",
+                    409,
+                    format!("User task {user_task_key} is not active and cannot be unassigned."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
+    /// Updates a user task's attributes (candidate groups/users, due/follow-up
+    /// date, priority) from the request changeset.
+    async fn update_user_task_impl(
+        &self,
+        path_params: &models::UpdateUserTaskPathParams,
+        body: &Option<models::UserTaskUpdateRequest>,
+    ) -> Result<apis::user_task::UpdateUserTaskResponse, ()> {
+        use apis::user_task::UpdateUserTaskResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!(
+                            "User task key '{}' is not a valid key.",
+                            path_params.user_task_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        // Translate the REST changeset into the engine changeset. A `Present`
+        // value sets the attribute; an explicit `Null` resets it (empty list /
+        // cleared date); an absent field leaves it unchanged.
+        let changeset = body
+            .as_ref()
+            .and_then(|b| b.changeset.as_ref())
+            .and_then(|cs| match cs {
+                types::Nullable::Present(cs) => Some(cs),
+                types::Nullable::Null => None,
+            });
+
+        let to_list = |n: &Option<types::Nullable<Vec<String>>>| match n {
+            Some(types::Nullable::Present(v)) => Some(v.clone()),
+            Some(types::Nullable::Null) => Some(Vec::new()),
+            None => None,
+        };
+        let to_date = |n: &Option<types::Nullable<chrono::DateTime<chrono::Utc>>>| match n {
+            Some(types::Nullable::Present(dt)) => Some(Some(dt.to_rfc3339())),
+            Some(types::Nullable::Null) => Some(None),
+            None => None,
+        };
+        let to_priority = |n: &Option<types::Nullable<u8>>| match n {
+            Some(types::Nullable::Present(p)) => Some(*p as i32),
+            _ => None,
+        };
+
+        let engine_changeset = match changeset {
+            Some(cs) => nanobpmn_engine_core::UserTaskChangeset {
+                candidate_groups: to_list(&cs.candidate_groups),
+                candidate_users: to_list(&cs.candidate_users),
+                due_date: to_date(&cs.due_date),
+                follow_up_date: to_date(&cs.follow_up_date),
+                priority: to_priority(&cs.priority),
+            },
+            None => nanobpmn_engine_core::UserTaskChangeset::default(),
+        };
+
+        let command = Command::update_user_task(user_task_key, engine_changeset);
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(command, now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheUserTaskWasUpdatedSuccessfully)
+            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => {
+                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    ),
+                ))
+            }
+            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "User task not active",
+                    409,
+                    format!("User task {user_task_key} is not active and cannot be updated."),
                 )),
             ),
             Err(e) => Ok(
@@ -2147,7 +2366,14 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
             .unwrap_or_else(chrono::Utc::now);
 
-    models::UserTaskResult::new(
+    let parse_date = |d: &Option<String>| -> types::Nullable<chrono::DateTime<chrono::Utc>> {
+        match d.as_deref().map(|s| s.parse::<chrono::DateTime<chrono::Utc>>()) {
+            Some(Ok(dt)) => types::Nullable::Present(dt),
+            _ => types::Nullable::Null,
+        }
+    };
+
+    let mut result = models::UserTaskResult::new(
         types::Nullable::Null,
         user_task_state_enum(task.state),
         match &task.assignee {
@@ -2155,13 +2381,13 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
             None => types::Nullable::Null,
         },
         task.element_id.clone(),
-        Vec::new(),
-        Vec::new(),
+        task.candidate_groups.clone(),
+        task.candidate_users.clone(),
         task.process_definition_id.clone(),
         creation_date,
         types::Nullable::Null,
-        types::Nullable::Null,
-        types::Nullable::Null,
+        parse_date(&task.follow_up_date),
+        parse_date(&task.due_date),
         "<default>".to_string(),
         types::Nullable::Null,
         task.process_definition_version,
@@ -2174,7 +2400,9 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
         types::Nullable::Null,
         types::Nullable::Null,
         Vec::new(),
-    )
+    );
+    result.priority = task.priority.clamp(0, 100) as u8;
+    result
 }
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,

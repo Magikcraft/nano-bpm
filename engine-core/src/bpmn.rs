@@ -37,6 +37,11 @@
 //!   evaluated against the instance variables at job-creation time via
 //!   [`crate::feel`]; an expression that cannot be evaluated falls back to the
 //!   literal text (no incident is raised).
+//! * A user task's assignment/scheduling/priority attributes come from nested
+//!   `zeebe:assignmentDefinition` (`assignee`, `candidateGroups`,
+//!   `candidateUsers`), `zeebe:taskSchedule` (`dueDate`, `followUpDate`) and
+//!   `zeebe:priorityDefinition` (`priority`). Each may be a literal or a FEEL
+//!   expression resolved against the instance variables when the task is created.
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is stored verbatim and evaluated by
 //!   [`crate::feel`] at the exclusive gateway (comparisons, arithmetic, boolean
@@ -124,6 +129,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut current: Option<ProcessAcc> = None;
     // Index of the service task currently being read (to attach its job type).
     let mut cur_service_task: Option<usize> = None;
+    // Index of the user task currently being read (to attach assignment,
+    // scheduling and priority expressions from its Zeebe extension elements).
+    let mut cur_user_task: Option<usize> = None;
     // Index of the sequence flow currently being read (to attach a condition).
     let mut cur_flow: Option<usize> = None;
     let mut condition_text: Option<String> = None;
@@ -219,7 +227,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "userTask" => {
-                                acc.add_node(attrs, NodeKind::User);
+                                let idx = acc.add_node(attrs, NodeKind::User);
+                                if !self_closing {
+                                    cur_user_task = idx;
+                                }
                             }
                             "subProcess" => {
                                 // An embedded sub-process: register it, then push
@@ -281,6 +292,35 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     acc.nodes[idx].job_type = Some(t.to_string());
                                 }
                             }
+                            "assignmentDefinition" => {
+                                // zeebe:assignmentDefinition inside a user task.
+                                if let Some(idx) = cur_user_task {
+                                    let props = &mut acc.nodes[idx].user_task;
+                                    props.assignee =
+                                        attr(attrs, "assignee").map(str::to_string);
+                                    props.candidate_groups =
+                                        attr(attrs, "candidateGroups").map(str::to_string);
+                                    props.candidate_users =
+                                        attr(attrs, "candidateUsers").map(str::to_string);
+                                }
+                            }
+                            "taskSchedule" => {
+                                // zeebe:taskSchedule inside a user task.
+                                if let Some(idx) = cur_user_task {
+                                    let props = &mut acc.nodes[idx].user_task;
+                                    props.due_date =
+                                        attr(attrs, "dueDate").map(str::to_string);
+                                    props.follow_up_date =
+                                        attr(attrs, "followUpDate").map(str::to_string);
+                                }
+                            }
+                            "priorityDefinition" => {
+                                // zeebe:priorityDefinition inside a user task.
+                                if let Some(idx) = cur_user_task {
+                                    acc.nodes[idx].user_task.priority =
+                                        attr(attrs, "priority").map(str::to_string);
+                                }
+                            }
                             "sequenceFlow" => {
                                 let idx = acc.add_flow(attrs);
                                 if !self_closing {
@@ -335,8 +375,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     duration_text = None;
                     cur_start = None;
                     cycle_text = None;
+                    cur_user_task = None;
                 }
                 "serviceTask" => cur_service_task = None,
+                "userTask" => cur_user_task = None,
                 "subProcess" => {
                     if let Some(acc) = current.as_mut() {
                         acc.scope_stack.pop();
@@ -433,6 +475,9 @@ struct NodeAcc {
     /// Id of the embedded sub-process containing this node, or `None` at the
     /// process level. Set from the scope stack as the node is scanned.
     parent: Option<String>,
+    /// For user tasks: the raw assignment/scheduling/priority expressions parsed
+    /// from the Zeebe extension elements.
+    user_task: crate::model::UserTaskProps,
 }
 
 #[derive(Clone, Copy)]
@@ -511,6 +556,7 @@ impl ProcessAcc {
             message_ref: None,
             timer_repeating: None,
             parent: self.scope_stack.last().cloned(),
+            user_task: crate::model::UserTaskProps::default(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -582,7 +628,7 @@ impl ProcessAcc {
                     let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
                     builder.service_task(node.id, job_type)
                 }
-                NodeKind::User => builder.user_task(node.id),
+                NodeKind::User => builder.user_task_with(node.id, node.user_task),
                 NodeKind::IntermediateCatch => {
                     // A messageRef makes it a message catch; otherwise it is a
                     // timer catch carrying a (possibly zero) duration.
@@ -1104,9 +1150,52 @@ mod tests {
 
         // then: the user task is recognised and its sequence flows resolve (a
         // regression guard against the "unknown target element" parse error).
-        assert_eq!(def.element("review").unwrap().kind, ElementKind::UserTask);
+        assert!(matches!(
+            def.element("review").unwrap().kind,
+            ElementKind::UserTask(_)
+        ));
         assert_eq!(def.element("s").unwrap().outgoing[0].to, "review");
         assert_eq!(def.element("review").unwrap().outgoing[0].to, "e");
+    }
+
+    #[test]
+    fn should_parse_user_task_assignment_schedule_and_priority() {
+        // given: a user task carrying assignment/schedule/priority extension
+        // elements, as the Camunda modeler emits them.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:assignmentDefinition assignee="=requester"
+                      candidateGroups="ops,finance" candidateUsers="=reviewers" />
+                  <zeebe:taskSchedule dueDate="2025-01-01T00:00:00Z"
+                      followUpDate="=followUp" />
+                  <zeebe:priorityDefinition priority="80" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the raw expressions are captured on the user-task props.
+        let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.assignee.as_deref(), Some("=requester"));
+        assert_eq!(props.candidate_groups.as_deref(), Some("ops,finance"));
+        assert_eq!(props.candidate_users.as_deref(), Some("=reviewers"));
+        assert_eq!(props.due_date.as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert_eq!(props.follow_up_date.as_deref(), Some("=followUp"));
+        assert_eq!(props.priority.as_deref(), Some("80"));
     }
 
     #[test]

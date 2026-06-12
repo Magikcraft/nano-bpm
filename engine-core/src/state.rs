@@ -102,6 +102,16 @@ pub struct UserTask {
     pub state: UserTaskState,
     /// The currently assigned user, if any.
     pub assignee: Option<String>,
+    /// Candidate groups that may claim the task.
+    pub candidate_groups: Vec<String>,
+    /// Candidate users that may claim the task.
+    pub candidate_users: Vec<String>,
+    /// The due date (an ISO-8601 string), if set.
+    pub due_date: Option<String>,
+    /// The follow-up date (an ISO-8601 string), if set.
+    pub follow_up_date: Option<String>,
+    /// The task priority (0..=100); defaults to 50.
+    pub priority: i32,
     /// The logical instant the task was created (the `now` carried on the
     /// activating command), in milliseconds since the Unix epoch.
     pub created_at: u64,
@@ -639,6 +649,12 @@ pub fn apply(state: &mut State, event: &Event) {
             element_instance_key,
             element_id,
             created_at,
+            assignee,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
         } => {
             state.user_tasks.insert(
                 *user_task_key,
@@ -648,7 +664,12 @@ pub fn apply(state: &mut State, event: &Event) {
                     element_instance_key: *element_instance_key,
                     element_id: element_id.clone(),
                     state: UserTaskState::Created,
-                    assignee: None,
+                    assignee: assignee.clone(),
+                    candidate_groups: candidate_groups.clone(),
+                    candidate_users: candidate_users.clone(),
+                    due_date: due_date.clone(),
+                    follow_up_date: follow_up_date.clone(),
+                    priority: *priority,
                     created_at: *created_at,
                 },
             );
@@ -661,6 +682,34 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(task) = state.user_tasks.get_mut(user_task_key) {
                 task.assignee = assignee.clone();
+            }
+        }
+
+        Event::UserTaskUpdated {
+            user_task_key,
+            candidate_groups,
+            candidate_users,
+            due_date,
+            follow_up_date,
+            priority,
+            ..
+        } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                if let Some(groups) = candidate_groups {
+                    task.candidate_groups = groups.clone();
+                }
+                if let Some(users) = candidate_users {
+                    task.candidate_users = users.clone();
+                }
+                if let Some(due) = due_date {
+                    task.due_date = due.clone();
+                }
+                if let Some(follow_up) = follow_up_date {
+                    task.follow_up_date = follow_up.clone();
+                }
+                if let Some(p) = priority {
+                    task.priority = *p;
+                }
             }
         }
 
