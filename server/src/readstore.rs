@@ -24,13 +24,13 @@ use std::sync::Mutex;
 
 use nanobpmn_engine_core::{
     DEFAULT_JOB_RETRIES, Event, IncidentKind, IncidentState, JobState, Key, ProcessInstanceState,
-    Value,
+    UserTaskState, Value,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped whenever the schema or projection changes; a stored database with a
 /// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
@@ -75,6 +75,18 @@ CREATE TABLE incidents (
     process_definition_key TEXT NOT NULL
 );
 CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+CREATE TABLE user_tasks (
+    key                    INTEGER PRIMARY KEY,
+    instance_key           INTEGER NOT NULL,
+    element_instance_key   INTEGER NOT NULL,
+    element_id             TEXT NOT NULL,
+    state                  INTEGER NOT NULL,
+    assignee               TEXT,
+    created_at_ms          INTEGER NOT NULL,
+    process_definition_id  TEXT NOT NULL,
+    process_definition_key TEXT NOT NULL,
+    process_definition_version INTEGER NOT NULL
+);
 CREATE TABLE variables (
     key                    INTEGER PRIMARY KEY AUTOINCREMENT,
     instance_key           INTEGER NOT NULL,
@@ -122,6 +134,21 @@ fn job_state_from(code: i64) -> JobState {
         4 => JobState::Completed,
         5 => JobState::Canceled,
         _ => JobState::Created,
+    }
+}
+
+fn user_task_state_code(s: UserTaskState) -> i64 {
+    match s {
+        UserTaskState::Created => 0,
+        UserTaskState::Completed => 1,
+        UserTaskState::Canceled => 2,
+    }
+}
+fn user_task_state_from(code: i64) -> UserTaskState {
+    match code {
+        1 => UserTaskState::Completed,
+        2 => UserTaskState::Canceled,
+        _ => UserTaskState::Created,
     }
 }
 
@@ -180,6 +207,19 @@ pub struct JobRow {
     pub deadline_ms: Option<u64>,
     pub process_definition_id: String,
     pub process_definition_key: String,
+}
+
+pub struct UserTaskRow {
+    pub key: Key,
+    pub instance_key: Key,
+    pub element_instance_key: Key,
+    pub element_id: String,
+    pub state: UserTaskState,
+    pub assignee: Option<String>,
+    pub created_at_ms: u64,
+    pub process_definition_id: String,
+    pub process_definition_key: String,
+    pub process_definition_version: i32,
 }
 
 pub struct IncidentRow {
@@ -260,6 +300,7 @@ impl ReadStore {
              DROP TABLE IF EXISTS process_instances;
              DROP TABLE IF EXISTS jobs;
              DROP TABLE IF EXISTS incidents;
+             DROP TABLE IF EXISTS user_tasks;
              DROP TABLE IF EXISTS variables;
              DROP TABLE IF EXISTS meta;",
         )?;
@@ -300,6 +341,7 @@ impl ReadStore {
                  DROP TABLE IF EXISTS process_instances;
                  DROP TABLE IF EXISTS jobs;
                  DROP TABLE IF EXISTS incidents;
+             DROP TABLE IF EXISTS user_tasks;
                  DROP TABLE IF EXISTS variables;
                  DROP TABLE IF EXISTS meta;",
             )?;
@@ -370,6 +412,20 @@ impl ReadStore {
             )
             .expect("prepare jobs");
         let rows = stmt.query_map([], map_job).expect("query jobs");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    pub fn user_tasks(&self) -> Vec<UserTaskRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, instance_key, element_instance_key, element_id, state, \
+                 assignee, created_at_ms, process_definition_id, process_definition_key, \
+                 process_definition_version \
+                 FROM user_tasks",
+            )
+            .expect("prepare user_tasks");
+        let rows = stmt.query_map([], map_user_task).expect("query user_tasks");
         rows.filter_map(Result::ok).collect()
     }
 
@@ -488,6 +544,21 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
     })
 }
 
+fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
+    Ok(UserTaskRow {
+        key: r.get::<_, i64>(0)? as Key,
+        instance_key: r.get::<_, i64>(1)? as Key,
+        element_instance_key: r.get::<_, i64>(2)? as Key,
+        element_id: r.get(3)?,
+        state: user_task_state_from(r.get(4)?),
+        assignee: r.get(5)?,
+        created_at_ms: r.get::<_, i64>(6)? as u64,
+        process_definition_id: r.get(7)?,
+        process_definition_key: r.get(8)?,
+        process_definition_version: r.get(9)?,
+    })
+}
+
 fn map_incident(r: &rusqlite::Row) -> rusqlite::Result<IncidentRow> {
     Ok(IncidentRow {
         key: r.get::<_, i64>(0)? as Key,
@@ -565,6 +636,20 @@ fn instance_def(tx: &rusqlite::Transaction, instance_key: Key) -> (String, Strin
     .ok()
     .flatten()
     .unwrap_or_default()
+}
+
+/// The deployed version of the definition behind an instance (defaults to 1
+/// when the instance row is not yet present).
+fn instance_version(tx: &rusqlite::Transaction, instance_key: Key) -> i32 {
+    tx.query_row(
+        "SELECT version FROM process_instances WHERE key = ?1",
+        params![instance_key as i64],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(1)
 }
 
 /// Applies a single event to the read model. Only events that surface in a
@@ -756,6 +841,66 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             tx.execute(
                 "UPDATE jobs SET retries = ?2 WHERE key = ?1",
                 params![*job_key as i64, retries],
+            )?;
+        }
+
+        Event::UserTaskCreated {
+            user_task_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            created_at,
+        } => {
+            let (def_id, def_key) = instance_def(tx, *instance_key);
+            let version = instance_version(tx, *instance_key);
+            tx.execute(
+                "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
+                 state, assignee, created_at_ms, process_definition_id, process_definition_key, \
+                 process_definition_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9) \
+                 ON CONFLICT(key) DO UPDATE SET state = excluded.state",
+                params![
+                    *user_task_key as i64,
+                    *instance_key as i64,
+                    *element_instance_key as i64,
+                    element_id,
+                    user_task_state_code(UserTaskState::Created),
+                    *created_at as i64,
+                    def_id,
+                    def_key,
+                    version,
+                ],
+            )?;
+        }
+
+        Event::UserTaskAssigned {
+            user_task_key,
+            assignee,
+            ..
+        } => {
+            tx.execute(
+                "UPDATE user_tasks SET assignee = ?2 WHERE key = ?1",
+                params![*user_task_key as i64, assignee],
+            )?;
+        }
+
+        Event::UserTaskCompleted { user_task_key, .. } => {
+            tx.execute(
+                "UPDATE user_tasks SET state = ?2 WHERE key = ?1",
+                params![
+                    *user_task_key as i64,
+                    user_task_state_code(UserTaskState::Completed)
+                ],
+            )?;
+        }
+
+        Event::UserTaskCanceled { user_task_key, .. } => {
+            tx.execute(
+                "UPDATE user_tasks SET state = ?2 WHERE key = ?1",
+                params![
+                    *user_task_key as i64,
+                    user_task_state_code(UserTaskState::Canceled)
+                ],
             )?;
         }
 

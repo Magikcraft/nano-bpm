@@ -142,6 +142,12 @@ pub enum ElementKind {
     /// A service task. On activation it creates a job of `job_type` and the token
     /// rests until the job is completed.
     ServiceTask { job_type: String },
+    /// A (native/Zeebe) user task. On activation it creates a user task that a
+    /// human claims and completes; the token rests until the user task is
+    /// completed ([`crate::Command::CompleteUserTask`]). Unlike a service task it
+    /// is not activated by a job worker — it is assigned and completed directly
+    /// through the user-task API.
+    UserTask,
     /// An exclusive (XOR) gateway: takes exactly one outgoing flow, chosen by
     /// evaluating flow conditions in order (first match wins; an unconditional
     /// flow is the default). Tokens pass through independently — there is no
@@ -429,6 +435,12 @@ impl ProcessBuilder {
     /// Adds an exclusive (XOR) gateway.
     pub fn exclusive_gateway(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::ExclusiveGateway)
+    }
+
+    /// Adds a (native) user task: on activation it creates a user task that a
+    /// human claims and completes through the user-task API.
+    pub fn user_task(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::UserTask)
     }
 
     /// Adds a parallel (AND) gateway.

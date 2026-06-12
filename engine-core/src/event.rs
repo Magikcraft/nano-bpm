@@ -141,13 +141,40 @@ pub enum Event {
         error_code: String,
     },
     /// A job was completed.
-    JobCompleted { job_key: Key, instance_key: Key },
-    /// A job's remaining retries were updated (e.g. by an operator recovering a
+    JobCompleted { job_key: Key, instance_key: Key },    /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {
         job_key: Key,
         instance_key: Key,
         retries: i32,
+    },
+
+    /// A user task was created for a `userTask` element; the token now rests
+    /// until the task is completed. `created_at` is the logical instant it was
+    /// created, carried on the event so replay reconstructs the same timestamp.
+    UserTaskCreated {
+        user_task_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        created_at: u64,
+    },
+    /// A user task's assignee was set (or cleared, when `assignee` is `None`).
+    UserTaskAssigned {
+        user_task_key: Key,
+        instance_key: Key,
+        assignee: Option<String>,
+    },
+    /// A user task was completed; the parked token resumes along the task's
+    /// outgoing flow.
+    UserTaskCompleted {
+        user_task_key: Key,
+        instance_key: Key,
+    },
+    /// A user task was cancelled because its activity/instance was terminated.
+    UserTaskCanceled {
+        user_task_key: Key,
+        instance_key: Key,
     },
 
     /// An incident was raised (e.g. an exclusive gateway found no matching flow,
@@ -325,6 +352,10 @@ impl Event {
             | Event::JobErrorThrown { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
             | Event::JobRetriesUpdated { instance_key, .. }
+            | Event::UserTaskCreated { instance_key, .. }
+            | Event::UserTaskAssigned { instance_key, .. }
+            | Event::UserTaskCompleted { instance_key, .. }
+            | Event::UserTaskCanceled { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
             | Event::IncidentResolved { instance_key, .. }
             | Event::TimerCreated { instance_key, .. }
@@ -460,6 +491,14 @@ impl Event {
                 ..
             } => m = m.max(*timer_key).max(*process_definition_key),
             Event::ProcessStartTimerFired { timer_key, .. } => m = m.max(*timer_key),
+            Event::UserTaskCreated {
+                user_task_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*user_task_key).max(*element_instance_key),
+            Event::UserTaskAssigned { user_task_key, .. }
+            | Event::UserTaskCompleted { user_task_key, .. }
+            | Event::UserTaskCanceled { user_task_key, .. } => m = m.max(*user_task_key),
             _ => {}
         }
         m

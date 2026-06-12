@@ -31,6 +31,18 @@ pub enum Command {
         job_key: Key,
         variables: HashMap<String, Value>,
     },
+    /// Assign (or, with `assignee: None`, unassign) a user task. The task must be
+    /// in the `Created` state.
+    AssignUserTask {
+        user_task_key: Key,
+        assignee: Option<String>,
+    },
+    /// Complete a user task, optionally merging `variables` into the instance
+    /// before the parked token resumes. The task must be in the `Created` state.
+    CompleteUserTask {
+        user_task_key: Key,
+        variables: HashMap<String, Value>,
+    },
     /// Activate up to `max_jobs` activatable jobs of `job_type` for `worker`,
     /// locking each until `now + timeout`. `now` is a caller-supplied logical
     /// instant — the engine never reads a wall clock.
@@ -139,6 +151,33 @@ impl Command {
     /// Convenience constructor for a `CompleteJob` that sets variables.
     pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::CompleteJob { job_key, variables }
+    }
+
+    /// Convenience constructor for an `AssignUserTask`.
+    pub fn assign_user_task(user_task_key: Key, assignee: impl Into<String>) -> Self {
+        Command::AssignUserTask {
+            user_task_key,
+            assignee: Some(assignee.into()),
+        }
+    }
+
+    /// Convenience constructor for a `CompleteUserTask` with no variables.
+    pub fn complete_user_task(user_task_key: Key) -> Self {
+        Command::CompleteUserTask {
+            user_task_key,
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Convenience constructor for a `CompleteUserTask` that sets variables.
+    pub fn complete_user_task_with(
+        user_task_key: Key,
+        variables: HashMap<String, Value>,
+    ) -> Self {
+        Command::CompleteUserTask {
+            user_task_key,
+            variables,
+        }
     }
 
     /// Convenience constructor for a `FailJob`.

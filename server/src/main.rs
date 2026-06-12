@@ -1262,6 +1262,205 @@ impl ServerImpl {
         ))
     }
 
+    async fn search_user_tasks_impl(
+        &self,
+        body: &Option<models::UserTaskSearchQuery>,
+    ) -> Result<apis::user_task::SearchUserTasksResponse, ()> {
+        use apis::user_task::SearchUserTasksResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let tasks = self.store.user_tasks();
+
+        let mut matched: Vec<&readstore::UserTaskRow> = tasks
+            .iter()
+            .filter(|task| match filter {
+                None => true,
+                Some(f) => {
+                    let assignee = task.assignee.clone().unwrap_or_default();
+                    f.user_task_key
+                        .as_ref()
+                        .is_none_or(|k| k.0 == task.key.to_string())
+                        && query::match_process_instance_key(
+                            &f.process_instance_key,
+                            &task.instance_key.to_string(),
+                        )
+                        && query::match_process_definition_key(
+                            &f.process_definition_key,
+                            &task.process_definition_key,
+                        )
+                        && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
+                        && query::match_string(&f.assignee, &assignee)
+                        && query::match_user_task_state(
+                            &f.state,
+                            &user_task_state_enum(task.state).to_string(),
+                        )
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::UserTaskSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |task, field| match field {
+                "processInstanceKey" => query::SortVal::Num(task.instance_key as i64),
+                "elementId" => query::SortVal::Str(task.element_id.clone()),
+                "state" => {
+                    query::SortVal::Str(user_task_state_enum(task.state).to_string())
+                }
+                "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
+                _ => query::SortVal::Num(task.key as i64),
+            },
+            |task| task.key,
+        );
+
+        let sorted: Vec<(u64, &readstore::UserTaskRow)> =
+            matched.into_iter().map(|task| (task.key, task)).collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::UserTaskResult> =
+            page.items.into_iter().map(user_task_result).collect();
+
+        Ok(Resp::Status200_TheUserTaskSearchResult(
+            models::UserTaskSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    async fn assign_user_task_impl(
+        &self,
+        path_params: &models::AssignUserTaskPathParams,
+        body: &models::UserTaskAssignmentRequest,
+    ) -> Result<apis::user_task::AssignUserTaskResponse, ()> {
+        use apis::user_task::AssignUserTaskResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!(
+                            "User task key '{}' is not a valid key.",
+                            path_params.user_task_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        let assignee = body.assignee.clone().unwrap_or_default();
+        let command = Command::assign_user_task(user_task_key, assignee);
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(command, now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheUserTask)
+            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => {
+                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    ),
+                ))
+            }
+            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "User task not active",
+                    409,
+                    format!("User task {user_task_key} is not active and cannot be assigned."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
+    async fn complete_user_task_impl(
+        &self,
+        path_params: &models::CompleteUserTaskPathParams,
+        body: &Option<models::UserTaskCompletionRequest>,
+    ) -> Result<apis::user_task::CompleteUserTaskResponse, ()> {
+        use apis::user_task::CompleteUserTaskResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!(
+                            "User task key '{}' is not a valid key.",
+                            path_params.user_task_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        // Variables the human submits are merged into the instance so they can
+        // drive downstream gateway routing.
+        let variables = body
+            .as_ref()
+            .and_then(|b| b.variables.as_ref())
+            .and_then(|v| match v {
+                types::Nullable::Present(map) => Some(from_object_map(map)),
+                types::Nullable::Null => None,
+            })
+            .unwrap_or_default();
+
+        let command = Command::complete_user_task_with(user_task_key, variables);
+        let result = {
+            let mut engine = self.journal.write().expect("engine lock poisoned");
+            engine.apply_command_at(command, now_millis())
+        };
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                // Completing a user task advances the token, which may create a
+                // following job: wake any long-pollers.
+                self.jobs_available.notify_waiters();
+                Ok(Resp::Status204_TheUserTaskWasCompletedSuccessfully)
+            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => {
+                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    ),
+                ))
+            }
+            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "User task not active",
+                    409,
+                    format!("User task {user_task_key} is not active and cannot be completed."),
+                )),
+            ),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
     /// Searches variables in the read model. nano keeps a single instance-level
     /// scope, so every variable's `scopeKey` equals its `processInstanceKey`.
     async fn search_variables_impl(
@@ -1925,6 +2124,56 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         types::Nullable::Null,
         types::Nullable::Null,
         0,
+    )
+}
+
+/// Maps an engine [`nanobpmn_engine_core::UserTaskState`] to the REST user-task
+/// state enum.
+fn user_task_state_enum(
+    state: nanobpmn_engine_core::UserTaskState,
+) -> models::UserTaskStateEnum {
+    use nanobpmn_engine_core::UserTaskState;
+    match state {
+        UserTaskState::Created => models::UserTaskStateEnum::Created,
+        UserTaskState::Completed => models::UserTaskStateEnum::Completed,
+        UserTaskState::Canceled => models::UserTaskStateEnum::Canceled,
+    }
+}
+
+/// Projects a [`readstore::UserTaskRow`] into the generated `UserTaskResult`. The
+/// process-definition identity is denormalized onto the row at projection time.
+fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
+    let creation_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
+            .unwrap_or_else(chrono::Utc::now);
+
+    models::UserTaskResult::new(
+        types::Nullable::Null,
+        user_task_state_enum(task.state),
+        match &task.assignee {
+            Some(a) => types::Nullable::Present(a.clone()),
+            None => types::Nullable::Null,
+        },
+        task.element_id.clone(),
+        Vec::new(),
+        Vec::new(),
+        task.process_definition_id.clone(),
+        creation_date,
+        types::Nullable::Null,
+        types::Nullable::Null,
+        types::Nullable::Null,
+        "<default>".to_string(),
+        types::Nullable::Null,
+        task.process_definition_version,
+        std::collections::HashMap::new(),
+        models::UserTaskKey(task.key.to_string()),
+        models::ElementInstanceKey(task.element_instance_key.to_string()),
+        types::Nullable::Null,
+        models::ProcessDefinitionKey(task.process_definition_key.clone()),
+        models::ProcessInstanceKey(task.instance_key.to_string()),
+        types::Nullable::Null,
+        types::Nullable::Null,
+        Vec::new(),
     )
 }
 

@@ -80,6 +80,33 @@ pub struct Job {
 /// Retries a job starts with when first created.
 pub const DEFAULT_JOB_RETRIES: i32 = 3;
 
+/// Lifecycle state of a (native) user task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserTaskState {
+    /// Created and available for a human to claim/complete.
+    Created,
+    /// Completed. Terminal: the parked token has resumed.
+    Completed,
+    /// Cancelled because its activity/instance was terminated. Terminal.
+    Canceled,
+}
+
+/// A user task created for a `userTask` element, awaiting human completion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserTask {
+    pub key: Key,
+    pub instance_key: Key,
+    /// The element instance that is parked waiting on this user task.
+    pub element_instance_key: Key,
+    pub element_id: ElementId,
+    pub state: UserTaskState,
+    /// The currently assigned user, if any.
+    pub assignee: Option<String>,
+    /// The logical instant the task was created (the `now` carried on the
+    /// activating command), in milliseconds since the Unix epoch.
+    pub created_at: u64,
+}
+
 /// A running (or completed) process instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessInstance {
@@ -373,6 +400,10 @@ pub struct State {
     pub processes: HashMap<String, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
+    /// User tasks created for `userTask` elements, keyed by user-task key. A
+    /// completed task is retained (transitioned to [`UserTaskState::Completed`])
+    /// as an audit trail.
+    pub user_tasks: HashMap<Key, UserTask>,
     /// All incidents ever raised, keyed by incident key, retained after
     /// resolution as an audit trail (each carries its [`IncidentState`]).
     pub incidents: HashMap<Key, Incident>,
@@ -602,6 +633,43 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        Event::UserTaskCreated {
+            user_task_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            created_at,
+        } => {
+            state.user_tasks.insert(
+                *user_task_key,
+                UserTask {
+                    key: *user_task_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    state: UserTaskState::Created,
+                    assignee: None,
+                    created_at: *created_at,
+                },
+            );
+        }
+
+        Event::UserTaskAssigned {
+            user_task_key,
+            assignee,
+            ..
+        } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                task.assignee = assignee.clone();
+            }
+        }
+
+        Event::UserTaskCompleted { user_task_key, .. } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                task.state = UserTaskState::Completed;
+            }
+        }
+
         Event::IncidentRaised {
             incident_key,
             instance_key,
@@ -736,6 +804,12 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Canceled;
                 job.worker = None;
                 job.deadline = None;
+            }
+        }
+
+        Event::UserTaskCanceled { user_task_key, .. } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                task.state = UserTaskState::Canceled;
             }
         }
 

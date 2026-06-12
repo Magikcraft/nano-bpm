@@ -322,6 +322,22 @@ pub fn match_job_state(filter: &Option<models::JobStateFilterProperty>, value: &
     }
 }
 
+/// Matches a `UserTaskStateFilterProperty` against a user-task state's wire
+/// spelling.
+pub fn match_user_task_state(
+    filter: &Option<models::UserTaskStateFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::UserTaskStateFilterProperty::UserTaskStateEnum(e)) => e.to_string() == value,
+        Some(models::UserTaskStateFilterProperty::AdvancedUserTaskStateFilter(a)) => {
+            ops!(a, |e: &models::UserTaskStateEnum| e.to_string(), like_no_notin)
+                .matches(Some(value))
+        }
+    }
+}
+
 /// One normalised sort instruction: the field name and whether it is descending.
 pub struct SortKey {
     pub field: String,

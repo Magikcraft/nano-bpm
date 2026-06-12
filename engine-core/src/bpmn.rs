@@ -14,8 +14,8 @@
 //! ## Supported subset
 //!
 //! * `process` (one or more per file) with its `id`.
-//! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `exclusiveGateway`,
-//!   `parallelGateway`.
+//! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `userTask`,
+//!   `exclusiveGateway`, `parallelGateway`.
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
@@ -217,6 +217,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 if !self_closing {
                                     cur_service_task = idx;
                                 }
+                            }
+                            "userTask" => {
+                                acc.add_node(attrs, NodeKind::User);
                             }
                             "subProcess" => {
                                 // An embedded sub-process: register it, then push
@@ -437,6 +440,7 @@ enum NodeKind {
     Start,
     End,
     Service,
+    User,
     Exclusive,
     Parallel,
     IntermediateCatch,
@@ -578,6 +582,7 @@ impl ProcessAcc {
                     let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
                     builder.service_task(node.id, job_type)
                 }
+                NodeKind::User => builder.user_task(node.id),
                 NodeKind::IntermediateCatch => {
                     // A messageRef makes it a message catch; otherwise it is a
                     // timer catch carrying a (possibly zero) duration.
@@ -1072,6 +1077,36 @@ mod tests {
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
+    }
+
+    #[test]
+    fn should_parse_a_user_task_and_link_its_flows() {
+        // given: start -> review (userTask) -> end, the shape the Camunda SDK's
+        // user-task fixture deploys (a <bpmn:userTask> with <zeebe:userTask/>).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the user task is recognised and its sequence flows resolve (a
+        // regression guard against the "unknown target element" parse error).
+        assert_eq!(def.element("review").unwrap().kind, ElementKind::UserTask);
+        assert_eq!(def.element("s").unwrap().outgoing[0].to, "review");
+        assert_eq!(def.element("review").unwrap().outgoing[0].to, "e");
     }
 
     #[test]

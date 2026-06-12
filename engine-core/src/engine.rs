@@ -567,6 +567,69 @@ impl Engine {
                 });
             }
 
+            Command::AssignUserTask {
+                user_task_key,
+                assignee,
+            } => {
+                let task = self
+                    .state
+                    .user_tasks
+                    .get(&user_task_key)
+                    .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotActive { user_task_key });
+                }
+                let instance_key = task.instance_key;
+                self.emit(
+                    &mut log,
+                    Event::UserTaskAssigned {
+                        user_task_key,
+                        instance_key,
+                        assignee,
+                    },
+                );
+            }
+
+            Command::CompleteUserTask {
+                user_task_key,
+                variables,
+            } => {
+                let task = self
+                    .state
+                    .user_tasks
+                    .get(&user_task_key)
+                    .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
+                if task.state != state::UserTaskState::Created {
+                    return Err(EngineError::UserTaskNotActive { user_task_key });
+                }
+                let instance_key = task.instance_key;
+                let element_instance_key = task.element_instance_key;
+                let element_id = task.element_id.clone();
+
+                self.emit(
+                    &mut log,
+                    Event::UserTaskCompleted {
+                        user_task_key,
+                        instance_key,
+                    },
+                );
+                if !variables.is_empty() {
+                    self.emit(
+                        &mut log,
+                        Event::VariablesUpdated {
+                            instance_key,
+                            variables,
+                        },
+                    );
+                }
+                // The parked user-task token resumes from ACTIVATED.
+                queue.push_back(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
+            }
+
             Command::ActivateJobs {
                 job_type,
                 worker,
@@ -1272,6 +1335,24 @@ impl Engine {
                     })
                     .collect();
 
+                let mut user_tasks: Vec<&state::UserTask> = self
+                    .state
+                    .user_tasks
+                    .values()
+                    .filter(|t| {
+                        t.instance_key == instance_key
+                            && t.state == state::UserTaskState::Created
+                    })
+                    .collect();
+                user_tasks.sort_unstable_by_key(|t| t.key);
+                let user_task_cancels: Vec<Event> = user_tasks
+                    .iter()
+                    .map(|t| Event::UserTaskCanceled {
+                        user_task_key: t.key,
+                        instance_key,
+                    })
+                    .collect();
+
                 for event in job_cancels {
                     self.emit(&mut log, event);
                 }
@@ -1279,6 +1360,9 @@ impl Engine {
                     self.emit(&mut log, event);
                 }
                 for event in sub_cancels {
+                    self.emit(&mut log, event);
+                }
+                for event in user_task_cancels {
                     self.emit(&mut log, event);
                 }
                 self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
@@ -1458,6 +1542,23 @@ impl Engine {
                     job_type,
                 });
                 // Arm timers/subscriptions for every attached boundary event.
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                ));
+            }
+            // A user task creates a user task record and parks the token; a
+            // CompleteUserTask releases it.
+            Some(ElementKind::UserTask) => {
+                let user_task_key = self.mint_key();
+                events.push(Event::UserTaskCreated {
+                    user_task_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    created_at: self.now,
+                });
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
@@ -2402,6 +2503,12 @@ pub enum EngineError {
     /// `CancelInstance` referenced a process instance that does not exist or is
     /// no longer active (already completed or terminated).
     InstanceNotFound { instance_key: Key },
+    /// `AssignUserTask`/`CompleteUserTask` referenced a user-task key that does
+    /// not exist.
+    UserTaskNotFound { user_task_key: Key },
+    /// `AssignUserTask`/`CompleteUserTask` referenced a user task that is not in
+    /// a state where it can be acted on (already completed or cancelled).
+    UserTaskNotActive { user_task_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -2440,6 +2547,15 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::InstanceNotFound { instance_key } => {
                 write!(f, "no active process instance with key {instance_key}")
+            }
+            EngineError::UserTaskNotFound { user_task_key } => {
+                write!(f, "no user task with key {user_task_key}")
+            }
+            EngineError::UserTaskNotActive { user_task_key } => {
+                write!(
+                    f,
+                    "user task {user_task_key} is not in a state that can be acted on"
+                )
             }
         }
     }
@@ -3312,6 +3428,70 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
         assert!(!engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn should_park_on_a_user_task_then_resume_when_completed() {
+        // start -> review (user task) -> end
+        let def = ProcessBuilder::new("approval")
+            .start_event("start")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+        let created = engine
+            .apply_command(Command::create_instance("approval"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The token parks on the user task: a UserTaskCreated event was emitted
+        // and the instance is not yet complete.
+        let user_task_key = created
+            .iter()
+            .find_map(|e| match e {
+                Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+                _ => None,
+            })
+            .expect("user task created");
+        assert!(!engine.is_completed(instance_key));
+
+        // Assigning keeps it parked; the assignee is recorded.
+        engine
+            .apply_command(Command::assign_user_task(user_task_key, "alice"))
+            .unwrap();
+        assert_eq!(
+            engine.state().user_tasks[&user_task_key].assignee.as_deref(),
+            Some("alice")
+        );
+        assert!(!engine.is_completed(instance_key));
+
+        // Completing it (merging a variable) resumes the token to the end event,
+        // completing the instance.
+        let vars = HashMap::from([("approved".to_string(), Value::Bool(true))]);
+        let done = engine
+            .apply_command(Command::complete_user_task_with(user_task_key, vars))
+            .unwrap();
+        assert!(done.iter().any(|e| matches!(
+            e,
+            Event::UserTaskCompleted { user_task_key: k, .. } if *k == user_task_key
+        )));
+        assert!(engine.is_completed(instance_key));
+        assert_eq!(
+            engine.state().user_tasks[&user_task_key].state,
+            state::UserTaskState::Completed
+        );
+
+        // Completing again is rejected: the task is no longer active.
+        assert!(matches!(
+            engine.apply_command(Command::complete_user_task(user_task_key)),
+            Err(EngineError::UserTaskNotActive { .. })
+        ));
     }
 
     #[test]

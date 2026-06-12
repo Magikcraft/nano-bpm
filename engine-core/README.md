@@ -93,6 +93,13 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   expression (`type="=jobType"`, `type='="worker-" + region'`); it is evaluated
   against the instance variables at job-creation time (an expression that cannot
   be evaluated falls back to the literal text).
+- A **user task** (`<bpmn:userTask>` with a `<zeebe:userTask/>`, i.e. a native
+  Zeebe user task) rests in `ACTIVATED` after the engine creates the task, and
+  advances only when an `AssignUserTask` / `CompleteUserTask` command arrives.
+  Unlike jobs there is no worker lock or retries: a task is `Created`, then
+  optionally assigned, then `Completed` (or `Canceled` when its instance is
+  terminated). Completion merges its variables and resumes the token, exactly
+  like `CompleteJob`.
 - **Job activation** mirrors Camunda 8: a worker activates available jobs of a
   type (`ActivateJobs`), locking each until `now + timeout`. A job must be
   activated before it can be completed. Locks expire — either lazily on the next
