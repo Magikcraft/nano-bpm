@@ -5,7 +5,7 @@
 //! every mutation here is what makes the engine deterministic and replayable:
 //! replaying the same events over a fresh [`State`] reconstructs it exactly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::event::Event;
 use crate::model::{ElementId, ProcessDefinition, Value};
@@ -433,12 +433,71 @@ pub struct State {
     /// instance when due; a cycle re-arms, a one-shot is retained with
     /// `due_at = None`.
     pub start_timers: HashMap<Key, StartTimer>,
+    /// Index of jobs eligible to be *considered* for activation, grouped by job
+    /// type and ordered by key. A job is a member iff its state is `Created` or
+    /// `Activated` (an activated job may still be re-activatable once its lock
+    /// deadline passes, so it stays indexed and is filtered by deadline at
+    /// activation time). This lets `ActivateJobs` serve a worker poll in roughly
+    /// `O(max_jobs)` instead of scanning every job in the system — critical when
+    /// a large backlog of pending jobs accumulates under load. It is fully
+    /// derived from `jobs` and kept in lockstep by [`resync_job_index`].
+    pub activatable_jobs: HashMap<String, BTreeSet<Key>>,
+    /// The keys of all jobs currently in the `Activated` state (holding a lock).
+    /// Bounded by the number of concurrently working workers, so it lets
+    /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning
+    /// every job. Derived from `jobs`, kept in lockstep by [`resync_job_index`].
+    pub activated_jobs: std::collections::HashSet<Key>,
 }
 
 impl State {
     /// A fresh, empty state.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Removes `key` from both job indices (the activatable set under
+    /// `job_type`, and the activated set), pruning an emptied per-type set.
+    /// Used when a job is dropped from `jobs` entirely (eviction), where
+    /// [`resync_job_index`] cannot run because the job is already gone.
+    pub fn deindex_job(&mut self, job_type: &str, key: Key) {
+        if let Some(set) = self.activatable_jobs.get_mut(job_type) {
+            set.remove(&key);
+            if set.is_empty() {
+                self.activatable_jobs.remove(job_type);
+            }
+        }
+        self.activated_jobs.remove(&key);
+    }
+}
+
+/// Re-syncs the index membership of one job to match its current state.
+/// Idempotent: a `Created`/`Activated` job is in the activatable index, an
+/// `Activated` job is additionally in the activated index, and anything else
+/// (or a missing job) is removed from both. Call after any arm that changes a
+/// job's state. Keeping membership a pure function of the job's current state
+/// means the indices can never drift from `jobs`.
+fn resync_job_index(state: &mut State, job_key: Key) {
+    let Some(job) = state.jobs.get(&job_key) else {
+        return;
+    };
+    let job_type = job.job_type.clone();
+    let job_state = job.state;
+    if matches!(job_state, JobState::Created | JobState::Activated) {
+        state
+            .activatable_jobs
+            .entry(job_type)
+            .or_default()
+            .insert(job_key);
+    } else if let Some(set) = state.activatable_jobs.get_mut(&job_type) {
+        set.remove(&job_key);
+        if set.is_empty() {
+            state.activatable_jobs.remove(&job_type);
+        }
+    }
+    if job_state == JobState::Activated {
+        state.activated_jobs.insert(job_key);
+    } else {
+        state.activated_jobs.remove(&job_key);
     }
 }
 
@@ -584,6 +643,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     retries: DEFAULT_JOB_RETRIES,
                 },
             );
+            resync_job_index(state, *job_key);
         }
 
         Event::JobActivated {
@@ -598,6 +658,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.deadline = Some(*deadline);
                 job.activated = true;
             }
+            resync_job_index(state, *job_key);
         }
 
         Event::JobLockExpired { job_key, .. } => {
@@ -608,6 +669,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.deadline = None;
                 }
             }
+            resync_job_index(state, *job_key);
         }
 
         Event::JobFailed {
@@ -625,6 +687,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     JobState::Failed
                 };
             }
+            resync_job_index(state, *job_key);
         }
 
         Event::JobErrorThrown { job_key, .. } => {
@@ -633,6 +696,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.worker = None;
                 job.deadline = None;
             }
+            resync_job_index(state, *job_key);
         }
 
         Event::JobCompleted { job_key, .. } => {
@@ -641,6 +705,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.worker = None;
                 job.deadline = None;
             }
+            resync_job_index(state, *job_key);
         }
 
         Event::UserTaskCreated {
@@ -785,6 +850,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.worker = None;
                     job.deadline = None;
                 }
+                resync_job_index(state, *job_key);
             }
         }
 
@@ -854,6 +920,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.worker = None;
                 job.deadline = None;
             }
+            resync_job_index(state, *job_key);
         }
 
         Event::UserTaskCanceled { user_task_key, .. } => {

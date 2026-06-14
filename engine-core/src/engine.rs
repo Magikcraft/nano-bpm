@@ -143,6 +143,19 @@ impl Engine {
             return false;
         }
         self.state.instances.remove(&key);
+        // Drop the instance's jobs, first removing any from the activatable index
+        // (a terminal instance's jobs are normally already Completed/Canceled and
+        // thus not indexed, but deindex unconditionally to be safe).
+        let removed_jobs: Vec<(String, Key)> = self
+            .state
+            .jobs
+            .values()
+            .filter(|j| j.instance_key == key)
+            .map(|j| (j.job_type.clone(), j.key))
+            .collect();
+        for (job_type, job_key) in removed_jobs {
+            self.state.deindex_job(&job_type, job_key);
+        }
         self.state.jobs.retain(|_, j| j.instance_key != key);
         self.state.timers.retain(|_, t| t.instance_key != key);
         self.state
@@ -177,6 +190,17 @@ impl Engine {
         }
         for key in &terminal {
             self.state.instances.remove(key);
+        }
+        // Deindex jobs of evicted instances before dropping them (single pass).
+        let removed_jobs: Vec<(String, Key)> = self
+            .state
+            .jobs
+            .values()
+            .filter(|j| terminal.contains(&j.instance_key))
+            .map(|j| (j.job_type.clone(), j.key))
+            .collect();
+        for (job_type, job_key) in removed_jobs {
+            self.state.deindex_job(&job_type, job_key);
         }
         self.state.jobs.retain(|_, j| !terminal.contains(&j.instance_key));
         self.state
@@ -228,6 +252,8 @@ impl Engine {
         self.state.timers.shrink_to_fit();
         self.state.message_subscriptions.shrink_to_fit();
         self.state.incidents.shrink_to_fit();
+        self.state.activatable_jobs.shrink_to_fit();
+        self.state.activated_jobs.shrink_to_fit();
     }
 
     /// Looks up a job.
@@ -735,17 +761,28 @@ impl Engine {
                 now,
             } => {
                 let deadline = now.saturating_add(timeout);
-                // Deterministic selection: activatable jobs of this type, by key
-                // ascending, capped at max_jobs.
-                let mut keys: Vec<Key> = self
-                    .state
-                    .jobs
-                    .values()
-                    .filter(|j| j.job_type == job_type && job_activatable(j, now))
-                    .map(|j| j.key)
-                    .collect();
-                keys.sort_unstable();
-                keys.truncate(max_jobs);
+                // Deterministic selection: walk the per-type activatable index
+                // (keys ascending) and take the first `max_jobs` that are truly
+                // activatable now. The index holds Created and Activated jobs of
+                // this type; an Activated job only qualifies once its lock has
+                // expired (`job_activatable`). Iterating the index instead of
+                // scanning every job keeps a worker poll ~O(max_jobs) even with a
+                // large pending-job backlog. Stale keys (none expected) are
+                // skipped defensively.
+                let keys: Vec<Key> = match self.state.activatable_jobs.get(&job_type) {
+                    Some(set) => set
+                        .iter()
+                        .filter(|k| {
+                            self.state
+                                .jobs
+                                .get(k)
+                                .is_some_and(|j| job_activatable(j, now))
+                        })
+                        .take(max_jobs)
+                        .copied()
+                        .collect(),
+                    None => Vec::new(),
+                };
                 for job_key in keys {
                     let instance_key = self.state.jobs[&job_key].instance_key;
                     self.emit(
@@ -761,15 +798,18 @@ impl Engine {
             }
 
             Command::ExpireJobs { now } => {
+                // Only Activated jobs can have an expired lock, and they are
+                // indexed, so iterate that small set instead of every job.
                 let mut expired: Vec<(Key, Key)> = self
                     .state
-                    .jobs
-                    .values()
-                    .filter(|j| {
-                        j.state == state::JobState::Activated
-                            && j.deadline.is_some_and(|d| d <= now)
+                    .activated_jobs
+                    .iter()
+                    .filter_map(|k| {
+                        let j = self.state.jobs.get(k)?;
+                        (j.state == state::JobState::Activated
+                            && j.deadline.is_some_and(|d| d <= now))
+                        .then_some((j.key, j.instance_key))
                     })
-                    .map(|j| (j.key, j.instance_key))
                     .collect();
                 expired.sort_unstable();
                 for (job_key, instance_key) in expired {
@@ -5446,6 +5486,83 @@ mod tests {
             .values()
             .any(|j| j.instance_key == done1 || j.instance_key == done2));
         assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
+    }
+
+    /// The activatable index must always equal the set of jobs in state
+    /// `Created`/`Activated`, grouped by type. Asserts that invariant.
+    fn assert_job_index_consistent(engine: &Engine) {
+        use std::collections::{BTreeSet, HashMap, HashSet};
+        let mut expected: HashMap<String, BTreeSet<Key>> = HashMap::new();
+        let mut expected_activated: HashSet<Key> = HashSet::new();
+        for job in engine.state().jobs.values() {
+            if matches!(
+                job.state,
+                state::JobState::Created | state::JobState::Activated
+            ) {
+                expected.entry(job.job_type.clone()).or_default().insert(job.key);
+            }
+            if job.state == state::JobState::Activated {
+                expected_activated.insert(job.key);
+            }
+        }
+        assert_eq!(
+            engine.state().activatable_jobs,
+            expected,
+            "activatable index drifted from jobs"
+        );
+        assert_eq!(
+            engine.state().activated_jobs,
+            expected_activated,
+            "activated index drifted from jobs"
+        );
+    }
+
+    #[test]
+    fn job_index_tracks_create_activate_complete_expire_and_evict() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        // Three instances → three activatable "payment" jobs, indexed in key
+        // order.
+        let mut instances = Vec::new();
+        for _ in 0..3 {
+            let k = engine
+                .apply_command(Command::create_instance("order"))
+                .unwrap()
+                .iter()
+                .find_map(|e| e.instance_key())
+                .unwrap();
+            instances.push(k);
+        }
+        assert_eq!(engine.state().activatable_jobs["payment"].len(), 3);
+        assert_job_index_consistent(&engine);
+
+        // Activating keeps the job indexed (it may still re-activate after its
+        // lock expires); the index iterates by key ascending.
+        let first = engine.activate_jobs("payment", "A", 1, 1_000, 0);
+        assert_eq!(first.len(), 1);
+        assert_eq!(engine.state().activatable_jobs["payment"].len(), 3);
+        assert_job_index_consistent(&engine);
+
+        // Completing the activated job removes it from the index.
+        engine
+            .apply_command(Command::complete_job(first[0].key))
+            .unwrap();
+        assert_eq!(engine.state().activatable_jobs["payment"].len(), 2);
+        assert_job_index_consistent(&engine);
+
+        // Expiry of another worker's lock returns the job to the index.
+        let locked = engine.activate_jobs("payment", "B", 1, 1_000, 0)[0].key;
+        engine.expire_jobs(5_000);
+        assert!(engine.state().activatable_jobs["payment"].contains(&locked));
+        assert_job_index_consistent(&engine);
+
+        // Evicting a completed instance drops its (already-deindexed) job and
+        // leaves the index consistent.
+        engine.evict_instances(&instances);
+        assert_job_index_consistent(&engine);
     }
 
     #[test]
