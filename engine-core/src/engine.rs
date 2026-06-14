@@ -152,6 +152,45 @@ impl Engine {
         true
     }
 
+    /// Evicts a batch of completed instances in a single pass over the hot-state
+    /// maps. Each [`Engine::evict_instance`] call rescans every job/timer/
+    /// subscription/incident map, so evicting `k` instances one at a time is
+    /// `O(k * state)`; this collects the terminal keys up front and then makes
+    /// one `retain` pass per map (`O(state)`), which matters on the steady-state
+    /// exporter path where completions stream in continuously under the global
+    /// write lock. Non-terminal or unknown keys are ignored. Returns the number
+    /// of instances evicted. Does **not** shrink the maps — capacity is reused by
+    /// the next instances, which is exactly what is wanted under sustained load.
+    pub fn evict_instances(&mut self, keys: &[Key]) -> usize {
+        let terminal: HashSet<Key> = keys
+            .iter()
+            .copied()
+            .filter(|k| {
+                matches!(
+                    self.state.instances.get(k).map(|i| i.state),
+                    Some(ProcessInstanceState::Completed | ProcessInstanceState::Terminated)
+                )
+            })
+            .collect();
+        if terminal.is_empty() {
+            return 0;
+        }
+        for key in &terminal {
+            self.state.instances.remove(key);
+        }
+        self.state.jobs.retain(|_, j| !terminal.contains(&j.instance_key));
+        self.state
+            .timers
+            .retain(|_, t| !terminal.contains(&t.instance_key));
+        self.state
+            .message_subscriptions
+            .retain(|_, s| !terminal.contains(&s.instance_key));
+        self.state
+            .incidents
+            .retain(|_, i| !terminal.contains(&i.instance_key));
+        terminal.len()
+    }
+
     /// Evicts every completed instance (see [`Engine::evict_instance`]) and
     /// shrinks the backing maps so freed capacity is returned. Returns the
     /// number of instances evicted. Intended to run once after a boot replay,
@@ -5363,6 +5402,50 @@ mod tests {
         assert!(engine.instance(live).is_some());
         assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
         assert_eq!(engine.state().processes.len(), 1);
+    }
+
+    #[test]
+    fn evict_instances_batches_in_one_pass() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        // Two completed instances and one left in-flight.
+        let done1 = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        complete_one(&mut engine, "payment");
+        let done2 = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        complete_one(&mut engine, "payment");
+        let live = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+
+        // Batch includes both completed keys, the live key (ignored, not
+        // terminal) and an unknown key (ignored).
+        let evicted = engine.evict_instances(&[done1, done2, live, 9_999_999]);
+        assert_eq!(evicted, 2);
+        assert!(engine.instance(done1).is_none());
+        assert!(engine.instance(done2).is_none());
+        assert!(engine.instance(live).is_some());
+        assert!(!engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.instance_key == done1 || j.instance_key == done2));
+        assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
     }
 
     #[test]

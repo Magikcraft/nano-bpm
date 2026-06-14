@@ -184,22 +184,17 @@ impl Journal {
         self.exporter = Some(exporter);
     }
 
-    /// Evicts a completed instance and everything it owns from hot state once the
-    /// read model has it. Mirrors [`Engine::evict_instance`].
-    pub fn evict_instance(&mut self, key: Key) -> bool {
-        self.engine.evict_instance(key)
+    /// Evicts a batch of completed instances in a single pass over hot state.
+    /// Mirrors [`Engine::evict_instances`]. Used on the steady-state exporter
+    /// path once the read model has the completions.
+    pub fn evict_instances(&mut self, keys: &[Key]) -> usize {
+        self.engine.evict_instances(keys)
     }
 
     /// Evicts every completed instance from hot state (used after a boot replay,
     /// once the read model is caught up). Mirrors [`Engine::evict_completed`].
     pub fn evict_completed(&mut self) -> usize {
         self.engine.evict_completed()
-    }
-
-    /// Shrinks the hot-state maps so evicted capacity is returned. Mirrors
-    /// [`Engine::shrink`].
-    pub fn shrink(&mut self) {
-        self.engine.shrink();
     }
 
     /// Whether the journal started empty (no prior log).

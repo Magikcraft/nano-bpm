@@ -162,10 +162,11 @@ fn spawn_exporter(
                 instances_changed.notify_waiters();
                 if !completed.is_empty() {
                     let mut journal = journal.write().expect("engine lock poisoned");
-                    for key in completed {
-                        journal.evict_instance(key);
-                    }
-                    journal.shrink();
+                    // One pass over hot state for the whole batch; no per-batch
+                    // shrink_to_fit (reallocating every map under the global
+                    // write lock on each completion batch needlessly throttles
+                    // command throughput — capacity is reused by new instances).
+                    journal.evict_instances(&completed);
                 }
             }
         })
