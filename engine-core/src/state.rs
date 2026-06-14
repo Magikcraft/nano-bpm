@@ -447,6 +447,15 @@ pub struct State {
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning
     /// every job. Derived from `jobs`, kept in lockstep by [`resync_job_index`].
     pub activated_jobs: std::collections::HashSet<Key>,
+    /// Reverse index of instance key → the keys of every job that instance owns,
+    /// regardless of job state. Jobs are only removed from `jobs` in bulk when
+    /// their owning instance is evicted, so this index lets eviction drop an
+    /// instance's jobs in `O(jobs of that instance)` instead of scanning every
+    /// job in the system — the difference between bounded and `O(total backlog)`
+    /// eviction under sustained overload. Derived from `jobs`: a key is inserted
+    /// when a job is created and the whole entry is removed when the instance is
+    /// evicted.
+    pub jobs_by_instance: HashMap<Key, std::collections::HashSet<Key>>,
 }
 
 impl State {
@@ -644,6 +653,11 @@ pub fn apply(state: &mut State, event: &Event) {
                 },
             );
             resync_job_index(state, *job_key);
+            state
+                .jobs_by_instance
+                .entry(*instance_key)
+                .or_default()
+                .insert(*job_key);
         }
 
         Event::JobActivated {

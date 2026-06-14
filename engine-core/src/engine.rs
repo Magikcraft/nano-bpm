@@ -143,20 +143,17 @@ impl Engine {
             return false;
         }
         self.state.instances.remove(&key);
-        // Drop the instance's jobs, first removing any from the activatable index
-        // (a terminal instance's jobs are normally already Completed/Canceled and
-        // thus not indexed, but deindex unconditionally to be safe).
-        let removed_jobs: Vec<(String, Key)> = self
-            .state
-            .jobs
-            .values()
-            .filter(|j| j.instance_key == key)
-            .map(|j| (j.job_type.clone(), j.key))
-            .collect();
-        for (job_type, job_key) in removed_jobs {
-            self.state.deindex_job(&job_type, job_key);
+        // Drop the instance's jobs via the reverse index (O(this instance's
+        // jobs)), deindexing each from the activatable/activated indices. A
+        // terminal instance's jobs are normally already settled and thus not in
+        // the activatable index, but `deindex_job` is unconditional and safe.
+        if let Some(job_keys) = self.state.jobs_by_instance.remove(&key) {
+            for job_key in job_keys {
+                if let Some(job) = self.state.jobs.remove(&job_key) {
+                    self.state.deindex_job(&job.job_type, job_key);
+                }
+            }
         }
-        self.state.jobs.retain(|_, j| j.instance_key != key);
         self.state.timers.retain(|_, t| t.instance_key != key);
         self.state
             .message_subscriptions
@@ -165,14 +162,15 @@ impl Engine {
         true
     }
 
-    /// Evicts a batch of completed instances in a single pass over the hot-state
-    /// maps. Each [`Engine::evict_instance`] call rescans every job/timer/
-    /// subscription/incident map, so evicting `k` instances one at a time is
-    /// `O(k * state)`; this collects the terminal keys up front and then makes
-    /// one `retain` pass per map (`O(state)`), which matters on the steady-state
-    /// exporter path where completions stream in continuously under the global
-    /// write lock. Non-terminal or unknown keys are ignored. Returns the number
-    /// of instances evicted. Does **not** shrink the maps — capacity is reused by
+    /// Evicts a batch of completed instances in a single pass. Each instance's
+    /// jobs are dropped via the `jobs_by_instance` reverse index, so the cost is
+    /// `O(evicted jobs)` rather than `O(total jobs)` — this is the steady-state
+    /// exporter path where completions stream in continuously, and a backlog of
+    /// in-flight instances must not make every eviction scan the whole job map.
+    /// Timers, subscriptions and incidents are not reverse-indexed (they stay
+    /// small or empty for job-only processes), so they are pruned with a `retain`
+    /// pass. Non-terminal or unknown keys are ignored. Returns the number of
+    /// instances evicted. Does **not** shrink the maps — capacity is reused by
     /// the next instances, which is exactly what is wanted under sustained load.
     pub fn evict_instances(&mut self, keys: &[Key]) -> usize {
         let terminal: HashSet<Key> = keys
@@ -190,19 +188,16 @@ impl Engine {
         }
         for key in &terminal {
             self.state.instances.remove(key);
+            // Drop this instance's jobs via the reverse index (O(its jobs)),
+            // deindexing each from the activatable/activated indices.
+            if let Some(job_keys) = self.state.jobs_by_instance.remove(key) {
+                for job_key in job_keys {
+                    if let Some(job) = self.state.jobs.remove(&job_key) {
+                        self.state.deindex_job(&job.job_type, job_key);
+                    }
+                }
+            }
         }
-        // Deindex jobs of evicted instances before dropping them (single pass).
-        let removed_jobs: Vec<(String, Key)> = self
-            .state
-            .jobs
-            .values()
-            .filter(|j| terminal.contains(&j.instance_key))
-            .map(|j| (j.job_type.clone(), j.key))
-            .collect();
-        for (job_type, job_key) in removed_jobs {
-            self.state.deindex_job(&job_type, job_key);
-        }
-        self.state.jobs.retain(|_, j| !terminal.contains(&j.instance_key));
         self.state
             .timers
             .retain(|_, t| !terminal.contains(&t.instance_key));
@@ -254,6 +249,7 @@ impl Engine {
         self.state.incidents.shrink_to_fit();
         self.state.activatable_jobs.shrink_to_fit();
         self.state.activated_jobs.shrink_to_fit();
+        self.state.jobs_by_instance.shrink_to_fit();
     }
 
     /// Looks up a job.
@@ -5514,6 +5510,18 @@ mod tests {
             engine.state().activated_jobs,
             expected_activated,
             "activated index drifted from jobs"
+        );
+        let mut expected_by_instance: HashMap<Key, HashSet<Key>> = HashMap::new();
+        for job in engine.state().jobs.values() {
+            expected_by_instance
+                .entry(job.instance_key)
+                .or_default()
+                .insert(job.key);
+        }
+        assert_eq!(
+            engine.state().jobs_by_instance,
+            expected_by_instance,
+            "jobs_by_instance index drifted from jobs"
         );
     }
 
