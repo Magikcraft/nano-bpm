@@ -2579,13 +2579,20 @@ fn activated_job_result(
         process_definition_key,
     } = activated;
 
+    // Project the job's variables into the REST object map off the engine
+    // thread. `job.variables` is an `Arc` shared with engine state, so reading it
+    // here neither blocks the command thread nor deep-clones the value tree.
     let variables = match fetch_variable {
-        Some(names) => job
-            .variables
-            .into_iter()
-            .filter(|(name, _)| names.iter().any(|n| n == name))
-            .collect(),
-        None => job.variables,
+        Some(names) => {
+            let filtered: std::collections::HashMap<String, Value> = job
+                .variables
+                .iter()
+                .filter(|(name, _)| names.iter().any(|n| n == *name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            to_object_map(&filtered)
+        }
+        None => to_object_map(&job.variables),
     };
 
     models::ActivatedJobResult::new(
@@ -2597,7 +2604,7 @@ fn activated_job_result(
         job.worker,
         job.retries,
         job.deadline as i64,
-        to_object_map(variables),
+        variables,
         "<default>".to_string(),
         models::JobKey(job.key.to_string()),
         models::ProcessInstanceKey(job.instance_key.to_string()),
@@ -2615,11 +2622,11 @@ fn activated_job_result(
 /// Converts engine variables into the generated `Object` (JSON) map used by the
 /// REST models.
 fn to_object_map(
-    variables: std::collections::HashMap<String, Value>,
+    variables: &std::collections::HashMap<String, Value>,
 ) -> std::collections::HashMap<String, types::Object> {
     variables
-        .into_iter()
-        .map(|(name, value)| (name, types::Object(value_to_json(&value))))
+        .iter()
+        .map(|(name, value)| (name.clone(), types::Object(value_to_json(value))))
         .collect()
 }
 

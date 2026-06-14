@@ -11,6 +11,7 @@
 //! ([`Engine::process_step`]) only *reads* state and *decides*; it never mutates.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::command::Command;
 use crate::event::Event;
@@ -2566,11 +2567,11 @@ impl Engine {
             .unwrap_or(0)
     }
 
-    fn variables(&self, instance_key: Key) -> HashMap<String, Value> {
+    fn variables(&self, instance_key: Key) -> Arc<HashMap<String, Value>> {
         self.state
             .instances
             .get(&instance_key)
-            .map(|i| i.variables.clone())
+            .map(|i| Arc::clone(&i.variables))
             .unwrap_or_default()
     }
 
@@ -2822,8 +2823,11 @@ pub struct ActivatedJob {
     pub deadline: u64,
     /// Remaining retries for this job.
     pub retries: i32,
-    /// A snapshot of the instance's variables at activation time.
-    pub variables: HashMap<String, Value>,
+    /// A snapshot of the instance's variables at activation time. Shared via
+    /// `Arc` with the engine's instance state, so activation does not deep-clone
+    /// the (up to 50 KB) value tree on the single command thread; the response
+    /// mapper encodes it to JSON off-thread by borrowing.
+    pub variables: Arc<HashMap<String, Value>>,
 }
 
 /// Whether a job can be activated at the logical instant `now`: it is created

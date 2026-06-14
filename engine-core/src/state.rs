@@ -6,6 +6,7 @@
 //! replaying the same events over a fresh [`State`] reconstructs it exactly.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::event::Event;
 use crate::model::{ElementId, ProcessDefinition, Value};
@@ -140,8 +141,11 @@ pub struct ProcessInstance {
     /// drained (all its inner tokens consumed) and to terminate a scope when an
     /// error boundary interrupts it.
     pub scopes: HashMap<Key, Key>,
-    /// Process variables (used by exclusive-gateway conditions).
-    pub variables: HashMap<String, Value>,
+    /// Process variables (used by exclusive-gateway conditions). Shared via `Arc`
+    /// so activating a job (which snapshots the instance's variables) is a cheap
+    /// refcount bump rather than a deep clone of the (up to 50 KB) decoded value
+    /// tree. A mutation (`VariablesUpdated`) copies-on-write via `Arc::make_mut`.
+    pub variables: Arc<HashMap<String, Value>>,
     /// For each open parallel-gateway join: how many incoming tokens have
     /// arrived so far.
     pub join_counts: HashMap<ElementId, usize>,
@@ -545,7 +549,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     created_at: *created_at,
                     active: HashMap::new(),
                     scopes: HashMap::new(),
-                    variables: variables.clone(),
+                    variables: Arc::new(variables.clone()),
                     join_counts: HashMap::new(),
                     join_instances: HashMap::new(),
                     incidents: Vec::new(),
@@ -558,8 +562,9 @@ pub fn apply(state: &mut State, event: &Event) {
             variables,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                let map = Arc::make_mut(&mut instance.variables);
                 for (k, v) in variables {
-                    instance.variables.insert(k.clone(), v.clone());
+                    map.insert(k.clone(), v.clone());
                 }
             }
         }
