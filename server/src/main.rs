@@ -9,6 +9,7 @@
 //! (see scripts/gen-stub-server.py). This file owns only the stable pieces: the
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
+mod engine_actor;
 mod journal;
 mod query;
 mod readstore;
@@ -16,8 +17,8 @@ mod stub_impls;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -27,11 +28,12 @@ use nanobpm_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, IncidentKind, IncidentState, ProcessBuilder,
+    ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, ProcessBuilder,
     ProcessInstanceState, Value,
 };
 
-use crate::journal::Journal;
+use crate::engine_actor::EngineHandle;
+use crate::journal::{Commit, Journal};
 use crate::readstore::ReadStore;
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
@@ -45,18 +47,19 @@ const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
 /// The single type that implements every generated API trait.
 ///
 /// It owns an embedded [`Engine`] (the `engine-core` crate), wrapped in a
-/// durable [`Journal`], behind a read/write lock. The engine is a single writer,
-/// so mutating operations take the write lock (serialized), while the read-only
-/// `search*`/`get*` projections take the read lock and therefore run
-/// concurrently across cores. Most operations are still 501 stubs (see
-/// the generated `stub_impls` module); a few — process-instance creation, job
-/// activation, and job completion — are wired to the engine via the inherent
-/// methods below and routed from the stub generator's override table. Every
-/// durable command is appended to the journal so engine state survives a
-/// restart.
+/// durable [`Journal`], driven through a single-writer [`EngineHandle`] actor.
+/// The engine is a single writer, so every mutating command is serialized onto
+/// the actor's dedicated thread (see [`engine_actor`]); read-only
+/// `search*`/`get*` projections are answered from the [`ReadStore`] and never
+/// touch the engine thread, so they run concurrently across cores. Most
+/// operations are still 501 stubs (see the generated `stub_impls` module); a
+/// few — process-instance creation, job activation, and job completion — are
+/// wired to the engine via the inherent methods below and routed from the stub
+/// generator's override table. Every durable command is appended to the journal
+/// so engine state survives a restart.
 #[derive(Clone)]
 pub struct ServerImpl {
-    journal: Arc<RwLock<Journal>>,
+    engine: EngineHandle,
     /// The read model. All `search*`/`get*` queries are answered from here
     /// (eventually consistent), never from hot engine state.
     store: Arc<ReadStore>,
@@ -102,7 +105,7 @@ impl ServerImpl {
                 .expect("deploy demo process");
         }
         Self {
-            journal: Arc::new(RwLock::new(journal)),
+            engine: EngineHandle::spawn(journal),
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
@@ -140,7 +143,7 @@ fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
     spawn_exporter(
         rx,
         store,
-        server.journal.clone(),
+        server.engine.clone(),
         server.instances_changed.clone(),
     );
     server
@@ -148,13 +151,13 @@ fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
 
 /// Spawns the read-model exporter thread. It drains the channel (batching every
 /// queued command's events), projects the batch into the read store, then evicts
-/// any now-completed instances from hot engine state under the journal write
-/// lock. The thread exits when the channel closes (all `ServerImpl` clones and
-/// the journal are dropped).
+/// any now-completed instances from hot engine state via the engine actor. The
+/// thread exits when the channel closes (all `ServerImpl` clones and the journal
+/// are dropped).
 fn spawn_exporter(
     rx: mpsc::Receiver<Vec<Event>>,
     store: Arc<ReadStore>,
-    journal: Arc<RwLock<Journal>>,
+    engine: EngineHandle,
     instances_changed: Arc<tokio::sync::Notify>,
 ) {
     std::thread::Builder::new()
@@ -177,12 +180,14 @@ fn spawn_exporter(
                 // state. notify_waiters() is a no-op when nobody is waiting.
                 instances_changed.notify_waiters();
                 if !completed.is_empty() {
-                    let mut journal = journal.write().expect("engine lock poisoned");
-                    // One pass over hot state for the whole batch; no per-batch
-                    // shrink_to_fit (reallocating every map under the global
-                    // write lock on each completion batch needlessly throttles
-                    // command throughput — capacity is reused by new instances).
-                    journal.evict_instances(&completed);
+                    // Reclaim hot state for the whole batch in one pass on the
+                    // engine thread; no per-batch shrink_to_fit (reallocating
+                    // every map needlessly throttles command throughput —
+                    // capacity is reused by new instances). Fire-and-forget: the
+                    // exporter has no reply to wait for.
+                    engine.spawn_job(move |journal| {
+                        journal.evict_instances(&completed);
+                    });
                 }
             }
         })
@@ -229,12 +234,9 @@ impl ServerImpl {
         // concurrent creates is irrelevant for an approximate watermark.
         if let Some(limit) = self.backpressure_limit {
             let inflight = self
-                .journal
-                .read()
-                .expect("engine lock poisoned")
-                .state()
-                .instances
-                .len();
+                .engine
+                .with(|journal| journal.state().instances.len())
+                .await;
             if inflight >= limit {
                 return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                     "RESOURCE_EXHAUSTED",
@@ -260,93 +262,121 @@ impl ServerImpl {
         };
         let await_completion = await_completion.unwrap_or(false);
 
-        // Apply under the engine write lock inside a scope so the (non-Send) lock
-        // guard is dropped before we await. The block yields the success fields
-        // plus the commit to await; error paths return early (nothing written).
-        let (process_id, version, definition_key, instance_key, sync_completed, commit) = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
+        // Decode the request variables off the engine thread so the 50 KB JSON →
+        // engine `Value` conversion runs in parallel rather than serially on the
+        // single command thread. The variables come from the request body and so
+        // are available for both creation variants without touching the engine.
+        let variables = match body {
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                b.variables.as_ref()
+            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                b.variables.as_ref()
+            }
+        }
+        .map(from_object_map)
+        .unwrap_or_default();
 
-            // The engine starts processes by BPMN process id. A creation-by-key
-            // request is resolved to its process id by looking up the deployed
-            // definition whose key matches; an unknown key is rejected as invalid
-            // input (the create endpoint has no 404 variant).
-            let (process_id, variables) = match body {
-                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
-                    b,
-                ) => (b.process_definition_id.clone(), b.variables.as_ref()),
-                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
-                    b,
-                ) => {
-                    let requested = &b.process_definition_key.0;
-                    match engine
-                        .state()
-                        .processes
-                        .values()
-                        .find(|d| d.key.to_string() == *requested)
-                    {
-                        Some(d) => (d.definition.id.clone(), b.variables.as_ref()),
-                        None => {
-                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                "Process not found",
-                                400,
-                                format!("No deployed process with key '{requested}'."),
-                            )));
+        // Only the by-key variant needs the engine (to resolve a deployed key to a
+        // process id); capture the lookup inputs the engine thread will need.
+        let (by_id, by_key) = match body {
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                (Some(b.process_definition_id.clone()), None)
+            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                (None, Some(b.process_definition_key.0.clone()))
+            }
+        };
+
+        // Run the command on the engine thread. The closure yields the success
+        // fields plus the commit to await, or a ready `Resp` for an error path
+        // (nothing written). Both arms produce `Send` values.
+        type CreateOk = (String, i32, String, u64, bool, Commit);
+        let outcome: Result<CreateOk, Box<Resp>> = self
+            .engine
+            .with(move |engine| {
+                // The engine starts processes by BPMN process id. A creation-by-key
+                // request is resolved to its process id by looking up the deployed
+                // definition whose key matches; an unknown key is rejected as
+                // invalid input (the create endpoint has no 404 variant).
+                let process_id = match (by_id, by_key) {
+                    (Some(id), _) => id,
+                    (None, Some(requested)) => {
+                        match engine
+                            .state()
+                            .processes
+                            .values()
+                            .find(|d| d.key.to_string() == requested)
+                        {
+                            Some(d) => d.definition.id.clone(),
+                            None => {
+                                return Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(
+                                    problem(
+                                        "Process not found",
+                                        400,
+                                        format!("No deployed process with key '{requested}'."),
+                                    ),
+                                )));
+                            }
                         }
                     }
-                }
-            };
-            // Seed the root variable scope with any variables on the request.
-            let variables = variables.map(from_object_map).unwrap_or_default();
+                    (None, None) => unreachable!("one creation variant is always set"),
+                };
 
-            match engine.apply_command_at(
-                Command::create_instance_with(process_id.clone(), variables),
-                now_millis(),
-            ) {
-                Ok((events, commit)) => {
-                    let instance_key = events
-                        .iter()
-                        .find_map(Event::instance_key)
-                        .expect("created instance has a key");
-                    // Project the real deployed key and version now that the
-                    // instance exists, so by-id and by-key requests report the
-                    // same definition identity.
-                    let (definition_key, version) = engine
-                        .state()
-                        .processes
-                        .get(&process_id)
-                        .map(|d| (d.key.to_string(), d.version))
-                        .unwrap_or_else(|| (process_id.clone(), 1));
-                    // An auto-completing process (no wait states) finishes
-                    // synchronously within this create command; a process that
-                    // parks on a job/timer/etc. is still running.
-                    let sync_completed = engine.engine().is_completed(instance_key);
-                    (
-                        process_id,
-                        version,
-                        definition_key,
-                        instance_key,
-                        sync_completed,
-                        commit,
-                    )
-                }
-                Err(EngineError::ProcessNotFound { process_id }) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Process not found",
-                        400,
-                        format!("No deployed process with id '{process_id}'."),
-                    )));
-                }
-                Err(e) => {
-                    return Ok(
+                match engine.apply_command_at(
+                    Command::create_instance_with(process_id.clone(), variables),
+                    now_millis(),
+                ) {
+                    Ok((events, commit)) => {
+                        let instance_key = events
+                            .iter()
+                            .find_map(Event::instance_key)
+                            .expect("created instance has a key");
+                        // Project the real deployed key and version now that the
+                        // instance exists, so by-id and by-key requests report the
+                        // same definition identity.
+                        let (definition_key, version) = engine
+                            .state()
+                            .processes
+                            .get(&process_id)
+                            .map(|d| (d.key.to_string(), d.version))
+                            .unwrap_or_else(|| (process_id.clone(), 1));
+                        // An auto-completing process (no wait states) finishes
+                        // synchronously within this create command; a process that
+                        // parks on a job/timer/etc. is still running.
+                        let sync_completed = engine.engine().is_completed(instance_key);
+                        Ok((
+                            process_id,
+                            version,
+                            definition_key,
+                            instance_key,
+                            sync_completed,
+                            commit,
+                        ))
+                    }
+                    Err(EngineError::ProcessNotFound { process_id }) => {
+                        Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                            "Process not found",
+                            400,
+                            format!("No deployed process with id '{process_id}'."),
+                        ))))
+                    }
+                    Err(e) => Err(Box::new(
                         Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                             "Internal error",
                             500,
                             e.to_string(),
                         )),
-                    );
+                    )),
                 }
-            }
-        };
+            })
+            .await;
+
+        let (process_id, version, definition_key, instance_key, sync_completed, commit) =
+            match outcome {
+                Ok(fields) => fields,
+                Err(resp) => return Ok(*resp),
+            };
 
         // Block on durability before acknowledging: a returned 200 means the
         // create is fsynced.
@@ -481,10 +511,12 @@ impl ServerImpl {
             }
         };
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -536,10 +568,12 @@ impl ServerImpl {
             })
             .unwrap_or_default();
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
+            })
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -603,10 +637,12 @@ impl ServerImpl {
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
+            })
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -670,14 +706,17 @@ impl ServerImpl {
             Some(types::Nullable::Present(msg)) => msg.clone(),
             _ => String::new(),
         };
+        let body_error_code = body.error_code.clone();
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(
-                Command::throw_job_error(job_key, body.error_code.clone(), error_message),
-                now_millis(),
-            )
-        };
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(
+                    Command::throw_job_error(job_key, body_error_code, error_message),
+                    now_millis(),
+                )
+            })
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -744,10 +783,12 @@ impl ServerImpl {
             }
         };
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
+            })
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -806,10 +847,10 @@ impl ServerImpl {
             operation_reference,
         };
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(command, now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -870,10 +911,12 @@ impl ServerImpl {
 
         let variables = from_object_map(&body.variables);
 
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+            })
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -990,15 +1033,18 @@ impl ServerImpl {
             .map(from_object_map)
             .unwrap_or_default();
 
-        let (events, commit) = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine
-                .apply_command_at(
-                    Command::correlate_message_with(body.name.clone(), correlation_key, variables),
-                    now_millis(),
-                )
-                .expect("CorrelateMessage never fails")
-        };
+        let body_name = body.name.clone();
+        let (events, commit) = self
+            .engine
+            .with(move |engine| {
+                engine
+                    .apply_command_at(
+                        Command::correlate_message_with(body_name, correlation_key, variables),
+                        now_millis(),
+                    )
+                    .expect("CorrelateMessage never fails")
+            })
+            .await;
         let message_key = message_key_of(&events);
         commit.wait().await;
 
@@ -1029,15 +1075,18 @@ impl ServerImpl {
             .map(from_object_map)
             .unwrap_or_default();
 
-        let (events, commit) = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine
-                .apply_command_at(
-                    Command::correlate_message_with(body.name.clone(), correlation_key, variables),
-                    now_millis(),
-                )
-                .expect("CorrelateMessage never fails")
-        };
+        let body_name = body.name.clone();
+        let (events, commit) = self
+            .engine
+            .with(move |engine| {
+                engine
+                    .apply_command_at(
+                        Command::correlate_message_with(body_name, correlation_key, variables),
+                        now_millis(),
+                    )
+                    .expect("CorrelateMessage never fails")
+            })
+            .await;
         let message_key = message_key_of(&events);
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
@@ -1419,10 +1468,10 @@ impl ServerImpl {
             assignee,
             allow_override,
         };
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(command, now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -1499,10 +1548,10 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let command = Command::complete_user_task_with(user_task_key, variables);
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(command, now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -1603,10 +1652,10 @@ impl ServerImpl {
         };
 
         let command = Command::unassign_user_task(user_task_key);
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(command, now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -1701,10 +1750,10 @@ impl ServerImpl {
         };
 
         let command = Command::update_user_task(user_task_key, engine_changeset);
-        let result = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            engine.apply_command_at(command, now_millis())
-        };
+        let result = self
+            .engine
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -2004,18 +2053,22 @@ impl ServerImpl {
             }
         }
 
-        let (events, commit) = {
-            let mut engine = self.journal.write().expect("engine lock poisoned");
-            match engine.apply_command(Command::DeployResources(processes)) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+        let deploy_result: Result<(Vec<Event>, Commit), Box<Resp>> = self
+            .engine
+            .with(move |engine| {
+                match engine.apply_command(Command::DeployResources(processes)) {
+                    Ok(pair) => Ok(pair),
+                    Err(e) => Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(problem(
                         "Invalid deployment",
                         400,
                         e.to_string(),
-                    )));
+                    )))),
                 }
-            }
+            })
+            .await;
+        let (events, commit) = match deploy_result {
+            Ok(pair) => pair,
+            Err(resp) => return Ok(*resp),
         };
 
         let mut deployment_key = String::new();
@@ -2090,13 +2143,15 @@ impl ServerImpl {
         let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
 
         loop {
-            let jobs = self.try_activate(
-                &job_type,
-                &worker,
-                max_jobs,
-                timeout,
-                fetch_variable.as_deref(),
-            );
+            let jobs = self
+                .try_activate(
+                    &job_type,
+                    &worker,
+                    max_jobs,
+                    timeout,
+                    fetch_variable.as_deref(),
+                )
+                .await;
             if !jobs.is_empty() {
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
@@ -2126,11 +2181,13 @@ impl ServerImpl {
         }
     }
 
-    /// Takes the engine write lock, activates up to `max_jobs` jobs of `job_type`,
-    /// and maps them into the generated REST result type. Synchronous: never
-    /// `.await`s while holding the engine lock. Activation mutates volatile lease
-    /// state, so it takes the write lock even though nothing is journaled.
-    fn try_activate(
+    /// Activates up to `max_jobs` jobs of `job_type` on the engine thread and maps
+    /// them into the generated REST result type. Activation mutates volatile lease
+    /// state, so it runs on the engine actor even though nothing is journaled. The
+    /// engine thread does only the cheap work — leasing the jobs and resolving each
+    /// one's definition identity — while the 50 KB variable encoding runs here, off
+    /// the single engine thread, in parallel across cores.
+    async fn try_activate(
         &self,
         job_type: &str,
         worker: &str,
@@ -2138,12 +2195,43 @@ impl ServerImpl {
         timeout: u64,
         fetch_variable: Option<&[String]>,
     ) -> Vec<models::ActivatedJobResult> {
-        let mut engine = self.journal.write().expect("engine lock poisoned");
-        let now = now_millis();
-        let activated = engine.activate_jobs(job_type, worker, max_jobs, timeout, now);
+        let job_type = job_type.to_string();
+        let worker = worker.to_string();
+        let activated: Vec<ActivatedJobWithIdentity> = self
+            .engine
+            .with(move |engine| {
+                let now = now_millis();
+                engine
+                    .activate_jobs(&job_type, &worker, max_jobs, timeout, now)
+                    .into_iter()
+                    .map(|job| {
+                        let (process_id, version, process_definition_key) = engine
+                            .instance(job.instance_key)
+                            .and_then(|instance| {
+                                engine.state().processes.get(&instance.process_id)
+                            })
+                            .map(|deployed| {
+                                (
+                                    deployed.definition.id.clone(),
+                                    deployed.version,
+                                    deployed.key.to_string(),
+                                )
+                            })
+                            .unwrap_or_else(|| (String::new(), 1, String::new()));
+                        ActivatedJobWithIdentity {
+                            job,
+                            process_id,
+                            version,
+                            process_definition_key,
+                        }
+                    })
+                    .collect()
+            })
+            .await;
+
         activated
             .into_iter()
-            .map(|job| activated_job_result(engine.engine(), job, fetch_variable))
+            .map(|activated| activated_job_result(activated, fetch_variable))
             .collect()
     }
 }
@@ -2465,22 +2553,27 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
 /// resolving process-definition identity from engine state. When `fetch_variable`
 /// is `Some`, only the named variables are returned; `None` returns all of the
 /// job's visible variables.
-fn activated_job_result(
-    engine: &Engine,
+/// An activated job paired with its resolved process-definition identity, looked
+/// up on the engine thread so the off-thread response mapper needs no engine
+/// access. The job still owns its variable snapshot, which is encoded to JSON in
+/// [`activated_job_result`] off the single engine thread.
+struct ActivatedJobWithIdentity {
     job: ActivatedJob,
+    process_id: String,
+    version: i32,
+    process_definition_key: String,
+}
+
+fn activated_job_result(
+    activated: ActivatedJobWithIdentity,
     fetch_variable: Option<&[String]>,
 ) -> models::ActivatedJobResult {
-    let (process_id, version, process_definition_key) = engine
-        .instance(job.instance_key)
-        .and_then(|instance| engine.state().processes.get(&instance.process_id))
-        .map(|deployed| {
-            (
-                deployed.definition.id.clone(),
-                deployed.version,
-                deployed.key.to_string(),
-            )
-        })
-        .unwrap_or_else(|| (String::new(), 1, String::new()));
+    let ActivatedJobWithIdentity {
+        job,
+        process_id,
+        version,
+        process_definition_key,
+    } = activated;
 
     let variables = match fetch_variable {
         Some(names) => job
@@ -2738,12 +2831,12 @@ async fn main() {
 
             // The read model now has every completed instance, so shed them from
             // hot engine state to bound memory.
-            {
-                let mut journal = server.journal.write().expect("engine lock poisoned");
-                let evicted = journal.evict_completed();
-                if evicted > 0 {
-                    tracing::info!("evicted {evicted} completed instance(s) from hot state");
-                }
+            let evicted = server
+                .engine
+                .with(|journal| journal.evict_completed())
+                .await;
+            if evicted > 0 {
+                tracing::info!("evicted {evicted} completed instance(s) from hot state");
             }
 
             if recovered {
@@ -2769,7 +2862,7 @@ async fn main() {
 
     // Capture handles for the background tick before `server` is moved into the
     // router.
-    let tick_journal = server.journal.clone();
+    let tick_engine = server.engine.clone();
     let tick_jobs_available = server.jobs_available.clone();
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
@@ -2784,19 +2877,20 @@ async fn main() {
     // (journaled); lock expiry is volatile (not journaled). Wakes any long-polling
     // activateJobs when a tick produced events (a fired timer may create jobs).
     {
-        let journal = tick_journal;
+        let engine = tick_engine;
         let jobs_available = tick_jobs_available;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
                 interval.tick().await;
                 let now = now_millis();
-                let produced = {
-                    let mut journal = journal.write().expect("engine lock poisoned");
-                    let (fired, _commit) = journal.trigger_timers(now);
-                    journal.expire_jobs(now);
-                    !fired.is_empty()
-                };
+                let produced = engine
+                    .with(move |journal| {
+                        let (fired, _commit) = journal.trigger_timers(now);
+                        journal.expire_jobs(now);
+                        !fired.is_empty()
+                    })
+                    .await;
                 if produced {
                     jobs_available.notify_waiters();
                 }
