@@ -45,15 +45,69 @@ impl EngineHandle {
     /// kill.
     pub fn spawn(mut journal: Journal) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        let profile = std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some();
         thread::Builder::new()
             .name("nanobpmn-engine".into())
             .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    job(&mut journal);
+                if profile {
+                    Self::run_profiled(rx, &mut journal);
+                } else {
+                    while let Ok(job) = rx.recv() {
+                        job(&mut journal);
+                    }
                 }
             })
             .expect("spawn engine thread");
         Self { tx }
+    }
+
+    /// Command loop with utilization profiling. Times each `recv` (idle, queue
+    /// empty = actor starved) and each job execution (busy). Every reporting
+    /// window it logs jobs/s and the busy fraction, so we can tell whether the
+    /// single writer is the bottleneck (busy≈100%) or whether throughput is
+    /// limited upstream of it (busy≪100% = latency/contention/client bound).
+    fn run_profiled(rx: mpsc::Receiver<Job>, journal: &mut Journal) {
+        use std::time::{Duration, Instant};
+        const WINDOW: Duration = Duration::from_secs(5);
+
+        let mut busy = Duration::ZERO;
+        let mut idle = Duration::ZERO;
+        let mut jobs: u64 = 0;
+        let mut window_start = Instant::now();
+
+        loop {
+            let before_recv = Instant::now();
+            let Ok(job) = rx.recv() else { break };
+            idle += before_recv.elapsed();
+
+            let before_job = Instant::now();
+            job(journal);
+            busy += before_job.elapsed();
+            jobs += 1;
+
+            let elapsed = window_start.elapsed();
+            if elapsed >= WINDOW {
+                let total = busy + idle;
+                let busy_pct = if total.is_zero() {
+                    0.0
+                } else {
+                    busy.as_secs_f64() / total.as_secs_f64() * 100.0
+                };
+                let jps = jobs as f64 / elapsed.as_secs_f64();
+                let avg_us = if jobs > 0 {
+                    busy.as_micros() as f64 / jobs as f64
+                } else {
+                    0.0
+                };
+                tracing::info!(
+                    "actor: {jps:.0} jobs/s, busy {busy_pct:.1}%, avg {avg_us:.1}us/job ({jobs} jobs/window)"
+                );
+                busy = Duration::ZERO;
+                idle = Duration::ZERO;
+                jobs = 0;
+                window_start = Instant::now();
+            }
+        }
     }
 
     /// Runs `f` on the engine thread and awaits its result. The closure receives
