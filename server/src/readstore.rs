@@ -363,12 +363,13 @@ impl ReadStore {
     /// transaction and advances `exported_position` by `events.len()`. Returns
     /// the keys of instances that completed in this batch, so the caller can
     /// evict them from hot engine state. Projection is idempotent, so replaying
-    /// an overlapping prefix is safe.
-    pub fn export(&self, events: &[Event]) -> rusqlite::Result<Vec<Key>> {
+    /// an overlapping prefix is safe. Takes event references so a caller batching
+    /// several `Arc<Vec<Event>>` can project them without deep-copying payloads.
+    pub fn export(&self, events: &[&Event]) -> rusqlite::Result<Vec<Key>> {
         let mut conn = self.conn.lock().expect("read store poisoned");
         let tx = conn.transaction()?;
         let mut completed = Vec::new();
-        for event in events {
+        for &event in events {
             if let Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } = event
             {

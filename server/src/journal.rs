@@ -19,6 +19,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -71,9 +72,12 @@ pub struct Journal {
     /// goes away (matters for synchronous callers that never await the commit).
     writer_thread: Option<JoinHandle<()>>,
     /// Channel to the read-model exporter thread, if one is wired. Every command's
-    /// journaled events are forwarded here (under the engine write lock, so the
-    /// exporter sees them in command order) to be projected into the read store.
-    exporter: Option<Sender<Vec<Event>>>,
+    /// journaled events are forwarded here (in command order: the actor applies
+    /// commands serially) to be projected into the read store. The events are
+    /// shared with the command's caller via `Arc`, so forwarding them costs only a
+    /// refcount bump — the 50 KB variable payloads are never deep-copied on the
+    /// single command thread.
+    exporter: Option<Sender<Arc<Vec<Event>>>>,
     /// `true` when the journal started with no prior log, so the host knows it
     /// should seed any initial deployments.
     fresh: bool,
@@ -180,7 +184,7 @@ impl Journal {
 
     /// Wires the read-model exporter channel. Set before any command is applied
     /// (including demo seeding) so every journaled event is projected.
-    pub fn set_exporter(&mut self, exporter: Sender<Vec<Event>>) {
+    pub fn set_exporter(&mut self, exporter: Sender<Arc<Vec<Event>>>) {
         self.exporter = Some(exporter);
     }
 
@@ -202,19 +206,22 @@ impl Journal {
         self.fresh
     }
 
-    /// Serializes `events` and hands them to the background writer, returning a
-    /// [`Commit`] that resolves once they are fsynced. Empty batches and
-    /// in-memory journals are already durable, so they return a ready commit.
-    fn persist(&self, events: &[Event]) -> Commit {
+    /// Serializes `events` for the durable writer and forwards them to the
+    /// read-model exporter, returning a [`Commit`] that resolves once they are
+    /// fsynced. The events are shared via `Arc`, so the exporter handoff is a
+    /// refcount bump rather than a deep copy of the (up to 50 KB) payloads — the
+    /// single command thread never clones them. Empty batches and in-memory
+    /// journals are already durable, so they return a ready commit.
+    fn persist(&self, events: &Arc<Vec<Event>>) -> Commit {
         if events.is_empty() {
             return Commit::ready();
         }
 
-        // Forward to the read-model exporter (in command order: this runs under
-        // the engine write lock). Independent of disk persistence, so the
-        // in-memory journal still feeds an in-memory read store.
+        // Forward to the read-model exporter in command order (the actor applies
+        // commands serially). Independent of disk persistence, so the in-memory
+        // journal still feeds an in-memory read store. `Arc::clone` is cheap.
         if let Some(exporter) = self.exporter.as_ref() {
-            let _ = exporter.send(events.to_vec());
+            let _ = exporter.send(Arc::clone(events));
         }
 
         let Some(writer) = self.writer.as_ref() else {
@@ -222,7 +229,7 @@ impl Journal {
         };
 
         let mut bytes = Vec::new();
-        for event in events {
+        for event in events.iter() {
             let line = serde_json::to_string(event).expect("event serializes");
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
@@ -238,23 +245,26 @@ impl Journal {
     }
 
     /// Applies a durable command at logical instant `now`, journaling its events
-    /// on success. Returns the events and a [`Commit`] the caller should await
-    /// (outside any lock) before acknowledging the request. Mirrors
-    /// [`Engine::apply_command_at`].
+    /// on success. Returns the events (shared via `Arc` with the read-model
+    /// exporter) and a [`Commit`] the caller should await before acknowledging the
+    /// request. Mirrors [`Engine::apply_command_at`].
     pub fn apply_command_at(
         &mut self,
         command: Command,
         now: u64,
-    ) -> Result<(Vec<Event>, Commit), EngineError> {
-        let events = self.engine.apply_command_at(command, now)?;
+    ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let commit = self.persist(&events);
         Ok((events, commit))
     }
 
     /// Applies a durable command using the engine's current clock, journaling its
     /// events on success. Mirrors [`Engine::apply_command`].
-    pub fn apply_command(&mut self, command: Command) -> Result<(Vec<Event>, Commit), EngineError> {
-        let events = self.engine.apply_command(command)?;
+    pub fn apply_command(
+        &mut self,
+        command: Command,
+    ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
         Ok((events, commit))
     }
@@ -277,8 +287,8 @@ impl Journal {
     /// events (timers are durable business facts). Mirrors
     /// [`Engine::trigger_timers`]; returns the events produced (empty if none
     /// were due) and their [`Commit`].
-    pub fn trigger_timers(&mut self, now: u64) -> (Vec<Event>, Commit) {
-        let events = self.engine.trigger_timers(now);
+    pub fn trigger_timers(&mut self, now: u64) -> (Arc<Vec<Event>>, Commit) {
+        let events = Arc::new(self.engine.trigger_timers(now));
         let commit = self.persist(&events);
         (events, commit)
     }

@@ -137,7 +137,7 @@ impl Default for ServerImpl {
 /// projected; the thread is spawned after so it can hold the server's journal
 /// handle for hot-state eviction.
 fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
-    let (tx, rx) = mpsc::channel::<Vec<Event>>();
+    let (tx, rx) = mpsc::channel::<Arc<Vec<Event>>>();
     journal.set_exporter(tx);
     let server = ServerImpl::new(journal, store.clone());
     spawn_exporter(
@@ -153,9 +153,10 @@ fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
 /// queued command's events), projects the batch into the read store, then evicts
 /// any now-completed instances from hot engine state via the engine actor. The
 /// thread exits when the channel closes (all `ServerImpl` clones and the journal
-/// are dropped).
+/// are dropped). Events arrive as `Arc<Vec<Event>>` shared with the command
+/// thread, so projecting them costs no deep copy of the 50 KB payloads.
 fn spawn_exporter(
-    rx: mpsc::Receiver<Vec<Event>>,
+    rx: mpsc::Receiver<Arc<Vec<Event>>>,
     store: Arc<ReadStore>,
     engine: EngineHandle,
     instances_changed: Arc<tokio::sync::Notify>,
@@ -164,11 +165,14 @@ fn spawn_exporter(
         .name("nanobpmn-exporter".into())
         .spawn(move || {
             while let Ok(first) = rx.recv() {
-                let mut batch = first;
+                let mut batch = vec![first];
                 while let Ok(next) = rx.try_recv() {
-                    batch.extend(next);
+                    batch.push(next);
                 }
-                let completed = match store.export(&batch) {
+                // Borrow every command's events as a flat slice of references —
+                // the payloads stay in their original `Arc`s, never copied here.
+                let refs: Vec<&Event> = batch.iter().flat_map(|events| events.iter()).collect();
+                let completed = match store.export(&refs) {
                     Ok(keys) => keys,
                     Err(e) => {
                         tracing::error!("read-model export failed: {e}");
@@ -2053,7 +2057,7 @@ impl ServerImpl {
             }
         }
 
-        let deploy_result: Result<(Vec<Event>, Commit), Box<Resp>> = self
+        let deploy_result: Result<(Arc<Vec<Event>>, Commit), Box<Resp>> = self
             .engine
             .with(move |engine| {
                 match engine.apply_command(Command::DeployResources(processes)) {
@@ -2073,7 +2077,7 @@ impl ServerImpl {
 
         let mut deployment_key = String::new();
         let mut deployments = Vec::new();
-        for event in &events {
+        for event in events.iter() {
             if let Event::ProcessDeployed {
                 deployment_key: dk,
                 process_definition_key,
@@ -2818,8 +2822,9 @@ async fn main() {
                 pos = 0;
             }
             if pos < events.len() {
+                let refs: Vec<&Event> = events[pos..].iter().collect();
                 store
-                    .export(&events[pos..])
+                    .export(&refs)
                     .expect("catch up read model from journal");
             }
 
