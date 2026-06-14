@@ -69,6 +69,12 @@ pub struct ServerImpl {
     /// a terminal state (the exporter is the single point through which all
     /// completion/termination events flow).
     instances_changed: Arc<tokio::sync::Notify>,
+    /// Optional backpressure watermark: when set, `createProcessInstance` rejects
+    /// new work with `503 RESOURCE_EXHAUSTED` once the number of in-flight
+    /// (un-evicted) process instances in hot engine state reaches this limit.
+    /// `None` disables backpressure (the engine accepts work unboundedly).
+    /// Configured by `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`.
+    backpressure_limit: Option<usize>,
 }
 
 impl ServerImpl {
@@ -100,6 +106,16 @@ impl ServerImpl {
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
+            backpressure_limit: {
+                let limit = backpressure_limit_from_env();
+                if let Some(n) = limit {
+                    tracing::info!(
+                        "backpressure enabled: rejecting createProcessInstance with 503 \
+                         RESOURCE_EXHAUSTED at >= {n} in-flight instances"
+                    );
+                }
+                limit
+            },
         }
     }
 }
@@ -183,6 +199,17 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
     models::ProblemDetail::new(title.to_string(), status, detail, String::new())
 }
 
+/// Reads the backpressure watermark from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`.
+/// A positive integer caps the number of in-flight process instances before
+/// `createProcessInstance` starts returning `503 RESOURCE_EXHAUSTED`; an absent,
+/// zero, or unparseable value disables backpressure.
+fn backpressure_limit_from_env() -> Option<usize> {
+    std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -191,6 +218,34 @@ impl ServerImpl {
         body: &models::ProcessInstanceCreationInstruction,
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
+
+        // Backpressure: when a watermark is configured, reject new work once hot
+        // engine state already holds `limit` in-flight (un-evicted) instances.
+        // This bounds work-in-progress so the producer converges to the worker
+        // drain rate instead of growing an unbounded backlog. Mirrors Zeebe: the
+        // 503 carries a `RESOURCE_EXHAUSTED` title, which the client SDK reads as
+        // a backpressure signal and answers with a retry backoff. A read lock is
+        // cheap and runs concurrently with other reads; the small race against
+        // concurrent creates is irrelevant for an approximate watermark.
+        if let Some(limit) = self.backpressure_limit {
+            let inflight = self
+                .journal
+                .read()
+                .expect("engine lock poisoned")
+                .state()
+                .instances
+                .len();
+            if inflight >= limit {
+                return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "RESOURCE_EXHAUSTED",
+                    503,
+                    format!(
+                        "Backpressure: {inflight} in-flight process instances at or above the \
+                         configured limit of {limit}. Retry after a backoff."
+                    ),
+                )));
+            }
+        }
 
         // Pull the await-completion controls (shared by both creation variants).
         // When `awaitCompletion` is set, the request blocks until the instance

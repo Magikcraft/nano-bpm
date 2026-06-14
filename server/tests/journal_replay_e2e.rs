@@ -98,13 +98,23 @@ impl ServerProcess {
     /// reserve-then-rebind race. Output is otherwise suppressed to keep test
     /// logs clean.
     fn boot(journal: &Path) -> Self {
-        let mut child = Command::new(SERVER_BIN)
+        Self::boot_with_env(journal, &[])
+    }
+
+    /// Like [`boot`](Self::boot) but sets additional environment variables on the
+    /// server process, so tests can exercise env-gated behaviour (e.g. the
+    /// backpressure watermark) against the real binary.
+    fn boot_with_env(journal: &Path, env: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(SERVER_BIN);
+        command
             .env("NANOBPMN_JOURNAL", journal)
             .env("PORT", "0")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn server binary");
+            .stderr(Stdio::null());
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().expect("spawn server binary");
 
         let port = read_listening_port(&mut child);
         let server = Self { child, port };
@@ -1572,6 +1582,54 @@ fn feel_gateway_condition_routes_end_to_end() {
         Some(true),
         "amount > 100 should route to the completing branch: {body}"
     );
+
+    server.shutdown();
+}
+
+#[test]
+fn backpressure_rejects_creates_above_the_inflight_watermark() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Boot with a watermark of one in-flight instance. The seeded demo process
+    // parks each instance at a service task, so a created instance stays
+    // in-flight (un-evicted) and counts against the watermark.
+    let server = ServerProcess::boot_with_env(&journal, &[("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "1")]);
+
+    // First create succeeds: zero in-flight is below the limit.
+    let first = create_demo_instance(&server);
+    assert!(!first.is_empty(), "first create should mint a key");
+
+    // Second create is over the watermark (one in-flight >= limit of one), so
+    // the engine sheds load with a Zeebe-style 503 RESOURCE_EXHAUSTED.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(r#"{"processDefinitionId":"demo"}"#),
+    );
+    assert_eq!(status, 503, "over-watermark create must be rejected: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("503 body is a problem JSON");
+    assert_eq!(
+        json["title"].as_str(),
+        Some("RESOURCE_EXHAUSTED"),
+        "503 must carry the RESOURCE_EXHAUSTED backpressure title: {body}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn backpressure_is_disabled_by_default() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // With no watermark configured, creates never shed load regardless of how
+    // many instances are already parked in-flight.
+    let server = ServerProcess::boot(&journal);
+    for _ in 0..5 {
+        let key = create_demo_instance(&server);
+        assert!(!key.is_empty(), "create should always succeed without a watermark");
+    }
 
     server.shutdown();
 }
