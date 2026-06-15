@@ -412,6 +412,16 @@ AsyncAPI 3.1 description of every client/server frame, and
 `server/tests/command_stream_e2e.rs` for runnable examples of every frame
 exchange.
 
+### Node/TypeScript SDK
+
+[`clients/node-stream`](clients/node-stream) publishes **`@nanobpmn/sdk`**, a
+companion to `@camunda8/orchestration-cluster-api` that adds a typed
+command-stream client and a streaming job worker. The worker auto-detects the
+backend: it uses the command stream against nanobpmn and **falls back to Camunda
+REST polling** against a Camunda gateway, so the same handler code serves both.
+See [`clients/node-stream/README.md`](clients/node-stream/README.md).
+
+
 ## Two crates
 
 

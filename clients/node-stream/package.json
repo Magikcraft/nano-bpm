@@ -1,0 +1,47 @@
+{
+  "name": "@nanobpmn/sdk",
+  "version": "0.1.0",
+  "description": "Streaming SDK for the nanobpmn command-stream WebSocket, layered on @camunda8/orchestration-cluster-api. Adds a credit-coordinated command stream and a streaming job worker that auto-detects nanobpmn and falls back to REST polling against Camunda.",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@camunda8/orchestration-cluster-api": ">=10.0.0-alpha.0"
+  },
+  "peerDependenciesMeta": {
+    "@camunda8/orchestration-cluster-api": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.12",
+    "tsup": "^8.3.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "keywords": ["nanobpmn", "camunda", "bpmn", "websocket", "stream", "job-worker"],
+  "license": "SEE LICENSE IN ../../LICENSE"
+}
