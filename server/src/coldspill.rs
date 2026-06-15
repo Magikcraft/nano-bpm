@@ -38,6 +38,9 @@ struct ColdFacets {
     user_tasks: Vec<Key>,
     /// Keys of every incident the instance owns, for `ResolveIncident`.
     incidents: Vec<Key>,
+    /// Active element-instance (token) scope keys, for `SetVariables` targeting a
+    /// local scope rather than the instance root.
+    scopes: Vec<Key>,
 }
 
 /// A resident index from routing keys to the cold instance that owns them.
@@ -50,6 +53,7 @@ pub struct ColdIndex {
     by_timer: BTreeMap<u64, HashSet<Key>>,
     by_user_task: HashMap<Key, Key>,
     by_incident: HashMap<Key, Key>,
+    by_scope: HashMap<Key, Key>,
 }
 
 impl ColdIndex {
@@ -91,6 +95,10 @@ impl ColdIndex {
         for incident in &snapshot.incidents {
             self.by_incident.insert(incident.key, key);
             facets.incidents.push(incident.key);
+        }
+        for &scope in snapshot.instance.active.keys() {
+            self.by_scope.insert(scope, key);
+            facets.scopes.push(scope);
         }
 
         self.instances.insert(key, facets);
@@ -134,6 +142,9 @@ impl ColdIndex {
         for incident in facets.incidents {
             self.by_incident.remove(&incident);
         }
+        for scope in facets.scopes {
+            self.by_scope.remove(&scope);
+        }
     }
 
     /// Whether `key` is a cold instance.
@@ -159,6 +170,13 @@ impl ColdIndex {
     /// The cold instance owning `incident_key`, if any.
     pub fn instance_for_incident(&self, incident_key: Key) -> Option<Key> {
         self.by_incident.get(&incident_key).copied()
+    }
+
+    /// The cold instance owning element-instance scope `scope_key`, if any — for
+    /// a `SetVariables` addressing a local (token) scope rather than the instance
+    /// root.
+    pub fn instance_for_scope(&self, scope_key: Key) -> Option<Key> {
+        self.by_scope.get(&scope_key).copied()
     }
 
     /// Up to `limit` cold instances with an activatable job of `job_type`, oldest
@@ -298,5 +316,22 @@ mod tests {
         assert!(idx.instances_for_message("approve", "A").is_empty());
         assert!(idx.instances_due(10_000).is_empty());
         assert!(!idx.contains(300));
+    }
+
+    #[test]
+    fn routes_element_instance_scopes_for_set_variables() {
+        let mut idx = ColdIndex::default();
+        let mut snap = snapshot_with_job(400, 401, "work");
+        // an active token scope within the instance (the SetVariables target)
+        snap.instance.active.insert(450, "task".into());
+        idx.insert(&snap);
+
+        // both the instance root and the element-instance scope resolve to it
+        assert!(idx.contains(400));
+        assert_eq!(idx.instance_for_scope(450), Some(400));
+        assert_eq!(idx.instance_for_scope(999), None);
+
+        idx.remove(400);
+        assert_eq!(idx.instance_for_scope(450), None);
     }
 }

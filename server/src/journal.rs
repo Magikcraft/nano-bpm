@@ -274,8 +274,8 @@ impl Journal {
     /// unset or nothing relevant is cold (a few index lookups). Routing mirrors
     /// the engine's own: by job key (`CompleteJob`/`FailJob`/...), user-task key,
     /// incident key, message name+correlation (`CorrelateMessage`), timer due-time
-    /// (`TriggerTimers`), or the instance key itself (`CancelInstance`/
-    /// `SetVariables`).
+    /// (`TriggerTimers`), the instance key (`CancelInstance`), or an instance-root
+    /// or element-instance scope key (`SetVariables`).
     fn ensure_resident_for_command(&mut self, command: &Command) {
         let Some(cold) = self.cold.as_ref() else {
             return;
@@ -298,8 +298,13 @@ impl Journal {
                 targets.extend(cold.index.instance_for_incident(*incident_key));
             }
             Command::SetVariables { scope_key, .. } => {
+                // The scope may be the instance root or one of its active
+                // element-instance (token) scopes; both can address a cold
+                // instance and must page it back in before the update applies.
                 if cold.index.contains(*scope_key) {
                     targets.push(*scope_key);
+                } else {
+                    targets.extend(cold.index.instance_for_scope(*scope_key));
                 }
             }
             Command::CancelInstance { instance_key } => {
@@ -758,6 +763,41 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn set_variables_on_an_element_scope_rehydrates_a_cold_instance() {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = cold_journal();
+        let key = deploy_and_create(&mut journal);
+
+        // the active token scope at the service task — a valid SetVariables target
+        // that is NOT the instance root key
+        let scope_key = *journal
+            .instance(key)
+            .unwrap()
+            .active
+            .keys()
+            .find(|k| **k != key)
+            .expect("an element-instance scope");
+
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(journal.instance(key).is_none());
+
+        // SetVariables addresses the element scope: ensure_resident_for_command
+        // must route it back to the cold instance and page it in (else the engine
+        // would raise ScopeNotFound)
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("approved".to_string(), Value::Bool(true));
+        let (events, _) = journal
+            .apply_command(Command::set_variables(scope_key, vars))
+            .unwrap();
+        assert_eq!(journal.cold_count(), 0);
+        assert!(journal.instance(key).is_some());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::VariablesUpdated { instance_key, .. } if *instance_key == key)));
     }
 
     #[test]
