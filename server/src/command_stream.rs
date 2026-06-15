@@ -58,6 +58,12 @@ const HEARTBEAT_MS: u64 = 15_000;
 /// Max jobs leased to a single stream per dispatch tick, so a high-credit worker
 /// cannot starve its peers between round-robin rotations.
 const PER_STREAM_BATCH: usize = 64;
+/// Default job-lock duration applied when a `Subscribe` omits `timeout` (or sends
+/// a non-positive one). A zero lock makes every leased job instantly re-activatable
+/// (`deadline == now`), so the dispatcher re-pushes it on the next pass before the
+/// worker's completion lands — manifesting as duplicate delivery. Mirrors the SDK's
+/// `jobTimeoutMs` default so a lock is always meaningful regardless of the client.
+const DEFAULT_JOB_LOCK_MS: u64 = 60_000;
 /// Bound on the per-connection outbound frame buffer (slow-consumer guard).
 const OUTBOUND_CHANNEL_CAP: usize = 1024;
 
@@ -505,7 +511,7 @@ async fn handle_client_frame(
                         default_worker.to_string()
                     }
                 }),
-                timeout: timeout.unwrap_or(0),
+                timeout: timeout.filter(|&t| t > 0).unwrap_or(DEFAULT_JOB_LOCK_MS),
                 fetch_variable: fetch_variable.filter(|names| !names.is_empty()),
                 credits: AtomicI64::new(job_credits.max(0)),
             });

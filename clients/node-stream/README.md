@@ -77,7 +77,9 @@ delivery is **at-least-once**, so make handlers idempotent. A failed action ack
 `404`/`409` results (the job was already completed or reclaimed under
 at-least-once redelivery) are treated as benign and not surfaced. `jobTimeoutMs`
 (the activation lock; default `60_000`) bounds how long an in-flight job is held
-before it is eligible for redelivery.
+before it is eligible for redelivery. The server also enforces this: a subscribe
+with a null or non-positive timeout is clamped to a 60 s lock, so a job is never
+leased with a zero lock (which would re-dispatch it before the worker completes).
 
 ## Low-level command-stream client
 

@@ -200,6 +200,8 @@ multiplexes two interaction patterns over one socket: **demand/push** (jobs) and
 ### 13.4 Frame protocol (tagged union)
 Client→server:
 - `Subscribe { jobType, jobCredits, fetchVariable, timeout }` — opt into job push for a type
+  (`timeout` is the per-job activation lock in ms; null/non-positive applies a 60 s server
+  default so a job is never leased with a zero lock, which would re-dispatch it instantly)
 - `CreateInstance { corr, processDefinitionId|key, version, variables, awaitCompletion }`
 - `CompleteJob { corr, jobKey, variables }`
 - `FailJob { corr, jobKey, retries, retryBackoff, errorMessage }`

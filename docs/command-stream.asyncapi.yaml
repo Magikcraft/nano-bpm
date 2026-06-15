@@ -258,7 +258,12 @@ components:
           type: integer
           format: int64
           nullable: true
-          description: Job activation lock timeout in milliseconds.
+          description: >-
+            Job activation lock (in milliseconds) applied to every job pushed to
+            this subscription. A null or non-positive value is treated as unset
+            and the server applies a 60000 ms default — a zero lock would make
+            each leased job instantly re-activatable and cause duplicate
+            delivery before the worker completes it.
         worker:
           type: string
           nullable: true

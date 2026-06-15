@@ -147,6 +147,11 @@ impl Drop for ServerProcess {
 /// payload unchanged); server frames arrive unmasked.
 struct WsClient {
     stream: TcpStream,
+    /// Text frames read while awaiting a different frame type. A `Job` push can
+    /// race ahead of the `CommandResult` for the create that spawned it, so
+    /// `recv_until` must buffer (not discard) frames it isn't currently waiting
+    /// for, or a later `recv_until(&["job"])` would block forever.
+    buffered: std::collections::VecDeque<Value>,
 }
 
 impl WsClient {
@@ -175,7 +180,10 @@ impl WsClient {
             status_line.contains("101"),
             "expected 101 Switching Protocols, got: {status_line}"
         );
-        Self { stream }
+        Self {
+            stream,
+            buffered: std::collections::VecDeque::new(),
+        }
     }
 
     /// Sends a JSON value as a single masked text frame.
@@ -229,8 +237,17 @@ impl WsClient {
     }
 
     /// Reads frames until a JSON text frame whose `"type"` is one of `wanted`,
-    /// skipping heartbeats and any unrelated frames. Panics on timeout/close.
+    /// skipping heartbeats and buffering any other typed frame (so a frame read
+    /// here is still available to a later call). Panics on timeout/close.
     fn recv_until(&mut self, wanted: &[&str]) -> Value {
+        // A matching frame may already be buffered from an earlier call.
+        if let Some(pos) = self
+            .buffered
+            .iter()
+            .position(|v| wanted.contains(&v["type"].as_str().unwrap_or("")))
+        {
+            return self.buffered.remove(pos).expect("buffered frame present");
+        }
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             let (opcode, payload) = self.recv_frame();
@@ -242,8 +259,10 @@ impl WsClient {
                     if wanted.contains(&frame_type) {
                         return value;
                     }
-                    // Otherwise (welcome/submissionCredits/heartbeat/pressure/...)
-                    // keep reading until a wanted frame arrives.
+                    // Not what we're waiting for (welcome/submissionCredits/job/
+                    // heartbeat/pressure/...): buffer it so a later call can find
+                    // it instead of it being lost.
+                    self.buffered.push_back(value);
                 }
                 0x8 => panic!("server closed the connection while awaiting {wanted:?}"),
                 // Ping/pong/continuation: ignore.
@@ -255,6 +274,72 @@ impl WsClient {
 
     fn read_exact(&mut self, buf: &mut [u8]) {
         self.stream.read_exact(buf).expect("read ws bytes");
+    }
+
+    /// Waits up to `within` for a `job` frame, returning it (or `None` on
+    /// timeout/close). Skips unrelated frames. Used to assert the *absence* of a
+    /// duplicate redelivery: a single leased job must not be pushed again before
+    /// the worker completes it. Mutates the socket read timeout.
+    fn recv_job_within(&mut self, within: Duration) -> Option<Value> {
+        // A buffered job frame already counts as delivery within the window.
+        if let Some(pos) = self
+            .buffered
+            .iter()
+            .position(|v| v["type"].as_str() == Some("job"))
+        {
+            return self.buffered.remove(pos);
+        }
+        self.stream
+            .set_read_timeout(Some(within))
+            .expect("set read timeout");
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            match self.try_recv_frame() {
+                Some((0x1, payload)) => {
+                    let value: Value =
+                        serde_json::from_slice(&payload).expect("server frame is JSON");
+                    if value["type"].as_str() == Some("job") {
+                        return Some(value);
+                    }
+                }
+                Some((0x8, _)) | None => return None,
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
+    /// Like [`Self::recv_frame`] but returns `None` if a read times out or the
+    /// stream ends, instead of panicking.
+    fn try_recv_frame(&mut self) -> Option<(u8, Vec<u8>)> {
+        let mut header = [0u8; 2];
+        if self.stream.read_exact(&mut header).is_err() {
+            return None;
+        }
+        let opcode = header[0] & 0x0F;
+        let masked = header[1] & 0x80 != 0;
+        let mut len = (header[1] & 0x7F) as usize;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            self.stream.read_exact(&mut ext).ok()?;
+            len = u16::from_be_bytes(ext) as usize;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            self.stream.read_exact(&mut ext).ok()?;
+            len = u64::from_be_bytes(ext) as usize;
+        }
+        let mut mask = [0u8; 4];
+        if masked {
+            self.stream.read_exact(&mut mask).ok()?;
+        }
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).ok()?;
+        if masked {
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[i % 4];
+            }
+        }
+        Some((opcode, payload))
     }
 }
 
@@ -498,3 +583,51 @@ fn await_instance_rejects_an_invalid_key() {
     assert_eq!(err["corr"].as_u64(), Some(5));
     assert_eq!(err["status"].as_u64(), Some(404), "expected 404: {err}");
 }
+
+#[test]
+fn a_subscribe_without_a_timeout_does_not_redeliver_an_in_flight_job() {
+    // Regression: a `Subscribe` that omits `timeout` must apply a sane default
+    // job lock, not a 0ms lock. With a 0ms lock every leased job is instantly
+    // re-activatable (`deadline == now`), so the dispatcher re-pushes it on the
+    // next backstop tick before the worker completes it — surfacing as duplicate
+    // delivery. We subscribe without a timeout, take delivery of one job, and
+    // assert no second copy arrives across several backstop ticks.
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path(), &[]);
+
+    let mut ws = WsClient::connect(server.port);
+    ws.recv_until(&["welcome"]);
+
+    // Subscribe WITHOUT a `timeout` field (the regression trigger).
+    ws.send(&json!({
+        "type": "subscribe",
+        "jobType": DEMO_JOB_TYPE,
+        "jobCredits": 10,
+    }));
+
+    // Create a single instance; its one job should be pushed exactly once.
+    ws.send(&json!({
+        "type": "createInstance",
+        "corr": 1,
+        "processDefinitionId": "demo",
+    }));
+    assert_eq!(
+        ws.recv_until(&["commandResult"])["status"].as_u64(),
+        Some(200)
+    );
+
+    let first = ws.recv_until(&["job"]);
+    let job_key = first["job"]["jobKey"]
+        .as_str()
+        .expect("pushed job carries a key")
+        .to_string();
+
+    // Do NOT complete the job. Across ~5 backstop ticks (DISPATCH_TICK_MS=200ms),
+    // a correctly-locked job must not be redelivered.
+    let redelivered = ws.recv_job_within(Duration::from_millis(1200));
+    assert!(
+        redelivered.is_none(),
+        "job {job_key} was redelivered before completion (lock too short): {redelivered:?}"
+    );
+}
+
