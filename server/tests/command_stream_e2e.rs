@@ -415,3 +415,86 @@ fn a_malformed_frame_is_rejected_without_dropping_the_socket() {
     assert_eq!(ok["corr"].as_u64(), Some(99));
     assert_eq!(ok["status"].as_u64(), Some(200), "create failed: {ok}");
 }
+
+#[test]
+fn await_instance_recovers_completion_on_a_fresh_socket() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path(), &[]);
+
+    // A worker drains the demo job so the instance can complete.
+    let mut worker = WsClient::connect(server.port);
+    worker.recv_until(&["welcome"]);
+    worker.send(&json!({
+        "type": "subscribe",
+        "jobType": DEMO_JOB_TYPE,
+        "jobCredits": 10,
+    }));
+
+    // First socket creates an instance *without* awaiting, then "disconnects"
+    // (dropped below). It only keeps the processInstanceKey from the create ack —
+    // exactly what a client would persist for recovery.
+    let instance_key = {
+        let mut submitter = WsClient::connect(server.port);
+        submitter.recv_until(&["welcome"]);
+        submitter.send(&json!({
+            "type": "createInstance",
+            "corr": 1,
+            "processDefinitionId": "demo",
+        }));
+        let result = submitter.recv_until(&["commandResult"]);
+        assert_eq!(result["status"].as_u64(), Some(200));
+        result["body"]["processInstanceKey"]
+            .as_str()
+            .expect("create ack carries the instance key")
+            .to_string()
+        // submitter drops here, simulating a lost connection.
+    };
+
+    // Complete the job so the instance reaches a terminal state while the
+    // submitter is gone.
+    let job_frame = worker.recv_until(&["job"]);
+    let job_key = job_frame["job"]["jobKey"].as_str().unwrap().to_string();
+    worker.send(&json!({ "type": "completeJob", "corr": 1, "jobKey": job_key }));
+    assert_eq!(
+        worker.recv_until(&["commandResult"])["status"].as_u64(),
+        Some(200)
+    );
+
+    // A brand-new socket re-awaits by key and recovers the terminal outcome
+    // immediately (the read model is durable history).
+    let mut reconnect = WsClient::connect(server.port);
+    reconnect.recv_until(&["welcome"]);
+    reconnect.send(&json!({
+        "type": "awaitInstance",
+        "corr": 42,
+        "processInstanceKey": instance_key,
+    }));
+    let completed = reconnect.recv_until(&["instanceCompleted"]);
+    assert_eq!(completed["corr"].as_u64(), Some(42));
+    assert_eq!(
+        completed["processCompleted"].as_bool(),
+        Some(true),
+        "re-await should recover completion: {completed}"
+    );
+    assert_eq!(
+        completed["processInstanceKey"].as_str(),
+        Some(instance_key.as_str())
+    );
+}
+
+#[test]
+fn await_instance_rejects_an_invalid_key() {
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(&scratch.journal_path(), &[]);
+
+    let mut ws = WsClient::connect(server.port);
+    ws.recv_until(&["welcome"]);
+    ws.send(&json!({
+        "type": "awaitInstance",
+        "corr": 5,
+        "processInstanceKey": "not-a-key",
+    }));
+    let err = ws.recv_until(&["commandResult"]);
+    assert_eq!(err["corr"].as_u64(), Some(5));
+    assert_eq!(err["status"].as_u64(), Some(404), "expected 404: {err}");
+}

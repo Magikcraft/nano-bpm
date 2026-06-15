@@ -247,7 +247,94 @@ environment:
 | `NANOBPMN_JOURNAL=<file>` | Back-compat: selects the journal file; the database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`. |
 | *(neither set)* | Fully in-memory: an ephemeral journal and a `:memory:` read store. Nothing is persisted. |
 
+## Command stream (WebSocket)
+
+Alongside the REST API, the server exposes a single **bidirectional WebSocket**
+at `GET /command-stream` that multiplexes the whole client lifecycle — process
+creation *and* the full job lifecycle — onto one persistent, credit-coordinated
+socket. It funnels to the same engine command path as the REST handlers (the
+engine core is untouched), so it is purely a more efficient ingress: no
+per-request connection setup, no long-poll for jobs, and flow control by
+**credits** instead of `429`/`503` + client retry.
+
+Connect with an optional `worker` query parameter
+(`/command-stream?worker=my-worker`). Frames are **JSON text frames**, each a
+tagged union with a camelCase `"type"`. On connect the server sends a `welcome`
+(initial submission window + heartbeat cadence) followed by a `submissionCredits`
+grant. Idle sockets exchange `heartbeat` frames every 15 s.
+
+The stream carries **two credit lanes** over the one engine thread:
+
+- **Job push (demand/pull).** A client `subscribe`s to a job type with a credit
+  count; a single server-side dispatcher leases jobs **round-robin across all
+  subscribers** (reusing the REST activation + off-thread variable encoding) and
+  pushes `job` frames while credits remain, topping demand back up via
+  `jobCredits`. A pushed job carries the same shape as a REST `ActivatedJobResult`.
+  **Lease expiry is the at-least-once guarantee:** a job pushed to a worker that
+  never completes it is reclaimed by the existing periodic lock-expiry tick, so a
+  dropped socket needs no special handling — the job is simply re-dispatched.
+- **Submission (request/response).** `createInstance` is metered by a
+  **submission-credit window** fed from the engine's processing headroom via the
+  backpressure controller: under saturation the server simply **withholds
+  credits** and the client stalls intake — no `503`, no retry storm, no thundering
+  herd. When pressure clears, a top-up `submissionCredits` frame resumes the
+  client. Job completions (`completeJob` / `failJob` / `throwError`) flow
+  **unmetered** — draining backlog must never be throttled. A coarse, edge-
+  triggered `pressure` frame (`level: "red"`/`"green"`) is broadcast on each
+  transition so workers can coordinate without polling.
+
+Client → server frames: `subscribe`, `jobCredits`, `createInstance`,
+`completeJob`, `failJob`, `throwError`, `awaitInstance`, `heartbeat`.
+Server → client frames: `welcome`, `job`, `commandResult` (`corr`-correlated
+ack/result for every write), `instanceCompleted`, `submissionCredits`,
+`pressure`, `heartbeat`.
+
+**Await-completion and recovery.** `createInstance` may set
+`awaitCompletion: true`; rather than holding the request, the server returns the
+`commandResult` (with the `processInstanceKey`) immediately and later emits an
+async `instanceCompleted` frame, correlated by the create's `corr`, when the
+instance reaches a terminal state. If the socket drops before that arrives, the
+client recovers by sending an **`awaitInstance`** frame on the new connection
+with the `processInstanceKey` it persisted from the create ack. Because the read
+model is durable history, an already-terminal (even evicted) instance resolves
+**immediately**, so `awaitInstance` doubles as a completion poll.
+
+> **Per-connection ordering vs. throughput.** A single connection's frames are
+> processed in arrival order, each engine command awaited inline — so successive
+> `createInstance`s on *one* socket serialize at journal fsync latency. Throughput
+> comes from **concurrency across connections**: the group-commit journal writer
+> batches many connections' appends into a single fsync. An application should
+> therefore spread submission load over multiple sockets rather than pipelining
+> one (see the recommended worker topology below).
+
+**Recommended worker topology.** Because ordering is per-socket and throughput
+scales with concurrent sockets, an application should **not** funnel everything
+through one stream:
+
+- **One stream per job-type worker.** Open a dedicated socket for each worker
+  (i.e. each `subscribe` job type), as a Zeebe/Camunda client does with its job
+  workers. Each gets its own demand-credit lane and its own reader task, so job
+  delivery for different types proceeds in parallel.
+- **Separate creation from work.** Use a distinct socket (or a small pool) for
+  `createInstance` submission, kept apart from the job-worker sockets, so a burst
+  of creates can't head-of-line-block job completions and vice versa. For high
+  create rates, fan out across a **pool** of submission sockets — that is what
+  lets the group-commit writer batch their appends and is where throughput comes
+  from.
+- **Rule of thumb for 10 job types:** ~10 worker sockets (one per type) **plus** a
+  small submission pool (e.g. 2–8 sockets sized to your create rate) — not a
+  single shared socket for everything.
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_STREAM_SUBMISSION_WINDOW=<n>` | Per-connection create-submission window (default `256`): how many `createInstance`s a client may have outstanding before it must wait for the server to replenish credits. |
+
+See [`docs/command-stream-design.md`](docs/command-stream-design.md) for the full
+design rationale, and `server/tests/command_stream_e2e.rs` for runnable examples
+of every frame exchange.
+
 ## Two crates
+
 
 nanobpmn is deliberately split so the execution engine stays embeddable
 (including on mobile via FFI and in the browser via wasm) while the REST layer

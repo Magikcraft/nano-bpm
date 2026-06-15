@@ -19,7 +19,10 @@
 //!   server withholds credits and the client stalls intake (no 503, no retry,
 //!   no herd). Completing jobs flows unmetered (draining backlog must never be
 //!   throttled). `awaitCompletion` becomes an async `InstanceCompleted` frame
-//!   rather than a held request.
+//!   rather than a held request. After a reconnect a client can re-request that
+//!   outcome with `AwaitInstance` (carrying a `processInstanceKey` it persisted
+//!   from the original create), which resolves immediately for an already-terminal
+//!   instance since the read model is durable history.
 //!
 //! The engine core is untouched: this is purely a new ingress to the existing
 //! command path and a new consumer of `activate_jobs`.
@@ -131,6 +134,21 @@ pub enum ClientFrame {
         error_code: String,
         #[serde(default)]
         error_message: Option<String>,
+    },
+    /// Re-subscribe to completion of an already-created instance. Used for
+    /// recovery: a client that persisted the `processInstanceKey` from an earlier
+    /// `CreateInstance` `CommandResult` can, after a reconnect, re-request the
+    /// terminal outcome over the new socket. Resolves immediately if the instance
+    /// is already terminal (the read model is durable history), so it doubles as a
+    /// poll. Answered by an `InstanceCompleted` correlated by `corr`.
+    #[serde(rename_all = "camelCase")]
+    AwaitInstance {
+        corr: u64,
+        process_instance_key: String,
+        #[serde(default)]
+        fetch_variables: Option<Vec<String>>,
+        #[serde(default)]
+        request_timeout: Option<i64>,
     },
     Heartbeat,
 }
@@ -596,6 +614,35 @@ async fn handle_client_frame(
                 .await;
             reply_job_command(conn, corr, outcome);
         }
+        ClientFrame::AwaitInstance {
+            corr,
+            process_instance_key,
+            fetch_variables,
+            request_timeout,
+        } => match process_instance_key.parse::<nanobpmn_engine_core::Key>() {
+            Ok(instance_key) => {
+                // Reuse the same async await path as `CreateInstance{awaitCompletion}`:
+                // it resolves immediately for an already-terminal (possibly evicted)
+                // instance, since the read model is durable history.
+                spawn_await_completion(
+                    server.clone(),
+                    conn.clone(),
+                    corr,
+                    instance_key,
+                    fetch_variables,
+                    request_timeout,
+                );
+            }
+            Err(_) => {
+                conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status: 404,
+                    body: Some(Value::String(format!(
+                        "Process instance key '{process_instance_key}' is not a valid key."
+                    ))),
+                });
+            }
+        },
         ClientFrame::Heartbeat => {}
     }
 }
