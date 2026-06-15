@@ -301,29 +301,29 @@ impl Engine {
     }
 
     /// Picks up to `limit` *resident* spill candidates: `Active` instances that
-    /// are parked (hold at least one job), still carry their variables, and are
+    /// are parked solely on a job (hold at least one job and have **no** armed
+    /// timer or open message subscription), still carry their variables, and are
     /// not already spilled. Returned oldest-key first (keys are monotonic, so the
     /// oldest backlog — least likely to be activated next — is shed first). Used
     /// by the host to choose which instances to spill when hot RAM crosses its
     /// budget.
+    ///
+    /// Excluding instances with an armed timer or open subscription is a
+    /// correctness guard: those tokens can resume the flow **without** going
+    /// through job activation (a boundary timer firing, a message correlating),
+    /// and the host only rehydrates on activation. Spilling such an instance
+    /// would let an async resumption read the empty placeholder variables, so
+    /// they are kept resident.
     pub fn spillable_instances(&self, limit: usize) -> Vec<Key> {
         if limit == 0 {
             return Vec::new();
         }
+        let guarded = self.instances_with_async_token();
         let mut candidates: Vec<Key> = self
             .state
             .instances
             .iter()
-            .filter(|(key, i)| {
-                i.state == ProcessInstanceState::Active
-                    && !i.variables_spilled
-                    && !i.variables.is_empty()
-                    && self
-                        .state
-                        .jobs_by_instance
-                        .get(key)
-                        .is_some_and(|jobs| !jobs.is_empty())
-            })
+            .filter(|(key, i)| self.is_spillable(key, i, &guarded))
             .map(|(key, _)| *key)
             .collect();
         candidates.sort_unstable();
@@ -335,15 +335,56 @@ impl Engine {
     /// [`Engine::spillable_instances`]). Lets the host size its spill budget
     /// without materialising the key list.
     pub fn resident_spillable_count(&self) -> usize {
+        let guarded = self.instances_with_async_token();
         self.state
             .instances
-            .values()
-            .filter(|i| {
-                i.state == ProcessInstanceState::Active
-                    && !i.variables_spilled
-                    && !i.variables.is_empty()
-            })
+            .iter()
+            .filter(|(key, i)| self.is_spillable(key, i, &guarded))
             .count()
+    }
+
+    /// Whether `instance` (keyed `key`) may have its variables spilled, given the
+    /// set of instances that hold an async-resumable token (`guarded`). Shared by
+    /// [`spillable_instances`](Engine::spillable_instances) and
+    /// [`resident_spillable_count`](Engine::resident_spillable_count) so the
+    /// budget accounting and the spill selection never diverge.
+    fn is_spillable(
+        &self,
+        key: &Key,
+        instance: &state::ProcessInstance,
+        guarded: &std::collections::HashSet<Key>,
+    ) -> bool {
+        instance.state == ProcessInstanceState::Active
+            && !instance.variables_spilled
+            && !instance.variables.is_empty()
+            && !guarded.contains(key)
+            && self
+                .state
+                .jobs_by_instance
+                .get(key)
+                .is_some_and(|jobs| !jobs.is_empty())
+    }
+
+    /// The set of instance keys holding a token that can resume the flow without
+    /// job activation: an armed (`Created`) timer or an open message
+    /// subscription. Empty (and allocation-free on the fast path) when no timers
+    /// or subscriptions exist — the common case under a create-heavy backlog.
+    fn instances_with_async_token(&self) -> std::collections::HashSet<Key> {
+        let mut guarded = std::collections::HashSet::new();
+        if self.state.timers.is_empty() && self.state.message_subscriptions.is_empty() {
+            return guarded;
+        }
+        for timer in self.state.timers.values() {
+            if timer.state == state::TimerState::Created {
+                guarded.insert(timer.instance_key);
+            }
+        }
+        for sub in self.state.message_subscriptions.values() {
+            if sub.state == state::MessageSubscriptionState::Open {
+                guarded.insert(sub.instance_key);
+            }
+        }
+        guarded
     }
 
     /// Looks up a job.
@@ -2964,6 +3005,79 @@ mod tests {
         engine
             .apply_command(Command::complete_job(job.key))
             .unwrap()
+    }
+
+    #[test]
+    fn variable_spill_selects_only_job_parked_instances() {
+        // A plain service-task instance is a spill candidate (parked on a job,
+        // carries variables); spilling drops the payload and rehydration restores
+        // it, and a spilled instance is no longer a candidate.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("k".to_string(), Value::Int(7));
+        let events = engine
+            .apply_command(Command::create_instance_with("order", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        assert_eq!(engine.spillable_instances(10), vec![key]);
+        assert_eq!(engine.resident_spillable_count(), 1);
+
+        let payload = engine.spill_variables(key).expect("spillable");
+        assert!(engine.is_variables_spilled(key));
+        assert!(engine.instance(key).unwrap().variables.is_empty());
+        assert!(
+            engine.spillable_instances(10).is_empty(),
+            "an already-spilled instance is not a candidate"
+        );
+
+        engine.rehydrate_variables(key, payload);
+        assert!(!engine.is_variables_spilled(key));
+        assert_eq!(engine.instance(key).unwrap().variables.get("k"), Some(&Value::Int(7)));
+    }
+
+    #[test]
+    fn variable_spill_excludes_instances_with_an_armed_boundary_timer() {
+        // An instance parked on a service-task job that ALSO has an armed boundary
+        // timer must NOT be spilled: the timer can resume the flow without job
+        // activation (the host's rehydration seam), which would read empty
+        // variables. start -> charge (service task, boundary timer PT5S) -> end.
+        let def = ProcessBuilder::new("guarded")
+            .start_event("start")
+            .service_task("charge", "payment")
+            .timer_boundary_event("deadline", "charge", 5_000)
+            .end_event("end")
+            .end_event("expired")
+            .connect("start", "charge")
+            .connect("charge", "end")
+            .connect("deadline", "expired")
+            .build()
+            .unwrap();
+
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("k".to_string(), Value::Int(1));
+        let events = engine
+            .apply_command_at(Command::create_instance_with("guarded", vars), 1_000)
+            .unwrap();
+        let _key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The instance is parked on the payment job AND has an armed boundary
+        // timer, so it is deliberately excluded from spill candidates.
+        assert_eq!(
+            engine.timers().len(),
+            1,
+            "a boundary timer is armed while the job is parked"
+        );
+        assert!(
+            engine.spillable_instances(10).is_empty(),
+            "instance with an armed boundary timer must not be spillable"
+        );
+        assert_eq!(engine.resident_spillable_count(), 0);
     }
 
     #[test]

@@ -274,18 +274,31 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
 }
 
 /// Resolves the variable-spill configuration from the environment, or `None` to
-/// keep every payload resident (the default).
+/// keep every payload resident.
 ///
-/// - `NANOBPMN_VAR_SPILL=1` (or `on`/`true`) enables spilling.
-/// - `NANOBPMN_VAR_SPILL_BUDGET=<n>` sets the hot budget (max resident spillable
-///   instances before the oldest backlog is shed); default 512.
-/// - The store is co-located with the data dir (`<dir>/var-spill.sqlite`) when
-///   `NANOBPMN_DATA_DIR` is set, else in-memory (no memory saving — for tests).
+/// Spill is **on by default in persistent mode** (when a data dir / journal is
+/// configured, so the spill store has somewhere durable to live and the run is
+/// memory-bound under a large active backlog). It stays off for in-memory runs
+/// (no data dir): the spill store would fall back to an in-memory SQLite db,
+/// doubling the payload footprint with no RAM saving.
+///
+/// - `NANOBPMN_VAR_SPILL` unset: on iff a persistent data path exists.
+/// - `NANOBPMN_VAR_SPILL=0`/`off`/`false`/`none`/`disabled`/`no`: forced off.
+/// - `NANOBPMN_VAR_SPILL=1`/`on`/`true`/`yes`: forced on (even in-memory — for tests).
+/// - `NANOBPMN_VAR_SPILL_BUDGET=<n>`: hot budget (max resident spillable instances
+///   before the oldest backlog is shed); default 512.
+/// - The store is co-located with the read-model db (`<dir>/var-spill.sqlite`)
+///   when persistent, else in-memory.
 fn spill_from_env() -> Option<(Option<PathBuf>, usize)> {
-    let enabled = matches!(
-        std::env::var("NANOBPMN_VAR_SPILL").ok().as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes")
-    );
+    let (_, db) = resolve_data_paths();
+    let enabled = match std::env::var("NANOBPMN_VAR_SPILL").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("none") | Some("disabled") | Some("no") => {
+            false
+        }
+        Some("1") | Some("on") | Some("true") | Some("yes") => true,
+        // Unset / unrecognised: default on only when a persistent path exists.
+        _ => db.is_some(),
+    };
     if !enabled {
         return None;
     }
@@ -293,10 +306,7 @@ fn spill_from_env() -> Option<(Option<PathBuf>, usize)> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(512);
-    let path = std::env::var("NANOBPMN_DATA_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|d| PathBuf::from(d).join("var-spill.sqlite"));
+    let path = db.map(|db| db.with_file_name("var-spill.sqlite"));
     Some((path, budget))
 }
 
