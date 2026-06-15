@@ -435,9 +435,25 @@ impl Journal {
 
     /// Evicts a batch of completed instances in a single pass over hot state.
     /// Mirrors [`Engine::evict_instances`]. Used on the steady-state exporter
-    /// path once the read model has the completions.
+    /// path once the read model has the completions. Also drops any spilled
+    /// variable / cold rows the evicted (now terminal) instances left behind, so
+    /// the spill store stays bounded to the live backlog rather than accumulating
+    /// orphan payloads for every completed or cancelled instance.
     pub fn evict_instances(&mut self, keys: &[Key]) -> usize {
+        if let Some(store) = self.spill_store() {
+            store.forget(keys);
+        }
         self.engine.evict_instances(keys)
+    }
+
+    /// The shared disk-backed spill/cold store, if either tier is wired. Both
+    /// tiers share one [`VarSpillStore`] (one file, one WAL), so either handle
+    /// reaches the same `spill` and `cold` tables.
+    fn spill_store(&self) -> Option<Arc<VarSpillStore>> {
+        if let Some((store, _)) = self.spill.as_ref() {
+            return Some(Arc::clone(store));
+        }
+        self.cold.as_ref().map(|c| Arc::clone(&c.store))
     }
 
     /// Evicts every completed instance from hot state (used after a boot replay,
@@ -817,5 +833,44 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn evicting_a_terminal_instance_drops_its_spilled_variable_row() {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        // Budget 0: any dormant, variable-carrying instance spills immediately.
+        journal.set_spill(Arc::clone(&store), 0);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("payload".to_string()));
+
+        // Two instances, both parked on the demo-work job with non-empty variables,
+        // so maybe_spill sheds both their payloads to the store.
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let (events, _) = journal
+                .apply_command(Command::create_instance_with("demo", vars.clone()))
+                .unwrap();
+            keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+        }
+        let (a, b) = (keys[0], keys[1]);
+        assert!(journal.engine.is_variables_spilled(a), "a spilled");
+        assert!(journal.engine.is_variables_spilled(b), "b spilled");
+
+        // Evicting the (now terminal) instance a must drop its spill row, while
+        // leaving the still-live instance b's payload in the store.
+        journal.evict_instances(&[a]);
+
+        assert!(store.take(a).is_none(), "evicted instance's spill row is gone");
+        assert!(
+            store.take(b).is_some(),
+            "a live instance's spill row is untouched"
+        );
     }
 }

@@ -109,6 +109,38 @@ impl VarSpillStore {
         let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
         serde_json::from_str(&json).ok()
     }
+
+    /// Drops any spilled variable and cold-snapshot rows for `keys`, in one
+    /// transaction. Called when instances reach a terminal state and are evicted
+    /// from hot state: their spilled payloads are now dead and would otherwise
+    /// accumulate as orphan rows (the store is destructive only on *rehydration*,
+    /// and a terminal instance is never rehydrated). Absent keys are no-ops, so
+    /// this is safe to call for every evicted instance whether or not it spilled.
+    pub fn forget(&self, keys: &[Key]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut conn = self.conn.lock().expect("spill store poisoned");
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(_) => return,
+        };
+        {
+            let mut del_spill = match tx.prepare_cached("DELETE FROM spill WHERE key = ?1") {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut del_cold = match tx.prepare_cached("DELETE FROM cold WHERE key = ?1") {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            for &key in keys {
+                let _ = del_spill.execute(params![key as i64]);
+                let _ = del_cold.execute(params![key as i64]);
+            }
+        }
+        let _ = tx.commit();
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +201,29 @@ mod tests {
         assert_eq!(got, snapshot);
         assert!(store.take_cold(42).is_none(), "take_cold is destructive");
         assert!(store.take_cold(7).is_none(), "absent key is None");
+    }
+
+    #[test]
+    fn forget_drops_spill_and_cold_rows_and_ignores_absent_keys() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+        store.put(3, &vars("c")).unwrap();
+
+        // Forgetting terminal instances drops their rows; an absent key (99) is a
+        // no-op, and an untouched key (3) survives.
+        store.forget(&[1, 2, 99]);
+
+        assert!(store.take(1).is_none(), "forgotten spill row gone");
+        assert!(store.take(2).is_none(), "forgotten spill row gone");
+        assert!(store.take(3).is_some(), "untouched spill row survives");
+
+        // forget also clears the cold tier for the same key.
+        store.put(4, &vars("d")).unwrap();
+        store.forget(&[4]);
+        assert!(store.take(4).is_none(), "forget clears spill tier for key");
+
+        // Empty slice is a cheap no-op.
+        store.forget(&[]);
     }
 }
