@@ -387,6 +387,20 @@ impl ReadStore {
 
     // --- queries used by the search/get handlers ---
 
+    /// The number of non-terminal (Active) process instances currently in the
+    /// read model. Used once at startup to seed the in-flight backpressure gauge
+    /// after a journal replay, so the watermark reflects recovered work.
+    pub fn active_instance_count(&self) -> usize {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT COUNT(*) FROM process_instances WHERE state = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    }
+
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
