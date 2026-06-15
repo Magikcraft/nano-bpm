@@ -9,13 +9,15 @@ description = "NanoBPM gateway: stub server for the generated Camunda 8 Orchestr
 nanobpm-gateway-rest = { path = "../generated" }
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 async-trait = "0.1"
-axum = { version = "0.8", features = ["multipart"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
 bytes = "1"
 chrono = "0.4"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 headers = "0.4"
 http = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tracing = "0.1"

@@ -10,6 +10,7 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 mod backpressure;
+mod command_stream;
 mod engine_actor;
 mod journal;
 mod query;
@@ -2374,6 +2375,199 @@ impl ServerImpl {
     }
 }
 
+/// Engine-facing helpers used by the WebSocket command stream (`command_stream`).
+/// They mirror the core of the REST handlers above but return plain data instead
+/// of the generated response envelope, so the stream can build its own frames.
+/// They live here (not in `command_stream`) to keep all engine command issuing
+/// next to the REST handlers that share the same command path and `jobs_available`
+/// wake discipline.
+impl ServerImpl {
+    /// Maps the result of a job lifecycle command (complete/fail/throw) into a
+    /// `(status, message)` outcome, awaiting durability and waking job pollers on
+    /// success. Mirrors the REST handlers' success/error arms.
+    fn map_job_outcome(
+        result: Result<(Arc<Vec<Event>>, Commit), EngineError>,
+    ) -> Result<Commit, (u16, String)> {
+        match result {
+            Ok((_, commit)) => Ok(commit),
+            Err(EngineError::JobNotFound { job_key }) => {
+                Err((404, format!("No job with key {job_key}.")))
+            }
+            Err(EngineError::JobNotActive { job_key }) => {
+                Err((409, format!("Job {job_key} is not active.")))
+            }
+            Err(EngineError::JobNotActivated { job_key }) => {
+                Err((409, format!("Job {job_key} has not been activated.")))
+            }
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
+    /// Stream `CreateInstance`: applies the create command and returns the new
+    /// instance key plus whether it completed synchronously. The processing guard
+    /// is held only across the engine round-trip (the stream meters intake via
+    /// submission credits, not a 503).
+    pub(crate) async fn create_for_stream(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        let outcome: Result<(nanobpmn_engine_core::Key, bool, Commit), (u16, String)> = {
+            let _processing = ProcessingGuard::enter(&self.processing);
+            self.engine
+                .with(move |engine| {
+                    let process_id = match (by_id, by_key) {
+                        (Some(id), _) => id,
+                        (None, Some(requested)) => match engine
+                            .state()
+                            .processes
+                            .values()
+                            .find(|d| d.key.to_string() == requested)
+                        {
+                            Some(d) => d.definition.id.clone(),
+                            None => {
+                                return Err((
+                                    400,
+                                    format!("No deployed process with key '{requested}'."),
+                                ));
+                            }
+                        },
+                        (None, None) => {
+                            return Err((
+                                400,
+                                "A processDefinitionId or processDefinitionKey is required."
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    match engine.apply_command_at(
+                        Command::create_instance_with(process_id.clone(), variables),
+                        now_millis(),
+                    ) {
+                        Ok((events, commit)) => {
+                            let instance_key = events
+                                .iter()
+                                .find_map(Event::instance_key)
+                                .expect("created instance has a key");
+                            let sync_completed = engine.engine().is_completed(instance_key);
+                            Ok((instance_key, sync_completed, commit))
+                        }
+                        Err(EngineError::ProcessNotFound { process_id }) => {
+                            Err((400, format!("No deployed process with id '{process_id}'.")))
+                        }
+                        Err(e) => Err((500, e.to_string())),
+                    }
+                })
+                .await
+        };
+        let (instance_key, sync_completed, commit) = outcome?;
+        commit.wait().await;
+        self.jobs_available.notify_waiters();
+        Ok((instance_key, sync_completed))
+    }
+
+    /// Stream `CompleteJob`.
+    pub(crate) async fn complete_job_for_stream(
+        &self,
+        job_key: u64,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
+            })
+            .await;
+        let commit = Self::map_job_outcome(result)?;
+        commit.wait().await;
+        self.jobs_available.notify_waiters();
+        Ok(())
+    }
+
+    /// Stream `FailJob`.
+    pub(crate) async fn fail_job_for_stream(
+        &self,
+        job_key: u64,
+        retries: i32,
+        error_message: String,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
+            })
+            .await;
+        let commit = Self::map_job_outcome(result)?;
+        commit.wait().await;
+        self.jobs_available.notify_waiters();
+        Ok(())
+    }
+
+    /// Stream `ThrowError`.
+    pub(crate) async fn throw_error_for_stream(
+        &self,
+        job_key: u64,
+        error_code: String,
+        error_message: String,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .with(move |engine| {
+                engine.apply_command_at(
+                    Command::throw_job_error(job_key, error_code, error_message),
+                    now_millis(),
+                )
+            })
+            .await;
+        let commit = Self::map_job_outcome(result)?;
+        commit.wait().await;
+        self.jobs_available.notify_waiters();
+        Ok(())
+    }
+
+    /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
+    /// projected REST job results. Thin wrapper over [`Self::try_activate`] so the
+    /// stream dispatcher reuses the exact activation + off-thread variable
+    /// encoding path as the REST `activateJobs`.
+    pub(crate) async fn activate_for_stream(
+        &self,
+        job_type: &str,
+        worker: &str,
+        max_jobs: usize,
+        timeout: u64,
+        fetch_variable: Option<&[String]>,
+    ) -> Vec<models::ActivatedJobResult> {
+        self.try_activate(job_type, worker, max_jobs, timeout, fetch_variable)
+            .await
+    }
+
+    /// Read access to the create-side backpressure controller for the stream's
+    /// submission-credit policy.
+    pub(crate) fn submission_pressure(&self) -> bool {
+        let processing = self.processing.load(Ordering::Relaxed);
+        self.backpressure.should_shed(processing)
+    }
+
+    /// Awaits a created instance reaching a terminal state for the stream's async
+    /// `InstanceCompleted` frame. Reuses the REST await path verbatim.
+    pub(crate) async fn await_completion_for_stream(
+        &self,
+        instance_key: nanobpmn_engine_core::Key,
+        fetch_variables: Option<&Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> (std::collections::HashMap<String, types::Object>, bool) {
+        self.await_process_completion(instance_key, fetch_variables, request_timeout)
+            .await
+    }
+
+    /// Handle to the job-availability notifier, so the stream can wake the
+    /// dispatcher after a new subscription or credit grant.
+    pub(crate) fn jobs_available_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.jobs_available.clone()
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
 /// clock-free; the server owns the real clock and feeds it logical instants.
 fn now_millis() -> u64 {
@@ -3016,7 +3210,15 @@ async fn main() {
     let tick_engine = server.engine.clone();
     let tick_jobs_available = server.jobs_available.clone();
 
-    let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server);
+    // The unified bidirectional command stream (WebSocket) shares the engine via a
+    // clone of `server` and a registry of connections; a single dispatcher pushes
+    // jobs and the existing periodic tick reclaims expired leases.
+    let cs_registry = command_stream::Registry::new();
+    command_stream::spawn_dispatcher(server.clone(), cs_registry.clone());
+    let cs_router = command_stream::router(server.clone(), cs_registry);
+
+    let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
+        .merge(cs_router);
 
     if debug_rest_enabled() {
         app = app.layer(axum::middleware::from_fn(log_rest));
