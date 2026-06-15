@@ -76,6 +76,14 @@ pub struct ServerImpl {
     /// `activateJobs` requests can wake immediately instead of waiting out their
     /// full timeout.
     jobs_available: Arc<tokio::sync::Notify>,
+    /// Permit-storing wake for the command-stream dispatcher. Unlike
+    /// [`jobs_available`](Self::jobs_available) (a broadcast `notify_waiters`
+    /// that drops signals arriving while the single dispatcher is mid-pass),
+    /// this is signalled with `notify_one` so a job-available or credit-grant
+    /// wake that lands during an engine-bound `dispatch_jobs` pass is retained
+    /// and consumed on the next park — the dispatcher never sleeps to the
+    /// backstop tick while there is pushable work. See [`signal_jobs_available`].
+    dispatch_wake: Arc<tokio::sync::Notify>,
     /// Notified by the read-model exporter after every projected batch, so an
     /// `awaitCompletion` create request can wake the moment its instance reaches
     /// a terminal state (the exporter is the single point through which all
@@ -216,6 +224,7 @@ impl ServerImpl {
             engine: EngineHandle::spawn(journal, controller),
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
+            dispatch_wake: Arc::new(tokio::sync::Notify::new()),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
             backpressure,
             // Seed the gauge from the read model so a journal-replay restart
@@ -610,7 +619,7 @@ impl ServerImpl {
         commit.wait().await;
         // Starting an instance parks it on its first service task, so new jobs
         // may now be activatable: wake any long-pollers.
-        self.jobs_available.notify_waiters();
+        self.signal_jobs_available();
 
         // Resolve the final response. Without awaitCompletion we report whatever
         // completion state held synchronously and return no variables. With it,
@@ -806,7 +815,7 @@ impl ServerImpl {
                 commit.wait().await;
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
-                self.jobs_available.notify_waiters();
+                self.signal_jobs_available();
                 Ok(Resp::Status204_TheJobWasCompletedSuccessfully)
             }
             Err(EngineError::JobNotFound { job_key }) => {
@@ -875,7 +884,7 @@ impl ServerImpl {
                 commit.wait().await;
                 // Failing with retries left returns the job to the activatable
                 // pool, so wake any long-pollers.
-                self.jobs_available.notify_waiters();
+                self.signal_jobs_available();
                 Ok(Resp::Status204_TheJobIsFailed)
             }
             Err(EngineError::JobNotFound { job_key }) => {
@@ -949,7 +958,7 @@ impl ServerImpl {
                 commit.wait().await;
                 // A caught error can route the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
-                self.jobs_available.notify_waiters();
+                self.signal_jobs_available();
                 Ok(Resp::Status204_AnErrorIsThrownForTheJob)
             }
             Err(EngineError::JobNotFound { job_key }) => Ok(
@@ -1083,7 +1092,7 @@ impl ServerImpl {
                 commit.wait().await;
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
-                self.jobs_available.notify_waiters();
+                self.signal_jobs_available();
                 Ok(Resp::Status204_TheIncidentIsMarkedAsResolved)
             }
             Err(EngineError::IncidentNotFound { incident_key }) => Ok(
@@ -1277,7 +1286,7 @@ impl ServerImpl {
 
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
-        self.jobs_available.notify_waiters();
+        self.signal_jobs_available();
 
         let result = models::MessagePublicationResult::new(
             "<default>".to_string(),
@@ -1330,7 +1339,7 @@ impl ServerImpl {
             Some(instance_key) => {
                 // Correlation may have advanced a token onto a service task,
                 // creating a new activatable job: wake any long-pollers.
-                self.jobs_available.notify_waiters();
+                self.signal_jobs_available();
                 let result = models::MessageCorrelationResult::new(
                     "<default>".to_string(),
                     models::MessageKey(message_key.to_string()),
@@ -1784,7 +1793,7 @@ impl ServerImpl {
                 commit.wait().await;
                 // Completing a user task advances the token, which may create a
                 // following job: wake any long-pollers.
-                self.jobs_available.notify_waiters();
+                self.signal_jobs_available();
                 Ok(Resp::Status204_TheUserTaskWasCompletedSuccessfully)
             }
             Err(EngineError::UserTaskNotFound { user_task_key }) => {
@@ -2551,7 +2560,7 @@ impl ServerImpl {
         };
         let (instance_key, sync_completed, commit) = outcome?;
         commit.wait().await;
-        self.jobs_available.notify_waiters();
+        self.signal_jobs_available();
         Ok((instance_key, sync_completed))
     }
 
@@ -2569,7 +2578,7 @@ impl ServerImpl {
             .await;
         let commit = Self::map_job_outcome(result)?;
         commit.wait().await;
-        self.jobs_available.notify_waiters();
+        self.signal_jobs_available();
         Ok(())
     }
 
@@ -2588,7 +2597,7 @@ impl ServerImpl {
             .await;
         let commit = Self::map_job_outcome(result)?;
         commit.wait().await;
-        self.jobs_available.notify_waiters();
+        self.signal_jobs_available();
         Ok(())
     }
 
@@ -2610,7 +2619,7 @@ impl ServerImpl {
             .await;
         let commit = Self::map_job_outcome(result)?;
         commit.wait().await;
-        self.jobs_available.notify_waiters();
+        self.signal_jobs_available();
         Ok(())
     }
 
@@ -2649,10 +2658,20 @@ impl ServerImpl {
             .await
     }
 
-    /// Handle to the job-availability notifier, so the stream can wake the
-    /// dispatcher after a new subscription or credit grant.
-    pub(crate) fn jobs_available_handle(&self) -> Arc<tokio::sync::Notify> {
-        self.jobs_available.clone()
+    /// Signals that new jobs may have become activatable. Wakes both the
+    /// long-polling `activateJobs` REST waiters (broadcast) and the
+    /// command-stream dispatcher (permit-storing, so the wake survives an
+    /// in-flight dispatch pass).
+    pub(crate) fn signal_jobs_available(&self) {
+        self.jobs_available.notify_waiters();
+        self.dispatch_wake.notify_one();
+    }
+
+    /// Handle to the permit-storing dispatcher wake, so the command stream can
+    /// wake the dispatcher after a new subscription or credit grant without the
+    /// signal being lost mid-pass.
+    pub(crate) fn dispatch_wake_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.dispatch_wake.clone()
     }
 }
 
@@ -3301,6 +3320,7 @@ async fn main() {
     // router.
     let tick_engine = server.engine.clone();
     let tick_jobs_available = server.jobs_available.clone();
+    let tick_dispatch_wake = server.dispatch_wake.clone();
     let idle_engine = server.engine.clone();
     let idle_activity = server.activity.clone();
     let idle_processing = server.processing.clone();
@@ -3327,6 +3347,7 @@ async fn main() {
     {
         let engine = tick_engine;
         let jobs_available = tick_jobs_available;
+        let dispatch_wake = tick_dispatch_wake;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
@@ -3344,6 +3365,7 @@ async fn main() {
                     .await;
                 if produced {
                     jobs_available.notify_waiters();
+                    dispatch_wake.notify_one();
                 }
             }
         });

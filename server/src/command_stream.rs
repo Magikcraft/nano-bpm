@@ -515,13 +515,13 @@ async fn handle_client_frame(
                 .insert(job_type.clone(), sub);
             registry.index(&job_type, conn.id);
             // A new subscription may have a backlog waiting: wake the dispatcher.
-            server.jobs_available_handle().notify_waiters();
+            server.dispatch_wake_handle().notify_one();
         }
         ClientFrame::JobCredits { job_type, n } => {
             if let Some(sub) = conn.subs.lock().expect("registry poisoned").get(&job_type) {
                 sub.credits.fetch_add(n, Ordering::Relaxed);
             }
-            server.jobs_available_handle().notify_waiters();
+            server.dispatch_wake_handle().notify_one();
         }
         ClientFrame::CreateInstance {
             corr,
@@ -735,7 +735,7 @@ fn grant_submission_credit_if_clear(server: &ServerImpl, conn: &Arc<Connection>,
 /// periodic backstop sweep), leases jobs round-robin across subscribers, and tops
 /// up submission credits as engine headroom allows.
 pub fn spawn_dispatcher(server: ServerImpl, registry: Arc<Registry>) {
-    let jobs_available = server.jobs_available_handle();
+    let jobs_available = server.dispatch_wake_handle();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(DISPATCH_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
