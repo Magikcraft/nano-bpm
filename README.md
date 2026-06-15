@@ -247,6 +247,43 @@ environment:
 | `NANOBPMN_JOURNAL=<file>` | Back-compat: selects the journal file; the database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`. |
 | *(neither set)* | Fully in-memory: an ephemeral journal and a `:memory:` read store. Nothing is persisted. |
 
+### Memory footprint (allocator + idle reclamation)
+
+Load arrives in bursts: a flood of `createProcessInstance`s grows the hot-state
+maps and 50 KB-class variable payloads, which are then freed as instances
+complete and are evicted. Two things keep that freed memory from coming back:
+
+- **Rust maps never shrink on removal.** Eviction removes the entries but leaves
+  the `instances` / `jobs` / index maps at *peak* bucket capacity.
+- **The default system allocator hoards freed pages.** macOS libmalloc (and Linux
+  glibc) keep freed allocations in their own free lists rather than returning them
+  to the OS, so an idle server pins its peak resident footprint long after the
+  work is gone.
+
+nanobpmn addresses both:
+
+- It uses **jemalloc** as the global allocator (vendored, built from source — the
+  binary stays self-contained). jemalloc returns unused pages to the OS on a
+  **decay** schedule, driven by a background thread on Linux.
+- An **idle-purge tick** closes the gap on platforms with no jemalloc background
+  thread (macOS) and makes reclamation prompt everywhere: when the engine goes
+  quiescent after a burst (no command exported and no create in flight for the
+  quiescence window), it `shrink_to_fit`s the hot-state maps and forces jemalloc
+  to purge every arena, returning the freed memory to the OS **immediately**. It
+  fires once per active→idle transition, never while work is flowing, so it adds
+  no steady-state cost. (In a local run, a 4 000-instance create+complete burst's
+  idle tick logged `returned 156.9 MiB to the OS (214.4 -> 57.5 MiB resident)`.)
+
+This is distinct from the **variable-spill** tier (above), which bounds the
+*live* peak of a large *active* backlog by moving cold parked instances' variables
+to disk; the allocator/idle-purge work bounds *idle* footprint after a backlog has
+drained. Together: low idle memory, bounded live memory, full in-RAM speed for the
+working set.
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_IDLE_PURGE_MS=<n>` | Quiescence (ms) the server must be idle before it compacts hot state and returns freed memory to the OS. Default `5000`; `0` disables the idle-purge tick. |
+
 ## Command stream (WebSocket)
 
 Alongside the REST API, the server exposes a single **bidirectional WebSocket**
@@ -474,8 +511,10 @@ INFO rest: <-- POST /v2/process-instances 200 OK (39.7ms) [180 bytes] {"processI
 > The generated REST layer under `generated/` is a build dependency, so
 > `make release` runs `make generate` first if needed (which downloads and runs
 > the `openapi-generator-cli` JAR with local Java — no Docker).
-> Once generated, the binary itself has no build- or run-time external
-> dependencies.
+> Once generated, the binary itself has no run-time external dependencies. (At
+> build time the vendored jemalloc allocator is compiled from source, so a C
+> compiler — `cc`/`clang`, already present on macOS and most Linux toolchains —
+> is required; the resulting binary is still self-contained.)
 
 ## Engine (`engine-core`)
 

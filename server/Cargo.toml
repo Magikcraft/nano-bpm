@@ -23,6 +23,17 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+# jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
+# Linux glibc), it returns freed memory to the OS on a decay schedule and exposes
+# a portable `mallctl` purge knob, so an idle server's resident footprint falls
+# back down after a load burst instead of pinning the peak (see `memory.rs` and
+# the idle-purge tick). It is vendored and built from source, so the binary stays
+# self-contained. Not available on MSVC; the system allocator is used there.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
+tikv-jemalloc-sys = "0.6"
+
 [dev-dependencies]
 serde_json = "1"
 

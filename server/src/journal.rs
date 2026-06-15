@@ -221,6 +221,15 @@ impl Journal {
         self.engine.evict_completed()
     }
 
+    /// Shrinks the hot-state map capacities to fit their live contents, returning
+    /// the bucket arrays freed by prior eviction back to the allocator. Mirrors
+    /// [`Engine::shrink`]; called on the idle-purge path, where steady-state
+    /// eviction has already removed the entries but left the maps at peak
+    /// capacity.
+    pub fn shrink(&mut self) {
+        self.engine.shrink();
+    }
+
     /// Whether the journal started empty (no prior log).
     pub fn is_fresh(&self) -> bool {
         self.fresh

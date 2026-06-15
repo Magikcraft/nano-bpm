@@ -13,6 +13,7 @@ mod backpressure;
 mod command_stream;
 mod engine_actor;
 mod journal;
+mod memory;
 mod query;
 mod readstore;
 mod stub_impls;
@@ -21,7 +22,7 @@ mod varspill;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -102,6 +103,12 @@ pub struct ServerImpl {
     /// Memory under a large backlog is bounded by the variable-spill tier, not by
     /// this gate, so backpressure and memory safety are now independent rails.
     processing: Arc<AtomicUsize>,
+    /// Monotonic counter bumped once per exported event batch — i.e. on every
+    /// durable command's events flowing through the read-model exporter. It is a
+    /// cheap "did anything happen" signal the idle-purge tick watches: when it
+    /// stops advancing (and no creates are in flight) the server is quiescent and
+    /// can compact hot state and return freed memory to the OS.
+    activity: Arc<AtomicU64>,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -197,6 +204,7 @@ impl ServerImpl {
             // reports zero. The exporter maintains it from here on.
             inflight,
             processing,
+            activity: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -224,6 +232,7 @@ fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
         server.engine.clone(),
         server.instances_changed.clone(),
         server.inflight.clone(),
+        server.activity.clone(),
     );
     server
 }
@@ -240,6 +249,7 @@ fn spawn_exporter(
     engine: EngineHandle,
     instances_changed: Arc<tokio::sync::Notify>,
     inflight: Arc<AtomicUsize>,
+    activity: Arc<AtomicU64>,
 ) {
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
@@ -249,6 +259,9 @@ fn spawn_exporter(
                 while let Ok(next) = rx.try_recv() {
                     batch.push(next);
                 }
+                // Signal liveness to the idle-purge tick: a batch means at least
+                // one durable command was applied since the last check.
+                activity.fetch_add(1, Ordering::Relaxed);
                 // Borrow every command's events as a flat slice of references —
                 // the payloads stay in their original `Arc`s, never copied here.
                 let refs: Vec<&Event> = batch.iter().flat_map(|events| events.iter()).collect();
@@ -305,6 +318,23 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
 /// adaptive) by default.
 fn backpressure_setting_from_env() -> BackpressureSetting {
     parse_backpressure_setting(std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT").ok().as_deref())
+}
+
+/// Resolves the idle quiescence delay before the idle-purge tick compacts hot
+/// state and returns freed memory to the OS, or `None` to disable it.
+///
+/// - `NANOBPMN_IDLE_PURGE_MS` unset: default 5000 ms.
+/// - `NANOBPMN_IDLE_PURGE_MS=0`: disabled (never purge on idle).
+/// - `NANOBPMN_IDLE_PURGE_MS=<n>`: wait `n` ms of quiescence before purging.
+fn idle_purge_quiescence_from_env() -> Option<Duration> {
+    match std::env::var("NANOBPMN_IDLE_PURGE_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(Duration::from_millis(5000)),
+        },
+        Err(_) => Some(Duration::from_millis(5000)),
+    }
 }
 
 /// Resolves the variable-spill configuration from the environment, or `None` to
@@ -3132,6 +3162,10 @@ async fn log_rest(req: axum::extract::Request, next: axum::middleware::Next) -> 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
+    // Enable jemalloc's background page-decay thread where supported (Linux), so
+    // freed memory returns to the OS automatically; on macOS the idle-purge tick
+    // forces it instead.
+    memory::enable_background_thread();
     // Resolve where the journal (durable event log) and read-model database live.
     let (journal_path, db_path) = resolve_data_paths();
 
@@ -3209,6 +3243,9 @@ async fn main() {
     // router.
     let tick_engine = server.engine.clone();
     let tick_jobs_available = server.jobs_available.clone();
+    let idle_engine = server.engine.clone();
+    let idle_activity = server.activity.clone();
+    let idle_processing = server.processing.clone();
 
     // The unified bidirectional command stream (WebSocket) shares the engine via a
     // clone of `server` and a registry of connections; a single dispatcher pushes
@@ -3246,6 +3283,62 @@ async fn main() {
                     .await;
                 if produced {
                     jobs_available.notify_waiters();
+                }
+            }
+        });
+    }
+
+    // Idle-purge tick: when the engine goes quiescent after a burst, compact the
+    // hot-state maps (which eviction left at peak capacity) and force the
+    // allocator to return the freed pages to the OS, so an idle server's resident
+    // footprint falls back down instead of pinning its peak. Gated on
+    // NANOBPMN_IDLE_PURGE_MS (default 5000; set 0 to disable). It fires once per
+    // active→idle transition, never while work is flowing.
+    if let Some(quiescence) = idle_purge_quiescence_from_env() {
+        let engine = idle_engine;
+        let activity = idle_activity;
+        let processing = idle_processing;
+        tokio::spawn(async move {
+            let check = std::time::Duration::from_millis(1000);
+            let needed_idle_checks = quiescence.as_millis().div_ceil(1000).max(1) as u32;
+            let mut interval = tokio::time::interval(check);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_activity = activity.load(Ordering::Relaxed);
+            let mut idle_checks = 0u32;
+            let mut purged = true; // nothing to reclaim until work has happened.
+            loop {
+                interval.tick().await;
+                let now_activity = activity.load(Ordering::Relaxed);
+                let busy = now_activity != last_activity || processing.load(Ordering::Relaxed) > 0;
+                last_activity = now_activity;
+                if busy {
+                    idle_checks = 0;
+                    purged = false;
+                    continue;
+                }
+                idle_checks += 1;
+                if idle_checks < needed_idle_checks || purged {
+                    continue;
+                }
+                // Quiescent and not yet reclaimed since the last burst: compact +
+                // purge, exactly once until activity resumes.
+                let before = memory::resident_bytes();
+                engine.with(|journal| journal.shrink()).await;
+                let purged_ok = memory::purge();
+                purged = true;
+                if purged_ok {
+                    match (before, memory::resident_bytes()) {
+                        (Some(before), Some(after)) if before > after => {
+                            tracing::info!(
+                                "idle: compacted hot state, returned {:.1} MiB to the OS \
+                                 ({:.1} -> {:.1} MiB resident)",
+                                (before - after) as f64 / (1024.0 * 1024.0),
+                                before as f64 / (1024.0 * 1024.0),
+                                after as f64 / (1024.0 * 1024.0),
+                            );
+                        }
+                        _ => tracing::debug!("idle: compacted hot state and purged allocator"),
+                    }
                 }
             }
         });
