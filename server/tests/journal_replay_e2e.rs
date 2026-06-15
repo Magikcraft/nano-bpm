@@ -1646,3 +1646,52 @@ fn backpressure_can_be_turned_off() {
 
     server.shutdown();
 }
+
+#[test]
+fn spilled_variables_rehydrate_correctly_on_job_activation() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Variable spill on with a zero hot budget: every instance parked on a job
+    // has its variables shed to the (here in-memory, since only a journal path
+    // is set) spill store immediately after creation. Activation must then
+    // rehydrate each payload from the store and deliver it to the worker
+    // unchanged — proving the create -> spill -> activate round-trip is lossless.
+    let server = ServerProcess::boot_with_env(
+        &journal,
+        &[
+            ("NANOBPMN_VAR_SPILL", "1"),
+            ("NANOBPMN_VAR_SPILL_BUDGET", "0"),
+            ("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "off"),
+        ],
+    );
+
+    // Create several instances, each carrying distinct variables, so a stale or
+    // cross-wired rehydration would be caught.
+    for i in 0..5 {
+        let body = format!(
+            r#"{{"processDefinitionId":"demo","variables":{{"n":{i},"tag":"v{i}"}}}}"#
+        );
+        let (status, resp) = server.request("POST", &path("/process-instances"), Some(&body));
+        assert_eq!(status, 200, "create {i} failed: {resp}");
+    }
+
+    // Activate the jobs one at a time and confirm each carries a correct,
+    // self-consistent variable payload restored from the spill store.
+    let mut seen: Vec<i64> = Vec::new();
+    for _ in 0..5 {
+        let vars = activate_demo_job_variables(&server, None);
+        let obj = vars.as_object().expect("variables is an object");
+        let n = obj["n"].as_i64().expect("n present after rehydration");
+        assert_eq!(
+            obj["tag"].as_str(),
+            Some(format!("v{n}").as_str()),
+            "tag must match its own n (no cross-wired rehydration): {vars}"
+        );
+        seen.push(n);
+    }
+    seen.sort_unstable();
+    assert_eq!(seen, vec![0, 1, 2, 3, 4], "every instance's variables rehydrated exactly once");
+
+    server.shutdown();
+}

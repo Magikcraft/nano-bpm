@@ -28,6 +28,8 @@ use nanobpmn_engine_core::{
 };
 use tokio::sync::oneshot;
 
+use crate::varspill::VarSpillStore;
+
 /// A durable-write request handed to the background journal writer: the
 /// newline-terminated, serialized bytes for one command's events, plus a
 /// one-shot sender signalled once those bytes are fsynced to disk.
@@ -81,6 +83,11 @@ pub struct Journal {
     /// `true` when the journal started with no prior log, so the host knows it
     /// should seed any initial deployments.
     fresh: bool,
+    /// Optional disk-backed store for spilled instance variables, with the hot
+    /// budget (max resident spillable instances) above which the engine sheds the
+    /// oldest backlog's variables to disk. `None` keeps every payload resident
+    /// (the original behaviour).
+    spill: Option<(Arc<VarSpillStore>, usize)>,
 }
 
 /// The background journal writer: blocks for the next request, drains every
@@ -129,6 +136,7 @@ impl Journal {
             writer_thread: None,
             exporter: None,
             fresh: true,
+            spill: None,
         }
     }
 
@@ -179,7 +187,19 @@ impl Journal {
             writer_thread: Some(writer_thread),
             exporter: None,
             fresh,
+            spill: None,
         })
+    }
+
+    /// Wires the disk-backed variable spill. `budget` is the maximum number of
+    /// resident instances allowed to hold their variables in hot RAM; once the
+    /// active backlog exceeds it, each command that grows the backlog sheds the
+    /// oldest instances' variables to `store` (rehydrated on job activation). Set
+    /// before serving. A `budget` of 0 spills aggressively (keeps nothing extra
+    /// resident); leaving the spill unset keeps the original all-resident
+    /// behaviour.
+    pub fn set_spill(&mut self, store: Arc<VarSpillStore>, budget: usize) {
+        self.spill = Some((store, budget));
     }
 
     /// Wires the read-model exporter channel. Set before any command is applied
@@ -255,6 +275,7 @@ impl Journal {
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let commit = self.persist(&events);
+        self.maybe_spill();
         Ok((events, commit))
     }
 
@@ -266,11 +287,45 @@ impl Journal {
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
+        self.maybe_spill();
         Ok((events, commit))
+    }
+
+    /// Sheds the oldest backlog's variables to the spill store when the resident
+    /// spillable set exceeds the hot budget. Cheap when within budget (one
+    /// counter read); only a genuinely growing backlog pays the spill writes.
+    /// The variables are already durable in the journal, so a spill write that
+    /// is later lost is reconstructable — it is a cache, not a system of record.
+    fn maybe_spill(&mut self) {
+        let Some((store, budget)) = self.spill.as_ref() else {
+            return;
+        };
+        let resident = self.engine.resident_spillable_count();
+        if resident <= *budget {
+            return;
+        }
+        let store = Arc::clone(store);
+        let over = resident - *budget;
+        for key in self.engine.spillable_instances(over) {
+            if let Some(vars) = self.engine.spill_variables(key)
+                && store.put(key, &vars).is_err()
+            {
+                // Spill failed: keep the payload resident rather than lose it.
+                self.engine.rehydrate_variables(key, vars);
+            }
+        }
     }
 
     /// Activates jobs **without** journaling: activation locks are volatile lease
     /// state, forfeited on restart. Mirrors [`Engine::activate_jobs`].
+    ///
+    /// When variable spill is wired, an activated job's instance may have had its
+    /// variables shed to disk. Activation is exactly the moment they are needed
+    /// again (the worker receives them, and completion may follow), so each
+    /// spilled instance is rehydrated here: its payload is taken back from the
+    /// store, restored into hot state, and used to fill the activated job. This
+    /// is the read side of the memory/disk fusion — a single keyed SQLite read,
+    /// served from the page cache for a warm working set.
     pub fn activate_jobs(
         &mut self,
         job_type: impl Into<String>,
@@ -279,8 +334,24 @@ impl Journal {
         timeout: u64,
         now: u64,
     ) -> Vec<ActivatedJob> {
-        self.engine
-            .activate_jobs(job_type, worker, max_jobs, timeout, now)
+        let mut activated = self
+            .engine
+            .activate_jobs(job_type, worker, max_jobs, timeout, now);
+        if let Some((store, _)) = self.spill.as_ref() {
+            let store = Arc::clone(store);
+            for job in activated.iter_mut() {
+                if !self.engine.is_variables_spilled(job.instance_key) {
+                    continue;
+                }
+                if let Some(vars) = store.take(job.instance_key) {
+                    let vars = Arc::new(vars);
+                    self.engine
+                        .rehydrate_variables(job.instance_key, Arc::clone(&vars));
+                    job.variables = vars;
+                }
+            }
+        }
+        activated
     }
 
     /// Fires every due timer at logical instant `now`, journaling the resulting

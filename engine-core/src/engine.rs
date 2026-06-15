@@ -253,6 +253,99 @@ impl Engine {
         self.state.jobs_by_instance.shrink_to_fit();
     }
 
+    // --- Variable spill: host-managed hot-state memory reclamation. ---
+    //
+    // The 50 KB-class `variables` payload dominates the per-instance footprint of
+    // a large *active* backlog (instances created and parked on a job, waiting for
+    // a worker). Such instances are quiescent: the only way their token resumes is
+    // job activation followed by completion. So the host can move their variables
+    // to a disk-backed store and rehydrate them at activation time, bounding hot
+    // RAM the way Zeebe's RocksDB-backed state does — but keeping the in-memory
+    // speed for the working set. These methods are pure (no I/O): the host owns the
+    // store and decides the policy; the engine only swaps the `Arc` in and out.
+
+    /// Returns `true` when `key`'s variables have been spilled and not yet
+    /// rehydrated (so `instance(key).variables` is an empty placeholder).
+    pub fn is_variables_spilled(&self, key: Key) -> bool {
+        self.state
+            .instances
+            .get(&key)
+            .is_some_and(|i| i.variables_spilled)
+    }
+
+    /// Spills `key`'s variables out of hot state: replaces them with an empty
+    /// placeholder, marks the instance spilled, and returns the payload for the
+    /// host to persist. Returns `None` (a no-op) if the instance does not exist,
+    /// is already spilled, or carries no variables — nothing worth spilling.
+    ///
+    /// Pure: it only moves an `Arc` out of the map. The host must persist the
+    /// returned payload and rehydrate it (via [`Engine::rehydrate_variables`])
+    /// before any command that reads this instance's variables.
+    pub fn spill_variables(&mut self, key: Key) -> Option<Arc<HashMap<String, Value>>> {
+        let instance = self.state.instances.get_mut(&key)?;
+        if instance.variables_spilled || instance.variables.is_empty() {
+            return None;
+        }
+        instance.variables_spilled = true;
+        Some(std::mem::take(&mut instance.variables))
+    }
+
+    /// Restores previously [spilled](Engine::spill_variables) variables into hot
+    /// state. A no-op if the instance is gone. Idempotent with respect to the
+    /// spilled flag (clears it regardless).
+    pub fn rehydrate_variables(&mut self, key: Key, variables: Arc<HashMap<String, Value>>) {
+        if let Some(instance) = self.state.instances.get_mut(&key) {
+            instance.variables = variables;
+            instance.variables_spilled = false;
+        }
+    }
+
+    /// Picks up to `limit` *resident* spill candidates: `Active` instances that
+    /// are parked (hold at least one job), still carry their variables, and are
+    /// not already spilled. Returned oldest-key first (keys are monotonic, so the
+    /// oldest backlog — least likely to be activated next — is shed first). Used
+    /// by the host to choose which instances to spill when hot RAM crosses its
+    /// budget.
+    pub fn spillable_instances(&self, limit: usize) -> Vec<Key> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<Key> = self
+            .state
+            .instances
+            .iter()
+            .filter(|(key, i)| {
+                i.state == ProcessInstanceState::Active
+                    && !i.variables_spilled
+                    && !i.variables.is_empty()
+                    && self
+                        .state
+                        .jobs_by_instance
+                        .get(key)
+                        .is_some_and(|jobs| !jobs.is_empty())
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        candidates.sort_unstable();
+        candidates.truncate(limit);
+        candidates
+    }
+
+    /// How many resident instances are spill candidates right now (see
+    /// [`Engine::spillable_instances`]). Lets the host size its spill budget
+    /// without materialising the key list.
+    pub fn resident_spillable_count(&self) -> usize {
+        self.state
+            .instances
+            .values()
+            .filter(|i| {
+                i.state == ProcessInstanceState::Active
+                    && !i.variables_spilled
+                    && !i.variables.is_empty()
+            })
+            .count()
+    }
+
     /// Looks up a job.
     pub fn job(&self, key: Key) -> Option<&state::Job> {
         self.state.jobs.get(&key)

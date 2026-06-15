@@ -157,6 +157,15 @@ pub struct ProcessInstance {
     /// resolution; resolving an incident removes its key from this active index
     /// (so `hasIncident` reflects only open incidents).
     pub incidents: Vec<Key>,
+    /// `true` when this instance's `variables` payload has been spilled to the
+    /// host's disk-backed store to bound hot-state memory under a large backlog.
+    /// While spilled, `variables` holds an empty placeholder; the host rehydrates
+    /// it (see [`crate::Engine::rehydrate_variables`]) before any command that
+    /// needs the real payload — notably job activation. Purely a host-managed
+    /// memory optimisation: it never changes the engine's logical state, is not
+    /// journaled, and is irrelevant to replay (a replayed instance starts
+    /// resident with its variables from the log).
+    pub variables_spilled: bool,
 }
 
 /// Why an incident was raised. Maps to a recovery story and to the REST
@@ -553,6 +562,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     join_counts: HashMap::new(),
                     join_instances: HashMap::new(),
                     incidents: Vec::new(),
+                    variables_spilled: false,
                 },
             );
         }

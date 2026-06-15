@@ -15,6 +15,7 @@ mod journal;
 mod query;
 mod readstore;
 mod stub_impls;
+mod varspill;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -132,6 +133,25 @@ impl ServerImpl {
             }
         };
         tracing::info!("backpressure: {}", backpressure.describe());
+
+        // Optional variable spill: shed cold-backlog variable payloads to a
+        // disk-backed store so hot RAM stays bounded under a large active
+        // backlog, rehydrating on job activation. Off unless configured.
+        if let Some((spill_path, budget)) = spill_from_env() {
+            match varspill::VarSpillStore::open(spill_path.as_deref()) {
+                Ok(store) => {
+                    journal.set_spill(Arc::new(store), budget);
+                    tracing::info!(
+                        "variable spill: on, hot budget {budget} instance(s){}",
+                        spill_path
+                            .as_deref()
+                            .map(|p| format!(", store {}", p.display()))
+                            .unwrap_or_else(|| " (in-memory)".to_string())
+                    );
+                }
+                Err(e) => tracing::error!("variable spill disabled: failed to open store: {e}"),
+            }
+        }
 
         Self {
             engine: EngineHandle::spawn(journal, controller),
@@ -251,6 +271,33 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
 /// adaptive) by default.
 fn backpressure_setting_from_env() -> BackpressureSetting {
     parse_backpressure_setting(std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT").ok().as_deref())
+}
+
+/// Resolves the variable-spill configuration from the environment, or `None` to
+/// keep every payload resident (the default).
+///
+/// - `NANOBPMN_VAR_SPILL=1` (or `on`/`true`) enables spilling.
+/// - `NANOBPMN_VAR_SPILL_BUDGET=<n>` sets the hot budget (max resident spillable
+///   instances before the oldest backlog is shed); default 512.
+/// - The store is co-located with the data dir (`<dir>/var-spill.sqlite`) when
+///   `NANOBPMN_DATA_DIR` is set, else in-memory (no memory saving — for tests).
+fn spill_from_env() -> Option<(Option<PathBuf>, usize)> {
+    let enabled = matches!(
+        std::env::var("NANOBPMN_VAR_SPILL").ok().as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes")
+    );
+    if !enabled {
+        return None;
+    }
+    let budget = std::env::var("NANOBPMN_VAR_SPILL_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    let path = std::env::var("NANOBPMN_DATA_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(|d| PathBuf::from(d).join("var-spill.sqlite"));
+    Some((path, budget))
 }
 
 /// Engine-backed implementations of selected operations. The stub generator
