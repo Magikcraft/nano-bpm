@@ -8,3 +8,6 @@ server/src/stub_impls.rs
 
 # Persistence journals written by the server (set via NANOBPMN_JOURNAL).
 *.journal
+
+# Runtime data directory (NANOBPMN_DATA_DIR: read-model DB + journal).
+.data/
