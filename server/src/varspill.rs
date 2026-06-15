@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use nanobpmn_engine_core::{Key, Value};
+use nanobpmn_engine_core::{InstanceSnapshot, Key, Value};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// A SQLite-backed key → variables map for spilled instance payloads.
@@ -39,7 +39,9 @@ impl VarSpillStore {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              CREATE TABLE IF NOT EXISTS spill (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
-             DELETE FROM spill;",
+             CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
+             DELETE FROM spill;
+             DELETE FROM cold;",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -74,6 +76,39 @@ impl VarSpillStore {
         let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
         serde_json::from_str(&json).ok()
     }
+
+    /// Persists a whole-instance cold [`InstanceSnapshot`] under `key`, replacing
+    /// any prior snapshot. Shares the connection (and thus the WAL) with the
+    /// variable spill above, so the two tiers live in one file and one durability
+    /// story — the reason cold spill reuses this store rather than a second DB.
+    pub fn put_cold(&self, key: Key, snapshot: &InstanceSnapshot) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(snapshot).expect("snapshot serializes to JSON");
+        let conn = self.conn.lock().expect("spill store poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO cold (key, snapshot) VALUES (?1, ?2)",
+            params![key as i64, json],
+        )?;
+        Ok(())
+    }
+
+    /// Removes and returns the cold snapshot for `key`, or `None` if absent.
+    /// Destructive on read (like [`take`](VarSpillStore::take)): rehydrating an
+    /// instance takes its snapshot back out, so the cold table holds only the
+    /// still-dormant backlog.
+    pub fn take_cold(&self, key: Key) -> Option<InstanceSnapshot> {
+        let conn = self.conn.lock().expect("spill store poisoned");
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT snapshot FROM cold WHERE key = ?1",
+                params![key as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()?;
+        let json = json?;
+        let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
+        serde_json::from_str(&json).ok()
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +136,38 @@ mod tests {
         assert!(store.take(1).is_some());
         assert!(store.take(1).is_none(), "second take sees nothing");
         assert!(store.take(999).is_none(), "absent key is None");
+    }
+
+    #[test]
+    fn cold_snapshot_round_trips() {
+        use std::sync::Arc;
+        use nanobpmn_engine_core::{ProcessInstance, ProcessInstanceState};
+
+        let store = VarSpillStore::open(None).unwrap();
+        let snapshot = InstanceSnapshot {
+            instance: ProcessInstance {
+                key: 42,
+                process_id: "order".to_string(),
+                state: ProcessInstanceState::Active,
+                created_at: 1,
+                active: HashMap::new(),
+                scopes: HashMap::new(),
+                variables: Arc::new(vars("payload")),
+                join_counts: HashMap::new(),
+                join_instances: HashMap::new(),
+                incidents: Vec::new(),
+                variables_spilled: false,
+            },
+            jobs: Vec::new(),
+            timers: Vec::new(),
+            message_subscriptions: Vec::new(),
+            user_tasks: Vec::new(),
+            incidents: Vec::new(),
+        };
+        store.put_cold(42, &snapshot).unwrap();
+        let got = store.take_cold(42).expect("snapshot present");
+        assert_eq!(got, snapshot);
+        assert!(store.take_cold(42).is_none(), "take_cold is destructive");
+        assert!(store.take_cold(7).is_none(), "absent key is None");
     }
 }

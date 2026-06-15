@@ -10,6 +10,7 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 mod backpressure;
+mod coldspill;
 mod command_stream;
 mod engine_actor;
 mod journal;
@@ -174,22 +175,40 @@ impl ServerImpl {
         };
         tracing::info!("backpressure: {}", backpressure.describe());
 
-        // Optional variable spill: shed cold-backlog variable payloads to a
-        // disk-backed store so hot RAM stays bounded under a large active
-        // backlog, rehydrating on job activation. Off unless configured.
-        if let Some((spill_path, budget)) = spill_from_env() {
-            match varspill::VarSpillStore::open(spill_path.as_deref()) {
+        // Optional spill tiers, sharing one disk-backed store (one file, one WAL,
+        // one durability story). Variable spill sheds the variables of a large
+        // *active* (job-parked) backlog; cold spill sheds whole *dormant*
+        // instances of a large *parked* backlog. Both off unless configured.
+        let var_cfg = spill_from_env();
+        let cold_cfg = cold_spill_from_env();
+        if var_cfg.is_some() || cold_cfg.is_some() {
+            let path = var_cfg
+                .as_ref()
+                .and_then(|(p, _)| p.clone())
+                .or_else(|| resolve_data_paths().1.map(|db| db.with_file_name("var-spill.sqlite")));
+            let location = path
+                .as_deref()
+                .map(|p| format!(", store {}", p.display()))
+                .unwrap_or_else(|| " (in-memory)".to_string());
+            match varspill::VarSpillStore::open(path.as_deref()) {
                 Ok(store) => {
-                    journal.set_spill(Arc::new(store), budget);
-                    tracing::info!(
-                        "variable spill: on, hot budget {budget} instance(s){}",
-                        spill_path
-                            .as_deref()
-                            .map(|p| format!(", store {}", p.display()))
-                            .unwrap_or_else(|| " (in-memory)".to_string())
-                    );
+                    let store = Arc::new(store);
+                    if let Some((_, budget)) = var_cfg {
+                        journal.set_spill(Arc::clone(&store), budget);
+                        tracing::info!(
+                            "variable spill: on, hot budget {budget} instance(s){location}"
+                        );
+                    }
+                    if let Some((high, low)) = cold_cfg {
+                        journal.set_cold_spill(Arc::clone(&store), high, low);
+                        tracing::info!(
+                            "cold spill: on, high-water {:.0} MiB / low-water {:.0} MiB{location}",
+                            high as f64 / (1024.0 * 1024.0),
+                            low as f64 / (1024.0 * 1024.0),
+                        );
+                    }
                 }
-                Err(e) => tracing::error!("variable spill disabled: failed to open store: {e}"),
+                Err(e) => tracing::error!("spill disabled: failed to open store: {e}"),
             }
         }
 
@@ -372,6 +391,45 @@ fn spill_from_env() -> Option<(Option<PathBuf>, usize)> {
         .unwrap_or(512);
     let path = db.map(|db| db.with_file_name("var-spill.sqlite"));
     Some((path, budget))
+}
+
+/// Resolves the cold-spill configuration: the resident-byte high-/low-water marks
+/// at which whole *dormant* instances are evicted to / kept on disk. Returns
+/// `None` to keep every instance resident.
+///
+/// Cold spill is the long-lived counterpart to variable spill: where variable
+/// spill sheds the variables of a job-parked instance, cold spill sheds the
+/// *entire* dormant instance (control state, jobs, timers, subscriptions),
+/// keeping only a slim routing index resident and rehydrating on demand. It is
+/// **on by default in persistent mode** (it needs a durable store to relieve
+/// RAM) but only ever fires once resident memory crosses the high-water mark, so
+/// a small workload never pays for it.
+///
+/// - `NANOBPMN_COLD_SPILL` unset: on iff a persistent data path exists.
+/// - `NANOBPMN_COLD_SPILL=0`/`off`/`false`/`none`/`disabled`/`no`: forced off.
+/// - `NANOBPMN_COLD_SPILL=1`/`on`/`true`/`yes`: forced on (even in-memory — tests).
+/// - `NANOBPMN_COLD_SPILL_MB=<n>`: high-water in MiB (default 384). The sweep
+///   stops once resident memory falls under `low = high * 7/8`.
+fn cold_spill_from_env() -> Option<(u64, u64)> {
+    let (_, db) = resolve_data_paths();
+    let enabled = match std::env::var("NANOBPMN_COLD_SPILL").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("none") | Some("disabled") | Some("no") => {
+            false
+        }
+        Some("1") | Some("on") | Some("true") | Some("yes") => true,
+        _ => db.is_some(),
+    };
+    if !enabled {
+        return None;
+    }
+    let high_mb = std::env::var("NANOBPMN_COLD_SPILL_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(384);
+    let high = high_mb * 1024 * 1024;
+    let low = high / 8 * 7;
+    Some((high, low))
 }
 
 /// Engine-backed implementations of selected operations. The stub generator
@@ -3278,6 +3336,9 @@ async fn main() {
                     .with(move |journal| {
                         let (fired, _commit) = journal.trigger_timers(now);
                         journal.expire_jobs(now);
+                        // Shed dormant instances to disk if hot RAM is over the
+                        // high-water mark (cheap no-op below it / when unset).
+                        journal.maybe_cold_spill();
                         !fired.is_empty()
                     })
                     .await;

@@ -274,7 +274,7 @@ nanobpmn addresses both:
   no steady-state cost. (In a local run, a 4 000-instance create+complete burst's
   idle tick logged `returned 156.9 MiB to the OS (214.4 -> 57.5 MiB resident)`.)
 
-This is distinct from the **variable-spill** tier (above), which bounds the
+This is distinct from the **variable-spill** tier (below), which bounds the
 *live* peak of a large *active* backlog by moving cold parked instances' variables
 to disk; the allocator/idle-purge work bounds *idle* footprint after a backlog has
 drained. Together: low idle memory, bounded live memory, full in-RAM speed for the
@@ -283,6 +283,45 @@ working set.
 | Variable | Effect |
 | --- | --- |
 | `NANOBPMN_IDLE_PURGE_MS=<n>` | Quiescence (ms) the server must be idle before it compacts hot state and returns freed memory to the OS. Default `5000`; `0` disables the idle-purge tick. |
+
+### Tiered hot state: variable spill and cold spill
+
+The engine's hot state lives in RAM for speed, but two workloads make an unbounded
+resident footprint a problem: a large *active* backlog (many instances parked on a
+job, each carrying a 50 KB-class variable payload) and a large *dormant* backlog
+(many long-lived instances parked on a timer or message, idle for minutes to days).
+nanobpmn pages both classes out to disk and rehydrates them on demand, mirroring how
+Camunda 8 / Zeebe back hot state with RocksDB. Both tiers reuse one SQLite store
+(`<data-dir>/var-spill.sqlite`) and are **derived caches** of the durable journal — a
+lost spill blob is reconstructable, so the store runs `synchronous=NORMAL`.
+
+- **Variable spill** sheds just the *variables* of instances parked on a job once the
+  resident parked-backlog exceeds a hot budget, and rehydrates them on `activateJobs`
+  (the moment a worker needs them). It targets the high-throughput flood case and
+  leaves the small control-state maps resident. It deliberately skips instances
+  holding a timer or open message subscription, since those resume without an
+  activation seam.
+
+- **Cold spill** evicts whole *dormant* instances — control state, jobs, timers,
+  subscriptions, variables — when resident RAM crosses a high-water mark, keeping only
+  a slim resident **routing index** (job keys, message correlation keys, timer
+  due-times) so an off-heap instance can still be found. It rehydrates an instance the
+  instant an event targets it: a worker poll for its job type, a command addressing it
+  by key, a correlating message, or its timer falling due. It targets the
+  many-long-lived-parked-instances case and includes the timer/message-parked
+  instances variable spill leaves resident. Eviction shrinks the hot-state maps and
+  purges the allocator, so cold RAM is returned to the OS, not just freed internally.
+
+Both tiers are **on by default in persistent mode** (a data directory is configured)
+and off for fully in-memory runs, where spilling to an in-memory SQLite would only
+double the footprint.
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_VAR_SPILL=<on\|off>` | Force variable spill on/off. Unset: on iff a persistent data path exists. |
+| `NANOBPMN_VAR_SPILL_BUDGET=<n>` | Resident parked-instance budget before variables spill. Default `512`. |
+| `NANOBPMN_COLD_SPILL=<on\|off>` | Force cold spill on/off. Unset: on iff a persistent data path exists. |
+| `NANOBPMN_COLD_SPILL_MB=<n>` | High-water resident RAM (MiB) above which dormant instances are evicted to disk. Default `384`; low-water = 7/8 of high. |
 
 ## Command stream (WebSocket)
 

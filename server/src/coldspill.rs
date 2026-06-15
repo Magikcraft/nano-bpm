@@ -1,0 +1,302 @@
+//! The slim resident routing index for cold-spilled instances.
+//!
+//! When [`crate::Journal`] cold-spills a dormant instance it lifts the whole
+//! instance — its `active`/`scopes`/`join_*` maps and every job, timer, message
+//! subscription, user task and incident it owns — out of the engine and into the
+//! disk-backed store, keeping only what is needed to *route a future event back
+//! to it*: the keys and match criteria recorded here.
+//!
+//! This index is deliberately tiny. Per cold instance it holds a handful of
+//! `u64` keys and (for messages) two short strings — never the variables or the
+//! control-state maps. So a backlog of 100k dormant instances costs a few MB of
+//! index instead of the hundreds of MB their live state would, and any targeting
+//! event (a worker activating its job type, a correlated message, a due timer, or
+//! a direct command by key) is matched here first and the owning instance
+//! rehydrated on demand before the engine processes it.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use nanobpmn_engine_core::{
+    InstanceSnapshot, JobState, Key, MessageSubscriptionState, TimerState, UserTaskState,
+};
+
+/// The routing facets of one cold instance, retained so its reverse-index
+/// entries can be removed wholesale when it is rehydrated.
+#[derive(Default)]
+struct ColdFacets {
+    /// Keys of every job the instance owns (any state), for key-targeted
+    /// commands (`CompleteJob`, `FailJob`, `UpdateJobRetries`, ...).
+    jobs: Vec<Key>,
+    /// Job type of each *activatable* (`Created`) job, for worker activation.
+    activatable_job_types: Vec<String>,
+    /// (message name, correlation key) of each *open* subscription, for
+    /// `CorrelateMessage`.
+    messages: Vec<(String, String)>,
+    /// `due_at` of each *armed* (`Created`) timer, for `TriggerTimers`.
+    timers: Vec<u64>,
+    /// Keys of every user task the instance owns, for user-task commands.
+    user_tasks: Vec<Key>,
+    /// Keys of every incident the instance owns, for `ResolveIncident`.
+    incidents: Vec<Key>,
+}
+
+/// A resident index from routing keys to the cold instance that owns them.
+#[derive(Default)]
+pub struct ColdIndex {
+    instances: HashMap<Key, ColdFacets>,
+    by_job: HashMap<Key, Key>,
+    by_job_type: HashMap<String, BTreeSet<Key>>,
+    by_message: HashMap<(String, String), HashSet<Key>>,
+    by_timer: BTreeMap<u64, HashSet<Key>>,
+    by_user_task: HashMap<Key, Key>,
+    by_incident: HashMap<Key, Key>,
+}
+
+impl ColdIndex {
+    /// Records the routing facets of a freshly cold-spilled `snapshot`.
+    pub fn insert(&mut self, snapshot: &InstanceSnapshot) {
+        let key = snapshot.instance.key;
+        let mut facets = ColdFacets::default();
+
+        for job in &snapshot.jobs {
+            self.by_job.insert(job.key, key);
+            facets.jobs.push(job.key);
+            if matches!(job.state, JobState::Created | JobState::Activated) {
+                self.by_job_type
+                    .entry(job.job_type.clone())
+                    .or_default()
+                    .insert(key);
+                facets.activatable_job_types.push(job.job_type.clone());
+            }
+        }
+        for sub in &snapshot.message_subscriptions {
+            if sub.state == MessageSubscriptionState::Open {
+                let id = (sub.message_name.clone(), sub.correlation_key.clone());
+                self.by_message.entry(id.clone()).or_default().insert(key);
+                facets.messages.push(id);
+            }
+        }
+        for timer in &snapshot.timers {
+            if timer.state == TimerState::Created {
+                self.by_timer.entry(timer.due_at).or_default().insert(key);
+                facets.timers.push(timer.due_at);
+            }
+        }
+        for task in &snapshot.user_tasks {
+            if task.state == UserTaskState::Created {
+                self.by_user_task.insert(task.key, key);
+                facets.user_tasks.push(task.key);
+            }
+        }
+        for incident in &snapshot.incidents {
+            self.by_incident.insert(incident.key, key);
+            facets.incidents.push(incident.key);
+        }
+
+        self.instances.insert(key, facets);
+    }
+
+    /// Forgets every entry for `key` (called when the instance is rehydrated).
+    pub fn remove(&mut self, key: Key) {
+        let Some(facets) = self.instances.remove(&key) else {
+            return;
+        };
+        for job in facets.jobs {
+            self.by_job.remove(&job);
+        }
+        for job_type in facets.activatable_job_types {
+            if let Some(set) = self.by_job_type.get_mut(&job_type) {
+                set.remove(&key);
+                if set.is_empty() {
+                    self.by_job_type.remove(&job_type);
+                }
+            }
+        }
+        for id in facets.messages {
+            if let Some(set) = self.by_message.get_mut(&id) {
+                set.remove(&key);
+                if set.is_empty() {
+                    self.by_message.remove(&id);
+                }
+            }
+        }
+        for due in facets.timers {
+            if let Some(set) = self.by_timer.get_mut(&due) {
+                set.remove(&key);
+                if set.is_empty() {
+                    self.by_timer.remove(&due);
+                }
+            }
+        }
+        for task in facets.user_tasks {
+            self.by_user_task.remove(&task);
+        }
+        for incident in facets.incidents {
+            self.by_incident.remove(&incident);
+        }
+    }
+
+    /// Whether `key` is a cold instance.
+    pub fn contains(&self, key: Key) -> bool {
+        self.instances.contains_key(&key)
+    }
+
+    /// How many instances are currently cold.
+    pub fn len(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// The cold instance owning `job_key`, if any.
+    pub fn instance_for_job(&self, job_key: Key) -> Option<Key> {
+        self.by_job.get(&job_key).copied()
+    }
+
+    /// The cold instance owning `user_task_key`, if any.
+    pub fn instance_for_user_task(&self, user_task_key: Key) -> Option<Key> {
+        self.by_user_task.get(&user_task_key).copied()
+    }
+
+    /// The cold instance owning `incident_key`, if any.
+    pub fn instance_for_incident(&self, incident_key: Key) -> Option<Key> {
+        self.by_incident.get(&incident_key).copied()
+    }
+
+    /// Up to `limit` cold instances with an activatable job of `job_type`, oldest
+    /// (lowest key) first — the ones a worker poll for that type must rehydrate.
+    pub fn instances_for_job_type(&self, job_type: &str, limit: usize) -> Vec<Key> {
+        match self.by_job_type.get(job_type) {
+            Some(set) => set.iter().take(limit).copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Cold instances with an open subscription matching `(message_name,
+    /// correlation_key)` — the ones a `CorrelateMessage` must rehydrate.
+    pub fn instances_for_message(&self, message_name: &str, correlation_key: &str) -> Vec<Key> {
+        let id = (message_name.to_string(), correlation_key.to_string());
+        match self.by_message.get(&id) {
+            Some(set) => set.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Cold instances holding an armed timer due at or before `now` — the ones a
+    /// `TriggerTimers(now)` must rehydrate so the tick can fire them.
+    pub fn instances_due(&self, now: u64) -> Vec<Key> {
+        let mut due = HashSet::new();
+        for (_, set) in self.by_timer.range(..=now) {
+            due.extend(set.iter().copied());
+        }
+        due.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use nanobpmn_engine_core::{
+        Job, MessageSubscription, MessageSubscriptionKind, ProcessInstance, ProcessInstanceState,
+        Timer, TimerKind,
+    };
+
+    fn instance(key: Key) -> ProcessInstance {
+        ProcessInstance {
+            key,
+            process_id: "p".into(),
+            state: ProcessInstanceState::Active,
+            created_at: 0,
+            active: HashMap::new(),
+            scopes: HashMap::new(),
+            variables: Arc::new(HashMap::new()),
+            join_counts: HashMap::new(),
+            join_instances: HashMap::new(),
+            incidents: Vec::new(),
+            variables_spilled: false,
+        }
+    }
+
+    fn job(key: Key, instance_key: Key, job_type: &str) -> Job {
+        Job {
+            key,
+            instance_key,
+            element_instance_key: 0,
+            element_id: "t".into(),
+            job_type: job_type.into(),
+            state: JobState::Created,
+            worker: None,
+            deadline: None,
+            activated: false,
+            retries: 3,
+        }
+    }
+
+    fn snapshot_with_job(instance_key: Key, job_key: Key, job_type: &str) -> InstanceSnapshot {
+        InstanceSnapshot {
+            instance: instance(instance_key),
+            jobs: vec![job(job_key, instance_key, job_type)],
+            timers: Vec::new(),
+            message_subscriptions: Vec::new(),
+            user_tasks: Vec::new(),
+            incidents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn routes_jobs_and_job_types_then_clears_on_remove() {
+        let mut idx = ColdIndex::default();
+        idx.insert(&snapshot_with_job(100, 101, "payment"));
+        idx.insert(&snapshot_with_job(200, 201, "payment"));
+
+        assert_eq!(idx.instance_for_job(101), Some(100));
+        assert_eq!(idx.instance_for_job(201), Some(200));
+        // Oldest-first, limit-respecting.
+        assert_eq!(idx.instances_for_job_type("payment", 1), vec![100]);
+        assert_eq!(idx.instances_for_job_type("payment", 10), vec![100, 200]);
+        assert!(idx.instances_for_job_type("other", 10).is_empty());
+
+        idx.remove(100);
+        assert_eq!(idx.instance_for_job(101), None);
+        assert_eq!(idx.instances_for_job_type("payment", 10), vec![200]);
+        idx.remove(200);
+        assert!(idx.instances_for_job_type("payment", 10).is_empty());
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn routes_messages_and_due_timers() {
+        let mut idx = ColdIndex::default();
+        let mut snap = snapshot_with_job(300, 301, "work");
+        snap.message_subscriptions.push(MessageSubscription {
+            key: 310,
+            instance_key: 300,
+            element_instance_key: 0,
+            element_id: "m".into(),
+            message_name: "approve".into(),
+            correlation_key: "A".into(),
+            state: MessageSubscriptionState::Open,
+            kind: MessageSubscriptionKind::IntermediateCatch,
+        });
+        snap.timers.push(Timer {
+            key: 320,
+            instance_key: 300,
+            element_instance_key: 0,
+            element_id: "t".into(),
+            due_at: 5_000,
+            state: TimerState::Created,
+            kind: TimerKind::IntermediateCatch,
+        });
+        idx.insert(&snap);
+
+        assert_eq!(idx.instances_for_message("approve", "A"), vec![300]);
+        assert!(idx.instances_for_message("approve", "B").is_empty());
+        assert!(idx.instances_due(4_999).is_empty(), "not yet due");
+        assert_eq!(idx.instances_due(5_000), vec![300], "due at boundary");
+        assert!(idx.contains(300));
+
+        idx.remove(300);
+        assert!(idx.instances_for_message("approve", "A").is_empty());
+        assert!(idx.instances_due(10_000).is_empty());
+        assert!(!idx.contains(300));
+    }
+}

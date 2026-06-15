@@ -28,6 +28,7 @@ use nanobpmn_engine_core::{
 };
 use tokio::sync::oneshot;
 
+use crate::coldspill::ColdIndex;
 use crate::varspill::VarSpillStore;
 
 /// A durable-write request handed to the background journal writer: the
@@ -88,6 +89,24 @@ pub struct Journal {
     /// oldest backlog's variables to disk. `None` keeps every payload resident
     /// (the original behaviour).
     spill: Option<(Arc<VarSpillStore>, usize)>,
+    /// Optional cold spill: evicts whole *dormant* instances (control state and
+    /// all) to the same disk-backed store, keeping only a slim resident routing
+    /// index ([`ColdIndex`]) so an event can rehydrate the owning instance on
+    /// demand. Triggered by hot-RAM pressure (resident bytes crossing
+    /// `high_water`), it sheds the oldest dormant instances until back under
+    /// `low_water`. `None` keeps every instance resident. This is the long-lived,
+    /// low-throughput counterpart to variable spill: where variable spill bounds a
+    /// large *active* backlog, cold spill bounds a large *parked* one.
+    cold: Option<ColdSpill>,
+}
+
+/// Cold-spill state held by a [`Journal`]: the shared disk store, the resident
+/// routing index, and the resident-byte watermarks that gate the sweep.
+struct ColdSpill {
+    store: Arc<VarSpillStore>,
+    index: ColdIndex,
+    high_water: u64,
+    low_water: u64,
 }
 
 /// The background journal writer: blocks for the next request, drains every
@@ -137,6 +156,7 @@ impl Journal {
             exporter: None,
             fresh: true,
             spill: None,
+            cold: None,
         }
     }
 
@@ -188,6 +208,7 @@ impl Journal {
             exporter: None,
             fresh,
             spill: None,
+            cold: None,
         })
     }
 
@@ -200,6 +221,205 @@ impl Journal {
     /// behaviour.
     pub fn set_spill(&mut self, store: Arc<VarSpillStore>, budget: usize) {
         self.spill = Some((store, budget));
+    }
+
+    /// Wires cold spill onto the same disk-backed `store`. Once the engine's
+    /// resident memory crosses `high_water` bytes, the periodic sweep
+    /// ([`maybe_cold_spill`](Journal::maybe_cold_spill)) evicts whole dormant
+    /// instances to the store — oldest first — until resident memory falls back
+    /// under `low_water`, keeping only a slim routing index resident. A cold
+    /// instance is rehydrated on demand the moment an event targets it. Set
+    /// before serving; leaving it unset keeps every instance resident.
+    pub fn set_cold_spill(&mut self, store: Arc<VarSpillStore>, high_water: u64, low_water: u64) {
+        self.cold = Some(ColdSpill {
+            store,
+            index: ColdIndex::default(),
+            high_water,
+            low_water,
+        });
+    }
+
+    /// How many instances are currently cold (off-heap). Zero when cold spill is
+    /// unset or nothing is parked. Exposed for observability/tests.
+    pub fn cold_count(&self) -> usize {
+        self.cold.as_ref().map(|c| c.index.len()).unwrap_or(0)
+    }
+
+    /// Rehydrates the cold instance `key` back into hot state: takes its snapshot
+    /// from the store, restores it into the engine, and drops its routing-index
+    /// entries. A no-op (returns `false`) if cold spill is unset or `key` is not
+    /// cold. A store miss (snapshot lost) still clears the stale index entry so a
+    /// later event cannot loop trying to rehydrate a vanished instance — the
+    /// journal remains the durable source of truth.
+    fn rehydrate_cold(&mut self, key: Key) -> bool {
+        let store = match self.cold.as_ref() {
+            Some(cold) if cold.index.contains(key) => Arc::clone(&cold.store),
+            _ => return false,
+        };
+        let snapshot = store.take_cold(key);
+        if let Some(cold) = self.cold.as_mut() {
+            cold.index.remove(key);
+        }
+        match snapshot {
+            Some(snapshot) => {
+                self.engine.rehydrate_instance(snapshot);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Rehydrates any cold instance a command is about to target, so the engine
+    /// processes the command against complete hot state. Cheap when cold spill is
+    /// unset or nothing relevant is cold (a few index lookups). Routing mirrors
+    /// the engine's own: by job key (`CompleteJob`/`FailJob`/...), user-task key,
+    /// incident key, message name+correlation (`CorrelateMessage`), timer due-time
+    /// (`TriggerTimers`), or the instance key itself (`CancelInstance`/
+    /// `SetVariables`).
+    fn ensure_resident_for_command(&mut self, command: &Command) {
+        let Some(cold) = self.cold.as_ref() else {
+            return;
+        };
+        let mut targets: Vec<Key> = Vec::new();
+        match command {
+            Command::CompleteJob { job_key, .. }
+            | Command::FailJob { job_key, .. }
+            | Command::ThrowJobError { job_key, .. }
+            | Command::UpdateJobRetries { job_key, .. } => {
+                targets.extend(cold.index.instance_for_job(*job_key));
+            }
+            Command::AssignUserTask { user_task_key, .. }
+            | Command::UnassignUserTask { user_task_key }
+            | Command::UpdateUserTask { user_task_key, .. }
+            | Command::CompleteUserTask { user_task_key, .. } => {
+                targets.extend(cold.index.instance_for_user_task(*user_task_key));
+            }
+            Command::ResolveIncident { incident_key, .. } => {
+                targets.extend(cold.index.instance_for_incident(*incident_key));
+            }
+            Command::SetVariables { scope_key, .. } => {
+                if cold.index.contains(*scope_key) {
+                    targets.push(*scope_key);
+                }
+            }
+            Command::CancelInstance { instance_key } => {
+                if cold.index.contains(*instance_key) {
+                    targets.push(*instance_key);
+                }
+            }
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                ..
+            } => {
+                targets.extend(cold.index.instances_for_message(message_name, correlation_key));
+            }
+            Command::TriggerTimers { now } => {
+                targets.extend(cold.index.instances_due(*now));
+            }
+            _ => {}
+        }
+        for key in targets {
+            self.rehydrate_cold(key);
+        }
+    }
+
+    /// Sheds dormant instances to disk when hot RAM crosses the high-water mark.
+    /// Cheap below the mark (one resident-bytes read). Above it, snapshots the
+    /// oldest cold-spillable instances in bounded batches — lifting each whole
+    /// instance (control state, jobs, timers, subscriptions) out of the engine
+    /// and into the store, recording only its routing facets in the resident
+    /// index — until resident memory falls under the low-water mark or no dormant
+    /// instance remains. Run from the background tick on the engine thread. The
+    /// snapshots are derived from the durable journal, so a lost one is
+    /// reconstructable: this is a memory cache, not a system of record.
+    pub fn maybe_cold_spill(&mut self) {
+        let (high, low) = match self.cold.as_ref() {
+            Some(cold) if cold.high_water > 0 => (cold.high_water, cold.low_water),
+            _ => return,
+        };
+        let Some(resident) = crate::memory::resident_bytes() else {
+            return;
+        };
+        let resident = resident as u64;
+        if resident < high {
+            return;
+        }
+        let store = Arc::clone(&self.cold.as_ref().expect("cold set").store);
+        let mut spilled = 0usize;
+        loop {
+            let batch = self.engine.cold_spillable_instances(64);
+            if batch.is_empty() {
+                break;
+            }
+            let mut spilled_in_batch = 0usize;
+            for key in batch {
+                let Some(snapshot) = self.engine.snapshot_instance(key) else {
+                    continue;
+                };
+                if store.put_cold(key, &snapshot).is_ok() {
+                    self.cold.as_mut().expect("cold set").index.insert(&snapshot);
+                    spilled_in_batch += 1;
+                } else {
+                    // Store write failed: keep the instance resident rather than
+                    // drop it from hot state with no durable cold copy.
+                    self.engine.rehydrate_instance(snapshot);
+                }
+            }
+            spilled += spilled_in_batch;
+            if spilled_in_batch == 0 {
+                break;
+            }
+            // Compact + purge so the resident reading reflects the eviction, then
+            // re-check against the low-water mark.
+            self.engine.shrink();
+            let _ = crate::memory::purge();
+            match crate::memory::resident_bytes() {
+                Some(now) if (now as u64) < low => break,
+                _ => {}
+            }
+        }
+        if spilled > 0 {
+            tracing::info!(
+                "cold spill: shed {spilled} dormant instance(s) to disk ({} now cold)",
+                self.cold.as_ref().expect("cold set").index.len(),
+            );
+        }
+    }
+
+    /// Test hook: cold-spills every currently dormant instance regardless of the
+    /// memory watermark, returning the number shed. Lets tests exercise the
+    /// spill/rehydrate seams deterministically without driving real RAM pressure.
+    #[cfg(test)]
+    pub fn force_cold_spill_all(&mut self) -> usize {
+        let store = match self.cold.as_ref() {
+            Some(cold) => Arc::clone(&cold.store),
+            None => return 0,
+        };
+        let mut spilled = 0usize;
+        loop {
+            let batch = self.engine.cold_spillable_instances(64);
+            if batch.is_empty() {
+                break;
+            }
+            let mut spilled_in_batch = 0usize;
+            for key in batch {
+                let Some(snapshot) = self.engine.snapshot_instance(key) else {
+                    continue;
+                };
+                if store.put_cold(key, &snapshot).is_ok() {
+                    self.cold.as_mut().expect("cold set").index.insert(&snapshot);
+                    spilled_in_batch += 1;
+                } else {
+                    self.engine.rehydrate_instance(snapshot);
+                }
+            }
+            spilled += spilled_in_batch;
+            if spilled_in_batch == 0 {
+                break;
+            }
+        }
+        spilled
     }
 
     /// Wires the read-model exporter channel. Set before any command is applied
@@ -282,6 +502,7 @@ impl Journal {
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        self.ensure_resident_for_command(&command);
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let commit = self.persist(&events);
         self.maybe_spill();
@@ -294,6 +515,7 @@ impl Journal {
         &mut self,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        self.ensure_resident_for_command(&command);
         let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
         self.maybe_spill();
@@ -343,9 +565,24 @@ impl Journal {
         timeout: u64,
         now: u64,
     ) -> Vec<ActivatedJob> {
+        let job_type = job_type.into();
+        // Rehydrate up to `max_jobs` cold instances holding an activatable job of
+        // this type, so a worker poll can reach a parked-then-cold backlog. Only
+        // pays a SQLite read when something of this type is actually cold.
+        if self.cold.is_some() {
+            let candidates = self
+                .cold
+                .as_ref()
+                .expect("cold set")
+                .index
+                .instances_for_job_type(&job_type, max_jobs);
+            for key in candidates {
+                self.rehydrate_cold(key);
+            }
+        }
         let mut activated = self
             .engine
-            .activate_jobs(job_type, worker, max_jobs, timeout, now);
+            .activate_jobs(&job_type, worker, max_jobs, timeout, now);
         if let Some((store, _)) = self.spill.as_ref() {
             let store = Arc::clone(store);
             for job in activated.iter_mut() {
@@ -368,6 +605,19 @@ impl Journal {
     /// [`Engine::trigger_timers`]; returns the events produced (empty if none
     /// were due) and their [`Commit`].
     pub fn trigger_timers(&mut self, now: u64) -> (Arc<Vec<Event>>, Commit) {
+        // Rehydrate any cold instance whose armed timer is now due, so the tick
+        // can fire it. No-op when nothing cold is due.
+        if self.cold.is_some() {
+            let due = self
+                .cold
+                .as_ref()
+                .expect("cold set")
+                .index
+                .instances_due(now);
+            for key in due {
+                self.rehydrate_cold(key);
+            }
+        }
         let events = Arc::new(self.engine.trigger_timers(now));
         let commit = self.persist(&events);
         (events, commit)
@@ -462,5 +712,70 @@ mod tests {
         assert_eq!(reopened.state().processes.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn cold_journal() -> Journal {
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        // Watermarks are irrelevant: tests drive spill via force_cold_spill_all.
+        journal.set_cold_spill(store, 1, 0);
+        journal
+    }
+
+    fn deploy_and_create(journal: &mut Journal) -> Key {
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        events.iter().find_map(|e| e.instance_key()).unwrap()
+    }
+
+    #[test]
+    fn cold_spilled_instance_rehydrates_on_job_activation_and_completes() {
+        let mut journal = cold_journal();
+        let key = deploy_and_create(&mut journal);
+
+        // the instance is parked on the "demo-work" job: dormant and spillable
+        assert!(journal.instance(key).is_some());
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert_eq!(journal.cold_count(), 1);
+        // its whole control state is now off-heap
+        assert!(journal.instance(key).is_none());
+
+        // a worker poll rehydrates it from the cold store and hands back the job
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].instance_key, key);
+        assert_eq!(journal.cold_count(), 0);
+        assert!(journal.instance(key).is_some());
+
+        // completing the rehydrated job drives the instance to completion
+        let (events, _) = journal
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn command_targeting_a_cold_instance_rehydrates_it_first() {
+        let mut journal = cold_journal();
+        let key = deploy_and_create(&mut journal);
+
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(journal.instance(key).is_none());
+
+        // CancelInstance targets a cold instance by key: ensure_resident_for_command
+        // must page it back in before the engine applies the command
+        let (events, _) = journal
+            .apply_command(Command::cancel_instance(key))
+            .unwrap();
+        assert_eq!(journal.cold_count(), 0);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == key)));
     }
 }

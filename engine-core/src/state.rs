@@ -17,6 +17,7 @@ pub type Key = u64;
 
 /// Lifecycle state of a process instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ProcessInstanceState {
     Active,
     Completed,
@@ -27,6 +28,7 @@ pub enum ProcessInstanceState {
 
 /// Lifecycle state of a job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum JobState {
     /// Created and activatable: available for a worker to activate. A job is
     /// also back in this state once its activation lock expires.
@@ -52,6 +54,7 @@ pub enum JobState {
 
 /// A job created for a service task, awaiting activation and completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Job {
     pub key: Key,
     pub instance_key: Key,
@@ -83,6 +86,7 @@ pub const DEFAULT_JOB_RETRIES: i32 = 3;
 
 /// Lifecycle state of a (native) user task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UserTaskState {
     /// Created and available for a human to claim/complete.
     Created,
@@ -94,6 +98,7 @@ pub enum UserTaskState {
 
 /// A user task created for a `userTask` element, awaiting human completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UserTask {
     pub key: Key,
     pub instance_key: Key,
@@ -120,6 +125,7 @@ pub struct UserTask {
 
 /// A running (or completed) process instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessInstance {
     pub key: Key,
     pub process_id: String,
@@ -189,6 +195,7 @@ pub enum IncidentKind {
 /// Lifecycle state of an incident. Incidents are retained after resolution (as
 /// `Resolved`) so they remain queryable as an audit trail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IncidentState {
     /// Raised and parking a token; awaiting resolution.
     Active,
@@ -201,6 +208,7 @@ pub enum IncidentState {
 /// business error went uncaught). Incidents are resolved with
 /// [`crate::Command::ResolveIncident`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Incident {
     pub key: Key,
     pub instance_key: Key,
@@ -277,6 +285,7 @@ pub enum TimerKind {
 /// `due_at` instant passes. A clock tick ([`crate::Command::TriggerTimers`])
 /// fires every due timer, releasing its token along the event's outgoing flow.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Timer {
     pub key: Key,
     pub instance_key: Key,
@@ -346,6 +355,7 @@ pub enum MessageSubscriptionKind {
 /// name and correlation key match an open subscription releases its token (an
 /// intermediate catch) or interrupts its activity (an interrupting boundary).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MessageSubscription {
     pub key: Key,
     pub instance_key: Key,
@@ -471,6 +481,32 @@ pub struct State {
     pub jobs_by_instance: HashMap<Key, std::collections::HashSet<Key>>,
 }
 
+/// A self-contained snapshot of one process instance and every entity it owns
+/// (jobs, timers, message subscriptions, user tasks, incidents), captured for
+/// **cold spill**: the host-managed eviction of an idle but still-running
+/// instance's full control state to disk, to be rehydrated on demand when an
+/// event targets it.
+///
+/// Distinct from variable spill (which sheds only the `variables` payload of a
+/// job-parked instance, rehydrated on activation): a cold snapshot moves the
+/// *whole* instance — including instances parked on a timer or a message, the
+/// genuinely long-lived waits — out of hot state, so a backlog of dormant
+/// instances stops costing RAM. The snapshot is authoritative and self-contained
+/// (its `instance.variables` hold the real payload, never a spilled
+/// placeholder), so [`crate::Engine::rehydrate_instance`] reconstructs hot state
+/// exactly. Like every spill artefact it is a cache, not a system of record: the
+/// journal already holds the durable history, so a lost snapshot is replayable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct InstanceSnapshot {
+    pub instance: ProcessInstance,
+    pub jobs: Vec<Job>,
+    pub timers: Vec<Timer>,
+    pub message_subscriptions: Vec<MessageSubscription>,
+    pub user_tasks: Vec<UserTask>,
+    pub incidents: Vec<Incident>,
+}
+
 impl State {
     /// A fresh, empty state.
     pub fn new() -> Self {
@@ -498,7 +534,7 @@ impl State {
 /// (or a missing job) is removed from both. Call after any arm that changes a
 /// job's state. Keeping membership a pure function of the job's current state
 /// means the indices can never drift from `jobs`.
-fn resync_job_index(state: &mut State, job_key: Key) {
+pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     let Some(job) = state.jobs.get(&job_key) else {
         return;
     };

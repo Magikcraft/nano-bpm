@@ -12,7 +12,10 @@ license = "Apache-2.0"
 # The optional `serde` feature derives (de)serialization on the event log and
 # model so a host can persist and replay it; it is off by default.
 [dependencies]
-serde = { version = "1", optional = true, features = ["derive"] }
+# `rc` lets the optional control-state snapshot (cold spill) (de)serialize the
+# `Arc`-shared `variables` payload on `ProcessInstance`; it has no effect when
+# the `serde` feature is off.
+serde = { version = "1", optional = true, features = ["derive", "rc"] }
 
 [features]
 serde = ["dep:serde"]

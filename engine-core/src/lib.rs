@@ -90,8 +90,8 @@ pub use model::{
     SequenceFlow, UserTaskProps, Value,
 };
 pub use state::{
-    DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind, IncidentState, Job, JobState,
-    Key, MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
+    DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind, IncidentState, InstanceSnapshot,
+    Job, JobState, Key, MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
     MessageSubscriptionState, ProcessInstance, ProcessInstanceState, StartTimer, State, Timer,
     TimerKind, TimerState, UserTask, UserTaskState,
 };

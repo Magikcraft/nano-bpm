@@ -387,6 +387,159 @@ impl Engine {
         guarded
     }
 
+    // --- Cold spill: host-managed eviction of whole idle instances. ---
+    //
+    // Variable spill (above) sheds only the `variables` of a job-parked instance,
+    // rehydrated at activation. It deliberately keeps instances parked on a timer
+    // or message resident, because those resume *without* job activation. But the
+    // long-lived, low-throughput workload — tens of thousands of instances each
+    // waiting hours or days on a timer or an incoming message — is exactly those
+    // instances, and their resident control state (the `active`/`scopes`/`join_*`
+    // maps and the owned job/timer/subscription records) is what grows hot RAM
+    // with the parked backlog even while nothing runs.
+    //
+    // Cold spill moves such an instance out of hot state *in full*: the host takes
+    // a [`state::InstanceSnapshot`], persists it, and keeps only a slim routing
+    // index (the instance's job keys, message name/correlation keys and timer
+    // due-times) resident, so an event that targets the instance can rehydrate it
+    // on demand. As with variable spill these methods are pure — no I/O: the host
+    // owns the store, the index and the policy; the engine only lifts the instance
+    // in and out of its maps and keeps its derived indices consistent.
+
+    /// Picks up to `limit` *idle* cold-spill candidates: `Active` instances that
+    /// hold at least one parked token and have **no activated (locked) job** — so
+    /// no worker is mid-task on them and they are genuinely dormant. Returned
+    /// oldest-key first (keys are monotonic, so the coldest backlog is shed
+    /// first), the LRU order the host evicts in under memory pressure.
+    ///
+    /// Unlike [`spillable_instances`](Engine::spillable_instances) (variable
+    /// spill) this **includes** instances parked on a timer or message — the
+    /// whole point, since those are the long-lived waits — because the host
+    /// rehydrates a cold instance on *any* targeting event (timer fire, message
+    /// correlation, job activation or a direct command), not only activation.
+    pub fn cold_spillable_instances(&self, limit: usize) -> Vec<Key> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut candidates: Vec<Key> = self
+            .state
+            .instances
+            .iter()
+            .filter(|(key, i)| self.is_cold_spillable(key, i))
+            .map(|(key, _)| *key)
+            .collect();
+        candidates.sort_unstable();
+        candidates.truncate(limit);
+        candidates
+    }
+
+    /// How many resident instances are cold-spill candidates right now (see
+    /// [`Engine::cold_spillable_instances`]).
+    pub fn cold_spillable_count(&self) -> usize {
+        self.state
+            .instances
+            .iter()
+            .filter(|(key, i)| self.is_cold_spillable(key, i))
+            .count()
+    }
+
+    /// Whether `instance` (keyed `key`) is an idle cold-spill candidate: `Active`,
+    /// holding at least one parked token, and owning no job that currently holds
+    /// an activation lock (a locked job means a worker is mid-task — keep it hot).
+    fn is_cold_spillable(&self, key: &Key, instance: &state::ProcessInstance) -> bool {
+        if instance.state != ProcessInstanceState::Active
+            || instance.active.is_empty()
+            || instance.variables_spilled
+        {
+            return false;
+        }
+        match self.state.jobs_by_instance.get(key) {
+            Some(jobs) => !jobs.iter().any(|j| self.state.activated_jobs.contains(j)),
+            None => true,
+        }
+    }
+
+    /// Lifts an idle instance and every entity it owns (jobs, timers, message
+    /// subscriptions, user tasks, incidents) out of hot state, returning a
+    /// self-contained [`state::InstanceSnapshot`] for the host to persist. The
+    /// engine's derived job indices are kept consistent (each job is deindexed as
+    /// it leaves). Returns `None` — a no-op — for an unknown or terminal instance.
+    ///
+    /// If the instance's variables were previously variable-spilled the snapshot
+    /// would capture an empty placeholder, so this refuses (returns `None`) while
+    /// `variables_spilled` is set: the host must rehydrate the variables first so
+    /// the cold snapshot is authoritative.
+    pub fn snapshot_instance(&mut self, key: Key) -> Option<state::InstanceSnapshot> {
+        let instance = self.state.instances.get(&key)?;
+        if instance.state != ProcessInstanceState::Active || instance.variables_spilled {
+            return None;
+        }
+
+        let mut jobs = Vec::new();
+        if let Some(job_keys) = self.state.jobs_by_instance.remove(&key) {
+            for job_key in job_keys {
+                if let Some(job) = self.state.jobs.remove(&job_key) {
+                    self.state.deindex_job(&job.job_type, job_key);
+                    jobs.push(job);
+                }
+            }
+        }
+
+        let timers = drain_owned(&mut self.state.timers, key);
+        let message_subscriptions = drain_owned(&mut self.state.message_subscriptions, key);
+        let user_tasks = drain_owned(&mut self.state.user_tasks, key);
+        let incidents = drain_owned(&mut self.state.incidents, key);
+
+        let instance = self.state.instances.remove(&key)?;
+        Some(state::InstanceSnapshot {
+            instance,
+            jobs,
+            timers,
+            message_subscriptions,
+            user_tasks,
+            incidents,
+        })
+    }
+
+    /// Restores a previously [snapshotted](Engine::snapshot_instance) instance
+    /// into hot state, re-inserting every owned entity and rebuilding the derived
+    /// job indices, so command processing sees exactly the state that was lifted
+    /// out. Idempotent-ish: re-inserting keys that already exist overwrites them.
+    pub fn rehydrate_instance(&mut self, snapshot: state::InstanceSnapshot) {
+        let state::InstanceSnapshot {
+            instance,
+            jobs,
+            timers,
+            message_subscriptions,
+            user_tasks,
+            incidents,
+        } = snapshot;
+        let key = instance.key;
+        self.state.instances.insert(key, instance);
+        for job in jobs {
+            let job_key = job.key;
+            self.state
+                .jobs_by_instance
+                .entry(key)
+                .or_default()
+                .insert(job_key);
+            self.state.jobs.insert(job_key, job);
+            state::resync_job_index(&mut self.state, job_key);
+        }
+        for timer in timers {
+            self.state.timers.insert(timer.key, timer);
+        }
+        for sub in message_subscriptions {
+            self.state.message_subscriptions.insert(sub.key, sub);
+        }
+        for task in user_tasks {
+            self.state.user_tasks.insert(task.key, task);
+        }
+        for incident in incidents {
+            self.state.incidents.insert(incident.key, incident);
+        }
+    }
+
     /// Looks up a job.
     pub fn job(&self, key: Key) -> Option<&state::Job> {
         self.state.jobs.get(&key)
@@ -2857,6 +3010,49 @@ impl Engine {
     }
 }
 
+/// An entity owned by a single process instance, identified by `instance_key`.
+/// Lets [`drain_owned`] lift every record an instance owns out of a hot-state map
+/// in one generic pass during cold-spill snapshotting.
+trait OwnedByInstance {
+    fn instance_key(&self) -> Key;
+}
+
+impl OwnedByInstance for state::Timer {
+    fn instance_key(&self) -> Key {
+        self.instance_key
+    }
+}
+impl OwnedByInstance for state::MessageSubscription {
+    fn instance_key(&self) -> Key {
+        self.instance_key
+    }
+}
+impl OwnedByInstance for state::UserTask {
+    fn instance_key(&self) -> Key {
+        self.instance_key
+    }
+}
+impl OwnedByInstance for state::Incident {
+    fn instance_key(&self) -> Key {
+        self.instance_key
+    }
+}
+
+/// Removes from `map` every entity owned by `instance_key`, returning them. Used
+/// to lift an instance's timers/subscriptions/user-tasks/incidents out of hot
+/// state when snapshotting it for cold spill.
+fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key) -> Vec<V> {
+    let owned: Vec<Key> = map
+        .iter()
+        .filter(|(_, v)| v.instance_key() == instance_key)
+        .map(|(k, _)| *k)
+        .collect();
+    owned
+        .into_iter()
+        .filter_map(|k| map.remove(&k))
+        .collect()
+}
+
 /// Errors returned by [`Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
@@ -3048,6 +3244,111 @@ mod tests {
         engine.rehydrate_variables(key, payload);
         assert!(!engine.is_variables_spilled(key));
         assert_eq!(engine.instance(key).unwrap().variables.get("k"), Some(&Value::Int(7)));
+    }
+
+    #[test]
+    fn cold_spill_round_trips_a_job_parked_instance() {
+        // Snapshotting a job-parked instance lifts it (and its job) entirely out
+        // of hot state; rehydrating restores it so the job is activatable and the
+        // instance completes exactly as if it had never been spilled.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("k".to_string(), Value::Int(7));
+        let events = engine
+            .apply_command(Command::create_instance_with("order", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        assert_eq!(engine.cold_spillable_instances(10), vec![key]);
+        assert_eq!(engine.cold_spillable_count(), 1);
+
+        let snapshot = engine.snapshot_instance(key).expect("snapshottable");
+        assert_eq!(snapshot.instance.key, key);
+        assert_eq!(snapshot.jobs.len(), 1, "the parked job travels in the snapshot");
+        assert_eq!(snapshot.instance.variables.get("k"), Some(&Value::Int(7)));
+        // Fully out of hot state: instance, job and job index all gone.
+        assert!(engine.instance(key).is_none());
+        assert!(!engine.state().jobs_by_instance.contains_key(&key));
+        assert!(engine.activate_jobs("payment", "w", 10, 60_000, 0).is_empty());
+
+        engine.rehydrate_instance(snapshot);
+        assert!(engine.instance(key).is_some());
+        assert_eq!(engine.instance(key).unwrap().variables.get("k"), Some(&Value::Int(7)));
+        // Job is activatable and completable again; the instance then completes.
+        let completion = complete_one(&mut engine, "payment");
+        assert!(completion
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn cold_spill_round_trips_a_message_parked_instance() {
+        // The long-lived case variable spill deliberately skips: an instance
+        // parked on a message intermediate catch (no job at all). Cold spill lifts
+        // it out wholesale and rehydration restores the subscription so a later
+        // correlated message still resumes and completes it.
+        let def = ProcessBuilder::new("wait")
+            .start_event("start")
+            .message_intermediate_catch_event("await", "approve", "orderId")
+            .end_event("end")
+            .connect("start", "await")
+            .connect("await", "end")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let mut vars = HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A".to_string()));
+        let events = engine
+            .apply_command(Command::create_instance_with("wait", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Parked on a message, no job: still a cold-spill candidate.
+        assert_eq!(engine.cold_spillable_instances(10), vec![key]);
+        let snapshot = engine.snapshot_instance(key).expect("snapshottable");
+        assert_eq!(snapshot.message_subscriptions.len(), 1);
+        assert!(engine.instance(key).is_none());
+        // While cold the subscription is out of hot state entirely.
+        assert!(engine.state().message_subscriptions.is_empty());
+
+        engine.rehydrate_instance(snapshot);
+        // Now the subscription is back: correlation resumes and completes it.
+        let correlated = engine
+            .apply_command(Command::correlate_message("approve", "A"))
+            .unwrap();
+        assert!(correlated
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn cold_spill_excludes_instances_with_a_locked_job() {
+        // An instance whose job is currently activated (a worker holds the lock)
+        // is mid-task, not dormant: it must not be a cold-spill candidate.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(engine.cold_spillable_instances(10), vec![key]);
+
+        // Activate (lock) the job — now the instance is busy.
+        let _ = engine.activate_jobs("payment", "w", 1, 60_000, 0);
+        assert!(
+            engine.cold_spillable_instances(10).is_empty(),
+            "an instance with a locked job is not cold-spillable"
+        );
+        assert!(
+            engine.snapshot_instance(key).is_some(),
+            "snapshot_instance itself is unconditional on lock state (host gates via the selector)"
+        );
     }
 
     #[test]
