@@ -288,7 +288,25 @@ impl ReadStore {
             conn: Mutex::new(conn),
         };
         store.ensure_schema()?;
+        // A persistent store whose schema already matched is opened without any
+        // write so far, so a read-only file (or directory) would not surface
+        // until the first exporter batch — where it logs "attempt to write a
+        // readonly database" every time and silently never advances the read
+        // model. Probe writability now so that case fails fast at startup.
+        if path.is_some() {
+            store.check_writable()?;
+        }
         Ok(store)
+    }
+
+    /// Performs a trivial no-op write to confirm the database (and the directory
+    /// it lives in) are writable. A self-assignment changes no data but still
+    /// opens a write transaction and creates the rollback journal, exercising
+    /// both file and directory permissions.
+    fn check_writable(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.execute("UPDATE meta SET v = v WHERE k = 'schema_version'", [])?;
+        Ok(())
     }
 
     fn ensure_schema(&self) -> rusqlite::Result<()> {
@@ -1078,4 +1096,60 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod writability_tests {
+    use super::ReadStore;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn scratch_db() -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "nanobpm-readstore-{}-{}.sqlite",
+            std::process::id(),
+            n
+        ))
+    }
+
+    #[test]
+    fn open_succeeds_on_a_writable_db() {
+        let path = scratch_db();
+        ReadStore::open(Some(&path)).expect("fresh writable db opens");
+        // Re-open (schema already matches) still validates writability.
+        ReadStore::open(Some(&path)).expect("existing writable db re-opens");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_fails_fast_on_a_readonly_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = scratch_db();
+        // Create a healthy db with the current schema, then drop the handle.
+        ReadStore::open(Some(&path)).expect("seed db");
+        // Make the file itself read-only: re-open finds a matching schema (so it
+        // writes nothing during open) and must fail on the writability probe.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o444);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = match ReadStore::open(Some(&path)) {
+            Ok(_) => panic!("read-only db must fail fast"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().to_lowercase().contains("readonly"),
+            "expected a readonly error, got: {err}"
+        );
+
+        // Restore perms so cleanup can remove the file.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        std::fs::remove_file(&path).ok();
+    }
 }

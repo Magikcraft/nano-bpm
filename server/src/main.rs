@@ -2949,8 +2949,13 @@ async fn main() {
             // (a full rebuild on a fresh/reset store), then open the journal
             // (which replays into the engine) and wire the live exporter.
             let store = Arc::new(
-                ReadStore::open(db_path.as_deref())
-                    .unwrap_or_else(|e| panic!("failed to open read store: {e}")),
+                ReadStore::open(db_path.as_deref()).unwrap_or_else(|e| {
+                    let at = db_path
+                        .as_deref()
+                        .map(|p| format!(" at {}", p.display()))
+                        .unwrap_or_default();
+                    panic!("failed to open read model{at} (is the file or its directory writable?): {e}")
+                }),
             );
             let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                 panic!("failed to read journal {}: {e}", journal_path.display())
