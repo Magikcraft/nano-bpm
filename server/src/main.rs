@@ -18,7 +18,7 @@ mod stub_impls;
 mod varspill;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -3083,11 +3083,13 @@ async fn shutdown_signal() {
 /// Resolves the journal and read-model database paths from the environment.
 ///
 /// - `NANOBPMN_DATA_DIR=<dir>` co-locates both under one directory:
-///   `<dir>/journal.jsonl` and `<dir>/read-model.sqlite` (the directory is
-///   created if absent).
+///   `<dir>/journal.jsonl` and `<dir>/read-model.sqlite`. The directory is
+///   created if absent, but only a *single* missing level (its parent must
+///   already exist) — see [`ensure_data_dir`].
 /// - Otherwise `NANOBPMN_JOURNAL=<file>` (back-compat) selects the journal; the
 ///   database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`
-///   next to the journal.
+///   next to the journal. The journal's parent directory is subject to the same
+///   one-level-deep policy.
 /// - With neither set, both are `None`: an in-memory journal and an in-memory
 ///   (`:memory:`) read store (nothing is persisted).
 fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
@@ -3095,8 +3097,8 @@ fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
         && !dir.is_empty()
     {
         let dir = PathBuf::from(dir);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            panic!("failed to create data dir {}: {e}", dir.display());
+        if let Err(e) = ensure_data_dir(&dir) {
+            panic!("{e}");
         }
         return (
             Some(dir.join("journal.jsonl")),
@@ -3107,6 +3109,15 @@ fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
     match std::env::var("NANOBPMN_JOURNAL") {
         Ok(path) if !path.is_empty() => {
             let journal = PathBuf::from(path);
+            // The journal lives in a directory; hold it to the same policy so a
+            // mistyped path fails loudly instead of erroring out deeper in
+            // (journal open / read-model export) with a confusing message.
+            if let Some(parent) = journal.parent()
+                && !parent.as_os_str().is_empty()
+                && let Err(e) = ensure_data_dir(parent)
+            {
+                panic!("{e}");
+            }
             let db = match std::env::var("NANOBPMN_READ_DB") {
                 Ok(db) if !db.is_empty() => PathBuf::from(db),
                 _ => journal.with_file_name("read-model.sqlite"),
@@ -3114,5 +3125,103 @@ fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
             (Some(journal), Some(db))
         }
         _ => (None, None),
+    }
+}
+
+/// Ensures `dir` is usable as a data directory: it must already exist as a
+/// directory, or be creatable as a *single* new level beneath an already
+/// existing parent.
+///
+/// This deliberately does **not** use `create_dir_all`: silently materialising
+/// an arbitrarily deep path turns a typo'd `NANOBPMN_DATA_DIR` into a brand-new
+/// tree in an unexpected place, which then surfaces much later as a baffling
+/// failure (e.g. a read-model export landing somewhere unwritable and logging
+/// "attempt to write a readonly database" on every batch). Requiring the parent
+/// to exist makes such mistakes fail fast and legibly at startup.
+fn ensure_data_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "data dir {} exists but is not a directory",
+            dir.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let parent_exists = match dir.parent() {
+                // Relative leaf (e.g. "data"): the parent is the current
+                // working directory, which exists by definition.
+                Some(parent) if parent.as_os_str().is_empty() => true,
+                Some(parent) => parent.is_dir(),
+                None => false,
+            };
+            if !parent_exists {
+                return Err(format!(
+                    "data dir {} does not exist and neither does its parent; create the parent \
+                     directory first (only a single new directory level is created automatically)",
+                    dir.display()
+                ));
+            }
+            std::fs::create_dir(dir)
+                .map_err(|e| format!("failed to create data dir {}: {e}", dir.display()))
+        }
+        Err(e) => Err(format!(
+            "failed to access data dir {}: {e}",
+            dir.display()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod data_dir_tests {
+    use super::ensure_data_dir;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A unique, non-existent path under the system temp dir. Caller owns cleanup.
+    fn scratch(suffix: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "nanobpm-ddir-{}-{}-{}",
+            std::process::id(),
+            n,
+            suffix
+        ))
+    }
+
+    #[test]
+    fn existing_directory_is_accepted() {
+        let dir = scratch("existing");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(ensure_data_dir(&dir).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_missing_level_is_created() {
+        let dir = scratch("leaf");
+        assert!(!dir.exists());
+        assert!(ensure_data_dir(&dir).is_ok());
+        assert!(dir.is_dir());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_level_missing_path_is_rejected() {
+        let base = scratch("missing-parent");
+        let deep = base.join("a").join("b");
+        let err = ensure_data_dir(&deep).expect_err("should reject a missing parent");
+        assert!(err.contains("neither does its parent"), "got: {err}");
+        // Nothing should have been created.
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn path_pointing_at_a_file_is_rejected() {
+        let file = scratch("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let err = ensure_data_dir(&file).expect_err("a file is not a usable data dir");
+        assert!(err.contains("not a directory"), "got: {err}");
+        std::fs::remove_file(&file).ok();
     }
 }
