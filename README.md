@@ -367,8 +367,11 @@ through one stream:
 | `NANOBPMN_STREAM_SUBMISSION_WINDOW=<n>` | Per-connection create-submission window (default `256`): how many `createInstance`s a client may have outstanding before it must wait for the server to replenish credits. |
 
 See [`docs/command-stream-design.md`](docs/command-stream-design.md) for the full
-design rationale, and `server/tests/command_stream_e2e.rs` for runnable examples
-of every frame exchange.
+design rationale,
+[`docs/command-stream.asyncapi.yaml`](docs/command-stream.asyncapi.yaml) for the
+AsyncAPI 3.1 description of every client/server frame, and
+`server/tests/command_stream_e2e.rs` for runnable examples of every frame
+exchange.
 
 ## Two crates
 

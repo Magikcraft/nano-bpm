@@ -1,0 +1,522 @@
+asyncapi: 3.1.0
+
+info:
+  title: nanobpmn Command Stream
+  version: 1.0.0
+  description: >
+    Bidirectional WebSocket protocol for the nanobpmn gateway. A single
+    long-lived socket multiplexes two lanes:
+
+
+    * a **submission lane** — credit-metered `createInstance` commands, and
+
+
+    * a **job lane** — server-pushed activated jobs (`subscribe` + credits) and
+      their unmetered completions (`completeJob` / `failJob` / `throwError`).
+
+
+    Every frame is a JSON object sent in a WebSocket **text** frame. The frame
+    kind is carried in a `type` discriminator (camelCase). This document is a
+    hand-maintained companion to the OpenAPI REST spec under `spec/`: the
+    command stream is a WebSocket endpoint and cannot be modeled by OpenAPI, so
+    it is not part of code generation. It mirrors the Rust `ClientFrame` /
+    `ServerFrame` enums in `server/src/command_stream.rs` and the design notes in
+    `docs/command-stream-design.md`.
+  contact:
+    name: nanobpmn
+  license:
+    name: See repository LICENSE
+
+defaultContentType: application/json
+
+servers:
+  local:
+    host: localhost:8080
+    pathname: /command-stream
+    protocol: ws
+    description: >
+      Default local gateway. Use `wss` behind TLS termination. The submission
+      window advertised in `welcome.submissionCredits` is configurable via the
+      `NANOBPMN_STREAM_SUBMISSION_WINDOW` environment variable (default 256).
+
+channels:
+  commandStream:
+    address: /command-stream
+    title: Command stream
+    description: >
+      The single WebSocket channel. The server sends a `welcome` frame once on
+      connect, then both peers exchange frames asynchronously until close.
+    messages:
+      # client -> server
+      subscribe:
+        $ref: '#/components/messages/Subscribe'
+      jobCredits:
+        $ref: '#/components/messages/JobCredits'
+      createInstance:
+        $ref: '#/components/messages/CreateInstance'
+      completeJob:
+        $ref: '#/components/messages/CompleteJob'
+      failJob:
+        $ref: '#/components/messages/FailJob'
+      throwError:
+        $ref: '#/components/messages/ThrowError'
+      awaitInstance:
+        $ref: '#/components/messages/AwaitInstance'
+      clientHeartbeat:
+        $ref: '#/components/messages/ClientHeartbeat'
+      # server -> client
+      welcome:
+        $ref: '#/components/messages/Welcome'
+      job:
+        $ref: '#/components/messages/Job'
+      commandResult:
+        $ref: '#/components/messages/CommandResult'
+      instanceCompleted:
+        $ref: '#/components/messages/InstanceCompleted'
+      submissionCredits:
+        $ref: '#/components/messages/SubmissionCredits'
+      pressure:
+        $ref: '#/components/messages/Pressure'
+      serverHeartbeat:
+        $ref: '#/components/messages/ServerHeartbeat'
+
+operations:
+  sendCommand:
+    action: send
+    channel:
+      $ref: '#/channels/commandStream'
+    title: Client frames (client → server)
+    description: >
+      Frames the client writes to the socket. `subscribe`/`jobCredits` drive the
+      job lane; `createInstance` consumes one submission credit; `completeJob`/
+      `failJob`/`throwError` drain activated jobs and are unmetered;
+      `awaitInstance` re-subscribes to a known instance's terminal outcome for
+      reconnect recovery.
+    messages:
+      - $ref: '#/channels/commandStream/messages/subscribe'
+      - $ref: '#/channels/commandStream/messages/jobCredits'
+      - $ref: '#/channels/commandStream/messages/createInstance'
+      - $ref: '#/channels/commandStream/messages/completeJob'
+      - $ref: '#/channels/commandStream/messages/failJob'
+      - $ref: '#/channels/commandStream/messages/throwError'
+      - $ref: '#/channels/commandStream/messages/awaitInstance'
+      - $ref: '#/channels/commandStream/messages/clientHeartbeat'
+
+  receiveEvent:
+    action: receive
+    channel:
+      $ref: '#/channels/commandStream'
+    title: Server frames (server → client)
+    description: >
+      Frames the server writes to the socket. `welcome` arrives once on connect.
+      `job` pushes are gated by job-delivery credits; `commandResult` acks a
+      `corr`-tagged command; `instanceCompleted` delivers an awaited terminal
+      outcome; `submissionCredits` replenishes create capacity; `pressure`
+      signals coarse fleet backpressure.
+    messages:
+      - $ref: '#/channels/commandStream/messages/welcome'
+      - $ref: '#/channels/commandStream/messages/job'
+      - $ref: '#/channels/commandStream/messages/commandResult'
+      - $ref: '#/channels/commandStream/messages/instanceCompleted'
+      - $ref: '#/channels/commandStream/messages/submissionCredits'
+      - $ref: '#/channels/commandStream/messages/pressure'
+      - $ref: '#/channels/commandStream/messages/serverHeartbeat'
+
+components:
+  messages:
+    # ---------------------------------------------------------------- client
+    Subscribe:
+      name: subscribe
+      title: Subscribe to job push
+      summary: Opt into job push for a type, granting an initial credit batch.
+      payload:
+        $ref: '#/components/schemas/Subscribe'
+    JobCredits:
+      name: jobCredits
+      title: Replenish job credits
+      summary: Replenish job-push demand for a type.
+      payload:
+        $ref: '#/components/schemas/JobCredits'
+    CreateInstance:
+      name: createInstance
+      title: Create process instance
+      summary: Start a process instance (consumes one submission credit).
+      payload:
+        $ref: '#/components/schemas/CreateInstance'
+    CompleteJob:
+      name: completeJob
+      title: Complete job
+      summary: Complete an activated job (unmetered drain).
+      payload:
+        $ref: '#/components/schemas/CompleteJob'
+    FailJob:
+      name: failJob
+      title: Fail job
+      summary: Fail an activated job (unmetered drain).
+      payload:
+        $ref: '#/components/schemas/FailJob'
+    ThrowError:
+      name: throwError
+      title: Throw BPMN error
+      summary: Throw a BPMN error from an activated job (unmetered drain).
+      payload:
+        $ref: '#/components/schemas/ThrowError'
+    AwaitInstance:
+      name: awaitInstance
+      title: Await known instance (recovery)
+      summary: Re-subscribe to completion of an already-created instance.
+      description: >
+        Recovery primitive: a client that persisted the `processInstanceKey`
+        from an earlier `createInstance` `commandResult` can, after a reconnect,
+        re-request the terminal outcome over the new socket. Resolves
+        immediately if the instance is already terminal (the read model is
+        durable history), so it doubles as a poll. Answered by an
+        `instanceCompleted` correlated by `corr`; an unknown key yields a 404
+        `commandResult`.
+      payload:
+        $ref: '#/components/schemas/AwaitInstance'
+    ClientHeartbeat:
+      name: heartbeat
+      title: Client heartbeat
+      summary: Liveness keep-alive from the client.
+      payload:
+        $ref: '#/components/schemas/Heartbeat'
+
+    # ---------------------------------------------------------------- server
+    Welcome:
+      name: welcome
+      title: Welcome
+      summary: Sent once on connect; initial submission window and heartbeat cadence.
+      payload:
+        $ref: '#/components/schemas/Welcome'
+    Job:
+      name: job
+      title: Pushed job
+      summary: A pushed activated job (consumes one job-delivery credit).
+      description: >
+        `job` has the same shape as a REST `ActivatedJobResult` (see the OpenAPI
+        spec). One `job` frame consumes one outstanding job-delivery credit for
+        its type.
+      payload:
+        $ref: '#/components/schemas/Job'
+    CommandResult:
+      name: commandResult
+      title: Command result
+      summary: Ack/result for a create/complete/fail/throwError/await, correlated by corr.
+      payload:
+        $ref: '#/components/schemas/CommandResult'
+    InstanceCompleted:
+      name: instanceCompleted
+      title: Instance completed
+      summary: An awaited instance reached a terminal state, routed by the create's corr.
+      payload:
+        $ref: '#/components/schemas/InstanceCompleted'
+    SubmissionCredits:
+      name: submissionCredits
+      title: Submission credits
+      summary: Grants the client additional submission (create-side) capacity.
+      payload:
+        $ref: '#/components/schemas/SubmissionCredits'
+    Pressure:
+      name: pressure
+      title: Pressure signal
+      summary: Coarse fleet pressure signal.
+      payload:
+        $ref: '#/components/schemas/Pressure'
+    ServerHeartbeat:
+      name: heartbeat
+      title: Server heartbeat
+      summary: Liveness keep-alive from the server (cadence in welcome.heartbeatMs).
+      payload:
+        $ref: '#/components/schemas/Heartbeat'
+
+  schemas:
+    # ---------------------------------------------------------------- client
+    Subscribe:
+      type: object
+      required: [type, jobType]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: subscribe
+        jobType:
+          type: string
+          description: The BPMN job type to receive.
+        jobCredits:
+          type: integer
+          format: int64
+          default: 0
+          description: Initial job-delivery demand for this type.
+        fetchVariable:
+          type: array
+          items:
+            type: string
+          description: Restrict fetched variables to these names (null = all).
+          nullable: true
+        timeout:
+          type: integer
+          format: int64
+          nullable: true
+          description: Job activation lock timeout in milliseconds.
+        worker:
+          type: string
+          nullable: true
+          description: Worker name recorded on activation.
+
+    JobCredits:
+      type: object
+      required: [type, jobType, n]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: jobCredits
+        jobType:
+          type: string
+        n:
+          type: integer
+          format: int64
+          description: Additional job-delivery credits to grant for this type.
+
+    CreateInstance:
+      type: object
+      required: [type, corr]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: createInstance
+        corr:
+          $ref: '#/components/schemas/Corr'
+        processDefinitionId:
+          type: string
+          nullable: true
+          description: BPMN process id (one of id/key is required).
+        processDefinitionKey:
+          type: string
+          nullable: true
+          description: Numeric process definition key as a string.
+        variables:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Initial process variables.
+        awaitCompletion:
+          type: boolean
+          nullable: true
+          description: >
+            If true, the server emits an `instanceCompleted` frame (correlated
+            by `corr`) when the instance reaches a terminal state, in addition to
+            the immediate `commandResult` ack.
+        fetchVariables:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: Variables to include in the `instanceCompleted` payload.
+        requestTimeout:
+          type: integer
+          format: int64
+          nullable: true
+          description: Await timeout in milliseconds.
+
+    CompleteJob:
+      type: object
+      required: [type, corr, jobKey]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: completeJob
+        corr:
+          $ref: '#/components/schemas/Corr'
+        jobKey:
+          $ref: '#/components/schemas/Key'
+        variables:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    FailJob:
+      type: object
+      required: [type, corr, jobKey]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: failJob
+        corr:
+          $ref: '#/components/schemas/Corr'
+        jobKey:
+          $ref: '#/components/schemas/Key'
+        retries:
+          type: integer
+          format: int32
+          nullable: true
+        errorMessage:
+          type: string
+          nullable: true
+
+    ThrowError:
+      type: object
+      required: [type, corr, jobKey, errorCode]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: throwError
+        corr:
+          $ref: '#/components/schemas/Corr'
+        jobKey:
+          $ref: '#/components/schemas/Key'
+        errorCode:
+          type: string
+        errorMessage:
+          type: string
+          nullable: true
+
+    AwaitInstance:
+      type: object
+      required: [type, corr, processInstanceKey]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: awaitInstance
+        corr:
+          $ref: '#/components/schemas/Corr'
+        processInstanceKey:
+          $ref: '#/components/schemas/Key'
+        fetchVariables:
+          type: array
+          items:
+            type: string
+          nullable: true
+        requestTimeout:
+          type: integer
+          format: int64
+          nullable: true
+
+    # ---------------------------------------------------------------- server
+    Welcome:
+      type: object
+      required: [type, submissionCredits, heartbeatMs]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: welcome
+        submissionCredits:
+          type: integer
+          format: int64
+          description: Initial create-side submission window for this connection.
+        heartbeatMs:
+          type: integer
+          format: int64
+          description: Server heartbeat cadence in milliseconds.
+
+    Job:
+      type: object
+      required: [type, job]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: job
+        job:
+          type: object
+          additionalProperties: true
+          description: An activated job, same shape as REST `ActivatedJobResult`.
+
+    CommandResult:
+      type: object
+      required: [type, corr, status]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: commandResult
+        corr:
+          $ref: '#/components/schemas/Corr'
+        status:
+          type: integer
+          description: HTTP-equivalent status code for the command (e.g. 200, 404).
+        body:
+          description: >
+            Result payload (e.g. the create result with `processInstanceKey`) or
+            an error body. Omitted when there is no body.
+          nullable: true
+
+    InstanceCompleted:
+      type: object
+      required: [type, corr, processInstanceKey, processCompleted, variables]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: instanceCompleted
+        corr:
+          $ref: '#/components/schemas/Corr'
+        processInstanceKey:
+          $ref: '#/components/schemas/Key'
+        processCompleted:
+          type: boolean
+          description: >
+            True if the instance completed normally; false if it was terminated.
+        variables:
+          description: Fetched output variables (object), or empty if none requested.
+
+    SubmissionCredits:
+      type: object
+      required: [type, n]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: submissionCredits
+        n:
+          type: integer
+          format: int64
+          description: Additional submission credits granted.
+
+    Pressure:
+      type: object
+      required: [type, level]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: pressure
+        level:
+          type: string
+          description: Coarse pressure level (e.g. "ok", "high").
+        retryAfterMs:
+          type: integer
+          format: int64
+          nullable: true
+          description: Suggested backoff before resubmitting, if applicable.
+
+    Heartbeat:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: heartbeat
+
+    # ---------------------------------------------------------------- shared
+    Corr:
+      type: integer
+      format: int64
+      minimum: 0
+      description: >
+        Client-chosen correlation id. The server echoes it on the matching
+        `commandResult` and on the `instanceCompleted` for an awaited create.
+
+    Key:
+      type: string
+      description: >
+        A 64-bit nanobpmn key serialized as a decimal string (jobKey,
+        processInstanceKey, ...).
