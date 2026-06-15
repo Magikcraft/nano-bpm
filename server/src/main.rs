@@ -88,10 +88,37 @@ pub struct ServerImpl {
     backpressure: Backpressure,
     /// Lock-free gauge of in-flight (Active) process instances, maintained by the
     /// read-model exporter (+1 per `ProcessInstanceCreated`, −1 per terminal
-    /// event). The backpressure check reads this with a relaxed atomic load
-    /// instead of a round-trip to the single engine thread, so an always-on
-    /// watermark adds no per-create command-queue traffic.
+    /// event). This is the *active backlog*; it is kept for observability and
+    /// hot-state eviction, but is **not** the backpressure signal — a no-drain
+    /// burst would pin it even though the engine is healthy.
     inflight: Arc<AtomicUsize>,
+    /// Lock-free gauge of create requests currently being *processed* by the
+    /// engine (incremented when a create is submitted to the command thread,
+    /// decremented the instant it is applied — typically tens of µs later). This
+    /// is the backpressure signal: it measures request-processing concurrency
+    /// (Zeebe/Camunda-style), so it sheds only when the engine thread genuinely
+    /// can't keep up, never merely because an undrained backlog has accumulated.
+    /// Memory under a large backlog is bounded by the variable-spill tier, not by
+    /// this gate, so backpressure and memory safety are now independent rails.
+    processing: Arc<AtomicUsize>,
+}
+
+/// RAII counter for the request-processing concurrency gauge: bumps the gauge on
+/// entry and restores it on drop, so every exit path (success, error, or a
+/// dropped/cancelled request future) releases its slot exactly once.
+struct ProcessingGuard<'a>(&'a AtomicUsize);
+
+impl<'a> ProcessingGuard<'a> {
+    fn enter(gauge: &'a AtomicUsize) -> Self {
+        gauge.fetch_add(1, Ordering::Relaxed);
+        ProcessingGuard(gauge)
+    }
+}
+
+impl Drop for ProcessingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl ServerImpl {
@@ -120,15 +147,20 @@ impl ServerImpl {
         }
         let inflight_seed = store.active_instance_count();
         let inflight = Arc::new(AtomicUsize::new(inflight_seed));
+        // Request-processing concurrency starts at zero: nothing is mid-apply at
+        // boot, regardless of how large the replayed backlog is.
+        let processing = Arc::new(AtomicUsize::new(0));
 
         // Resolve the backpressure mode and, for adaptive mode, build the
         // latency controller that the engine thread will drive. The controller
-        // owns the shared limit atomic; the server keeps the read side.
+        // owns the shared limit atomic; the server keeps the read side. The
+        // controller's "is the limit being used" signal reads the processing
+        // gauge (the gated quantity), not the backlog.
         let (backpressure, controller) = match backpressure_setting_from_env() {
             BackpressureSetting::Disabled => (Backpressure::Disabled, None),
             BackpressureSetting::Fixed(n) => (Backpressure::Fixed(n), None),
             BackpressureSetting::Adaptive => {
-                let (ctrl, limit) = AdaptiveController::new(inflight.clone());
+                let (ctrl, limit) = AdaptiveController::new(processing.clone());
                 (Backpressure::Adaptive(limit), Some(ctrl))
             }
         };
@@ -163,6 +195,7 @@ impl ServerImpl {
             // accounts for instances still in flight; a fresh/in-memory store
             // reports zero. The exporter maintains it from here on.
             inflight,
+            processing,
         }
     }
 }
@@ -319,25 +352,27 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
-        // Backpressure: reject new work once the in-flight (Active) instance
-        // gauge is at or above the current limit. This bounds work-in-progress so
-        // the producer converges to the worker drain rate instead of growing an
-        // unbounded backlog (which would saturate the single engine thread with
-        // creates and inflate hot state). Mirrors Zeebe: the 503 carries a
-        // `RESOURCE_EXHAUSTED` title that the client SDK reads as a backpressure
-        // signal and answers with a retry backoff. The limit is either a fixed
-        // watermark or an adaptive AIMD value sized from the engine's measured
-        // latency; either way reading it (and the exporter-maintained gauge) is a
-        // relaxed atomic load, so this check costs no engine round-trip — a small
-        // race against concurrent creates is irrelevant for an approximate limit.
+        // Backpressure: reject new work once the engine's request-processing
+        // concurrency is at or above the current limit. The gated quantity is the
+        // number of creates being *applied right now* (the `processing` gauge),
+        // not the active backlog — so a no-drain burst is absorbed (it converges
+        // to client concurrency, like Zeebe/Camunda) and we shed only when the
+        // single engine thread genuinely can't keep up. Memory under a large
+        // backlog is bounded independently by the variable-spill tier. The 503
+        // carries a `RESOURCE_EXHAUSTED` title that the client SDK reads as a
+        // backpressure signal and answers with a retry backoff. The limit is
+        // either a fixed watermark or an adaptive AIMD value sized from measured
+        // latency; reading it (and the gauge) is a relaxed atomic load, so this
+        // check costs no engine round-trip — a small race against concurrent
+        // creates is irrelevant for an approximate limit.
         if let Some(limit) = self.backpressure.current_limit() {
-            let inflight = self.inflight.load(Ordering::Relaxed);
-            if inflight >= limit {
+            let processing = self.processing.load(Ordering::Relaxed);
+            if self.backpressure.should_shed(processing) {
                 return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
                     "RESOURCE_EXHAUSTED",
                     503,
                     format!(
-                        "Backpressure: {inflight} in-flight process instances at or above the \
+                        "Backpressure: {processing} creates in flight at or above the \
                          configured limit of {limit}. Retry after a backoff."
                     ),
                 )));
@@ -386,8 +421,15 @@ impl ServerImpl {
         // Run the command on the engine thread. The closure yields the success
         // fields plus the commit to await, or a ready `Resp` for an error path
         // (nothing written). Both arms produce `Send` values.
+        //
+        // The processing guard is held only across the engine round-trip (submit
+        // → applied), not the later `awaitCompletion` wait, so the backpressure
+        // gauge measures command-processing concurrency rather than how long a
+        // client chooses to block for completion.
         type CreateOk = (String, i32, String, u64, bool, Commit);
-        let outcome: Result<CreateOk, Box<Resp>> = self
+        let outcome: Result<CreateOk, Box<Resp>> = {
+            let _processing = ProcessingGuard::enter(&self.processing);
+            self
             .engine
             .with(move |engine| {
                 // The engine starts processes by BPMN process id. A creation-by-key
@@ -465,7 +507,8 @@ impl ServerImpl {
                     )),
                 }
             })
-            .await;
+            .await
+        };
 
         let (process_id, version, definition_key, instance_key, sync_completed, commit) =
             match outcome {

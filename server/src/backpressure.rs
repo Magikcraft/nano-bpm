@@ -76,11 +76,21 @@ impl Backpressure {
         }
     }
 
+    /// Whether a create carrying the engine's current request-processing
+    /// concurrency (`in_flight`) should be shed. `false` whenever load shedding is
+    /// disabled. The comparison is `>=` so a watermark of `n` admits at most `n`
+    /// concurrent creates.
+    pub fn should_shed(&self, in_flight: usize) -> bool {
+        self.current_limit().is_some_and(|limit| in_flight >= limit)
+    }
+
     /// Human-readable description for the startup log.
     pub fn describe(&self) -> String {
         match self {
             Backpressure::Disabled => "disabled".to_string(),
-            Backpressure::Fixed(n) => format!("fixed watermark of {n} in-flight instances"),
+            Backpressure::Fixed(n) => {
+                format!("fixed watermark of {n} concurrent creates in processing")
+            }
             Backpressure::Adaptive(limit) => format!(
                 "adaptive (AIMD, latency-driven), starting watermark {}",
                 limit.load(Ordering::Relaxed)
@@ -294,6 +304,28 @@ mod tests {
         assert_eq!(Backpressure::Fixed(7).current_limit(), Some(7));
         let l = Arc::new(AtomicUsize::new(123));
         assert_eq!(Backpressure::Adaptive(l).current_limit(), Some(123));
+    }
+
+    #[test]
+    fn should_shed_compares_concurrency_against_the_watermark() {
+        // Disabled never sheds, whatever the gauge.
+        assert!(!Backpressure::Disabled.should_shed(0));
+        assert!(!Backpressure::Disabled.should_shed(1_000_000));
+
+        // Fixed watermark sheds at or above the limit, admits below it.
+        let bp = Backpressure::Fixed(2);
+        assert!(!bp.should_shed(0), "0 concurrent creates is below the limit");
+        assert!(!bp.should_shed(1), "1 concurrent create is below the limit");
+        assert!(bp.should_shed(2), "at the limit sheds (admits at most `limit`)");
+        assert!(bp.should_shed(3), "above the limit sheds");
+
+        // Adaptive tracks its shared atomic.
+        let l = Arc::new(AtomicUsize::new(5));
+        let bp = Backpressure::Adaptive(l.clone());
+        assert!(!bp.should_shed(4));
+        assert!(bp.should_shed(5));
+        l.store(10, Ordering::Relaxed);
+        assert!(!bp.should_shed(5), "raising the watermark re-admits");
     }
 
     #[test]

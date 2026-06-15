@@ -1587,44 +1587,29 @@ fn feel_gateway_condition_routes_end_to_end() {
 }
 
 #[test]
-fn backpressure_rejects_creates_above_the_inflight_watermark() {
+fn backpressure_absorbs_an_undrained_create_burst() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();
 
-    // Boot with a watermark of one in-flight instance. The seeded demo process
-    // parks each instance at a service task, so a created instance stays
-    // in-flight (un-evicted) and counts against the watermark.
+    // Boot with a watermark of one. The backpressure signal is request-processing
+    // concurrency (creates being applied right now), NOT the active backlog, so a
+    // serial no-drain burst — each instance parks on its service task and never
+    // drains — is fully absorbed: at any instant at most one create is in the
+    // engine apply, which is below the limit. (Under the old backlog gauge this
+    // same watermark would have shed every create after the first.)
     let server = ServerProcess::boot_with_env(&journal, &[("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "1")]);
 
-    // First create succeeds: zero in-flight is below the limit.
-    let first = create_demo_instance(&server);
-    assert!(!first.is_empty(), "first create should mint a key");
-
-    // The in-flight gauge is maintained by the read-model exporter, which
-    // projects each created instance a moment after the create response returns.
-    // Once it catches up the watermark is breached for good (the parked
-    // instances never drain), so further creates shed load with a Zeebe-style
-    // 503 RESOURCE_EXHAUSTED. Poll until the load shedder engages.
-    let mut last = (0u16, String::new());
-    for _ in 0..100 {
-        last = server.request(
+    for i in 0..25 {
+        let (status, body) = server.request(
             "POST",
             &path("/process-instances"),
             Some(r#"{"processDefinitionId":"demo"}"#),
         );
-        if last.0 == 503 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(
+            status, 200,
+            "create {i} of an undrained burst must be absorbed, not shed: {body}"
+        );
     }
-    let (status, body) = last;
-    assert_eq!(status, 503, "over-watermark create must be rejected: {body}");
-    let json: serde_json::Value = serde_json::from_str(&body).expect("503 body is a problem JSON");
-    assert_eq!(
-        json["title"].as_str(),
-        Some("RESOURCE_EXHAUSTED"),
-        "503 must carry the RESOURCE_EXHAUSTED backpressure title: {body}"
-    );
 
     server.shutdown();
 }
