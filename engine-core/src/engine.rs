@@ -1672,8 +1672,19 @@ impl Engine {
     /// completion events and returning the follow-up activations for its outgoing
     /// flows. Deterministic in `(instance_key, element_instance_key)` order.
     fn complete_drained_subprocesses(&mut self, log: &mut Vec<Event>) -> Vec<Step> {
+        // Only an instance whose tokens moved this command can have a *newly*
+        // drained sub-process scope (draining requires consuming a child token,
+        // which emits an event), so restrict the sweep to the instances touched in
+        // the log — exactly as `complete_finished_instances` does. Scanning every
+        // active instance instead made this O(total active backlog) per command:
+        // under a large undrained backlog that scan dominated the engine thread
+        // (per-command cost grew linearly with the backlog).
+        let touched: HashSet<Key> = log.iter().filter_map(|e| e.instance_key()).collect();
         let mut drained: Vec<(Key, Key, ElementId)> = Vec::new();
-        for instance in self.state.instances.values() {
+        for instance_key in &touched {
+            let Some(instance) = self.state.instances.get(instance_key) else {
+                continue;
+            };
             if instance.state != ProcessInstanceState::Active {
                 continue;
             }
