@@ -9,6 +9,7 @@
 //! (see scripts/gen-stub-server.py). This file owns only the stable pieces: the
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
+mod backpressure;
 mod engine_actor;
 mod journal;
 mod query;
@@ -33,6 +34,9 @@ use nanobpmn_engine_core::{
     ProcessInstanceState, Value,
 };
 
+use crate::backpressure::{
+    parse_backpressure_setting, AdaptiveController, Backpressure, BackpressureSetting,
+};
 use crate::engine_actor::EngineHandle;
 use crate::journal::{Commit, Journal};
 use crate::readstore::ReadStore;
@@ -73,13 +77,14 @@ pub struct ServerImpl {
     /// a terminal state (the exporter is the single point through which all
     /// completion/termination events flow).
     instances_changed: Arc<tokio::sync::Notify>,
-    /// Backpressure watermark: when `Some(n)`, `createProcessInstance` rejects
-    /// new work with `503 RESOURCE_EXHAUSTED` once the number of in-flight
-    /// (Active, not-yet-terminal) process instances reaches `n`. Enabled by
-    /// default (see [`DEFAULT_BACKPRESSURE_MAX_INFLIGHT`]); `None` disables it
-    /// (the engine accepts work unboundedly). Overridable via
-    /// `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT` (`0`/`off`/`none` to disable).
-    backpressure_limit: Option<usize>,
+    /// Backpressure controller for `createProcessInstance`. When its
+    /// [`current_limit`](Backpressure::current_limit) is `Some(n)`, creates are
+    /// rejected with `503 RESOURCE_EXHAUSTED` once the in-flight (Active,
+    /// non-terminal) instance count reaches `n`. The default is **adaptive**
+    /// (an AIMD limiter that sizes the watermark from the engine's measured
+    /// per-command latency); a fixed watermark or fully-off are selectable via
+    /// `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`. See [`crate::backpressure`].
+    backpressure: Backpressure,
     /// Lock-free gauge of in-flight (Active) process instances, maintained by the
     /// read-model exporter (+1 per `ProcessInstanceCreated`, −1 per terminal
     /// event). The backpressure check reads this with a relaxed atomic load
@@ -113,26 +118,31 @@ impl ServerImpl {
                 .expect("deploy demo process");
         }
         let inflight_seed = store.active_instance_count();
+        let inflight = Arc::new(AtomicUsize::new(inflight_seed));
+
+        // Resolve the backpressure mode and, for adaptive mode, build the
+        // latency controller that the engine thread will drive. The controller
+        // owns the shared limit atomic; the server keeps the read side.
+        let (backpressure, controller) = match backpressure_setting_from_env() {
+            BackpressureSetting::Disabled => (Backpressure::Disabled, None),
+            BackpressureSetting::Fixed(n) => (Backpressure::Fixed(n), None),
+            BackpressureSetting::Adaptive => {
+                let (ctrl, limit) = AdaptiveController::new(inflight.clone());
+                (Backpressure::Adaptive(limit), Some(ctrl))
+            }
+        };
+        tracing::info!("backpressure: {}", backpressure.describe());
+
         Self {
-            engine: EngineHandle::spawn(journal),
+            engine: EngineHandle::spawn(journal, controller),
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
-            backpressure_limit: {
-                let limit = backpressure_limit_from_env();
-                match limit {
-                    Some(n) => tracing::info!(
-                        "backpressure enabled: rejecting createProcessInstance with 503 \
-                         RESOURCE_EXHAUSTED at >= {n} in-flight instances"
-                    ),
-                    None => tracing::info!("backpressure disabled"),
-                }
-                limit
-            },
+            backpressure,
             // Seed the gauge from the read model so a journal-replay restart
             // accounts for instances still in flight; a fresh/in-memory store
             // reports zero. The exporter maintains it from here on.
-            inflight: Arc::new(AtomicUsize::new(inflight_seed)),
+            inflight,
         }
     }
 }
@@ -236,53 +246,11 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
     models::ProblemDetail::new(title.to_string(), status, detail, String::new())
 }
 
-/// Default backpressure watermark (in-flight Active instances) when
-/// `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT` is unset. Backpressure is **on by
-/// default**: an unbounded create backlog otherwise saturates the single engine
-/// thread with creation work and grows hot state without limit, collapsing
-/// completion throughput. This value keeps work-in-progress bounded (and hot
-/// state small enough that per-command cost stays flat) while leaving ample
-/// headroom for bursts; the producer converges to the worker drain rate.
-///
-/// Tuned empirically (P10x1 create-flood lane, 50 KB payloads): completion
-/// throughput is flat (~430/s) across watermarks from ~250 up to 6000 — once the
-/// buffer is large enough to keep workers fed the workload is client-bound — but
-/// the actor's per-command cost and hot-state memory climb with the watermark
-/// (≈55 µs/job at 500 vs ≈300 µs/job and 60 % busy at 6000). 2000 sits in the
-/// flat-throughput, low-utilisation region with ~8x headroom over the ~250
-/// saturation knee, covering far larger worker fleets while bounding worst-case
-/// hot state to ~100 MB. Override via the env var for very large fleets (raise)
-/// or tight memory (lower / `off`).
-const DEFAULT_BACKPRESSURE_MAX_INFLIGHT: usize = 2000;
-
-/// Resolves the backpressure watermark from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`.
-/// See [`parse_backpressure_setting`] for the override grammar; backpressure is
-/// on by default ([`DEFAULT_BACKPRESSURE_MAX_INFLIGHT`]).
-fn backpressure_limit_from_env() -> Option<usize> {
+/// Resolves the backpressure mode from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`.
+/// See [`parse_backpressure_setting`] for the grammar; backpressure is on (and
+/// adaptive) by default.
+fn backpressure_setting_from_env() -> BackpressureSetting {
     parse_backpressure_setting(std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT").ok().as_deref())
-}
-
-/// Pure resolver for the backpressure watermark (split out so it is unit-testable
-/// without touching the process environment). Backpressure is **on by default**:
-/// - `None` (unset) → `Some(DEFAULT_BACKPRESSURE_MAX_INFLIGHT)`;
-/// - `0`, `off`, `none`, `false`, `disabled` (any case) → `None` (disabled);
-/// - a positive integer → `Some(n)`;
-/// - anything unparseable → the default (fail safe: never silently disable).
-fn parse_backpressure_setting(raw: Option<&str>) -> Option<usize> {
-    let Some(raw) = raw else {
-        return Some(DEFAULT_BACKPRESSURE_MAX_INFLIGHT);
-    };
-    let v = raw.trim();
-    if matches!(
-        v.to_ascii_lowercase().as_str(),
-        "0" | "off" | "none" | "false" | "disabled"
-    ) {
-        return None;
-    }
-    match v.parse::<usize>() {
-        Ok(n) if n > 0 => Some(n),
-        _ => Some(DEFAULT_BACKPRESSURE_MAX_INFLIGHT),
-    }
 }
 
 /// Engine-backed implementations of selected operations. The stub generator
@@ -294,17 +262,18 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
-        // Backpressure: when a watermark is configured, reject new work once the
-        // in-flight (Active) instance gauge is at or above it. This bounds
-        // work-in-progress so the producer converges to the worker drain rate
-        // instead of growing an unbounded backlog (which would saturate the
-        // single engine thread with creates and inflate hot state). Mirrors
-        // Zeebe: the 503 carries a `RESOURCE_EXHAUSTED` title that the client SDK
-        // reads as a backpressure signal and answers with a retry backoff. The
-        // gauge is a relaxed atomic maintained by the exporter, so this check
-        // costs no engine round-trip; a small race against concurrent creates is
-        // irrelevant for an approximate watermark.
-        if let Some(limit) = self.backpressure_limit {
+        // Backpressure: reject new work once the in-flight (Active) instance
+        // gauge is at or above the current limit. This bounds work-in-progress so
+        // the producer converges to the worker drain rate instead of growing an
+        // unbounded backlog (which would saturate the single engine thread with
+        // creates and inflate hot state). Mirrors Zeebe: the 503 carries a
+        // `RESOURCE_EXHAUSTED` title that the client SDK reads as a backpressure
+        // signal and answers with a retry backoff. The limit is either a fixed
+        // watermark or an adaptive AIMD value sized from the engine's measured
+        // latency; either way reading it (and the exporter-maintained gauge) is a
+        // relaxed atomic load, so this check costs no engine round-trip — a small
+        // race against concurrent creates is irrelevant for an approximate limit.
+        if let Some(limit) = self.backpressure.current_limit() {
             let inflight = self.inflight.load(Ordering::Relaxed);
             if inflight >= limit {
                 return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
@@ -3045,42 +3014,5 @@ fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
             (Some(journal), Some(db))
         }
         _ => (None, None),
-    }
-}
-
-#[cfg(test)]
-mod backpressure_config_tests {
-    use super::{parse_backpressure_setting, DEFAULT_BACKPRESSURE_MAX_INFLIGHT};
-
-    #[test]
-    fn unset_enables_backpressure_at_the_default_watermark() {
-        assert_eq!(
-            parse_backpressure_setting(None),
-            Some(DEFAULT_BACKPRESSURE_MAX_INFLIGHT)
-        );
-    }
-
-    #[test]
-    fn off_aliases_disable_backpressure() {
-        for raw in ["0", "off", "none", "false", "disabled", "OFF", " Off ", "Disabled"] {
-            assert_eq!(parse_backpressure_setting(Some(raw)), None, "{raw:?}");
-        }
-    }
-
-    #[test]
-    fn positive_integer_sets_the_watermark() {
-        assert_eq!(parse_backpressure_setting(Some("6000")), Some(6000));
-        assert_eq!(parse_backpressure_setting(Some(" 1 ")), Some(1));
-    }
-
-    #[test]
-    fn unparseable_values_fall_back_to_the_default_rather_than_disabling() {
-        for raw in ["garbage", "-5", "1.5", ""] {
-            assert_eq!(
-                parse_backpressure_setting(Some(raw)),
-                Some(DEFAULT_BACKPRESSURE_MAX_INFLIGHT),
-                "{raw:?}"
-            );
-        }
     }
 }

@@ -22,6 +22,7 @@ use std::thread;
 
 use tokio::sync::oneshot;
 
+use crate::backpressure::AdaptiveController;
 use crate::journal::Journal;
 
 /// A unit of work executed on the engine thread against the owned [`Journal`].
@@ -43,14 +44,18 @@ impl EngineHandle {
     /// callers `await` each command's [`Commit`](crate::journal::Commit) before
     /// acknowledging, so an acknowledged write is already fsynced even on a hard
     /// kill.
-    pub fn spawn(mut journal: Journal) -> Self {
+    ///
+    /// When `controller` is `Some`, the loop times every command and feeds the
+    /// latency to the adaptive backpressure limiter (which sizes the in-flight
+    /// watermark from observed per-command latency).
+    pub fn spawn(mut journal: Journal, controller: Option<AdaptiveController>) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let profile = std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some();
         thread::Builder::new()
             .name("nanobpmn-engine".into())
             .spawn(move || {
-                if profile {
-                    Self::run_profiled(rx, &mut journal);
+                if profile || controller.is_some() {
+                    Self::run_instrumented(rx, &mut journal, profile, controller);
                 } else {
                     while let Ok(job) = rx.recv() {
                         job(&mut journal);
@@ -61,12 +66,18 @@ impl EngineHandle {
         Self { tx }
     }
 
-    /// Command loop with utilization profiling. Times each `recv` (idle, queue
-    /// empty = actor starved) and each job execution (busy). Every reporting
-    /// window it logs jobs/s and the busy fraction, so we can tell whether the
-    /// single writer is the bottleneck (busy≈100%) or whether throughput is
-    /// limited upstream of it (busy≪100% = latency/contention/client bound).
-    fn run_profiled(rx: mpsc::Receiver<Job>, journal: &mut Journal) {
+    /// Command loop with per-command timing. Drives two optional consumers of the
+    /// latency signal: the adaptive backpressure `controller` (per command) and,
+    /// when `profile` is set, utilization logging (per 5 s window). Timing each
+    /// `recv` (idle, queue empty = actor starved) and each job (busy) lets us tell
+    /// whether the single writer is the bottleneck (busy≈100%) or whether
+    /// throughput is limited upstream of it (busy≪100% = latency/client bound).
+    fn run_instrumented(
+        rx: mpsc::Receiver<Job>,
+        journal: &mut Journal,
+        profile: bool,
+        mut controller: Option<AdaptiveController>,
+    ) {
         use std::time::{Duration, Instant};
         const WINDOW: Duration = Duration::from_secs(5);
 
@@ -82,7 +93,17 @@ impl EngineHandle {
 
             let before_job = Instant::now();
             job(journal);
-            busy += before_job.elapsed();
+            let job_time = before_job.elapsed();
+
+            // Feed the adaptive limiter every command; it windows internally.
+            if let Some(c) = controller.as_mut() {
+                c.record(job_time);
+            }
+
+            if !profile {
+                continue;
+            }
+            busy += job_time;
             jobs += 1;
 
             let elapsed = window_start.elapsed();
