@@ -1,4 +1,4 @@
-import { CommandStreamClient } from './commandStreamClient.js';
+import { CommandStreamClient, CommandError, ConnectionClosedError } from './commandStreamClient.js';
 import { detectNanobpm } from './detect.js';
 
 /**
@@ -98,6 +98,13 @@ export interface StreamingJobWorkerOptions {
   camundaClient?: FallbackCamundaClient;
   /** Start working immediately. Default `true`. */
   autoStart?: boolean;
+  /**
+   * Invoked for transport errors and pipelined-completion failures (the
+   * fire-and-forget `complete`/`fail`/`error` fast path surfaces non-2xx acks
+   * here). Defaults to logging on the console. Provide one to integrate with
+   * your own logging or to count completion failures.
+   */
+  onError?: (err: Error) => void;
 }
 
 /** A running job worker, regardless of transport. */
@@ -181,6 +188,22 @@ export class StreamingJobWorker implements JobWorkerHandle {
     this.client.on('job', (frame) => {
       void this.dispatch(frame.job as ActivatedJob);
     });
+    // Pipelined completes are fire-and-forget: their failures (and transport
+    // errors) arrive as `error` events. Always keep a listener so Node does not
+    // throw on an otherwise-unhandled `error`; route to the caller's handler or
+    // the console.
+    this.client.on('error', (err) => {
+      // In-flight pipelined completes are rejected when the socket closes
+      // (intentional stop or a transient reconnect); those jobs are redelivered
+      // after lock expiry, so don't surface them as worker errors.
+      if (this.stopped || err instanceof ConnectionClosedError) return;
+      // A 404/409 on a pipelined complete/fail means the job was already gone
+      // or no longer active (completed, or lock-expired and reclaimed under
+      // at-least-once delivery); benign, not a worker error.
+      if (err instanceof CommandError && (err.status === 404 || err.status === 409)) return;
+      if (this.options.onError) this.options.onError(err);
+      else console.error('[nanobpmn stream worker]', err);
+    });
   }
 
   /** Connects and subscribes, beginning job push. Idempotent. */
@@ -192,7 +215,7 @@ export class StreamingJobWorker implements JobWorkerHandle {
       jobType: this.jobType,
       jobCredits: this.maxParallelJobs,
       worker: this.options.worker ?? null,
-      timeout: this.options.jobTimeoutMs ?? null,
+      timeout: this.options.jobTimeoutMs ?? 60_000,
       fetchVariable: this.options.fetchVariables ?? null,
     });
   }
@@ -231,21 +254,21 @@ export class StreamingJobWorker implements JobWorkerHandle {
     const markActed = () => this.acted.add(raw.jobKey);
     return {
       ...raw,
-      complete: async (variables?: Record<string, unknown>) => {
+      complete: (variables?: Record<string, unknown>) => {
         markActed();
-        await this.client.completeJob(raw.jobKey, variables);
-        return JobActionReceipt;
+        this.client.completeJobNoWait(raw.jobKey, variables);
+        return Promise.resolve(JobActionReceipt);
       },
-      fail: async (opts?: { retries?: number; errorMessage?: string } | string) => {
+      fail: (opts?: { retries?: number; errorMessage?: string } | string) => {
         markActed();
         const normalized = typeof opts === 'string' ? { errorMessage: opts } : opts;
-        await this.client.failJob(raw.jobKey, normalized);
-        return JobActionReceipt;
+        this.client.failJobNoWait(raw.jobKey, normalized);
+        return Promise.resolve(JobActionReceipt);
       },
-      error: async (opts: { errorCode: string; errorMessage?: string }) => {
+      error: (opts: { errorCode: string; errorMessage?: string }) => {
         markActed();
-        await this.client.throwError(raw.jobKey, opts.errorCode, opts.errorMessage);
-        return JobActionReceipt;
+        this.client.throwErrorNoWait(raw.jobKey, opts.errorCode, opts.errorMessage);
+        return Promise.resolve(JobActionReceipt);
       },
       ignore: () => {
         markActed();

@@ -430,6 +430,42 @@ export class CommandStreamClient extends EventEmitter {
     });
   }
 
+  /**
+   * Completes an activated job without awaiting the server's durable ack
+   * (pipelined fast path). The frame is journaled by the server as usual; a
+   * non-2xx result or a send failure is surfaced via the `error` event rather
+   * than rejecting a caller. Lets a single connection keep its whole credit
+   * window in flight instead of stalling one round-trip per job.
+   */
+  completeJobNoWait(jobKey: string, variables?: Record<string, unknown>): void {
+    const corr = this.nextCorr();
+    this.sendCommandFireAndForget(corr, { type: 'completeJob', corr, jobKey, variables: variables ?? null });
+  }
+
+  /** Fails an activated job without awaiting the ack. See {@link completeJobNoWait}. */
+  failJobNoWait(jobKey: string, opts?: { retries?: number; errorMessage?: string }): void {
+    const corr = this.nextCorr();
+    this.sendCommandFireAndForget(corr, {
+      type: 'failJob',
+      corr,
+      jobKey,
+      retries: opts?.retries ?? null,
+      errorMessage: opts?.errorMessage ?? null,
+    });
+  }
+
+  /** Throws a BPMN error without awaiting the ack. See {@link completeJobNoWait}. */
+  throwErrorNoWait(jobKey: string, errorCode: string, errorMessage?: string): void {
+    const corr = this.nextCorr();
+    this.sendCommandFireAndForget(corr, {
+      type: 'throwError',
+      corr,
+      jobKey,
+      errorCode,
+      errorMessage: errorMessage ?? null,
+    });
+  }
+
   /** Subscribes to job push for `jobType`, granting `jobCredits` initial demand. */
   subscribe(sub: JobSubscription): void {
     this.subscriptions.set(sub.jobType, { ...sub });
@@ -486,6 +522,26 @@ export class CommandStreamClient extends EventEmitter {
         reject(err as Error);
       }
     });
+  }
+
+  /**
+   * Sends a command without a caller awaiting it. A non-2xx `commandResult`
+   * (or a connection drop while in flight) is reported on the `error` event;
+   * a successful ack is silently discarded. Used by the pipelined job-action
+   * fast path so completion does not gate the worker's credit window.
+   */
+  private sendCommandFireAndForget(corr: number, frame: ClientFrame): void {
+    this.pendingCommands.set(corr, {
+      resolve: () => {},
+      reject: (err: unknown) =>
+        this.emit('error', err instanceof Error ? err : new Error(String(err))),
+    });
+    try {
+      this.sendRaw(frame);
+    } catch (err) {
+      this.pendingCommands.delete(corr);
+      this.emit('error', err as Error);
+    }
   }
 
   private sendRaw(frame: ClientFrame): void {

@@ -67,6 +67,18 @@ subscribes with `maxParallelJobs` credits and replenishes one per completed job,
 so the server pushes at most `maxParallelJobs` jobs in flight — no long-poll, no
 client-side activation loop.
 
+For throughput, the worker's `complete()` / `fail()` / `error()` are
+**pipelined**: they send the action frame and resolve immediately rather than
+blocking the handler on the server's durable ack, so a single connection keeps
+its whole credit window in flight (reaching the handler-bound ceiling instead of
+one job per round-trip). The server still journals every action durably;
+delivery is **at-least-once**, so make handlers idempotent. A failed action ack
+(or a transport error) is reported via the optional `onError` callback —
+`404`/`409` results (the job was already completed or reclaimed under
+at-least-once redelivery) are treated as benign and not surfaced. `jobTimeoutMs`
+(the activation lock; default `60_000`) bounds how long an in-flight job is held
+before it is eligible for redelivery.
+
 ## Low-level command-stream client
 
 ```ts
