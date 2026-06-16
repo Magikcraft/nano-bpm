@@ -20,8 +20,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
     ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, ProcessInstance, State,
@@ -60,7 +61,9 @@ impl Commit {
     /// thread is gone (shutdown), it resolves immediately rather than hanging.
     pub async fn wait(self) {
         if let CommitInner::Pending(rx) = self.0 {
+            let start = std::time::Instant::now();
             let _ = rx.await;
+            crate::metrics::record_commit_wait(start.elapsed());
         }
     }
 }
@@ -109,20 +112,56 @@ struct ColdSpill {
     low_water: u64,
 }
 
+/// Upper bound on how many writes one group-commit batch will accumulate before
+/// forcing the fsync, regardless of the linger window. Bounds worst-case commit
+/// latency and the staging buffer when offered load is very high.
+const MAX_GROUP_BATCH: usize = 8192;
+
 /// The background journal writer: blocks for the next request, drains every
 /// other request already queued, then **group-commits** the whole batch in a
 /// single `write` + `fsync` before signalling each command's commit. Batching
 /// amortizes one fsync across all concurrently in-flight writes.
 ///
+/// `linger` is an optional group-commit delay (à la Postgres `commit_delay` /
+/// MySQL binlog group commit). When non-zero, after draining the instantly
+/// available writes the writer waits up to `linger` for *more* writes to arrive
+/// before committing. This breaks the closed-loop pathology where each client
+/// blocks on its own `fsync` ack, so only one write is ever queued at a time and
+/// the batch never grows past 1 — leaving throughput pinned at one commit per
+/// fsync latency. A small linger lets many in-flight clients coalesce into one
+/// fsync, trading a bounded latency increase for a large throughput gain on
+/// fsync-latency-bound workloads. Zero (the default) preserves the original
+/// drain-only behaviour exactly.
+///
 /// A write or fsync failure is unrecoverable — the in-memory engine has already
 /// advanced past the durable log — so the process is aborted rather than risk
 /// acknowledging or serving non-durable state (mirrors the previous
 /// panic-on-I/O-error contract).
-fn writer_loop(mut file: File, rx: Receiver<WriteRequest>) {
+fn writer_loop(mut file: File, rx: Receiver<WriteRequest>, linger: Duration) {
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
         while let Ok(next) = rx.try_recv() {
             batch.push(next);
+        }
+
+        // Optional group-commit linger: hold the fsync briefly so more
+        // concurrently in-flight writes can join this batch. Bounded by both the
+        // window and a hard batch cap so a steady flood can't defer a commit
+        // indefinitely.
+        if !linger.is_zero() && batch.len() < MAX_GROUP_BATCH {
+            let deadline = Instant::now() + linger;
+            while batch.len() < MAX_GROUP_BATCH {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match rx.recv_timeout(remaining) {
+                    Ok(next) => batch.push(next),
+                    Err(RecvTimeoutError::Timeout) => break,
+                    // All senders gone: flush what we have; the outer `recv`
+                    // will then observe the disconnect and exit.
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
 
         let mut buf = Vec::new();
@@ -130,18 +169,36 @@ fn writer_loop(mut file: File, rx: Receiver<WriteRequest>) {
             buf.extend_from_slice(&req.bytes);
         }
 
+        let fsync_start = Instant::now();
         if let Err(e) = file.write_all(&buf).and_then(|()| file.sync_all()) {
             tracing::error!(
                 "journal write failed: {e}; aborting to avoid serving non-durable state"
             );
             std::process::abort();
         }
+        crate::metrics::record_commit(batch.len(), fsync_start.elapsed(), buf.len());
+        crate::metrics::inflight_sub(batch.len());
 
         for req in batch {
             // The receiver is gone for fire-and-forget writes (the background
             // tick and startup seeding never await their commit); that's fine.
             let _ = req.ack.send(());
         }
+    }
+}
+
+/// Group-commit linger window from `NANOBPMN_JOURNAL_LINGER_US` (microseconds).
+/// Default 0 = off (drain-only group commit, original behaviour). A small value
+/// (e.g. 200–2000µs) coalesces fsyncs on latency-bound workloads. Clamped to a
+/// 50ms ceiling so a fat-fingered value can't stall durability.
+fn journal_linger_from_env() -> Duration {
+    const MAX_US: u64 = 50_000;
+    match std::env::var("NANOBPMN_JOURNAL_LINGER_US") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(us) => Duration::from_micros(us.min(MAX_US)),
+            Err(_) => Duration::ZERO,
+        },
+        Err(_) => Duration::ZERO,
     }
 }
 
@@ -210,9 +267,10 @@ impl Journal {
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let (tx, rx) = mpsc::channel::<WriteRequest>();
+        let linger = journal_linger_from_env();
         let writer_thread = thread::Builder::new()
             .name("nanobpmn-journal-writer".into())
-            .spawn(move || writer_loop(file, rx))
+            .spawn(move || writer_loop(file, rx, linger))
             .expect("spawn journal writer thread");
 
         Ok(Self {
@@ -531,7 +589,10 @@ impl Journal {
 
         let (ack, rx) = oneshot::channel();
         match writer.send(WriteRequest { bytes, ack }) {
-            Ok(()) => Commit(CommitInner::Pending(rx)),
+            Ok(()) => {
+                crate::metrics::inflight_inc();
+                Commit(CommitInner::Pending(rx))
+            }
             // The writer thread is gone (shutting down); treat as already settled
             // so callers never hang.
             Err(_) => Commit::ready(),

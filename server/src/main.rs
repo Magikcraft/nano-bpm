@@ -15,6 +15,7 @@ mod command_stream;
 mod engine_actor;
 mod journal;
 mod memory;
+mod metrics;
 mod partition;
 mod query;
 mod readstore;
@@ -3331,6 +3332,21 @@ const REST_LOG_BODY_PREVIEW: usize = 4096;
 /// Whether `DEBUG_REST` requests verbose REST request/response logging. Accepts
 /// the usual truthy spellings (`1`, `true`, `yes`, `on`); unset or anything
 /// else leaves it off.
+/// `GET /metrics` — Prometheus text exposition of the durability hot-path
+/// metrics (commit batch size, fsync/commit-wait latency, pipeline depth). Served
+/// unauthenticated alongside the REST API; scrape it while benchmarking to see
+/// how many writes share each fsync.
+async fn metrics_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(metrics::gather()))
+        .expect("metrics response builds")
+}
+
 fn debug_rest_enabled() -> bool {
     std::env::var("DEBUG_REST")
         .map(|v| {
@@ -3527,7 +3543,8 @@ async fn main() {
     let cs_router = command_stream::router(server.clone(), cs_registry);
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
-        .merge(cs_router);
+        .merge(cs_router)
+        .route("/metrics", axum::routing::get(metrics_handler));
 
     if debug_rest_enabled() {
         app = app.layer(axum::middleware::from_fn(log_rest));
