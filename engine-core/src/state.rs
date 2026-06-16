@@ -11,9 +11,43 @@ use std::sync::Arc;
 use crate::event::Event;
 use crate::model::{ElementId, ProcessDefinition, Value};
 
-/// A monotonically increasing identifier for instances, element instances and
-/// jobs. (Zeebe encodes the partition id into keys; nano just increments.)
+/// A globally-unique identifier for instances, element instances and jobs.
+///
+/// Following Zeebe, the high [`PARTITION_BITS`] bits encode the id of the
+/// partition that minted the key and the low [`LOCAL_BITS`] bits are a
+/// per-partition monotonic counter. This makes every key globally unique across
+/// partitions *and* self-routing: the owning partition is recoverable with
+/// [`partition_of`]. A single-partition engine uses partition id `0`, so its
+/// keys are just `1, 2, 3, …` (identical to the pre-partitioning scheme).
 pub type Key = u64;
+
+/// Number of high bits in a [`Key`] reserved for the partition id (Zeebe uses
+/// the same split). `PARTITION_BITS + LOCAL_BITS == 64`.
+pub const PARTITION_BITS: u32 = 13;
+/// Number of low bits in a [`Key`] holding the per-partition local counter.
+pub const LOCAL_BITS: u32 = 64 - PARTITION_BITS;
+/// Mask selecting the local-counter portion of a [`Key`].
+pub const LOCAL_MASK: u64 = (1u64 << LOCAL_BITS) - 1;
+/// Largest partition id representable in a [`Key`].
+pub const MAX_PARTITION_ID: u64 = (1u64 << PARTITION_BITS) - 1;
+
+/// Extracts the id of the partition that minted `key` (its high bits).
+#[inline]
+pub const fn partition_of(key: Key) -> u64 {
+    key >> LOCAL_BITS
+}
+
+/// Extracts the per-partition local counter portion of `key` (its low bits).
+#[inline]
+pub const fn local_of(key: Key) -> u64 {
+    key & LOCAL_MASK
+}
+
+/// Composes a [`Key`] from a partition id and a local counter value.
+#[inline]
+pub const fn compose_key(partition_id: u64, local: u64) -> Key {
+    (partition_id << LOCAL_BITS) | (local & LOCAL_MASK)
+}
 
 /// Lifecycle state of a process instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -26,9 +26,14 @@ use crate::state::{self, Key, ProcessInstanceState, State};
 #[derive(Debug, Default)]
 pub struct Engine {
     state: State,
-    /// Source of monotonic keys. The single-writer loop makes plain increments
-    /// deterministic.
-    next_key: Key,
+    /// Id of the partition this engine instance owns. Mints keys in its own
+    /// namespace (see [`crate::partition_of`]); `0` for a single-partition host,
+    /// which yields the historical `1, 2, 3, …` key sequence.
+    partition_id: u64,
+    /// Per-partition monotonic local counter. The next minted key is
+    /// `compose_key(partition_id, next_local + 1)`. The single-writer loop makes
+    /// plain increments deterministic.
+    next_local: u64,
     /// The clock reading for the command currently being processed, in the units
     /// the host supplies (Unix epoch milliseconds on the server). Set at the top
     /// of [`Engine::apply_command_at`] and read where the engine stamps a
@@ -68,11 +73,27 @@ enum Step {
 }
 
 impl Engine {
-    /// Creates an empty engine.
+    /// Creates an empty engine for the single-partition (id `0`) namespace.
     pub fn new() -> Self {
+        Self::with_partition(0)
+    }
+
+    /// Creates an empty engine that mints keys in partition `partition_id`'s
+    /// namespace. Every key it produces carries `partition_id` in its high bits
+    /// (see [`crate::compose_key`]), so keys are globally unique across a set of
+    /// partitions and route back to their owner via [`crate::partition_of`].
+    ///
+    /// Panics if `partition_id` exceeds [`crate::MAX_PARTITION_ID`].
+    pub fn with_partition(partition_id: u64) -> Self {
+        assert!(
+            partition_id <= state::MAX_PARTITION_ID,
+            "partition id {partition_id} exceeds MAX_PARTITION_ID {}",
+            state::MAX_PARTITION_ID
+        );
         Self {
             state: State::new(),
-            next_key: 0,
+            partition_id,
+            next_local: 0,
             now: 0,
         }
     }
@@ -97,15 +118,37 @@ impl Engine {
     where
         I: IntoIterator<Item = Event>,
     {
+        Self::replay_partition(0, events)
+    }
+
+    /// Like [`Engine::replay`] but reconstructs partition `partition_id`. The key
+    /// generator is advanced past every replayed key **that belongs to this
+    /// partition** (`partition_of(key) == partition_id`); keys minted by other
+    /// partitions (e.g. a deployment replicated in from partition 0) are applied
+    /// to state but never advance this partition's local counter, so it keeps
+    /// minting in its own namespace without colliding.
+    pub fn replay_partition<I>(partition_id: u64, events: I) -> Self
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        assert!(
+            partition_id <= state::MAX_PARTITION_ID,
+            "partition id {partition_id} exceeds MAX_PARTITION_ID {}",
+            state::MAX_PARTITION_ID
+        );
         let mut state = State::new();
-        let mut max_key: Key = 0;
+        let mut next_local: u64 = 0;
         for event in events {
-            max_key = max_key.max(event.max_key());
+            let max_key = event.max_key();
+            if state::partition_of(max_key) == partition_id {
+                next_local = next_local.max(state::local_of(max_key));
+            }
             state::apply(&mut state, &event);
         }
         Self {
             state,
-            next_key: max_key,
+            partition_id,
+            next_local,
             now: 0,
         }
     }
@@ -710,8 +753,31 @@ impl Engine {
     }
 
     fn mint_key(&mut self) -> Key {
-        self.next_key += 1;
-        self.next_key
+        self.next_local += 1;
+        debug_assert!(
+            self.next_local <= state::LOCAL_MASK,
+            "partition {} exhausted its 51-bit local key space",
+            self.partition_id
+        );
+        state::compose_key(self.partition_id, self.next_local)
+    }
+
+    /// Installs an already-minted deployment (a slice of [`Event`]s produced by
+    /// another partition's [`Command::Deploy`]) into this partition's state
+    /// **without minting new keys**, so every partition registers the identical
+    /// process definition under the identical `processDefinitionKey`.
+    ///
+    /// Only [`Event::ProcessDeployed`] events are applied: message-start
+    /// subscriptions and timer-start arming are intentionally skipped so those
+    /// start events remain owned by the single deployment partition (otherwise a
+    /// timer-start would fire once per partition). Used by a multi-partition host
+    /// to replicate partition 0's deployments to the others.
+    pub fn install_deployment(&mut self, events: &[Event]) {
+        for event in events {
+            if matches!(event, Event::ProcessDeployed { .. }) {
+                state::apply(&mut self.state, event);
+            }
+        }
     }
 
     /// Creates a fresh process instance and queues its start event for
@@ -6355,5 +6421,136 @@ mod tests {
             .jobs
             .values()
             .all(|j| j.state == state::JobState::Canceled));
+    }
+
+    #[test]
+    fn default_engine_mints_unpartitioned_keys() {
+        // partition 0 keeps the historical 1,2,3,… sequence (zero regression).
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(crate::partition_of(key), 0);
+        assert!(key < (1 << 51), "partition-0 keys carry no high bits");
+    }
+
+    #[test]
+    fn partitioned_engine_embeds_partition_id_in_every_key() {
+        let mut engine = Engine::with_partition(3);
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        for key in events.iter().filter_map(|e| {
+            // every minted key in these events belongs to partition 3
+            let k = e.max_key();
+            if k != 0 { Some(k) } else { None }
+        }) {
+            assert_eq!(crate::partition_of(key), 3, "key {key} routes to partition 3");
+        }
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(crate::partition_of(instance_key), 3);
+        assert!(crate::local_of(instance_key) > 0);
+    }
+
+    #[test]
+    fn keys_from_different_partitions_never_collide() {
+        let mut p1 = Engine::with_partition(1);
+        let mut p2 = Engine::with_partition(2);
+        for e in [&mut p1, &mut p2] {
+            e.apply_command(Command::DeployProcess(linear_with_task()))
+                .unwrap();
+        }
+        let k1 = p1
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        let k2 = p2
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        assert_ne!(k1, k2);
+        assert_eq!(crate::partition_of(k1), 1);
+        assert_eq!(crate::partition_of(k2), 2);
+    }
+
+    #[test]
+    fn replay_partition_recovers_local_counter_ignoring_foreign_keys() {
+        // Build a partition-2 log, then replay it prefixed with a foreign
+        // (partition-0) deployment event. The foreign key must NOT advance
+        // partition 2's local counter, so the next minted key stays in
+        // partition 2 and does not collide with the replayed instance.
+        let mut p2 = Engine::with_partition(2);
+        let deploy_events = p2
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let create_events = p2
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let replayed_key = create_events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // A deployment minted on partition 0 (low keys) that is replicated in.
+        let mut p0 = Engine::new();
+        let foreign_deploy = p0
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        let mut log: Vec<Event> = foreign_deploy.to_vec();
+        log.extend(deploy_events.iter().cloned());
+        log.extend(create_events.iter().cloned());
+
+        let mut recovered = Engine::replay_partition(2, log);
+        let next_key = recovered
+            .apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap();
+        assert_eq!(crate::partition_of(next_key), 2);
+        assert!(
+            crate::local_of(next_key) > crate::local_of(replayed_key),
+            "counter advanced past the replayed partition-2 key"
+        );
+    }
+
+    #[test]
+    fn install_deployment_registers_definition_without_minting() {
+        // Mint a deployment on partition 0, then install it on partition 5.
+        // Partition 5 can create instances of it, the definition key is shared,
+        // and partition 5's own key counter is untouched by the install.
+        let mut p0 = Engine::new();
+        let deploy_events = p0
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let def_key = deploy_events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessDeployed { process_definition_key, .. } => Some(*process_definition_key),
+                _ => None,
+            })
+            .unwrap();
+
+        let mut p5 = Engine::with_partition(5);
+        p5.install_deployment(&deploy_events);
+        // Definition is registered under the same shared key (partition 0).
+        assert_eq!(crate::partition_of(def_key), 0);
+
+        let events = p5
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        // The instance is minted in partition 5, not partition 0.
+        assert_eq!(crate::partition_of(instance_key), 5);
+        assert_eq!(crate::local_of(instance_key), 1, "install did not consume a local key");
     }
 }
