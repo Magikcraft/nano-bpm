@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -42,6 +43,7 @@ use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 use crate::ServerImpl;
 
@@ -58,6 +60,13 @@ const HEARTBEAT_MS: u64 = 15_000;
 /// Max jobs leased to a single stream per dispatch tick, so a high-credit worker
 /// cannot starve its peers between round-robin rotations.
 const PER_STREAM_BATCH: usize = 64;
+/// A connection is reaped as a phantom when no frame (the client's own heartbeat
+/// included) has arrived for this long. Three missed client heartbeats: long
+/// enough to tolerate a GC pause or a brief network blip, short enough to free a
+/// dispatch slot before the 60s job lock would even expire.
+const LIVENESS_TIMEOUT_MS: u64 = 3 * HEARTBEAT_MS;
+/// How often the reaper scans connections for liveness.
+const REAPER_INTERVAL_MS: u64 = 5_000;
 /// Default job-lock duration applied when a `Subscribe` omits `timeout` (or sends
 /// a non-positive one). A zero lock makes every leased job instantly re-activatable
 /// (`deadline == now`), so the dispatcher re-pushes it on the next pass before the
@@ -226,6 +235,18 @@ struct Connection {
     /// Target submission window this connection is topped up to.
     submission_window: i64,
     closed: AtomicBool,
+    /// Set by the dispatcher when it had credited demand but the outbound socket
+    /// buffer was full; the writer task clears it and wakes the dispatcher once a
+    /// frame drains, so re-dispatch is push-driven instead of waiting for the
+    /// backstop tick. Shared (not borrowed via the connection) so the writer task
+    /// does not keep the connection's `tx` alive past teardown.
+    wants_redispatch: Arc<AtomicBool>,
+    /// Wall-clock millis of the last frame received from this client. Updated on
+    /// every inbound message (including heartbeats); the reaper closes connections
+    /// that fall silent past the liveness deadline.
+    last_seen_ms: AtomicU64,
+    /// Fired to break the reader loop when the connection is reaped as a phantom.
+    shutdown: Notify,
 }
 
 impl Connection {
@@ -366,6 +387,25 @@ fn submission_window_from_env() -> i64 {
         .unwrap_or(DEFAULT_SUBMISSION_WINDOW)
 }
 
+/// Phantom-connection liveness deadline in millis, overridable via
+/// `NANOBPMN_STREAM_LIVENESS_MS` (chiefly for tests that need a fast reap).
+fn liveness_timeout_ms() -> u64 {
+    std::env::var("NANOBPMN_STREAM_LIVENESS_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(LIVENESS_TIMEOUT_MS)
+}
+
+/// Reaper scan interval in millis, overridable via `NANOBPMN_STREAM_REAPER_MS`.
+fn reaper_interval_ms() -> u64 {
+    std::env::var("NANOBPMN_STREAM_REAPER_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(REAPER_INTERVAL_MS)
+}
+
 async fn ws_handler(
     State(state): State<CsState>,
     Query(params): Query<ConnectParams>,
@@ -394,11 +434,19 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
         submission_outstanding: AtomicI64::new(0),
         submission_window,
         closed: AtomicBool::new(false),
+        wants_redispatch: Arc::new(AtomicBool::new(false)),
+        last_seen_ms: AtomicU64::new(now_millis()),
+        shutdown: Notify::new(),
     });
     registry.register(conn.clone());
 
     let (sink, stream) = socket.split();
-    tokio::spawn(writer_task(sink, rx));
+    tokio::spawn(writer_task(
+        conn.wants_redispatch.clone(),
+        sink,
+        rx,
+        server.dispatch_wake_handle(),
+    ));
 
     // Open the submission window so the client may start sending creates, and
     // announce the connection parameters.
@@ -422,10 +470,13 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
 
 /// Drains outbound frames to the socket and emits periodic heartbeats. Exits when
 /// every sender (the [`Connection`] and any await tasks) is dropped or the socket
-/// errors.
+/// errors. When a frame drains and the dispatcher had stalled on a full buffer
+/// (`wants_redispatch`), wakes it so re-dispatch is push-driven, not tick-driven.
 async fn writer_task(
+    wants_redispatch: Arc<AtomicBool>,
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
     mut rx: mpsc::Receiver<ServerFrame>,
+    dispatch_wake: Arc<Notify>,
 ) {
     let mut heartbeat = tokio::time::interval(Duration::from_millis(HEARTBEAT_MS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -444,6 +495,11 @@ async fn writer_task(
         if sink.send(Message::text(json)).await.is_err() {
             break;
         }
+        // A slot just freed on the outbound buffer. If the dispatcher skipped this
+        // connection because the buffer was full, wake it to retry now.
+        if wants_redispatch.swap(false, Ordering::Relaxed) {
+            dispatch_wake.notify_one();
+        }
     }
     let _ = sink.close().await;
 }
@@ -455,11 +511,18 @@ async fn reader_loop(
     conn: &Arc<Connection>,
     default_worker: &str,
 ) {
-    while let Some(message) = stream.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(_) => break,
+    loop {
+        let message = tokio::select! {
+            // Reaped as a phantom: stop reading so the connection tears down.
+            _ = conn.shutdown.notified() => break,
+            next = stream.next() => match next {
+                Some(Ok(message)) => message,
+                // Stream ended or errored (clean close, FIN/RST): disconnect.
+                Some(Err(_)) | None => break,
+            },
         };
+        // Any inbound frame — command or heartbeat — proves the client is alive.
+        conn.last_seen_ms.store(now_millis(), Ordering::Relaxed);
         match message {
             Message::Text(text) => {
                 let frame: ClientFrame = match serde_json::from_str(&text) {
@@ -742,6 +805,7 @@ fn grant_submission_credit_if_clear(server: &ServerImpl, conn: &Arc<Connection>,
 /// up submission credits as engine headroom allows.
 pub fn spawn_dispatcher(server: ServerImpl, registry: Arc<Registry>) {
     let jobs_available = server.dispatch_wake_handle();
+    let registry_for_reaper = registry.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(DISPATCH_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -775,6 +839,37 @@ pub fn spawn_dispatcher(server: ServerImpl, registry: Arc<Registry>) {
             }
         }
     });
+    spawn_reaper(registry_for_reaper);
+}
+
+/// Spawns the phantom-connection reaper: a frozen client or a network partition
+/// can leave a socket open (no FIN) with `reader_loop` blocked forever, holding a
+/// dispatch slot and submission credits. The SDK client heartbeats on a fixed
+/// cadence, so a connection that has sent nothing for [`LIVENESS_TIMEOUT_MS`] is
+/// treated as dead: we mark it closed, wake its reader to tear down (releasing the
+/// socket), and unregister it. Jobs it had leased were already protected by the
+/// lock deadline and are reclaimed independently.
+fn spawn_reaper(registry: Arc<Registry>) {
+    tokio::spawn(async move {
+        let timeout_ms = liveness_timeout_ms();
+        let mut tick = tokio::time::interval(Duration::from_millis(reaper_interval_ms()));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let now = now_millis();
+            for conn in registry.all_connections() {
+                let last = conn.last_seen_ms.load(Ordering::Relaxed);
+                if now.saturating_sub(last) >= timeout_ms {
+                    conn.closed.store(true, Ordering::Relaxed);
+                    // Break the reader loop; handle_socket then unregisters.
+                    // notify_one persists a permit, so this is race-free even if
+                    // the reader is not parked at this exact instant.
+                    conn.shutdown.notify_one();
+                    registry.unregister(conn.id);
+                }
+            }
+        }
+    });
 }
 
 /// Sends a frame to every live connection (best-effort).
@@ -782,6 +877,15 @@ fn broadcast(registry: &Arc<Registry>, frame: &ServerFrame) {
     for conn in registry.all_connections() {
         conn.send(frame.clone());
     }
+}
+
+/// Wall-clock millis since the Unix epoch (the engine itself is clock-free; this
+/// is only for connection liveness, not journaled state).
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// One dispatch pass: for each job type, lease and push jobs to credited streams in
@@ -800,6 +904,10 @@ async fn dispatch_jobs(server: &ServerImpl, registry: &Arc<Registry>) {
             // Never lease more than we can immediately enqueue to this socket.
             let room = conn.tx.capacity() as i64;
             if room <= 0 {
+                // Credited demand we cannot satisfy because the outbound buffer is
+                // full: arm a redispatch so the writer wakes us the moment a slot
+                // frees, instead of relying on the backstop tick.
+                conn.wants_redispatch.store(true, Ordering::Relaxed);
                 continue;
             }
             let want = credits.min(room).min(PER_STREAM_BATCH as i64) as usize;

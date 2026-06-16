@@ -646,9 +646,10 @@ impl Journal {
 
     /// Releases expired activation locks at logical instant `now`, **without**
     /// journaling: like activation, lock expiry is volatile lease state. Mirrors
-    /// [`Engine::expire_jobs`].
-    pub fn expire_jobs(&mut self, now: u64) {
-        self.engine.expire_jobs(now);
+    /// [`Engine::expire_jobs`]. Returns the reclaimed-job events so the caller can
+    /// wake dispatch when a lease frees a job for redelivery.
+    pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
+        self.engine.expire_jobs(now)
     }
 
     /// Read-only access to the underlying engine (for projections that take an

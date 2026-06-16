@@ -3356,11 +3356,15 @@ async fn main() {
                 let produced = engine
                     .with(move |journal| {
                         let (fired, _commit) = journal.trigger_timers(now);
-                        journal.expire_jobs(now);
+                        let expired = journal.expire_jobs(now);
                         // Shed dormant instances to disk if hot RAM is over the
                         // high-water mark (cheap no-op below it / when unset).
                         journal.maybe_cold_spill();
-                        !fired.is_empty()
+                        // Either a fired timer (may create a job) or a reclaimed
+                        // job lease (frees a job for redelivery) means there is
+                        // pushable work — wake dispatch instead of waiting for its
+                        // own backstop tick.
+                        !fired.is_empty() || !expired.is_empty()
                     })
                     .await;
                 if produced {

@@ -311,8 +311,7 @@ impl WsClient {
 
     /// Like [`Self::recv_frame`] but returns `None` if a read times out or the
     /// stream ends, instead of panicking.
-    fn try_recv_frame(&mut self) -> Option<(u8, Vec<u8>)> {
-        let mut header = [0u8; 2];
+    fn try_recv_frame(&mut self) -> Option<(u8, Vec<u8>)> {        let mut header = [0u8; 2];
         if self.stream.read_exact(&mut header).is_err() {
             return None;
         }
@@ -340,6 +339,40 @@ impl WsClient {
             }
         }
         Some((opcode, payload))
+    }
+
+    /// Waits up to `within` for the server to close the connection, returning
+    /// `true` only on a genuine Close frame (0x8) or EOF — **not** on a read
+    /// timeout. Skips any other frames. Used to assert the reaper drops a silent
+    /// (phantom) client.
+    fn wait_for_close(&mut self, within: Duration) -> bool {
+        // Poll in short slices so a read timeout doesn't masquerade as a close.
+        self.stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            let mut header = [0u8; 2];
+            match self.stream.read_exact(&mut header) {
+                Ok(()) => {
+                    // A frame header arrived; a Close opcode means the server shut
+                    // us down. (We don't bother draining other frame bodies here —
+                    // the reaper sends no data frames, so anything else is benign.)
+                    if header[0] & 0x0F == 0x8 {
+                        return true;
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // No data this slice; keep waiting until the overall deadline.
+                }
+                // EOF or any other error: the socket is gone — a close.
+                Err(_) => return true,
+            }
+        }
+        false
     }
 }
 
@@ -628,6 +661,90 @@ fn a_subscribe_without_a_timeout_does_not_redeliver_an_in_flight_job() {
     assert!(
         redelivered.is_none(),
         "job {job_key} was redelivered before completion (lock too short): {redelivered:?}"
+    );
+}
+
+#[test]
+fn a_silent_client_is_reaped_as_a_phantom() {
+    // A frozen/partitioned client whose TCP stays open (no FIN) would otherwise
+    // hold its dispatch slot and credits indefinitely. With a short liveness
+    // deadline the reaper must close the socket once the client stops
+    // heartbeating.
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(
+        &scratch.journal_path(),
+        &[
+            ("NANOBPMN_STREAM_LIVENESS_MS", "500"),
+            ("NANOBPMN_STREAM_REAPER_MS", "150"),
+        ],
+    );
+
+    let mut ws = WsClient::connect(server.port);
+    ws.recv_until(&["welcome"]);
+    ws.send(&json!({
+        "type": "subscribe",
+        "jobType": DEMO_JOB_TYPE,
+        "jobCredits": 10,
+    }));
+
+    // Now go silent: send no further frames (no client heartbeats). The server
+    // should reap us and close the socket within a couple of liveness windows.
+    assert!(
+        ws.wait_for_close(Duration::from_secs(4)),
+        "server did not reap a silent client within the liveness deadline"
+    );
+}
+
+#[test]
+fn a_heartbeating_client_is_not_reaped() {
+    // The reaper must not drop a healthy-but-idle client that keeps heartbeating.
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(
+        &scratch.journal_path(),
+        &[
+            ("NANOBPMN_STREAM_LIVENESS_MS", "500"),
+            ("NANOBPMN_STREAM_REAPER_MS", "150"),
+        ],
+    );
+
+    let mut ws = WsClient::connect(server.port);
+    ws.recv_until(&["welcome"]);
+
+    // Heartbeat every 200ms for ~1.5s — comfortably past the 500ms deadline and
+    // several reaper scans — then confirm the socket is still alive by completing
+    // a normal create/push/complete round-trip.
+    ws.send(&json!({
+        "type": "subscribe",
+        "jobType": DEMO_JOB_TYPE,
+        "jobCredits": 10,
+    }));
+    for _ in 0..7 {
+        ws.send(&json!({ "type": "heartbeat" }));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    ws.send(&json!({
+        "type": "createInstance",
+        "corr": 1,
+        "processDefinitionId": "demo",
+    }));
+    assert_eq!(
+        ws.recv_until(&["commandResult"])["status"].as_u64(),
+        Some(200),
+        "a heartbeating client was wrongly reaped (create failed)"
+    );
+    let job_key = ws.recv_until(&["job"])["job"]["jobKey"]
+        .as_str()
+        .expect("pushed job carries a key")
+        .to_string();
+    ws.send(&json!({
+        "type": "completeJob",
+        "corr": 2,
+        "jobKey": job_key,
+    }));
+    assert_eq!(
+        ws.recv_until(&["commandResult"])["status"].as_u64(),
+        Some(200)
     );
 }
 

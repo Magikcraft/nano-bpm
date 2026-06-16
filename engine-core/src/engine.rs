@@ -622,9 +622,14 @@ impl Engine {
     /// Releases the activation lock of every job whose deadline is at or before
     /// `now`. The host drives this periodically (a "tick"); the engine itself
     /// never reads a clock.
-    pub fn expire_jobs(&mut self, now: u64) {
+    /// Reclaims every job whose activation lock has expired at or before `now`,
+    /// making it activatable again. Like [`Engine::trigger_timers`], the host
+    /// drives this periodically; the engine never reads a clock. Returns the
+    /// [`Event::JobLockExpired`] events produced (empty when nothing was due), so
+    /// the host can wake job dispatch immediately rather than waiting for a tick.
+    pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
         self.apply_command_at(Command::ExpireJobs { now }, now)
-            .expect("ExpireJobs never fails");
+            .expect("ExpireJobs never fails")
     }
 
     /// Fires every armed timer whose due instant is at or before `now`, resuming
