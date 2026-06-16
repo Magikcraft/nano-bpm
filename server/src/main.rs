@@ -2715,12 +2715,17 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
-    /// Stream `CompleteJob`.
+    /// Stream `CompleteJob`: applies the command on the engine actor (establishing
+    /// journal order) and returns the [`Commit`] WITHOUT awaiting durability. The
+    /// caller awaits the commit off the connection's read path so multiple
+    /// completions can be in flight at once, letting the journal's group-commit
+    /// coalesce their fsyncs. Journal arrival order is still the frame order
+    /// because the actor round-trip below is awaited inline by the reader loop.
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
         variables: std::collections::HashMap<String, Value>,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Commit, (u16, String)> {
         let result = self
             .engine
             .by_key(job_key)
@@ -2728,19 +2733,17 @@ impl ServerImpl {
                 engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
             })
             .await;
-        let commit = Self::map_job_outcome(result)?;
-        commit.wait().await;
-        self.signal_jobs_available();
-        Ok(())
+        Self::map_job_outcome(result)
     }
 
-    /// Stream `FailJob`.
+    /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
+    /// [`Self::complete_job_for_stream`].
     pub(crate) async fn fail_job_for_stream(
         &self,
         job_key: u64,
         retries: i32,
         error_message: String,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Commit, (u16, String)> {
         let result = self
             .engine
             .by_key(job_key)
@@ -2748,19 +2751,17 @@ impl ServerImpl {
                 engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
             })
             .await;
-        let commit = Self::map_job_outcome(result)?;
-        commit.wait().await;
-        self.signal_jobs_available();
-        Ok(())
+        Self::map_job_outcome(result)
     }
 
-    /// Stream `ThrowError`.
+    /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
+    /// [`Self::complete_job_for_stream`].
     pub(crate) async fn throw_error_for_stream(
         &self,
         job_key: u64,
         error_code: String,
         error_message: String,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Commit, (u16, String)> {
         let result = self
             .engine
             .by_key(job_key)
@@ -2771,10 +2772,7 @@ impl ServerImpl {
                 )
             })
             .await;
-        let commit = Self::map_job_outcome(result)?;
-        commit.wait().await;
-        self.signal_jobs_available();
-        Ok(())
+        Self::map_job_outcome(result)
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the

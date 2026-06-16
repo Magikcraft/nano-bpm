@@ -46,6 +46,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
 use crate::ServerImpl;
+use crate::journal::Commit;
 
 /// Per-connection submission-credit window (creates the client may have in flight
 /// before it must wait for the server to replenish). Overridable via
@@ -653,7 +654,7 @@ async fn handle_client_frame(
                 return;
             };
             let vars = to_engine_vars(variables);
-            reply_job_command(conn, corr, server.complete_job_for_stream(key, vars).await);
+            pipeline_job_command(server, conn, corr, server.complete_job_for_stream(key, vars).await);
         }
         ClientFrame::FailJob {
             corr,
@@ -667,7 +668,7 @@ async fn handle_client_frame(
             let outcome = server
                 .fail_job_for_stream(key, retries.unwrap_or(0), error_message.unwrap_or_default())
                 .await;
-            reply_job_command(conn, corr, outcome);
+            pipeline_job_command(server, conn, corr, outcome);
         }
         ClientFrame::ThrowError {
             corr,
@@ -681,7 +682,7 @@ async fn handle_client_frame(
             let outcome = server
                 .throw_error_for_stream(key, error_code, error_message.unwrap_or_default())
                 .await;
-            reply_job_command(conn, corr, outcome);
+            pipeline_job_command(server, conn, corr, outcome);
         }
         ClientFrame::AwaitInstance {
             corr,
@@ -716,14 +717,33 @@ async fn handle_client_frame(
     }
 }
 
-/// Maps a job-command outcome to a `CommandResult` frame.
-fn reply_job_command(conn: &Arc<Connection>, corr: u64, outcome: Result<(), (u16, String)>) {
+/// Completes a job-lifecycle command without blocking the connection's read loop
+/// on durability. On a successful apply, the engine has already journaled the
+/// events in frame order; we await the fsync `Commit` in a detached task and only
+/// then reply `200` and wake job pollers. Because the reader loop does not await
+/// the commit, several connections' (and a pipelining client's) completions can
+/// be in flight at once, so the journal's group-commit coalesces their fsyncs —
+/// the single biggest throughput lever on fsync-latency-bound disks. Replies are
+/// correlated by `corr`, so the relaxed reply ordering is safe. Apply-time errors
+/// (job not found / not active) carry no commit and are replied inline.
+fn pipeline_job_command(
+    server: &ServerImpl,
+    conn: &Arc<Connection>,
+    corr: u64,
+    outcome: Result<Commit, (u16, String)>,
+) {
     match outcome {
-        Ok(()) => {
-            conn.send(ServerFrame::CommandResult {
-                corr,
-                status: 200,
-                body: None,
+        Ok(commit) => {
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                commit.wait().await;
+                server.signal_jobs_available();
+                conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: None,
+                });
             });
         }
         Err((status, message)) => {
