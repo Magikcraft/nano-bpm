@@ -1680,3 +1680,173 @@ fn spilled_variables_rehydrate_correctly_on_job_activation() {
 
     server.shutdown();
 }
+
+/// Decodes the partition id from a process-instance/job key string (`key >> 51`,
+/// mirroring `nanobpmn_engine_core::partition_of`). Used by the multi-partition
+/// tests to prove a round-robin create actually spread instances across
+/// partitions and that each key routes back to its owning partition.
+fn partition_of_key(key: &str) -> u64 {
+    key.parse::<u64>().expect("numeric key") >> 51
+}
+
+/// Completes a job by key, asserting a 2xx response.
+fn complete_job(server: &ServerProcess, job_key: &str) {
+    let (status, body) = server.request(
+        "POST",
+        &path(&format!("/jobs/{job_key}/completion")),
+        Some("{}"),
+    );
+    assert!(
+        (200..300).contains(&status),
+        "complete job {job_key} failed: {status} {body}"
+    );
+}
+
+#[test]
+fn multi_partition_spreads_instances_and_completes_jobs_across_partitions() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Four partitions: createProcessInstance is balanced round-robin, so a batch
+    // of creates must land on more than one partition (keys carry their owning
+    // partition in their high bits).
+    let server = ServerProcess::boot_with_env(&journal, &[("NANOBPMN_PARTITIONS", "4")]);
+
+    let mut keys = Vec::new();
+    for _ in 0..8 {
+        keys.push(create_demo_instance(&server));
+    }
+
+    let partitions: std::collections::BTreeSet<u64> =
+        keys.iter().map(|k| partition_of_key(k)).collect();
+    assert!(
+        partitions.len() > 1,
+        "round-robin create must spread 8 instances across partitions, got {partitions:?}"
+    );
+
+    // Every instance is visible in the single shared read model regardless of
+    // which partition owns it.
+    for key in &keys {
+        let (status, body) = server.request_until(
+            "GET",
+            &path(&format!("/process-instances/{key}")),
+            None,
+            |status, _| status == 200,
+        );
+        assert_eq!(status, 200, "instance {key} should be visible: {body}");
+    }
+
+    // Job activation fans out across all partitions: all 8 demo-work jobs are
+    // activatable even though they live on different partitions. Drain and
+    // complete every one.
+    let mut completed = 0;
+    for _ in 0..8 {
+        let body =
+            r#"{"type":"demo-work","maxJobsToActivate":10,"timeout":60000,"requestTimeout":-1}"#;
+        let (status, resp) = server.request("POST", &path("/jobs/activation"), Some(body));
+        assert_eq!(status, 200, "activation failed: {resp}");
+        let json: serde_json::Value =
+            serde_json::from_str(&resp).expect("activation response is JSON");
+        let jobs = json["jobs"].as_array().expect("jobs array");
+        for job in jobs {
+            let job_key = job["jobKey"].as_str().expect("jobKey present");
+            // A job routes back to the partition that owns its instance.
+            let instance_key = job["processInstanceKey"]
+                .as_str()
+                .expect("processInstanceKey present");
+            assert_eq!(
+                partition_of_key(job_key),
+                partition_of_key(instance_key),
+                "job key must share its instance's partition"
+            );
+            complete_job(&server, job_key);
+            completed += 1;
+        }
+        if completed >= 8 {
+            break;
+        }
+    }
+    assert_eq!(completed, 8, "all 8 jobs across partitions must activate");
+
+    // Each instance now completes (the single shared read model reflects every
+    // partition's terminal state).
+    for key in &keys {
+        let (status, body) = server.request_until(
+            "GET",
+            &path(&format!("/process-instances/{key}")),
+            None,
+            |status, body| {
+                status == 200
+                    && serde_json::from_str::<serde_json::Value>(body)
+                        .ok()
+                        .and_then(|j| j["state"].as_str().map(|s| s.to_string()))
+                        .as_deref()
+                        == Some("COMPLETED")
+            },
+        );
+        assert_eq!(status, 200, "instance {key} should be queryable: {body}");
+    }
+
+    server.shutdown();
+}
+
+#[test]
+fn multi_partition_state_survives_a_restart() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+    let env = [("NANOBPMN_PARTITIONS", "4")];
+
+    // Create and park instances spread across partitions.
+    let server = ServerProcess::boot_with_env(&journal, &env);
+    let mut keys = Vec::new();
+    for _ in 0..8 {
+        keys.push(create_demo_instance(&server));
+    }
+    for key in &keys {
+        let (status, _) = server.request_until(
+            "GET",
+            &path(&format!("/process-instances/{key}")),
+            None,
+            |status, _| status == 200,
+        );
+        assert_eq!(status, 200, "instance {key} visible before restart");
+    }
+    server.shutdown();
+
+    // Reboot over the same per-partition journals: the read model is rebuilt from
+    // every partition's log and each instance is recovered on its owning
+    // partition.
+    let restarted = ServerProcess::boot_with_env(&journal, &env);
+    for key in &keys {
+        let (status, body) = restarted.request_until(
+            "GET",
+            &path(&format!("/process-instances/{key}")),
+            None,
+            |status, _| status == 200,
+        );
+        assert_eq!(status, 200, "instance {key} must survive restart: {body}");
+    }
+
+    // The recovered instances are still drivable: their demo-work jobs activate
+    // (proving the engine state, not just the read model, was recovered per
+    // partition).
+    let mut completed = 0;
+    for _ in 0..8 {
+        let body =
+            r#"{"type":"demo-work","maxJobsToActivate":10,"timeout":60000,"requestTimeout":-1}"#;
+        let (status, resp) = restarted.request("POST", &path("/jobs/activation"), Some(body));
+        assert_eq!(status, 200, "post-restart activation failed: {resp}");
+        let json: serde_json::Value =
+            serde_json::from_str(&resp).expect("activation response is JSON");
+        for job in json["jobs"].as_array().expect("jobs array") {
+            complete_job(&restarted, job["jobKey"].as_str().expect("jobKey"));
+            completed += 1;
+        }
+        if completed >= 8 {
+            break;
+        }
+    }
+    assert_eq!(completed, 8, "all recovered jobs must activate after restart");
+
+    restarted.shutdown();
+}

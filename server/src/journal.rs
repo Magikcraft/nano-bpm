@@ -149,8 +149,14 @@ impl Journal {
     /// A non-persistent journal: the engine runs purely in memory and nothing is
     /// written. Used for tests and ephemeral runs.
     pub fn in_memory() -> Self {
+        Self::in_memory_partition(0)
+    }
+
+    /// Like [`Journal::in_memory`] but the engine mints keys in `partition_id`'s
+    /// namespace (see [`nanobpmn_engine_core::partition_of`]).
+    pub fn in_memory_partition(partition_id: u64) -> Self {
         Self {
-            engine: Engine::new(),
+            engine: Engine::with_partition(partition_id),
             writer: None,
             writer_thread: None,
             exporter: None,
@@ -184,13 +190,21 @@ impl Journal {
     /// log to reconstruct engine state, then spawns the background writer thread
     /// positioned to append.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_partition(path, 0)
+    }
+
+    /// Like [`Journal::open`] but the engine owns `partition_id`'s key namespace.
+    /// Replay only advances this partition's local key counter (foreign keys, e.g.
+    /// a deployment replicated from partition 0, are applied to state but do not
+    /// advance the counter — see [`Engine::replay_partition`]).
+    pub fn open_partition(path: impl AsRef<Path>, partition_id: u64) -> io::Result<Self> {
         let path = path.as_ref();
-        let mut engine = Engine::new();
+        let mut engine = Engine::with_partition(partition_id);
         let mut fresh = true;
 
         let events = Self::read_events(path)?;
         if !events.is_empty() {
-            engine = Engine::replay(events);
+            engine = Engine::replay_partition(partition_id, events);
             fresh = false;
         }
 
@@ -210,6 +224,16 @@ impl Journal {
             spill: None,
             cold: None,
         })
+    }
+
+    /// Installs an already-minted deployment (the [`Event`]s from a `Deploy`
+    /// command processed on another partition) into this partition's engine without minting new keys, so every partition shares the identical
+    /// process definition under the identical key. Not journaled here: a
+    /// multi-partition host re-derives the replication on restart from the
+    /// deployment partition's log (which is the single durable record of the
+    /// deployment). See [`Engine::install_deployment`].
+    pub fn install_deployment(&mut self, events: &[Event]) {
+        self.engine.install_deployment(events);
     }
 
     /// Wires the disk-backed variable spill. `budget` is the maximum number of

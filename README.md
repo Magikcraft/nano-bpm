@@ -323,6 +323,31 @@ double the footprint.
 | `NANOBPMN_COLD_SPILL=<on\|off>` | Force cold spill on/off. Unset: on iff a persistent data path exists. |
 | `NANOBPMN_COLD_SPILL_MB=<n>` | High-water resident RAM (MiB) above which dormant instances are evicted to disk. Default `384`; low-water = 7/8 of high. |
 
+## Partitions
+
+Following Zeebe, a node may run several **partitions**, each its own
+single-writer engine thread + journal. Partitioning multiplies the single-writer
+throughput ceiling (each partition fsyncs and applies independently) while
+keeping every command serialized within its partition.
+
+- **Default is one partition** (`NANOBPMN_PARTITIONS=1`), which preserves the
+  historical behaviour exactly: one engine thread, one `journal.jsonl`, keys
+  `1, 2, 3, …`.
+- Set `NANOBPMN_PARTITIONS=<n>` to run `n` partitions (0-based ids `0…n-1`).
+  Keys embed their owning partition in their high bits, so a command targeting an
+  existing key (complete/cancel/…) routes to exactly one partition, while a fresh
+  `createProcessInstance` is balanced **round-robin** across partitions. An
+  instance lives on its creating partition for life.
+- **Queries, `awaitCompletion`, and the read model are global** — answered from a
+  single shared projection fed by all partitions, so multi-partition is
+  transparent to clients.
+- Each partition gets its own journal file: `journal.partition-<p>.jsonl`.
+  Deployments are journaled on partition 0 and replicated in-memory to the rest.
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_PARTITIONS=<n>` | Number of single-writer partitions. Default `1`. Clamped to `[1, 8192]`. Changing this requires fresh data directories (the journal layout differs). |
+
 ## Command stream (WebSocket)
 
 Alongside the REST API, the server exposes a single **bidirectional WebSocket**
