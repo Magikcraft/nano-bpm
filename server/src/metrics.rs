@@ -39,6 +39,22 @@ struct Metrics {
     bytes_total: IntCounter,
     /// Writes enqueued but not yet fsynced — the live commit-pipeline depth.
     inflight: IntGauge,
+    
+    // ---- Phase 2: command-stream and protocol metrics ----
+    
+    /// Command-stream WebSocket frames processed, by frame type.
+    stream_frames_total: prometheus::IntCounterVec,
+    /// How many times a streaming client stalled waiting for submission credits.
+    stream_credit_stalls_total: IntCounter,
+    /// Active command-stream WebSocket connections.
+    stream_connections_active: IntGauge,
+    /// Time spent processing each command-stream frame (read + apply + reply).
+    stream_frame_processing_seconds: Histogram,
+    
+    /// Process instance creates, split by protocol (rest vs stream).
+    creates_total: prometheus::IntCounterVec,
+    /// Job completions, split by protocol (rest vs stream).
+    job_completions_total: prometheus::IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -99,6 +115,60 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    // Phase 2: command-stream and protocol metrics
+    use prometheus::IntCounterVec;
+    use prometheus::Opts;
+
+    let stream_frames_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_stream_frames_total",
+            "Command-stream frames processed by type.",
+        ),
+        &["type"],
+    )
+    .expect("valid counter vec");
+
+    let stream_credit_stalls_total = IntCounter::new(
+        "nanobpm_stream_credit_stalls_total",
+        "Streaming clients stalled waiting for submission credits.",
+    )
+    .expect("valid counter");
+
+    let stream_connections_active = IntGauge::new(
+        "nanobpm_stream_connections_active",
+        "Active command-stream WebSocket connections.",
+    )
+    .expect("valid gauge");
+
+    let stream_frame_processing_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_stream_frame_processing_seconds",
+            "Time to process each command-stream frame (read+apply+reply).",
+        )
+        .buckets(vec![
+            0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01,
+        ]),
+    )
+    .expect("valid histogram");
+
+    let creates_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_creates_total",
+            "Process instance creates by protocol (rest|stream).",
+        ),
+        &["protocol"],
+    )
+    .expect("valid counter vec");
+
+    let job_completions_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_job_completions_total",
+            "Job completions by protocol (rest|stream).",
+        ),
+        &["protocol"],
+    )
+    .expect("valid counter vec");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -107,7 +177,13 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(writes_total.clone())))
         .and(registry.register(Box::new(bytes_total.clone())))
         .and(registry.register(Box::new(inflight.clone())))
-        .expect("register Phase-1 metrics");
+        .and(registry.register(Box::new(stream_frames_total.clone())))
+        .and(registry.register(Box::new(stream_credit_stalls_total.clone())))
+        .and(registry.register(Box::new(stream_connections_active.clone())))
+        .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
+        .and(registry.register(Box::new(creates_total.clone())))
+        .and(registry.register(Box::new(job_completions_total.clone())))
+        .expect("register metrics");
 
     Metrics {
         registry,
@@ -118,6 +194,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         writes_total,
         bytes_total,
         inflight,
+        stream_frames_total,
+        stream_credit_stalls_total,
+        stream_connections_active,
+        stream_frame_processing_seconds,
+        creates_total,
+        job_completions_total,
     }
 });
 
@@ -154,4 +236,41 @@ pub fn gather() -> String {
         .encode_utf8(&families, &mut buf)
         .expect("encode metrics");
     buf
+}
+
+// ---- Phase 2: command-stream and protocol metrics ----
+
+/// Records a command-stream frame processed (by frame type).
+pub fn record_stream_frame(frame_type: &str) {
+    METRICS.stream_frames_total.with_label_values(&[frame_type]).inc();
+}
+
+/// Records a streaming client stalling for submission credits.
+pub fn record_stream_credit_stall() {
+    METRICS.stream_credit_stalls_total.inc();
+}
+
+/// Command-stream connection opened (+1).
+pub fn stream_connection_inc() {
+    METRICS.stream_connections_active.inc();
+}
+
+/// Command-stream connection closed (-1).
+pub fn stream_connection_dec() {
+    METRICS.stream_connections_active.dec();
+}
+
+/// Records time spent processing one command-stream frame.
+pub fn record_stream_frame_processing(elapsed: Duration) {
+    METRICS.stream_frame_processing_seconds.observe(elapsed.as_secs_f64());
+}
+
+/// Records a process instance create (by protocol: "rest" or "stream").
+pub fn record_create(protocol: &str) {
+    METRICS.creates_total.with_label_values(&[protocol]).inc();
+}
+
+/// Records a job completion (by protocol: "rest" or "stream").
+pub fn record_job_completion(protocol: &str) {
+    METRICS.job_completions_total.with_label_values(&[protocol]).inc();
 }

@@ -704,6 +704,9 @@ impl ServerImpl {
                 Err(resp) => return Ok(*resp),
             };
 
+        // Record REST create
+        crate::metrics::record_create("rest");
+
         // Block on durability before acknowledging: a returned 200 means the
         // create is fsynced.
         commit.wait().await;
@@ -904,6 +907,8 @@ impl ServerImpl {
             .await;
         match result {
             Ok((_, commit)) => {
+                // Record REST job completion
+                crate::metrics::record_job_completion("rest");
                 // REST API: await fsync before replying (synchronous durability).
                 // Contrast with command_stream::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
@@ -977,6 +982,8 @@ impl ServerImpl {
             .await;
         match result {
             Ok((_, commit)) => {
+                // Record REST job completion (fail also completes the job lifecycle)
+                crate::metrics::record_job_completion("rest");
                 commit.wait().await;
                 // Failing with retries left returns the job to the activatable
                 // pool, so wake any long-pollers.

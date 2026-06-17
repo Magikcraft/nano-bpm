@@ -284,10 +284,12 @@ impl Registry {
     }
 
     fn register(&self, conn: Arc<Connection>) {
+        crate::metrics::stream_connection_inc();
         self.conns.lock().expect("registry poisoned").insert(conn.id, conn);
     }
 
     fn unregister(&self, id: ConnId) {
+        crate::metrics::stream_connection_dec();
         if let Some(conn) = self.conns.lock().expect("registry poisoned").remove(&id) {
             conn.closed.store(true, Ordering::Relaxed);
         }
@@ -559,6 +561,22 @@ async fn handle_client_frame(
     default_worker: &str,
     frame: ClientFrame,
 ) {
+    use std::time::Instant;
+    let start = Instant::now();
+    
+    // Record frame type
+    let frame_type = match &frame {
+        ClientFrame::Subscribe { .. } => "subscribe",
+        ClientFrame::JobCredits { .. } => "job_credits",
+        ClientFrame::CreateInstance { .. } => "create_instance",
+        ClientFrame::CompleteJob { .. } => "complete_job",
+        ClientFrame::FailJob { .. } => "fail_job",
+        ClientFrame::ThrowError { .. } => "throw_error",
+        ClientFrame::AwaitInstance { .. } => "await_instance",
+        ClientFrame::Heartbeat => "heartbeat",
+    };
+    crate::metrics::record_stream_frame(frame_type);
+    
     match frame {
         ClientFrame::Subscribe {
             job_type,
@@ -604,7 +622,12 @@ async fn handle_client_frame(
         } => {
             // Consume a submission credit (intake metering). The client is
             // expected to hold one; we still account so the top-up pass refills.
-            conn.submission_outstanding.fetch_sub(1, Ordering::Relaxed);
+            let before = conn.submission_outstanding.fetch_sub(1, Ordering::Relaxed);
+            // If we just consumed the last credit (or went negative), the client
+            // is about to stall waiting for top-up.
+            if before <= 1 {
+                crate::metrics::record_stream_credit_stall();
+            }
 
             let vars = to_engine_vars(variables);
             match server
@@ -612,6 +635,7 @@ async fn handle_client_frame(
                 .await
             {
                 Ok((instance_key, sync_completed)) => {
+                    crate::metrics::record_create("stream");
                     conn.send(ServerFrame::CommandResult {
                         corr,
                         status: 200,
@@ -715,6 +739,9 @@ async fn handle_client_frame(
         },
         ClientFrame::Heartbeat => {}
     }
+    
+    // Record frame processing time
+    crate::metrics::record_stream_frame_processing(start.elapsed());
 }
 
 /// Completes a job-lifecycle command (completeJob / failJob / throwError) without
@@ -762,6 +789,7 @@ fn pipeline_job_command(
 ) {
     match outcome {
         Ok(commit) => {
+            crate::metrics::record_job_completion("stream");
             let server = server.clone();
             let conn = conn.clone();
             tokio::spawn(async move {
