@@ -790,6 +790,8 @@ impl Engine {
         process_id: String,
         start_event: ElementId,
         variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
     ) -> Key {
         let instance_key = self.mint_key();
         self.emit(
@@ -799,6 +801,8 @@ impl Engine {
                 process_id,
                 variables,
                 created_at: self.now,
+                tags,
+                business_id,
             },
         );
         queue.push_back(Step::Activate {
@@ -927,6 +931,8 @@ impl Engine {
             Command::CreateInstance {
                 process_id,
                 variables,
+                tags,
+                business_id,
             } => {
                 let process = self.state.processes.get(&process_id).ok_or_else(|| {
                     EngineError::ProcessNotFound {
@@ -934,7 +940,7 @@ impl Engine {
                     }
                 })?;
                 let start_event = process.definition.start_event.clone();
-                self.start_instance(&mut log, &mut queue, process_id, start_event, variables);
+                self.start_instance(&mut log, &mut queue, process_id, start_event, variables, tags, business_id);
             }
 
             Command::CompleteJob { job_key, variables } => {
@@ -1322,6 +1328,8 @@ impl Engine {
                         process_id,
                         start_element_id,
                         HashMap::new(),
+                        Vec::new(),
+                        None,
                     );
                 }
             }
@@ -1749,6 +1757,8 @@ impl Engine {
                         process_id,
                         start_element_id,
                         variables.clone(),
+                        Vec::new(),
+                        None,
                     );
                 }
             }

@@ -169,6 +169,15 @@ pub struct ProcessInstance {
     /// instance's start date. `0` for instances created before the engine
     /// recorded a start time.
     pub created_at: u64,
+    /// User-defined tags associated with this instance. Empty for instances
+    /// created before tags were supported.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tags: Vec<String>,
+    /// Optional user-defined business identifier for this instance. `None` for
+    /// instances created without a business id or before business ids were
+    /// supported.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub business_id: Option<String>,
     /// Currently-active element instances, keyed by element-instance key. An
     /// element instance is "active" from `ACTIVATED` until `COMPLETED`; a service
     /// task therefore stays here while its job is pending, as does a token parked
@@ -618,6 +627,8 @@ pub fn apply(state: &mut State, event: &Event) {
             process_id,
             variables,
             created_at,
+            tags,
+            business_id,
         } => {
             state.instances.insert(
                 *instance_key,
@@ -626,6 +637,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     process_id: process_id.clone(),
                     state: ProcessInstanceState::Active,
                     created_at: *created_at,
+                    tags: tags.clone(),
+                    business_id: business_id.clone(),
                     active: HashMap::new(),
                     scopes: HashMap::new(),
                     variables: Arc::new(variables.clone()),

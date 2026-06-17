@@ -46,7 +46,9 @@ CREATE TABLE process_instances (
     version                INTEGER NOT NULL,
     state                  INTEGER NOT NULL,
     start_date_ms          INTEGER NOT NULL,
-    has_incident           INTEGER NOT NULL
+    has_incident           INTEGER NOT NULL,
+    tags                   TEXT NOT NULL,
+    business_id            TEXT
 );
 CREATE TABLE jobs (
     key                    INTEGER PRIMARY KEY,
@@ -198,6 +200,8 @@ pub struct ProcessInstanceRow {
     pub state: ProcessInstanceState,
     pub start_date_ms: u64,
     pub has_incident: bool,
+    pub tags: Vec<String>,
+    pub business_id: Option<String>,
 }
 
 pub struct JobRow {
@@ -424,7 +428,7 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, process_definition_id, process_definition_key, \
-                 version, state, start_date_ms, has_incident FROM process_instances",
+                 version, state, start_date_ms, has_incident, tags, business_id FROM process_instances",
             )
             .expect("prepare process_instances");
         let rows = stmt
@@ -437,7 +441,7 @@ impl ReadStore {
         let conn = self.conn.lock().expect("read store poisoned");
         conn.query_row(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
-             version, state, start_date_ms, has_incident FROM process_instances WHERE key = ?1",
+             version, state, start_date_ms, has_incident, tags, business_id FROM process_instances WHERE key = ?1",
             params![key as i64],
             map_instance,
         )
@@ -560,6 +564,12 @@ impl ReadStore {
 }
 
 fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
+    let tags_str: String = r.get(8)?;
+    let tags = if tags_str.is_empty() {
+        Vec::new()
+    } else {
+        tags_str.split(',').map(|s| s.to_string()).collect()
+    };
     Ok(ProcessInstanceRow {
         key: r.get::<_, i64>(0)? as Key,
         process_id: r.get(1)?,
@@ -569,6 +579,8 @@ fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
         state: instance_state_from(r.get(5)?),
         start_date_ms: r.get::<_, i64>(6)? as u64,
         has_incident: r.get::<_, i64>(7)? != 0,
+        tags,
+        business_id: r.get(9)?,
     })
 }
 
@@ -729,6 +741,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             process_id,
             created_at,
             variables,
+            tags,
+            business_id,
         } => {
             // Resolve the deployed identity now (defaults mirror
             // `process_instance_result` when no definition is on record).
@@ -741,14 +755,17 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 .optional()?
                 .map(|(k, v)| (k.to_string(), v))
                 .unwrap_or_else(|| ("-1".to_string(), 0));
+            // Serialize tags as comma-separated string for storage
+            let tags_str = tags.join(",");
             tx.execute(
                 "INSERT INTO process_instances (key, process_id, process_definition_id, \
-                 process_definition_key, version, state, start_date_ms, has_incident) \
-                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0) \
+                 process_definition_key, version, state, start_date_ms, has_incident, tags, business_id) \
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
                  ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, \
                  process_definition_id = excluded.process_definition_id, \
                  process_definition_key = excluded.process_definition_key, \
-                 version = excluded.version, start_date_ms = excluded.start_date_ms",
+                 version = excluded.version, start_date_ms = excluded.start_date_ms, \
+                 tags = excluded.tags, business_id = excluded.business_id",
                 params![
                     *instance_key as i64,
                     process_id,
@@ -756,6 +773,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     version,
                     instance_state_code(ProcessInstanceState::Active),
                     *created_at as i64,
+                    tags_str,
+                    business_id.as_ref(),
                 ],
             )?;
             // Variables the instance was created with (the process-instance row

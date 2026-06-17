@@ -19,10 +19,13 @@ pub enum Command {
     /// own process-definition key and a per-id version.
     DeployResources(Vec<ProcessDefinition>),
     /// Start a new instance of a previously deployed process, seeding it with the
-    /// given variables (used by exclusive-gateway conditions).
+    /// given variables (used by exclusive-gateway conditions), optional tags, and
+    /// an optional business id.
     CreateInstance {
         process_id: String,
         variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
     },
     /// Report that the work for a job has finished, optionally merging variables
     /// into the instance before the token resumes. Completion is by key alone:
@@ -163,11 +166,14 @@ impl UserTaskChangeset {
 }
 
 impl Command {
-    /// Convenience constructor for a `CreateInstance` with no variables.
+    /// Convenience constructor for a `CreateInstance` with no variables, tags, or
+    /// business id.
     pub fn create_instance(process_id: impl Into<String>) -> Self {
         Command::CreateInstance {
             process_id: process_id.into(),
             variables: HashMap::new(),
+            tags: Vec::new(),
+            business_id: None,
         }
     }
 
@@ -179,6 +185,24 @@ impl Command {
         Command::CreateInstance {
             process_id: process_id.into(),
             variables,
+            tags: Vec::new(),
+            business_id: None,
+        }
+    }
+
+    /// Convenience constructor for a `CreateInstance` with variables, tags, and
+    /// optional business id.
+    pub fn create_instance_full(
+        process_id: impl Into<String>,
+        variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+    ) -> Self {
+        Command::CreateInstance {
+            process_id: process_id.into(),
+            variables,
+            tags,
+            business_id,
         }
     }
 

@@ -594,6 +594,23 @@ impl ServerImpl {
         .map(from_object_map)
         .unwrap_or_default();
 
+        // Extract tags and business_id from the request body (both variants have
+        // these fields). Convert Option<Vec<Tag>> to Vec<String> for the engine.
+        let (tags, business_id) = match body {
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                (b.tags.clone(), b.business_id.clone())
+            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                (b.tags.clone(), b.business_id.clone())
+            }
+        };
+        let tags_vec: Vec<String> = tags
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| t.0)
+            .collect();
+        let business_id_str = business_id;
+
         // Only the by-key variant needs the engine (to resolve a deployed key to a
         // process id); capture the lookup inputs the engine thread will need.
         let (by_id, by_key) = match body {
@@ -614,6 +631,10 @@ impl ServerImpl {
         // gauge measures command-processing concurrency rather than how long a
         // client chooses to block for completion.
         type CreateOk = (String, i32, String, u64, bool, Commit);
+        // Clone tags and business_id for use in the response after the engine
+        // command completes (the closure moves them).
+        let tags_for_response = tags_vec.clone();
+        let business_id_for_response = business_id_str.clone();
         let outcome: Result<CreateOk, Box<Resp>> = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self
@@ -649,7 +670,7 @@ impl ServerImpl {
                 };
 
                 match engine.apply_command_at(
-                    Command::create_instance_with(process_id.clone(), variables),
+                    Command::create_instance_full(process_id.clone(), variables, tags_vec, business_id_str),
                     now_millis(),
                 ) {
                     Ok((events, commit)) => {
@@ -734,8 +755,9 @@ impl ServerImpl {
             variables_out,
             models::ProcessDefinitionKey(definition_key),
             models::ProcessInstanceKey(instance_key.to_string()),
-            Vec::new(),
-            nanobpm_gateway_rest::types::Nullable::Null,
+            tags_for_response.into_iter().map(models::Tag).collect(),
+            business_id_for_response.map(nanobpm_gateway_rest::types::Nullable::Present)
+                .unwrap_or(nanobpm_gateway_rest::types::Nullable::Null),
             process_completed,
         );
         Ok(Resp::Status200_TheProcessInstanceWasCreated(result))
@@ -2946,8 +2968,8 @@ fn process_instance_result(
         types::Nullable::Null,
         types::Nullable::Null,
         types::Nullable::Null,
-        Vec::new(),
-        types::Nullable::Null,
+        instance.tags.clone().into_iter().map(models::Tag).collect(),
+        instance.business_id.clone().map(types::Nullable::Present).unwrap_or(types::Nullable::Null),
     )
 }
 

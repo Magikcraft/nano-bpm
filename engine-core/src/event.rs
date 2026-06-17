@@ -30,13 +30,18 @@ pub enum Event {
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
     /// a wall clock); it is the instance's start date. Defaulted to `0` so
-    /// journals written before this field existed still replay.
+    /// journals written before this field existed still replay. `tags` and
+    /// `business_id` are user-supplied metadata, defaulted for older journals.
     ProcessInstanceCreated {
         instance_key: Key,
         process_id: String,
         variables: HashMap<String, Value>,
         #[cfg_attr(feature = "serde", serde(default))]
         created_at: u64,
+        #[cfg_attr(feature = "serde", serde(default))]
+        tags: Vec<String>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        business_id: Option<String>,
     },
 
     /// Variables were merged into a process instance.
