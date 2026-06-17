@@ -15,6 +15,8 @@ mod command_stream;
 mod engine_actor;
 mod journal;
 mod memory;
+mod metrics;
+mod partition;
 mod query;
 mod readstore;
 mod stub_impls;
@@ -35,13 +37,14 @@ use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
     ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, ProcessBuilder,
-    ProcessInstanceState, Value,
+    ProcessInstanceState, Value, MAX_PARTITION_ID,
 };
 
 use crate::backpressure::{
     parse_backpressure_setting, AdaptiveController, Backpressure, BackpressureSetting,
 };
 use crate::engine_actor::EngineHandle;
+use crate::partition::Partitions;
 use crate::journal::{Commit, Journal};
 use crate::readstore::ReadStore;
 
@@ -68,7 +71,7 @@ const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
 /// so engine state survives a restart.
 #[derive(Clone)]
 pub struct ServerImpl {
-    engine: EngineHandle,
+    engine: Partitions,
     /// The read model. All `search*`/`get*` queries are answered from here
     /// (eventually consistent), never from hot engine state.
     store: Arc<ReadStore>,
@@ -139,13 +142,16 @@ impl Drop for ProcessingGuard<'_> {
 }
 
 impl ServerImpl {
-    /// Builds a server over `journal` and its read `store`, seeding the demo
-    /// process only when the journal is fresh (an existing log already carries
-    /// its deployment, and re-deploying would mint a spurious second version on
-    /// every restart). The `journal`'s exporter must already be wired so the
-    /// seed deployment is projected into the store.
-    pub fn new(mut journal: Journal, store: Arc<ReadStore>) -> Self {
-        if journal.is_fresh() {
+    /// Builds a server over `journals` (one single-writer engine actor per
+    /// partition; `journals[i]` owns partition id `i`) and the shared read
+    /// `store`. Seeds the demo process on the deployment partition only when its
+    /// journal is fresh, then replicates every deployed definition to the other
+    /// partitions so any of them can instantiate it. Each journal's exporter must
+    /// already be wired to the shared read store so the seed deployment is
+    /// projected.
+    pub fn new(mut journals: Vec<Journal>, store: Arc<ReadStore>) -> Self {
+        assert!(!journals.is_empty(), "at least one partition is required");
+        if journals[0].is_fresh() {
             // Pre-deploy a demo process so `createProcessInstance` (by id "demo")
             // has something to start. A real build would deploy from BPMN XML.
             let demo = ProcessBuilder::new("demo")
@@ -158,9 +164,21 @@ impl ServerImpl {
                 .expect("valid demo process");
             // Seed durability is non-critical: a fresh journal re-seeds on every
             // start, so we don't await the commit here.
-            let _ = journal
+            let _ = journals[0]
                 .apply_command(Command::DeployProcess(demo))
                 .expect("deploy demo process");
+        }
+        // Replicate the deployment partition's definitions to every other
+        // partition (in-memory, not journaled — re-derived here on each restart
+        // from partition 0's durable log). The deployment partition keeps the
+        // sole copy of each message-start / timer-start subscription.
+        if journals.len() > 1 {
+            let replication = deployment_replication_events(&journals[0]);
+            if !replication.is_empty() {
+                for journal in journals.iter_mut().skip(1) {
+                    journal.install_deployment(&replication);
+                }
+            }
         }
         let inflight_seed = store.active_instance_count();
         let inflight = Arc::new(AtomicUsize::new(inflight_seed));
@@ -173,7 +191,7 @@ impl ServerImpl {
         // owns the shared limit atomic; the server keeps the read side. The
         // controller's "is the limit being used" signal reads the processing
         // gauge (the gated quantity), not the backlog.
-        let (backpressure, controller) = match backpressure_setting_from_env() {
+        let (backpressure, mut controller) = match backpressure_setting_from_env() {
             BackpressureSetting::Disabled => (Backpressure::Disabled, None),
             BackpressureSetting::Fixed(n) => (Backpressure::Fixed(n), None),
             BackpressureSetting::Adaptive => {
@@ -187,6 +205,8 @@ impl ServerImpl {
         // one durability story). Variable spill sheds the variables of a large
         // *active* (job-parked) backlog; cold spill sheds whole *dormant*
         // instances of a large *parked* backlog. Both off unless configured.
+        // Keys are globally unique across partitions, so a single store serves
+        // every partition without collision.
         let var_cfg = spill_from_env();
         let cold_cfg = cold_spill_from_env();
         if var_cfg.is_some() || cold_cfg.is_some() {
@@ -202,13 +222,17 @@ impl ServerImpl {
                 Ok(store) => {
                     let store = Arc::new(store);
                     if let Some((_, budget)) = var_cfg {
-                        journal.set_spill(Arc::clone(&store), budget);
+                        for journal in journals.iter_mut() {
+                            journal.set_spill(Arc::clone(&store), budget);
+                        }
                         tracing::info!(
                             "variable spill: on, hot budget {budget} instance(s){location}"
                         );
                     }
                     if let Some((high, low)) = cold_cfg {
-                        journal.set_cold_spill(Arc::clone(&store), high, low);
+                        for journal in journals.iter_mut() {
+                            journal.set_cold_spill(Arc::clone(&store), high, low);
+                        }
                         tracing::info!(
                             "cold spill: on, high-water {:.0} MiB / low-water {:.0} MiB{location}",
                             high as f64 / (1024.0 * 1024.0),
@@ -220,8 +244,25 @@ impl ServerImpl {
             }
         }
 
+        // Spawn one engine actor per partition. The adaptive backpressure
+        // controller (when present) is driven by the deployment partition's
+        // command latency — a representative single sample of engine load that
+        // sizes the create-admission watermark applied across all partitions.
+        let partition_count = journals.len();
+        let handles: Vec<EngineHandle> = journals
+            .into_iter()
+            .enumerate()
+            .map(|(i, journal)| {
+                let ctrl = if i == 0 { controller.take() } else { None };
+                EngineHandle::spawn(journal, ctrl)
+            })
+            .collect();
+        if partition_count > 1 {
+            tracing::info!("partitions: {partition_count} (keys embed partition id)");
+        }
+
         Self {
-            engine: EngineHandle::spawn(journal, controller),
+            engine: Partitions::new(handles),
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
@@ -237,23 +278,51 @@ impl ServerImpl {
     }
 }
 
+/// Synthesises the `ProcessDeployed` events needed to replicate the deployment
+/// partition's process definitions to the other partitions. Reads the deployment
+/// partition's engine state (its definitions survive its own journal replay) and
+/// re-emits one `ProcessDeployed` per definition under the same shared
+/// `processDefinitionKey`. `install_deployment` applies only these events (never
+/// arming a second copy of a start subscription/timer).
+fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
+    deploy_journal
+        .engine()
+        .state()
+        .processes
+        .values()
+        .map(|deployed| Event::ProcessDeployed {
+            // The deployment key is not used by the applier (definitions are
+            // keyed by processDefinitionKey); 0 is a harmless placeholder.
+            deployment_key: 0,
+            process_definition_key: deployed.key,
+            version: deployed.version,
+            process: deployed.definition.clone(),
+        })
+        .collect()
+}
+
 impl Default for ServerImpl {
     fn default() -> Self {
         let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        build_server(Journal::in_memory(), store)
+        build_server(vec![Journal::in_memory()], store)
     }
 }
 
-/// Wires the read-model exporter onto `journal`, builds the [`ServerImpl`] (which
-/// seeds the demo process when the journal is fresh — that deployment is then
-/// forwarded to the exporter), and spawns the background exporter thread. The
-/// exporter must be set before `ServerImpl::new` so the seed deployment is
-/// projected; the thread is spawned after so it can hold the server's journal
-/// handle for hot-state eviction.
-fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
+/// Wires one shared read-model exporter across every partition's `journals`,
+/// builds the [`ServerImpl`] (which seeds the demo process on partition 0 when
+/// its journal is fresh — that deployment is then forwarded to the exporter),
+/// and spawns the background exporter thread. Every journal sends into the same
+/// channel, so the single read model aggregates all partitions (keys are
+/// globally unique). The exporter must be set before `ServerImpl::new` so the
+/// seed deployment is projected; the thread is spawned after so it can route
+/// hot-state eviction back to the owning partition.
+fn build_server(mut journals: Vec<Journal>, store: Arc<ReadStore>) -> ServerImpl {
     let (tx, rx) = mpsc::channel::<Arc<Vec<Event>>>();
-    journal.set_exporter(tx);
-    let server = ServerImpl::new(journal, store.clone());
+    for journal in journals.iter_mut() {
+        journal.set_exporter(tx.clone());
+    }
+    drop(tx);
+    let server = ServerImpl::new(journals, store.clone());
     spawn_exporter(
         rx,
         store,
@@ -266,15 +335,16 @@ fn build_server(mut journal: Journal, store: Arc<ReadStore>) -> ServerImpl {
 }
 
 /// Spawns the read-model exporter thread. It drains the channel (batching every
-/// queued command's events), projects the batch into the read store, then evicts
-/// any now-completed instances from hot engine state via the engine actor. The
-/// thread exits when the channel closes (all `ServerImpl` clones and the journal
-/// are dropped). Events arrive as `Arc<Vec<Event>>` shared with the command
-/// thread, so projecting them costs no deep copy of the 50 KB payloads.
+/// queued command's events from every partition), projects the batch into the
+/// shared read store, then evicts any now-completed instances from hot engine
+/// state — routed back to each instance's owning partition by its key. The
+/// thread exits when the channel closes (all `ServerImpl` clones and every
+/// journal are dropped). Events arrive as `Arc<Vec<Event>>` shared with the
+/// command thread, so projecting them costs no deep copy of the 50 KB payloads.
 fn spawn_exporter(
     rx: mpsc::Receiver<Arc<Vec<Event>>>,
     store: Arc<ReadStore>,
-    engine: EngineHandle,
+    engine: Partitions,
     instances_changed: Arc<tokio::sync::Notify>,
     inflight: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
@@ -317,14 +387,33 @@ fn spawn_exporter(
                 // state. notify_waiters() is a no-op when nobody is waiting.
                 instances_changed.notify_waiters();
                 if !completed.is_empty() {
-                    // Reclaim hot state for the whole batch in one pass on the
-                    // engine thread; no per-batch shrink_to_fit (reallocating
-                    // every map needlessly throttles command throughput —
-                    // capacity is reused by new instances). Fire-and-forget: the
-                    // exporter has no reply to wait for.
-                    engine.spawn_job(move |journal| {
-                        journal.evict_instances(&completed);
-                    });
+                    // Reclaim hot state for the whole batch; no per-batch
+                    // shrink_to_fit (reallocating every map needlessly throttles
+                    // command throughput — capacity is reused by new instances).
+                    // Each instance lives on the partition that minted its key, so
+                    // route the eviction there. Fire-and-forget: the exporter has
+                    // no reply to wait for.
+                    if engine.is_single() {
+                        engine.all()[0].spawn_job(move |journal| {
+                            journal.evict_instances(&completed);
+                        });
+                    } else {
+                        let mut by_partition: std::collections::HashMap<usize, Vec<u64>> =
+                            std::collections::HashMap::new();
+                        for key in completed {
+                            by_partition
+                                .entry(nanobpmn_engine_core::partition_of(key) as usize)
+                                .or_default()
+                                .push(key);
+                        }
+                        for (idx, keys) in by_partition {
+                            if let Some(handle) = engine.all().get(idx) {
+                                handle.spawn_job(move |journal| {
+                                    journal.evict_instances(&keys);
+                                });
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -529,6 +618,7 @@ impl ServerImpl {
             let _processing = ProcessingGuard::enter(&self.processing);
             self
             .engine
+            .for_create()
             .with(move |engine| {
                 // The engine starts processes by BPMN process id. A creation-by-key
                 // request is resolved to its process id by looking up the deployed
@@ -749,6 +839,7 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(instance_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
             })
@@ -806,12 +897,16 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
             })
             .await;
         match result {
             Ok((_, commit)) => {
+                // REST API: await fsync before replying (synchronous durability).
+                // Contrast with command_stream::pipeline_job_command, which replies
+                // immediately and awaits fsync in a detached task for throughput.
                 commit.wait().await;
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
@@ -875,6 +970,7 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
             })
@@ -946,6 +1042,7 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(
                     Command::throw_job_error(job_key, body_error_code, error_message),
@@ -1021,6 +1118,7 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
             })
@@ -1085,6 +1183,7 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(incident_key)
             .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
@@ -1149,6 +1248,7 @@ impl ServerImpl {
 
         let result = self
             .engine
+            .by_key(scope_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
             })
@@ -1252,6 +1352,39 @@ impl ServerImpl {
         Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology))
     }
 
+    /// Correlates a message across **all** partitions and returns the combined
+    /// events. A waiting subscription can sit on any partition (instances are
+    /// spread across them), and the message-start subscriptions live on partition
+    /// 0, so the message must reach every partition. Each partition mints its own
+    /// message key and correlates against its own subscriptions; with a single
+    /// partition this is one round-trip, identical to the pre-partitioning path.
+    async fn correlate_message_everywhere(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> Vec<Event> {
+        let mut all_events: Vec<Event> = Vec::new();
+        for handle in self.engine.all() {
+            let name = name.clone();
+            let correlation_key = correlation_key.clone();
+            let variables = variables.clone();
+            let (events, commit) = handle
+                .with(move |engine| {
+                    engine
+                        .apply_command_at(
+                            Command::correlate_message_with(name, correlation_key, variables),
+                            now_millis(),
+                        )
+                        .expect("CorrelateMessage never fails")
+                })
+                .await;
+            commit.wait().await;
+            all_events.extend(events.iter().cloned());
+        }
+        all_events
+    }
+
     /// Publishes a message and correlates it to any matching open subscriptions.
     /// nanobpmn does not buffer messages (no TTL/dedup): the message is minted,
     /// correlated to every matching open subscription, then dropped. Always
@@ -1270,19 +1403,10 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let body_name = body.name.clone();
-        let (events, commit) = self
-            .engine
-            .with(move |engine| {
-                engine
-                    .apply_command_at(
-                        Command::correlate_message_with(body_name, correlation_key, variables),
-                        now_millis(),
-                    )
-                    .expect("CorrelateMessage never fails")
-            })
+        let events = self
+            .correlate_message_everywhere(body_name, correlation_key, variables)
             .await;
         let message_key = message_key_of(&events);
-        commit.wait().await;
 
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
@@ -1312,16 +1436,8 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let body_name = body.name.clone();
-        let (events, commit) = self
-            .engine
-            .with(move |engine| {
-                engine
-                    .apply_command_at(
-                        Command::correlate_message_with(body_name, correlation_key, variables),
-                        now_millis(),
-                    )
-                    .expect("CorrelateMessage never fails")
-            })
+        let events = self
+            .correlate_message_everywhere(body_name, correlation_key, variables)
             .await;
         let message_key = message_key_of(&events);
         // A message correlates either to an existing instance's open subscription
@@ -1333,7 +1449,6 @@ impl ServerImpl {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
-        commit.wait().await;
 
         match correlated_instance {
             Some(instance_key) => {
@@ -1706,6 +1821,7 @@ impl ServerImpl {
         };
         let result = self
             .engine
+            .by_key(user_task_key)
             .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
@@ -1786,6 +1902,7 @@ impl ServerImpl {
         let command = Command::complete_user_task_with(user_task_key, variables);
         let result = self
             .engine
+            .by_key(user_task_key)
             .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
@@ -1890,6 +2007,7 @@ impl ServerImpl {
         let command = Command::unassign_user_task(user_task_key);
         let result = self
             .engine
+            .by_key(user_task_key)
             .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
@@ -1988,6 +2106,7 @@ impl ServerImpl {
         let command = Command::update_user_task(user_task_key, engine_changeset);
         let result = self
             .engine
+            .by_key(user_task_key)
             .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
@@ -2291,6 +2410,7 @@ impl ServerImpl {
 
         let deploy_result: Result<(Arc<Vec<Event>>, Commit), Box<Resp>> = self
             .engine
+            .deploy_partition()
             .with(move |engine| {
                 match engine.apply_command(Command::DeployResources(processes)) {
                     Ok(pair) => Ok(pair),
@@ -2306,6 +2426,10 @@ impl ServerImpl {
             Ok(pair) => pair,
             Err(resp) => return Ok(*resp),
         };
+        // Replicate the new definition(s) to the other partitions so any of them
+        // can instantiate the process (the deployment itself is journaled only on
+        // partition 0; replication is in-memory and re-derived on restart).
+        self.replicate_deployment(&events).await;
 
         let mut deployment_key = String::new();
         let mut deployments = Vec::new();
@@ -2345,6 +2469,23 @@ impl ServerImpl {
         // later createProcessInstance can; nothing to notify here.
         commit.wait().await;
         Ok(Resp::Status200_TheResourcesAreDeployed(result))
+    }
+
+    /// Replicates a deployment's process definitions to every partition other
+    /// than the deployment partition (0), so a `createProcessInstance` routed to
+    /// any partition finds the definition. A no-op for a single partition. Only
+    /// the `ProcessDeployed` events are installed (start subscriptions/timers stay
+    /// owned by partition 0); `install_deployment` filters the rest.
+    async fn replicate_deployment(&self, events: &Arc<Vec<Event>>) {
+        if self.engine.is_single() {
+            return;
+        }
+        for handle in self.engine.all().iter().skip(1) {
+            let events = Arc::clone(events);
+            handle
+                .with(move |journal| journal.install_deployment(&events))
+                .await;
+        }
     }
 
     async fn activate_jobs_impl(
@@ -2417,12 +2558,17 @@ impl ServerImpl {
         }
     }
 
-    /// Activates up to `max_jobs` jobs of `job_type` on the engine thread and maps
-    /// them into the generated REST result type. Activation mutates volatile lease
-    /// state, so it runs on the engine actor even though nothing is journaled. The
-    /// engine thread does only the cheap work — leasing the jobs and resolving each
-    /// one's definition identity — while the 50 KB variable encoding runs here, off
-    /// the single engine thread, in parallel across cores.
+    /// Activates up to `max_jobs` jobs of `job_type` and maps them into the
+    /// generated REST result type. Activation mutates volatile lease state, so it
+    /// runs on the engine actor even though nothing is journaled. The engine
+    /// thread does only the cheap work — leasing the jobs and resolving each
+    /// one's definition identity — while the 50 KB variable encoding runs here,
+    /// off the engine thread, in parallel across cores.
+    ///
+    /// With multiple partitions the request fans out across them in turn,
+    /// accumulating up to `max_jobs` total (jobs of a type can live on any
+    /// partition). A single partition takes exactly one pass — identical to the
+    /// pre-partitioning path.
     async fn try_activate(
         &self,
         job_type: &str,
@@ -2431,39 +2577,46 @@ impl ServerImpl {
         timeout: u64,
         fetch_variable: Option<&[String]>,
     ) -> Vec<models::ActivatedJobResult> {
-        let job_type = job_type.to_string();
-        let worker = worker.to_string();
-        let activated: Vec<ActivatedJobWithIdentity> = self
-            .engine
-            .with(move |engine| {
-                let now = now_millis();
-                engine
-                    .activate_jobs(&job_type, &worker, max_jobs, timeout, now)
-                    .into_iter()
-                    .map(|job| {
-                        let (process_id, version, process_definition_key) = engine
-                            .instance(job.instance_key)
-                            .and_then(|instance| {
-                                engine.state().processes.get(&instance.process_id)
-                            })
-                            .map(|deployed| {
-                                (
-                                    deployed.definition.id.clone(),
-                                    deployed.version,
-                                    deployed.key.to_string(),
-                                )
-                            })
-                            .unwrap_or_else(|| (String::new(), 1, String::new()));
-                        ActivatedJobWithIdentity {
-                            job,
-                            process_id,
-                            version,
-                            process_definition_key,
-                        }
-                    })
-                    .collect()
-            })
-            .await;
+        let mut activated: Vec<ActivatedJobWithIdentity> = Vec::new();
+        for handle in self.engine.all() {
+            if activated.len() >= max_jobs {
+                break;
+            }
+            let remaining = max_jobs - activated.len();
+            let job_type = job_type.to_string();
+            let worker = worker.to_string();
+            let mut part: Vec<ActivatedJobWithIdentity> = handle
+                .with(move |engine| {
+                    let now = now_millis();
+                    engine
+                        .activate_jobs(&job_type, &worker, remaining, timeout, now)
+                        .into_iter()
+                        .map(|job| {
+                            let (process_id, version, process_definition_key) = engine
+                                .instance(job.instance_key)
+                                .and_then(|instance| {
+                                    engine.state().processes.get(&instance.process_id)
+                                })
+                                .map(|deployed| {
+                                    (
+                                        deployed.definition.id.clone(),
+                                        deployed.version,
+                                        deployed.key.to_string(),
+                                    )
+                                })
+                                .unwrap_or_else(|| (String::new(), 1, String::new()));
+                            ActivatedJobWithIdentity {
+                                job,
+                                process_id,
+                                version,
+                                process_definition_key,
+                            }
+                        })
+                        .collect()
+                })
+                .await;
+            activated.append(&mut part);
+        }
 
         activated
             .into_iter()
@@ -2513,6 +2666,7 @@ impl ServerImpl {
         let outcome: Result<(nanobpmn_engine_core::Key, bool, Commit), (u16, String)> = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
+                .for_create()
                 .with(move |engine| {
                     let process_id = match (by_id, by_key) {
                         (Some(id), _) => id,
@@ -2564,52 +2718,66 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
-    /// Stream `CompleteJob`.
+    /// Stream `CompleteJob`: applies the command on the engine actor (establishing
+    /// journal order) and returns the [`Commit`] WITHOUT awaiting durability.
+    ///
+    /// The caller (`command_stream::pipeline_job_command`) awaits the commit in a
+    /// detached task off the connection's read path, so multiple completions from
+    /// many connections can be in flight at once, letting the journal's group-commit
+    /// coalesce their fsyncs into larger batches. This **ack-before-fsync pipelining**
+    /// delivers ~4× higher throughput (measured: 2280 vs 572 writes/s) on fsync-bound
+    /// disks.
+    ///
+    /// Journal arrival order is still correct (frame order) because the engine actor
+    /// round-trip below is awaited inline by the reader loop before returning the
+    /// commit handle. If the server crashes after replying `200` but before the fsync
+    /// (~5ms window), the job re-activates on restart (lock expires), preserving
+    /// at-least-once semantics. See README.md "Stream durability: ack-before-fsync
+    /// pipelining" and `command_stream::pipeline_job_command` for full rationale.
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
         variables: std::collections::HashMap<String, Value>,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Commit, (u16, String)> {
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
             })
             .await;
-        let commit = Self::map_job_outcome(result)?;
-        commit.wait().await;
-        self.signal_jobs_available();
-        Ok(())
+        Self::map_job_outcome(result)
     }
 
-    /// Stream `FailJob`.
+    /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
+    /// [`Self::complete_job_for_stream`].
     pub(crate) async fn fail_job_for_stream(
         &self,
         job_key: u64,
         retries: i32,
         error_message: String,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Commit, (u16, String)> {
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
             })
             .await;
-        let commit = Self::map_job_outcome(result)?;
-        commit.wait().await;
-        self.signal_jobs_available();
-        Ok(())
+        Self::map_job_outcome(result)
     }
 
-    /// Stream `ThrowError`.
+    /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
+    /// [`Self::complete_job_for_stream`].
     pub(crate) async fn throw_error_for_stream(
         &self,
         job_key: u64,
         error_code: String,
         error_message: String,
-    ) -> Result<(), (u16, String)> {
+    ) -> Result<Commit, (u16, String)> {
         let result = self
             .engine
+            .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(
                     Command::throw_job_error(job_key, error_code, error_message),
@@ -2617,10 +2785,7 @@ impl ServerImpl {
                 )
             })
             .await;
-        let commit = Self::map_job_outcome(result)?;
-        commit.wait().await;
-        self.signal_jobs_available();
-        Ok(())
+        Self::map_job_outcome(result)
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
@@ -3178,6 +3343,21 @@ const REST_LOG_BODY_PREVIEW: usize = 4096;
 /// Whether `DEBUG_REST` requests verbose REST request/response logging. Accepts
 /// the usual truthy spellings (`1`, `true`, `yes`, `on`); unset or anything
 /// else leaves it off.
+/// `GET /metrics` — Prometheus text exposition of the durability hot-path
+/// metrics (commit batch size, fsync/commit-wait latency, pipeline depth). Served
+/// unauthenticated alongside the REST API; scrape it while benchmarking to see
+/// how many writes share each fsync.
+async fn metrics_handler() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(metrics::gather()))
+        .expect("metrics response builds")
+}
+
 fn debug_rest_enabled() -> bool {
     std::env::var("DEBUG_REST")
         .map(|v| {
@@ -3249,10 +3429,7 @@ async fn main() {
     let server = match journal_path {
         Some(journal_path) => {
             // Persistent run: the read store is a derived projection of the
-            // journal, so reconcile it against the log before serving. Open the
-            // store, replay any journal events the store has not yet projected
-            // (a full rebuild on a fresh/reset store), then open the journal
-            // (which replays into the engine) and wire the live exporter.
+            // journal(s), so reconcile it against the log before serving.
             let store = Arc::new(
                 ReadStore::open(db_path.as_deref()).unwrap_or_else(|e| {
                     let at = db_path
@@ -3262,35 +3439,75 @@ async fn main() {
                     panic!("failed to open read model{at} (is the file or its directory writable?): {e}")
                 }),
             );
-            let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
-                panic!("failed to read journal {}: {e}", journal_path.display())
-            });
-            let mut pos = store.exported_position();
-            if pos > events.len() {
-                // The store is ahead of the log (truncated/corrupt journal):
-                // rebuild from scratch.
-                store.reset().expect("reset read store");
-                pos = 0;
-            }
-            if pos < events.len() {
-                let refs: Vec<&Event> = events[pos..].iter().collect();
-                store
-                    .export(&refs)
-                    .expect("catch up read model from journal");
-            }
+            let partitions = partition_count_from_env();
+            let (journals, recovered) = if partitions == 1 {
+                // Single partition: warm-start fast by replaying only the events
+                // the store has not yet projected (a full rebuild on a
+                // fresh/reset store). The journal file keeps its historical name.
+                let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                    panic!("failed to read journal {}: {e}", journal_path.display())
+                });
+                let mut pos = store.exported_position();
+                if pos > events.len() {
+                    // The store is ahead of the log (truncated/corrupt journal):
+                    // rebuild from scratch.
+                    store.reset().expect("reset read store");
+                    pos = 0;
+                }
+                if pos < events.len() {
+                    let refs: Vec<&Event> = events[pos..].iter().collect();
+                    store
+                        .export(&refs)
+                        .expect("catch up read model from journal");
+                }
+                let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
+                    panic!("failed to open journal {}: {e}", journal_path.display())
+                });
+                let recovered = !journal.is_fresh();
+                (vec![journal], recovered)
+            } else {
+                // Multi-partition: one journal file per partition. The single
+                // `exported_position` cursor can't track N independent logs, so
+                // rebuild the read model from scratch by replaying every
+                // partition's journal (keys are globally unique, instances are
+                // independent across partitions, so order across files is
+                // irrelevant). Deployments live only in partition 0's log.
+                let paths: Vec<PathBuf> = (0..partitions)
+                    .map(|i| partition_journal_path(&journal_path, i))
+                    .collect();
+                store.reset().expect("reset read store for multi-partition rebuild");
+                for path in &paths {
+                    let events = Journal::read_events(path).unwrap_or_else(|e| {
+                        panic!("failed to read journal {}: {e}", path.display())
+                    });
+                    if !events.is_empty() {
+                        let refs: Vec<&Event> = events.iter().collect();
+                        store
+                            .export(&refs)
+                            .expect("catch up read model from journal");
+                    }
+                }
+                let journals: Vec<Journal> = paths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, path)| {
+                        Journal::open_partition(path, i as u64).unwrap_or_else(|e| {
+                            panic!("failed to open journal {}: {e}", path.display())
+                        })
+                    })
+                    .collect();
+                let recovered = journals.iter().any(|j| !j.is_fresh());
+                (journals, recovered)
+            };
 
-            let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
-                panic!("failed to open journal {}: {e}", journal_path.display())
-            });
-            let recovered = !journal.is_fresh();
-            let server = build_server(journal, store);
+            let server = build_server(journals, store);
 
             // The read model now has every completed instance, so shed them from
-            // hot engine state to bound memory.
-            let evicted = server
-                .engine
-                .with(|journal| journal.evict_completed())
-                .await;
+            // hot engine state to bound memory. Each partition evicts its own.
+            let mut evicted = 0usize;
+            for handle in server.engine.all() {
+                evicted += handle.with(|journal| journal.evict_completed()).await;
+            }
             if evicted > 0 {
                 tracing::info!("evicted {evicted} completed instance(s) from hot state");
             }
@@ -3312,7 +3529,11 @@ async fn main() {
             let store = Arc::new(
                 ReadStore::open(db_path.as_deref()).expect("open in-memory read store"),
             );
-            build_server(Journal::in_memory(), store)
+            let partitions = partition_count_from_env();
+            let journals: Vec<Journal> = (0..partitions)
+                .map(|i| Journal::in_memory_partition(i as u64))
+                .collect();
+            build_server(journals, store)
         }
     };
 
@@ -3333,7 +3554,8 @@ async fn main() {
     let cs_router = command_stream::router(server.clone(), cs_registry);
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
-        .merge(cs_router);
+        .merge(cs_router)
+        .route("/metrics", axum::routing::get(metrics_handler));
 
     if debug_rest_enabled() {
         app = app.layer(axum::middleware::from_fn(log_rest));
@@ -3353,20 +3575,24 @@ async fn main() {
             loop {
                 interval.tick().await;
                 let now = now_millis();
-                let produced = engine
-                    .with(move |journal| {
-                        let (fired, _commit) = journal.trigger_timers(now);
-                        let expired = journal.expire_jobs(now);
-                        // Shed dormant instances to disk if hot RAM is over the
-                        // high-water mark (cheap no-op below it / when unset).
-                        journal.maybe_cold_spill();
-                        // Either a fired timer (may create a job) or a reclaimed
-                        // job lease (frees a job for redelivery) means there is
-                        // pushable work — wake dispatch instead of waiting for its
-                        // own backstop tick.
-                        !fired.is_empty() || !expired.is_empty()
-                    })
-                    .await;
+                // Drive every partition's clock so timers fire and leases expire.
+                let mut produced = false;
+                for handle in engine.all() {
+                    produced |= handle
+                        .with(move |journal| {
+                            let (fired, _commit) = journal.trigger_timers(now);
+                            let expired = journal.expire_jobs(now);
+                            // Shed dormant instances to disk if hot RAM is over the
+                            // high-water mark (cheap no-op below it / when unset).
+                            journal.maybe_cold_spill();
+                            // Either a fired timer (may create a job) or a reclaimed
+                            // job lease (frees a job for redelivery) means there is
+                            // pushable work — wake dispatch instead of waiting for
+                            // its own backstop tick.
+                            !fired.is_empty() || !expired.is_empty()
+                        })
+                        .await;
+                }
                 if produced {
                     jobs_available.notify_waiters();
                     dispatch_wake.notify_one();
@@ -3410,7 +3636,9 @@ async fn main() {
                 // Quiescent and not yet reclaimed since the last burst: compact +
                 // purge, exactly once until activity resumes.
                 let before = memory::resident_bytes();
-                engine.with(|journal| journal.shrink()).await;
+                for handle in engine.all() {
+                    handle.with(|journal| journal.shrink()).await;
+                }
                 let purged_ok = memory::purge();
                 purged = true;
                 if purged_ok {
@@ -3513,6 +3741,40 @@ fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
         }
         _ => (None, None),
     }
+}
+
+/// Number of engine partitions to run, from `NANOBPMN_PARTITIONS`.
+///
+/// Defaults to 1 (single-writer, today's behavior exactly — partition 0 mints
+/// keys `1,2,3…` for zero regression). Values are clamped to `[1, MAX]` where
+/// `MAX = MAX_PARTITION_ID + 1` (partition ids are 0-based, so the highest id
+/// `N-1` must be `<= MAX_PARTITION_ID`). Unset/unparseable => 1.
+fn partition_count_from_env() -> usize {
+    let max = MAX_PARTITION_ID as usize + 1;
+    match std::env::var("NANOBPMN_PARTITIONS") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(n) if n >= 1 => n.min(max),
+            _ => 1,
+        },
+        Err(_) => 1,
+    }
+}
+
+/// Per-partition journal file path. Partition 0 in a multi-partition layout uses
+/// `journal.partition-0.jsonl` (all partitions are symmetric); single-partition
+/// runs keep the historical bare `journal.jsonl` (handled by the caller).
+///
+/// `<dir>/journal.jsonl` => `<dir>/journal.partition-<idx>.jsonl`.
+fn partition_journal_path(base: &Path, idx: usize) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("journal");
+    let ext = base
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("jsonl");
+    base.with_file_name(format!("{stem}.partition-{idx}.{ext}"))
 }
 
 /// Ensures `dir` is usable as a data directory: it must already exist as a

@@ -91,7 +91,8 @@ pub use model::{
 };
 pub use state::{
     DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind, IncidentState, InstanceSnapshot,
-    Job, JobState, Key, MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
-    MessageSubscriptionState, ProcessInstance, ProcessInstanceState, StartTimer, State, Timer,
-    TimerKind, TimerState, UserTask, UserTaskState,
+    Job, JobState, Key, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, MessageStartSubscription,
+    MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, PARTITION_BITS,
+    ProcessInstance, ProcessInstanceState, StartTimer, State, Timer, TimerKind, TimerState,
+    UserTask, UserTaskState, compose_key, local_of, partition_of,
 };
