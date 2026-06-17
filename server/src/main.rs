@@ -904,6 +904,9 @@ impl ServerImpl {
             .await;
         match result {
             Ok((_, commit)) => {
+                // REST API: await fsync before replying (synchronous durability).
+                // Contrast with command_stream::pipeline_job_command, which replies
+                // immediately and awaits fsync in a detached task for throughput.
                 commit.wait().await;
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
@@ -2716,11 +2719,21 @@ impl ServerImpl {
     }
 
     /// Stream `CompleteJob`: applies the command on the engine actor (establishing
-    /// journal order) and returns the [`Commit`] WITHOUT awaiting durability. The
-    /// caller awaits the commit off the connection's read path so multiple
-    /// completions can be in flight at once, letting the journal's group-commit
-    /// coalesce their fsyncs. Journal arrival order is still the frame order
-    /// because the actor round-trip below is awaited inline by the reader loop.
+    /// journal order) and returns the [`Commit`] WITHOUT awaiting durability.
+    ///
+    /// The caller (`command_stream::pipeline_job_command`) awaits the commit in a
+    /// detached task off the connection's read path, so multiple completions from
+    /// many connections can be in flight at once, letting the journal's group-commit
+    /// coalesce their fsyncs into larger batches. This **ack-before-fsync pipelining**
+    /// delivers ~4× higher throughput (measured: 2280 vs 572 writes/s) on fsync-bound
+    /// disks.
+    ///
+    /// Journal arrival order is still correct (frame order) because the engine actor
+    /// round-trip below is awaited inline by the reader loop before returning the
+    /// commit handle. If the server crashes after replying `200` but before the fsync
+    /// (~5ms window), the job re-activates on restart (lock expires), preserving
+    /// at-least-once semantics. See README.md "Stream durability: ack-before-fsync
+    /// pipelining" and `command_stream::pipeline_job_command` for full rationale.
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,

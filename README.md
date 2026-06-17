@@ -1,5 +1,7 @@
 # nanobpmn
 
+**A Rust research engine exploring high-performance BPMN execution and Camunda 8 compatibility.**
+
 A self-contained Rust code-generation project for the Camunda 8 Orchestration
 Cluster REST API. It bundles a copy of the OpenAPI specification and generates a
 Rust REST layer (models + `axum` router + service traits) from it, plus a
@@ -429,6 +431,28 @@ through one stream:
 | Variable | Effect |
 | --- | --- |
 | `NANOBPMN_STREAM_SUBMISSION_WINDOW=<n>` | Per-connection create-submission window (default `256`): how many `createInstance`s a client may have outstanding before it must wait for the server to replenish credits. |
+
+**Stream durability: ack-before-fsync pipelining.** To maximize throughput on the
+command stream, job lifecycle commands (`completeJob` / `failJob` / `throwError`)
+use **pipelined commits**: the server applies the command to the engine (which
+writes to the journal and establishes order), then **replies `200` immediately**
+while fsync completes asynchronously in a detached task (~5ms later). This lets
+multiple connections' completions batch into a single group-commit fsync, measured
+at **4× higher throughput** (2280 vs 572 writes/s) than awaiting fsync inline.
+
+The trade-off: if the server crashes in the ~5ms window after replying but before
+fsync finishes, the completion is lost from disk and the job **re-activates** after
+restart (its lock expires). This **preserves at-least-once semantics** — handlers
+must already be idempotent (standard BPMN worker contract) — and the durability
+window (~5ms) is negligible compared to typical job lock timeouts (30–60s). The
+REST API `/jobs/{key}/completion` endpoint still awaits fsync before replying; only
+the command stream pipelines. Analogous to Kafka `acks=1` or RabbitMQ async
+confirms.
+
+> **Multi-node future:** When nanobpmn adds Raft replication (multi-broker
+> distribution like Zeebe), this would change to await quorum-fsync before acking,
+> trading the 5ms durability window for the ~30ms cross-datacenter Raft round-trip
+> that provides true distributed durability.
 
 See [`docs/command-stream-design.md`](docs/command-stream-design.md) for the full
 design rationale,
