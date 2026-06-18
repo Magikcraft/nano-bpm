@@ -10,6 +10,11 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 mod backpressure;
+// Cluster topology + ownership math (distributed-scaling stage 1). The
+// clustered constructors are wired into startup in the following increment; the
+// types and ownership logic are exercised by unit tests now.
+#[allow(dead_code)]
+mod cluster;
 mod coldspill;
 mod command_stream;
 mod engine_actor;
@@ -443,7 +448,11 @@ fn spawn_exporter(
                                 .push(key);
                         }
                         for (idx, keys) in by_partition {
-                            if let Some(handle) = engine.all().get(idx) {
+                            // Route by GLOBAL partition id: `all()` is the compacted
+                            // slice of owned handles, so it cannot be indexed by id.
+                            // A completed instance is always owned locally (it came
+                            // from this node's read-store export), so this resolves.
+                            if let Some(handle) = engine.local_for_partition(idx as u64) {
                                 handle.spawn_job(move |journal| {
                                     journal.evict_instances(&keys);
                                 });

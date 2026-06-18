@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nanobpmn_engine_core::{Key, partition_of};
 
+use crate::cluster::Topology;
 use crate::engine_actor::EngineHandle;
 
 /// Identifies a partition by its id — the value encoded in the high bits of
@@ -35,47 +36,53 @@ use crate::engine_actor::EngineHandle;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PartitionId(pub u64);
 
-/// Identifies a node in the cluster. Single-node today: every partition is
-/// [`Location::Local`], so a `NodeId` is never constructed until distributed
-/// transport (stage 1) lands.
+/// Identifies a node in the cluster (an index into [`Topology::peers`]). In a
+/// single-node cluster every partition is [`Location::Local`], so no `NodeId` is
+/// ever produced.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // the inner id is read by the stage-1 forwarding layer
 pub struct NodeId(pub u32);
 
 /// Where a partition's leader currently lives, as resolved by
-/// [`PartitionRouter::resolve`]. Stage 0 only ever yields [`Location::Local`].
+/// [`PartitionRouter::resolve`]. A single-node cluster only ever yields
+/// [`Location::Local`].
+#[allow(dead_code)] // Remote's NodeId is read by the stage-1 forwarding layer
 pub enum Location<'a> {
     /// The partition is owned by this node; here is its engine actor.
     Local(&'a EngineHandle),
-    /// The partition is owned by a remote node (distributed mode). Unreachable
-    /// while running as a single process.
-    #[allow(dead_code)]
+    /// The partition is owned by a remote node; forward to it (its base URL is
+    /// [`Topology::peer_addr`]).
     Remote(NodeId),
 }
 
 /// Owner of a partition slot. `Local(i)` indexes into [`PartitionRouter::local`];
-/// `Remote(node)` names the owning node (distributed mode only).
+/// `Remote(node)` names the owning node.
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // `Remote` is constructed once clustered startup is wired
 enum Owner {
     Local(usize),
-    #[allow(dead_code)]
     Remote(NodeId),
 }
 
 /// Maps each [`PartitionId`] to its current [`Location`].
 ///
-/// In a single process this owns every partition's [`EngineHandle`] and every
-/// slot is `Local`. The router is the single resolution point for all command
-/// routing, so distributed mode (stage 1) only has to populate some slots with
-/// `Remote(NodeId)` and teach the remote arm to forward over the network — the
-/// local fast path and the engine core are untouched.
+/// A node owns a subset of the cluster's partitions ([`Topology::local_partitions`])
+/// and holds an [`EngineHandle`] for each; the rest resolve `Remote(NodeId)`. The
+/// router is the single resolution point for all command routing, so the gateway
+/// forwarding layer only has to handle the [`Location::Remote`] arm — the local
+/// fast path and the engine core are untouched. In a single-node cluster every
+/// slot is `Local`, identical to pre-cluster behaviour.
 pub struct PartitionRouter {
-    /// Engine actors for the partitions this node owns. `local[i]` is referenced
-    /// by an `Owner::Local(i)` slot.
+    /// Engine actors for the partitions this node owns, in ascending partition-id
+    /// order. `local[i]` is referenced by an `Owner::Local(i)` slot.
     local: Vec<EngineHandle>,
-    /// One entry per partition id, in id order: who owns partition `id` is
-    /// `owners[id]`. Today `owners[i] == Owner::Local(i)` for every partition.
+    /// One entry per partition id (`owners[p]` owns partition `p`): `Local(i)`
+    /// when this node owns it, `Remote(node)` otherwise.
     owners: Vec<Owner>,
+    /// The cluster topology this router was built from (node ids → addresses,
+    /// total partition count, ownership map).
+    #[allow(dead_code)] // read via topology() once clustered startup is wired
+    topology: Topology,
 }
 
 impl PartitionRouter {
@@ -84,9 +91,41 @@ impl PartitionRouter {
     fn single_node(handles: Vec<EngineHandle>) -> Self {
         assert!(!handles.is_empty(), "at least one partition is required");
         let owners = (0..handles.len()).map(Owner::Local).collect();
+        let topology = Topology::single(handles.len() as u64);
         Self {
             local: handles,
             owners,
+            topology,
+        }
+    }
+
+    /// Builds a router from a cluster [`Topology`]. `local_handles` are the engine
+    /// actors for this node's owned partitions, in the same ascending order as
+    /// [`Topology::local_partitions`]; every other partition resolves to the
+    /// `Remote` node that owns it. A single-node topology is equivalent to
+    /// [`single_node`](Self::single_node).
+    #[allow(dead_code)] // called by clustered startup in the next increment
+    fn from_topology(topology: Topology, local_handles: Vec<EngineHandle>) -> Self {
+        let owned = topology.local_partitions();
+        assert_eq!(
+            owned.len(),
+            local_handles.len(),
+            "expected one engine handle per owned partition ({} owned, {} handles)",
+            owned.len(),
+            local_handles.len(),
+        );
+        // Map each owned partition id to its index in `local_handles`.
+        let mut owners: Vec<Owner> = (0..topology.num_partitions)
+            .map(|p| Owner::Remote(NodeId(topology.owner_of(p))))
+            .collect();
+        for (i, &p) in owned.iter().enumerate() {
+            owners[p as usize] = Owner::Local(i);
+        }
+        assert!(!owners.is_empty(), "at least one partition is required");
+        Self {
+            local: local_handles,
+            owners,
+            topology,
         }
     }
 
@@ -116,7 +155,7 @@ impl PartitionRouter {
         match self.resolve(p) {
             Location::Local(h) => h,
             Location::Remote(_) => {
-                debug_assert!(false, "remote partition in single-process mode");
+                debug_assert!(false, "local_for called on a remote partition; callers must check resolve()/locate() and forward Remote");
                 &self.local[0]
             }
         }
@@ -127,6 +166,12 @@ impl PartitionRouter {
     /// timer ticks, eviction, idle compaction.
     fn local_handles(&self) -> &[EngineHandle] {
         &self.local
+    }
+
+    /// The cluster topology backing this router.
+    #[allow(dead_code)] // surfaced via Partitions::topology() in the next increment
+    fn topology(&self) -> &Topology {
+        &self.topology
     }
 }
 
@@ -151,13 +196,44 @@ pub struct Partitions {
 }
 
 impl Partitions {
-    /// Wraps one engine actor per partition. `handles[i]` owns partition id `i`.
-    /// Must be non-empty.
+    /// Wraps one engine actor per partition for a single-node cluster.
+    /// `handles[i]` owns partition id `i`. Must be non-empty.
     pub fn new(handles: Vec<EngineHandle>) -> Self {
         Self {
             router: Arc::new(PartitionRouter::single_node(handles)),
             next_create: Arc::new(AtomicUsize::new(0)),
             next_activate: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Builds a router for a clustered node from its [`Topology`]. `local_handles`
+    /// are the engine actors for this node's owned partitions, in ascending
+    /// partition-id order (matching [`Topology::local_partitions`]); every other
+    /// partition resolves to the remote node that owns it.
+    #[allow(dead_code)] // called by clustered startup in the next increment
+    pub fn with_topology(topology: Topology, local_handles: Vec<EngineHandle>) -> Self {
+        Self {
+            router: Arc::new(PartitionRouter::from_topology(topology, local_handles)),
+            next_create: Arc::new(AtomicUsize::new(0)),
+            next_activate: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// The cluster topology (node addresses, ownership map, partition count).
+    #[allow(dead_code)] // consumed by the stage-1 forwarding layer
+    pub fn topology(&self) -> &Topology {
+        self.router.topology()
+    }
+
+    /// The local engine actor that owns global partition id `p`, or `None` when
+    /// `p` is owned by a remote node (or out of range). Use this to route an
+    /// operation addressed by *global partition id* (e.g. evicting a completed
+    /// instance by its key's partition) — unlike indexing [`all`](Self::all),
+    /// which is the compacted slice of owned handles, not indexed by global id.
+    pub fn local_for_partition(&self, p: u64) -> Option<&EngineHandle> {
+        match self.router.resolve(PartitionId(p)) {
+            Location::Local(h) => Some(h),
+            Location::Remote(_) => None,
         }
     }
 
@@ -294,5 +370,45 @@ mod tests {
         assert!(parts.is_single());
         assert_eq!(parts.len(), 1);
         assert_eq!(parts.activate_start(), 0);
+    }
+
+    #[test]
+    fn clustered_router_resolves_owned_local_and_others_remote() {
+        // Node 0 of a 2-node, 4-partition cluster owns partitions 0 and 2; it
+        // holds engine handles only for those. Partitions 1 and 3 must resolve
+        // Remote(node 1); 0 and 2 must resolve Local.
+        let topology = Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into(), "http://n1".into()],
+            num_partitions: 4,
+        };
+        let owned = topology.local_partitions();
+        assert_eq!(owned, vec![0, 2]);
+        let handles: Vec<EngineHandle> = owned
+            .iter()
+            .map(|p| EngineHandle::spawn(Journal::in_memory_partition(*p), None))
+            .collect();
+        let parts = Partitions::with_topology(topology, handles);
+
+        assert_eq!(parts.len(), 4);
+        assert!(!parts.is_single());
+        // local() / all() only holds the owned partitions.
+        assert_eq!(parts.all().len(), 2);
+
+        for p in [0u64, 2] {
+            match parts.router.resolve(PartitionId(p)) {
+                Location::Local(_) => {}
+                Location::Remote(_) => panic!("partition {p} should be Local on node 0"),
+            }
+        }
+        for p in [1u64, 3] {
+            match parts.router.resolve(PartitionId(p)) {
+                Location::Remote(NodeId(1)) => {}
+                Location::Remote(NodeId(other)) => panic!("partition {p} owner should be node 1, got {other}"),
+                Location::Local(_) => panic!("partition {p} should be Remote on node 0"),
+            }
+        }
+        // by_key of an owned partition resolves locally; both 0 and 2 present.
+        assert!(std::ptr::eq(parts.by_key(compose_key(2, 1)), &parts.all()[1]));
     }
 }
