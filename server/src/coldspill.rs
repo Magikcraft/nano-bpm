@@ -224,6 +224,8 @@ mod tests {
             process_id: "p".into(),
             state: ProcessInstanceState::Active,
             created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
             active: HashMap::new(),
             scopes: HashMap::new(),
             variables: Arc::new(HashMap::new()),

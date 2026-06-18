@@ -1123,13 +1123,13 @@ impl Engine {
             } => {
                 let deadline = now.saturating_add(timeout);
                 // Deterministic selection: walk the per-type activatable index
-                // (keys ascending) and take the first `max_jobs` that are truly
-                // activatable now. The index holds Created and Activated jobs of
-                // this type; an Activated job only qualifies once its lock has
-                // expired (`job_activatable`). Iterating the index instead of
-                // scanning every job keeps a worker poll ~O(max_jobs) even with a
-                // large pending-job backlog. Stale keys (none expected) are
-                // skipped defensively.
+                // (keys ascending) and take the first `max_jobs`. The index holds
+                // only `Created` jobs (an `Activated` job is removed when it locks
+                // and re-added by `JobLockExpired` when its lock expires), so the
+                // walk is O(`max_jobs`) even with a large in-flight backlog rather
+                // than rescanning and skipping every locked job on each poll. The
+                // `job_activatable` check is a defensive guard against any stale
+                // key (none expected).
                 let keys: Vec<Key> = match self.state.activatable_jobs.get(&job_type) {
                     Some(set) => set
                         .iter()
@@ -4384,6 +4384,8 @@ mod tests {
             .apply_command(Command::CreateInstance {
                 process_id: "approval".to_string(),
                 variables: vars,
+                tags: Vec::new(),
+                business_id: None,
             })
             .unwrap();
         let user_task_key = created
@@ -5610,7 +5612,9 @@ mod tests {
             .activate_jobs("payment", "B", 10, 1_000, 500)
             .is_empty());
 
-        // and once the lock has expired the job is activatable again
+        // and once the lock has expired and the periodic expiry tick reclaims it,
+        // the job is activatable again
+        engine.expire_jobs(1_500);
         let reactivated = engine.activate_jobs("payment", "B", 10, 1_000, 1_500);
         assert_eq!(reactivated.len(), 1);
         assert_eq!(reactivated[0].worker, "B");
@@ -5630,6 +5634,8 @@ mod tests {
         let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
         let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+        // A's lock expires; the periodic expiry tick returns the job to the pool.
+        engine.expire_jobs(1_500);
         let reactivated = engine.activate_jobs("payment", "B", 10, 1_000, 1_500);
         assert_eq!(reactivated[0].key, job_key);
 
@@ -6095,10 +6101,7 @@ mod tests {
         let mut expected: HashMap<String, BTreeSet<Key>> = HashMap::new();
         let mut expected_activated: HashSet<Key> = HashSet::new();
         for job in engine.state().jobs.values() {
-            if matches!(
-                job.state,
-                state::JobState::Created | state::JobState::Activated
-            ) {
+            if job.state == state::JobState::Created {
                 expected.entry(job.job_type.clone()).or_default().insert(job.key);
             }
             if job.state == state::JobState::Activated {
@@ -6151,14 +6154,16 @@ mod tests {
         assert_eq!(engine.state().activatable_jobs["payment"].len(), 3);
         assert_job_index_consistent(&engine);
 
-        // Activating keeps the job indexed (it may still re-activate after its
-        // lock expires); the index iterates by key ascending.
+        // Activating removes the job from the activatable index (it is now
+        // locked); a lock that expires re-adds it via `JobLockExpired`. The index
+        // iterates by key ascending and holds only `Created` jobs.
         let first = engine.activate_jobs("payment", "A", 1, 1_000, 0);
         assert_eq!(first.len(), 1);
-        assert_eq!(engine.state().activatable_jobs["payment"].len(), 3);
+        assert_eq!(engine.state().activatable_jobs["payment"].len(), 2);
         assert_job_index_consistent(&engine);
 
-        // Completing the activated job removes it from the index.
+        // Completing the activated job leaves the index unchanged (it was already
+        // de-indexed at activation).
         engine
             .apply_command(Command::complete_job(first[0].key))
             .unwrap();

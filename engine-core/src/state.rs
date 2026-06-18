@@ -572,18 +572,26 @@ impl State {
 }
 
 /// Re-syncs the index membership of one job to match its current state.
-/// Idempotent: a `Created`/`Activated` job is in the activatable index, an
-/// `Activated` job is additionally in the activated index, and anything else
-/// (or a missing job) is removed from both. Call after any arm that changes a
-/// job's state. Keeping membership a pure function of the job's current state
-/// means the indices can never drift from `jobs`.
+/// Idempotent: a `Created` job is in the activatable index, an `Activated` job
+/// is in the activated index, and anything else (or a missing job) is removed
+/// from both. Call after any arm that changes a job's state. Keeping membership
+/// a pure function of the job's current state means the indices can never drift
+/// from `jobs`.
+///
+/// `Activated` jobs are deliberately *not* kept in the activatable index: a job
+/// whose lock expires is returned to `Created` by [`Event::JobLockExpired`]
+/// (driven by the host's periodic tick), which re-adds it here. Excluding locked
+/// jobs keeps `activate_jobs`'s walk O(`max_jobs`) instead of O(in-flight
+/// backlog) — without it, a large pool of locked jobs (lower keys) is rescanned
+/// and skipped on every poll, which degrades into a throughput death spiral once
+/// a backlog builds.
 pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     let Some(job) = state.jobs.get(&job_key) else {
         return;
     };
     let job_type = job.job_type.clone();
     let job_state = job.state;
-    if matches!(job_state, JobState::Created | JobState::Activated) {
+    if job_state == JobState::Created {
         state
             .activatable_jobs
             .entry(job_type)

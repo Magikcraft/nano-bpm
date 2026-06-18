@@ -182,6 +182,8 @@ mod tests {
                 process_id: "order".to_string(),
                 state: ProcessInstanceState::Active,
                 created_at: 1,
+                tags: Vec::new(),
+                business_id: None,
                 active: HashMap::new(),
                 scopes: HashMap::new(),
                 variables: Arc::new(vars("payload")),
