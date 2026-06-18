@@ -222,6 +222,29 @@ impl PeerLink {
         .await
     }
 
+    /// Asks the peer to activate up to `max_jobs` of `job_type` on its OWN
+    /// partitions for `worker` (job-stream aggregation). The peer leases the jobs
+    /// under `timeout` and replies a `CommandResult` whose body is the JSON array
+    /// of `ActivatedJobResult`.
+    pub async fn activate_jobs(
+        &self,
+        job_type: String,
+        worker: String,
+        max_jobs: i64,
+        timeout: u64,
+        fetch_variable: Option<Vec<String>>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::ActivateJobs {
+            corr,
+            job_type,
+            worker,
+            max_jobs,
+            timeout: Some(timeout),
+            fetch_variable,
+        })
+        .await
+    }
+
     /// Forwards a client deploy to this peer (the deployment-partition owner),
     /// which processes it centrally and broadcasts it. Used when a gateway that
     /// does not own partition 0 receives a deploy.

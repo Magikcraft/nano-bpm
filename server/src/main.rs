@@ -1854,8 +1854,16 @@ impl ServerImpl {
     /// Returns the id of the peer owning `key`'s partition, or `None` when this
     /// node owns it. The single branch every by-key REST handler consults before
     /// touching the local engine.
-    fn remote_owner_of(&self, key: u64) -> Option<u32> {
+    pub(crate) fn remote_owner_of(&self, key: u64) -> Option<u32> {
         self.engine.remote_owner(key)
+    }
+
+    /// Remote node ids this gateway forwards to (every peer that owns at least one
+    /// partition this node does not). Empty on a single-node cluster, so the
+    /// dispatcher's job-aggregation fan-out is a no-op and the hot path is
+    /// byte-identical to the pre-cluster build.
+    pub(crate) fn peer_nodes(&self) -> Vec<u32> {
+        self.engine.peer_nodes()
     }
 
     /// Acquires the uplink to peer `node`, mapping a connect failure to a 502.
@@ -1981,6 +1989,100 @@ impl ServerImpl {
                 502,
                 e.to_string(),
             )),
+        }
+    }
+
+    /// Stream-path forward of a `completeJob` to the peer that owns the job's
+    /// partition. Unlike [`forward_complete_job`] (which builds a typed REST
+    /// response), this relays the peer's raw `(status, body)` so the command-stream
+    /// handler can mirror it straight into a `CommandResult`. Used when a worker
+    /// attached to this gateway completes a job that a peer owns (job aggregation).
+    pub(crate) async fn forward_complete_job_stream(
+        &self,
+        node: u32,
+        job_key: u64,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> (u16, Option<serde_json::Value>) {
+        match self.peer_link(node).await {
+            Ok(link) => match link.complete_job(job_key.to_string(), variables).await {
+                Ok(r) => (r.status, r.body),
+                Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
+            },
+            Err((s, m)) => (s, Some(serde_json::Value::String(m))),
+        }
+    }
+
+    /// Stream-path forward of a `failJob` to the peer owning the job. See
+    /// [`forward_complete_job_stream`].
+    pub(crate) async fn forward_fail_job_stream(
+        &self,
+        node: u32,
+        job_key: u64,
+        retries: i32,
+        error_message: String,
+    ) -> (u16, Option<serde_json::Value>) {
+        match self.peer_link(node).await {
+            Ok(link) => match link.fail_job(job_key.to_string(), retries, error_message).await {
+                Ok(r) => (r.status, r.body),
+                Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
+            },
+            Err((s, m)) => (s, Some(serde_json::Value::String(m))),
+        }
+    }
+
+    /// Stream-path forward of a `throwError` to the peer owning the job. See
+    /// [`forward_complete_job_stream`].
+    pub(crate) async fn forward_throw_error_stream(
+        &self,
+        node: u32,
+        job_key: u64,
+        error_code: String,
+        error_message: String,
+    ) -> (u16, Option<serde_json::Value>) {
+        match self.peer_link(node).await {
+            Ok(link) => match link.throw_error(job_key.to_string(), error_code, error_message).await {
+                Ok(r) => (r.status, r.body),
+                Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
+            },
+            Err((s, m)) => (s, Some(serde_json::Value::String(m))),
+        }
+    }
+
+    /// Stream-path activation pull from a peer: asks `node` to activate up to
+    /// `max_jobs` of `job_type` on *its own* partitions for `worker`, returning the
+    /// projected jobs. The peer leases them under `timeout`, so at-least-once is
+    /// preserved by the owner's lock (if this gateway dies before the worker
+    /// completes, the lease expires and the job re-activates on the owner). Empty on
+    /// any error — the dispatcher simply moves on. Drives job aggregation: a worker
+    /// attached to one gateway draws jobs from every node's partitions.
+    pub(crate) async fn activate_from_peer(
+        &self,
+        node: u32,
+        job_type: &str,
+        worker: &str,
+        max_jobs: usize,
+        timeout: u64,
+        fetch_variable: Option<&[String]>,
+    ) -> Vec<models::ActivatedJobResult> {
+        let link = match self.peer_link(node).await {
+            Ok(l) => l,
+            Err(_) => return Vec::new(),
+        };
+        let res = link
+            .activate_jobs(
+                job_type.to_string(),
+                worker.to_string(),
+                max_jobs as i64,
+                timeout,
+                fetch_variable.map(|f| f.to_vec()),
+            )
+            .await;
+        match res {
+            Ok(r) if is_ok_status(r.status) => r
+                .body
+                .and_then(|b| serde_json::from_value::<Vec<models::ActivatedJobResult>>(b).ok())
+                .unwrap_or_default(),
+            _ => Vec::new(),
         }
     }
 
@@ -5500,6 +5602,79 @@ mod clustered_startup_tests {
             p == 1 || p == 3,
             "the forwarded instance must live on a node-1-owned partition (1 or 3), got {p}"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_pulls_and_completes_a_peer_owned_job() {
+        // Job aggregation: a worker attached to one gateway is fed jobs from a
+        // peer's partitions, and its completion is routed back to that peer.
+        //
+        // node 0 owns partitions 0 & 2, seeds the demo, and parks a `demo-work`
+        // job on one of its partitions. node 1 (a different gateway) pulls that
+        // job over the command stream (activate_from_peer) and completes it via
+        // the stream-completion forward.
+        let node0 = clustered_node(0);
+        let (_instance, _) = node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let node0_url = serve_node(&node0).await;
+
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        // node 1 owns no demo job locally; it must pull from node 0.
+        let local = node1.activate_for_stream("demo-work", "w", 10, 60_000, None).await;
+        assert!(local.is_empty(), "node 1 owns no demo-work job of its own");
+
+        let pulled = node1
+            .activate_from_peer(0, "demo-work", "w", 10, 60_000, None)
+            .await;
+        assert_eq!(pulled.len(), 1, "node 1 pulls the peer's parked job");
+        let job_key: u64 = pulled[0].job_key.0.parse().expect("numeric job key");
+        let p = nanobpmn_engine_core::partition_of(job_key);
+        assert!(p == 0 || p == 2, "the pulled job lives on a node-0 partition, got {p}");
+
+        // The owner owns the job's partition, so the completion must forward.
+        let owner = node1
+            .remote_owner_of(job_key)
+            .expect("the job's partition is owned by node 0");
+        assert_eq!(owner, 0);
+        let (status, _) = node1.forward_complete_job_stream(owner, job_key, None).await;
+        assert!(is_ok_status(status), "forwarded completion succeeds, got {status}");
+
+        // Re-completing the same job is rejected — proof it mutated node 0's state.
+        let (again, _) = node1.forward_complete_job_stream(owner, job_key, None).await;
+        assert!(!is_ok_status(again), "re-completing must not succeed, got {again}");
+    }
+
+    #[test]
+    fn single_node_has_no_peers_to_aggregate() {
+        // A single-node cluster owns every partition, so job aggregation finds no
+        // peers and the dispatcher's fan-out loop never runs (zero overhead).
+        let solo = ServerImpl::default();
+        assert!(
+            solo.peer_nodes().is_empty(),
+            "a single node must report no remote peers"
+        );
+    }
+
+    #[test]
+    fn clustered_node_reports_its_peers() {
+        // node 0 of a 2-node cluster owns partitions 0 & 2; node 1 owns 1 & 3, so
+        // node 0 reports exactly node 1 as its job-aggregation peer.
+        let node0 = clustered_node(0);
+        assert_eq!(node0.peer_nodes(), vec![1]);
     }
 }
 

@@ -281,7 +281,23 @@ impl Partitions {
         }
     }
 
-    /// The next partition to receive a fresh `createProcessInstance`, chosen
+    /// The set of remote nodes this gateway can forward to: every node that owns
+    /// at least one partition not owned locally, in ascending id order. Empty on a
+    /// single-node cluster (every partition is `Local`), so the dispatcher's
+    /// job-aggregation fan-out becomes a no-op and the hot path stays unchanged.
+    pub fn peer_nodes(&self) -> Vec<u32> {
+        let mut nodes: Vec<u32> = (0..self.router.partition_count() as u64)
+            .filter_map(|p| match self.router.resolve(PartitionId(p)) {
+                Location::Local(_) => None,
+                Location::Remote(NodeId(node)) => Some(node),
+            })
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+
     /// round-robin across the partitions **this node owns**. An instance lives on
     /// the partition that created it for its whole life (its key embeds the
     /// partition). In a single-node cluster the owned set is every partition in

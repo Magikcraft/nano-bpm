@@ -245,6 +245,25 @@ pub enum ClientFrame {
         #[serde(default)]
         variables: Option<Map<String, Value>>,
     },
+    /// **Intra-cluster only.** A gateway asks a peer to activate jobs on the peer's
+    /// own partitions for a worker attached to the gateway (job-stream
+    /// aggregation). The peer leases the jobs under `timeout` and replies a
+    /// `CommandResult` whose body is the JSON array of `ActivatedJobResult`. The
+    /// peer activates locally only (its engine owns just its partitions), so there
+    /// is no fan-out loop. At-least-once is preserved by the peer's lock: if the
+    /// gateway dies before the worker completes, the lease expires and the job
+    /// re-activates on its owner.
+    #[serde(rename_all = "camelCase")]
+    ActivateJobs {
+        corr: u64,
+        job_type: String,
+        worker: String,
+        max_jobs: i64,
+        #[serde(default)]
+        timeout: Option<u64>,
+        #[serde(default)]
+        fetch_variable: Option<Vec<String>>,
+    },
     /// **Intra-cluster only.** A gateway forwards a `createProcessInstance` to a
     /// peer for cluster-wide create placement (the gateway round-robins creates
     /// across every partition; a partition owned by a peer is placed via this
@@ -688,6 +707,7 @@ async fn handle_client_frame(
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
+        ClientFrame::ActivateJobs { .. } => "activate_jobs",
         ClientFrame::ForwardCreate { .. } => "forward_create",
     };
     crate::metrics::record_stream_frame(frame_type);
@@ -792,8 +812,23 @@ async fn handle_client_frame(
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
-            let vars = to_engine_vars(variables);
-            pipeline_job_command(server, conn, corr, server.complete_job_for_stream(key, vars).await);
+            // Cluster: a worker attached here may complete a job a peer owns
+            // (job aggregation). Forward to the owner; local jobs stay on the
+            // pipelined fast path. Single-node always owns every key.
+            if let Some(node) = server.remote_owner_of(key) {
+                let server = server.clone();
+                spawn_forward_stream_reply(conn, corr, async move {
+                    server.forward_complete_job_stream(node, key, variables).await
+                });
+            } else {
+                let vars = to_engine_vars(variables);
+                pipeline_job_command(
+                    server,
+                    conn,
+                    corr,
+                    server.complete_job_for_stream(key, vars).await,
+                );
+            }
         }
         ClientFrame::FailJob {
             corr,
@@ -804,10 +839,21 @@ async fn handle_client_frame(
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
-            let outcome = server
-                .fail_job_for_stream(key, retries.unwrap_or(0), error_message.unwrap_or_default())
-                .await;
-            pipeline_job_command(server, conn, corr, outcome);
+            if let Some(node) = server.remote_owner_of(key) {
+                let server = server.clone();
+                let retries = retries.unwrap_or(0);
+                let error_message = error_message.unwrap_or_default();
+                spawn_forward_stream_reply(conn, corr, async move {
+                    server
+                        .forward_fail_job_stream(node, key, retries, error_message)
+                        .await
+                });
+            } else {
+                let outcome = server
+                    .fail_job_for_stream(key, retries.unwrap_or(0), error_message.unwrap_or_default())
+                    .await;
+                pipeline_job_command(server, conn, corr, outcome);
+            }
         }
         ClientFrame::ThrowError {
             corr,
@@ -818,10 +864,21 @@ async fn handle_client_frame(
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
-            let outcome = server
-                .throw_error_for_stream(key, error_code, error_message.unwrap_or_default())
-                .await;
-            pipeline_job_command(server, conn, corr, outcome);
+            if let Some(node) = server.remote_owner_of(key) {
+                let server = server.clone();
+                let error_code = error_code.clone();
+                let error_message = error_message.clone().unwrap_or_default();
+                spawn_forward_stream_reply(conn, corr, async move {
+                    server
+                        .forward_throw_error_stream(node, key, error_code, error_message)
+                        .await
+                });
+            } else {
+                let outcome = server
+                    .throw_error_for_stream(key, error_code, error_message.unwrap_or_default())
+                    .await;
+                pipeline_job_command(server, conn, corr, outcome);
+            }
         }
         ClientFrame::AwaitInstance {
             corr,
@@ -983,6 +1040,40 @@ async fn handle_client_frame(
                 }),
             };
         }
+        ClientFrame::ActivateJobs {
+            corr,
+            job_type,
+            worker,
+            max_jobs,
+            timeout,
+            fetch_variable,
+        } => {
+            // Peer-side of job aggregation: activate on THIS node's own partitions
+            // for a worker attached to the requesting gateway, and answer with the
+            // projected jobs. Local-only (the engine owns just this node's
+            // partitions) ⇒ no fan-out loop. The lease is held here under `timeout`,
+            // so at-least-once survives the gateway dying mid-flight.
+            let want = max_jobs.max(0) as usize;
+            let jobs = if want == 0 {
+                Vec::new()
+            } else {
+                server
+                    .activate_for_stream(
+                        &job_type,
+                        &worker,
+                        want,
+                        timeout.filter(|&t| t > 0).unwrap_or(DEFAULT_JOB_LOCK_MS),
+                        fetch_variable.as_deref().filter(|names| !names.is_empty()),
+                    )
+                    .await
+            };
+            let body = serde_json::to_value(&jobs).unwrap_or(Value::Null);
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 200,
+                body: Some(body),
+            });
+        }
     }
     
     // Record frame processing time
@@ -1069,6 +1160,22 @@ fn parse_job_key(conn: &Arc<Connection>, corr: u64, raw: &str) -> Option<u64> {
             None
         }
     }
+}
+
+/// Spawns a detached task that drives a forwarded stream job-lifecycle command
+/// (complete / fail / throwError on a peer-owned job) and relays the peer's
+/// `(status, body)` straight back as the connection's `CommandResult`. Detached so
+/// the connection's read loop never blocks on the cross-node round-trip, matching
+/// the off-thread reply of the local [`pipeline_job_command`] path.
+fn spawn_forward_stream_reply<F>(conn: &Arc<Connection>, corr: u64, fut: F)
+where
+    F: std::future::Future<Output = (u16, Option<Value>)> + Send + 'static,
+{
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let (status, body) = fut.await;
+        conn.send(ServerFrame::CommandResult { corr, status, body });
+    });
 }
 
 /// Peer-side handler for a forwarded by-key mutation (cancel / update-retries /
@@ -1297,6 +1404,10 @@ async fn dispatch_to_connection(
     if conn.closed.load(Ordering::Relaxed) {
         return;
     }
+    // Remote nodes to draw jobs from once the local pool is drained (job
+    // aggregation). Empty on a single-node cluster ⇒ the peer-pull loop never
+    // runs and this pass is byte-identical to the pre-cluster dispatcher.
+    let peers = server.peer_nodes();
     for (job_type, sub) in work {
         let credits = sub.credits.load(Ordering::Relaxed);
         if credits <= 0 {
@@ -1315,7 +1426,10 @@ async fn dispatch_to_connection(
         if want == 0 {
             continue;
         }
-        let jobs = server
+        let mut pushed = 0i64;
+
+        // 1. Local partitions first — the hot path, no network hop.
+        let local = server
             .activate_for_stream(
                 &job_type,
                 &sub.worker,
@@ -1324,19 +1438,52 @@ async fn dispatch_to_connection(
                 sub.fetch_variable.as_deref(),
             )
             .await;
-        if jobs.is_empty() {
-            // Pool drained for this type right now; move on to this connection's
-            // other subscriptions rather than abandoning the whole connection.
-            continue;
-        }
-        let mut pushed = 0i64;
-        for job in jobs {
+        for job in local {
             let value = serde_json::to_value(&job).unwrap_or(Value::Null);
             if conn.send(ServerFrame::Job { job: value }) {
                 pushed += 1;
             }
         }
-        sub.credits.fetch_sub(pushed, Ordering::Relaxed);
+
+        // 2. Cluster: pull the shortfall from peers' partitions so a worker
+        //    attached to this gateway is fed by the whole cluster. The peer leases
+        //    each job under `sub.timeout`, preserving at-least-once if this gateway
+        //    dies before the worker completes (the lease expires on the owner).
+        let mut remaining = want.saturating_sub(pushed as usize);
+        if remaining > 0 && !peers.is_empty() {
+            for &node in &peers {
+                if remaining == 0 {
+                    break;
+                }
+                let room_now = conn.tx.capacity() as i64;
+                if room_now <= 0 {
+                    conn.wants_redispatch.store(true, Ordering::Relaxed);
+                    break;
+                }
+                let ask = remaining.min(room_now as usize);
+                let jobs = server
+                    .activate_from_peer(
+                        node,
+                        &job_type,
+                        &sub.worker,
+                        ask,
+                        sub.timeout,
+                        sub.fetch_variable.as_deref(),
+                    )
+                    .await;
+                for job in jobs {
+                    let value = serde_json::to_value(&job).unwrap_or(Value::Null);
+                    if conn.send(ServerFrame::Job { job: value }) {
+                        pushed += 1;
+                        remaining = remaining.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        if pushed > 0 {
+            sub.credits.fetch_sub(pushed, Ordering::Relaxed);
+        }
     }
 }
 
