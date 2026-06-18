@@ -265,6 +265,86 @@ impl PeerLink {
         })
         .await
     }
+
+    /// Forwards a `failJob` to the peer that owns the job's partition.
+    pub async fn fail_job(
+        &self,
+        job_key: String,
+        retries: i32,
+        error_message: String,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::FailJob {
+            corr,
+            job_key,
+            retries: Some(retries),
+            error_message: Some(error_message),
+        })
+        .await
+    }
+
+    /// Forwards a `throwError` to the peer that owns the job's partition.
+    pub async fn throw_error(
+        &self,
+        job_key: String,
+        error_code: String,
+        error_message: String,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::ThrowError {
+            corr,
+            job_key,
+            error_code,
+            error_message: Some(error_message),
+        })
+        .await
+    }
+
+    /// Forwards a `cancelProcessInstance` to the peer that owns the instance.
+    pub async fn cancel_instance(&self, instance_key: String) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::CancelInstance { corr, instance_key })
+            .await
+    }
+
+    /// Forwards a job-retries update to the peer that owns the job's partition.
+    pub async fn update_job_retries(
+        &self,
+        job_key: String,
+        retries: i32,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::UpdateJobRetries {
+            corr,
+            job_key,
+            retries,
+        })
+        .await
+    }
+
+    /// Forwards an incident resolution to the peer that owns the incident.
+    pub async fn resolve_incident(
+        &self,
+        incident_key: String,
+        operation_reference: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::ResolveIncident {
+            corr,
+            incident_key,
+            operation_reference,
+        })
+        .await
+    }
+
+    /// Forwards a by-key variable merge to the peer that owns the scope.
+    pub async fn set_variables(
+        &self,
+        scope_key: String,
+        variables: Option<serde_json::Map<String, Value>>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::SetVariables {
+            corr,
+            scope_key,
+            variables,
+        })
+        .await
+    }
 }
 
 /// Resolves a `CommandResult`/`InstanceCompleted` to its waiting request; other

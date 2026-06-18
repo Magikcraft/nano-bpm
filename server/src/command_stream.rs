@@ -214,6 +214,37 @@ pub enum ClientFrame {
         #[serde(default)]
         variables: Option<Map<String, Value>>,
     },
+    /// **Intra-cluster only.** A gateway forwards a by-key process-instance
+    /// cancellation to the peer that owns the instance's partition. Answered by a
+    /// `CommandResult` (204 on success, 404 unknown instance, 4xx/5xx otherwise).
+    #[serde(rename_all = "camelCase")]
+    CancelInstance { corr: u64, instance_key: String },
+    /// **Intra-cluster only.** A gateway forwards a by-key job-retries update to
+    /// the peer that owns the job's partition. Answered by a `CommandResult`.
+    #[serde(rename_all = "camelCase")]
+    UpdateJobRetries {
+        corr: u64,
+        job_key: String,
+        retries: i32,
+    },
+    /// **Intra-cluster only.** A gateway forwards a by-key incident resolution to
+    /// the peer that owns the incident's partition. Answered by a `CommandResult`.
+    #[serde(rename_all = "camelCase")]
+    ResolveIncident {
+        corr: u64,
+        incident_key: String,
+        #[serde(default)]
+        operation_reference: Option<i64>,
+    },
+    /// **Intra-cluster only.** A gateway forwards a by-key variable merge to the
+    /// peer that owns the scope's partition. Answered by a `CommandResult`.
+    #[serde(rename_all = "camelCase")]
+    SetVariables {
+        corr: u64,
+        scope_key: String,
+        #[serde(default)]
+        variables: Option<Map<String, Value>>,
+    },
 }
 
 /// Server → client frames.
@@ -627,6 +658,10 @@ async fn handle_client_frame(
         ClientFrame::Deploy { .. } => "deploy",
         ClientFrame::InstallDeployment { .. } => "install_deployment",
         ClientFrame::PublishMessage { .. } => "publish_message",
+        ClientFrame::CancelInstance { .. } => "cancel_instance",
+        ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
+        ClientFrame::ResolveIncident { .. } => "resolve_incident",
+        ClientFrame::SetVariables { .. } => "set_variables",
     };
     crate::metrics::record_stream_frame(frame_type);
     
@@ -844,6 +879,43 @@ async fn handle_client_frame(
                 })),
             });
         }
+        ClientFrame::CancelInstance { corr, instance_key } => {
+            forward_by_key_reply(conn, corr, &instance_key, |key| async move {
+                server.cancel_instance_local(key).await
+            })
+            .await;
+        }
+        ClientFrame::UpdateJobRetries {
+            corr,
+            job_key,
+            retries,
+        } => {
+            forward_by_key_reply(conn, corr, &job_key, |key| async move {
+                server.update_job_retries_local(key, retries).await
+            })
+            .await;
+        }
+        ClientFrame::ResolveIncident {
+            corr,
+            incident_key,
+            operation_reference,
+        } => {
+            forward_by_key_reply(conn, corr, &incident_key, |key| async move {
+                server.resolve_incident_local(key, operation_reference).await
+            })
+            .await;
+        }
+        ClientFrame::SetVariables {
+            corr,
+            scope_key,
+            variables,
+        } => {
+            let vars = to_engine_vars(variables);
+            forward_by_key_reply(conn, corr, &scope_key, |key| async move {
+                server.set_variables_local(key, vars).await
+            })
+            .await;
+        }
     }
     
     // Record frame processing time
@@ -930,6 +1002,42 @@ fn parse_job_key(conn: &Arc<Connection>, corr: u64, raw: &str) -> Option<u64> {
             None
         }
     }
+}
+
+/// Peer-side handler for a forwarded by-key mutation (cancel / update-retries /
+/// resolve-incident / set-variables). Parses the key, runs `apply` on this node's
+/// owning partition, awaits durability, and replies a uniform `CommandResult`:
+/// `204` on success, the engine-mapped status on a domain error, `404` on an
+/// unparseable key. The `apply` closure (a `ServerImpl::*_local` method) is
+/// responsible for waking job pollers when its command can re-activate a job.
+async fn forward_by_key_reply<F, Fut>(conn: &Arc<Connection>, corr: u64, raw: &str, apply: F)
+where
+    F: FnOnce(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<(), (u16, String)>>,
+{
+    let key = match raw.parse::<u64>() {
+        Ok(k) => k,
+        Err(_) => {
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 404,
+                body: Some(Value::String(format!("Key '{raw}' is not a valid key."))),
+            });
+            return;
+        }
+    };
+    match apply(key).await {
+        Ok(()) => conn.send(ServerFrame::CommandResult {
+            corr,
+            status: 204,
+            body: None,
+        }),
+        Err((status, message)) => conn.send(ServerFrame::CommandResult {
+            corr,
+            status,
+            body: Some(Value::String(message)),
+        }),
+    };
 }
 
 fn to_engine_vars(variables: Option<Map<String, Value>>) -> HashMap<String, crate::Value> {

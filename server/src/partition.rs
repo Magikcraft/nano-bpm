@@ -260,6 +260,18 @@ impl Partitions {
         self.router.local_for(PartitionId(partition_of(key)))
     }
 
+    /// The id of the remote node owning `key`'s partition, or `None` when this
+    /// node owns it (the local fast path) — the by-key forwarding seam. A
+    /// gateway uses this to decide whether a by-key operation
+    /// (complete/fail/cancel/…) must be forwarded to a peer over the command
+    /// stream. Single-node clusters always return `None`.
+    pub fn remote_owner(&self, key: Key) -> Option<u32> {
+        match self.router.resolve(PartitionId(partition_of(key))) {
+            Location::Local(_) => None,
+            Location::Remote(NodeId(node)) => Some(node),
+        }
+    }
+
     /// The next partition to receive a fresh `createProcessInstance`, chosen
     /// round-robin across the partitions **this node owns**. An instance lives on
     /// the partition that created it for its whole life (its key embeds the

@@ -1016,6 +1016,10 @@ impl ServerImpl {
             }
         };
 
+        if let Some(node) = self.remote_owner_of(instance_key) {
+            return Ok(self.forward_cancel_instance(node, instance_key).await);
+        }
+
         let result = self
             .engine
             .by_key(instance_key)
@@ -1073,6 +1077,19 @@ impl ServerImpl {
                 types::Nullable::Null => None,
             })
             .unwrap_or_default();
+
+        // Cluster: if a peer owns the job's partition, forward over the command
+        // stream and map its answer back (single-node always owns every key).
+        if let Some(node) = self.remote_owner_of(job_key) {
+            let wire = body
+                .as_ref()
+                .and_then(|b| b.variables.as_ref())
+                .and_then(|v| match v {
+                    types::Nullable::Present(map) => wire_variables(Some(map)),
+                    types::Nullable::Null => None,
+                });
+            return Ok(self.forward_complete_job(node, job_key, wire).await);
+        }
 
         let result = self
             .engine
@@ -1149,6 +1166,10 @@ impl ServerImpl {
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
 
+        if let Some(node) = self.remote_owner_of(job_key) {
+            return Ok(self.forward_fail_job(node, job_key, retries, error_message).await);
+        }
+
         let result = self
             .engine
             .by_key(job_key)
@@ -1222,6 +1243,12 @@ impl ServerImpl {
             _ => String::new(),
         };
         let body_error_code = body.error_code.clone();
+
+        if let Some(node) = self.remote_owner_of(job_key) {
+            return Ok(self
+                .forward_throw_error(node, job_key, body_error_code, error_message)
+                .await);
+        }
 
         let result = self
             .engine
@@ -1299,6 +1326,10 @@ impl ServerImpl {
             }
         };
 
+        if let Some(node) = self.remote_owner_of(job_key) {
+            return Ok(self.forward_update_job(node, job_key, retries).await);
+        }
+
         let result = self
             .engine
             .by_key(job_key)
@@ -1359,6 +1390,13 @@ impl ServerImpl {
         };
 
         let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
+
+        if let Some(node) = self.remote_owner_of(incident_key) {
+            return Ok(self
+                .forward_resolve_incident(node, incident_key, operation_reference)
+                .await);
+        }
+
         let command = Command::ResolveIncident {
             incident_key,
             operation_reference,
@@ -1428,6 +1466,12 @@ impl ServerImpl {
         };
 
         let variables = from_object_map(&body.variables);
+
+        if let Some(node) = self.remote_owner_of(scope_key) {
+            return Ok(self
+                .forward_set_variables(node, scope_key, wire_variables(Some(&body.variables)))
+                .await);
+        }
 
         let result = self
             .engine
@@ -1649,6 +1693,401 @@ impl ServerImpl {
             }
         }
         (message_key, instance)
+    }
+
+    // ---- By-key forwarding (stage 1) -------------------------------------
+    //
+    // A client may submit a by-key mutation (complete/fail/throwError a job,
+    // cancel an instance, update retries, resolve an incident, set variables)
+    // to ANY gateway. If the key's partition is owned by a peer, the gateway
+    // forwards the operation to that peer over the command stream; the peer
+    // applies it on its owning partition (durably) and answers. The `*_local`
+    // methods below are the peer-side apply step (also reused by the in-crate
+    // tests); the `forward_*` methods are the gateway-side uplink + response
+    // mapping. The hot, same-node path never calls either: `remote_owner`
+    // returns `None` and the existing in-process handler runs unchanged.
+
+    /// Applies a `cancelProcessInstance` on this node's owning partition,
+    /// awaiting durability. Status mapping mirrors the REST handler.
+    pub(crate) async fn cancel_instance_local(
+        &self,
+        instance_key: u64,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await;
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                self.signal_jobs_available();
+                Ok(())
+            }
+            Err(EngineError::InstanceNotFound { instance_key }) => Err((
+                404,
+                format!("No active process instance with key {instance_key}."),
+            )),
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
+    /// Applies a job-retries update on this node's owning partition.
+    pub(crate) async fn update_job_retries_local(
+        &self,
+        job_key: u64,
+        retries: i32,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .by_key(job_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
+            })
+            .await;
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(())
+            }
+            Err(EngineError::JobNotFound { job_key }) => {
+                Err((404, format!("No job with key {job_key}.")))
+            }
+            Err(EngineError::JobNotActive { job_key }) => Err((
+                409,
+                format!("Job {job_key} is terminal and its retries cannot be updated."),
+            )),
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
+    /// Resolves an incident on this node's owning partition.
+    pub(crate) async fn resolve_incident_local(
+        &self,
+        incident_key: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let command = Command::ResolveIncident {
+            incident_key,
+            operation_reference,
+        };
+        let result = self
+            .engine
+            .by_key(incident_key)
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                self.signal_jobs_available();
+                Ok(())
+            }
+            Err(EngineError::IncidentNotFound { incident_key }) => {
+                Err((404, format!("No incident with key {incident_key}.")))
+            }
+            Err(EngineError::IncidentNotResolvable { reason, .. }) => Err((409, reason)),
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
+    /// Merges variables into a scope on this node's owning partition.
+    pub(crate) async fn set_variables_local(
+        &self,
+        scope_key: u64,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .by_key(scope_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+            })
+            .await;
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(())
+            }
+            Err(EngineError::ScopeNotFound { scope_key }) => Err((
+                400,
+                format!("No process or element instance with key {scope_key}."),
+            )),
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
+    /// Returns the id of the peer owning `key`'s partition, or `None` when this
+    /// node owns it. The single branch every by-key REST handler consults before
+    /// touching the local engine.
+    fn remote_owner_of(&self, key: u64) -> Option<u32> {
+        self.engine.remote_owner(key)
+    }
+
+    /// Acquires the uplink to peer `node`, mapping a connect failure to a 502.
+    async fn peer_link(&self, node: u32) -> Result<crate::peer::PeerLink, (u16, String)> {
+        self.peers
+            .link(node)
+            .await
+            .map_err(|e| (502, format!("peer node {node} unreachable: {e}")))
+    }
+
+    /// Forwards a `completeJob` to the peer owning the job and maps its answer to
+    /// the REST response. Used when the job's partition is owned by another node.
+    async fn forward_complete_job(
+        &self,
+        node: u32,
+        job_key: u64,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> apis::job::CompleteJobResponse {
+        use apis::job::CompleteJobResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.complete_job(job_key.to_string(), variables).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasCompletedSuccessfully,
+            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
+                "Job not found",
+                404,
+                peer_detail(&r),
+            )),
+            Ok(r) if r.status == 409 => {
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job in wrong state",
+                    409,
+                    peer_detail(&r),
+                ))
+            }
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Forwards a `failJob` to the peer owning the job.
+    async fn forward_fail_job(
+        &self,
+        node: u32,
+        job_key: u64,
+        retries: i32,
+        error_message: String,
+    ) -> apis::job::FailJobResponse {
+        use apis::job::FailJobResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.fail_job(job_key.to_string(), retries, error_message).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobIsFailed,
+            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
+                "Job not found",
+                404,
+                peer_detail(&r),
+            )),
+            Ok(r) if r.status == 409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
+                problem("Job in wrong state", 409, peer_detail(&r)),
+            ),
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Forwards a `throwError` to the peer owning the job.
+    async fn forward_throw_error(
+        &self,
+        node: u32,
+        job_key: u64,
+        error_code: String,
+        error_message: String,
+    ) -> apis::job::ThrowJobErrorResponse {
+        use apis::job::ThrowJobErrorResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.throw_error(job_key.to_string(), error_code, error_message).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_AnErrorIsThrownForTheJob,
+            Ok(r) if r.status == 404 => {
+                Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                    "Job not found",
+                    404,
+                    peer_detail(&r),
+                ))
+            }
+            Ok(r) if r.status == 409 => {
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job in wrong state",
+                    409,
+                    peer_detail(&r),
+                ))
+            }
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Forwards a `cancelProcessInstance` to the peer owning the instance.
+    async fn forward_cancel_instance(
+        &self,
+        node: u32,
+        instance_key: u64,
+    ) -> apis::process_instance::CancelProcessInstanceResponse {
+        use apis::process_instance::CancelProcessInstanceResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.cancel_instance(instance_key.to_string()).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheProcessInstanceIsCanceled,
+            Ok(r) if r.status == 404 => Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                "Process instance not found",
+                404,
+                peer_detail(&r),
+            )),
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Forwards a job-retries update to the peer owning the job.
+    async fn forward_update_job(
+        &self,
+        node: u32,
+        job_key: u64,
+        retries: i32,
+    ) -> apis::job::UpdateJobResponse {
+        use apis::job::UpdateJobResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.update_job_retries(job_key.to_string(), retries).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasUpdatedSuccessfully,
+            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
+                "Job not found",
+                404,
+                peer_detail(&r),
+            )),
+            Ok(r) if r.status == 409 => {
+                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                    "Job in wrong state",
+                    409,
+                    peer_detail(&r),
+                ))
+            }
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Forwards an incident resolution to the peer owning the incident.
+    async fn forward_resolve_incident(
+        &self,
+        node: u32,
+        incident_key: u64,
+        operation_reference: Option<i64>,
+    ) -> apis::incident::ResolveIncidentResponse {
+        use apis::incident::ResolveIncidentResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.resolve_incident(incident_key.to_string(), operation_reference).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheIncidentIsMarkedAsResolved,
+            Ok(r) if r.status == 404 => Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(
+                problem("Incident not found", 404, peer_detail(&r)),
+            ),
+            Ok(r) if r.status == 409 => {
+                Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
+                    "Incident not resolvable",
+                    409,
+                    peer_detail(&r),
+                ))
+            }
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Forwards a by-key variable merge to the peer owning the scope.
+    async fn forward_set_variables(
+        &self,
+        node: u32,
+        scope_key: u64,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> apis::element_instance::CreateElementInstanceVariablesResponse {
+        use apis::element_instance::CreateElementInstanceVariablesResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => link.set_variables(scope_key.to_string(), variables).await,
+            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheVariablesWereUpdated,
+            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Scope not found",
+                400,
+                peer_detail(&r),
+            )),
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
     }
 
     /// Publishes a message and correlates it to any matching open subscriptions.
@@ -3761,6 +4200,23 @@ fn wire_variables(
     variables.map(|m| m.iter().map(|(k, o)| (k.clone(), o.0.clone())).collect())
 }
 
+/// Whether a forwarded by-key command's peer status counts as success. The
+/// job-lifecycle handlers reply `200` (ack-before-fsync pipeline) and the other
+/// by-key handlers reply `204`; both mean the command applied.
+fn is_ok_status(status: u16) -> bool {
+    status == 200 || status == 204
+}
+
+/// Extracts a human-readable detail from a peer's error `CommandResult` body
+/// (a JSON string), for the `problem(...)` detail field surfaced to the client.
+fn peer_detail(res: &crate::peer::PeerResult) -> String {
+    res.body
+        .as_ref()
+        .and_then(|b| b.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("peer returned status {}", res.status))
+}
+
 /// Converts a JSON value into the engine [`Value`] tree, preserving numbers
 /// (integral vs. decimal), lists and objects so FEEL can operate on them.
 pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
@@ -4648,6 +5104,110 @@ mod clustered_startup_tests {
             nanobpmn_engine_core::partition_of(instance),
             0,
             "the message-start instance lives on the owner's partition 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_job_forwards_to_the_owning_peer() {
+        // A worker's completeJob may land on ANY gateway. When the job's partition
+        // is owned by a peer, the gateway forwards the completion over the command
+        // stream; the peer applies it durably on its own partition and answers.
+        //
+        // node 0 owns partitions 0 & 2 and seeds the demo. Create an instance and
+        // activate its service-task job there, so the job key lives on an
+        // node-0-owned partition. node 1 (a different gateway) must forward the
+        // completion back to node 0.
+        let node0 = clustered_node(0);
+        let (_instance, _) = node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let jobs = node0
+            .activate_for_stream("demo-work", "w", 10, 60_000, None)
+            .await;
+        assert_eq!(jobs.len(), 1, "the demo parks exactly one service-task job");
+        let job_key_str = jobs[0].job_key.0.clone();
+        let job_key: u64 = job_key_str.parse().expect("job key is numeric");
+
+        let node0_url = serve_node(&node0).await;
+
+        // node 1 is the gateway the worker hits; it points at the served owner.
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        // The job lives on a partition node 1 does NOT own — it must forward.
+        let owner = node1
+            .remote_owner_of(job_key)
+            .expect("the job's partition is owned by a peer, not node 1");
+        assert_eq!(owner, 0, "node 0 owns the job's partition");
+
+        // Forward the completion to node 0 over the wire and map its answer back.
+        use apis::job::CompleteJobResponse as R;
+        let resp = node1.forward_complete_job(owner, job_key, None).await;
+        assert!(
+            matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
+            "the forwarded completion should succeed (204)"
+        );
+
+        // The completion really mutated node 0's state: completing the same job
+        // again is rejected (it is no longer an activated job).
+        let again = node1.forward_complete_job(owner, job_key, None).await;
+        assert!(
+            !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
+            "re-completing an already-completed job must not return 204, got a success"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_instance_forwards_to_the_owning_peer() {
+        // cancelProcessInstance by key must reach the node owning the instance's
+        // partition, even when submitted to a different gateway.
+        let node0 = clustered_node(0);
+        let (instance, _) = node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let instance_key: u64 = instance;
+
+        let node0_url = serve_node(&node0).await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        let owner = node1
+            .remote_owner_of(instance_key)
+            .expect("the instance's partition is owned by a peer");
+        use apis::process_instance::CancelProcessInstanceResponse as R;
+        let resp = node1.forward_cancel_instance(owner, instance_key).await;
+        assert!(
+            matches!(resp, R::Status204_TheProcessInstanceIsCanceled),
+            "the forwarded cancel should succeed (204)"
+        );
+        // Cancelling again is rejected (the instance is already terminal),
+        // proving the first cancel took effect on the owner.
+        let again = node1.forward_cancel_instance(owner, instance_key).await;
+        assert!(
+            matches!(again, R::Status404_TheProcessInstanceIsNotFound(_)),
+            "re-cancelling a terminated instance must 404"
         );
     }
 }
