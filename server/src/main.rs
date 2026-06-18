@@ -10,10 +10,6 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 mod backpressure;
-// Cluster topology + ownership math (distributed-scaling stage 1). The
-// clustered constructors are wired into startup in the following increment; the
-// types and ownership logic are exercised by unit tests now.
-#[allow(dead_code)]
 mod cluster;
 mod coldspill;
 mod command_stream;
@@ -175,9 +171,16 @@ impl ServerImpl {
     /// partitions so any of them can instantiate it. Each journal's exporter must
     /// already be wired to the shared read store so the seed deployment is
     /// projected.
-    pub fn new(mut journals: Vec<Journal>, store: Arc<ReadStore>) -> Self {
+    pub fn new(mut journals: Vec<Journal>, store: Arc<ReadStore>, topology: cluster::Topology) -> Self {
         assert!(!journals.is_empty(), "at least one partition is required");
-        if journals[0].is_fresh() {
+        // The deployment partition (id 0) is the only one that seeds the demo
+        // process and owns the message-/timer-start subscriptions. In a clustered
+        // deployment only the node that owns partition 0 holds it (and it is its
+        // smallest owned id, hence `journals[0]`); other nodes skip seeding and
+        // receive deployed definitions via cross-node replication (stage 1
+        // broadcast). Single-node always owns partition 0, so this is unchanged.
+        let owns_deploy_partition = topology.is_local(0);
+        if owns_deploy_partition && journals[0].is_fresh() {
             // Pre-deploy a demo process so `createProcessInstance` (by id "demo")
             // has something to start. A real build would deploy from BPMN XML.
             let demo = ProcessBuilder::new("demo")
@@ -197,8 +200,10 @@ impl ServerImpl {
         // Replicate the deployment partition's definitions to every other
         // partition (in-memory, not journaled — re-derived here on each restart
         // from partition 0's durable log). The deployment partition keeps the
-        // sole copy of each message-start / timer-start subscription.
-        if journals.len() > 1 {
+        // sole copy of each message-start / timer-start subscription. Only the
+        // node owning partition 0 can do this locally; cross-node replication to
+        // peers is stage-1 broadcast.
+        if owns_deploy_partition && journals.len() > 1 {
             let replication = deployment_replication_events(&journals[0]);
             if !replication.is_empty() {
                 for journal in journals.iter_mut().skip(1) {
@@ -283,11 +288,11 @@ impl ServerImpl {
             }
         }
 
-        // Spawn one engine actor per partition. The adaptive backpressure
-        // controller (when present) is driven by the deployment partition's
+        // Spawn one engine actor per OWNED partition. The adaptive backpressure
+        // controller (when present) is driven by the first owned partition's
         // command latency — a representative single sample of engine load that
         // sizes the create-admission watermark applied across all partitions.
-        let partition_count = journals.len();
+        let owned_count = journals.len();
         let handles: Vec<EngineHandle> = journals
             .into_iter()
             .enumerate()
@@ -296,12 +301,25 @@ impl ServerImpl {
                 EngineHandle::spawn(journal, ctrl)
             })
             .collect();
-        if partition_count > 1 {
-            tracing::info!("partitions: {partition_count} (keys embed partition id)");
-        }
+        let engine = if topology.is_single_node() {
+            if owned_count > 1 {
+                tracing::info!("partitions: {owned_count} (keys embed partition id)");
+            }
+            Partitions::new(handles)
+        } else {
+            tracing::info!(
+                "cluster: node {}/{}, owns {} of {} partition(s) {:?}",
+                topology.node_id,
+                topology.num_nodes(),
+                owned_count,
+                topology.num_partitions,
+                topology.local_partitions(),
+            );
+            Partitions::with_topology(topology, handles)
+        };
 
         Self {
-            engine: Partitions::new(handles),
+            engine,
             store,
             jobs_available: Arc::new(tokio::sync::Notify::new()),
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
@@ -345,7 +363,7 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
 impl Default for ServerImpl {
     fn default() -> Self {
         let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        build_server(vec![Journal::in_memory()], store)
+        build_server(vec![Journal::in_memory()], store, cluster::Topology::single(1))
     }
 }
 
@@ -357,13 +375,17 @@ impl Default for ServerImpl {
 /// globally unique). The exporter must be set before `ServerImpl::new` so the
 /// seed deployment is projected; the thread is spawned after so it can route
 /// hot-state eviction back to the owning partition.
-fn build_server(mut journals: Vec<Journal>, store: Arc<ReadStore>) -> ServerImpl {
+fn build_server(
+    mut journals: Vec<Journal>,
+    store: Arc<ReadStore>,
+    topology: cluster::Topology,
+) -> ServerImpl {
     let (tx, rx) = mpsc::channel::<Arc<Vec<Event>>>();
     for journal in journals.iter_mut() {
         journal.set_exporter(tx.clone());
     }
     drop(tx);
-    let server = ServerImpl::new(journals, store.clone());
+    let server = ServerImpl::new(journals, store.clone(), topology);
     spawn_exporter(
         rx,
         store,
@@ -3643,7 +3665,8 @@ async fn main() {
                 }),
             );
             let partitions = partition_count_from_env();
-            let (journals, recovered) = if partitions == 1 {
+            let topology = cluster::Topology::from_env(partitions as u64);
+            let (journals, recovered) = if topology.is_single_node() && partitions == 1 {
                 // Single partition: warm-start fast by replaying only the events
                 // the store has not yet projected (a full rebuild on a
                 // fresh/reset store). The journal file keeps its historical name.
@@ -3668,7 +3691,7 @@ async fn main() {
                 });
                 let recovered = !journal.is_fresh();
                 (vec![journal], recovered)
-            } else {
+            } else if topology.is_single_node() {
                 // Multi-partition: ONE shared group-commit WAL for every
                 // partition (a single [`SharedWriter`]: one file, one writer
                 // thread, one fsync stream). Funneling all partitions through one
@@ -3723,9 +3746,64 @@ async fn main() {
                     .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
                     .collect();
                 (journals, recovered)
+            } else {
+                // Clustered: this node owns only a SUBSET of the cluster's
+                // partitions (`partition_id % num_nodes == node_id`). Its journal
+                // file therefore holds only its own partitions' events; rebuild
+                // its read model from them and open one engine actor per owned
+                // partition (each keyed by its GLOBAL partition id so keys stay
+                // globally unique across the cluster). Partitions owned by peers
+                // are reached by forwarding (handled by the routing seam), not
+                // replayed here.
+                let owned = topology.local_partitions();
+                assert!(
+                    !owned.is_empty(),
+                    "clustered node {} owns no partitions (NANOBPMN_PARTITIONS={} must exceed node count, or fix NANOBPMN_NODE_ID)",
+                    topology.node_id,
+                    partitions,
+                );
+                let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                    panic!("failed to read journal {}: {e}", journal_path.display())
+                });
+                store
+                    .reset()
+                    .expect("reset read store for clustered rebuild");
+                if !events.is_empty() {
+                    let refs: Vec<&Event> = events.iter().collect();
+                    store
+                        .export(&refs)
+                        .expect("catch up read model from journal");
+                }
+                // Demultiplex the node's log into its owned partitions by the
+                // partition id encoded in every key. Any event for a partition
+                // this node does not own (a stray from a re-sharded layout) is
+                // dropped — its owner replays it from its own journal.
+                let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
+                    owned.iter().map(|p| (*p, Vec::new())).collect();
+                for event in events {
+                    let p = nanobpmn_engine_core::partition_of(event.max_key());
+                    if let Some(bucket) = per_owned.get_mut(&p) {
+                        bucket.push(event);
+                    }
+                }
+                let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to open shared journal {}: {e}",
+                        journal_path.display()
+                    )
+                });
+                let recovered = per_owned.values().any(|evs| !evs.is_empty());
+                let journals: Vec<Journal> = owned
+                    .iter()
+                    .map(|p| {
+                        let evs = per_owned.remove(p).unwrap_or_default();
+                        Journal::from_events_shared(*p, evs, &shared)
+                    })
+                    .collect();
+                (journals, recovered)
             };
 
-            let server = build_server(journals, store);
+            let server = build_server(journals, store, topology);
 
             // The read model now has every completed instance, so shed them from
             // hot engine state to bound memory. Each partition evicts its own.
@@ -3755,10 +3833,19 @@ async fn main() {
                 ReadStore::open(db_path.as_deref()).expect("open in-memory read store"),
             );
             let partitions = partition_count_from_env();
-            let journals: Vec<Journal> = (0..partitions)
-                .map(|i| Journal::in_memory_partition(i as u64))
-                .collect();
-            build_server(journals, store)
+            let topology = cluster::Topology::from_env(partitions as u64);
+            let journals: Vec<Journal> = if topology.is_single_node() {
+                (0..partitions)
+                    .map(|i| Journal::in_memory_partition(i as u64))
+                    .collect()
+            } else {
+                topology
+                    .local_partitions()
+                    .iter()
+                    .map(|p| Journal::in_memory_partition(*p))
+                    .collect()
+            };
+            build_server(journals, store, topology)
         }
     };
 
@@ -4027,6 +4114,64 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
             "failed to access data dir {}: {e}",
             dir.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod clustered_startup_tests {
+    use super::*;
+
+    /// Builds an in-memory clustered `ServerImpl` for `node_id` of a 2-node,
+    /// 4-partition cluster (node 0 owns partitions 0 & 2; node 1 owns 1 & 3),
+    /// exactly as `main()` would on that node.
+    fn clustered_node(node_id: u32) -> ServerImpl {
+        let topology = cluster::Topology {
+            node_id,
+            peers: vec!["http://n0".into(), "http://n1".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        build_server(journals, store, topology)
+    }
+
+    #[test]
+    fn clustered_node_owns_only_its_partition_subset() {
+        let node0 = clustered_node(0);
+        let node1 = clustered_node(1);
+        // Each node spawns an engine actor only for the two partitions it owns.
+        assert_eq!(node0.engine.all().len(), 2);
+        assert_eq!(node1.engine.all().len(), 2);
+        // The cluster is not collapsed to the single-partition fast path.
+        assert!(!node0.engine.is_single());
+        assert_eq!(node0.engine.len(), 4); // total cluster partitions
+    }
+
+    #[test]
+    fn for_create_stays_on_owned_partitions() {
+        // `createProcessInstance` on a clustered node must mint keys only on the
+        // partitions that node owns — never on a peer's partition (which it holds
+        // no engine actor for). Round-robining `for_create` many times must only
+        // ever return one of this node's own handles.
+        let node0 = clustered_node(0);
+        let owned: Vec<*const EngineHandle> =
+            node0.engine.all().iter().map(|h| h as *const _).collect();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let h = node0.engine.for_create() as *const EngineHandle;
+            assert!(
+                owned.contains(&h),
+                "for_create returned a handle this node does not own"
+            );
+            seen.insert(h);
+        }
+        // Over many calls it must exercise BOTH owned partitions (round-robin),
+        // not collapse onto one.
+        assert_eq!(seen.len(), 2, "for_create should spread across both owned partitions");
     }
 }
 

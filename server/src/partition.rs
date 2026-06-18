@@ -58,7 +58,6 @@ pub enum Location<'a> {
 /// Owner of a partition slot. `Local(i)` indexes into [`PartitionRouter::local`];
 /// `Remote(node)` names the owning node.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // `Remote` is constructed once clustered startup is wired
 enum Owner {
     Local(usize),
     Remote(NodeId),
@@ -104,7 +103,6 @@ impl PartitionRouter {
     /// [`Topology::local_partitions`]; every other partition resolves to the
     /// `Remote` node that owns it. A single-node topology is equivalent to
     /// [`single_node`](Self::single_node).
-    #[allow(dead_code)] // called by clustered startup in the next increment
     fn from_topology(topology: Topology, local_handles: Vec<EngineHandle>) -> Self {
         let owned = topology.local_partitions();
         assert_eq!(
@@ -210,7 +208,6 @@ impl Partitions {
     /// are the engine actors for this node's owned partitions, in ascending
     /// partition-id order (matching [`Topology::local_partitions`]); every other
     /// partition resolves to the remote node that owns it.
-    #[allow(dead_code)] // called by clustered startup in the next increment
     pub fn with_topology(topology: Topology, local_handles: Vec<EngineHandle>) -> Self {
         Self {
             router: Arc::new(PartitionRouter::from_topology(topology, local_handles)),
@@ -264,25 +261,29 @@ impl Partitions {
     }
 
     /// The next partition to receive a fresh `createProcessInstance`, chosen
-    /// round-robin. An instance lives on the partition that created it for its
-    /// whole life (its key embeds the partition).
+    /// round-robin across the partitions **this node owns**. An instance lives on
+    /// the partition that created it for its whole life (its key embeds the
+    /// partition). In a single-node cluster the owned set is every partition in
+    /// id order, so this is byte-identical to the pre-cluster round-robin; in a
+    /// multi-node cluster each node creates only on its own partitions (the hot
+    /// path needs no cross-node forwarding — clients spread across gateways).
     pub fn for_create(&self) -> &EngineHandle {
-        let n = self.router.partition_count();
-        if n == 1 {
-            return self.router.local_for(PartitionId(0));
+        let locals = self.router.local_handles();
+        if locals.len() == 1 {
+            return &locals[0];
         }
-        let i = self.next_create.fetch_add(1, Ordering::Relaxed) % n;
-        self.router.local_for(PartitionId(i as u64))
+        let i = self.next_create.fetch_add(1, Ordering::Relaxed) % locals.len();
+        &locals[i]
     }
 
-    /// The partition index at which the next job-activation pass should begin
-    /// probing, chosen round-robin. A pass probes partitions in wrap-around order
-    /// from here, so activation load spreads evenly across every partition's
-    /// engine thread instead of concentrating on partition 0. Returns 0 for a
-    /// single partition (the probe order is trivial).
+    /// The local-partition index at which the next job-activation pass should
+    /// begin probing, chosen round-robin. A pass probes this node's owned
+    /// partitions in wrap-around order from here, so activation load spreads
+    /// evenly across every local engine thread instead of concentrating on the
+    /// first. Returns 0 for a single owned partition (the probe order is trivial).
     pub fn activate_start(&self) -> usize {
-        let n = self.router.partition_count();
-        if n == 1 {
+        let n = self.router.local_handles().len();
+        if n <= 1 {
             return 0;
         }
         self.next_activate.fetch_add(1, Ordering::Relaxed) % n

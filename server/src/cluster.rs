@@ -100,6 +100,7 @@ impl Topology {
     }
 
     /// The base URL of node `id`, or `None` if out of range.
+    #[allow(dead_code)] // consumed by the stage-1 peer-forwarding layer
     pub fn peer_addr(&self, id: u32) -> Option<&str> {
         self.peers.get(id as usize).map(String::as_str)
     }
