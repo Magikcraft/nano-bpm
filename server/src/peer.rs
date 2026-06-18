@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cluster::Topology;
-use crate::command_stream::{ClientFrame, ServerFrame};
+use crate::command_stream::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 
 /// Default ceiling on how long a forwarded request waits for its peer's
 /// `CommandResult` before giving up. Overridable via `NANOBPMN_PEER_TIMEOUT_MS`.
@@ -241,6 +241,30 @@ impl PeerLink {
             max_jobs,
             timeout: Some(timeout),
             fetch_variable,
+        })
+        .await
+    }
+
+    /// Forwards a GET-by-key read to the peer that owns the key's partition
+    /// (query forwarding). The peer answers from its local read model.
+    pub async fn get_by_key(&self, kind: ReadKind, key: u64) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::GetByKey { corr, kind, key })
+            .await
+    }
+
+    /// Forwards a user-task by-key mutation to the peer that owns the task's
+    /// partition. `payload` is the original REST request body.
+    pub async fn forward_user_task(
+        &self,
+        op: UserTaskOp,
+        user_task_key: String,
+        payload: Option<Value>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::ForwardUserTask {
+            corr,
+            op,
+            user_task_key,
+            payload,
         })
         .await
     }

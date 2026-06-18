@@ -290,9 +290,51 @@ pub enum ClientFrame {
         #[serde(default)]
         request_timeout: Option<i64>,
     },
+    /// **Intra-cluster only.** A gateway forwards a GET-by-key read to the peer
+    /// that owns the key's partition. Each node only projects its own partitions
+    /// into its read model, so a read for a remote key must be answered by the
+    /// owner. Answered by a `CommandResult` carrying the entity JSON (200) or 404.
+    #[serde(rename_all = "camelCase")]
+    GetByKey {
+        corr: u64,
+        kind: ReadKind,
+        key: u64,
+    },
+    /// **Intra-cluster only.** A gateway forwards a user-task by-key mutation
+    /// (assign / complete / unassign / update) to the peer that owns the task's
+    /// partition. `payload` is the original REST request body, re-applied locally
+    /// by the owner. Answered by a `CommandResult` whose status mirrors the REST
+    /// outcome (204 / 404 / 409 / 500).
+    #[serde(rename_all = "camelCase")]
+    ForwardUserTask {
+        corr: u64,
+        op: UserTaskOp,
+        user_task_key: String,
+        #[serde(default)]
+        payload: Option<Value>,
+    },
 }
 
-/// Server → client frames.
+/// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
+/// read-model lookup the owning peer runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReadKind {
+    ProcessInstance,
+    Incident,
+    UserTask,
+    Variable,
+}
+
+/// The user-task mutation a [`ClientFrame::ForwardUserTask`] carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserTaskOp {
+    Assign,
+    Complete,
+    Unassign,
+    Update,
+}
 ///
 /// `Deserialize` is derived so the peer uplink (a node acting as a command-stream
 /// client to its cluster peers) can decode a peer's responses.
@@ -708,6 +750,8 @@ async fn handle_client_frame(
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
+        ClientFrame::GetByKey { .. } => "get_by_key",
+        ClientFrame::ForwardUserTask { .. } => "forward_user_task",
         ClientFrame::ForwardCreate { .. } => "forward_create",
     };
     crate::metrics::record_stream_frame(frame_type);
@@ -1072,6 +1116,30 @@ async fn handle_client_frame(
                 corr,
                 status: 200,
                 body: Some(body),
+            });
+        }
+        ClientFrame::GetByKey { corr, kind, key } => {
+            // Peer-side of query forwarding: answer a read for a key this node
+            // owns from its local read model.
+            let (status, body) = server.read_by_key_local(kind, key);
+            conn.send(ServerFrame::CommandResult { corr, status, body });
+        }
+        ClientFrame::ForwardUserTask {
+            corr,
+            op,
+            user_task_key,
+            payload,
+        } => {
+            // Peer-side of user-task forwarding: re-apply the original REST
+            // mutation locally (this node owns the task's partition) and mirror
+            // the REST status. Local-only ⇒ no forwarding loop.
+            let (status, message) = server
+                .apply_user_task_forwarded(op, &user_task_key, payload)
+                .await;
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status,
+                body: message.map(Value::String),
             });
         }
     }

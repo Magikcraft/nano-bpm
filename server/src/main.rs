@@ -1564,6 +1564,29 @@ impl ServerImpl {
         };
 
         let result = self.store.process_instance(key);
+        if result.is_none() {
+            if let Some(node) = self.remote_owner_of(key) {
+                let (status, body) = self
+                    .forward_get(node, crate::command_stream::ReadKind::ProcessInstance, key)
+                    .await;
+                return Ok(match (status, body) {
+                    (200, Some(b)) => match serde_json::from_value(b) {
+                        Ok(r) => Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(r),
+                        Err(e) => {
+                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                problem("Peer error", 500, e.to_string()),
+                            )
+                        }
+                    },
+                    (404, _) => Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(
+                        problem("Process instance not found", 404, format!("No process instance with key {key}.")),
+                    ),
+                    (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+                    ),
+                });
+            }
+        }
         match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
                 process_instance_result(&instance),
@@ -1878,6 +1901,203 @@ impl ServerImpl {
             .link(node)
             .await
             .map_err(|e| (502, format!("peer node {node} unreachable: {e}")))
+    }
+
+    /// Peer-side of query forwarding: answers a GET-by-key read for a key this
+    /// node owns from its local read model. Returns `(200, entity-json)` or
+    /// `(404, None)` (or `(500, None)` on a serialization error). The gateway
+    /// reconstructs the typed REST response from the status + body.
+    pub(crate) fn read_by_key_local(
+        &self,
+        kind: crate::command_stream::ReadKind,
+        key: u64,
+    ) -> (u16, Option<serde_json::Value>) {
+        use crate::command_stream::ReadKind;
+        let body = match kind {
+            ReadKind::ProcessInstance => self
+                .store
+                .process_instance(key)
+                .map(|x| serde_json::to_value(process_instance_result(&x))),
+            ReadKind::Incident => self
+                .store
+                .incident(key)
+                .map(|x| serde_json::to_value(incident_result(&x))),
+            ReadKind::UserTask => self
+                .store
+                .user_tasks()
+                .iter()
+                .find(|t| t.key == key)
+                .map(|t| serde_json::to_value(user_task_result(t))),
+            ReadKind::Variable => self
+                .store
+                .variable(key)
+                .map(|v| serde_json::to_value(variable_result(&v))),
+        };
+        match body {
+            Some(Ok(v)) => (200, Some(v)),
+            Some(Err(_)) => (500, None),
+            None => (404, None),
+        }
+    }
+
+    /// Forwards a GET-by-key read to the peer owning the key's partition and
+    /// returns its `(status, body)` for the gateway handler to map into the
+    /// typed REST response.
+    async fn forward_get(
+        &self,
+        node: u32,
+        kind: crate::command_stream::ReadKind,
+        key: u64,
+    ) -> (u16, Option<serde_json::Value>) {
+        match self.peer_link(node).await {
+            Ok(link) => match link.get_by_key(kind, key).await {
+                Ok(r) => (r.status, r.body),
+                Err(_) => (502, None),
+            },
+            Err((s, _)) => (s, None),
+        }
+    }
+
+    /// Peer-side of user-task forwarding: re-applies the original REST mutation
+    /// locally (this node owns the task's partition, so the per-handler
+    /// `remote_owner_of` check resolves Local — no forwarding loop) and reports
+    /// the REST status plus an optional problem detail. The gateway maps the
+    /// status back to its typed response.
+    pub(crate) async fn apply_user_task_forwarded(
+        &self,
+        op: crate::command_stream::UserTaskOp,
+        user_task_key: &str,
+        payload: Option<serde_json::Value>,
+    ) -> (u16, Option<String>) {
+        use crate::command_stream::UserTaskOp;
+        let key = user_task_key.to_string();
+        match op {
+            UserTaskOp::Assign => {
+                use apis::user_task::AssignUserTaskResponse as R;
+                let body: models::UserTaskAssignmentRequest = match payload {
+                    Some(v) => match serde_json::from_value(v) {
+                        Ok(b) => b,
+                        Err(e) => return (400, Some(e.to_string())),
+                    },
+                    None => return (400, Some("missing assignment payload".to_string())),
+                };
+                let path = models::AssignUserTaskPathParams {
+                    user_task_key: key,
+                };
+                match self.assign_user_task_impl(&path, &body).await {
+                    Ok(R::Status204_TheUserTask) => (204, None),
+                    Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
+                        (404, Some(p.detail))
+                    }
+                    Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
+                        (409, Some(p.detail))
+                    }
+                    Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
+                        (500, Some(p.detail))
+                    }
+                    _ => (500, None),
+                }
+            }
+            UserTaskOp::Complete => {
+                use apis::user_task::CompleteUserTaskResponse as R;
+                let body: Option<models::UserTaskCompletionRequest> = match payload {
+                    Some(v) => match serde_json::from_value(v) {
+                        Ok(b) => Some(b),
+                        Err(e) => return (400, Some(e.to_string())),
+                    },
+                    None => None,
+                };
+                let path = models::CompleteUserTaskPathParams {
+                    user_task_key: key,
+                };
+                match self.complete_user_task_impl(&path, &body).await {
+                    Ok(R::Status204_TheUserTaskWasCompletedSuccessfully) => (204, None),
+                    Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
+                        (404, Some(p.detail))
+                    }
+                    Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
+                        (409, Some(p.detail))
+                    }
+                    Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
+                        (500, Some(p.detail))
+                    }
+                    _ => (500, None),
+                }
+            }
+            UserTaskOp::Unassign => {
+                use apis::user_task::UnassignUserTaskResponse as R;
+                let path = models::UnassignUserTaskPathParams {
+                    user_task_key: key,
+                };
+                match self.unassign_user_task_impl(&path).await {
+                    Ok(R::Status204_TheUserTaskWasUnassignedSuccessfully) => (204, None),
+                    Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
+                        (404, Some(p.detail))
+                    }
+                    Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
+                        (409, Some(p.detail))
+                    }
+                    Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
+                        (500, Some(p.detail))
+                    }
+                    _ => (500, None),
+                }
+            }
+            UserTaskOp::Update => {
+                use apis::user_task::UpdateUserTaskResponse as R;
+                let body: Option<models::UserTaskUpdateRequest> = match payload {
+                    Some(v) => match serde_json::from_value(v) {
+                        Ok(b) => Some(b),
+                        Err(e) => return (400, Some(e.to_string())),
+                    },
+                    None => None,
+                };
+                let path = models::UpdateUserTaskPathParams {
+                    user_task_key: key,
+                };
+                match self.update_user_task_impl(&path, &body).await {
+                    Ok(R::Status204_TheUserTaskWasUpdatedSuccessfully) => (204, None),
+                    Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
+                        (404, Some(p.detail))
+                    }
+                    Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
+                        (409, Some(p.detail))
+                    }
+                    Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
+                        (500, Some(p.detail))
+                    }
+                    _ => (500, None),
+                }
+            }
+        }
+    }
+
+    /// Forwards a user-task by-key mutation to the peer owning the task's
+    /// partition. `payload` is the original REST request body JSON. Returns the
+    /// peer's `(status, detail)`; the gateway handler maps it to its typed
+    /// response.
+    async fn forward_user_task(
+        &self,
+        node: u32,
+        op: crate::command_stream::UserTaskOp,
+        user_task_key: u64,
+        payload: Option<serde_json::Value>,
+    ) -> (u16, String) {
+        match self.peer_link(node).await {
+            Ok(link) => match link
+                .forward_user_task(op, user_task_key.to_string(), payload)
+                .await
+            {
+                Ok(r) => (
+                    r.status,
+                    r.body
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                ),
+                Err(e) => (502, e.to_string()),
+            },
+            Err((s, m)) => (s, m),
+        }
     }
 
     /// Forwards a `completeJob` to the peer owning the job and maps its answer to
@@ -2511,6 +2731,31 @@ impl ServerImpl {
         };
 
         let result = self.store.incident(key);
+        if result.is_none() {
+            if let Some(node) = self.remote_owner_of(key) {
+                let (status, body) = self
+                    .forward_get(node, crate::command_stream::ReadKind::Incident, key)
+                    .await;
+                return Ok(match (status, body) {
+                    (200, Some(b)) => match serde_json::from_value(b) {
+                        Ok(r) => Resp::Status200_TheIncidentIsSuccessfullyReturned(r),
+                        Err(e) => {
+                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                problem("Peer error", 500, e.to_string()),
+                            )
+                        }
+                    },
+                    (404, _) => Resp::Status404_TheIncidentWithTheGivenKeyWasNotFound(problem(
+                        "Incident not found",
+                        404,
+                        format!("No incident with key {key}."),
+                    )),
+                    (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+                    ),
+                });
+            }
+        }
         match result {
             Some(incident) => Ok(Resp::Status200_TheIncidentIsSuccessfullyReturned(
                 incident_result(&incident),
@@ -2829,6 +3074,37 @@ impl ServerImpl {
             Some(types::Nullable::Present(v)) => *v,
             _ => true,
         };
+        if let Some(node) = self.remote_owner_of(user_task_key) {
+            let payload = serde_json::to_value(body).ok();
+            let (status, detail) = self
+                .forward_user_task(
+                    node,
+                    crate::command_stream::UserTaskOp::Assign,
+                    user_task_key,
+                    payload,
+                )
+                .await;
+            return Ok(match status {
+                204 => Resp::Status204_TheUserTask,
+                404 => Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    detail,
+                )),
+                409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
+                    problem("User task in wrong state", 409, detail),
+                ),
+                s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    500,
+                    if detail.is_empty() {
+                        format!("peer node {node} returned status {s}")
+                    } else {
+                        detail
+                    },
+                )),
+            });
+        }
         let command = Command::AssignUserTask {
             user_task_key,
             assignee,
@@ -2905,6 +3181,37 @@ impl ServerImpl {
 
         // Variables the human submits are merged into the instance so they can
         // drive downstream gateway routing.
+        if let Some(node) = self.remote_owner_of(user_task_key) {
+            let payload = serde_json::to_value(body).ok();
+            let (status, detail) = self
+                .forward_user_task(
+                    node,
+                    crate::command_stream::UserTaskOp::Complete,
+                    user_task_key,
+                    payload,
+                )
+                .await;
+            return Ok(match status {
+                204 => Resp::Status204_TheUserTaskWasCompletedSuccessfully,
+                404 => Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    detail,
+                )),
+                409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
+                    problem("User task in wrong state", 409, detail),
+                ),
+                s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    500,
+                    if detail.is_empty() {
+                        format!("peer node {node} returned status {s}")
+                    } else {
+                        detail
+                    },
+                )),
+            });
+        }
         let variables = body
             .as_ref()
             .and_then(|b| b.variables.as_ref())
@@ -2986,13 +3293,38 @@ impl ServerImpl {
             Some(task) => Ok(Resp::Status200_TheUserTaskIsSuccessfullyReturned(
                 user_task_result(task),
             )),
-            None => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
-                problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                ),
-            )),
+            None => {
+                if let Some(node) = self.remote_owner_of(user_task_key) {
+                    let (status, body) = self
+                        .forward_get(node, crate::command_stream::ReadKind::UserTask, user_task_key)
+                        .await;
+                    return Ok(match (status, body) {
+                        (200, Some(b)) => match serde_json::from_value(b) {
+                            Ok(r) => Resp::Status200_TheUserTaskIsSuccessfullyReturned(r),
+                            Err(e) => {
+                                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                    problem("Peer error", 500, e.to_string()),
+                                )
+                            }
+                        },
+                        (404, _) => Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                            "User task not found",
+                            404,
+                            format!("No user task with key {user_task_key}."),
+                        )),
+                        (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                            problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+                        ),
+                    });
+                }
+                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                    problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    ),
+                ))
+            }
         }
     }
 
@@ -3020,6 +3352,36 @@ impl ServerImpl {
         };
 
         let command = Command::unassign_user_task(user_task_key);
+        if let Some(node) = self.remote_owner_of(user_task_key) {
+            let (status, detail) = self
+                .forward_user_task(
+                    node,
+                    crate::command_stream::UserTaskOp::Unassign,
+                    user_task_key,
+                    None,
+                )
+                .await;
+            return Ok(match status {
+                204 => Resp::Status204_TheUserTaskWasUnassignedSuccessfully,
+                404 => Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    detail,
+                )),
+                409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
+                    problem("User task in wrong state", 409, detail),
+                ),
+                s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    500,
+                    if detail.is_empty() {
+                        format!("peer node {node} returned status {s}")
+                    } else {
+                        detail
+                    },
+                )),
+            });
+        }
         let result = self
             .engine
             .by_key(user_task_key)
@@ -3080,6 +3442,38 @@ impl ServerImpl {
                 ));
             }
         };
+
+        if let Some(node) = self.remote_owner_of(user_task_key) {
+            let payload = serde_json::to_value(body).ok();
+            let (status, detail) = self
+                .forward_user_task(
+                    node,
+                    crate::command_stream::UserTaskOp::Update,
+                    user_task_key,
+                    payload,
+                )
+                .await;
+            return Ok(match status {
+                204 => Resp::Status204_TheUserTaskWasUpdatedSuccessfully,
+                404 => Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    detail,
+                )),
+                409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
+                    problem("User task in wrong state", 409, detail),
+                ),
+                s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    500,
+                    if detail.is_empty() {
+                        format!("peer node {node} returned status {s}")
+                    } else {
+                        detail
+                    },
+                )),
+            });
+        }
 
         // Translate the REST changeset into the engine changeset. A `Present`
         // value sets the attribute; an explicit `Null` resets it (empty list /
@@ -3250,11 +3644,36 @@ impl ServerImpl {
             Some(v) => Ok(Resp::Status200_TheVariableIsSuccessfullyReturned(
                 variable_result(&v),
             )),
-            None => Ok(Resp::Status404_NotFound(problem(
-                "Variable not found",
-                404,
-                format!("No variable with key {key}."),
-            ))),
+            None => {
+                if let Some(node) = self.remote_owner_of(key) {
+                    let (status, body) = self
+                        .forward_get(node, crate::command_stream::ReadKind::Variable, key)
+                        .await;
+                    return Ok(match (status, body) {
+                        (200, Some(b)) => match serde_json::from_value(b) {
+                            Ok(r) => Resp::Status200_TheVariableIsSuccessfullyReturned(r),
+                            Err(e) => {
+                                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                    problem("Peer error", 500, e.to_string()),
+                                )
+                            }
+                        },
+                        (404, _) => Resp::Status404_NotFound(problem(
+                            "Variable not found",
+                            404,
+                            format!("No variable with key {key}."),
+                        )),
+                        (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                            problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+                        ),
+                    });
+                }
+                Ok(Resp::Status404_NotFound(problem(
+                    "Variable not found",
+                    404,
+                    format!("No variable with key {key}."),
+                )))
+            }
         }
     }
 
@@ -5575,6 +5994,159 @@ mod clustered_startup_tests {
         assert!(
             matches!(again, R::Status404_TheProcessInstanceIsNotFound(_)),
             "re-cancelling a terminated instance must 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_process_instance_forwards_to_the_owning_peer() {
+        // A GET-by-key read for a remote-owned instance must be answered by the
+        // owner: each node only projects its OWN partitions into its read model,
+        // so without forwarding the non-owning gateway would 404.
+        let node0 = clustered_node(0);
+        let (instance, _) = node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+
+        let node0_url = serve_node(&node0).await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        assert_eq!(
+            node1.remote_owner_of(instance),
+            Some(0),
+            "node 0 owns the instance's partition"
+        );
+
+        use apis::process_instance::GetProcessInstanceResponse as R;
+        let path = models::GetProcessInstancePathParams {
+            process_instance_key: instance.to_string(),
+        };
+        match node1.get_process_instance_impl(&path).await.unwrap() {
+            R::Status200_TheProcessInstanceIsSuccessfullyReturned(r) => {
+                assert_eq!(
+                    r.process_instance_key.0,
+                    instance.to_string(),
+                    "the forwarded read returns the owner's instance"
+                );
+            }
+            other => panic!("expected a forwarded 200, got {other:?}"),
+        }
+
+        // A genuinely-unknown remote key (partition 0, owned by node 0) still
+        // 404s through the forward — proving the forward, not a local hit.
+        let missing = models::GetProcessInstancePathParams {
+            process_instance_key: "1".to_string(),
+        };
+        match node1.get_process_instance_impl(&missing).await.unwrap() {
+            R::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(_) => {}
+            other => panic!("expected a forwarded 404 for an unknown remote key, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_user_task_forwards_to_the_owning_peer() {
+        // A user-task by-key mutation submitted to ANY gateway forwards to the
+        // node owning the task's partition, which re-runs the mutation locally.
+        let node0 = clustered_node(0);
+        let proc = ProcessBuilder::new("review")
+            .start_event("start")
+            .user_task("task")
+            .end_event("end")
+            .connect("start", "task")
+            .connect("task", "end")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("review".to_string(), "review.bpmn".to_string());
+        node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy the user-task process on the owner");
+        let (instance, _) = node0
+            .create_for_stream(Some("review".into()), None, Default::default())
+            .await
+            .expect("owner creates the review instance");
+
+        // The read model projects asynchronously off the commit; poll briefly
+        // for the parked user task to avoid a projection-timing race.
+        let mut task_key = None;
+        for _ in 0..200 {
+            if let Some(t) = node0
+                .store
+                .user_tasks()
+                .iter()
+                .find(|t| t.instance_key == instance)
+            {
+                task_key = Some(t.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_key = task_key.expect("the instance parks a user task");
+
+        let node0_url = serve_node(&node0).await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        assert_eq!(
+            node1.remote_owner_of(task_key),
+            Some(0),
+            "node 0 owns the user task's partition"
+        );
+
+        use apis::user_task::AssignUserTaskResponse as R;
+        let path = models::AssignUserTaskPathParams {
+            user_task_key: task_key.to_string(),
+        };
+        let body = models::UserTaskAssignmentRequest {
+            assignee: Some("alice".into()),
+            allow_override: None,
+            action: None,
+        };
+        let resp = node1.assign_user_task_impl(&path, &body).await.unwrap();
+        assert!(
+            matches!(resp, R::Status204_TheUserTask),
+            "the forwarded assign should succeed (204)"
+        );
+
+        // The assign really mutated node 0's state: re-assigning with
+        // allowOverride=false is now rejected as already-assigned (409).
+        let body_no_override = models::UserTaskAssignmentRequest {
+            assignee: Some("bob".into()),
+            allow_override: Some(types::Nullable::Present(false)),
+            action: None,
+        };
+        let again = node1
+            .assign_user_task_impl(&path, &body_no_override)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                again,
+                R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(_)
+            ),
+            "re-assigning an assigned task without override must 409 (proves the forward took effect)"
         );
     }
 
