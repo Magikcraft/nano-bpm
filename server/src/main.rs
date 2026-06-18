@@ -785,6 +785,39 @@ impl ServerImpl {
         // gauge measures command-processing concurrency rather than how long a
         // client chooses to block for completion.
         type CreateOk = (String, i32, String, u64, bool, Commit);
+
+        // Cluster-wide create placement (stage 1): round-robin across EVERY
+        // partition in the cluster so a single gateway drives the whole cluster.
+        // When the chosen partition is owned by a peer, forward the create there
+        // and map its answer back; otherwise (always, on a single node) fall
+        // through to the in-process create below. Placement is decided after the
+        // node-local backpressure/admission gates above, which remain the
+        // admission point for the whole request.
+        if let Some(node) = self.engine.next_create_placement() {
+            let wire_vars = match body {
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                    b.variables.as_ref()
+                }
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                    b.variables.as_ref()
+                }
+            }
+            .and_then(|m| wire_variables(Some(m)));
+            return Ok(self
+                .forward_create(
+                    node,
+                    by_id,
+                    by_key,
+                    wire_vars,
+                    tags_vec,
+                    business_id_str,
+                    await_completion,
+                    fetch_variables.cloned(),
+                    request_timeout,
+                )
+                .await);
+        }
+
         // Clone tags and business_id for use in the response after the engine
         // command completes (the closure moves them).
         let tags_for_response = tags_vec.clone();
@@ -2074,6 +2107,190 @@ impl ServerImpl {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheVariablesWereUpdated,
             Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Scope not found",
+                400,
+                peer_detail(&r),
+            )),
+            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                500,
+                peer_detail(&r),
+            )),
+            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Peer error",
+                502,
+                e.to_string(),
+            )),
+        }
+    }
+
+    /// Peer-side handler for a forwarded `createProcessInstance`: creates on one
+    /// of THIS node's own partitions (never re-forwarding) and returns the full
+    /// `CreateProcessInstanceResult` as JSON, so the originating gateway can map
+    /// it straight back to its REST response. Mirrors the local REST create core
+    /// + finalize. Backpressure/admission are applied at the receiving gateway,
+    /// not here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_forwarded(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: std::collections::HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let tags_for_response = tags.clone();
+        let business_id_for_response = business_id.clone();
+        type CreateOk = (String, i32, String, u64, bool, Commit);
+        let outcome: Result<CreateOk, (u16, String)> = {
+            let _processing = ProcessingGuard::enter(&self.processing);
+            self.engine
+                .for_create()
+                .with_low(move |engine| {
+                    let process_id = match (by_id, by_key) {
+                        (Some(id), _) => id,
+                        (None, Some(requested)) => match engine
+                            .state()
+                            .processes
+                            .values()
+                            .find(|d| d.key.to_string() == requested)
+                        {
+                            Some(d) => d.definition.id.clone(),
+                            None => {
+                                return Err((
+                                    400,
+                                    format!("No deployed process with key '{requested}'."),
+                                ));
+                            }
+                        },
+                        (None, None) => {
+                            return Err((
+                                400,
+                                "A processDefinitionId or processDefinitionKey is required."
+                                    .to_string(),
+                            ));
+                        }
+                    };
+                    match engine.apply_command_at(
+                        Command::create_instance_full(
+                            process_id.clone(),
+                            variables,
+                            tags,
+                            business_id,
+                        ),
+                        now_millis(),
+                    ) {
+                        Ok((events, commit)) => {
+                            let instance_key = events
+                                .iter()
+                                .find_map(Event::instance_key)
+                                .expect("created instance has a key");
+                            let (definition_key, version) = engine
+                                .state()
+                                .processes
+                                .get(&process_id)
+                                .map(|d| (d.key.to_string(), d.version))
+                                .unwrap_or_else(|| (process_id.clone(), 1));
+                            let sync_completed = engine.engine().is_completed(instance_key);
+                            Ok((
+                                process_id,
+                                version,
+                                definition_key,
+                                instance_key,
+                                sync_completed,
+                                commit,
+                            ))
+                        }
+                        Err(EngineError::ProcessNotFound { process_id }) => {
+                            Err((400, format!("No deployed process with id '{process_id}'.")))
+                        }
+                        Err(e) => Err((500, e.to_string())),
+                    }
+                })
+                .await
+        };
+        let (process_id, version, definition_key, instance_key, sync_completed, commit) = outcome?;
+        crate::metrics::record_create("rest");
+        commit.wait().await;
+        self.signal_jobs_available();
+        let (variables_out, process_completed) = if await_completion {
+            self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
+                .await
+        } else {
+            (std::collections::HashMap::new(), sync_completed)
+        };
+        let result = models::CreateProcessInstanceResult::new(
+            process_id,
+            version,
+            "<default>".to_string(),
+            variables_out,
+            models::ProcessDefinitionKey(definition_key),
+            models::ProcessInstanceKey(instance_key.to_string()),
+            tags_for_response.into_iter().map(models::Tag).collect(),
+            business_id_for_response
+                .map(nanobpm_gateway_rest::types::Nullable::Present)
+                .unwrap_or(nanobpm_gateway_rest::types::Nullable::Null),
+            process_completed,
+        );
+        serde_json::to_value(&result).map_err(|e| (500, e.to_string()))
+    }
+
+    /// Gateway side of cluster-wide create placement: forwards a
+    /// `createProcessInstance` to peer `node` and maps its answer to the REST
+    /// response. Used when this gateway's round-robin placement lands on a
+    /// partition owned by another node.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_create(
+        &self,
+        node: u32,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> apis::process_instance::CreateProcessInstanceResponse {
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let res = match self.peer_link(node).await {
+            Ok(link) => {
+                link.forward_create(
+                    by_id,
+                    by_key,
+                    variables,
+                    tags,
+                    business_id,
+                    await_completion,
+                    fetch_variables,
+                    request_timeout,
+                )
+                .await
+            }
+            Err((s, m)) => {
+                return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    s,
+                    m,
+                ));
+            }
+        };
+        match res {
+            Ok(r) if is_ok_status(r.status) => {
+                match r
+                    .body
+                    .and_then(|b| serde_json::from_value::<models::CreateProcessInstanceResult>(b).ok())
+                {
+                    Some(result) => Resp::Status200_TheProcessInstanceWasCreated(result),
+                    None => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", 500, "peer returned an unparseable create result".into()),
+                    ),
+                }
+            }
+            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid create",
                 400,
                 peer_detail(&r),
             )),
@@ -5208,6 +5425,80 @@ mod clustered_startup_tests {
         assert!(
             matches!(again, R::Status404_TheProcessInstanceIsNotFound(_)),
             "re-cancelling a terminated instance must 404"
+        );
+    }
+
+    #[test]
+    fn next_create_placement_spreads_across_the_cluster() {
+        // node 0 of a 2-node, 4-partition cluster owns partitions 0 & 2; node 1
+        // owns 1 & 3. Cluster-wide placement round-robins over ALL four
+        // partitions, so half of node 0's placements are local (None) and half
+        // are remote, owned by node 1 (Some(1)).
+        let node0 = clustered_node(0);
+        let mut local = 0;
+        let mut remote_to_1 = 0;
+        for _ in 0..8 {
+            match node0.engine.next_create_placement() {
+                None => local += 1,
+                Some(1) => remote_to_1 += 1,
+                Some(other) => panic!("unexpected remote placement to node {other}"),
+            }
+        }
+        assert_eq!(local, 4, "half of 8 placements (partitions 0,2) are local");
+        assert_eq!(remote_to_1, 4, "half (partitions 1,3) forward to node 1");
+    }
+
+    #[test]
+    fn single_node_create_placement_is_always_local() {
+        // A single-node cluster owns every partition, so placement never forwards
+        // — the create path stays byte-identical to the pre-cluster fast path.
+        let solo = ServerImpl::default();
+        for _ in 0..16 {
+            assert!(
+                solo.engine.next_create_placement().is_none(),
+                "single node must always place creates locally"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_forwards_to_a_peer_partition() {
+        // A create whose cluster placement lands on a peer's partition is
+        // forwarded to that peer, which mints the instance on one of ITS OWN
+        // partitions and returns the full result. node 1 owns partitions 1 & 3.
+        let node1 = clustered_node(1);
+        // node 1 owns no deployment partition, so install the demo over the wire
+        // path (mirrors the centralized broadcast) before it can create.
+        node1.install_replicated_deployment(demo_deployment_events().await).await;
+        let node1_url = serve_node(&node1).await;
+
+        // node 0 is the gateway the client hits; it points at the served node 1.
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused".into(), node1_url],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node0 = build_server(journals, store, topology);
+
+        use apis::process_instance::CreateProcessInstanceResponse as R;
+        let resp = node0
+            .forward_create(1, Some("demo".into()), None, None, vec![], None, false, None, None)
+            .await;
+        let result = match resp {
+            R::Status200_TheProcessInstanceWasCreated(r) => r,
+            other => panic!("expected a forwarded 200 create, got {other:?}"),
+        };
+        let instance_key: u64 = result.process_instance_key.0.parse().expect("numeric key");
+        let p = nanobpmn_engine_core::partition_of(instance_key);
+        assert!(
+            p == 1 || p == 3,
+            "the forwarded instance must live on a node-1-owned partition (1 or 3), got {p}"
         );
     }
 }

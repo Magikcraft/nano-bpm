@@ -345,6 +345,35 @@ impl PeerLink {
         })
         .await
     }
+
+    /// Forwards a `createProcessInstance` to this peer for cluster-wide create
+    /// placement. The peer creates on one of its own partitions and answers with
+    /// the full `CreateProcessInstanceResult` JSON.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_create(
+        &self,
+        process_definition_id: Option<String>,
+        process_definition_key: Option<String>,
+        variables: Option<serde_json::Map<String, Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::ForwardCreate {
+            corr,
+            process_definition_id,
+            process_definition_key,
+            variables,
+            tags,
+            business_id,
+            await_completion,
+            fetch_variables,
+            request_timeout,
+        })
+        .await
+    }
 }
 
 /// Resolves a `CommandResult`/`InstanceCompleted` to its waiting request; other

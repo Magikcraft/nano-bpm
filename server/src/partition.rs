@@ -191,6 +191,13 @@ pub struct Partitions {
     /// empty, so no job is ever left unactivated (no starvation). Relaxed: it
     /// only needs to spread load, not be exact.
     next_activate: Arc<AtomicUsize>,
+    /// Round-robin cursor for cluster-wide create *placement*: it cycles over
+    /// every partition in the cluster (local and remote), so a single gateway
+    /// spreads creates across the whole cluster instead of only its own
+    /// partitions. Drives [`next_create_placement`](Self::next_create_placement).
+    /// Distinct from `next_create` (which balances among local handles once a
+    /// create lands locally). Relaxed: spread, not exact.
+    next_place: Arc<AtomicUsize>,
 }
 
 impl Partitions {
@@ -201,6 +208,7 @@ impl Partitions {
             router: Arc::new(PartitionRouter::single_node(handles)),
             next_create: Arc::new(AtomicUsize::new(0)),
             next_activate: Arc::new(AtomicUsize::new(0)),
+            next_place: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -213,6 +221,7 @@ impl Partitions {
             router: Arc::new(PartitionRouter::from_topology(topology, local_handles)),
             next_create: Arc::new(AtomicUsize::new(0)),
             next_activate: Arc::new(AtomicUsize::new(0)),
+            next_place: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -286,6 +295,30 @@ impl Partitions {
         }
         let i = self.next_create.fetch_add(1, Ordering::Relaxed) % locals.len();
         &locals[i]
+    }
+
+    /// Cluster-wide create *placement*: round-robins over **every** partition in
+    /// the cluster and returns the remote node that owns the chosen partition, or
+    /// `None` when it is local (create here, the fast path). This lets a single
+    /// gateway spread `createProcessInstance` across the whole cluster — the
+    /// stage-1 create-forwarding seam — rather than only its own partitions, so
+    /// one client connection can drive every node. A remote placement is forwarded
+    /// to the owner over the command stream; a local one runs in-process via
+    /// [`for_create`](Self::for_create).
+    ///
+    /// Single-node (and any node owning every partition) always returns `None`:
+    /// the placement is always local, so the create path is byte-identical to the
+    /// pre-cluster behaviour with zero forwarding overhead.
+    pub fn next_create_placement(&self) -> Option<u32> {
+        let n = self.router.partition_count();
+        if n <= 1 {
+            return None;
+        }
+        let p = self.next_place.fetch_add(1, Ordering::Relaxed) % n;
+        match self.router.resolve(PartitionId(p as u64)) {
+            Location::Local(_) => None,
+            Location::Remote(NodeId(node)) => Some(node),
+        }
     }
 
     /// The local-partition index at which the next job-activation pass should

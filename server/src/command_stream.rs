@@ -245,6 +245,32 @@ pub enum ClientFrame {
         #[serde(default)]
         variables: Option<Map<String, Value>>,
     },
+    /// **Intra-cluster only.** A gateway forwards a `createProcessInstance` to a
+    /// peer for cluster-wide create placement (the gateway round-robins creates
+    /// across every partition; a partition owned by a peer is placed via this
+    /// frame). The peer creates on one of *its own* partitions and does **not**
+    /// re-forward (local-only, no placement loop). Answered by a `CommandResult`
+    /// carrying the full `CreateProcessInstanceResult` JSON (200) or an error.
+    #[serde(rename_all = "camelCase")]
+    ForwardCreate {
+        corr: u64,
+        #[serde(default)]
+        process_definition_id: Option<String>,
+        #[serde(default)]
+        process_definition_key: Option<String>,
+        #[serde(default)]
+        variables: Option<Map<String, Value>>,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        business_id: Option<String>,
+        #[serde(default)]
+        await_completion: bool,
+        #[serde(default)]
+        fetch_variables: Option<Vec<String>>,
+        #[serde(default)]
+        request_timeout: Option<i64>,
+    },
 }
 
 /// Server → client frames.
@@ -662,6 +688,7 @@ async fn handle_client_frame(
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
+        ClientFrame::ForwardCreate { .. } => "forward_create",
     };
     crate::metrics::record_stream_frame(frame_type);
     
@@ -915,6 +942,46 @@ async fn handle_client_frame(
                 server.set_variables_local(key, vars).await
             })
             .await;
+        }
+        ClientFrame::ForwardCreate {
+            corr,
+            process_definition_id,
+            process_definition_key,
+            variables,
+            tags,
+            business_id,
+            await_completion,
+            fetch_variables,
+            request_timeout,
+        } => {
+            // Local-only: create on one of THIS peer's own partitions and answer
+            // with the full result JSON. The peer never re-forwards, so there is
+            // no placement loop.
+            let vars = to_engine_vars(variables);
+            match server
+                .create_forwarded(
+                    process_definition_id,
+                    process_definition_key,
+                    vars,
+                    tags,
+                    business_id,
+                    await_completion,
+                    fetch_variables,
+                    request_timeout,
+                )
+                .await
+            {
+                Ok(body) => conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(body),
+                }),
+                Err((status, message)) => conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status,
+                    body: Some(Value::String(message)),
+                }),
+            };
         }
     }
     
