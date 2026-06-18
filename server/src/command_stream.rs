@@ -198,6 +198,22 @@ pub enum ClientFrame {
     /// committed.
     #[serde(rename_all = "camelCase")]
     InstallDeployment { corr: u64, events: Vec<Event> },
+    /// **Intra-cluster only.** A gateway fans a published message out to this peer
+    /// so it correlates the message against the subscriptions on *its* owned
+    /// partitions (open message subscriptions are spread across the cluster with
+    /// their instances; message-start subscriptions live solely on the
+    /// partition-0 owner). Local-only: the peer correlates across its own
+    /// partitions and does **not** re-forward, so there is no fan-out loop.
+    /// Answered by a `CommandResult` carrying `{messageKey, correlatedInstanceKey}`.
+    #[serde(rename_all = "camelCase")]
+    PublishMessage {
+        corr: u64,
+        name: String,
+        #[serde(default)]
+        correlation_key: String,
+        #[serde(default)]
+        variables: Option<Map<String, Value>>,
+    },
 }
 
 /// Server → client frames.
@@ -610,6 +626,7 @@ async fn handle_client_frame(
         ClientFrame::Heartbeat => "heartbeat",
         ClientFrame::Deploy { .. } => "deploy",
         ClientFrame::InstallDeployment { .. } => "install_deployment",
+        ClientFrame::PublishMessage { .. } => "publish_message",
     };
     crate::metrics::record_stream_frame(frame_type);
     
@@ -804,6 +821,27 @@ async fn handle_client_frame(
                 corr,
                 status: 200,
                 body: None,
+            });
+        }
+        ClientFrame::PublishMessage {
+            corr,
+            name,
+            correlation_key,
+            variables,
+        } => {
+            let vars = to_engine_vars(variables);
+            let (message_key, instance) =
+                server.correlate_message_local(name, correlation_key, vars).await;
+            // Correlation may have advanced a token onto a service task on one of
+            // this peer's partitions, creating an activatable job: wake pollers.
+            server.signal_jobs_available();
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 200,
+                body: Some(serde_json::json!({
+                    "messageKey": message_key.to_string(),
+                    "correlatedInstanceKey": instance.map(|k| k.to_string()),
+                })),
             });
         }
     }

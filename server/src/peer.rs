@@ -247,6 +247,24 @@ impl PeerLink {
         self.request(|corr| ClientFrame::InstallDeployment { corr, events })
             .await
     }
+
+    /// Fans a published message out to this peer so it correlates against the
+    /// subscriptions on its owned partitions. The peer answers with
+    /// `{messageKey, correlatedInstanceKey}`.
+    pub async fn publish_message(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: Option<serde_json::Map<String, Value>>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::PublishMessage {
+            corr,
+            name,
+            correlation_key,
+            variables,
+        })
+        .await
+    }
 }
 
 /// Resolves a `CommandResult`/`InstanceCompleted` to its waiting request; other

@@ -1568,6 +1568,89 @@ impl ServerImpl {
         all_events
     }
 
+    /// Correlates a message across this node's owned partitions and returns the
+    /// minted message key and the first instance it correlated to (an existing
+    /// subscription or a message-start-created instance), if any. The local
+    /// building block for both the gateway fan-out and the peer-side
+    /// `PublishMessage` handler.
+    pub(crate) async fn correlate_message_local(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> (u64, Option<u64>) {
+        let events = self
+            .correlate_message_everywhere(name, correlation_key, variables)
+            .await;
+        let message_key = message_key_of(&events);
+        let instance = events.iter().find_map(|e| match e {
+            Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        });
+        (message_key, instance)
+    }
+
+    /// Correlates a message across the **whole cluster**: this node's own
+    /// partitions plus every peer (each correlates against its own partitions).
+    /// An open subscription's instance can live on any node, and the message-start
+    /// subscriptions live solely on the partition-0 owner, so a published message
+    /// must reach every node. Returns the (locally minted) message key and the
+    /// first correlated instance found across the cluster — local matches first,
+    /// then peers. A peer that is unreachable is logged and skipped (best-effort,
+    /// matching the no-buffer correlate-and-drop model). A single-node cluster
+    /// fans only locally — byte-identical to the pre-cluster path.
+    async fn correlate_message_cluster(
+        &self,
+        name: String,
+        correlation_key: String,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> (u64, Option<u64>) {
+        let engine_vars: std::collections::HashMap<String, Value> = variables
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), json_to_value(v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (message_key, mut instance) = self
+            .correlate_message_local(name.clone(), correlation_key.clone(), engine_vars)
+            .await;
+
+        if self.peers.has_peers() {
+            let topology = self.engine.topology();
+            for node in 0..topology.num_nodes() {
+                if node == topology.node_id {
+                    continue;
+                }
+                match self.peers.link(node).await {
+                    Ok(link) => match link
+                        .publish_message(name.clone(), correlation_key.clone(), variables.clone())
+                        .await
+                    {
+                        Ok(res) if res.status == 200 => {
+                            if instance.is_none() {
+                                instance = res
+                                    .body
+                                    .as_ref()
+                                    .and_then(|b| b.get("correlatedInstanceKey"))
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<u64>().ok());
+                            }
+                        }
+                        Ok(res) => {
+                            tracing::warn!("message fan-out to node {node}: status {}", res.status)
+                        }
+                        Err(e) => tracing::warn!("message fan-out to node {node} failed: {e}"),
+                    },
+                    Err(e) => tracing::warn!("message fan-out: node {node} unreachable: {e}"),
+                }
+            }
+        }
+        (message_key, instance)
+    }
+
     /// Publishes a message and correlates it to any matching open subscriptions.
     /// nanobpmn does not buffer messages (no TTL/dedup): the message is minted,
     /// correlated to every matching open subscription, then dropped. Always
@@ -1579,17 +1662,12 @@ impl ServerImpl {
         use apis::message::PublishMessageResponse as Resp;
 
         let correlation_key = body.correlation_key.clone().unwrap_or_default();
-        let variables = body
-            .variables
-            .as_ref()
-            .map(from_object_map)
-            .unwrap_or_default();
+        let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
-        let events = self
-            .correlate_message_everywhere(body_name, correlation_key, variables)
+        let (message_key, _instance) = self
+            .correlate_message_cluster(body_name, correlation_key, variables)
             .await;
-        let message_key = message_key_of(&events);
 
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
@@ -1612,26 +1690,16 @@ impl ServerImpl {
         use apis::message::CorrelateMessageResponse as Resp;
 
         let correlation_key = body.correlation_key.clone().unwrap_or_default();
-        let variables = body
-            .variables
-            .as_ref()
-            .map(from_object_map)
-            .unwrap_or_default();
+        let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
-        let events = self
-            .correlate_message_everywhere(body_name, correlation_key, variables)
+        let (message_key, correlated_instance) = self
+            .correlate_message_cluster(body_name, correlation_key, variables)
             .await;
-        let message_key = message_key_of(&events);
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
         // instance (ProcessInstanceCreated). Either way it correlated to an
         // instance; report the first matched instance key.
-        let correlated_instance = events.iter().find_map(|e| match e {
-            Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
-            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
-            _ => None,
-        });
 
         match correlated_instance {
             Some(instance_key) => {
@@ -3684,6 +3752,15 @@ fn from_object_map(
         .collect()
 }
 
+/// Converts an optional REST variables map into the plain JSON map carried over
+/// the command stream when a message is fanned out to cluster peers. Preserves
+/// the original JSON exactly so the peer re-derives identical engine values.
+fn wire_variables(
+    variables: Option<&std::collections::HashMap<String, types::Object>>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    variables.map(|m| m.iter().map(|(k, o)| (k.clone(), o.0.clone())).collect())
+}
+
 /// Converts a JSON value into the engine [`Value`] tree, preserving numbers
 /// (integral vs. decimal), lists and objects so FEEL can operate on them.
 pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
@@ -4508,6 +4585,70 @@ mod clustered_startup_tests {
             .await
             .expect("peer creates after the wire broadcast");
         assert!(!completed);
+    }
+
+    /// Serves a node's command-stream endpoint on an ephemeral port and returns
+    /// its HTTP base URL, so a peer can forward to it exactly as in a cluster.
+    async fn serve_node(server: &ServerImpl) -> String {
+        let registry = command_stream::Registry::new();
+        command_stream::spawn_dispatcher(server.clone(), registry.clone());
+        let app = command_stream::router(server.clone(), registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn published_message_fans_out_to_the_owners_message_start_subscription() {
+        // The deployment-partition owner (node 0) holds every message-start
+        // subscription. A message published at a DIFFERENT gateway (node 1) must
+        // still reach it, creating an instance — the cross-node fan-out.
+        let node0 = clustered_node(0);
+        let proc = ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("order-flow".to_string(), "order.bpmn".to_string());
+        node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy message-start process on the owner");
+
+        let node0_url = serve_node(&node0).await;
+
+        // node 1 is the gateway the client hits; it points at the served owner.
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        // Publishing at node 1 fans out to node 0, whose message-start
+        // subscription fires and creates a new instance on partition 0.
+        let (_message_key, instance) = node1
+            .correlate_message_cluster("order-placed".into(), String::new(), None)
+            .await;
+        let instance = instance.expect("message-start must create an instance via fan-out");
+        assert_eq!(
+            nanobpmn_engine_core::partition_of(instance),
+            0,
+            "the message-start instance lives on the owner's partition 0"
+        );
     }
 }
 
