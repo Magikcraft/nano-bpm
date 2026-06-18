@@ -49,6 +49,37 @@ pub const fn compose_key(partition_id: u64, local: u64) -> Key {
     (partition_id << LOCAL_BITS) | (local & LOCAL_MASK)
 }
 
+/// Stable 64-bit FNV-1a hash of `bytes`. Deterministic across processes,
+/// architectures and restarts (unlike the standard-library `DefaultHasher`,
+/// which is randomly seeded), so every node in a cluster derives the same
+/// placement for the same input.
+#[inline]
+pub const fn stable_hash(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash
+}
+
+/// Partition that owns the message subscription for `correlation_key` in a
+/// `num_partitions`-wide cluster (Zeebe-style placement: a subscription and a
+/// published message land on the same partition iff they share a correlation
+/// key). Deterministic via [`stable_hash`]. With `num_partitions == 1` this is
+/// always partition `0`, so a single-partition host behaves exactly as before.
+#[inline]
+pub fn subscription_partition(correlation_key: &str, num_partitions: u64) -> u64 {
+    if num_partitions <= 1 {
+        return 0;
+    }
+    stable_hash(correlation_key.as_bytes()) % num_partitions
+}
+
 /// Lifecycle state of a process instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1153,6 +1184,51 @@ pub fn apply(state: &mut State, event: &Event) {
                 // with due_at = None so a later tick never re-fires it.
                 start_timer.due_at = *next_due_at;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{stable_hash, subscription_partition};
+
+    #[test]
+    fn stable_hash_is_deterministic_and_input_sensitive() {
+        assert_eq!(stable_hash(b"order-42"), stable_hash(b"order-42"));
+        assert_ne!(stable_hash(b"order-42"), stable_hash(b"order-43"));
+        // FNV-1a offset basis for the empty input.
+        assert_eq!(stable_hash(b""), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn single_partition_places_every_key_on_zero() {
+        for key in ["", "a", "order-1", "customer-99"] {
+            assert_eq!(subscription_partition(key, 1), 0);
+        }
+    }
+
+    #[test]
+    fn placement_is_stable_and_within_range() {
+        let n = 4;
+        for key in ["order-1", "order-2", "x", "really-long-correlation-key-value"] {
+            let p = subscription_partition(key, n);
+            assert!(p < n);
+            // Stable across calls.
+            assert_eq!(p, subscription_partition(key, n));
+        }
+    }
+
+    #[test]
+    fn placement_spreads_across_partitions() {
+        let n = 4;
+        let mut seen = [0u32; 4];
+        for i in 0..1000 {
+            let key = format!("correlation-{i}");
+            seen[subscription_partition(&key, n) as usize] += 1;
+        }
+        // Every partition gets a non-trivial share (no degenerate hashing).
+        for count in seen {
+            assert!(count > 150, "uneven placement: {seen:?}");
         }
     }
 }

@@ -34,6 +34,11 @@ pub struct Engine {
     /// `compose_key(partition_id, next_local + 1)`. The single-writer loop makes
     /// plain increments deterministic.
     next_local: u64,
+    /// Total number of partitions in the cluster (`1` for a single-partition
+    /// host). Used to place message subscriptions on the partition owning
+    /// `hash(correlation_key)` (see [`crate::subscription_partition`]); with a
+    /// value of `1` every subscription is local, so behaviour is unchanged.
+    num_partitions: u64,
     /// The clock reading for the command currently being processed, in the units
     /// the host supplies (Unix epoch milliseconds on the server). Set at the top
     /// of [`Engine::apply_command_at`] and read where the engine stamps a
@@ -94,6 +99,7 @@ impl Engine {
             state: State::new(),
             partition_id,
             next_local: 0,
+            num_partitions: 1,
             now: 0,
         }
     }
@@ -101,6 +107,28 @@ impl Engine {
     /// Read-only access to the full engine state (useful for queries and tests).
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Sets the cluster-wide partition count used to place message
+    /// subscriptions (see [`crate::subscription_partition`]). Defaults to `1`
+    /// (single-partition, every subscription local). A clustered host calls
+    /// this with `NANOBPMN_PARTITIONS` right after construction/replay so the
+    /// engine routes catch-event subscriptions to the partition owning their
+    /// correlation key. Must be identical on every node and stable for the life
+    /// of the cluster.
+    pub fn set_num_partitions(&mut self, num_partitions: u64) {
+        self.num_partitions = num_partitions.max(1);
+    }
+
+    /// The cluster-wide partition count this engine is configured with.
+    pub fn num_partitions(&self) -> u64 {
+        self.num_partitions
+    }
+
+    /// The partition that owns the message subscription for `correlation_key`.
+    /// Always this engine's own partition when single-partition.
+    pub fn subscription_partition(&self, correlation_key: &str) -> u64 {
+        state::subscription_partition(correlation_key, self.num_partitions)
     }
 
     /// Rebuilds an engine by replaying a recorded event log.
@@ -149,6 +177,7 @@ impl Engine {
             state,
             partition_id,
             next_local,
+            num_partitions: 1,
             now: 0,
         }
     }
