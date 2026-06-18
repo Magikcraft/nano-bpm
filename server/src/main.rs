@@ -57,6 +57,12 @@ use crate::readstore::ReadStore;
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 
+/// In a multi-node cluster, the maximum a REST `activateJobs` long poll sleeps
+/// between peer re-polls. The `jobs_available` notify only fires for local job
+/// arrivals, so this bounds the latency before a job that appeared on a peer's
+/// partition is pulled and returned. Single-node never uses it (no peers).
+const PEER_ACTIVATION_POLL_MS: u64 = 25;
+
 /// Default window (ms) an `awaitCompletion` create request waits for the process
 /// instance to finish when `requestTimeout` is absent or 0. On expiry the
 /// request still returns 200 with `processCompleted=false` and the instance key.
@@ -3705,8 +3711,14 @@ impl ServerImpl {
         };
         let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
 
+        // Remote nodes to draw the shortfall from once local partitions are
+        // drained (REST job aggregation, the analog of the stream dispatcher's
+        // peer pull). Empty on a single-node cluster ⇒ the whole peer path is
+        // skipped and this method is byte-identical to the pre-cluster long poll.
+        let peers = self.peer_nodes();
+
         loop {
-            let jobs = self
+            let mut jobs = self
                 .try_activate(
                     &job_type,
                     &worker,
@@ -3715,6 +3727,32 @@ impl ServerImpl {
                     fetch_variable.as_deref(),
                 )
                 .await;
+
+            // Cluster: top up from peers' partitions so a REST worker hitting one
+            // gateway is fed by the whole cluster. The peer leases each job under
+            // `timeout`, so at-least-once survives this gateway dying before the
+            // worker completes (the lease expires and the job re-activates on its
+            // owner); completions route back via the cluster-aware REST complete.
+            if jobs.len() < max_jobs && !peers.is_empty() {
+                for &node in &peers {
+                    if jobs.len() >= max_jobs {
+                        break;
+                    }
+                    let want = max_jobs - jobs.len();
+                    let more = self
+                        .activate_from_peer(
+                            node,
+                            &job_type,
+                            &worker,
+                            want,
+                            timeout,
+                            fetch_variable.as_deref(),
+                        )
+                        .await;
+                    jobs.extend(more);
+                }
+            }
+
             if !jobs.is_empty() {
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
@@ -3736,9 +3774,19 @@ impl ServerImpl {
                             models::JobActivationResult::new(Vec::new()),
                         ));
                     }
-                    // Wait for a wake-up or the remaining window, then retry.
+                    // Wait for a wake-up or the remaining window, then retry. The
+                    // `jobs_available` notify only fires for LOCAL job arrivals, so
+                    // when peers exist we cap the wait to a short poll interval to
+                    // re-pull from them within bounded latency. Single-node keeps
+                    // the original unbounded wait (no peers, nothing to re-poll).
+                    let remaining = deadline - now;
+                    let wait = if peers.is_empty() {
+                        remaining
+                    } else {
+                        remaining.min(Duration::from_millis(PEER_ACTIVATION_POLL_MS))
+                    };
                     let notified = self.jobs_available.notified();
-                    let _ = tokio::time::timeout(deadline - now, notified).await;
+                    let _ = tokio::time::timeout(wait, notified).await;
                 }
             }
         }
@@ -5675,6 +5723,51 @@ mod clustered_startup_tests {
         // node 0 reports exactly node 1 as its job-aggregation peer.
         let node0 = clustered_node(0);
         assert_eq!(node0.peer_nodes(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn rest_activate_jobs_aggregates_a_peer_owned_job() {
+        // The REST `activateJobs` long poll, like the stream dispatcher, tops up
+        // from peers: a REST worker hitting one gateway is fed jobs that live on
+        // another node's partitions.
+        //
+        // node 0 owns partitions 0 & 2, seeds the demo, and parks a `demo-work`
+        // job. node 1 (a different gateway) owns no such job locally but must
+        // aggregate it from node 0.
+        let node0 = clustered_node(0);
+        let (_instance, _) = node0
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("owner creates the demo instance");
+        let node0_url = serve_node(&node0).await;
+
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node1 = build_server(journals, store, topology);
+
+        // Long polling disabled (requestTimeout < 0): the only way this returns a
+        // job is by aggregating from node 0 in the same pass.
+        let mut req = models::JobActivationRequest::new("demo-work".into(), 60_000, 10);
+        req.request_timeout = Some(-1);
+        let resp = node1.activate_jobs_impl(&req).await.expect("activate ok");
+        use apis::job::ActivateJobsResponse as R;
+        let jobs = match resp {
+            R::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected 200 list, got {other:?}"),
+        };
+        assert_eq!(jobs.len(), 1, "node 1 aggregates the peer's parked job over REST");
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+        let p = nanobpmn_engine_core::partition_of(job_key);
+        assert!(p == 0 || p == 2, "the aggregated job lives on a node-0 partition, got {p}");
     }
 }
 
