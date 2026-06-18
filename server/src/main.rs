@@ -43,7 +43,7 @@ use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
     ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, ProcessBuilder,
-    ProcessInstanceState, Value, MAX_PARTITION_ID,
+    ProcessDefinition, ProcessInstanceState, Value, MAX_PARTITION_ID,
 };
 
 use crate::backpressure::{
@@ -374,6 +374,32 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             process: deployed.definition.clone(),
         })
         .collect()
+}
+
+/// Parses every deployment resource up front so a deploy is all-or-nothing,
+/// returning the parsed process definitions and a map from process id to its
+/// originating resource name. `Err` is `(title, detail)` for a 400 response.
+fn parse_deploy_resources(
+    resources: &[(String, String)],
+) -> Result<(Vec<ProcessDefinition>, std::collections::HashMap<String, String>), (&'static str, String)>
+{
+    let mut processes = Vec::new();
+    let mut resource_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (resource_name, xml) in resources {
+        match parse_bpmn(xml) {
+            Ok(defs) => {
+                for def in defs {
+                    resource_names.insert(def.id.clone(), resource_name.clone());
+                    processes.push(def);
+                }
+            }
+            Err(e) => {
+                return Err(("Invalid BPMN", format!("Failed to parse '{resource_name}': {e}.")));
+            }
+        }
+    }
+    Ok((processes, resource_names))
 }
 
 impl Default for ServerImpl {
@@ -2543,49 +2569,70 @@ impl ServerImpl {
             )));
         }
 
-        // Parse every resource up front so the deployment is all-or-nothing.
-        let mut processes = Vec::new();
-        let mut resource_names: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for (resource_name, xml) in &resources {
-            match parse_bpmn(xml) {
-                Ok(defs) => {
-                    for def in defs {
-                        resource_names.insert(def.id.clone(), resource_name.clone());
-                        processes.push(def);
-                    }
-                }
-                Err(e) => {
+        // Centralized cluster deployment: the partition-0 owner is the deploy
+        // authority. If this gateway owns partition 0, deploy locally (durable)
+        // and broadcast the result to every peer so all nodes can instantiate the
+        // process. Otherwise forward the whole deploy to the owner over the
+        // command stream and return its answer. Single-node always owns
+        // partition 0, so this is the unchanged local path.
+        if self.engine.topology().is_local(0) {
+            let (processes, resource_names) = match parse_deploy_resources(&resources) {
+                Ok(parsed) => parsed,
+                Err((title, detail)) => {
                     return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid BPMN",
-                        400,
-                        format!("Failed to parse '{resource_name}': {e}."),
+                        title, 400, detail,
                     )));
                 }
+            };
+            match self
+                .deploy_resources_locally(processes, &resource_names, &tenant_id)
+                .await
+            {
+                Ok((result, events)) => {
+                    self.broadcast_deployment(&events).await;
+                    Ok(Resp::Status200_TheResourcesAreDeployed(result))
+                }
+                Err((title, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
+                    problem(title, 400, detail),
+                )),
+            }
+        } else {
+            match self.forward_deploy(resources, tenant_id).await {
+                Ok(result) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
+                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
+                    problem("Deployment failed", status, detail),
+                )),
             }
         }
+    }
 
-        let deploy_result: Result<(Arc<Vec<Event>>, Commit), Box<Resp>> = self
+    /// Deploys already-parsed `processes` on this node's deployment partition
+    /// (durable) and replicates the definition(s) in-memory to its other owned
+    /// partitions. Returns the typed deployment result and the minted
+    /// `ProcessDeployed` events (for cross-node broadcast). The caller must be the
+    /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
+    async fn deploy_resources_locally(
+        &self,
+        processes: Vec<ProcessDefinition>,
+        resource_names: &std::collections::HashMap<String, String>,
+        tenant_id: &str,
+    ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
+        let deploy_result: Result<(Arc<Vec<Event>>, Commit), String> = self
             .engine
             .deploy_partition()
             .with(move |engine| {
-                match engine.apply_command(Command::DeployResources(processes)) {
-                    Ok(pair) => Ok(pair),
-                    Err(e) => Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid deployment",
-                        400,
-                        e.to_string(),
-                    )))),
-                }
+                engine
+                    .apply_command(Command::DeployResources(processes))
+                    .map_err(|e| e.to_string())
             })
             .await;
         let (events, commit) = match deploy_result {
             Ok(pair) => pair,
-            Err(resp) => return Ok(*resp),
+            Err(e) => return Err(("Invalid deployment", e)),
         };
-        // Replicate the new definition(s) to the other partitions so any of them
-        // can instantiate the process (the deployment itself is journaled only on
-        // partition 0; replication is in-memory and re-derived on restart).
+        // Replicate the new definition(s) to the other local partitions so any of
+        // them can instantiate the process (the deployment itself is journaled
+        // only on partition 0; replication is in-memory and re-derived on restart).
         self.replicate_deployment(&events).await;
 
         let mut deployment_key = String::new();
@@ -2604,7 +2651,7 @@ impl ServerImpl {
                     process.id.clone(),
                     *version,
                     resource_name,
-                    tenant_id.clone(),
+                    tenant_id.to_string(),
                     models::ProcessDefinitionKey(process_definition_key.to_string()),
                 );
                 deployments.push(models::DeploymentMetadataResult::new(
@@ -2619,13 +2666,169 @@ impl ServerImpl {
 
         let result = models::DeploymentResult::new(
             models::DeploymentKey(deployment_key),
-            tenant_id,
+            tenant_id.to_string(),
             deployments,
         );
         // Deployments don't create jobs, but a freshly available process means a
         // later createProcessInstance can; nothing to notify here.
         commit.wait().await;
-        Ok(Resp::Status200_TheResourcesAreDeployed(result))
+        Ok((result, events))
+    }
+
+    /// Runs a forwarded deploy on the partition-0 owner: parses, deploys locally,
+    /// broadcasts to peers, and returns the deployment JSON. Invoked by the
+    /// `Deploy` command-stream frame handler. `Err` is `(status, detail)`.
+    pub async fn deploy_centralized(
+        &self,
+        resources: Vec<(String, String)>,
+        tenant_id: String,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let (processes, resource_names) =
+            parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
+        let (result, events) = self
+            .deploy_resources_locally(processes, &resource_names, &tenant_id)
+            .await
+            .map_err(|(_, detail)| (400u16, detail))?;
+        self.broadcast_deployment(&events).await;
+        Ok(serde_json::to_value(result).expect("deployment result serializes"))
+    }
+
+    /// Durably installs a deployment broadcast from the partition-0 owner onto
+    /// this node's owned partitions: a single durable copy (on the first owned
+    /// partition) plus an in-memory copy on the rest. The restart demux replays
+    /// the durable `ProcessDeployed` into every owned partition, so the
+    /// definition survives this node's independent restart on all of them.
+    /// Invoked by the `InstallDeployment` command-stream frame handler.
+    pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
+        let handles = self.engine.all();
+        let events = Arc::new(events);
+        let durable = {
+            let events = Arc::clone(&events);
+            handles[0]
+                .with(move |journal| journal.install_deployment_durable(&events))
+                .await
+        };
+        for handle in handles.iter().skip(1) {
+            let events = Arc::clone(&events);
+            handle
+                .with(move |journal| journal.install_deployment(&events))
+                .await;
+        }
+        durable.wait().await;
+    }
+
+    /// Forwards a deploy to the partition-0 owner over the command stream and
+    /// decodes its deployment JSON. Used when a gateway that does not own
+    /// partition 0 receives an HTTP deploy. `Err` is `(status, detail)`.
+    async fn forward_deploy(
+        &self,
+        resources: Vec<(String, String)>,
+        tenant_id: String,
+    ) -> Result<models::DeploymentResult, (u16, String)> {
+        let owner = self.engine.topology().owner_of(0);
+        let link = self
+            .peers
+            .link(owner)
+            .await
+            .map_err(|e| (502u16, format!("deploy-partition owner unreachable: {e}")))?;
+        let res = link
+            .deploy(resources, Some(tenant_id))
+            .await
+            .map_err(|e| (502u16, format!("deploy forward failed: {e}")))?;
+        if res.status != 200 {
+            let detail = res
+                .body
+                .as_ref()
+                .and_then(|b| b.as_str().map(str::to_string))
+                .unwrap_or_else(|| "deployment rejected by owner".to_string());
+            return Err((res.status, detail));
+        }
+        let body = res
+            .body
+            .ok_or((502u16, "owner returned no deployment body".to_string()))?;
+        serde_json::from_value(body)
+            .map_err(|e| (502u16, format!("malformed deployment response: {e}")))
+    }
+
+    /// Broadcasts an already-minted deployment's `ProcessDeployed` events to every
+    /// peer so each can durably install the definition(s). Best-effort: a peer
+    /// that is briefly unreachable is logged and skipped (a runtime deploy assumes
+    /// the cluster is up; the startup seed broadcast retries until acknowledged).
+    /// A no-op for a single-node cluster.
+    async fn broadcast_deployment(&self, events: &Arc<Vec<Event>>) {
+        if !self.peers.has_peers() {
+            return;
+        }
+        let deployed: Vec<Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .cloned()
+            .collect();
+        if deployed.is_empty() {
+            return;
+        }
+        let topology = self.engine.topology();
+        for node in 0..topology.num_nodes() {
+            if node == topology.node_id {
+                continue;
+            }
+            match self.peers.link(node).await {
+                Ok(link) => {
+                    if let Err(e) = link.install_deployment(deployed.clone()).await {
+                        tracing::warn!("deploy broadcast to node {node} failed: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("deploy broadcast: node {node} unreachable: {e}"),
+            }
+        }
+    }
+
+    /// Spawns a background task — on the partition-0 owner of a clustered node —
+    /// that broadcasts this node's current deployment definitions to every peer,
+    /// retrying each until it acknowledges. Run at startup so peers receive the
+    /// seeded/recovered definitions even when they boot after this node (the
+    /// runtime `broadcast_deployment` is best-effort/single-shot and assumes the
+    /// cluster is already up). A no-op for a single-node cluster or a non-owner.
+    fn spawn_seed_broadcast(&self) {
+        if !self.peers.has_peers() || !self.engine.topology().is_local(0) {
+            return;
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            let events: Vec<Event> = server
+                .engine
+                .deploy_partition()
+                .with(|journal| deployment_replication_events(journal))
+                .await;
+            if events.is_empty() {
+                return;
+            }
+            let topology = server.engine.topology().clone();
+            for node in 0..topology.num_nodes() {
+                if node == topology.node_id {
+                    continue;
+                }
+                loop {
+                    match server.peers.link(node).await {
+                        Ok(link) => match link.install_deployment(events.clone()).await {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "seed deployment broadcast to node {node} acknowledged"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!("seed broadcast to node {node} failed: {e}; retrying")
+                            }
+                        },
+                        Err(e) => tracing::debug!(
+                            "seed broadcast: node {node} not yet reachable: {e}; retrying"
+                        ),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            }
+        });
     }
 
     /// Replicates a deployment's process definitions to every partition other
@@ -3794,9 +3997,25 @@ async fn main() {
                 // partition id encoded in every key. Any event for a partition
                 // this node does not own (a stray from a re-sharded layout) is
                 // dropped — its owner replays it from its own journal.
+                //
+                // `ProcessDeployed` is the exception: a deployment definition is
+                // partition-agnostic (it mints no instance state and arms no
+                // subscriptions) and its key belongs to the deployment partition
+                // (0), which a peer node does not own. So every `ProcessDeployed`
+                // is replayed into *every* owned partition, reconstructing the
+                // definition cluster-wide from a single durable copy (see
+                // `Journal::install_deployment_durable`). Start subscriptions /
+                // timers keep their partition-0 keys and demux normally, so they
+                // are only ever rebuilt on the deployment partition's owner.
                 let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
                     owned.iter().map(|p| (*p, Vec::new())).collect();
                 for event in events {
+                    if matches!(event, Event::ProcessDeployed { .. }) {
+                        for bucket in per_owned.values_mut() {
+                            bucket.push(event.clone());
+                        }
+                        continue;
+                    }
                     let p = nanobpmn_engine_core::partition_of(event.max_key());
                     if let Some(bucket) = per_owned.get_mut(&p) {
                         bucket.push(event);
@@ -3880,6 +4099,12 @@ async fn main() {
     let cs_registry = command_stream::Registry::new();
     command_stream::spawn_dispatcher(server.clone(), cs_registry.clone());
     let cs_router = command_stream::router(server.clone(), cs_registry);
+
+    // Clustered partition-0 owner: push the seeded/recovered deployment
+    // definitions to every peer so the whole cluster can instantiate them,
+    // retrying until each peer (which may still be booting) acknowledges.
+    // No-op for a single-node cluster.
+    server.spawn_seed_broadcast();
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
@@ -4188,6 +4413,101 @@ mod clustered_startup_tests {
         // Over many calls it must exercise BOTH owned partitions (round-robin),
         // not collapse onto one.
         assert_eq!(seen.len(), 2, "for_create should spread across both owned partitions");
+    }
+
+    /// The `ProcessDeployed` events the deployment-partition owner broadcasts: the
+    /// definitions registered on a fresh single-node server (which seeds `demo`).
+    async fn demo_deployment_events() -> Vec<Event> {
+        let owner = ServerImpl::default();
+        owner
+            .engine
+            .deploy_partition()
+            .with(|journal| deployment_replication_events(journal))
+            .await
+    }
+
+    #[tokio::test]
+    async fn peer_cannot_create_until_deployment_is_installed() {
+        // A peer owns no deployment partition, so it has no demo definition and a
+        // create is rejected — the live-observed node-1 create→400.
+        let node1 = clustered_node(1);
+        assert!(
+            node1
+                .create_for_stream(Some("demo".into()), None, Default::default())
+                .await
+                .is_err(),
+            "peer must reject a create before any deployment reaches it"
+        );
+
+        // Installing the broadcast deployment makes the peer able to create.
+        let events = demo_deployment_events().await;
+        assert!(!events.is_empty());
+        node1.install_replicated_deployment(events).await;
+
+        let (key, completed) = node1
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("peer creates after the deployment is installed");
+        assert!(!completed, "the demo parks at its service task");
+        // The instance lives on one of node 1's owned partitions (1 or 3) — the
+        // definition is partition-agnostic but the instance is minted locally.
+        let p = nanobpmn_engine_core::partition_of(key);
+        assert!(p == 1 || p == 3, "instance must live on an owned partition, got {p}");
+    }
+
+    #[tokio::test]
+    async fn deploy_broadcast_over_the_wire_reaches_a_peer() {
+        // Serve a real peer node (node 1) on an ephemeral command-stream endpoint.
+        let node1 = clustered_node(1);
+        let registry = command_stream::Registry::new();
+        command_stream::spawn_dispatcher(node1.clone(), registry.clone());
+        let app = command_stream::router(node1.clone(), registry);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let node1_url = format!("http://127.0.0.1:{port}");
+
+        // Build the deployment-partition owner (node 0) pointing at the served
+        // peer. It seeds `demo` on partition 0 and broadcasts it to node 1.
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused".into(), node1_url],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node0 = build_server(journals, store, topology);
+
+        // The peer has no definition yet.
+        assert!(
+            node1
+                .create_for_stream(Some("demo".into()), None, Default::default())
+                .await
+                .is_err()
+        );
+
+        // Broadcast node 0's seeded deployment to its peers over the command stream.
+        let events = node0
+            .engine
+            .deploy_partition()
+            .with(|journal| deployment_replication_events(journal))
+            .await;
+        node0.broadcast_deployment(&Arc::new(events)).await;
+
+        // The peer can now create the demo (the install rode the wire end-to-end).
+        let (_, completed) = node1
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("peer creates after the wire broadcast");
+        assert!(!completed);
     }
 }
 

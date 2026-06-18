@@ -221,6 +221,32 @@ impl PeerLink {
         })
         .await
     }
+
+    /// Forwards a client deploy to this peer (the deployment-partition owner),
+    /// which processes it centrally and broadcasts it. Used when a gateway that
+    /// does not own partition 0 receives a deploy.
+    pub async fn deploy(
+        &self,
+        resources: Vec<(String, String)>,
+        tenant_id: Option<String>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::Deploy {
+            corr,
+            resources,
+            tenant_id,
+        })
+        .await
+    }
+
+    /// Broadcasts an already-minted deployment's `ProcessDeployed` events to this
+    /// peer so it durably installs the definition(s) on its owned partitions.
+    pub async fn install_deployment(
+        &self,
+        events: Vec<nanobpmn_engine_core::Event>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::InstallDeployment { corr, events })
+            .await
+    }
 }
 
 /// Resolves a `CommandResult`/`InstanceCompleted` to its waiting request; other

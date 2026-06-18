@@ -575,6 +575,28 @@ impl Journal {
         self.engine.install_deployment(events);
     }
 
+    /// Durably installs a deployment replicated from another node: registers the
+    /// definition(s) (no key minting, no start subscriptions — `ProcessDeployed`
+    /// events only) **and** journals them so they survive this node's
+    /// independent restart. Unlike [`install_deployment`](Self::install_deployment)
+    /// (in-memory only, re-derived on restart from the local deployment
+    /// partition's log), a clustered peer owns no deployment partition, so it must
+    /// record its own durable copy. The journaled `ProcessDeployed` events carry
+    /// the deployment partition's keys; the restart demux replays every
+    /// `ProcessDeployed` into every owned partition (definitions are partition-
+    /// agnostic), so a single durable copy reconstructs the definition on all of
+    /// this node's partitions. Returns a [`Commit`] the caller awaits before
+    /// acknowledging the install.
+    pub fn install_deployment_durable(&mut self, events: &[Event]) -> Commit {
+        self.engine.install_deployment(events);
+        let deployed: Vec<Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .cloned()
+            .collect();
+        self.persist(&Arc::new(deployed))
+    }
+
     /// Wires the disk-backed variable spill. `budget` is the maximum number of
     /// resident instances allowed to hold their variables in hot RAM; once the
     /// active backlog exceeds it, each command that grows the backlog sheds the

@@ -47,6 +47,7 @@ use tokio::sync::Notify;
 
 use crate::ServerImpl;
 use crate::journal::Commit;
+use nanobpmn_engine_core::Event;
 
 /// Per-connection submission-credit window (creates the client may have in flight
 /// before it must wait for the server to replenish). Overridable via
@@ -176,6 +177,27 @@ pub enum ClientFrame {
         request_timeout: Option<i64>,
     },
     Heartbeat,
+    /// **Intra-cluster only.** A non-deployment-partition gateway forwards a
+    /// client's deploy to the partition-0 owner (the deploy authority), which
+    /// processes it durably and broadcasts the result to every peer. Answered by
+    /// a `corr`-correlated `CommandResult` carrying the deployment JSON (200) or
+    /// an error (4xx). See the centralized cluster-deployment model.
+    #[serde(rename_all = "camelCase")]
+    Deploy {
+        corr: u64,
+        /// `(resourceName, bpmnXml)` pairs, exactly as received over HTTP.
+        resources: Vec<(String, String)>,
+        #[serde(default)]
+        tenant_id: Option<String>,
+    },
+    /// **Intra-cluster only.** The deployment-partition owner broadcasts an
+    /// already-minted deployment (its `ProcessDeployed` events) to a peer, which
+    /// durably installs the definition(s) on its owned partitions without minting
+    /// new keys or arming start subscriptions (those stay solely on the
+    /// deployment partition). Answered by a `CommandResult` once the install is
+    /// committed.
+    #[serde(rename_all = "camelCase")]
+    InstallDeployment { corr: u64, events: Vec<Event> },
 }
 
 /// Server → client frames.
@@ -586,6 +608,8 @@ async fn handle_client_frame(
         ClientFrame::ThrowError { .. } => "throw_error",
         ClientFrame::AwaitInstance { .. } => "await_instance",
         ClientFrame::Heartbeat => "heartbeat",
+        ClientFrame::Deploy { .. } => "deploy",
+        ClientFrame::InstallDeployment { .. } => "install_deployment",
     };
     crate::metrics::record_stream_frame(frame_type);
     
@@ -750,6 +774,38 @@ async fn handle_client_frame(
             }
         },
         ClientFrame::Heartbeat => {}
+        ClientFrame::Deploy {
+            corr,
+            resources,
+            tenant_id,
+        } => {
+            // This node owns the deployment partition (a peer only forwards a
+            // Deploy here when it does not). Process it centrally — durable local
+            // deploy + broadcast to every peer — and return the deployment JSON.
+            match server
+                .deploy_centralized(resources, tenant_id.unwrap_or_else(|| "<default>".to_string()))
+                .await
+            {
+                Ok(body) => conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(body),
+                }),
+                Err((status, message)) => conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status,
+                    body: Some(Value::String(message)),
+                }),
+            };
+        }
+        ClientFrame::InstallDeployment { corr, events } => {
+            server.install_replicated_deployment(events).await;
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 200,
+                body: None,
+            });
+        }
     }
     
     // Record frame processing time
