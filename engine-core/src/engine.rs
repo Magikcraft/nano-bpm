@@ -452,7 +452,10 @@ impl Engine {
             }
         }
         for sub in self.state.message_subscriptions.values() {
-            if sub.state == state::MessageSubscriptionState::Open {
+            if matches!(
+                sub.state,
+                state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
+            ) {
                 guarded.insert(sub.instance_key);
             }
         }
@@ -1697,73 +1700,39 @@ impl Engine {
                     let element_id = subscription.element_id.clone();
                     let kind = subscription.kind.clone();
 
-                    self.emit(
-                        &mut log,
-                        Event::MessageCorrelated {
+                    if state::partition_of(instance_key) == self.partition_id {
+                        // The instance lives on this partition: correlate and
+                        // advance its token inline. This is the only path a
+                        // single-partition host ever takes, so its log is
+                        // byte-identical to the pre-placement engine.
+                        self.advance_correlated_token(
+                            &mut log,
+                            &mut queue,
                             subscription_key,
                             message_key,
                             instance_key,
                             element_instance_key,
-                            element_id: element_id.clone(),
-                        },
-                    );
-                    // The message's variables (if any) are merged into the
-                    // correlated instance before its token advances.
-                    if !variables.is_empty() {
+                            element_id,
+                            kind,
+                            &variables,
+                        );
+                    } else {
+                        // The instance lives on another partition: settle the
+                        // canonical subscription here and hand the token-advance to
+                        // the host, which routes a `CorrelateMessageSubscription`
+                        // continuation to `partition_of(instance_key)`.
                         self.emit(
                             &mut log,
-                            Event::VariablesUpdated {
-                                instance_key,
-                                variables: variables.clone(),
-                            },
-                        );
-                    }
-
-                    match kind {
-                        // Catch event: completing it resumes the token along its
-                        // own outgoing flow.
-                        state::MessageSubscriptionKind::IntermediateCatch => {
-                            queue.push_back(Step::Complete {
+                            Event::RemoteMessageCorrelation {
+                                subscription_key,
+                                message_key,
                                 instance_key,
                                 element_instance_key,
                                 element_id,
-                            });
-                        }
-                        // Boundary subscription: interrupt the attached activity
-                        // (a service task or sub-process), then run the boundary
-                        // event's outgoing flow. `element_instance_key`/
-                        // `element_id` are the activity here.
-                        state::MessageSubscriptionKind::InterruptingBoundary {
-                            boundary_element_id,
-                        } => {
-                            let scope = self.scope_of(instance_key, element_instance_key);
-                            self.interrupt_activity_via_boundary(
-                                &mut log,
-                                instance_key,
-                                element_instance_key,
-                                &element_id,
-                            );
-                            queue.push_back(Step::Activate {
-                                instance_key,
-                                element_id: boundary_element_id,
-                                scope,
-                            });
-                        }
-                        // Non-interrupting boundary subscription: leave the
-                        // activity (and its job) running and spawn a parallel
-                        // token along the boundary event's outgoing flow, in the
-                        // activity's scope. The subscription stays open (its
-                        // applier does not settle it), so the next matching
-                        // message spawns another token.
-                        state::MessageSubscriptionKind::NonInterruptingBoundary {
-                            boundary_element_id,
-                        } => {
-                            queue.push_back(Step::Activate {
-                                instance_key,
-                                element_id: boundary_element_id,
-                                scope: self.scope_of(instance_key, element_instance_key),
-                            });
-                        }
+                                kind,
+                                variables: variables.clone(),
+                            },
+                        );
                     }
                 }
 
@@ -1788,6 +1757,110 @@ impl Engine {
                         variables.clone(),
                         Vec::new(),
                         None,
+                    );
+                }
+            }
+
+            // --- Cross-partition message-subscription protocol -----------------
+            //
+            // These three commands are routed by the host between the instance
+            // partition (where a token waits) and the message partition
+            // (`hash(correlation_key)`, where the canonical subscription lives and
+            // where published messages correlate). A single-partition host never
+            // emits the events that drive them, so they only fire in a cluster.
+            Command::OpenMessageSubscription {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+            } => {
+                // Idempotent: re-delivering an open for a subscription we already
+                // hold (at-least-once retry, or a duplicate) is a no-op.
+                if !self
+                    .state
+                    .message_subscriptions
+                    .contains_key(&subscription_key)
+                {
+                    self.emit(
+                        &mut log,
+                        Event::MessageSubscriptionCreated {
+                            subscription_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            message_name,
+                            correlation_key,
+                            kind,
+                        },
+                    );
+                }
+            }
+
+            Command::CorrelateMessageSubscription {
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                variables,
+            } => {
+                // Advance only while the local record is still `Opening` (a parked
+                // token). Once it settles to `Correlated`/`Canceled` — or the
+                // instance is gone — a redelivered continuation is safely ignored,
+                // which is what makes the routed delivery at-least-once safe. A
+                // non-interrupting boundary keeps its `Opening` record open, so
+                // every routed message spawns another token.
+                let advance = matches!(
+                    self.state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .map(|s| s.state),
+                    Some(state::MessageSubscriptionState::Opening)
+                );
+                if advance {
+                    self.advance_correlated_token(
+                        &mut log,
+                        &mut queue,
+                        subscription_key,
+                        message_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind,
+                        &variables,
+                    );
+                }
+            }
+
+            Command::CloseMessageSubscription {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                // Disarm the canonical subscription because the instance partition
+                // tore down the waiting element. Idempotent: only an open
+                // subscription is cancelled.
+                let open = matches!(
+                    self.state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .map(|s| s.state),
+                    Some(state::MessageSubscriptionState::Open)
+                );
+                if open {
+                    self.emit(
+                        &mut log,
+                        Event::MessageSubscriptionCanceled {
+                            subscription_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                        },
                     );
                 }
             }
@@ -1852,7 +1925,11 @@ impl Engine {
                     .values()
                     .filter(|s| {
                         s.instance_key == instance_key
-                            && s.state == state::MessageSubscriptionState::Open
+                            && matches!(
+                                s.state,
+                                state::MessageSubscriptionState::Open
+                                    | state::MessageSubscriptionState::Opening
+                            )
                     })
                     .collect();
                 subs.sort_unstable_by_key(|s| s.key);
@@ -1927,6 +2004,94 @@ impl Engine {
                 break;
             }
             queue.extend(followups);
+        }
+    }
+
+    /// Records a correlation against a subscription whose **instance lives on this
+    /// partition** and advances its parked token: emits [`Event::MessageCorrelated`]
+    /// (settling the subscription unless it is a non-interrupting boundary), merges
+    /// the message's `variables`, then enqueues the catch/boundary outcome. Shared
+    /// by the inline local correlation in `CorrelateMessage` and the
+    /// `CorrelateMessageSubscription` continuation routed back from a message
+    /// partition, so both produce identical token-advance behaviour.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_correlated_token(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        subscription_key: Key,
+        message_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        kind: state::MessageSubscriptionKind,
+        variables: &HashMap<String, Value>,
+    ) {
+        self.emit(
+            log,
+            Event::MessageCorrelated {
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+            },
+        );
+        // The message's variables (if any) are merged into the correlated
+        // instance before its token advances.
+        if !variables.is_empty() {
+            self.emit(
+                log,
+                Event::VariablesUpdated {
+                    instance_key,
+                    variables: variables.clone(),
+                },
+            );
+        }
+
+        match kind {
+            // Catch event: completing it resumes the token along its own outgoing
+            // flow.
+            state::MessageSubscriptionKind::IntermediateCatch => {
+                queue.push_back(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
+            }
+            // Boundary subscription: interrupt the attached activity (a service
+            // task or sub-process), then run the boundary event's outgoing flow.
+            // `element_instance_key`/`element_id` are the activity here.
+            state::MessageSubscriptionKind::InterruptingBoundary {
+                boundary_element_id,
+            } => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.interrupt_activity_via_boundary(
+                    log,
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                );
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: boundary_element_id,
+                    scope,
+                });
+            }
+            // Non-interrupting boundary subscription: leave the activity (and its
+            // job) running and spawn a parallel token along the boundary event's
+            // outgoing flow, in the activity's scope. The subscription stays open
+            // (its applier does not settle it), so the next matching message spawns
+            // another token.
+            state::MessageSubscriptionKind::NonInterruptingBoundary {
+                boundary_element_id,
+            } => {
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: boundary_element_id,
+                    scope: self.scope_of(instance_key, element_instance_key),
+                });
+            }
         }
     }
 
@@ -2151,15 +2316,33 @@ impl Engine {
                 let subscription_key = self.mint_key();
                 let correlation_value =
                     self.resolve_correlation_value(instance_key, &correlation_key);
-                events.push(Event::MessageSubscriptionCreated {
-                    subscription_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    message_name,
-                    correlation_key: correlation_value,
-                    kind: state::MessageSubscriptionKind::IntermediateCatch,
-                });
+                let kind = state::MessageSubscriptionKind::IntermediateCatch;
+                // Zeebe-style placement: the canonical subscription lives on the
+                // partition owning `hash(correlation_key)`. When that is this
+                // partition (always so single-partition), open it locally; else
+                // park the token on an `Opening` record and let the host route an
+                // `OpenMessageSubscription` to the message partition.
+                if self.subscription_partition(&correlation_value) == self.partition_id {
+                    events.push(Event::MessageSubscriptionCreated {
+                        subscription_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        message_name,
+                        correlation_key: correlation_value,
+                        kind,
+                    });
+                } else {
+                    events.push(Event::MessageSubscriptionOpening {
+                        subscription_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        message_name,
+                        correlation_key: correlation_value,
+                        kind,
+                    });
+                }
             }
             // An embedded sub-process opens a token scope: it activates its inner
             // start event inside its own scope (this element instance) and rests
@@ -2667,7 +2850,11 @@ impl Engine {
             .values()
             .filter(|s| {
                 s.element_instance_key == element_instance_key
-                    && s.state == state::MessageSubscriptionState::Open
+                    && matches!(
+                        s.state,
+                        state::MessageSubscriptionState::Open
+                            | state::MessageSubscriptionState::Opening
+                    )
             })
             .collect();
         subs.sort_by_key(|s| s.key);
@@ -2752,15 +2939,31 @@ impl Engine {
                     boundary_element_id: boundary_id,
                 }
             };
-            events.push(Event::MessageSubscriptionCreated {
-                subscription_key,
-                instance_key,
-                element_instance_key,
-                element_id: element_id.to_string(),
-                message_name,
-                correlation_key: correlation_value,
-                kind,
-            });
+            // Placement matches the intermediate catch: a boundary subscription
+            // whose correlation key hashes off-partition is opened on the message
+            // partition; locally we keep only an `Opening` record (the host routes
+            // the open). Single-partition always opens locally.
+            if self.subscription_partition(&correlation_value) == self.partition_id {
+                events.push(Event::MessageSubscriptionCreated {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.to_string(),
+                    message_name,
+                    correlation_key: correlation_value,
+                    kind,
+                });
+            } else {
+                events.push(Event::MessageSubscriptionOpening {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.to_string(),
+                    message_name,
+                    correlation_key: correlation_value,
+                    kind,
+                });
+            }
         }
         events
     }
@@ -2929,7 +3132,11 @@ impl Engine {
             .values()
             .filter(|s| {
                 s.element_instance_key == element_instance_key
-                    && s.state == state::MessageSubscriptionState::Open
+                    && matches!(
+                        s.state,
+                        state::MessageSubscriptionState::Open
+                            | state::MessageSubscriptionState::Opening
+                    )
                     && matches!(
                         s.kind,
                         state::MessageSubscriptionKind::InterruptingBoundary { .. }
@@ -3766,6 +3973,191 @@ mod tests {
         // A repeat message never correlates the now-settled subscription twice.
         let fired = engine.correlate_message("payment-received", "A", HashMap::new(), 0);
         assert!(!fired
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    }
+
+    /// The cross-partition (Zeebe-style) placement protocol for an intermediate
+    /// catch: the instance partition parks on an `Opening` record, the host routes
+    /// `OpenMessageSubscription` to the message partition (`hash(correlation_key)`),
+    /// a published message correlates there and yields a `RemoteMessageCorrelation`,
+    /// and the routed `CorrelateMessageSubscription` continuation advances the token
+    /// back on the instance partition. Two engines, commands hand-routed.
+    #[test]
+    fn cross_partition_catch_opens_remote_then_correlates_back() {
+        const N: u64 = 2;
+        // A correlation value that hashes onto the *other* partition (1), so the
+        // subscription is placed off the instance partition (0).
+        let order = ('a'..='z')
+            .map(|c| c.to_string())
+            .find(|k| state::subscription_partition(k, N) == 1)
+            .expect("some key hashes to partition 1");
+
+        let mut instance_engine = Engine::with_partition(0);
+        instance_engine.set_num_partitions(N);
+        instance_engine
+            .apply_command(Command::DeployProcess(process_with_message_catch()))
+            .unwrap();
+
+        let mut message_engine = Engine::with_partition(1);
+        message_engine.set_num_partitions(N);
+
+        // Create the instance on partition 0; its token parks on an Opening record
+        // (the subscription's canonical home is partition 1).
+        let created = instance_engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str(order.clone()))]),
+            ))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(crate::partition_of(instance_key), 0);
+        assert!(!instance_engine.is_completed(instance_key));
+
+        // Exactly one Opening event, no local Open subscription.
+        let opening = created
+            .iter()
+            .find_map(|e| match e {
+                Event::MessageSubscriptionOpening {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    message_name,
+                    correlation_key,
+                    kind,
+                } => Some((
+                    *subscription_key,
+                    *instance_key,
+                    *element_instance_key,
+                    element_id.clone(),
+                    message_name.clone(),
+                    correlation_key.clone(),
+                    kind.clone(),
+                )),
+                _ => None,
+            })
+            .expect("an Opening event was emitted");
+        assert!(!created
+            .iter()
+            .any(|e| matches!(e, Event::MessageSubscriptionCreated { .. })));
+        assert_eq!(
+            instance_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Opening
+        );
+
+        // Host routes the open to the message partition: it records the canonical
+        // Open subscription.
+        let (sub_key, inst_key, eik, eid, name, ckey, kind) = opening;
+        assert_eq!(ckey, order);
+        message_engine
+            .apply_command(Command::OpenMessageSubscription {
+                subscription_key: sub_key,
+                instance_key: inst_key,
+                element_instance_key: eik,
+                element_id: eid,
+                message_name: name,
+                correlation_key: ckey,
+                kind,
+            })
+            .unwrap();
+        assert_eq!(
+            message_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Open
+        );
+
+        // Re-routing the same open is idempotent (no second subscription).
+        message_engine
+            .apply_command(Command::OpenMessageSubscription {
+                subscription_key: sub_key,
+                instance_key: inst_key,
+                element_instance_key: eik,
+                element_id: "await".into(),
+                message_name: "payment-received".into(),
+                correlation_key: order.clone(),
+                kind: state::MessageSubscriptionKind::IntermediateCatch,
+            })
+            .unwrap();
+        assert_eq!(message_engine.message_subscriptions().len(), 1);
+
+        // Publish lands on the message partition. It settles the canonical sub and
+        // emits a RemoteMessageCorrelation (no local token to advance there).
+        let published = message_engine
+            .apply_command(Command::correlate_message_with(
+                "payment-received",
+                order.clone(),
+                vars(&[("paid", Value::Bool(true))]),
+            ))
+            .unwrap();
+        assert!(!published
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+        let remote = published
+            .iter()
+            .find_map(|e| match e {
+                Event::RemoteMessageCorrelation {
+                    subscription_key,
+                    message_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    kind,
+                    variables,
+                } => Some((
+                    *subscription_key,
+                    *message_key,
+                    *instance_key,
+                    *element_instance_key,
+                    element_id.clone(),
+                    kind.clone(),
+                    variables.clone(),
+                )),
+                _ => None,
+            })
+            .expect("a RemoteMessageCorrelation was emitted");
+        assert_eq!(
+            message_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Correlated
+        );
+
+        // Host routes the continuation back to the instance partition: the token
+        // advances and the instance completes, merging the message variables.
+        let (r_sub, r_msg, r_inst, r_eik, r_eid, r_kind, r_vars) = remote;
+        assert_eq!(r_sub, sub_key);
+        assert_eq!(crate::partition_of(r_inst), 0);
+        let advanced = instance_engine
+            .apply_command(Command::CorrelateMessageSubscription {
+                subscription_key: r_sub,
+                message_key: r_msg,
+                instance_key: r_inst,
+                element_instance_key: r_eik,
+                element_id: r_eid,
+                kind: r_kind,
+                variables: r_vars,
+            })
+            .unwrap();
+        assert!(advanced
+            .iter()
+            .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+        assert!(instance_engine.is_completed(instance_key));
+        assert_eq!(
+            instance_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Correlated
+        );
+
+        // Re-delivering the continuation is a no-op (at-least-once safe).
+        let again = instance_engine
+            .apply_command(Command::CorrelateMessageSubscription {
+                subscription_key: sub_key,
+                message_key: r_msg,
+                instance_key: r_inst,
+                element_instance_key: r_eik,
+                element_id: "await".into(),
+                kind: state::MessageSubscriptionKind::IntermediateCatch,
+                variables: HashMap::new(),
+            })
+            .unwrap();
+        assert!(!again
             .iter()
             .any(|e| matches!(e, Event::MessageCorrelated { .. })));
     }

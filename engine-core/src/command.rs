@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::model::{ProcessDefinition, Value};
-use crate::state::Key;
+use crate::state::{Key, MessageSubscriptionKind};
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +128,47 @@ pub enum Command {
         message_name: String,
         correlation_key: String,
         variables: HashMap<String, Value>,
+    },
+    /// Open the **canonical** record for a message subscription on the partition
+    /// that owns its correlation key (`hash(correlation_key)`). Routed by the host
+    /// to the message partition after the instance partition emitted a
+    /// [`crate::Event::MessageSubscriptionOpening`]. Records a normal open
+    /// [`crate::Event::MessageSubscriptionCreated`]; **idempotent** — re-applying
+    /// it for an already-known `subscription_key` is a no-op (at-least-once safe).
+    OpenMessageSubscription {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        message_name: String,
+        correlation_key: String,
+        kind: MessageSubscriptionKind,
+    },
+    /// Deliver a correlation back to the **instance** partition: advance the token
+    /// parked on an `Opening` subscription (the counterpart of a
+    /// [`crate::Event::RemoteMessageCorrelation`] settled on the message
+    /// partition). Merges the message's `variables` and runs the catch/boundary
+    /// outcome exactly as a local correlation would. **Idempotent** — ignored if
+    /// the subscription is already settled or the instance has gone.
+    CorrelateMessageSubscription {
+        subscription_key: Key,
+        message_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        kind: MessageSubscriptionKind,
+        variables: HashMap<String, Value>,
+    },
+    /// Close a canonical subscription on the message partition because the
+    /// instance disarmed it (the guarded activity left the flow, the instance was
+    /// cancelled, or a sibling boundary fired). Routed by the host after the
+    /// instance partition cancelled its `Opening` record. **Idempotent** — a no-op
+    /// for an unknown or already-settled subscription.
+    CloseMessageSubscription {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
     },
     /// Cancel a running process instance. Every token is discarded: pending jobs
     /// are cancelled, armed timers and open message subscriptions are cancelled,

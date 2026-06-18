@@ -300,6 +300,25 @@ pub enum Event {
         correlation_key: String,
         kind: MessageSubscriptionKind,
     },
+    /// The **instance** partition parked a token on a message catch element whose
+    /// canonical subscription lives on another partition (`hash(correlation_key)`,
+    /// see [`crate::subscription_partition`]). This records the instance
+    /// partition's pending view; the host routes an
+    /// [`crate::Command::OpenMessageSubscription`] to the message partition (which
+    /// records the canonical [`Event::MessageSubscriptionCreated`]) and later a
+    /// [`crate::Command::CorrelateMessageSubscription`] continuation back here to
+    /// advance the token. Only emitted when `num_partitions > 1` and the key
+    /// hashes off-partition — a single-partition host never produces it, so its
+    /// log is byte-identical to before.
+    MessageSubscriptionOpening {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        message_name: String,
+        correlation_key: String,
+        kind: MessageSubscriptionKind,
+    },
     /// A published message correlated to an open subscription. For an
     /// intermediate catch event its token is released along the event's outgoing
     /// flow; for an interrupting boundary the attached activity is interrupted and
@@ -312,6 +331,22 @@ pub enum Event {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+    },
+    /// A published message matched a subscription on the **message** partition
+    /// whose instance lives on another partition. Settles the canonical
+    /// subscription (exactly like [`Event::MessageCorrelated`]) but does **not**
+    /// advance the token here; it carries the full continuation payload (kind +
+    /// the message's variables) so the host can route a
+    /// [`crate::Command::CorrelateMessageSubscription`] to the instance partition,
+    /// where the token actually advances. Only produced when `num_partitions > 1`.
+    RemoteMessageCorrelation {
+        subscription_key: Key,
+        message_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        kind: MessageSubscriptionKind,
+        variables: HashMap<String, Value>,
     },
     /// An open message subscription was cancelled before correlating because the
     /// element it guarded left the flow first (e.g. a boundary subscription whose
@@ -390,7 +425,9 @@ impl Event {
             | Event::TimerCanceled { instance_key, .. }
             | Event::JobCanceled { instance_key, .. }
             | Event::MessageSubscriptionCreated { instance_key, .. }
+            | Event::MessageSubscriptionOpening { instance_key, .. }
             | Event::MessageCorrelated { instance_key, .. }
+            | Event::RemoteMessageCorrelation { instance_key, .. }
             | Event::MessageSubscriptionCanceled { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
@@ -492,12 +529,23 @@ impl Event {
                 element_instance_key,
                 ..
             }
+            | Event::MessageSubscriptionOpening {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
             | Event::MessageSubscriptionCanceled {
                 subscription_key,
                 element_instance_key,
                 ..
             } => m = m.max(*subscription_key).max(*element_instance_key),
             Event::MessageCorrelated {
+                subscription_key,
+                message_key,
+                element_instance_key,
+                ..
+            }
+            | Event::RemoteMessageCorrelation {
                 subscription_key,
                 message_key,
                 element_instance_key,

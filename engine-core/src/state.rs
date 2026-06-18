@@ -383,6 +383,14 @@ pub struct Timer {
 pub enum MessageSubscriptionState {
     /// Open and waiting: a matching correlated message releases its token.
     Open,
+    /// Pending placement: the catch element's token is parked on the **instance**
+    /// partition, but the canonical subscription lives on a *different* partition
+    /// (`hash(correlation_key)`). This record is the instance partition's local
+    /// view, awaiting a [`crate::Command::CorrelateMessageSubscription`]
+    /// continuation routed back from the message partition. Only ever produced
+    /// when `num_partitions > 1` and the correlation key hashes off-partition; a
+    /// single-partition host never opens an `Opening` subscription.
+    Opening,
     /// Correlated: a matching message arrived and released its token. Retained
     /// so it is not correlated twice.
     Correlated,
@@ -1110,6 +1118,33 @@ pub fn apply(state: &mut State, event: &Event) {
             );
         }
 
+        // The instance partition's pending view of a subscription whose canonical
+        // record lives on the message partition (`hash(correlation_key)`). Holds
+        // the token until a `CorrelateMessageSubscription` continuation arrives.
+        Event::MessageSubscriptionOpening {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            message_name,
+            correlation_key,
+            kind,
+        } => {
+            state.message_subscriptions.insert(
+                *subscription_key,
+                MessageSubscription {
+                    key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    message_name: message_name.clone(),
+                    correlation_key: correlation_key.clone(),
+                    state: MessageSubscriptionState::Opening,
+                    kind: kind.clone(),
+                },
+            );
+        }
+
         Event::MessageCorrelated {
             subscription_key, ..
         } => {
@@ -1130,6 +1165,24 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
                 subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
+        // A match found on the message partition for a subscription whose instance
+        // lives on another partition: settle the canonical record exactly as
+        // `MessageCorrelated` does (a non-interrupting boundary stays open). The
+        // token advance happens on the instance partition, driven by the
+        // `CorrelateMessageSubscription` continuation the host routes there.
+        Event::RemoteMessageCorrelation {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
+                if !matches!(
+                    subscription.kind,
+                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                ) {
+                    subscription.state = MessageSubscriptionState::Correlated;
+                }
             }
         }
 
