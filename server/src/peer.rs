@@ -29,6 +29,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::cluster::Topology;
 use crate::command_stream::{ClientFrame, ServerFrame};
 
 /// Default ceiling on how long a forwarded request waits for its peer's
@@ -253,6 +254,59 @@ async fn route_server_frame(frame: ServerFrame, pending: &Pending) {
     }
 }
 
+/// The set of command-stream uplinks to a node's cluster peers, built from the
+/// [`Topology`]. The forwarding seam asks it for the link to a partition's owning
+/// node; links are established lazily on first use and re-established
+/// transparently after a drop, so a peer that is briefly down does not need a
+/// restart to rejoin.
+///
+/// A single-node cluster has no peers, so this is empty and never dialed —
+/// preserving the zero-overhead single-node path.
+#[derive(Clone)]
+pub struct PeerSet {
+    topology: Topology,
+    /// One slot per node id; `Some` once a link has been established. Guarded by
+    /// an async mutex so concurrent forwards to the same peer share one dial.
+    links: Arc<Mutex<HashMap<u32, PeerLink>>>,
+}
+
+impl PeerSet {
+    /// Builds the uplink set for `topology`. No connections are opened until a
+    /// peer is first needed.
+    pub fn new(topology: Topology) -> Self {
+        Self {
+            topology,
+            links: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Whether this node has any peers (false for a single-node cluster).
+    pub fn has_peers(&self) -> bool {
+        !self.topology.is_single_node()
+    }
+
+    /// Returns a live link to peer `node_id`, dialing it if there is no cached
+    /// link or the cached one has dropped. Concurrent callers for the same peer
+    /// share the single in-flight dial (serialized by the map lock).
+    pub async fn link(&self, node_id: u32) -> Result<PeerLink, PeerError> {
+        let mut links = self.links.lock().await;
+        if let Some(existing) = links.get(&node_id) {
+            if existing.is_connected() {
+                return Ok(existing.clone());
+            }
+            // Stale link (peer dropped): discard and redial below.
+            links.remove(&node_id);
+        }
+        let addr = self
+            .topology
+            .peer_addr(node_id)
+            .ok_or_else(|| PeerError::Connect(format!("no address for node {node_id}")))?;
+        let link = PeerLink::connect(addr).await?;
+        links.insert(node_id, link.clone());
+        Ok(link)
+    }
+}
+
 /// Maps a peer's HTTP base URL to its command-stream WebSocket URL.
 /// `http://h:p` → `ws://h:p/command-stream`, `https://…` → `wss://…`.
 fn ws_url(base_url: &str) -> String {
@@ -355,6 +409,40 @@ mod tests {
         // Port 1 is privileged/unused — connect must fail, not hang.
         let err = PeerLink::connect("http://127.0.0.1:1").await;
         assert!(matches!(err, Err(PeerError::Connect(_))));
+    }
+
+    /// `PeerSet` dials a peer lazily from the topology address and reuses the live
+    /// link on the next call — the connection manager every forwarding op uses.
+    #[tokio::test]
+    async fn peer_set_dials_lazily_and_forwards() {
+        let peer_base = serve_peer().await;
+        // Node 0 of a 2-node cluster; node 1 is the served peer.
+        let topology = crate::cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://self-unused".to_string(), peer_base],
+            num_partitions: 4,
+        };
+        let peers = PeerSet::new(topology);
+        assert!(peers.has_peers());
+
+        let link = peers.link(1).await.expect("dial peer node 1");
+        let res = link
+            .create_instance(Some("demo".to_string()), None, None)
+            .await
+            .expect("forwarded create");
+        assert_eq!(res.status, 200);
+
+        // Second call reuses the cached, still-connected link (no redial).
+        let link2 = peers.link(1).await.expect("reuse cached link");
+        assert!(link2.is_connected());
+    }
+
+    /// A single-node cluster has no peers, so `PeerSet` is inert.
+    #[tokio::test]
+    async fn peer_set_single_node_has_no_peers() {
+        let peers = PeerSet::new(crate::cluster::Topology::single(1));
+        assert!(!peers.has_peers());
+        assert!(peers.link(0).await.is_err(), "single node has no peer to dial");
     }
 }
 

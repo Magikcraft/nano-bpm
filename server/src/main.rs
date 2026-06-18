@@ -148,6 +148,13 @@ pub struct ServerImpl {
     /// clean retry signal. Durability/at-least-once are unaffected (a shed create
     /// is never journaled).
     admission_max_create_queue: usize,
+    /// Command-stream uplinks to this node's cluster peers, built from the
+    /// [`Topology`]. Empty for a single-node cluster (zero overhead). The
+    /// forwarding seam consults it to reach a partition's owning node.
+    // Read by the forwarding handlers landing in the following increments
+    // (s1-broadcast / s1-bykey-forward); constructed and tested now.
+    #[allow(dead_code)]
+    peers: peer::PeerSet,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -306,6 +313,9 @@ impl ServerImpl {
                 EngineHandle::spawn(journal, ctrl)
             })
             .collect();
+        // Build peer uplinks before `topology` is consumed by the engine. A
+        // single-node topology yields an empty set (never dialed).
+        let peers = peer::PeerSet::new(topology.clone());
         let engine = if topology.is_single_node() {
             if owned_count > 1 {
                 tracing::info!("partitions: {owned_count} (keys embed partition id)");
@@ -338,6 +348,7 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             admission_max_backlog,
             admission_max_create_queue,
+            peers,
         }
     }
 }
