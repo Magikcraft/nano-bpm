@@ -545,6 +545,23 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
     models::ProblemDetail::new(title.to_string(), status, detail, String::new())
 }
 
+/// Parses `host` and `port` from a peer base URL like `http://10.0.0.1:8080` (or
+/// bare `10.0.0.1:8080`). Returns `None` when no host/port can be extracted (e.g.
+/// the empty self-address of a single-node topology), so the caller can fall back.
+fn parse_host_port(url: &str) -> Option<(String, i32)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    let port: i32 = port.parse().ok()?;
+    Some((host.to_string(), port))
+}
+
 /// Resolves the backpressure mode from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`.
 /// See [`parse_backpressure_setting`] for the grammar; backpressure is on (and
 /// adaptive) by default.
@@ -1601,44 +1618,69 @@ impl ServerImpl {
         }
     }
 
-    /// Reports the cluster topology. nanobpmn is a single-writer, single-partition
-    /// embedded engine, so it always advertises a one-broker, one-partition cluster
-    /// with this gateway acting as the healthy leader of partition 1. The broker and
-    /// gateway versions both report the server crate version.
+    /// Reports the real cluster topology: one broker per node, each advertising
+    /// the partitions it owns (deterministic `partition % num_nodes` ownership).
+    /// Partition ids are surfaced 1-based (Camunda convention) over nano's 0-based
+    /// internal partitions. At replication factor 1 each owned partition has a
+    /// single replica, so its owner is reported as the `leader`. A single-node
+    /// cluster reports one broker owning every partition — equivalent to the
+    /// previous hardcoded response but with the real partition count.
     async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
         let version = env!("CARGO_PKG_VERSION").to_string();
-        let port: i32 = std::env::var("PORT")
+        let topology = self.engine.topology();
+        let num_nodes = topology.num_nodes();
+        let num_partitions = topology.num_partitions;
+
+        // host:port for a broker. Peer URLs are `http://host:port`; for a
+        // single-node cluster `peers[0]` is unset, so fall back to this node's
+        // bound PORT. `self` (this node) always reports its own bound port.
+        let self_port: i32 = std::env::var("PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(8080);
-
-        let partition = models::Partition {
-            partition_id: 1,
-            role: "leader".to_string(),
-            health: "healthy".to_string(),
+        let host_port = |node: u32| -> (String, i32) {
+            if node == topology.node_id {
+                return ("0.0.0.0".to_string(), self_port);
+            }
+            let url = topology.peers.get(node as usize).map(String::as_str).unwrap_or("");
+            parse_host_port(url).unwrap_or(("0.0.0.0".to_string(), self_port))
         };
 
-        let broker = models::BrokerInfo {
-            node_id: 0,
-            host: "0.0.0.0".to_string(),
-            port,
-            partitions: vec![partition],
-            version: version.clone(),
-        };
+        let brokers: Vec<models::BrokerInfo> = (0..num_nodes)
+            .map(|node| {
+                let partitions: Vec<models::Partition> = (0..num_partitions)
+                    .filter(|p| topology.owner_of(*p) == node)
+                    .map(|p| models::Partition {
+                        // 1-based partition id (Camunda convention).
+                        partition_id: (p + 1) as i32,
+                        role: "leader".to_string(),
+                        health: "healthy".to_string(),
+                    })
+                    .collect();
+                let (host, port) = host_port(node);
+                models::BrokerInfo {
+                    node_id: node as i32,
+                    host,
+                    port,
+                    partitions,
+                    version: version.clone(),
+                }
+            })
+            .collect();
 
-        let topology = models::TopologyResponse {
-            brokers: vec![broker],
+        let topology_response = models::TopologyResponse {
+            brokers,
             cluster_id: types::Nullable::Null,
-            cluster_size: 1,
-            partitions_count: 1,
+            cluster_size: num_nodes as i32,
+            partitions_count: num_partitions as i32,
             replication_factor: 1,
             gateway_version: version,
             last_completed_change_id: String::new(),
         };
 
-        Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology))
+        Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology_response))
     }
 
     /// Correlates a message across **all** partitions and returns the combined
@@ -6148,6 +6190,56 @@ mod clustered_startup_tests {
             ),
             "re-assigning an assigned task without override must 409 (proves the forward took effect)"
         );
+    }
+
+    #[tokio::test]
+    async fn topology_reports_every_node_and_its_partitions() {
+        // A 2-node, 4-partition cluster: ownership is p % num_nodes, so node 0
+        // owns partitions 0 & 2 and node 1 owns 1 & 3. The topology response must
+        // surface BOTH brokers, each listing only its own partitions (1-based).
+        let node0 = clustered_node(0);
+        use apis::cluster::GetTopologyResponse as Resp;
+        let t = match node0.get_topology_impl().await.unwrap() {
+            Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(t) => t,
+            other => panic!("expected 200 topology, got {other:?}"),
+        };
+
+        assert_eq!(t.cluster_size, 2, "two nodes");
+        assert_eq!(t.partitions_count, 4, "four partitions cluster-wide");
+        assert_eq!(t.replication_factor, 1, "stage 2 is still RF=1");
+        assert_eq!(t.brokers.len(), 2, "one broker per node");
+
+        let mut by_node: std::collections::HashMap<i32, Vec<i32>> =
+            std::collections::HashMap::new();
+        for b in &t.brokers {
+            assert_eq!(b.partitions.iter().filter(|p| p.role != "leader").count(), 0);
+            by_node.insert(
+                b.node_id,
+                b.partitions.iter().map(|p| p.partition_id).collect(),
+            );
+        }
+        // 1-based partition ids: node 0 owns internal {0,2} -> {1,3}; node 1 {1,3} -> {2,4}.
+        assert_eq!(by_node.get(&0), Some(&vec![1, 3]), "node 0 owns partitions 1 & 3 (1-based)");
+        assert_eq!(by_node.get(&1), Some(&vec![2, 4]), "node 1 owns partitions 2 & 4 (1-based)");
+    }
+
+    #[test]
+    fn parse_host_port_extracts_authority() {
+        assert_eq!(
+            parse_host_port("http://10.0.0.1:8080"),
+            Some(("10.0.0.1".to_string(), 8080))
+        );
+        assert_eq!(
+            parse_host_port("https://node-2.svc:9000/v2"),
+            Some(("node-2.svc".to_string(), 9000))
+        );
+        assert_eq!(
+            parse_host_port("127.0.0.1:7000"),
+            Some(("127.0.0.1".to_string(), 7000))
+        );
+        // No usable host/port (single-node self address) -> None, caller falls back.
+        assert_eq!(parse_host_port(""), None);
+        assert_eq!(parse_host_port("http://"), None);
     }
 
     #[test]
