@@ -1813,9 +1813,9 @@ fn multi_partition_state_survives_a_restart() {
     }
     server.shutdown();
 
-    // Reboot over the same per-partition journals: the read model is rebuilt from
-    // every partition's log and each instance is recovered on its owning
-    // partition.
+    // Reboot over the same shared journal: the read model is rebuilt from the
+    // single group-commit log and each instance is recovered on its owning
+    // partition (the log is demultiplexed by the partition encoded in each key).
     let restarted = ServerProcess::boot_with_env(&journal, &env);
     for key in &keys {
         let (status, body) = restarted.request_until(

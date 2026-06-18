@@ -39,7 +39,16 @@ struct Metrics {
     bytes_total: IntCounter,
     /// Writes enqueued but not yet fsynced — the live commit-pipeline depth.
     inflight: IntGauge,
-    
+    /// Cumulative wall time the writer thread spent blocked in `recv` with no
+    /// work (idle). Paired with `writer_busy_seconds`, a delta-scrape gives the
+    /// writer's duty cycle: `busy / (busy + idle)`. If idle ≈ 0 the single
+    /// writer is saturated and is the hard throughput ceiling.
+    writer_idle_seconds: prometheus::Counter,
+    /// Cumulative wall time the writer thread spent doing work (drain + linger +
+    /// serialize + fsync + ack). The non-fsync remainder (`busy − fsync_sum`) is
+    /// the writer's CPU cost; if that dominates, the ceiling is CPU not fsync.
+    writer_busy_seconds: prometheus::Counter,
+
     // ---- Phase 2: command-stream and protocol metrics ----
     
     /// Command-stream WebSocket frames processed, by frame type.
@@ -115,6 +124,17 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let writer_idle_seconds = prometheus::Counter::new(
+        "nanobpm_journal_writer_idle_seconds",
+        "Cumulative wall time the journal writer thread was idle (blocked in recv).",
+    )
+    .expect("valid counter");
+    let writer_busy_seconds = prometheus::Counter::new(
+        "nanobpm_journal_writer_busy_seconds",
+        "Cumulative wall time the journal writer thread was busy (drain+linger+fsync+ack).",
+    )
+    .expect("valid counter");
+
     // Phase 2: command-stream and protocol metrics
     use prometheus::IntCounterVec;
     use prometheus::Opts;
@@ -177,6 +197,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(writes_total.clone())))
         .and(registry.register(Box::new(bytes_total.clone())))
         .and(registry.register(Box::new(inflight.clone())))
+        .and(registry.register(Box::new(writer_idle_seconds.clone())))
+        .and(registry.register(Box::new(writer_busy_seconds.clone())))
         .and(registry.register(Box::new(stream_frames_total.clone())))
         .and(registry.register(Box::new(stream_credit_stalls_total.clone())))
         .and(registry.register(Box::new(stream_connections_active.clone())))
@@ -194,6 +216,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         writes_total,
         bytes_total,
         inflight,
+        writer_idle_seconds,
+        writer_busy_seconds,
         stream_frames_total,
         stream_credit_stalls_total,
         stream_connections_active,
@@ -205,12 +229,28 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
 
 /// Records one completed group-commit: its batch size, fsync duration, and bytes.
 pub fn record_commit(batch_size: usize, fsync: Duration, bytes: usize) {
+    record_write_batch(batch_size, bytes);
+    record_fsync(batch_size, fsync);
+}
+
+/// Records a batch of durable writes appended (write_all) but not necessarily yet
+/// fsynced. Used by the async-durability writer, which acks after the append and
+/// fsyncs on a separate cadence. `record_commit` delegates here for the bytes/
+/// writes counters.
+pub fn record_write_batch(writes: usize, bytes: usize) {
     let m = &*METRICS;
-    m.commit_batch_size.observe(batch_size as f64);
+    m.writes_total.inc_by(writes as u64);
+    m.bytes_total.inc_by(bytes as u64);
+}
+
+/// Records one fsync (group-commit barrier): the number of writes it made durable
+/// and its wall time. In sync mode `writes` == the batch; in async mode it is all
+/// writes appended since the previous fsync.
+pub fn record_fsync(writes: usize, fsync: Duration) {
+    let m = &*METRICS;
+    m.commit_batch_size.observe(writes as f64);
     m.fsync_seconds.observe(fsync.as_secs_f64());
     m.commits_total.inc();
-    m.writes_total.inc_by(batch_size as u64);
-    m.bytes_total.inc_by(bytes as u64);
 }
 
 /// Records how long a caller waited for its commit to become durable.
@@ -226,6 +266,15 @@ pub fn inflight_inc() {
 /// `n` durable writes were fsynced and acknowledged (pipeline depth -n).
 pub fn inflight_sub(n: usize) {
     METRICS.inflight.sub(n as i64);
+}
+
+/// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
+/// first request, `busy` is the time spent draining/lingering/fsyncing/acking
+/// that batch. Delta-scraping the two counters yields the writer's duty cycle.
+pub fn record_writer_cycle(idle: Duration, busy: Duration) {
+    let m = &*METRICS;
+    m.writer_idle_seconds.inc_by(idle.as_secs_f64());
+    m.writer_busy_seconds.inc_by(busy.as_secs_f64());
 }
 
 /// Renders the registry in the Prometheus text exposition format.

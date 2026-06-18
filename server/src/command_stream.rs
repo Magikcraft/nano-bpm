@@ -61,6 +61,11 @@ const HEARTBEAT_MS: u64 = 15_000;
 /// Max jobs leased to a single stream per dispatch tick, so a high-credit worker
 /// cannot starve its peers between round-robin rotations.
 const PER_STREAM_BATCH: usize = 64;
+/// Default number of connections serviced concurrently per dispatch pass (see
+/// [`dispatch_concurrency`]). Chosen to keep several activation round-trips in
+/// flight per partition engine thread so they stay busy, while bounding the
+/// High-priority activation load so it cannot crowd out completions.
+const DEFAULT_DISPATCH_CONCURRENCY: usize = 64;
 /// A connection is reaped as a phantom when no frame (the client's own heartbeat
 /// included) has arrived for this long. Three missed client heartbeats: long
 /// enough to tolerate a GC pause or a brief network blip, short enough to free a
@@ -964,55 +969,112 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// One dispatch pass: for each job type, lease and push jobs to credited streams in
-/// round-robin order until their credits, socket room, or the activatable pool runs
-/// out.
+/// One dispatch pass. Connections are serviced CONCURRENTLY, bounded by
+/// [`dispatch_concurrency`]: each connection is an independent unit of work that
+/// awaits its own activation round-trips, so many activations are in flight across
+/// the partition engine threads at once instead of one connection at a time. This
+/// fills the engine threads' idle headroom (profiling showed them ~16% busy under
+/// the old serial loop — the dispatcher, not the engine, was the ceiling) without
+/// weakening at-least-once: job leases are serialized on each engine thread, and
+/// per-connection credit/socket-room accounting is owned by exactly one task
+/// because the work is sharded by connection. Bounding the concurrency keeps the
+/// activation (High-priority) load from swamping completions in the engine mailbox.
 async fn dispatch_jobs(server: &ServerImpl, registry: &Arc<Registry>) {
+    // Regroup the round-robin plan by connection so each connection's whole
+    // workload (every job type it subscribes to) is handled by a single task,
+    // keeping its credit and socket-room mutations race-free across the pass.
+    let mut by_conn: Vec<(Arc<Connection>, Vec<(String, Arc<Subscription>)>)> = Vec::new();
+    let mut index: HashMap<ConnId, usize> = HashMap::new();
     for (job_type, targets) in registry.dispatch_plan() {
         for (conn, sub) in targets {
-            if conn.closed.load(Ordering::Relaxed) {
-                continue;
-            }
-            let credits = sub.credits.load(Ordering::Relaxed);
-            if credits <= 0 {
-                continue;
-            }
-            // Never lease more than we can immediately enqueue to this socket.
-            let room = conn.tx.capacity() as i64;
-            if room <= 0 {
-                // Credited demand we cannot satisfy because the outbound buffer is
-                // full: arm a redispatch so the writer wakes us the moment a slot
-                // frees, instead of relying on the backstop tick.
-                conn.wants_redispatch.store(true, Ordering::Relaxed);
-                continue;
-            }
-            let want = credits.min(room).min(PER_STREAM_BATCH as i64) as usize;
-            if want == 0 {
-                continue;
-            }
-            let jobs = server
-                .activate_for_stream(
-                    &job_type,
-                    &sub.worker,
-                    want,
-                    sub.timeout,
-                    sub.fetch_variable.as_deref(),
-                )
-                .await;
-            if jobs.is_empty() {
-                // Pool drained for this type; stop spending effort on it.
-                break;
-            }
-            let mut pushed = 0i64;
-            for job in jobs {
-                let value = serde_json::to_value(&job).unwrap_or(Value::Null);
-                if conn.send(ServerFrame::Job { job: value }) {
-                    pushed += 1;
-                }
-            }
-            sub.credits.fetch_sub(pushed, Ordering::Relaxed);
+            let slot = *index.entry(conn.id).or_insert_with(|| {
+                by_conn.push((conn.clone(), Vec::new()));
+                by_conn.len() - 1
+            });
+            by_conn[slot].1.push((job_type.clone(), sub));
         }
     }
+    if by_conn.is_empty() {
+        return;
+    }
+    let concurrency = dispatch_concurrency();
+    futures_util::stream::iter(
+        by_conn
+            .into_iter()
+            .map(|(conn, work)| dispatch_to_connection(server, conn, work)),
+    )
+    .buffer_unordered(concurrency)
+    .for_each(|_| async {})
+    .await;
+}
+
+/// Services one connection for a dispatch pass: leases and pushes jobs for each of
+/// its subscribed job types, in round-robin order, until its credits or outbound
+/// socket room run out. Because the pass shards by connection, this task is the
+/// sole mutator of `sub.credits` and the connection's socket for the pass, so the
+/// relaxed atomics need no cross-task coordination.
+async fn dispatch_to_connection(
+    server: &ServerImpl,
+    conn: Arc<Connection>,
+    work: Vec<(String, Arc<Subscription>)>,
+) {
+    if conn.closed.load(Ordering::Relaxed) {
+        return;
+    }
+    for (job_type, sub) in work {
+        let credits = sub.credits.load(Ordering::Relaxed);
+        if credits <= 0 {
+            continue;
+        }
+        // Never lease more than we can immediately enqueue to this socket.
+        let room = conn.tx.capacity() as i64;
+        if room <= 0 {
+            // Credited demand we cannot satisfy because the outbound buffer is
+            // full: arm a redispatch so the writer wakes us the moment a slot
+            // frees, instead of relying on the backstop tick.
+            conn.wants_redispatch.store(true, Ordering::Relaxed);
+            continue;
+        }
+        let want = credits.min(room).min(PER_STREAM_BATCH as i64) as usize;
+        if want == 0 {
+            continue;
+        }
+        let jobs = server
+            .activate_for_stream(
+                &job_type,
+                &sub.worker,
+                want,
+                sub.timeout,
+                sub.fetch_variable.as_deref(),
+            )
+            .await;
+        if jobs.is_empty() {
+            // Pool drained for this type right now; move on to this connection's
+            // other subscriptions rather than abandoning the whole connection.
+            continue;
+        }
+        let mut pushed = 0i64;
+        for job in jobs {
+            let value = serde_json::to_value(&job).unwrap_or(Value::Null);
+            if conn.send(ServerFrame::Job { job: value }) {
+                pushed += 1;
+            }
+        }
+        sub.credits.fetch_sub(pushed, Ordering::Relaxed);
+    }
+}
+
+/// Number of connections the dispatcher services concurrently in one pass.
+/// `NANOBPMN_DISPATCH_CONCURRENCY` overrides the default; values are clamped to at
+/// least 1. The default fans out enough activation round-trips to keep the engine
+/// threads busy (they idled at ~16% under fully serial dispatch) without an
+/// unbounded flood of High-priority activations that would crowd out completions.
+fn dispatch_concurrency() -> usize {
+    std::env::var("NANOBPMN_DISPATCH_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or(DEFAULT_DISPATCH_CONCURRENCY)
 }
 
 /// Refills each connection's submission window when the engine has headroom, so a

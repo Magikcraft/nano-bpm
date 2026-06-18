@@ -138,7 +138,12 @@ const MAX_GROUP_BATCH: usize = 8192;
 /// acknowledging or serving non-durable state (mirrors the previous
 /// panic-on-I/O-error contract).
 fn writer_loop(mut file: File, rx: Receiver<WriteRequest>, linger: Duration) {
-    while let Ok(first) = rx.recv() {
+    loop {
+        let idle_start = Instant::now();
+        let Ok(first) = rx.recv() else { break };
+        let idle = idle_start.elapsed();
+        let busy_start = Instant::now();
+
         let mut batch = vec![first];
         while let Ok(next) = rx.try_recv() {
             batch.push(next);
@@ -184,7 +189,142 @@ fn writer_loop(mut file: File, rx: Receiver<WriteRequest>, linger: Duration) {
             // tick and startup seeding never await their commit); that's fine.
             let _ = req.ack.send(());
         }
+        crate::metrics::record_writer_cycle(idle, busy_start.elapsed());
     }
+}
+
+/// The **async-durability** writer loop. Like [`writer_loop`] it group-commits a
+/// batch with a single `write_all`, but it **acknowledges callers immediately
+/// after the write reaches the OS page cache** and defers `fsync` to an
+/// amortized cadence (every [`AsyncFlush::interval`] or
+/// [`AsyncFlush::max_bytes`], whichever first). This removes the fsync media
+/// barrier from every commit's critical path and lets fsyncs coalesce across
+/// many batches, trading a bounded power-loss window for throughput. A process
+/// crash loses nothing — the appended bytes survive in the page cache / file and
+/// are replayed on restart; only an OS crash / power loss can lose the unfsynced
+/// tail. When the producer goes quiet the loop wakes on a bounded
+/// `recv_timeout` to flush that tail, so the window is always bounded by
+/// `interval`. Write/fsync errors abort, identical to the sync path.
+fn writer_loop_async(
+    mut file: File,
+    rx: Receiver<WriteRequest>,
+    linger: Duration,
+    flush: AsyncFlush,
+) {
+    let mut last_fsync = Instant::now();
+    let mut unsynced_bytes: usize = 0;
+    let mut unsynced_writes: usize = 0;
+
+    // Force a durability barrier for everything written since the last fsync.
+    let do_fsync = |file: &mut File, bytes: &mut usize, writes: &mut usize, last: &mut Instant| {
+        if *bytes == 0 {
+            return;
+        }
+        let fsync_start = Instant::now();
+        if let Err(e) = file.sync_all() {
+            tracing::error!(
+                "journal fsync failed: {e}; aborting to avoid serving non-durable state"
+            );
+            std::process::abort();
+        }
+        crate::metrics::record_fsync(*writes, fsync_start.elapsed());
+        *bytes = 0;
+        *writes = 0;
+        *last = Instant::now();
+    };
+
+    loop {
+        // Wait for the next request. While an unfsynced tail is outstanding,
+        // bound the wait so a quiet producer can't leave it unflushed past the
+        // configured interval.
+        let idle_start = Instant::now();
+        let first = if unsynced_bytes > 0 {
+            let budget = flush
+                .interval
+                .checked_sub(last_fsync.elapsed())
+                .unwrap_or_default();
+            match rx.recv_timeout(budget) {
+                Ok(req) => req,
+                Err(RecvTimeoutError::Timeout) => {
+                    do_fsync(
+                        &mut file,
+                        &mut unsynced_bytes,
+                        &mut unsynced_writes,
+                        &mut last_fsync,
+                    );
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(req) => req,
+                Err(_) => break,
+            }
+        };
+        let idle = idle_start.elapsed();
+        let busy_start = Instant::now();
+
+        let mut batch = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+        }
+        // Linger still fattens the *write* batch (fewer write_all syscalls), even
+        // though it no longer gates an fsync on the caller's behalf.
+        if !linger.is_zero() && batch.len() < MAX_GROUP_BATCH {
+            let deadline = Instant::now() + linger;
+            while batch.len() < MAX_GROUP_BATCH {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match rx.recv_timeout(remaining) {
+                    Ok(next) => batch.push(next),
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+
+        let mut buf = Vec::new();
+        for req in &batch {
+            buf.extend_from_slice(&req.bytes);
+        }
+        if let Err(e) = file.write_all(&buf) {
+            tracing::error!(
+                "journal write failed: {e}; aborting to avoid serving non-durable state"
+            );
+            std::process::abort();
+        }
+        unsynced_bytes += buf.len();
+        unsynced_writes += batch.len();
+        crate::metrics::record_write_batch(batch.len(), buf.len());
+
+        // Acknowledge now: the write is in the page cache and will survive a
+        // process restart; the amortized fsync below upgrades it to
+        // power-loss-durable.
+        crate::metrics::inflight_sub(batch.len());
+        for req in batch {
+            let _ = req.ack.send(());
+        }
+
+        if unsynced_bytes >= flush.max_bytes || last_fsync.elapsed() >= flush.interval {
+            do_fsync(
+                &mut file,
+                &mut unsynced_bytes,
+                &mut unsynced_writes,
+                &mut last_fsync,
+            );
+        }
+        crate::metrics::record_writer_cycle(idle, busy_start.elapsed());
+    }
+
+    // Drain on shutdown: fsync whatever tail was acked but not yet synced.
+    do_fsync(
+        &mut file,
+        &mut unsynced_bytes,
+        &mut unsynced_writes,
+        &mut last_fsync,
+    );
 }
 
 /// Group-commit linger window from `NANOBPMN_JOURNAL_LINGER_US` (microseconds).
@@ -199,6 +339,122 @@ fn journal_linger_from_env() -> Duration {
             Err(_) => Duration::ZERO,
         },
         Err(_) => Duration::ZERO,
+    }
+}
+
+/// Durability mode for the journal writer.
+///
+/// - [`Sync`](DurabilityMode::Sync) (default): a write is acknowledged only
+///   after it has been `fsync`ed. The strongest contract — anything the server
+///   returns `200` for survives power loss — at the cost of putting the ~4 ms
+///   media barrier on every commit's critical path.
+/// - [`Async`](DurabilityMode::Async): a write is acknowledged once it is in the
+///   OS page cache (after `write_all`), and `fsync` is amortized onto a periodic
+///   cadence in the background. This takes the fsync latency off the caller's
+///   critical path and lets fsyncs coalesce far more aggressively (the writer no
+///   longer blocks a commit per fsync), at the cost of a weaker durability
+///   window: a **process** crash loses nothing (the page cache, hence the log
+///   file, survives and is replayed on restart), but an **OS crash or power
+///   loss** can lose the unfsynced tail (bounded by the flush interval/bytes).
+///   This mirrors Zeebe's async-exporter model: ack from the in-memory/appended
+///   log, guarantee durability by journal replay on restart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DurabilityMode {
+    Sync,
+    Async,
+}
+
+/// Async-durability flush policy: `fsync` fires when either the bytes written
+/// since the last fsync reach `max_bytes`, or `interval` elapses (whichever
+/// comes first). Tunable via `NANOBPMN_ASYNC_FLUSH_MS` / `NANOBPMN_ASYNC_FLUSH_BYTES`.
+#[derive(Clone, Copy)]
+struct AsyncFlush {
+    interval: Duration,
+    max_bytes: usize,
+}
+
+/// Durability mode from `NANOBPMN_DURABILITY` (`sync` | `async`). Defaults to
+/// `sync` so the strong fsync-before-ack contract — and every existing test —
+/// is unchanged unless async is explicitly opted into.
+fn durability_mode_from_env() -> DurabilityMode {
+    match std::env::var("NANOBPMN_DURABILITY") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("async") => DurabilityMode::Async,
+        _ => DurabilityMode::Sync,
+    }
+}
+
+/// Async flush policy from env. `NANOBPMN_ASYNC_FLUSH_MS` (default 10, clamped to
+/// 1s) bounds the unfsynced time window; `NANOBPMN_ASYNC_FLUSH_BYTES` (default
+/// 8 MiB) bounds the unfsynced byte window. Either trigger forces an fsync.
+fn async_flush_from_env() -> AsyncFlush {
+    let interval = match std::env::var("NANOBPMN_ASYNC_FLUSH_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(ms) => Duration::from_millis(ms.clamp(1, 1000)),
+            Err(_) => Duration::from_millis(10),
+        },
+        Err(_) => Duration::from_millis(10),
+    };
+    let max_bytes = match std::env::var("NANOBPMN_ASYNC_FLUSH_BYTES") {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(8 << 20).max(4096),
+        Err(_) => 8 << 20,
+    };
+    AsyncFlush { interval, max_bytes }
+}
+
+/// Spawns the journal writer thread for `file`/`rx`, selecting the sync or async
+/// commit loop from `NANOBPMN_DURABILITY`. Shared by [`SharedWriter::open`] and
+/// [`Journal::open_partition`] so both honour the same durability configuration.
+fn spawn_writer(file: File, rx: Receiver<WriteRequest>) -> io::Result<JoinHandle<()>> {
+    let linger = journal_linger_from_env();
+    let mode = durability_mode_from_env();
+    let flush = async_flush_from_env();
+    thread::Builder::new()
+        .name("nanobpmn-journal-writer".into())
+        .spawn(move || match mode {
+            DurabilityMode::Sync => writer_loop(file, rx, linger),
+            DurabilityMode::Async => writer_loop_async(file, rx, linger, flush),
+        })
+}
+
+
+/// file+thread. Because every partition's in-flight commands land in the *same*
+/// group-commit batch, a single `fsync` drains them all — the batch coalesces
+/// across the whole node's write concurrency.
+///
+/// This is the fix for **per-partition fsync fragmentation**: with one journal
+/// file per partition, each writer only ever sees ~1/N of the node's concurrent
+/// writes, so its group-commit batches are N× smaller and it must `fsync` N×
+/// more often (and the disk's concurrent-fsync ceiling is hit sooner). Funneling
+/// every partition through one writer makes the fsync rate independent of the
+/// partition count while keeping the partitions fully independent for
+/// *processing* (each still has its own single-writer engine actor and key
+/// namespace; events are tagged by partition via their keys, so the shared log
+/// is demultiplexed back to the owning partition on replay).
+///
+/// The writer thread is detached (its [`JoinHandle`] is dropped): like the
+/// engine threads, durability never depends on a clean shutdown — a command is
+/// acked only after its [`Commit`] resolves, i.e. after the write is fsynced —
+/// so the thread can simply be reclaimed by the OS on exit. It stays alive as
+/// long as any partition journal (holding a cloned sender) is alive.
+pub struct SharedWriter {
+    tx: Sender<WriteRequest>,
+}
+
+impl SharedWriter {
+    /// Opens (creating if absent, positioned to append) the shared log at `path`
+    /// and spawns its group-commit writer thread, reading the same
+    /// `NANOBPMN_JOURNAL_LINGER_US` linger window as a per-partition journal.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let (tx, rx) = mpsc::channel::<WriteRequest>();
+        spawn_writer(file, rx).expect("spawn shared journal writer thread");
+        Ok(Self { tx })
+    }
+
+    /// A fresh sender into the shared writer, for one partition's [`Journal`].
+    /// The writer thread lives until every such sender is dropped.
+    fn sender(&self) -> Sender<WriteRequest> {
+        self.tx.clone()
     }
 }
 
@@ -267,11 +523,7 @@ impl Journal {
 
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let (tx, rx) = mpsc::channel::<WriteRequest>();
-        let linger = journal_linger_from_env();
-        let writer_thread = thread::Builder::new()
-            .name("nanobpmn-journal-writer".into())
-            .spawn(move || writer_loop(file, rx, linger))
-            .expect("spawn journal writer thread");
+        let writer_thread = spawn_writer(file, rx).expect("spawn journal writer thread");
 
         Ok(Self {
             engine,
@@ -282,6 +534,35 @@ impl Journal {
             spill: None,
             cold: None,
         })
+    }
+
+    /// Builds a partition journal that persists through a [`SharedWriter`] (one
+    /// fsync stream shared across every partition) instead of a private
+    /// file+thread. `events` are *this* partition's events, already split out of
+    /// the shared log by the caller (which reads the single log once and routes
+    /// each event to `partition_of(key)`); they reconstruct the engine exactly as
+    /// [`Journal::open_partition`] would. The journal owns a cloned sender into
+    /// the shared writer, so the writer thread stays alive as long as it does.
+    pub fn from_events_shared(
+        partition_id: u64,
+        events: Vec<Event>,
+        shared: &SharedWriter,
+    ) -> Self {
+        let fresh = events.is_empty();
+        let engine = if fresh {
+            Engine::with_partition(partition_id)
+        } else {
+            Engine::replay_partition(partition_id, events)
+        };
+        Self {
+            engine,
+            writer: Some(shared.sender()),
+            writer_thread: None,
+            exporter: None,
+            fresh,
+            spill: None,
+            cold: None,
+        }
     }
 
     /// Installs an already-minted deployment (the [`Event`]s from a `Deploy`

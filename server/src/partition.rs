@@ -29,6 +29,14 @@ pub struct Partitions {
     /// Round-robin cursor for balancing `createProcessInstance` across
     /// partitions. Relaxed is fine: it only needs to spread load, not be exact.
     next_create: Arc<AtomicUsize>,
+    /// Round-robin cursor for the partition at which a job-activation pass begins
+    /// its probe. Without it every activation starts at partition 0, so under
+    /// load all workers hammer partition 0's engine thread while the others idle
+    /// for activation. Rotating the start spreads activation evenly across every
+    /// partition's writer; a pass still probes onward when its start partition is
+    /// empty, so no job is ever left unactivated (no starvation). Relaxed: it
+    /// only needs to spread load, not be exact.
+    next_activate: Arc<AtomicUsize>,
 }
 
 impl Partitions {
@@ -39,6 +47,7 @@ impl Partitions {
         Self {
             handles: Arc::new(handles),
             next_create: Arc::new(AtomicUsize::new(0)),
+            next_activate: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -73,6 +82,18 @@ impl Partitions {
         &self.handles[i]
     }
 
+    /// The partition index at which the next job-activation pass should begin
+    /// probing, chosen round-robin. A pass probes partitions in wrap-around order
+    /// from here, so activation load spreads evenly across every partition's
+    /// engine thread instead of concentrating on partition 0. Returns 0 for a
+    /// single partition (the probe order is trivial).
+    pub fn activate_start(&self) -> usize {
+        if self.handles.len() == 1 {
+            return 0;
+        }
+        self.next_activate.fetch_add(1, Ordering::Relaxed) % self.handles.len()
+    }
+
     /// The partition that owns deployments. Deployments are processed and
     /// journaled here, then replicated in-memory to the others (so every
     /// partition can instantiate the definition). Partition 0 also owns the
@@ -85,5 +106,12 @@ impl Partitions {
     /// message correlation, timer ticks, eviction, idle compaction).
     pub fn all(&self) -> &[EngineHandle] {
         &self.handles
+    }
+
+    /// Total depth of every partition's `Low` (creation) queue: the standing
+    /// backlog of submitted-but-not-yet-applied creates across the node. The
+    /// create-admission gate bounds this to cap create-side latency under overload.
+    pub fn pending_create_queue(&self) -> usize {
+        self.handles.iter().map(EngineHandle::pending_low).sum()
     }
 }

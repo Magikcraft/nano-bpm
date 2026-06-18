@@ -45,7 +45,7 @@ use crate::backpressure::{
 };
 use crate::engine_actor::EngineHandle;
 use crate::partition::Partitions;
-use crate::journal::{Commit, Journal};
+use crate::journal::{Commit, Journal, SharedWriter};
 use crate::readstore::ReadStore;
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
@@ -121,6 +121,27 @@ pub struct ServerImpl {
     /// stops advancing (and no creates are in flight) the server is quiescent and
     /// can compact hot state and return freed memory to the OS.
     activity: Arc<AtomicU64>,
+    /// Active-instance backlog admission limit (0 = off, the default). When set,
+    /// `createProcessInstance` is shed (503 `RESOURCE_EXHAUSTED`) once the active
+    /// backlog (`inflight`) is at or above this value, bounding how many created-
+    /// but-not-yet-terminal instances can accumulate. This is *admission control*
+    /// on the backlog itself — complementary to the `processing`-concurrency
+    /// `backpressure` gate: completion-priority keeps the system from collapsing
+    /// under overload, and this gate keeps the resulting backlog (hence end-to-end
+    /// latency and memory) bounded by fast-failing excess creates with a clean
+    /// retry signal instead of queueing them for seconds. Durability and
+    /// at-least-once are unaffected: a shed create is never journaled, and accepted
+    /// instances' jobs retain their lease/replay guarantees.
+    admission_max_backlog: usize,
+    /// Create-queue-depth admission limit (0 = off, the default). When set,
+    /// `createProcessInstance` is shed once the standing backlog of submitted-but-
+    /// not-yet-applied creates (summed across partitions' `Low` queues) is at or
+    /// above this value. With completion-priority, creates yield to completion, so
+    /// under overload it is this create queue — not the active-instance backlog —
+    /// that grows and inflates create latency; bounding it caps that latency with a
+    /// clean retry signal. Durability/at-least-once are unaffected (a shed create
+    /// is never journaled).
+    admission_max_create_queue: usize,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -201,6 +222,19 @@ impl ServerImpl {
         };
         tracing::info!("backpressure: {}", backpressure.describe());
 
+        let admission_max_backlog = admission_max_backlog_from_env();
+        if admission_max_backlog > 0 {
+            tracing::info!(
+                "admission control: on, max active backlog {admission_max_backlog} instance(s)"
+            );
+        }
+        let admission_max_create_queue = admission_max_create_queue_from_env();
+        if admission_max_create_queue > 0 {
+            tracing::info!(
+                "admission control: on, max create-queue depth {admission_max_create_queue}"
+            );
+        }
+
         // Optional spill tiers, sharing one disk-backed store (one file, one WAL,
         // one durability story). Variable spill sheds the variables of a large
         // *active* (job-parked) backlog; cold spill sheds whole *dormant*
@@ -274,6 +308,8 @@ impl ServerImpl {
             inflight,
             processing,
             activity: Arc::new(AtomicU64::new(0)),
+            admission_max_backlog,
+            admission_max_create_queue,
         }
     }
 }
@@ -437,6 +473,38 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
     parse_backpressure_setting(std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT").ok().as_deref())
 }
 
+/// Resolves the active-instance-backlog admission limit, or `0` (off) by default.
+///
+/// `NANOBPMN_ADMISSION_MAX_BACKLOG=<n>` caps the number of active (created-but-not-
+/// terminal) instances: once the backlog reaches `n`, `createProcessInstance` is
+/// shed with a 503 `RESOURCE_EXHAUSTED` so clients back off, keeping end-to-end
+/// latency and memory bounded under sustained overload. Unset or `0` disables it
+/// (the default) — appropriate for workloads with a legitimately large parked
+/// population (e.g. many instances waiting on timers/messages), where the backlog
+/// is not a load signal. Distinct from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`, which
+/// gates on create-processing *concurrency*, not the standing backlog.
+fn admission_max_backlog_from_env() -> usize {
+    std::env::var("NANOBPMN_ADMISSION_MAX_BACKLOG")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Resolves the create-queue-depth admission limit, or `0` (off) by default.
+///
+/// `NANOBPMN_ADMISSION_MAX_CREATE_QUEUE=<n>` caps the standing backlog of
+/// submitted-but-not-yet-applied creates across all partitions; once it is reached,
+/// `createProcessInstance` is shed with a 503 `RESOURCE_EXHAUSTED`. Because
+/// completion-priority makes creates yield to completion, this queue is what grows
+/// under overload, so bounding it bounds create-side latency. Unset or `0`
+/// disables it (the default).
+fn admission_max_create_queue_from_env() -> usize {
+    std::env::var("NANOBPMN_ADMISSION_MAX_CREATE_QUEUE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 /// Resolves the idle quiescence delay before the idle-purge tick compacts hot
 /// state and returns freed memory to the OS, or `None` to disable it.
 ///
@@ -566,6 +634,19 @@ impl ServerImpl {
             }
         }
 
+        // Active-backlog admission control: independently of the concurrency gate
+        // above, shed once the standing backlog of active instances reaches the
+        // configured limit, so end-to-end latency and memory stay bounded under
+        // sustained overload instead of the create queue growing unboundedly. Off
+        // by default; a shed create is never journaled, so durability is untouched.
+        if let Some(message) = self.admission_shed() {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
+
         // Pull the await-completion controls (shared by both creation variants).
         // When `awaitCompletion` is set, the request blocks until the instance
         // reaches a terminal state or `requestTimeout` elapses.
@@ -640,7 +721,7 @@ impl ServerImpl {
             self
             .engine
             .for_create()
-            .with(move |engine| {
+            .with_low(move |engine| {
                 // The engine starts processes by BPMN process id. A creation-by-key
                 // request is resolved to its process id by looking up the deployed
                 // definition whose key matches; an unknown key is rejected as
@@ -2606,51 +2687,95 @@ impl ServerImpl {
         timeout: u64,
         fetch_variable: Option<&[String]>,
     ) -> Vec<models::ActivatedJobResult> {
-        let mut activated: Vec<ActivatedJobWithIdentity> = Vec::new();
-        for handle in self.engine.all() {
-            if activated.len() >= max_jobs {
-                break;
+        let handles = self.engine.all();
+        let n = handles.len();
+        let activated: Vec<ActivatedJobWithIdentity> = if n == 1 {
+            self.activate_on(&handles[0], job_type, worker, max_jobs, timeout)
+                .await
+        } else {
+            // Fan out across partitions CONCURRENTLY so every partition's engine
+            // thread runs its activation pass in parallel, instead of one
+            // round-trip at a time (which serialized N engine threads behind the
+            // single dispatcher and added N× round-trip latency per activation —
+            // the chief reason partitioning did not lift dispatch throughput).
+            //
+            // Each partition is asked for an exact share of `max_jobs` (an even
+            // `base`, with the remainder handed to the first few in rotated
+            // order) so the shares sum to exactly `max_jobs` and NO partition
+            // ever leases more than its slice. Over-leasing would be worse than
+            // under-delivering: a job leased here but not returned to the worker
+            // is locked and cannot be redelivered until its lease expires.
+            // CreateInstance round-robins across partitions, so the pool is
+            // balanced and the even split rarely under-delivers; when it does,
+            // continuous dispatch tops it up on the next pass.
+            let start = self.engine.activate_start();
+            let base = max_jobs / n;
+            let rem = max_jobs % n;
+            let mut futures = Vec::with_capacity(n);
+            for off in 0..n {
+                let want = base + usize::from(off < rem);
+                if want == 0 {
+                    continue;
+                }
+                let handle = &handles[(start + off) % n];
+                futures.push(self.activate_on(handle, job_type, worker, want, timeout));
             }
-            let remaining = max_jobs - activated.len();
-            let job_type = job_type.to_string();
-            let worker = worker.to_string();
-            let mut part: Vec<ActivatedJobWithIdentity> = handle
-                .with(move |engine| {
-                    let now = now_millis();
-                    engine
-                        .activate_jobs(&job_type, &worker, remaining, timeout, now)
-                        .into_iter()
-                        .map(|job| {
-                            let (process_id, version, process_definition_key) = engine
-                                .instance(job.instance_key)
-                                .and_then(|instance| {
-                                    engine.state().processes.get(&instance.process_id)
-                                })
-                                .map(|deployed| {
-                                    (
-                                        deployed.definition.id.clone(),
-                                        deployed.version,
-                                        deployed.key.to_string(),
-                                    )
-                                })
-                                .unwrap_or_else(|| (String::new(), 1, String::new()));
-                            ActivatedJobWithIdentity {
-                                job,
-                                process_id,
-                                version,
-                                process_definition_key,
-                            }
-                        })
-                        .collect()
-                })
-                .await;
-            activated.append(&mut part);
-        }
+            futures_util::future::join_all(futures)
+                .await
+                .into_iter()
+                .flatten()
+                .collect()
+        };
 
         activated
             .into_iter()
             .map(|activated| activated_job_result(activated, fetch_variable))
             .collect()
+    }
+
+    /// Activates up to `want` jobs of `job_type` on a single partition's engine
+    /// thread, resolving each job's deployed-process identity in the same pass
+    /// (so the lookup runs on the engine thread that owns the state, not the
+    /// caller). The serde-heavy variable projection is deferred to
+    /// [`activated_job_result`] off the engine thread.
+    async fn activate_on(
+        &self,
+        handle: &EngineHandle,
+        job_type: &str,
+        worker: &str,
+        want: usize,
+        timeout: u64,
+    ) -> Vec<ActivatedJobWithIdentity> {
+        let job_type = job_type.to_string();
+        let worker = worker.to_string();
+        handle
+            .with(move |engine| {
+                let now = now_millis();
+                engine
+                    .activate_jobs(&job_type, &worker, want, timeout, now)
+                    .into_iter()
+                    .map(|job| {
+                        let (process_id, version, process_definition_key) = engine
+                            .instance(job.instance_key)
+                            .and_then(|instance| engine.state().processes.get(&instance.process_id))
+                            .map(|deployed| {
+                                (
+                                    deployed.definition.id.clone(),
+                                    deployed.version,
+                                    deployed.key.to_string(),
+                                )
+                            })
+                            .unwrap_or_else(|| (String::new(), 1, String::new()));
+                        ActivatedJobWithIdentity {
+                            job,
+                            process_id,
+                            version,
+                            process_definition_key,
+                        }
+                    })
+                    .collect()
+            })
+            .await
     }
 }
 
@@ -2692,11 +2817,19 @@ impl ServerImpl {
         by_key: Option<String>,
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        // Active-backlog admission control (off by default): shed before doing any
+        // engine work when the standing active-instance backlog is at/above the
+        // limit, keeping end-to-end latency and memory bounded under overload. The
+        // stream client reads the 503 `RESOURCE_EXHAUSTED` as a retry signal. A
+        // shed create is never journaled, so durability/at-least-once are intact.
+        if let Some(message) = self.admission_shed() {
+            return Err((503, message));
+        }
         let outcome: Result<(nanobpmn_engine_core::Key, bool, Commit), (u16, String)> = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
                 .for_create()
-                .with(move |engine| {
+                .with_low(move |engine| {
                     let process_id = match (by_id, by_key) {
                         (Some(id), _) => id,
                         (None, Some(requested)) => match engine
@@ -2838,6 +2971,38 @@ impl ServerImpl {
     pub(crate) fn submission_pressure(&self) -> bool {
         let processing = self.processing.load(Ordering::Relaxed);
         self.backpressure.should_shed(processing)
+    }
+
+    /// Active-backlog / create-queue admission gate. When either
+    /// `NANOBPMN_ADMISSION_MAX_BACKLOG` or `NANOBPMN_ADMISSION_MAX_CREATE_QUEUE` is
+    /// set (> 0), returns `Some(reason)` once the corresponding signal is at or
+    /// above its limit, signalling the create should be shed; `None` when both are
+    /// off or have headroom. Relaxed atomic loads — no engine round-trip; an
+    /// approximate bound is fine. The create-queue gate fires first under overload
+    /// (completion-priority diverts the pile-up there); the active-backlog gate is
+    /// the complementary memory bound for worker-starved workloads.
+    pub(crate) fn admission_shed(&self) -> Option<String> {
+        let cq_limit = self.admission_max_create_queue;
+        if cq_limit > 0 {
+            let depth = self.engine.pending_create_queue();
+            if depth >= cq_limit {
+                return Some(format!(
+                    "Admission control: create queue depth {depth} at or above the \
+                     configured limit of {cq_limit}. Retry after a backoff."
+                ));
+            }
+        }
+        let backlog_limit = self.admission_max_backlog;
+        if backlog_limit > 0 {
+            let backlog = self.inflight.load(Ordering::Relaxed);
+            if backlog >= backlog_limit {
+                return Some(format!(
+                    "Admission control: {backlog} active instances at or above the \
+                     configured backlog limit of {backlog_limit}. Retry after a backoff."
+                ));
+            }
+        }
+        None
     }
 
     /// Awaits a created instance reaching a terminal state for the stream's async
@@ -3495,37 +3660,59 @@ async fn main() {
                 let recovered = !journal.is_fresh();
                 (vec![journal], recovered)
             } else {
-                // Multi-partition: one journal file per partition. The single
-                // `exported_position` cursor can't track N independent logs, so
-                // rebuild the read model from scratch by replaying every
-                // partition's journal (keys are globally unique, instances are
-                // independent across partitions, so order across files is
-                // irrelevant). Deployments live only in partition 0's log.
-                let paths: Vec<PathBuf> = (0..partitions)
-                    .map(|i| partition_journal_path(&journal_path, i))
-                    .collect();
-                store.reset().expect("reset read store for multi-partition rebuild");
-                for path in &paths {
-                    let events = Journal::read_events(path).unwrap_or_else(|e| {
-                        panic!("failed to read journal {}: {e}", path.display())
-                    });
-                    if !events.is_empty() {
-                        let refs: Vec<&Event> = events.iter().collect();
-                        store
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                // Multi-partition: ONE shared group-commit WAL for every
+                // partition (a single [`SharedWriter`]: one file, one writer
+                // thread, one fsync stream). Funneling all partitions through one
+                // writer eliminates per-partition fsync fragmentation — the chief
+                // multi-partition throughput cap — while the partitions stay fully
+                // independent for processing (each its own engine actor and key
+                // namespace). Events are tagged by partition via their keys, so
+                // the single log is demultiplexed back to the owning partition on
+                // replay.
+                //
+                // The read model is rebuilt from scratch: the runtime exporter
+                // interleaves partitions in projection order, which need not match
+                // the shared log's commit order, so the single `exported_position`
+                // cursor can't track it incrementally. Projection is
+                // order-independent across the (independent) partitions, and the
+                // boot-time deployment on partition 0 is written first, so a full
+                // replay in log order is correct.
+                let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                    panic!("failed to read journal {}: {e}", journal_path.display())
+                });
+                store
+                    .reset()
+                    .expect("reset read store for multi-partition rebuild");
+                if !events.is_empty() {
+                    let refs: Vec<&Event> = events.iter().collect();
+                    store
+                        .export(&refs)
+                        .expect("catch up read model from journal");
                 }
-                let journals: Vec<Journal> = paths
-                    .iter()
+
+                // Split the shared log into each partition's own events by the
+                // owning partition encoded in every event's key. A key whose
+                // partition is out of range (e.g. a log from a larger partition
+                // layout) falls back to partition 0 so replay never panics.
+                let mut per_partition: Vec<Vec<Event>> =
+                    (0..partitions).map(|_| Vec::new()).collect();
+                for event in events {
+                    let p = nanobpmn_engine_core::partition_of(event.max_key()) as usize;
+                    per_partition[p.min(partitions - 1)].push(event);
+                }
+
+                let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
+                    panic!(
+                        "failed to open shared journal {}: {e}",
+                        journal_path.display()
+                    )
+                });
+                let recovered = per_partition.iter().any(|evs| !evs.is_empty());
+                let journals: Vec<Journal> = per_partition
+                    .into_iter()
                     .enumerate()
-                    .map(|(i, path)| {
-                        Journal::open_partition(path, i as u64).unwrap_or_else(|e| {
-                            panic!("failed to open journal {}: {e}", path.display())
-                        })
-                    })
+                    .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
                     .collect();
-                let recovered = journals.iter().any(|j| !j.is_fresh());
                 (journals, recovered)
             };
 
@@ -3605,23 +3792,26 @@ async fn main() {
                 interval.tick().await;
                 let now = now_millis();
                 // Drive every partition's clock so timers fire and leases expire.
-                let mut produced = false;
-                for handle in engine.all() {
-                    produced |= handle
-                        .with(move |journal| {
-                            let (fired, _commit) = journal.trigger_timers(now);
-                            let expired = journal.expire_jobs(now);
-                            // Shed dormant instances to disk if hot RAM is over the
-                            // high-water mark (cheap no-op below it / when unset).
-                            journal.maybe_cold_spill();
-                            // Either a fired timer (may create a job) or a reclaimed
-                            // job lease (frees a job for redelivery) means there is
-                            // pushable work — wake dispatch instead of waiting for
-                            // its own backstop tick.
-                            !fired.is_empty() || !expired.is_empty()
-                        })
-                        .await;
-                }
+                // Fan out concurrently: each partition's tick is independent, so
+                // running them in parallel keeps the sweep off the critical path
+                // instead of serializing N engine round-trips every 500ms.
+                let produced = futures_util::future::join_all(engine.all().iter().map(|handle| {
+                    handle.with(move |journal| {
+                        let (fired, _commit) = journal.trigger_timers(now);
+                        let expired = journal.expire_jobs(now);
+                        // Shed dormant instances to disk if hot RAM is over the
+                        // high-water mark (cheap no-op below it / when unset).
+                        journal.maybe_cold_spill();
+                        // Either a fired timer (may create a job) or a reclaimed
+                        // job lease (frees a job for redelivery) means there is
+                        // pushable work — wake dispatch instead of waiting for
+                        // its own backstop tick.
+                        !fired.is_empty() || !expired.is_empty()
+                    })
+                }))
+                .await
+                .into_iter()
+                .any(|p| p);
                 if produced {
                     jobs_available.notify_waiters();
                     dispatch_wake.notify_one();
@@ -3787,23 +3977,6 @@ fn partition_count_from_env() -> usize {
         },
         Err(_) => 1,
     }
-}
-
-/// Per-partition journal file path. Partition 0 in a multi-partition layout uses
-/// `journal.partition-0.jsonl` (all partitions are symmetric); single-partition
-/// runs keep the historical bare `journal.jsonl` (handled by the caller).
-///
-/// `<dir>/journal.jsonl` => `<dir>/journal.partition-<idx>.jsonl`.
-fn partition_journal_path(base: &Path, idx: usize) -> PathBuf {
-    let stem = base
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("journal");
-    let ext = base
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("jsonl");
-    base.with_file_name(format!("{stem}.partition-{idx}.{ext}"))
 }
 
 /// Ensures `dir` is usable as a data directory: it must already exist as a

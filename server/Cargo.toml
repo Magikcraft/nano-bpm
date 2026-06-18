@@ -13,7 +13,7 @@ axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
 bytes = "1"
 chrono = "0.4"
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "alloc"] }
 headers = "0.4"
 http = "1"
 prometheus = { version = "0.13", default-features = false }
