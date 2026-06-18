@@ -93,7 +93,11 @@ type DispatchTarget = (Arc<Connection>, Arc<Subscription>);
 // ----------------------------------------------------------------------------
 
 /// Client → server frames.
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is derived so a node can act as a command-stream *client* to its
+/// cluster peers (the intra-cluster forwarding uplink), speaking the same wire
+/// protocol it serves.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ClientFrame {
     /// Opt into job push for a type, granting an initial credit batch.
@@ -175,7 +179,10 @@ pub enum ClientFrame {
 }
 
 /// Server → client frames.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` is derived so the peer uplink (a node acting as a command-stream
+/// client to its cluster peers) can decode a peer's responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ServerFrame {
     /// Sent once on connect: the initial submission window and heartbeat cadence.
@@ -192,7 +199,7 @@ pub enum ServerFrame {
     CommandResult {
         corr: u64,
         status: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<Value>,
     },
     /// Async await-completion: emitted when an awaited instance reaches a terminal
@@ -210,7 +217,7 @@ pub enum ServerFrame {
     #[serde(rename_all = "camelCase")]
     Pressure {
         level: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
     },
     Heartbeat,

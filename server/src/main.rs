@@ -17,6 +17,11 @@ mod engine_actor;
 mod journal;
 mod memory;
 mod metrics;
+// Intra-cluster peer uplink (command-stream client to peers). The forwarding
+// seam that drives it (create-forward, by-key forward, broadcast) lands in the
+// following increments; the transport is integration-tested now.
+#[allow(dead_code)]
+mod peer;
 mod partition;
 mod query;
 mod readstore;
