@@ -45,7 +45,7 @@ use nanobpm_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    partition_of, ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState,
+    partition_of, ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, Key,
     ProcessBuilder, ProcessDefinition, ProcessInstanceState, Value, MAX_PARTITION_ID,
 };
 
@@ -4839,6 +4839,38 @@ impl ServerImpl {
     ) -> Vec<models::ActivatedJobResult> {
         let handles = self.engine.all();
         let n = handles.len();
+        // Raft path: activation is a state mutation (it locks jobs), so when this
+        // node hosts Raft groups it MUST replicate through the leader's log — else
+        // the lock never reaches followers and a later replicated `CompleteJob`
+        // hits `JobNotActivated` on them, diverging the replica. We fan out the
+        // per-partition shares to `activate_on_raft`, which proposes `ActivateJobs`
+        // on partitions this node leads and skips the rest (their leader activates).
+        if !self.raft.is_empty() {
+            let owned = self.engine.topology().local_partitions();
+            debug_assert_eq!(owned.len(), n, "all() and local_partitions() agree in order");
+            let start = self.engine.activate_start();
+            let base = max_jobs / n;
+            let rem = max_jobs % n;
+            let mut futures = Vec::with_capacity(n);
+            for off in 0..n {
+                let want = base + usize::from(off < rem);
+                if want == 0 {
+                    continue;
+                }
+                let p = owned[(start + off) % n];
+                futures.push(self.activate_on_raft(p, job_type, worker, want, timeout));
+            }
+            let activated: Vec<ActivatedJobWithIdentity> =
+                futures_util::future::join_all(futures)
+                    .await
+                    .into_iter()
+                    .flatten()
+                    .collect();
+            return activated
+                .into_iter()
+                .map(|activated| activated_job_result(activated, fetch_variable))
+                .collect();
+        }
         let activated: Vec<ActivatedJobWithIdentity> = if n == 1 {
             self.activate_on(&handles[0], job_type, worker, max_jobs, timeout)
                 .await
@@ -4926,6 +4958,156 @@ impl ServerImpl {
                     .collect()
             })
             .await
+    }
+
+    /// The Raft activation path: replicate an `ActivateJobs` pass through partition
+    /// `p`'s leader so the activation lock is committed to the log and applied on
+    /// every replica's engine actor (keeping followers in lockstep for a later
+    /// `CompleteJob`). Only the leader activates; a non-leader replica returns
+    /// empty (the partition's actual leader runs its own dispatch). After the
+    /// commit, the activated jobs are projected for the worker by a read on the
+    /// leader's engine actor (the same copy the log was applied to).
+    async fn activate_on_raft(
+        &self,
+        p: u64,
+        job_type: &str,
+        worker: &str,
+        want: usize,
+        timeout: u64,
+    ) -> Vec<ActivatedJobWithIdentity> {
+        let Some(part) = self.raft.get(p) else {
+            return Vec::new();
+        };
+        let node_id = self.engine.topology().node_id as u64;
+        if part.raft.metrics().borrow().current_leader != Some(node_id) {
+            return Vec::new();
+        }
+        // A single logical instant drives both the command (job-lock deadlines)
+        // and the journal apply, so leader and followers mint identical state.
+        let now = now_millis();
+        let response = match part
+            .propose_result(Command::activate_jobs(job_type, worker, want, timeout, now), now)
+            .await
+        {
+            Ok(r) if r.error.is_none() => r,
+            _ => return Vec::new(),
+        };
+        let job_keys: Vec<Key> = response
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::JobActivated { job_key, .. } => Some(*job_key),
+                _ => None,
+            })
+            .collect();
+        if job_keys.is_empty() {
+            return Vec::new();
+        }
+        let Some(handle) = self.engine.local_for_partition(p) else {
+            return Vec::new();
+        };
+        handle
+            .with(move |journal| {
+                let engine = journal.engine();
+                job_keys
+                    .into_iter()
+                    .filter_map(|jk| {
+                        let job = engine.activated_job(jk)?;
+                        let (process_id, version, process_definition_key) = engine
+                            .instance(job.instance_key)
+                            .and_then(|instance| engine.state().processes.get(&instance.process_id))
+                            .map(|deployed| {
+                                (
+                                    deployed.definition.id.clone(),
+                                    deployed.version,
+                                    deployed.key.to_string(),
+                                )
+                            })
+                            .unwrap_or_else(|| (String::new(), 1, String::new()));
+                        Some(ActivatedJobWithIdentity {
+                            job,
+                            process_id,
+                            version,
+                            process_definition_key,
+                        })
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    /// The Raft clock tick for partition `p`: when this node leads `p`, replicate
+    /// `TriggerTimers` and `ExpireJobs` through the log so every replica fires the
+    /// same timers / reclaims the same leases at the same logical `now`, in the
+    /// same order as client writes. Mutations that mint state (a fired timer may
+    /// create a job) MUST be logged or follower key allocation diverges. A cheap
+    /// local pre-check skips proposing an empty tick (no due timers / leases), so
+    /// an idle partition adds no log entries. Cold-spill stays a local read-model
+    /// op (not replicated). Returns `(produced, routable)` like the direct tick.
+    async fn tick_partition_via_raft(
+        &self,
+        p: u64,
+        now: u64,
+        multi_partition: bool,
+    ) -> (bool, Vec<Event>) {
+        let Some(part) = self.raft.get(p) else {
+            return (false, Vec::new());
+        };
+        let node_id = self.engine.topology().node_id as u64;
+        if part.raft.metrics().borrow().current_leader != Some(node_id) {
+            return (false, Vec::new());
+        }
+        let Some(handle) = self.engine.local_for_partition(p) else {
+            return (false, Vec::new());
+        };
+        // One read on the leader: cold-spill + what (if anything) is due now. Only
+        // the leader runs this gate; followers never propose, so this is safe.
+        let (timers_due, jobs_due) = handle
+            .with(move |journal| {
+                journal.maybe_cold_spill();
+                let state = journal.engine().state();
+                let timers_due = state.timers.values().any(|t| t.due_at <= now);
+                let jobs_due = state
+                    .jobs
+                    .values()
+                    .any(|j| j.deadline.is_some_and(|d| d <= now));
+                (timers_due, jobs_due)
+            })
+            .await;
+
+        let mut produced = false;
+        let mut routable: Vec<Event> = Vec::new();
+        if timers_due {
+            if let Ok(resp) = part.propose_result(Command::TriggerTimers { now }, now).await {
+                if resp.error.is_none() && !resp.events.is_empty() {
+                    produced = true;
+                    if multi_partition {
+                        routable.extend(
+                            resp.events
+                                .iter()
+                                .filter(|e| {
+                                    matches!(
+                                        e,
+                                        Event::MessageSubscriptionOpening { .. }
+                                            | Event::RemoteMessageCorrelation { .. }
+                                            | Event::MessageSubscriptionClosing { .. }
+                                            | Event::StartInstanceDispatched { .. }
+                                    )
+                                })
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+        }
+        if jobs_due {
+            if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await {
+                if resp.error.is_none() && !resp.events.is_empty() {
+                    produced = true;
+                }
+            }
+        }
+        (produced, routable)
     }
 }
 
@@ -6258,7 +6440,22 @@ async fn main() {
                 // Fan out concurrently: each partition's tick is independent, so
                 // running them in parallel keeps the sweep off the critical path
                 // instead of serializing N engine round-trips every 500ms.
-                let outcomes = futures_util::future::join_all(engine.all().iter().map(|handle| {
+                //
+                // Raft path: tick-driven mutations MINT state (a fired timer may
+                // create a job) and must keep the same deterministic log order +
+                // single `now` as client writes, so they go through the leader's
+                // Raft log (followers apply in lockstep). Non-Raft uses the direct
+                // local path below, byte-identical to the pre-cluster behaviour.
+                let outcomes: Vec<(bool, Vec<Event>)> = if !tick_server.raft.is_empty() {
+                    let owned = engine.topology().local_partitions();
+                    futures_util::future::join_all(
+                        owned
+                            .iter()
+                            .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
+                    )
+                    .await
+                } else {
+                    futures_util::future::join_all(engine.all().iter().map(|handle| {
                     handle.with(move |journal| {
                         let (fired, _commit) = journal.trigger_timers(now);
                         let expired = journal.expire_jobs(now);
@@ -6291,7 +6488,8 @@ async fn main() {
                         (!fired.is_empty() || !expired.is_empty(), routable)
                     })
                 }))
-                .await;
+                    .await
+                };
                 let mut produced = false;
                 let mut routable: Vec<Event> = Vec::new();
                 for (p, mut r) in outcomes {
@@ -7856,6 +8054,163 @@ mod clustered_startup_tests {
         assert!(
             err.0 == 404 || err.0 == 409,
             "re-complete should be a 404/409, got {err:?}"
+        );
+
+        for node in [&node0, &node1] {
+            for p in 0..4u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_raft_routed_complete_converges_the_follower_replica_actor() {
+        // s3-failover correctness: because activation is now a LOGGED command, the
+        // follower's replica engine actor locks the job in lockstep, so a later
+        // replicated `CompleteJob` applies cleanly there too and the instance
+        // COMPLETES on the follower — not stuck parked at the service task (the
+        // pre-fix divergence, where the follower swallowed `JobNotActivated`).
+        use crate::raft::RaftPartition;
+
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+                replication_factor: 2,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+
+        let proc = ProcessBuilder::new("intake")
+            .start_event("start")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        let (_r, events) = node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+        tokio::join!(node0.raft_bootstrap(), node1.raft_bootstrap());
+
+        let leads = |node: &ServerImpl, p: u64, who: u64| -> bool {
+            node.raft_registry()
+                .get(p)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+                == Some(who)
+        };
+        for p in [0u64, 2] {
+            let mut ok = false;
+            for _ in 0..400 {
+                if leads(&node0, p, 0) {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(ok, "node 0 must lead partition {p}");
+        }
+
+        let (instance_key, _completed) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits");
+        let part = nanobpmn_engine_core::partition_of(instance_key);
+
+        // Activate through the leader (a LOGGED ActivateJobs), then complete.
+        let mut job_key = None;
+        for _ in 0..50 {
+            let jobs = node0
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the parked job activates on the leader");
+        node0
+            .complete_job_for_stream(job_key, Default::default())
+            .await
+            .expect("raft-routed complete commits via quorum")
+            .wait()
+            .await;
+
+        // The follower's REPLICA engine actor for this partition must converge to
+        // the instance being COMPLETED (Raft apply is async after commit, so poll).
+        let replica = {
+            let map = node1.raft_replicas.lock().unwrap();
+            map.get(&part).cloned()
+        }
+        .expect("node 1 hosts a replica engine actor for the leader's partition");
+
+        let mut converged = false;
+        for _ in 0..400 {
+            let done = replica
+                .with(move |journal| journal.engine().is_completed(instance_key))
+                .await;
+            if done {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !converged {
+            let diag = replica
+                .with(move |journal| {
+                    let e = journal.engine();
+                    let inst = e.instance(instance_key).map(|i| format!("{:?}", i.state));
+                    let njobs = e.state().jobs.len();
+                    let ninst = e.state().instances.len();
+                    let job = e.job(job_key).map(|j| format!("{:?} activated={}", j.state, j.activated));
+                    format!("instance={inst:?} njobs={njobs} ninst={ninst} job={job:?}")
+                })
+                .await;
+            panic!("follower did not converge: {diag}");
+        }
+        assert!(
+            converged,
+            "follower replica must converge: the instance completes there too \
+             (logged activation keeps the replica in lockstep for the complete)"
         );
 
         for node in [&node0, &node1] {

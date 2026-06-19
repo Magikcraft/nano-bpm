@@ -702,10 +702,25 @@ impl Engine {
             .collect()
     }
 
-    /// Releases the activation lock of every job whose deadline is at or before
-    /// `now`. The host drives this periodically (a "tick"); the engine itself
-    /// never reads a clock.
-    /// Reclaims every job whose activation lock has expired at or before `now`,
+    /// Projects an already-activated job into an [`ActivatedJob`] snapshot (job
+    /// detail + a shared copy of its instance variables) WITHOUT mutating state.
+    /// Returns `None` if the key is unknown. Used by the Raft write path, where
+    /// activation is applied through the replicated log (so the lock replicates
+    /// to followers) and the projection for the worker happens in a separate read
+    /// on the leader. Mirrors the projection inside [`Engine::activate_jobs`].
+    pub fn activated_job(&self, job_key: Key) -> Option<ActivatedJob> {
+        self.job(job_key).map(|job| ActivatedJob {
+            key: job.key,
+            job_type: job.job_type.clone(),
+            instance_key: job.instance_key,
+            element_instance_key: job.element_instance_key,
+            element_id: job.element_id.clone(),
+            worker: job.worker.clone().unwrap_or_default(),
+            deadline: job.deadline.unwrap_or(0),
+            retries: job.retries,
+            variables: self.variables(job.instance_key),
+        })
+    }
     /// making it activatable again. Like [`Engine::trigger_timers`], the host
     /// drives this periodically; the engine never reads a clock. Returns the
     /// [`Event::JobLockExpired`] events produced (empty when nothing was due), so
@@ -814,6 +829,19 @@ impl Engine {
     /// to replicate partition 0's deployments to the others.
     pub fn install_deployment(&mut self, events: &[Event]) {
         for event in events {
+            // Advance the local key generator past any installed key that belongs
+            // to THIS partition, exactly as `replay_partition` does. This matters
+            // when a partition installs a deployment it also minted (a Raft replica
+            // actor for the deploy-owning partition): without it the replica's
+            // instance-key counter lags the leader's by the number of keys the
+            // deploy minted, so a replicated `CreateInstance` mints a divergent key
+            // and the replica forks. Keys minted by OTHER partitions never advance
+            // this counter (partition guard), so the common in-memory fan-out to
+            // non-owning partitions is unchanged.
+            let max_key = event.max_key();
+            if state::partition_of(max_key) == self.partition_id {
+                self.next_local = self.next_local.max(state::local_of(max_key));
+            }
             if matches!(event, Event::ProcessDeployed { .. }) {
                 state::apply(&mut self.state, event);
             }
