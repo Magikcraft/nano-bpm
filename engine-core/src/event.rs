@@ -358,6 +358,25 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// The **instance** partition tore down a cross-partition parked
+    /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],
+    /// recorded by [`Event::MessageSubscriptionOpening`]) because the element it
+    /// guarded left the flow (cancel, normal completion or a sibling boundary
+    /// firing). Marks the local placeholder cancelled and carries `message_name`
+    /// + `correlation_key` so the host routes a
+    /// [`crate::Command::CloseMessageSubscription`] to the message partition
+    /// (`hash(correlation_key)`) to disarm the canonical record there. Mirrors
+    /// [`Event::MessageSubscriptionOpening`]: only emitted when the canonical
+    /// subscription lives off-partition, so a single-partition log never
+    /// produces it and stays byte-identical.
+    MessageSubscriptionClosing {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        message_name: String,
+        correlation_key: String,
+    },
     /// A process-level message start subscription was opened at deploy time: a
     /// later [`Event::MessagePublished`] with a matching `message_name` creates a
     /// new instance of `process_id`. Carried on the log so replay reconstructs
@@ -429,6 +448,7 @@ impl Event {
             | Event::MessageCorrelated { instance_key, .. }
             | Event::RemoteMessageCorrelation { instance_key, .. }
             | Event::MessageSubscriptionCanceled { instance_key, .. }
+            | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
@@ -535,6 +555,11 @@ impl Event {
                 ..
             }
             | Event::MessageSubscriptionCanceled {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Event::MessageSubscriptionClosing {
                 subscription_key,
                 element_instance_key,
                 ..

@@ -918,6 +918,7 @@ impl ServerImpl {
                                         e,
                                         Event::MessageSubscriptionOpening { .. }
                                             | Event::RemoteMessageCorrelation { .. }
+                                            | Event::MessageSubscriptionClosing { .. }
                                     )
                                 })
                                 .cloned()
@@ -1114,8 +1115,9 @@ impl ServerImpl {
             })
             .await;
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
                 commit.wait().await;
+                self.spawn_routing_if_needed(&events);
                 Ok(Resp::Status204_TheProcessInstanceIsCanceled)
             }
             Err(EngineError::InstanceNotFound { instance_key }) => {
@@ -1905,7 +1907,9 @@ impl ServerImpl {
         events.iter().any(|e| {
             matches!(
                 e,
-                Event::MessageSubscriptionOpening { .. } | Event::RemoteMessageCorrelation { .. }
+                Event::MessageSubscriptionOpening { .. }
+                    | Event::RemoteMessageCorrelation { .. }
+                    | Event::MessageSubscriptionClosing { .. }
             )
         })
     }
@@ -1999,6 +2003,24 @@ impl ServerImpl {
                 };
                 Some((target, command))
             }
+            Event::MessageSubscriptionClosing {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                correlation_key,
+                ..
+            } => {
+                let target =
+                    nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions);
+                let command = Command::CloseMessageSubscription {
+                    subscription_key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                };
+                Some((target, command))
+            }
             _ => None,
         }
     }
@@ -2056,6 +2078,7 @@ impl ServerImpl {
                     e,
                     Event::MessageSubscriptionOpening { .. }
                         | Event::RemoteMessageCorrelation { .. }
+                        | Event::MessageSubscriptionClosing { .. }
                 )
             })
             .cloned()
@@ -2092,8 +2115,9 @@ impl ServerImpl {
             })
             .await;
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
                 commit.wait().await;
+                self.spawn_routing_if_needed(&events);
                 self.signal_jobs_available();
                 Ok(())
             }
@@ -2839,6 +2863,7 @@ impl ServerImpl {
                                             e,
                                             Event::MessageSubscriptionOpening { .. }
                                                 | Event::RemoteMessageCorrelation { .. }
+                                                | Event::MessageSubscriptionClosing { .. }
                                         )
                                     })
                                     .cloned()
@@ -4746,6 +4771,7 @@ impl ServerImpl {
                                             e,
                                             Event::MessageSubscriptionOpening { .. }
                                                 | Event::RemoteMessageCorrelation { .. }
+                                                | Event::MessageSubscriptionClosing { .. }
                                         )
                                     })
                                     .cloned()
@@ -5831,6 +5857,7 @@ async fn main() {
                                         e,
                                         Event::MessageSubscriptionOpening { .. }
                                             | Event::RemoteMessageCorrelation { .. }
+                                            | Event::MessageSubscriptionClosing { .. }
                                     )
                                 })
                                 .cloned()
@@ -7000,6 +7027,142 @@ mod subscription_placement_tests {
         assert!(
             completed,
             "the instance completes after the cross-partition correlation is routed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_partition_cancel_disarms_the_canonical_subscription() {
+        // Cancelling an instance whose catch subscription is canonically placed
+        // on another partition must disarm that remote record (routing a
+        // CloseMessageSubscription), so a later publish on the key correlates
+        // nothing — no token is advanced on the terminated instance.
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy");
+
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("cancel-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, completed) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            assert!(!completed, "the instance parks at the message catch");
+            if nanobpmn_engine_core::subscription_partition(&order, 4)
+                != nanobpmn_engine_core::partition_of(key)
+            {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+
+        // Cancel and synchronously drive the resulting routing (production
+        // fire-and-forgets the Close), disarming the canonical subscription.
+        let (events, commit) = server
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await
+            .expect("cancel succeeds");
+        commit.wait().await;
+        server.drive_subscription_routing(events.to_vec()).await;
+
+        // The canonical subscription is gone, so the publish finds no match.
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".into(),
+                order.clone(),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        assert_eq!(
+            correlated, None,
+            "the publish correlates nothing after the remote subscription is disarmed"
+        );
+    }
+
+    /// start -> serviceTask "work" with an interrupting message boundary keyed on
+    /// `orderId` -> end. The boundary subscription opens when the task activates;
+    /// when its canonical home is another partition, the publish must interrupt
+    /// the activity across the partition boundary and run the boundary flow.
+    #[tokio::test]
+    async fn cross_partition_message_boundary_interrupts_via_the_pump() {
+        let server = single_node_multi_partition();
+        let proc = ProcessBuilder::new("guarded")
+            .start_event("s")
+            .service_task("work", "do-work")
+            .message_boundary_event("cancel-it", "work", "abort-order", "orderId")
+            .end_event("done-normally")
+            .end_event("aborted")
+            .connect("s", "work")
+            .connect("work", "done-normally")
+            .connect("cancel-it", "aborted")
+            .build()
+            .expect("valid boundary process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("guarded".to_string(), "guarded.bpmn".to_string());
+        server
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy the boundary process on every owned partition");
+
+        // Find an instance whose boundary subscription is canonically off its own
+        // partition. The token parks on the service-task job; the boundary sub is
+        // opened (and its Open routed) as soon as the task activates.
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("abort-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, completed) = server
+                .create_for_stream(Some("guarded".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            assert!(!completed, "the instance parks on the service task");
+            if nanobpmn_engine_core::subscription_partition(&order, 4)
+                != nanobpmn_engine_core::partition_of(key)
+            {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) =
+            chosen.expect("a cross-partition boundary placement appears within 64 creates");
+
+        // Publishing the boundary message interrupts the activity across the
+        // partition boundary: the canonical sub matches on the hash partition,
+        // and the correlation is routed back to cancel the job and run the
+        // boundary flow to the instance's completion.
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "abort-order".into(),
+                order.clone(),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        assert_eq!(
+            correlated,
+            Some(instance_key),
+            "the publish interrupts the cross-partition guarded activity"
+        );
+
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(
+            completed,
+            "the instance completes down the boundary path after the cross-partition interrupt"
         );
     }
 

@@ -1168,6 +1168,19 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        // The instance partition tearing down a cross-partition parked
+        // placeholder: mark it cancelled locally exactly like
+        // `MessageSubscriptionCanceled`. The host routes a
+        // `CloseMessageSubscription` to disarm the canonical record on the
+        // message partition.
+        Event::MessageSubscriptionClosing {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.message_subscriptions.get_mut(subscription_key) {
+                subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
         // A match found on the message partition for a subscription whose instance
         // lives on another partition: settle the canonical record exactly as
         // `MessageCorrelated` does (a non-interrupting boundary stays open). The

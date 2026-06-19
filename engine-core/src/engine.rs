@@ -1933,15 +1933,8 @@ impl Engine {
                     })
                     .collect();
                 subs.sort_unstable_by_key(|s| s.key);
-                let sub_cancels: Vec<Event> = subs
-                    .iter()
-                    .map(|s| Event::MessageSubscriptionCanceled {
-                        subscription_key: s.key,
-                        instance_key,
-                        element_instance_key: s.element_instance_key,
-                        element_id: s.element_id.clone(),
-                    })
-                    .collect();
+                let sub_cancels: Vec<Event> =
+                    subs.iter().map(|s| Self::disarm_subscription_event(s)).collect();
 
                 let mut user_tasks: Vec<&state::UserTask> = self
                     .state
@@ -2859,13 +2852,36 @@ impl Engine {
             .collect();
         subs.sort_by_key(|s| s.key);
         subs.into_iter()
-            .map(|s| Event::MessageSubscriptionCanceled {
+            .map(|s| Self::disarm_subscription_event(s))
+            .collect()
+    }
+
+    /// The disarm event for a subscription being torn down. A cross-partition
+    /// parked placeholder (state `Opening`, its canonical record lives on the
+    /// `hash(correlation_key)` partition) emits a routable
+    /// `MessageSubscriptionClosing` so the host disarms the canonical record;
+    /// any other (local, `Open`) subscription emits a plain
+    /// `MessageSubscriptionCanceled`. Single-partition runs only ever hold
+    /// `Open` subs, so they always take the latter branch and stay
+    /// byte-identical.
+    fn disarm_subscription_event(s: &state::MessageSubscription) -> Event {
+        if s.state == state::MessageSubscriptionState::Opening {
+            Event::MessageSubscriptionClosing {
                 subscription_key: s.key,
                 instance_key: s.instance_key,
                 element_instance_key: s.element_instance_key,
                 element_id: s.element_id.clone(),
-            })
-            .collect()
+                message_name: s.message_name.clone(),
+                correlation_key: s.correlation_key.clone(),
+            }
+        } else {
+            Event::MessageSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            }
+        }
     }
 
     /// The key of a still-in-play job parked on `element_instance_key`, if any.
@@ -3146,12 +3162,7 @@ impl Engine {
             .collect();
         subs.sort_by_key(|s| s.key);
         subs.into_iter()
-            .map(|s| Event::MessageSubscriptionCanceled {
-                subscription_key: s.key,
-                instance_key: s.instance_key,
-                element_instance_key: s.element_instance_key,
-                element_id: s.element_id.clone(),
-            })
+            .map(|s| Self::disarm_subscription_event(s))
             .collect()
     }
 
@@ -4160,6 +4171,127 @@ mod tests {
         assert!(!again
             .iter()
             .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    }
+
+    /// Cancelling an instance whose catch subscription is canonically placed on
+    /// another partition emits a routable `MessageSubscriptionClosing` (carrying
+    /// the message name + correlation key the host needs to address the message
+    /// partition), and the local placeholder transitions to `Canceled`. The
+    /// canonical record is then disarmed by routing a `CloseMessageSubscription`
+    /// to the message partition, which settles its own copy.
+    #[test]
+    fn cross_partition_cancel_emits_a_routable_closing() {
+        const N: u64 = 2;
+        let order = ('a'..='z')
+            .map(|c| c.to_string())
+            .find(|k| state::subscription_partition(k, N) == 1)
+            .expect("some key hashes to partition 1");
+
+        let mut instance_engine = Engine::with_partition(0);
+        instance_engine.set_num_partitions(N);
+        instance_engine
+            .apply_command(Command::DeployProcess(process_with_message_catch()))
+            .unwrap();
+        let mut message_engine = Engine::with_partition(1);
+        message_engine.set_num_partitions(N);
+
+        // Park the instance on partition 0 with a cross-partition Opening, then
+        // open the canonical subscription on partition 1.
+        let created = instance_engine
+            .apply_command(Command::create_instance_with(
+                "await-payment",
+                vars(&[("orderId", Value::Str(order.clone()))]),
+            ))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+        let opening = created
+            .iter()
+            .find_map(|e| match e {
+                Event::MessageSubscriptionOpening {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    message_name,
+                    correlation_key,
+                    kind,
+                } => Some(Command::OpenMessageSubscription {
+                    subscription_key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    message_name: message_name.clone(),
+                    correlation_key: correlation_key.clone(),
+                    kind: kind.clone(),
+                }),
+                _ => None,
+            })
+            .expect("an Opening was emitted");
+        message_engine.apply_command(opening).unwrap();
+        assert_eq!(
+            message_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Open
+        );
+
+        // Cancel on the instance partition: a routable Closing is emitted for the
+        // off-partition placeholder, carrying the routing payload.
+        let canceled = instance_engine
+            .apply_command(Command::cancel_instance(instance_key))
+            .unwrap();
+        let closing = canceled
+            .iter()
+            .find_map(|e| match e {
+                Event::MessageSubscriptionClosing {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    message_name,
+                    correlation_key,
+                } => Some(Command::CloseMessageSubscription {
+                    subscription_key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: {
+                        assert_eq!(message_name, "payment-received");
+                        assert_eq!(correlation_key, &order);
+                        element_id.clone()
+                    },
+                }),
+                _ => None,
+            })
+            .expect("a routable Closing was emitted for the cross-partition sub");
+        assert!(
+            !canceled
+                .iter()
+                .any(|e| matches!(e, Event::MessageSubscriptionCanceled { .. })),
+            "the off-partition placeholder routes a Closing, not a local Canceled"
+        );
+        assert_eq!(
+            instance_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Canceled
+        );
+
+        // Host routes the Close to the message partition, disarming the canonical
+        // record so a later publish correlates nothing.
+        message_engine.apply_command(closing).unwrap();
+        assert_eq!(
+            message_engine.message_subscriptions()[0].state,
+            state::MessageSubscriptionState::Canceled
+        );
+        let published = message_engine
+            .apply_command(Command::correlate_message_with(
+                "payment-received",
+                order.clone(),
+                HashMap::new(),
+            ))
+            .unwrap();
+        assert!(
+            !published
+                .iter()
+                .any(|e| matches!(e, Event::RemoteMessageCorrelation { .. })),
+            "the disarmed canonical sub correlates nothing"
+        );
     }
 
     #[test]
