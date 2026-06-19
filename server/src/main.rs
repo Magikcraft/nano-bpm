@@ -1716,20 +1716,43 @@ impl ServerImpl {
         Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology_response))
     }
 
-    /// Correlates a message across **all** partitions and returns the combined
-    /// events. A waiting subscription can sit on any partition (instances are
-    /// spread across them), and the message-start subscriptions live on partition
-    /// 0, so the message must reach every partition. Each partition mints its own
-    /// message key and correlates against its own subscriptions; with a single
-    /// partition this is one round-trip, identical to the pre-partitioning path.
+    /// Correlates a message, routing it to **only** the partitions that can hold a
+    /// matching subscription, and returns the combined events. With canonical
+    /// placement a message's subscriptions live on exactly two well-known
+    /// partitions: the intermediate/boundary catch subscriptions for this
+    /// `correlation_key` sit on `subscription_partition(correlation_key)`, and the
+    /// process-level message-start subscriptions live on the deployment partition
+    /// (partition 0). The publish therefore needs to reach just those two (often
+    /// one), not every partition — replacing the old all-partitions broadcast.
+    ///
+    /// Only the **local** members of that target set are applied here; a target
+    /// owned by a peer is reached because the cluster publish is broadcast to
+    /// every node (each node correlates its own local subset), so the union still
+    /// covers both owners. With a single partition the target set is `{0}` — one
+    /// round-trip, identical to the pre-partitioning path.
     async fn correlate_message_everywhere(
         &self,
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
     ) -> Vec<Event> {
+        let num_partitions = self.engine.topology().num_partitions;
+        // The (deduplicated) partitions that can own a matching subscription: the
+        // correlation-key hash partition (catch/boundary) + partition 0 (starts).
+        let hash_partition =
+            nanobpmn_engine_core::subscription_partition(&correlation_key, num_partitions);
+        let mut targets = vec![hash_partition];
+        if hash_partition != 0 {
+            targets.push(0);
+        }
+
         let mut all_events: Vec<Event> = Vec::new();
-        for handle in self.engine.all() {
+        for target in targets {
+            // Skip a target this node does not own; the cluster broadcast routes
+            // the publish to the owning node, which correlates it locally.
+            let Some(handle) = self.engine.local_for_partition(target) else {
+                continue;
+            };
             let name = name.clone();
             let correlation_key = correlation_key.clone();
             let variables = variables.clone();
@@ -6929,6 +6952,56 @@ mod subscription_placement_tests {
             .await_completion_for_stream(instance_key, None, Some(2000))
             .await;
         assert!(completed, "instance completes after the post-job-completion correlation");
+    }
+
+    #[tokio::test]
+    async fn message_start_correlation_reaches_partition_zero() {
+        // The route-to-one publish target set always includes partition 0, where
+        // message-start subscriptions live. A publish whose correlation key hashes
+        // to a NON-zero partition must still create a start instance on p0.
+        const START_BPMN: &str = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="on-order">
+              <bpmn:startEvent id="s">
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:startEvent>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="order-placed" />
+          </bpmn:definitions>"#;
+
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("on-order.bpmn".into(), START_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy succeeds");
+
+        // Pick a correlation key that hashes OFF partition 0, proving p0 is hit
+        // even though the hash target is elsewhere.
+        let key = (0..)
+            .map(|i| format!("k{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) != 0)
+            .expect("a non-zero-hashing key exists");
+
+        let (_message_key, instance) = server
+            .correlate_message_local(
+                "order-placed".into(),
+                key,
+                std::collections::HashMap::new(),
+            )
+            .await;
+        let instance_key = instance.expect("the message-start created an instance on p0");
+        assert_eq!(
+            nanobpmn_engine_core::partition_of(instance_key),
+            0,
+            "message-start instances are minted on the deployment partition"
+        );
     }
 
     #[tokio::test]
