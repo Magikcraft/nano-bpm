@@ -860,6 +860,38 @@ impl ServerImpl {
             }
         };
 
+        // Under Raft (RF>=2) the create must be REPLICATED through a partition's
+        // Raft log and placed by *leadership*, not statically-owned round-robin:
+        // route through the shared Raft create core (leadership-following + leader
+        // forward) instead of the stage-1 direct-apply path below. This closes the
+        // durability gap where a locally-placed REST create was applied without a
+        // quorum and would be lost on this node's failure. The Raft-off path below
+        // is left untouched (byte-identical single-node / RF=1 behaviour).
+        if !self.raft.is_empty() {
+            let wire_vars = match body {
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                    b.variables.as_ref()
+                }
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                    b.variables.as_ref()
+                }
+            }
+            .and_then(|m| wire_variables(Some(m)));
+            return Ok(self
+                .create_rest_via_raft(
+                    by_id,
+                    by_key,
+                    variables,
+                    wire_vars,
+                    tags_vec,
+                    business_id_str,
+                    await_completion,
+                    fetch_variables.cloned(),
+                    request_timeout,
+                )
+                .await);
+        }
+
         // Run the command on the engine thread. The closure yields the success
         // fields plus the commit to await, or a ready `Resp` for an error path
         // (nothing written). Both arms produce `Send` values.
@@ -5415,6 +5447,168 @@ impl ServerImpl {
                     || message.contains("no local engine actor")))
     }
 
+    /// Forwards a REST create to a peer leader, returning the full REST response
+    /// (the peer threads `awaitCompletion`). Used by
+    /// [`create_rest_via_raft`](Self::create_rest_via_raft) when this node leads
+    /// nothing or its local propose failed on a stale leadership view. Sheds a
+    /// retryable 503 when no partition has a reachable leader yet.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_rest_create_to_leader(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> apis::process_instance::CreateProcessInstanceResponse {
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        match self.leader_node_for_create() {
+            Some(node) => {
+                self.forward_create(
+                    node,
+                    by_id,
+                    by_key,
+                    wire_vars,
+                    tags,
+                    business_id,
+                    await_completion,
+                    fetch_variables,
+                    request_timeout,
+                )
+                .await
+            }
+            None => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                "no partition leader reachable; retry".to_string(),
+            )),
+        }
+    }
+
+    /// REST `createProcessInstance` through Raft (RF>=2). Mirrors the stream
+    /// [`create_via_raft`](Self::create_via_raft) — leadership-following placement
+    /// over the led partitions, with a leader-forward fallback when this node
+    /// leads nothing or its leadership view of the chosen partition was stale —
+    /// but returns the full REST result (definition identity + `awaitCompletion`
+    /// variables) instead of just `(key, sync)`. Replication closes the durability
+    /// gap of the legacy stage-1 direct-apply local path: a REST-created instance
+    /// now survives this node's failure exactly like a stream-created one.
+    ///
+    /// `awaitCompletion` observes the read model by key
+    /// ([`await_process_completion`](Self::await_process_completion)) and is wholly
+    /// decoupled from how the instance was created, so it behaves identically to
+    /// the direct-apply path with no lost-wakeup race: its register-before-read
+    /// loop catches a synchronously-completed instance on the first iteration.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_rest_via_raft(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: std::collections::HashMap<String, Value>,
+        wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> apis::process_instance::CreateProcessInstanceResponse {
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+
+        // This node leads nothing right now: forward instead of shedding a 503.
+        if self.led_partitions().is_empty() {
+            return self
+                .forward_rest_create_to_leader(
+                    by_id,
+                    by_key,
+                    wire_vars,
+                    tags,
+                    business_id,
+                    await_completion,
+                    fetch_variables,
+                    request_timeout,
+                )
+                .await;
+        }
+
+        let core = self
+            .raft_create_core(
+                by_id.clone(),
+                by_key.clone(),
+                variables,
+                tags.clone(),
+                business_id.clone(),
+            )
+            .await;
+        let (process_id, version, definition_key, instance_key, sync_completed, routable) =
+            match core {
+                Ok(fields) => fields,
+                // Stale leadership / leads-nothing-now: forward to the current
+                // leader rather than surface a retryable error.
+                Err(e) if Self::create_should_forward(&e) => {
+                    return self
+                        .forward_rest_create_to_leader(
+                            by_id,
+                            by_key,
+                            wire_vars,
+                            tags,
+                            business_id,
+                            await_completion,
+                            fetch_variables,
+                            request_timeout,
+                        )
+                        .await;
+                }
+                Err((409, message)) => {
+                    return Resp::Status409_TheProcessInstanceCreationWasRejectedDueToABusinessIDUniquenessConflict(
+                        problem("Conflict", 409, message),
+                    );
+                }
+                Err((400, message)) => {
+                    return Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "The provided data is not valid",
+                        400,
+                        message,
+                    ));
+                }
+                Err((status, message)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Internal error", status, message),
+                    );
+                }
+            };
+
+        crate::metrics::record_create("rest");
+        if !routable.is_empty() {
+            self.drive_subscription_routing(routable).await;
+        }
+        self.signal_jobs_available();
+
+        let (variables_out, process_completed) = if await_completion {
+            self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
+                .await
+        } else {
+            (std::collections::HashMap::new(), sync_completed)
+        };
+
+        let result = models::CreateProcessInstanceResult::new(
+            process_id,
+            version,
+            "<default>".to_string(),
+            variables_out,
+            models::ProcessDefinitionKey(definition_key),
+            models::ProcessInstanceKey(instance_key.to_string()),
+            tags.into_iter().map(models::Tag).collect(),
+            business_id
+                .map(nanobpm_gateway_rest::types::Nullable::Present)
+                .unwrap_or(nanobpm_gateway_rest::types::Nullable::Null),
+            process_completed,
+        );
+        Resp::Status200_TheProcessInstanceWasCreated(result)
+    }
+
     /// Shared Raft create core: pick a partition this node leads, resolve the
     /// process-definition id, replicate `CreateInstance` through that partition's
     /// Raft log, and return the rich result fields both the stream create
@@ -5523,6 +5717,24 @@ impl ServerImpl {
     /// commits it through its own Raft), mapping the peer's REST result back to
     /// the `(key, sync_completed)` shape the stream create returns. Falls back to
     /// a retryable 503 only when no partition has a reachable leader yet.
+    /// The node id of a partition leader other than this node, if any partition
+    /// currently has a reachable remote leader. Used by the create-forward paths
+    /// (stream and REST) when this node leads nothing — or its leadership view of
+    /// a chosen partition turned out to be stale — to pick a peer that can commit
+    /// the create through its own Raft. Returns `None` when no partition has a
+    /// known remote leader yet (the caller sheds a retryable 503).
+    fn leader_node_for_create(&self) -> Option<u32> {
+        let node_id = self.engine.topology().node_id as u64;
+        (0..self.engine.topology().num_partitions)
+            .find_map(|p| {
+                self.raft
+                    .get(p)
+                    .and_then(|part| part.raft.metrics().borrow().current_leader)
+                    .filter(|l| *l != node_id)
+            })
+            .map(|l| l as u32)
+    }
+
     async fn forward_create_to_leader(
         &self,
         by_id: Option<String>,
@@ -5530,14 +5742,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         use apis::process_instance::CreateProcessInstanceResponse as R;
-        let node_id = self.engine.topology().node_id as u64;
-        let leader = (0..self.engine.topology().num_partitions).find_map(|p| {
-            self.raft
-                .get(p)
-                .and_then(|part| part.raft.metrics().borrow().current_leader)
-                .filter(|l| *l != node_id)
-        });
-        let Some(leader) = leader else {
+        let Some(leader) = self.leader_node_for_create() else {
             return Err((503, "no partition leader reachable; retry".to_string()));
         };
         let wire_vars = if variables.is_empty() {
@@ -5552,7 +5757,7 @@ impl ServerImpl {
         };
         match self
             .forward_create(
-                leader as u32,
+                leader,
                 by_id,
                 by_key,
                 wire_vars,
@@ -8698,10 +8903,19 @@ mod clustered_startup_tests {
             .connect("work", "end")
             .build()
             .expect("valid process");
+        // An auto-completing process (start -> end, no wait state) so tests can
+        // exercise the synchronous-completion / awaitCompletion path through Raft.
+        let auto = ProcessBuilder::new("auto")
+            .start_event("start")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid auto process");
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
+        names.insert("auto".to_string(), "auto.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc, auto], &names, "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -9059,6 +9273,146 @@ mod clustered_startup_tests {
         assert!(
             present,
             "the forwarded create is committed on the peer leader's partition"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rest_create_replicates_through_raft_and_awaits_completion() {
+        // s3-rest-create: the REST createProcessInstance path must go through Raft
+        // under RF>=2 (not the legacy stage-1 direct apply), so the instance is
+        // quorum-replicated and survives a node failure. Also exercises the
+        // awaitCompletion path through Raft for an auto-completing process: the
+        // synchronous-completion wait observes the read model by key and must
+        // report processCompleted=true with no lost wakeup.
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let mut instr =
+            models::ProcessInstanceCreationInstructionById::new("auto".to_string());
+        instr.await_completion = Some(true);
+        instr.request_timeout = Some(5000);
+        let body = models::ProcessInstanceCreationInstruction::from(instr);
+
+        let resp = node0
+            .create_process_instance_impl(&body)
+            .await
+            .expect("rest create returns a response");
+        let result = match resp {
+            Resp::Status200_TheProcessInstanceWasCreated(r) => r,
+            other => panic!("rest create through raft should be 200, got {other:?}"),
+        };
+        assert!(
+            result.process_completed,
+            "the auto-completing process reports completion via awaitCompletion through Raft"
+        );
+        let instance_key: u64 = result
+            .process_instance_key
+            .0
+            .parse()
+            .expect("numeric instance key");
+
+        // The instance must be present on a FOLLOWER engine actor too — proof the
+        // REST create replicated through Raft rather than applying only locally.
+        let p = nanobpmn_engine_core::partition_of(instance_key);
+        let follower = if node0
+            .raft_registry()
+            .get(p)
+            .and_then(|part| part.raft.metrics().borrow().current_leader)
+            == Some(1)
+        {
+            &node2
+        } else {
+            &node1
+        };
+        let handle = follower
+            .engine_handle_for(p)
+            .expect("the follower replicates the instance's partition");
+        let mut present = false;
+        for _ in 0..200 {
+            if handle
+                .with(move |journal| journal.engine().instance(instance_key).is_some())
+                .await
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            present,
+            "the REST-created instance is replicated to a follower's partition"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rest_create_on_a_node_that_leads_nothing_forwards_to_a_peer_leader() {
+        // s3-rest-create: a REST create on a node that leads NO partition (its Raft
+        // groups shut down while its gateway stays up) must FORWARD to a peer
+        // leader and commit there, returning 200 — not shed a 503.
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        for p in 0..3u64 {
+            let _ = wait_new_leader(&node1, &node2, p).await;
+        }
+
+        let body = models::ProcessInstanceCreationInstruction::from(
+            models::ProcessInstanceCreationInstructionById::new("intake".to_string()),
+        );
+        let resp = node0
+            .create_process_instance_impl(&body)
+            .await
+            .expect("rest create returns a response");
+        let result = match resp {
+            Resp::Status200_TheProcessInstanceWasCreated(r) => r,
+            other => panic!("a leads-nothing rest create should forward and 200, got {other:?}"),
+        };
+        let instance_key: u64 = result
+            .process_instance_key
+            .0
+            .parse()
+            .expect("numeric instance key");
+
+        let p = nanobpmn_engine_core::partition_of(instance_key);
+        let leader = wait_new_leader(&node1, &node2, p).await;
+        let handle = leader
+            .engine_handle_for(p)
+            .expect("the leader materializes the instance's partition");
+        let mut present = false;
+        for _ in 0..200 {
+            if handle
+                .with(move |journal| journal.engine().instance(instance_key).is_some())
+                .await
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            present,
+            "the forwarded REST create is committed on the peer leader's partition"
         );
 
         for node in [&node1, &node2] {
