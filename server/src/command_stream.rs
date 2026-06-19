@@ -323,6 +323,16 @@ pub enum ClientFrame {
         #[serde(default)]
         payload: Option<Value>,
     },
+    /// **Intra-cluster only.** Carries one serialized Raft RPC (AppendEntries /
+    /// Vote / InstallSnapshot) for `partition`'s replica group to the node hosting
+    /// it. Answered by a `CommandResult` whose body is the serialized
+    /// `RaftRpcResponse` (200) or an error status. This is the command-stream
+    /// transport for per-partition Raft (stage 3 leader routing).
+    Raft {
+        corr: u64,
+        partition: u64,
+        rpc: Value,
+    },
 }
 
 /// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
@@ -764,6 +774,7 @@ async fn handle_client_frame(
         ClientFrame::GetByKey { .. } => "get_by_key",
         ClientFrame::ForwardUserTask { .. } => "forward_user_task",
         ClientFrame::ForwardCreate { .. } => "forward_create",
+        ClientFrame::Raft { .. } => "raft",
     };
     crate::metrics::record_stream_frame(frame_type);
     
@@ -1162,6 +1173,19 @@ async fn handle_client_frame(
                 status,
                 body: message.map(Value::String),
             });
+        }
+        ClientFrame::Raft {
+            corr,
+            partition,
+            rpc,
+        } => {
+            // Peer-side of the Raft network: feed the inbound RPC into the local
+            // replica of `partition` and answer with the serialized response.
+            let (status, body) = match server.dispatch_raft_rpc(partition, rpc).await {
+                Ok(resp) => (200u16, Some(resp)),
+                Err((status, message)) => (status, Some(Value::String(message))),
+            };
+            conn.send(ServerFrame::CommandResult { corr, status, body });
         }
     }
     

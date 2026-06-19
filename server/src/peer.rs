@@ -252,6 +252,20 @@ impl PeerLink {
             .await
     }
 
+    /// Carries one Raft RPC (AppendEntries/Vote/InstallSnapshot, serialized to
+    /// `rpc`) for `partition`'s replica group to this peer, which hosts a replica
+    /// of that partition. Answered by a `CommandResult` whose body is the
+    /// serialized `RaftRpcResponse`. This is the command-stream binding of the
+    /// per-partition Raft network (stage 3 leader routing).
+    pub async fn raft_rpc(&self, partition: u64, rpc: Value) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::Raft {
+            corr,
+            partition,
+            rpc,
+        })
+        .await
+    }
+
     /// Forwards a user-task by-key mutation to the peer that owns the task's
     /// partition. `payload` is the original REST request body.
     pub async fn forward_user_task(

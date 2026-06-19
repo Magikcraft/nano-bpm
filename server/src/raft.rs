@@ -51,7 +51,7 @@
 // in a plain `cargo build`, so dead-code is allowed at the module level.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
@@ -546,6 +546,41 @@ impl RaftPartition {
             .client_write(ReplicatedCommand { command, now })
             .await?;
         Ok(res.data.events)
+    }
+}
+
+/// The set of Raft groups this node hosts, keyed by partition id. A node hosts a
+/// group for every partition it is a replica of; the command-stream handler looks
+/// up the target partition here to feed it an inbound RPC, and the write path
+/// looks up the partition to propose through its leader. Empty by default — only
+/// populated when per-partition Raft is enabled — so the non-Raft path is
+/// untouched.
+#[derive(Default)]
+pub struct RaftRegistry {
+    partitions: Mutex<HashMap<u64, Arc<RaftPartition>>>,
+}
+
+impl RaftRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Hosts `part`, keyed by its partition id.
+    pub fn insert(&self, part: Arc<RaftPartition>) {
+        self.partitions
+            .lock()
+            .unwrap()
+            .insert(part.partition_id, part);
+    }
+
+    /// The hosted group for `partition`, if this node replicates it.
+    pub fn get(&self, partition: u64) -> Option<Arc<RaftPartition>> {
+        self.partitions.lock().unwrap().get(&partition).cloned()
+    }
+
+    /// Whether this node hosts no Raft groups (the non-Raft default).
+    pub fn is_empty(&self) -> bool {
+        self.partitions.lock().unwrap().is_empty()
     }
 }
 

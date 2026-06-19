@@ -164,6 +164,11 @@ pub struct ServerImpl {
     // (s1-broadcast / s1-bykey-forward); constructed and tested now.
     #[allow(dead_code)]
     peers: peer::PeerSet,
+    /// The Raft groups this node hosts (one per partition it replicates), empty
+    /// unless per-partition Raft is enabled. The command-stream handler dispatches
+    /// inbound RPCs through it; the write path proposes through it. An empty
+    /// registry means the classic single-writer path is in force — zero overhead.
+    raft: Arc<crate::raft::RaftRegistry>,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -365,6 +370,7 @@ impl ServerImpl {
             admission_max_backlog,
             admission_max_create_queue,
             peers,
+            raft: crate::raft::RaftRegistry::new(),
         }
     }
 }
@@ -422,6 +428,44 @@ impl Default for ServerImpl {
     fn default() -> Self {
         let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
         build_server(vec![Journal::in_memory()], store, cluster::Topology::single(1))
+    }
+}
+
+impl ServerImpl {
+    /// The Raft groups this node hosts. Used to host a partition's group and, by
+    /// the command-stream handler and write path, to reach it.
+    pub fn raft_registry(&self) -> &Arc<crate::raft::RaftRegistry> {
+        &self.raft
+    }
+
+    /// A [`RaftTransport`](crate::raft_net::RaftTransport) that carries this
+    /// node's Raft RPCs to peers over the command stream. Built from the node's
+    /// existing peer uplinks, so a target Raft node id maps straight onto a peer.
+    pub fn raft_transport(&self) -> Arc<dyn crate::raft_net::RaftTransport> {
+        Arc::new(crate::raft_net::PeerTransport::new(self.peers.clone()))
+    }
+
+    /// Peer-side of the Raft network: decode an inbound RPC, feed it to the local
+    /// replica of `partition`, and return its serialized response. `Err((status,
+    /// message))` maps to the command-stream `CommandResult` status (400 malformed,
+    /// 404 not hosted here, 500 dispatch failure).
+    pub async fn dispatch_raft_rpc(
+        &self,
+        partition: u64,
+        rpc: serde_json::Value,
+    ) -> Result<serde_json::Value, (u16, String)> {
+        let req: crate::raft_net::RaftRpcRequest =
+            serde_json::from_value(rpc).map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
+        let part = self.raft.get(partition).ok_or_else(|| {
+            (
+                404u16,
+                format!("no raft group for partition {partition} on this node"),
+            )
+        })?;
+        let resp = crate::raft_net::dispatch(&part.raft, req)
+            .await
+            .map_err(|e| (500u16, format!("raft dispatch failed: {e}")))?;
+        serde_json::to_value(resp).map_err(|e| (500u16, format!("encode raft response: {e}")))
     }
 }
 
@@ -7065,6 +7109,164 @@ mod clustered_startup_tests {
         let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
         let p = nanobpmn_engine_core::partition_of(job_key);
         assert!(p == 0 || p == 2, "the aggregated job lives on a node-0 partition, got {p}");
+    }
+
+    #[tokio::test]
+    async fn raft_rpcs_replicate_a_command_across_two_nodes_over_the_command_stream() {
+        // Proves the command-stream Raft binding: two served nodes host a 2-voter
+        // Raft group for partition 0, carry AppendEntries/Vote RPCs over the real
+        // command stream (PeerTransport -> ClientFrame::Raft -> dispatch_raft_rpc),
+        // and a command proposed on the leader commits via quorum and applies on
+        // BOTH nodes.
+        use crate::raft::RaftPartition;
+        use openraft::BasicNode;
+        use std::collections::BTreeMap;
+
+        // Pre-bind both listeners so each node can embed the other's real URL.
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+                replication_factor: 2,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+
+        // Serve both nodes' command-stream endpoints so the PeerTransport can reach
+        // them. (Serve BEFORE bootstrapping voters so inbound RPCs are accepted as
+        // soon as the group starts electing.)
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // Host a Raft group for partition 0 on BOTH nodes, each driving its peer
+        // over its own PeerTransport (the production command-stream carrier). A
+        // voter must be able to RECEIVE AppendEntries before the group forms, so
+        // construct + register every member first, then initialize once.
+        let part0 = Arc::new(
+            RaftPartition::bootstrap_member(
+                0,
+                0,
+                Journal::in_memory_partition(0),
+                node0.raft_transport(),
+            )
+            .await
+            .expect("boot raft member on node 0"),
+        );
+        node0.raft_registry().insert(part0.clone());
+
+        let part1 = Arc::new(
+            RaftPartition::bootstrap_member(
+                1,
+                0,
+                Journal::in_memory_partition(0),
+                node1.raft_transport(),
+            )
+            .await
+            .expect("boot raft member on node 1"),
+        );
+        node1.raft_registry().insert(part1.clone());
+
+        // Form the {0,1} group on node 0 and let it win the initial election —
+        // every Vote/AppendEntries to node 1 rides the real command stream.
+        let mut members = BTreeMap::new();
+        members.insert(0u64, BasicNode::new(peers[0].clone()));
+        members.insert(1u64, BasicNode::new(peers[1].clone()));
+        part0.initialize(members).await.expect("form group");
+
+        let wait_until = |part: Arc<RaftPartition>, want: u64| async move {
+            for _ in 0..300 {
+                if part.raft.metrics().borrow().current_leader == Some(want) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            false
+        };
+        assert!(
+            wait_until(part0.clone(), 0).await,
+            "node 0 should win the initial election over the wire"
+        );
+
+        // Deploy a process by proposing through the leader: with RF=2 this commits
+        // only once node 1 acks the entry over the command stream.
+        let proc = ProcessBuilder::new("raft-demo")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let events = part0
+            .propose(Command::DeployProcess(proc), 1_000)
+            .await
+            .expect("propose deploy via the leader");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+            "the deploy committed via quorum and applied on the leader (got {events:?})"
+        );
+
+        let target = part0
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        assert!(target >= 1, "leader applied at least the deploy entry");
+
+        // Node 1 converges to the same applied index — the entry replicated to and
+        // applied on the follower purely over the command-stream Raft binding.
+        let mut applied = false;
+        for _ in 0..300 {
+            let idx = part1
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
+            if idx >= target {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            applied,
+            "node 1 did not apply up to index {target} over the command stream"
+        );
+
+        part0.raft.shutdown().await.expect("clean shutdown node 0");
+        part1.raft.shutdown().await.expect("clean shutdown node 1");
     }
 }
 

@@ -39,6 +39,7 @@ use openraft::raft::{
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
+use crate::peer::PeerSet;
 use crate::raft::{NodeId, RaftConfig};
 
 /// A boxed, `Send` future — the return shape of the dyn-compatible
@@ -272,6 +273,55 @@ impl RaftTransport for LocalCluster {
             dispatch(&raft, req)
                 .await
                 .map_err(|e| TransportError(e.to_string()))
+        })
+    }
+}
+
+/// The production transport: carries a partition's Raft RPCs to peer nodes over
+/// the cluster's existing command-stream WebSocket. The target [`NodeId`] is the
+/// cluster node id, so it maps straight onto the [`PeerSet`] uplink; the RPC is
+/// serialized into a [`crate::command_stream::ClientFrame::Raft`] frame and the
+/// peer answers with the serialized [`RaftRpcResponse`] in its `CommandResult`.
+#[derive(Clone)]
+pub struct PeerTransport {
+    peers: PeerSet,
+}
+
+impl PeerTransport {
+    pub fn new(peers: PeerSet) -> Self {
+        Self { peers }
+    }
+}
+
+impl RaftTransport for PeerTransport {
+    fn send<'a>(
+        &'a self,
+        target: NodeId,
+        partition: u64,
+        req: RaftRpcRequest,
+    ) -> BoxFuture<'a, Result<RaftRpcResponse, TransportError>> {
+        Box::pin(async move {
+            let value =
+                serde_json::to_value(&req).map_err(|e| TransportError(e.to_string()))?;
+            let link = self
+                .peers
+                .link(target as u32)
+                .await
+                .map_err(|e| TransportError(e.to_string()))?;
+            let result = link
+                .raft_rpc(partition, value)
+                .await
+                .map_err(|e| TransportError(e.to_string()))?;
+            if result.status != 200 {
+                return Err(TransportError(format!(
+                    "peer raft rpc returned status {} (partition {partition}, target {target})",
+                    result.status
+                )));
+            }
+            let body = result
+                .body
+                .ok_or_else(|| TransportError("peer raft rpc returned no body".into()))?;
+            serde_json::from_value(body).map_err(|e| TransportError(e.to_string()))
         })
     }
 }
