@@ -188,18 +188,36 @@ impl PeerLink {
     where
         F: FnOnce(u64) -> ClientFrame,
     {
-        self.request_on(&self.out_app, &self.pending_app, build)
+        self.request_on(&self.out_app, &self.pending_app, request_timeout(), build)
+            .await
+    }
+
+    /// Like [`request`](Self::request) but with an explicit per-call deadline,
+    /// overriding the default 30s [`request_timeout`]. Used by the write-forward
+    /// path so a create/job command routed to a momentarily-leaderless (e.g.
+    /// just-failed) partition fails fast and is retried against the new leader,
+    /// instead of pinning the caller for 30s.
+    pub async fn request_within<F>(
+        &self,
+        timeout: Duration,
+        build: F,
+    ) -> Result<PeerResult, PeerError>
+    where
+        F: FnOnce(u64) -> ClientFrame,
+    {
+        self.request_on(&self.out_app, &self.pending_app, timeout, build)
             .await
     }
 
     /// Sends `build(corr)` on the given lane and awaits the peer's matching
-    /// `CommandResult`. Shared by the app-forwarding lane ([`request`]) and the
-    /// dedicated Raft lane ([`raft_rpc`]); each lane carries its own socket and
-    /// pending table, so neither can stall the other.
+    /// `CommandResult`, giving up after `timeout`. Shared by the app-forwarding
+    /// lane ([`request`]) and the dedicated Raft lane ([`raft_rpc`]); each lane
+    /// carries its own socket and pending table, so neither can stall the other.
     async fn request_on<F>(
         &self,
         out: &mpsc::Sender<Message>,
         pending: &Pending,
+        timeout: Duration,
         build: F,
     ) -> Result<PeerResult, PeerError>
     where
@@ -220,7 +238,7 @@ impl PeerLink {
             return Err(PeerError::Closed);
         }
 
-        match tokio::time::timeout(request_timeout(), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(PeerError::Closed),
             Err(_) => {
@@ -240,7 +258,7 @@ impl PeerLink {
         process_definition_key: Option<String>,
         variables: Option<serde_json::Map<String, Value>>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::CreateInstance {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::CreateInstance {
             corr,
             process_definition_id,
             process_definition_key,
@@ -258,7 +276,7 @@ impl PeerLink {
         job_key: String,
         variables: Option<serde_json::Map<String, Value>>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::CompleteJob {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::CompleteJob {
             corr,
             job_key,
             variables,
@@ -278,7 +296,7 @@ impl PeerLink {
         timeout: u64,
         fetch_variable: Option<Vec<String>>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::ActivateJobs {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ActivateJobs {
             corr,
             job_type,
             worker,
@@ -292,8 +310,12 @@ impl PeerLink {
     /// Forwards a GET-by-key read to the peer that owns the key's partition
     /// (query forwarding). The peer answers from its local read model.
     pub async fn get_by_key(&self, kind: ReadKind, key: u64) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::GetByKey { corr, kind, key })
-            .await
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::GetByKey {
+            corr,
+            kind,
+            key,
+        })
+        .await
     }
 
     /// Carries one Raft RPC (AppendEntries/Vote/InstallSnapshot, serialized to
@@ -302,10 +324,12 @@ impl PeerLink {
     /// serialized `RaftRpcResponse`. This is the command-stream binding of the
     /// per-partition Raft network (stage 3 leader routing).
     pub async fn raft_rpc(&self, partition: u64, rpc: Value) -> Result<PeerResult, PeerError> {
-        self.request_on(&self.out_raft, &self.pending_raft, |corr| ClientFrame::Raft {
-            corr,
-            partition,
-            rpc,
+        self.request_on(&self.out_raft, &self.pending_raft, request_timeout(), |corr| {
+            ClientFrame::Raft {
+                corr,
+                partition,
+                rpc,
+            }
         })
         .await
     }
@@ -318,7 +342,7 @@ impl PeerLink {
         user_task_key: String,
         payload: Option<Value>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::ForwardUserTask {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ForwardUserTask {
             corr,
             op,
             user_task_key,
@@ -378,7 +402,7 @@ impl PeerLink {
         retries: i32,
         error_message: String,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::FailJob {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::FailJob {
             corr,
             job_key,
             retries: Some(retries),
@@ -394,7 +418,7 @@ impl PeerLink {
         error_code: String,
         error_message: String,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::ThrowError {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ThrowError {
             corr,
             job_key,
             error_code,
@@ -405,8 +429,11 @@ impl PeerLink {
 
     /// Forwards a `cancelProcessInstance` to the peer that owns the instance.
     pub async fn cancel_instance(&self, instance_key: String) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::CancelInstance { corr, instance_key })
-            .await
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::CancelInstance {
+            corr,
+            instance_key,
+        })
+        .await
     }
 
     /// Forwards a cross-partition subscription follow-up event (a
@@ -427,7 +454,7 @@ impl PeerLink {
         job_key: String,
         retries: i32,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::UpdateJobRetries {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::UpdateJobRetries {
             corr,
             job_key,
             retries,
@@ -441,7 +468,7 @@ impl PeerLink {
         incident_key: String,
         operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::ResolveIncident {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ResolveIncident {
             corr,
             incident_key,
             operation_reference,
@@ -455,7 +482,7 @@ impl PeerLink {
         scope_key: String,
         variables: Option<serde_json::Map<String, Value>>,
     ) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::SetVariables {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::SetVariables {
             corr,
             scope_key,
             variables,
@@ -486,6 +513,39 @@ impl PeerLink {
             tags,
             business_id,
             await_completion,
+            fetch_variables,
+            request_timeout,
+        })
+        .await
+    }
+
+    /// Like [`forward_create`](Self::forward_create) but bounded by an explicit
+    /// `deadline` instead of the 30s default. The write-forward path uses a short
+    /// deadline so a create routed to a just-failed partition leader returns
+    /// `PeerError::Timeout` quickly and can be retried against the newly elected
+    /// leader, rather than pinning the producer connection until the partition
+    /// recovers. Only safe for non-`await_completion` creates, where the response
+    /// arrives as soon as the instance commits.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn forward_create_within(
+        &self,
+        deadline: Duration,
+        process_definition_id: Option<String>,
+        process_definition_key: Option<String>,
+        variables: Option<serde_json::Map<String, Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(deadline, |corr| ClientFrame::ForwardCreate {
+            corr,
+            process_definition_id,
+            process_definition_key,
+            variables,
+            tags,
+            business_id,
+            await_completion: false,
             fetch_variables,
             request_timeout,
         })
@@ -607,6 +667,23 @@ fn request_timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+/// Per-call deadline for *fast*, non-await peer forwards (job complete/fail/throw,
+/// activation pulls, by-key reads, simple mutations). Env
+/// `NANOBPMN_WRITE_FORWARD_TIMEOUT_MS` (default 2500ms) — a little above the Raft
+/// election ceiling so a forward racing a leader failure fails fast and is retried
+/// against the new leader (or, for activation, simply skipped that cycle), instead
+/// of pinning the caller for the 30s general [`request_timeout`]. The only forward
+/// that keeps the long timeout is an `await_completion` create, which legitimately
+/// blocks until the instance finishes.
+fn fast_forward_timeout() -> Duration {
+    let ms = std::env::var("NANOBPMN_WRITE_FORWARD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2500);
     Duration::from_millis(ms)
 }
 

@@ -3180,6 +3180,115 @@ impl ServerImpl {
         }
     }
 
+    /// Forwards a non-`await_completion` create to the current create-leader with
+    /// a short per-attempt deadline ([`write_forward_timeout`]) and leader
+    /// re-resolution across a total budget ([`write_forward_retry_budget`]). When
+    /// the targeted leader has just failed (e.g. a node left the network), the
+    /// per-attempt forward times out fast instead of pinning the caller for the
+    /// 30s general peer timeout; the loop then re-resolves the leader — which the
+    /// surviving replicas elect within the election timeout — and retries against
+    /// it. Converts a single-node loss from a closed-loop throughput collapse into
+    /// a brief blip while leadership moves. Business/validation rejections (400/409)
+    /// short-circuit; transient transport/leadership errors retry until the budget
+    /// is spent, then surface a retryable 503.
+    async fn forward_create_bounded(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> apis::process_instance::CreateProcessInstanceResponse {
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let started = std::time::Instant::now();
+        let budget = write_forward_retry_budget();
+        let per_try = write_forward_timeout();
+        let mut last_detail = "no partition leader reachable; retry".to_string();
+
+        loop {
+            let Some(node) = self.leader_node_for_create() else {
+                // No known leader yet (mid-election): wait briefly, then retry
+                // until the budget is spent.
+                if started.elapsed() >= budget {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            };
+
+            let link = match self.peer_link(node).await {
+                Ok(link) => link,
+                Err((_, m)) => {
+                    last_detail = m;
+                    if started.elapsed() >= budget {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            let res = link
+                .forward_create_within(
+                    per_try,
+                    by_id.clone(),
+                    by_key.clone(),
+                    wire_vars.clone(),
+                    tags.clone(),
+                    business_id.clone(),
+                    fetch_variables.clone(),
+                    request_timeout,
+                )
+                .await;
+
+            match res {
+                Ok(r) if is_ok_status(r.status) => {
+                    return match r.body.and_then(|b| {
+                        serde_json::from_value::<models::CreateProcessInstanceResult>(b).ok()
+                    }) {
+                        Some(result) => Resp::Status200_TheProcessInstanceWasCreated(result),
+                        None => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                            problem(
+                                "Peer error",
+                                500,
+                                "peer returned an unparseable create result".into(),
+                            ),
+                        ),
+                    };
+                }
+                // Deterministic client rejection: do not retry.
+                Ok(r) if r.status == 400 => {
+                    return Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid create",
+                        400,
+                        peer_detail(&r),
+                    ));
+                }
+                Ok(r) if r.status == 409 => {
+                    return Resp::Status409_TheProcessInstanceCreationWasRejectedDueToABusinessIDUniquenessConflict(
+                        problem("Conflict", 409, peer_detail(&r)),
+                    );
+                }
+                // Transient (peer 5xx, timeout, closed): re-resolve leader & retry.
+                Ok(r) => last_detail = peer_detail(&r),
+                Err(e) => last_detail = e.to_string(),
+            }
+
+            if started.elapsed() >= budget {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+            "RESOURCE_EXHAUSTED",
+            503,
+            format!("create could not reach a partition leader; retry ({last_detail})"),
+        ))
+    }
+
     /// Publishes a message and correlates it to any matching open subscriptions.
     /// nanobpmn does not buffer messages (no TTL/dedup): the message is minted,
     /// correlated to every matching open subscription, then dropped. Always
@@ -5465,6 +5574,24 @@ impl ServerImpl {
         request_timeout: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        // Non-await creates use the bounded, leader-re-resolving forward so a
+        // create racing a leader failure fails fast and retries on the new
+        // leader instead of pinning for the 30s peer timeout. Await-completion
+        // creates legitimately block until the instance completes, so they keep
+        // the long-lived forward bounded only by the client's request timeout.
+        if !await_completion {
+            return self
+                .forward_create_bounded(
+                    by_id,
+                    by_key,
+                    wire_vars,
+                    tags,
+                    business_id,
+                    fetch_variables,
+                    request_timeout,
+                )
+                .await;
+        }
         match self.leader_node_for_create() {
             Some(node) => {
                 self.forward_create(
@@ -5742,9 +5869,6 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         use apis::process_instance::CreateProcessInstanceResponse as R;
-        let Some(leader) = self.leader_node_for_create() else {
-            return Err((503, "no partition leader reachable; retry".to_string()));
-        };
         let wire_vars = if variables.is_empty() {
             None
         } else {
@@ -5756,17 +5880,7 @@ impl ServerImpl {
             )
         };
         match self
-            .forward_create(
-                leader,
-                by_id,
-                by_key,
-                wire_vars,
-                Vec::new(),
-                None,
-                false,
-                None,
-                None,
-            )
+            .forward_create_bounded(by_id, by_key, wire_vars, Vec::new(), None, None, None)
             .await
         {
             R::Status200_TheProcessInstanceWasCreated(result) => result
@@ -5776,6 +5890,9 @@ impl ServerImpl {
                 .map(|key| (key, result.process_completed))
                 .map_err(|_| (500, "peer returned a non-numeric instance key".to_string())),
             R::Status400_TheProvidedDataIsNotValid(p) => Err((400, p.detail)),
+            R::Status409_TheProcessInstanceCreationWasRejectedDueToABusinessIDUniquenessConflict(p) => {
+                Err((409, p.detail))
+            }
             R::Status503_TheServiceIsCurrentlyUnavailable(p) => Err((503, p.detail)),
             R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p) => Err((500, p.detail)),
             _ => Err((500, "unexpected peer create response".to_string())),
@@ -6561,6 +6678,35 @@ fn raft_enabled() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Per-attempt deadline for forwarding a (non-`await_completion`) create to a
+/// partition leader, env `NANOBPMN_WRITE_FORWARD_TIMEOUT_MS` (default 2500ms).
+/// Deliberately a little above the Raft election ceiling (election_timeout_max
+/// default 1000ms) so a create racing a leader failure can still land on the
+/// incumbent if it survives, yet fails fast — instead of pinning the producer
+/// for the 30s general peer timeout — when the leader is truly gone, so the
+/// write retries on the newly elected leader.
+fn write_forward_timeout() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_WRITE_FORWARD_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2500);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Total budget for retrying a forwarded create across leader re-resolution,
+/// env `NANOBPMN_WRITE_FORWARD_RETRY_MS` (default 5000ms). Spans at least one
+/// election so a create in flight when a leader fails is re-pointed at the new
+/// leader rather than shed; exhausting it returns a retryable 503.
+fn write_forward_retry_budget() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_WRITE_FORWARD_RETRY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(5000);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Renders a body as a single-line, length-prefixed preview for logging,
