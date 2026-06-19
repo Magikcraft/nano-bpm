@@ -1672,7 +1672,7 @@ impl ServerImpl {
 
         let result = self.store.process_instance(key);
         if result.is_none() {
-            if let Some(node) = self.remote_owner_of(key) {
+            if let Some(node) = self.read_route(key) {
                 let (status, body) = self
                     .forward_get(node, crate::command_stream::ReadKind::ProcessInstance, key)
                     .await;
@@ -2319,6 +2319,16 @@ impl ServerImpl {
     /// briefly ping-pong a command. A forward hop-limit is future work; in the
     /// stable post-election state every node agrees on the leader and routes once.
     pub(crate) fn job_route(&self, key: u64) -> Option<u32> {
+        self.route_by_leader(key)
+    }
+
+    /// Shared by-key routing that follows the partition's CURRENT Raft leader
+    /// when this node hosts the group, falling back to the static owner map
+    /// otherwise. `None` = handle locally (this node is the leader, or there is
+    /// no leader yet — a transient window), `Some(node)` = forward to peer
+    /// `node`. With Raft off this is exactly `remote_owner_of`, so the non-Raft
+    /// path is byte-identical.
+    fn route_by_leader(&self, key: u64) -> Option<u32> {
         if !self.raft.is_empty() {
             let p = partition_of(key);
             if let Some(part) = self.raft.get(p) {
@@ -2331,6 +2341,19 @@ impl ServerImpl {
             }
         }
         self.remote_owner_of(key)
+    }
+
+    /// Routing target for a by-key READ (GET process-instance / incident /
+    /// user-task / variable): `None` = serve from the local read model,
+    /// `Some(node)` = forward the read to peer `node`. Reads follow the
+    /// partition's CURRENT Raft leader, so after a leadership move the read
+    /// reaches the node whose applied read model is freshest rather than the
+    /// dead static owner. Callers consult this only AFTER missing their local
+    /// store, so a self-leader / no-leader result (`None`) correctly yields a
+    /// genuine 404 from local state. With Raft off this is exactly
+    /// `remote_owner_of`, leaving the non-Raft read path unchanged.
+    pub(crate) fn read_route(&self, key: u64) -> Option<u32> {
+        self.route_by_leader(key)
     }
 
     /// Remote node ids this gateway forwards to (every peer that owns at least one
@@ -3200,7 +3223,7 @@ impl ServerImpl {
 
         let result = self.store.incident(key);
         if result.is_none() {
-            if let Some(node) = self.remote_owner_of(key) {
+            if let Some(node) = self.read_route(key) {
                 let (status, body) = self
                     .forward_get(node, crate::command_stream::ReadKind::Incident, key)
                     .await;
@@ -3762,7 +3785,7 @@ impl ServerImpl {
                 user_task_result(task),
             )),
             None => {
-                if let Some(node) = self.remote_owner_of(user_task_key) {
+                if let Some(node) = self.read_route(user_task_key) {
                     let (status, body) = self
                         .forward_get(node, crate::command_stream::ReadKind::UserTask, user_task_key)
                         .await;
@@ -4113,7 +4136,7 @@ impl ServerImpl {
                 variable_result(&v),
             )),
             None => {
-                if let Some(node) = self.remote_owner_of(key) {
+                if let Some(node) = self.read_route(key) {
                     let (status, body) = self
                         .forward_get(node, crate::command_stream::ReadKind::Variable, key)
                         .await;
@@ -8657,6 +8680,77 @@ mod clustered_startup_tests {
             }
             assert!(done, "instance {key} must complete on the new leader");
         }
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reads_follow_leadership_across_a_failover() {
+        // s3-query-follow: a by-key READ must route to the partition's CURRENT
+        // Raft leader, not the static owner. Before failover a follower forwards
+        // the read to the owner/leader (node 0) while the leader serves locally;
+        // after the owner is killed and the survivors re-elect, the read must
+        // follow to the NEW leader so it hits a node whose applied read model is
+        // up to date rather than the dead owner.
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        // Baseline: the leader (node 0) serves the read locally; the followers
+        // forward it to the leader.
+        assert_eq!(
+            node0.read_route(instance_key),
+            None,
+            "the leader serves the read from its own read model"
+        );
+        assert_eq!(
+            node1.read_route(instance_key),
+            Some(0),
+            "a follower forwards the read to the current leader (node 0)"
+        );
+        assert_eq!(node2.read_route(instance_key), Some(0));
+
+        // Kill the leader/owner: shut down all of node 0's Raft groups.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+        let new_leader_id = new_leader.engine.topology().node_id;
+
+        // The new leader now serves the read locally; the other survivor forwards
+        // to the NEW leader — never back to the dead owner (node 0).
+        assert_eq!(
+            new_leader.read_route(instance_key),
+            None,
+            "the new leader serves the read locally after failover"
+        );
+        let other = if new_leader_id == node1.engine.topology().node_id {
+            &node2
+        } else {
+            &node1
+        };
+        assert_eq!(
+            other.read_route(instance_key),
+            Some(new_leader_id),
+            "the surviving follower's read follows leadership to the new leader, not the dead owner"
+        );
+        assert_ne!(
+            other.read_route(instance_key),
+            Some(0),
+            "the read must not route to the killed owner"
+        );
 
         for node in [&node1, &node2] {
             for p in 0..3u64 {
