@@ -4569,55 +4569,75 @@ impl ServerImpl {
         resource_names: &std::collections::HashMap<String, String>,
         tenant_id: &str,
     ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
-        let deploy_result: Result<(Arc<Vec<Event>>, Commit), String> = self
+        let requested_ids: Vec<String> = processes.iter().map(|p| p.id.clone()).collect();
+        // The closure returns, besides the emitted events and commit, the
+        // resolved (key, version) for every *requested* process id read back from
+        // post-apply state. An idempotent redeploy emits no event but must still
+        // be reported with its existing version, so the response is built from
+        // this resolution rather than from the events alone.
+        type Resolved = Vec<(String, u64, i32)>;
+        let deploy_result: Result<(Arc<Vec<Event>>, Commit, Resolved), String> = self
             .engine
             .deploy_partition()
             .with(move |engine| {
-                engine
+                let (events, commit) = engine
                     .apply_command(Command::DeployResources(processes))
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| e.to_string())?;
+                let resolved: Resolved = requested_ids
+                    .iter()
+                    .filter_map(|id| {
+                        engine
+                            .state()
+                            .processes
+                            .get(id)
+                            .map(|d| (id.clone(), d.key, d.version))
+                    })
+                    .collect();
+                Ok((events, commit, resolved))
             })
             .await;
-        let (events, commit) = match deploy_result {
-            Ok(pair) => pair,
+        let (events, commit, resolved) = match deploy_result {
+            Ok(triple) => triple,
             Err(e) => return Err(("Invalid deployment", e)),
         };
         // Replicate the new definition(s) to the other local partitions so any of
         // them can instantiate the process (the deployment itself is journaled
         // only on partition 0; replication is in-memory and re-derived on restart).
+        // An idempotent redeploy emits no events, so these are no-ops.
         self.replicate_deployment(&events).await;
         // Under Raft (RF>1) also fan into any follower replica engine actors so a
         // replicated create of this definition applies on every replica.
         self.install_into_raft_replicas(&events).await;
 
-        let mut deployment_key = String::new();
-        let mut deployments = Vec::new();
-        for event in events.iter() {
-            if let Event::ProcessDeployed {
-                deployment_key: dk,
-                process_definition_key,
-                version,
-                process,
-            } = event
-            {
-                deployment_key = dk.to_string();
-                let resource_name = resource_names.get(&process.id).cloned().unwrap_or_default();
+        // The deployment key rides on the emitted ProcessDeployed event(s); a
+        // pure idempotent redeploy emits none and reports an empty key.
+        let deployment_key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessDeployed { deployment_key, .. } => Some(deployment_key.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let deployments = resolved
+            .into_iter()
+            .map(|(process_id, process_definition_key, version)| {
+                let resource_name = resource_names.get(&process_id).cloned().unwrap_or_default();
                 let process_result = models::DeploymentProcessResult::new(
-                    process.id.clone(),
-                    *version,
+                    process_id,
+                    version,
                     resource_name,
                     tenant_id.to_string(),
                     models::ProcessDefinitionKey(process_definition_key.to_string()),
                 );
-                deployments.push(models::DeploymentMetadataResult::new(
+                models::DeploymentMetadataResult::new(
                     nanobpm_gateway_rest::types::Nullable::Present(process_result),
                     nanobpm_gateway_rest::types::Nullable::Null,
                     nanobpm_gateway_rest::types::Nullable::Null,
                     nanobpm_gateway_rest::types::Nullable::Null,
                     nanobpm_gateway_rest::types::Nullable::Null,
-                ));
-            }
-        }
+                )
+            })
+            .collect();
 
         let result = models::DeploymentResult::new(
             models::DeploymentKey(deployment_key),

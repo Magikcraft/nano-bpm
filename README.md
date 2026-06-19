@@ -13,6 +13,10 @@ with `501 Not Implemented`. A few operations are now backed by the embedded
 
 - `POST /v2/deployments` (`createDeployment`) parses the uploaded BPMN 2.0 XML
   resources and deploys them, assigning each process a key and a per-id version.
+  Deployment is **idempotent**: redeploying a process that is byte-for-byte
+  identical to the current latest version of the same id reuses that version
+  (no new key, no version bump, nothing journaled), mirroring Zeebe; a changed
+  model deploys as the next version.
 - `POST /v2/process-instances` (`createProcessInstance`, by `processDefinitionId`
   or `processDefinitionKey`) starts a real instance and returns its
   engine-assigned key. Variables supplied on the request seed the root scope.

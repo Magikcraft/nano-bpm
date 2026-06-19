@@ -980,8 +980,18 @@ impl Engine {
     /// Validates and registers a batch of process definitions as one deployment.
     ///
     /// All processes are validated first, so the deployment is atomic: if any is
-    /// invalid, none are emitted. Each process is assigned a unique
-    /// process-definition key and a per-id version (latest known + 1).
+    /// invalid, none are emitted. Each *new or changed* process is assigned a
+    /// unique process-definition key and a per-id version (latest known + 1).
+    ///
+    /// Deployment is idempotent: a process that is byte-for-byte identical to the
+    /// current latest version of the same id (`existing.definition == process`,
+    /// which includes the verbatim BPMN [`ProcessDefinition::xml`]) reuses that
+    /// version's identity and emits **nothing** — no new key, no version bump, no
+    /// journaled event. This mirrors Zeebe, where redeploying an unchanged
+    /// resource does not create a new version, and keeps repeated idempotent
+    /// deploys (e.g. on every app startup) from growing the journal. Keys are
+    /// minted only for emitted events so replay (which derives the key counter
+    /// from the max key seen in the log) stays in lock-step with the live engine.
     fn deploy(
         &mut self,
         log: &mut Vec<Event>,
@@ -995,8 +1005,22 @@ impl Engine {
             }
         }
 
-        let deployment_key = self.mint_key();
+        // Mint the shared deployment key lazily, only once we know at least one
+        // process actually changed — a deploy of nothing but duplicates emits no
+        // events and therefore must mint no keys.
+        let mut deployment_key: Option<Key> = None;
         for process in processes {
+            if self
+                .state
+                .processes
+                .get(&process.id)
+                .is_some_and(|existing| existing.definition == process)
+            {
+                // Idempotent redeploy of the latest version: reuse its identity
+                // and skip it entirely (no event, no new subscription/timer).
+                continue;
+            }
+            let deployment_key = *deployment_key.get_or_insert_with(|| self.mint_key());
             let version = self.next_version(&process.id);
             let process_definition_key = self.mint_key();
             let process_id = process.id.clone();
@@ -3680,6 +3704,79 @@ mod tests {
             .connect("charge", "end")
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn redeploying_an_identical_definition_is_idempotent() {
+        // A byte-for-byte identical redeploy of the latest version reuses its
+        // identity: no ProcessDeployed event, no new key, no version bump.
+        let mut engine = Engine::new();
+        let first = engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let deployed: Vec<_> = first
+            .iter()
+            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .collect();
+        assert_eq!(deployed.len(), 1, "first deploy registers the definition");
+        let (first_key, first_version) = match deployed[0] {
+            Event::ProcessDeployed {
+                process_definition_key,
+                version,
+                ..
+            } => (*process_definition_key, *version),
+            _ => unreachable!(),
+        };
+        assert_eq!(first_version, 1);
+
+        // Redeploy the exact same definition twice more.
+        let second = engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let third = engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        assert!(
+            second.is_empty() && third.is_empty(),
+            "an identical redeploy emits no events"
+        );
+
+        // State still holds exactly the original version and key.
+        let current = engine.state().processes.get("order").unwrap();
+        assert_eq!(current.version, 1, "version is not bumped");
+        assert_eq!(current.key, first_key, "key is reused");
+    }
+
+    #[test]
+    fn redeploying_a_changed_definition_bumps_the_version() {
+        // A different model under the same id is a new version (not idempotent).
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+
+        let changed = ProcessBuilder::new("order")
+            .start_event("start")
+            .service_task("charge", "payment")
+            .service_task("ship", "shipping")
+            .end_event("end")
+            .connect("start", "charge")
+            .connect("charge", "ship")
+            .connect("ship", "end")
+            .build()
+            .unwrap();
+        let events = engine
+            .apply_command(Command::DeployProcess(changed))
+            .unwrap();
+        let version = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessDeployed { version, .. } => Some(*version),
+                _ => None,
+            })
+            .expect("a changed definition is deployed as a new version");
+        assert_eq!(version, 2);
+        assert_eq!(engine.state().processes.get("order").unwrap().version, 2);
     }
 
     /// Test helper: activate the first job of `job_type` (locking it) and
