@@ -53,7 +53,7 @@ enum CommitInner {
 }
 
 impl Commit {
-    fn ready() -> Self {
+    pub(crate) fn ready() -> Self {
         Commit(CommitInner::Ready)
     }
 

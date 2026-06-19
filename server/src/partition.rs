@@ -298,6 +298,21 @@ impl Partitions {
     }
 
 
+    /// Like [`for_create`](Self::for_create) but returns the **global partition
+    /// id** chosen (round-robin over this node's owned partitions), not the
+    /// handle. Used by the Raft write path to look up the partition's Raft group
+    /// before proposing. Shares no counter with `for_create` — it is a parallel
+    /// chooser, fine since both only need to spread load.
+    pub fn for_create_partition(&self) -> u64 {
+        let owned = self.router.topology().local_partitions();
+        debug_assert!(!owned.is_empty(), "a node always owns at least one partition");
+        if owned.len() == 1 {
+            return owned[0];
+        }
+        let i = self.next_create.fetch_add(1, Ordering::Relaxed) % owned.len();
+        owned[i]
+    }
+
     /// round-robin across the partitions **this node owns**. An instance lives on
     /// the partition that created it for its whole life (its key embeds the
     /// partition). In a single-node cluster the owned set is every partition in

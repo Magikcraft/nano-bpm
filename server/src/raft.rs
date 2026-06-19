@@ -68,6 +68,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::engine_actor::EngineHandle;
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport};
 
@@ -99,6 +100,29 @@ pub struct ReplicatedCommand {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ReplicatedResponse {
     pub events: Vec<Event>,
+    /// On the leader, set when the command was *rejected* by the engine (e.g. a
+    /// complete on a non-existent job): the mapped `(http_status, message)`. The
+    /// log entry is still consumed on every replica (as a no-op) so replicas stay
+    /// in lockstep; only the leader surfaces the rejection to its client.
+    #[serde(default)]
+    pub error: Option<(u16, String)>,
+}
+
+/// Maps an engine rejection to the `(http_status, message)` the client sees,
+/// matching the direct (non-Raft) write path's status codes.
+fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
+    use nanobpmn_engine_core::EngineError as E;
+    match e {
+        E::ProcessNotFound { process_id } => {
+            (400, format!("No deployed process with id '{process_id}'."))
+        }
+        E::JobNotFound { job_key } => (404, format!("No job with key {job_key}.")),
+        E::JobNotActive { job_key } => (409, format!("Job {job_key} is not active.")),
+        E::JobNotActivated { job_key } => {
+            (409, format!("Job {job_key} has not been activated."))
+        }
+        other => (500, other.to_string()),
+    }
 }
 
 /// In-memory Raft log store (v2 `RaftLogStorage`). Holds the log entries, the
@@ -219,11 +243,11 @@ struct StoredSnapshot {
     data: Vec<u8>,
 }
 
-/// State held by the Raft state machine: the partition's engine journal, the
-/// last applied log id and membership, and the full applied-event history used
-/// to build snapshots.
-struct SmInner {
-    journal: Journal,
+/// Metadata held by the Raft state machine: the last applied log id and
+/// membership, plus the full applied-event history used to build snapshots. The
+/// materialized engine state itself lives on the partition's [`EngineHandle`]
+/// (driven by [`apply`](RaftStateMachine::apply)), not here.
+struct SmMeta {
     partition_id: u64,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
@@ -231,20 +255,26 @@ struct SmInner {
     history: Vec<Event>,
 }
 
-/// The Raft state machine for one partition, applying committed commands to a
-/// [`Journal`]. Wrapped in an `Arc` so openraft can share it with the snapshot
-/// builder.
+/// The Raft state machine for one partition. Committed commands are applied to
+/// the partition's [`EngineHandle`] — the *same* single-writer engine actor the
+/// rest of the server reads, dispatches jobs from, and runs timers on — so the
+/// replicated log and the served state share one materialized copy. Wrapped in
+/// an `Arc` so openraft can share it with the snapshot builder.
 pub struct PartitionStateMachine {
-    inner: Mutex<SmInner>,
+    /// The partition's engine actor: `apply` forwards each committed command to
+    /// it. Held outside the metadata `Mutex` so `apply` can `.await` the engine
+    /// round-trip without holding a std lock across the await point.
+    engine: EngineHandle,
+    inner: Mutex<SmMeta>,
     snapshot_idx: AtomicU64,
     current_snapshot: Mutex<Option<StoredSnapshot>>,
 }
 
 impl PartitionStateMachine {
-    fn new(journal: Journal, partition_id: u64) -> Self {
+    fn new(engine: EngineHandle, partition_id: u64) -> Self {
         Self {
-            inner: Mutex::new(SmInner {
-                journal,
+            engine,
+            inner: Mutex::new(SmMeta {
                 partition_id,
                 last_applied: None,
                 last_membership: StoredMembership::default(),
@@ -305,9 +335,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         I: IntoIterator<Item = Entry<RaftConfig>> + Send,
     {
         let mut responses = Vec::new();
-        // Each iteration takes the lock for the synchronous engine apply only,
-        // then releases it to await the durable commit — never holding the
-        // std::Mutex across `.await`.
+        // Each Normal entry is forwarded to the partition's engine actor and its
+        // durable commit awaited. We never hold the std::Mutex across the engine
+        // `.await`: the metadata (last_applied/history) is updated only after the
+        // engine round-trip returns.
         for entry in entries {
             let log_id = entry.log_id;
             match entry.payload {
@@ -316,28 +347,41 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(rc) => {
-                    let outcome = {
-                        let mut inner = self.inner.lock().unwrap();
-                        inner.last_applied = Some(log_id);
-                        match inner.journal.apply_command_at(rc.command, rc.now) {
-                            Ok((events, commit)) => {
-                                inner.history.extend(events.iter().cloned());
-                                Some((events, commit))
-                            }
-                            // A rejected command is journaled as a no-op (it
-                            // produced no events); the log entry is still
-                            // consumed so every replica stays in lockstep.
-                            Err(_) => None,
-                        }
-                    };
+                    let ReplicatedCommand { command, now } = rc;
+                    // Run the command on the single-writer engine actor (the same
+                    // actor that serves reads/dispatch/timers) and await its
+                    // durable commit before acking the apply.
+                    let outcome = self
+                        .engine
+                        .with(move |journal| match journal.apply_command_at(command, now) {
+                            Ok((events, commit)) => Ok((events, commit)),
+                            Err(e) => Err(e),
+                        })
+                        .await;
                     match outcome {
-                        Some((events, commit)) => {
+                        Ok((events, commit)) => {
                             commit.wait().await;
+                            {
+                                let mut inner = self.inner.lock().unwrap();
+                                inner.last_applied = Some(log_id);
+                                inner.history.extend(events.iter().cloned());
+                            }
                             responses.push(ReplicatedResponse {
                                 events: events.to_vec(),
+                                error: None,
                             });
                         }
-                        None => responses.push(ReplicatedResponse::default()),
+                        // A rejected command is journaled as a no-op (it produced
+                        // no events); the log entry is still consumed so every
+                        // replica stays in lockstep. The leader surfaces the
+                        // mapped rejection to its client via the response.
+                        Err(e) => {
+                            self.inner.lock().unwrap().last_applied = Some(log_id);
+                            responses.push(ReplicatedResponse {
+                                events: Vec::new(),
+                                error: Some(engine_error_status(&e)),
+                            });
+                        }
                     }
                 }
                 EntryPayload::Membership(mem) => {
@@ -370,13 +414,23 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         let history: Vec<Event> = serde_json::from_slice(&data)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
-        let mut inner = self.inner.lock().unwrap();
-        let partition_id = inner.partition_id;
-        inner.journal = Journal::in_memory_from_events(partition_id, history.clone());
-        inner.history = history;
-        inner.last_applied = meta.last_log_id;
-        inner.last_membership = meta.last_membership.clone();
-        drop(inner);
+        let partition_id = self.inner.lock().unwrap().partition_id;
+        // Rebuild the engine actor's state from the snapshot's event history. The
+        // engine journal is in-memory under Raft (the Raft log is the durable
+        // tier), so replacing it wholesale is the install.
+        let hist = history.clone();
+        self.engine
+            .with(move |journal| {
+                *journal = Journal::in_memory_from_events(partition_id, hist);
+            })
+            .await;
+
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.history = history;
+            inner.last_applied = meta.last_log_id;
+            inner.last_membership = meta.last_membership.clone();
+        }
 
         *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
             meta: meta.clone(),
@@ -420,13 +474,13 @@ pub struct RaftPartition {
 
 impl RaftPartition {
     /// Boots a single-voter (RF=1) Raft group for `partition_id` on `node_id`,
-    /// backed by `journal`, and initializes it so it elects itself leader. The
+    /// backed by `engine`, and initializes it so it elects itself leader. The
     /// returned partition is ready to accept [`propose`](Self::propose).
     pub async fn bootstrap_single(
         node_id: NodeId,
         partition_id: u64,
         addr: String,
-        journal: Journal,
+        engine: EngineHandle,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(
             Config {
@@ -441,7 +495,7 @@ impl RaftPartition {
         );
 
         let log_store = MemLogStore::default();
-        let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
+        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
         let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
@@ -466,7 +520,7 @@ impl RaftPartition {
         node_id: NodeId,
         partition_id: u64,
         addr: String,
-        journal: Journal,
+        engine: EngineHandle,
         log_dir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(
@@ -480,7 +534,7 @@ impl RaftPartition {
         );
 
         let log_store = crate::raft_logstore::RaftLogStore::open(log_dir)?;
-        let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
+        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
         let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
@@ -508,12 +562,12 @@ impl RaftPartition {
     pub async fn bootstrap_member(
         node_id: NodeId,
         partition_id: u64,
-        journal: Journal,
+        engine: EngineHandle,
         transport: Arc<dyn RaftTransport>,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(raft_config().validate()?);
         let log_store = MemLogStore::default();
-        let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
+        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
         let network = PartitionNetwork::new(transport, partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
         Ok(Self {
@@ -546,6 +600,22 @@ impl RaftPartition {
             .client_write(ReplicatedCommand { command, now })
             .await?;
         Ok(res.data.events)
+    }
+
+    /// Like [`propose`](Self::propose) but returns the full
+    /// [`ReplicatedResponse`] so the caller can distinguish a successful apply
+    /// (events) from an engine rejection (`error`). Used by the server write path
+    /// to map 404/409 statuses through the Raft log.
+    pub async fn propose_result(
+        &self,
+        command: Command,
+        now: u64,
+    ) -> anyhow::Result<ReplicatedResponse> {
+        let res = self
+            .raft
+            .client_write(ReplicatedCommand { command, now })
+            .await?;
+        Ok(res.data)
     }
 }
 
@@ -605,7 +675,7 @@ mod tests {
             0,
             0,
             "http://self".into(),
-            Journal::in_memory_partition(0),
+            EngineHandle::spawn(Journal::in_memory_partition(0), None),
         )
         .await
         .expect("bootstrap single-voter raft");
@@ -672,7 +742,7 @@ mod tests {
                 0,
                 0,
                 "http://self".into(),
-                Journal::in_memory_partition(0),
+                EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 &log_dir,
             )
             .await
@@ -697,7 +767,7 @@ mod tests {
                 0,
                 0,
                 "http://self".into(),
-                Journal::in_memory_partition(0),
+                EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 &log_dir,
             )
             .await
@@ -757,7 +827,7 @@ mod tests {
             let p = RaftPartition::bootstrap_member(
                 id,
                 0,
-                Journal::in_memory_partition(0),
+                EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 transport.clone(),
             )
             .await

@@ -45,8 +45,8 @@ use nanobpm_gateway_rest::{apis, models, types};
 use http::StatusCode;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, ProcessBuilder,
-    ProcessDefinition, ProcessInstanceState, Value, MAX_PARTITION_ID,
+    partition_of, ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState,
+    ProcessBuilder, ProcessDefinition, ProcessInstanceState, Value, MAX_PARTITION_ID,
 };
 
 use crate::backpressure::{
@@ -169,6 +169,12 @@ pub struct ServerImpl {
     /// inbound RPCs through it; the write path proposes through it. An empty
     /// registry means the classic single-writer path is in force — zero overhead.
     raft: Arc<crate::raft::RaftRegistry>,
+    /// Engine actors for partitions this node **replicates but does not own**
+    /// (followers under RF>1). The Raft state machine drives these so a follower
+    /// can apply the replicated log; they are NOT part of the read-model / serving
+    /// path (reads and job dispatch always go to the leader's owned actor). Empty
+    /// unless per-partition Raft is enabled with RF>1 — zero overhead otherwise.
+    raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, EngineHandle>>>,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -371,6 +377,7 @@ impl ServerImpl {
             admission_max_create_queue,
             peers,
             raft: crate::raft::RaftRegistry::new(),
+            raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -4316,6 +4323,9 @@ impl ServerImpl {
         // them can instantiate the process (the deployment itself is journaled
         // only on partition 0; replication is in-memory and re-derived on restart).
         self.replicate_deployment(&events).await;
+        // Under Raft (RF>1) also fan into any follower replica engine actors so a
+        // replicated create of this definition applies on every replica.
+        self.install_into_raft_replicas(&events).await;
 
         let mut deployment_key = String::new();
         let mut deployments = Vec::new();
@@ -4396,6 +4406,8 @@ impl ServerImpl {
                 .with(move |journal| journal.install_deployment(&events))
                 .await;
         }
+        // Under Raft (RF>1) also fan into any follower replica engine actors.
+        self.install_into_raft_replicas(&events).await;
         durable.wait().await;
     }
 
@@ -4544,13 +4556,23 @@ impl ServerImpl {
             let topology = server.engine.topology().clone();
             let transport = server.raft_transport();
 
-            // Host a member for every partition this node replicates, registering
-            // it so inbound RPCs from peers can reach it as soon as it exists.
+            // Host a member for every partition this node replicates. For a
+            // partition this node OWNS, the Raft state machine drives the SAME
+            // engine actor the rest of the server reads/dispatches/times from
+            // (leader path) — log and served state share one materialized copy.
+            // For a partition this node replicates but does NOT own (a follower
+            // under RF>1), there is no owned actor, so we build a dedicated
+            // replica engine actor here (seeded with the current deployments) for
+            // the state machine to apply the replicated log into.
             for p in topology.replica_partitions() {
+                let engine = match server.engine.local_for_partition(p) {
+                    Some(owned) => owned.clone(),
+                    None => server.replica_engine_for(p).await,
+                };
                 match crate::raft::RaftPartition::bootstrap_member(
                     topology.node_id as u64,
                     p,
-                    Journal::in_memory_partition(p),
+                    engine,
                     transport.clone(),
                 )
                 .await
@@ -4618,6 +4640,65 @@ impl ServerImpl {
             return;
         }
         for handle in self.engine.all().iter().skip(1) {
+            let events = Arc::clone(events);
+            handle
+                .with(move |journal| journal.install_deployment(&events))
+                .await;
+        }
+    }
+
+    /// The `ProcessDeployed` events for every definition currently known to this
+    /// node, read from one of its owned engine actors. Used to seed a freshly
+    /// built replica engine actor (a follower partition under RF>1) so it can
+    /// apply `CreateInstance` for already-deployed processes.
+    async fn current_deployment_events(&self) -> Vec<Event> {
+        let handles = self.engine.all();
+        if handles.is_empty() {
+            return Vec::new();
+        }
+        handles[0]
+            .with(|journal| deployment_replication_events(journal))
+            .await
+    }
+
+    /// Returns (building if necessary) the dedicated engine actor for a partition
+    /// this node **replicates but does not own**. The Raft state machine drives it
+    /// to apply the replicated log on a follower; it is not part of the read-model
+    /// / serving path. Seeded with the current deployments so it can apply creates
+    /// of already-deployed processes; later deploys fan in via
+    /// [`Self::install_into_raft_replicas`].
+    async fn replica_engine_for(&self, p: u64) -> EngineHandle {
+        if let Some(h) = self.raft_replicas.lock().unwrap().get(&p) {
+            return h.clone();
+        }
+        let mut journal = Journal::in_memory_partition(p);
+        journal.set_num_partitions(self.engine.topology().num_partitions);
+        let seed = self.current_deployment_events().await;
+        if !seed.is_empty() {
+            journal.install_deployment(&seed);
+        }
+        let handle = EngineHandle::spawn(journal, None);
+        self.raft_replicas
+            .lock()
+            .unwrap()
+            .entry(p)
+            .or_insert(handle)
+            .clone()
+    }
+
+    /// Fans a deployment into every replica engine actor (followers under RF>1) so
+    /// a replicated `CreateInstance` for the new definition applies successfully on
+    /// every replica. A no-op (and zero overhead) when this node hosts no replica
+    /// actors, i.e. single-node, RF=1, or Raft disabled.
+    async fn install_into_raft_replicas(&self, events: &Arc<Vec<Event>>) {
+        let handles: Vec<EngineHandle> = {
+            let map = self.raft_replicas.lock().unwrap();
+            if map.is_empty() {
+                return;
+            }
+            map.values().cloned().collect()
+        };
+        for handle in handles {
             let events = Arc::clone(events);
             handle
                 .with(move |journal| journal.install_deployment(&events))
@@ -4886,6 +4967,13 @@ impl ServerImpl {
         by_key: Option<String>,
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        // Per-partition Raft (experimental): when this node hosts Raft groups
+        // (populated only by the env-gated `raft_bootstrap`), the create is
+        // replicated through the partition leader's log instead of applied
+        // directly. Empty registry (the default) => byte-identical fast path.
+        if !self.raft.is_empty() {
+            return self.create_via_raft(by_id, by_key, variables).await;
+        }
         // Active-backlog admission control (off by default): shed before doing any
         // engine work when the standing active-instance backlog is at/above the
         // limit, keeping end-to-end latency and memory bounded under overload. The
@@ -4971,6 +5059,124 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
+    /// The Raft create path (experimental): resolve the process id, then replicate
+    /// `CreateInstance` through the chosen partition's Raft leader. The state
+    /// machine applies the committed command to the same engine actor the rest of
+    /// the server reads from, so durability and serving share one materialized
+    /// copy. Returns the minted instance key and whether it completed
+    /// synchronously (no async jobs), matching [`Self::create_for_stream`].
+    async fn create_via_raft(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        if let Some(message) = self.admission_shed() {
+            return Err((503, message));
+        }
+        let p = self.engine.for_create_partition();
+        let Some(handle) = self.engine.local_for_partition(p) else {
+            return Err((500, format!("no local engine actor for partition {p}")));
+        };
+
+        // Resolve the process-definition id (a by-key create needs a read of the
+        // engine's deployed-process table) before proposing — the command carries
+        // a concrete `process_id`.
+        let resolve = handle
+            .with(move |journal| match (by_id, by_key) {
+                (Some(id), _) => Ok(id),
+                (None, Some(requested)) => journal
+                    .state()
+                    .processes
+                    .values()
+                    .find(|d| d.key.to_string() == requested)
+                    .map(|d| d.definition.id.clone())
+                    .ok_or((400, format!("No deployed process with key '{requested}'."))),
+                (None, None) => Err((
+                    400,
+                    "A processDefinitionId or processDefinitionKey is required.".to_string(),
+                )),
+            })
+            .await;
+        let process_id = resolve?;
+
+        let Some(part) = self.raft.get(p) else {
+            return Err((500, format!("partition {p} has no Raft group")));
+        };
+        let node_id = self.engine.topology().node_id as u64;
+        if part.raft.metrics().borrow().current_leader != Some(node_id) {
+            // A non-leader replica cannot accept writes. Under the static
+            // leader_of map this only happens transiently during an election;
+            // the stream client retries on 503.
+            return Err((503, format!("partition {p} leader unavailable; retry")));
+        }
+
+        let response = part
+            .propose_result(
+                Command::create_instance_with(process_id, variables),
+                now_millis(),
+            )
+            .await
+            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+        if let Some((status, message)) = response.error {
+            return Err((status, message));
+        }
+        let events = response.events;
+
+        let instance_key = events
+            .iter()
+            .find_map(Event::instance_key)
+            .ok_or((500, "raft create produced no instance key".to_string()))?;
+        let sync_completed = events.iter().any(|e| {
+            matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+        });
+        let routable: Vec<Event> = events
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::MessageSubscriptionOpening { .. }
+                        | Event::RemoteMessageCorrelation { .. }
+                        | Event::MessageSubscriptionClosing { .. }
+                        | Event::StartInstanceDispatched { .. }
+                )
+            })
+            .collect();
+        if !routable.is_empty() {
+            self.drive_subscription_routing(routable).await;
+        }
+        self.signal_jobs_available();
+        Ok((instance_key, sync_completed))
+    }
+
+    /// The Raft job-mutation path (experimental): replicate `command` through the
+    /// owning partition's Raft leader, returning a ready [`Commit`] (durability is
+    /// already awaited inside the state-machine apply). Surfaces engine rejections
+    /// (404/409) via the replicated response, matching the direct path's statuses.
+    async fn propose_job_for_stream(
+        &self,
+        job_key: u64,
+        command: Command,
+    ) -> Result<Commit, (u16, String)> {
+        let p = partition_of(job_key);
+        let Some(part) = self.raft.get(p) else {
+            return Err((500, format!("partition {p} has no Raft group")));
+        };
+        let node_id = self.engine.topology().node_id as u64;
+        if part.raft.metrics().borrow().current_leader != Some(node_id) {
+            return Err((503, format!("partition {p} leader unavailable; retry")));
+        }
+        let response = part
+            .propose_result(command, now_millis())
+            .await
+            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+        if let Some((status, message)) = response.error {
+            return Err((status, message));
+        }
+        self.spawn_routing_if_needed(&response.events);
+        Ok(Commit::ready())
+    }
+
     /// Stream `CompleteJob`: applies the command on the engine actor (establishing
     /// journal order) and returns the [`Commit`] WITHOUT awaiting durability.
     ///
@@ -4992,6 +5198,11 @@ impl ServerImpl {
         job_key: u64,
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<Commit, (u16, String)> {
+        if !self.raft.is_empty() {
+            return self
+                .propose_job_for_stream(job_key, Command::complete_job_with(job_key, variables))
+                .await;
+        }
         let result = self
             .engine
             .by_key(job_key)
@@ -5013,6 +5224,14 @@ impl ServerImpl {
         retries: i32,
         error_message: String,
     ) -> Result<Commit, (u16, String)> {
+        if !self.raft.is_empty() {
+            return self
+                .propose_job_for_stream(
+                    job_key,
+                    Command::fail_job(job_key, retries, error_message),
+                )
+                .await;
+        }
         let result = self
             .engine
             .by_key(job_key)
@@ -5034,6 +5253,14 @@ impl ServerImpl {
         error_code: String,
         error_message: String,
     ) -> Result<Commit, (u16, String)> {
+        if !self.raft.is_empty() {
+            return self
+                .propose_job_for_stream(
+                    job_key,
+                    Command::throw_job_error(job_key, error_code, error_message),
+                )
+                .await;
+        }
         let result = self
             .engine
             .by_key(job_key)
@@ -7287,7 +7514,7 @@ mod clustered_startup_tests {
             RaftPartition::bootstrap_member(
                 0,
                 0,
-                Journal::in_memory_partition(0),
+                EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 node0.raft_transport(),
             )
             .await
@@ -7299,7 +7526,7 @@ mod clustered_startup_tests {
             RaftPartition::bootstrap_member(
                 1,
                 0,
-                Journal::in_memory_partition(0),
+                EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 node1.raft_transport(),
             )
             .await
@@ -7469,6 +7696,168 @@ mod clustered_startup_tests {
         }
 
         // Clean up every hosted group on both nodes.
+        for node in [&node0, &node1] {
+            for p in 0..4u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_routed_create_and_complete_commit_via_quorum_across_two_nodes() {
+        // L2b: client writes route through the partition leader's Raft log and
+        // commit via QUORUM (RF=2, so both nodes must ack). A create + complete
+        // submitted to node 0 replicate to node 1 and apply on the leader's engine
+        // actor (the same actor the server serves reads from). Node 1 hosts a
+        // dedicated replica engine actor for node 0's partitions so it can apply
+        // the replicated log.
+        use crate::raft::RaftPartition;
+
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+                replication_factor: 2,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+
+        // Deploy a service-task process on the owner (parks at the job) and
+        // replicate the definition to node 1's owned partitions.
+        let proc = ProcessBuilder::new("intake")
+            .start_event("start")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        let (_r, events) = node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // Both nodes bootstrap (building follower replica engine actors, seeded
+        // with the deployment) and form every group over the command stream.
+        tokio::join!(node0.raft_bootstrap(), node1.raft_bootstrap());
+
+        // Wait until node 0 leads its owned partitions (0 & 2).
+        let leads = |node: &ServerImpl, p: u64, who: u64| -> bool {
+            node.raft_registry()
+                .get(p)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+                == Some(who)
+        };
+        for p in [0u64, 2] {
+            let mut ok = false;
+            for _ in 0..400 {
+                if leads(&node0, p, 0) {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(ok, "node 0 must lead partition {p}");
+        }
+
+        // Drive a create through node 0. The create replicates to node 1 and
+        // commits via quorum (the registry is populated, so the write path routes
+        // through Raft — no env needed in tests).
+        let create = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await;
+        let (instance_key, completed) = match create {
+            Ok(v) => v,
+            Err(e) => {
+                panic!("raft-routed create should commit via quorum, got {e:?}");
+            }
+        };
+        assert!(!completed, "instance parks at the service task");
+        let part = nanobpmn_engine_core::partition_of(instance_key);
+        assert!(
+            part == 0 || part == 2,
+            "create lands on a node-0 partition (got {part})"
+        );
+
+        // The committed instance is materialized on the leader's engine actor.
+        let present = node0
+            .engine
+            .local_for_partition(part)
+            .expect("leader owns the partition")
+            .with(move |journal| journal.engine().state().instances.contains_key(&instance_key))
+            .await;
+        assert!(present, "the committed instance is visible on the leader");
+
+        // Activate the parked job locally, then complete it through the Raft log.
+        let mut job_key = None;
+        for _ in 0..50 {
+            let jobs = node0
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the parked job activates on the leader");
+
+        let commit = node0
+            .complete_job_for_stream(job_key, Default::default())
+            .await
+            .expect("raft-routed complete commits via quorum");
+        commit.wait().await;
+
+        // Re-completing the same job is rejected THROUGH the Raft log, proving the
+        // first completion mutated the leader's durable state via propose().
+        let err = match node0
+            .complete_job_for_stream(job_key, Default::default())
+            .await
+        {
+            Ok(_) => panic!("re-complete of a completed job must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.0 == 404 || err.0 == 409,
+            "re-complete should be a 404/409, got {err:?}"
+        );
+
         for node in [&node0, &node1] {
             for p in 0..4u64 {
                 if let Some(part) = node.raft_registry().get(p) {
