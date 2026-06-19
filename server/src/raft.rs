@@ -79,7 +79,7 @@ pub type NodeId = u64;
 openraft::declare_raft_types!(
     /// The Raft type configuration for a nanobpmn partition group.
     pub RaftConfig:
-        D = ReplicatedCommand,
+        D = ReplicatedBatch,
         R = ReplicatedResponse,
 );
 
@@ -93,19 +93,45 @@ pub struct ReplicatedCommand {
     pub now: u64,
 }
 
-/// The result handed back to the `client_write` caller on the leader: the events
-/// the command produced (so the caller can drive read-model export, routing and
-/// completion exactly as the direct engine path does). Only meaningful on the
-/// applying leader; followers discard it.
+/// A **batch** of commands replicated as a single Raft log entry. Coalescing
+/// many concurrently-proposed commands into one entry amortizes openraft's
+/// per-entry overhead (one append + one replication round-trip + one apply
+/// round-trip + one engine-actor hop for the whole batch) across all of them —
+/// the dominant write-path cost under load. A batch of one (the default for a
+/// lone proposer, e.g. tests or deploy) is byte-for-byte the prior behavior.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplicatedBatch {
+    pub items: Vec<ReplicatedCommand>,
+}
+
+impl ReplicatedBatch {
+    /// A single-command batch (the convenience path for `propose`).
+    pub fn single(command: Command, now: u64) -> Self {
+        Self {
+            items: vec![ReplicatedCommand { command, now }],
+        }
+    }
+}
+
+/// The per-command outcome within a committed batch: the events the command
+/// produced (so the caller can drive read-model export, routing and completion
+/// exactly as the direct engine path does), or — when the engine *rejected* the
+/// command (e.g. a complete on a non-existent job) — the mapped `(http_status,
+/// message)`. A rejected command is still consumed on every replica (as a no-op)
+/// so replicas stay in lockstep; only the leader surfaces the rejection.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ReplicatedResponse {
+pub struct ReplicatedItem {
     pub events: Vec<Event>,
-    /// On the leader, set when the command was *rejected* by the engine (e.g. a
-    /// complete on a non-existent job): the mapped `(http_status, message)`. The
-    /// log entry is still consumed on every replica (as a no-op) so replicas stay
-    /// in lockstep; only the leader surfaces the rejection to its client.
     #[serde(default)]
     pub error: Option<(u16, String)>,
+}
+
+/// The result handed back to the `client_write` caller on the leader: one
+/// [`ReplicatedItem`] per command in the proposed batch, in submission order.
+/// Only meaningful on the applying leader; followers discard it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReplicatedResponse {
+    pub items: Vec<ReplicatedItem>,
 }
 
 /// Maps an engine rejection to the `(http_status, message)` the client sees,
@@ -335,10 +361,12 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         I: IntoIterator<Item = Entry<RaftConfig>> + Send,
     {
         let mut responses = Vec::new();
-        // Each Normal entry is forwarded to the partition's engine actor and its
-        // durable commit awaited. We never hold the std::Mutex across the engine
-        // `.await`: the metadata (last_applied/history) is updated only after the
-        // engine round-trip returns.
+        // Each Normal entry is a BATCH of commands. We apply the whole batch in a
+        // single engine-actor round-trip (the actor runs them in submission order),
+        // collecting each command's events + durable-commit barrier, then await all
+        // the barriers together — so the journal's group-commit writer coalesces the
+        // batch into one write+fsync instead of one fsync per command. We never hold
+        // the std::Mutex across an engine `.await`.
         for entry in entries {
             let log_id = entry.log_id;
             match entry.payload {
@@ -346,43 +374,53 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     self.inner.lock().unwrap().last_applied = Some(log_id);
                     responses.push(ReplicatedResponse::default());
                 }
-                EntryPayload::Normal(rc) => {
-                    let ReplicatedCommand { command, now } = rc;
-                    // Run the command on the single-writer engine actor (the same
-                    // actor that serves reads/dispatch/timers) and await its
-                    // durable commit before acking the apply.
-                    let outcome = self
+                EntryPayload::Normal(batch) => {
+                    // Phase 1: apply every command in the batch in ONE actor hop,
+                    // returning per-command (events, commit) or the engine rejection.
+                    type ApplyOutcome =
+                        Result<(Arc<Vec<Event>>, crate::journal::Commit), nanobpmn_engine_core::EngineError>;
+                    let outcomes: Vec<ApplyOutcome> = self
                         .engine
-                        .with(move |journal| match journal.apply_command_at(command, now) {
-                            Ok((events, commit)) => Ok((events, commit)),
-                            Err(e) => Err(e),
+                        .with(move |journal| {
+                            batch
+                                .items
+                                .into_iter()
+                                .map(|ReplicatedCommand { command, now }| {
+                                    journal.apply_command_at(command, now)
+                                })
+                                .collect()
                         })
                         .await;
-                    match outcome {
-                        Ok((events, commit)) => {
-                            commit.wait().await;
-                            {
-                                let mut inner = self.inner.lock().unwrap();
-                                inner.last_applied = Some(log_id);
-                                inner.history.extend(events.iter().cloned());
+
+                    // Phase 2: await the durable barriers (now coalesced by the
+                    // group-commit writer) and build the per-command responses.
+                    let mut items = Vec::with_capacity(outcomes.len());
+                    for outcome in outcomes {
+                        match outcome {
+                            Ok((events, commit)) => {
+                                commit.wait().await;
+                                {
+                                    let mut inner = self.inner.lock().unwrap();
+                                    inner.history.extend(events.iter().cloned());
+                                }
+                                items.push(ReplicatedItem {
+                                    events: events.to_vec(),
+                                    error: None,
+                                });
                             }
-                            responses.push(ReplicatedResponse {
-                                events: events.to_vec(),
-                                error: None,
-                            });
-                        }
-                        // A rejected command is journaled as a no-op (it produced
-                        // no events); the log entry is still consumed so every
-                        // replica stays in lockstep. The leader surfaces the
-                        // mapped rejection to its client via the response.
-                        Err(e) => {
-                            self.inner.lock().unwrap().last_applied = Some(log_id);
-                            responses.push(ReplicatedResponse {
-                                events: Vec::new(),
-                                error: Some(engine_error_status(&e)),
-                            });
+                            // A rejected command produced no events; the log entry is
+                            // still consumed so every replica stays in lockstep. The
+                            // leader surfaces the mapped rejection to its client.
+                            Err(e) => {
+                                items.push(ReplicatedItem {
+                                    events: Vec::new(),
+                                    error: Some(engine_error_status(&e)),
+                                });
+                            }
                         }
                     }
+                    self.inner.lock().unwrap().last_applied = Some(log_id);
+                    responses.push(ReplicatedResponse { items });
                 }
                 EntryPayload::Membership(mem) => {
                     let mut inner = self.inner.lock().unwrap();
@@ -455,13 +493,106 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
 }
 
 /// The shared openraft tuning for a nanobpmn partition group: a brisk cadence so
-/// elections settle quickly. Returned unvalidated so the caller `?`s `validate`.
+/// elections settle quickly. All three are env-overridable for tuning (read once
+/// at bootstrap, never in the hot path) — on a heavily contended box a calmer
+/// cadence can avoid heartbeat-miss election churn, but the brisk defaults are
+/// what the failover tests and the A/B benchmark are validated against.
 fn raft_config() -> Config {
+    fn env_u64(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
     Config {
-        heartbeat_interval: 250,
-        election_timeout_min: 500,
-        election_timeout_max: 1000,
+        heartbeat_interval: env_u64("NANOBPMN_RAFT_HEARTBEAT_MS", 250),
+        election_timeout_min: env_u64("NANOBPMN_RAFT_ELECTION_MIN_MS", 500),
+        election_timeout_max: env_u64("NANOBPMN_RAFT_ELECTION_MAX_MS", 1000),
         ..Default::default()
+    }
+}
+
+/// Upper bound on commands coalesced into a single Raft log entry. Caps per-entry
+/// apply work and entry size; under a steady flood the batch fills toward this and
+/// openraft's per-entry overhead is amortized across the whole batch.
+const MAX_PROPOSE_BATCH: usize = 1024;
+
+/// One queued command awaiting placement into a batched Raft entry, plus the
+/// one-shot the batcher fulfils with that command's [`ReplicatedItem`] (or a
+/// propose error) once the entry commits and applies.
+struct Submission {
+    item: ReplicatedCommand,
+    resp: tokio::sync::oneshot::Sender<anyhow::Result<ReplicatedItem>>,
+}
+
+/// Coalesces concurrently-proposed commands for one partition into batched Raft
+/// log entries. A single background task drains every submission that queued
+/// while the previous `client_write` was in flight into the next entry — classic
+/// group commit: end-to-end latency stays one commit round-trip while throughput
+/// scales with batch size, because one append + one replication round-trip + one
+/// apply hop now carry up to [`MAX_PROPOSE_BATCH`] commands. A lone proposer
+/// (tests, deploy) simply forms batches of one — byte-identical to the prior
+/// one-command-per-entry path.
+struct Batcher {
+    tx: tokio::sync::mpsc::UnboundedSender<Submission>,
+}
+
+impl Batcher {
+    fn spawn(raft: openraft::Raft<RaftConfig>) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut subs = vec![first];
+                // Drain everything already queued (accumulated during the prior
+                // in-flight commit) into this batch, bounded by the cap.
+                while subs.len() < MAX_PROPOSE_BATCH {
+                    match rx.try_recv() {
+                        Ok(s) => subs.push(s),
+                        Err(_) => break,
+                    }
+                }
+                let items: Vec<ReplicatedCommand> = subs.iter().map(|s| s.item.clone()).collect();
+                let n = items.len();
+                match raft.client_write(ReplicatedBatch { items }).await {
+                    Ok(res) => {
+                        let mut out = res.data.items;
+                        if out.len() == n {
+                            for (s, item) in subs.into_iter().zip(out.drain(..)) {
+                                let _ = s.resp.send(Ok(item));
+                            }
+                        } else {
+                            // apply returns exactly one item per command; an arity
+                            // mismatch is a bug, surface it rather than mis-pair.
+                            for s in subs {
+                                let _ = s.resp.send(Err(anyhow::anyhow!(
+                                    "raft batch response arity mismatch ({} != {n})",
+                                    out.len()
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        for s in subs {
+                            let _ = s.resp.send(Err(anyhow::anyhow!("{msg}")));
+                        }
+                    }
+                }
+            }
+        });
+        Self { tx }
+    }
+
+    async fn submit(&self, command: Command, now: u64) -> anyhow::Result<ReplicatedItem> {
+        let (resp, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Submission {
+                item: ReplicatedCommand { command, now },
+                resp,
+            })
+            .map_err(|_| anyhow::anyhow!("raft propose batcher stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("raft propose batcher dropped the response"))?
     }
 }
 
@@ -470,6 +601,7 @@ pub struct RaftPartition {
     pub raft: openraft::Raft<RaftConfig>,
     pub node_id: NodeId,
     pub partition_id: u64,
+    batcher: Batcher,
 }
 
 impl RaftPartition {
@@ -503,10 +635,12 @@ impl RaftPartition {
         members.insert(node_id, BasicNode::new(addr));
         raft.initialize(members).await?;
 
+        let batcher = Batcher::spawn(raft.clone());
         Ok(Self {
             raft,
             node_id,
             partition_id,
+            batcher,
         })
     }
 
@@ -546,10 +680,12 @@ impl RaftPartition {
             raft.initialize(members).await?;
         }
 
+        let batcher = Batcher::spawn(raft.clone());
         Ok(Self {
             raft,
             node_id,
             partition_id,
+            batcher,
         })
     }
 
@@ -570,10 +706,12 @@ impl RaftPartition {
         let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
         let network = PartitionNetwork::new(transport, partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
+        let batcher = Batcher::spawn(raft.clone());
         Ok(Self {
             raft,
             node_id,
             partition_id,
+            batcher,
         })
     }
 
@@ -589,33 +727,27 @@ impl RaftPartition {
 
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
     /// it once committed, returning the events it produced. At RF=1 this commits
-    /// as soon as the local log write lands.
+    /// as soon as the local log write lands. Routed through the per-partition
+    /// [`Batcher`], so a flood of concurrent proposes coalesces into batched
+    /// entries; a lone proposer forms a batch of one.
     pub async fn propose(
         &self,
         command: Command,
         now: u64,
     ) -> anyhow::Result<Vec<Event>> {
-        let res = self
-            .raft
-            .client_write(ReplicatedCommand { command, now })
-            .await?;
-        Ok(res.data.events)
+        Ok(self.batcher.submit(command, now).await?.events)
     }
 
-    /// Like [`propose`](Self::propose) but returns the full
-    /// [`ReplicatedResponse`] so the caller can distinguish a successful apply
+    /// Like [`propose`](Self::propose) but returns the full per-command
+    /// [`ReplicatedItem`] so the caller can distinguish a successful apply
     /// (events) from an engine rejection (`error`). Used by the server write path
     /// to map 404/409 statuses through the Raft log.
     pub async fn propose_result(
         &self,
         command: Command,
         now: u64,
-    ) -> anyhow::Result<ReplicatedResponse> {
-        let res = self
-            .raft
-            .client_write(ReplicatedCommand { command, now })
-            .await?;
-        Ok(res.data)
+    ) -> anyhow::Result<ReplicatedItem> {
+        self.batcher.submit(command, now).await
     }
 }
 
