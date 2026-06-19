@@ -443,6 +443,7 @@ mod tests {
             node_id: 0,
             peers: vec!["http://n0".into(), "http://n1".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let owned = topology.local_partitions();
         assert_eq!(owned, vec![0, 2]);

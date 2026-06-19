@@ -6135,6 +6135,7 @@ mod clustered_startup_tests {
             node_id,
             peers: vec!["http://n0".into(), "http://n1".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6242,6 +6243,7 @@ mod clustered_startup_tests {
             node_id: 0,
             peers: vec!["http://unused".into(), node1_url],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6317,6 +6319,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6368,6 +6371,7 @@ mod clustered_startup_tests {
                 node_id,
                 peers: peers.clone(),
                 num_partitions: 4,
+                replication_factor: 1,
             };
             let journals: Vec<Journal> = topology
                 .local_partitions()
@@ -6476,6 +6480,7 @@ mod clustered_startup_tests {
                 node_id,
                 peers: peers.clone(),
                 num_partitions: 4,
+                replication_factor: 1,
             };
             let journals: Vec<Journal> = topology
                 .local_partitions()
@@ -6582,6 +6587,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6630,6 +6636,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6673,6 +6680,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6760,6 +6768,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6909,6 +6918,7 @@ mod clustered_startup_tests {
             node_id: 0,
             peers: vec!["http://unused".into(), node1_url],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -6954,6 +6964,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -7027,6 +7038,7 @@ mod clustered_startup_tests {
             node_id: 1,
             peers: vec![node0_url, "http://unused".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()
@@ -7066,6 +7078,7 @@ mod subscription_placement_tests {
             node_id: 0,
             peers: vec!["http://n0".into()],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let journals: Vec<Journal> = topology
             .local_partitions()

@@ -633,6 +633,7 @@ mod tests {
             node_id: 0,
             peers: vec!["http://self-unused".to_string(), peer_base],
             num_partitions: 4,
+            replication_factor: 1,
         };
         let peers = PeerSet::new(topology);
         assert!(peers.has_peers());
