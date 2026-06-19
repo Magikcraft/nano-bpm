@@ -26,11 +26,30 @@
 //! in-memory. [`bootstrap_single`](RaftPartition::bootstrap_single) keeps the
 //! original in-memory [`MemLogStore`] for tests that don't need durability.
 //!
+//! # Milestone C: multi-voter network (done)
+//!
+//! [`bootstrap_member`](RaftPartition::bootstrap_member) +
+//! [`initialize`](RaftPartition::initialize) form an RF>1 group whose replicas
+//! exchange AppendEntries/Vote/InstallSnapshot through a
+//! [`RaftTransport`](crate::raft_net::RaftTransport) (see [`crate::raft_net`]).
+//! The transport is pluggable: the in-process
+//! [`LocalCluster`](crate::raft_net::LocalCluster) proves replication + commit
+//! across a real 3-voter group, and a command-stream-backed carrier mounts the
+//! same network onto the cluster WebSocket once the server hosts the Raft groups.
+//!
 //! # Remaining
 //!
-//! One piece remains for the multi-node story: implement the [`RaftNetwork`] over
-//! the command stream so followers receive AppendEntries/Vote, raising RF to 3
-//! without touching routing.
+//! Leader routing: host the Raft groups in the server, carry the
+//! [`RaftTransport`](crate::raft_net::RaftTransport) over the command stream, and
+//! route client writes to the partition leader — replacing the additive
+//! [`EngineHandle`](crate::engine_actor::EngineHandle) write path.
+
+// This Raft subsystem (raft / raft_logstore / raft_net) is built up across
+// stage-3 milestones and is deliberately *additive*: it is fully exercised by
+// its own unit tests but not yet mounted on the server's production write path
+// (that lands with leader routing). Until then, several public items are unused
+// in a plain `cargo build`, so dead-code is allowed at the module level.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -40,12 +59,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{Command, Event};
-use openraft::error::{InstallSnapshotError, NetworkError, Unreachable};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    VoteRequest, VoteResponse,
-};
 use openraft::storage::{
     LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine, Snapshot,
 };
@@ -56,6 +69,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::journal::Journal;
+use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport};
 
 /// Raft node id. We key the cluster by the topology's `node_id` (a `u32`),
 /// widened to openraft's expected `u64`.
@@ -86,10 +100,6 @@ pub struct ReplicatedCommand {
 pub struct ReplicatedResponse {
     pub events: Vec<Event>,
 }
-
-type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError<NodeId, E>;
-type RPCError<E = openraft::error::Infallible> =
-    openraft::error::RPCError<NodeId, BasicNode, RaftError<E>>;
 
 /// In-memory Raft log store (v2 `RaftLogStorage`). Holds the log entries, the
 /// persisted vote, and the committed marker in memory.
@@ -390,62 +400,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     }
 }
 
-/// The Raft network factory. Stage-3 milestone A is single-voter (RF=1), so no
-/// inter-node RPC is ever sent; every method reports the peer unreachable. A
-/// later milestone implements these over the command stream to raise RF to 3.
-#[derive(Clone)]
-pub struct PartitionNetwork;
-
-impl RaftNetworkFactory<RaftConfig> for PartitionNetwork {
-    type Network = PartitionNetworkConnection;
-
-    async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
-        PartitionNetworkConnection {
-            target,
-            _node: node.clone(),
-        }
-    }
-}
-
-pub struct PartitionNetworkConnection {
-    target: NodeId,
-    _node: BasicNode,
-}
-
-impl PartitionNetworkConnection {
-    fn unreachable<E: std::error::Error + 'static>(&self) -> RPCError<E> {
-        RPCError::Unreachable(Unreachable::new(&NetworkError::new(
-            &std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                format!("raft network not wired yet (target node {})", self.target),
-            ),
-        )))
-    }
-}
-
-impl RaftNetwork<RaftConfig> for PartitionNetworkConnection {
-    async fn append_entries(
-        &mut self,
-        _req: AppendEntriesRequest<RaftConfig>,
-        _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError> {
-        Err(self.unreachable())
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        _req: InstallSnapshotRequest<RaftConfig>,
-        _option: RPCOption,
-    ) -> Result<InstallSnapshotResponse<NodeId>, RPCError<InstallSnapshotError>> {
-        Err(self.unreachable())
-    }
-
-    async fn vote(
-        &mut self,
-        _req: VoteRequest<NodeId>,
-        _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError> {
-        Err(self.unreachable())
+/// The shared openraft tuning for a nanobpmn partition group: a brisk cadence so
+/// elections settle quickly. Returned unvalidated so the caller `?`s `validate`.
+fn raft_config() -> Config {
+    Config {
+        heartbeat_interval: 250,
+        election_timeout_min: 500,
+        election_timeout_max: 1000,
+        ..Default::default()
     }
 }
 
@@ -480,14 +442,8 @@ impl RaftPartition {
 
         let log_store = MemLogStore::default();
         let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
-        let raft = openraft::Raft::new(
-            node_id,
-            config,
-            PartitionNetwork,
-            log_store,
-            state_machine,
-        )
-        .await?;
+        let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
+        let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         let mut members = BTreeMap::new();
         members.insert(node_id, BasicNode::new(addr));
@@ -525,14 +481,8 @@ impl RaftPartition {
 
         let log_store = crate::raft_logstore::RaftLogStore::open(log_dir)?;
         let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
-        let raft = openraft::Raft::new(
-            node_id,
-            config,
-            PartitionNetwork,
-            log_store,
-            state_machine,
-        )
-        .await?;
+        let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
+        let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         // A fresh log needs the one-shot membership bootstrap; a recovered log
         // already carries it, so initializing again would be an error.
@@ -547,6 +497,40 @@ impl RaftPartition {
             node_id,
             partition_id,
         })
+    }
+
+    /// Boots one **voter** of a multi-node Raft group (RF>1, milestone C) over a
+    /// shared [`RaftTransport`], without initializing membership. The caller boots
+    /// every member, registers their handles with the transport, then calls
+    /// [`initialize`](Self::initialize) once on a single member to form the group.
+    /// Splitting construction from initialization is required because a voter must
+    /// be able to *receive* AppendEntries/Vote before the group is formed.
+    pub async fn bootstrap_member(
+        node_id: NodeId,
+        partition_id: u64,
+        journal: Journal,
+        transport: Arc<dyn RaftTransport>,
+    ) -> anyhow::Result<Self> {
+        let config = Arc::new(raft_config().validate()?);
+        let log_store = MemLogStore::default();
+        let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
+        let network = PartitionNetwork::new(transport, partition_id);
+        let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
+        Ok(Self {
+            raft,
+            node_id,
+            partition_id,
+        })
+    }
+
+    /// Forms the Raft group from `members` (node id → address). Call once, on one
+    /// member, after every voter has been booted and registered with the shared
+    /// transport. A no-op (skipped) if the group is already initialized.
+    pub async fn initialize(&self, members: BTreeMap<NodeId, BasicNode>) -> anyhow::Result<()> {
+        if !self.raft.is_initialized().await? {
+            self.raft.initialize(members).await?;
+        }
+        Ok(())
     }
 
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
@@ -707,5 +691,94 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// Polls `cond` until it holds or `timeout_ms` elapses.
+    async fn wait_until(timeout_ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn three_voters_replicate_and_commit() {
+        use crate::raft_net::LocalCluster;
+
+        // An in-process transport routes RPCs straight into the peers' Raft
+        // instances, so this is a genuine 3-voter group (real elections, real
+        // AppendEntries, real quorum), just without the network bytes.
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+
+        let mut parts = Vec::new();
+        for id in 0u64..3 {
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                Journal::in_memory_partition(0),
+                transport.clone(),
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+
+        // Form the group once, then let node 0 win the initial election.
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader == Some(0)).await,
+            "node 0 should win the initial election"
+        );
+
+        // Propose on the leader: with RF=3 this commits only once a quorum (2 of
+        // 3) has the entry, exercising the network end to end.
+        let deploy_events = parts[0].propose(deploy_command(), 1_000).await.expect("deploy");
+        assert!(
+            deploy_events
+                .iter()
+                .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+            "the deploy committed via quorum and applied (got {deploy_events:?})"
+        );
+
+        let target = parts[0]
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+        assert!(target >= 1, "leader applied at least the deploy entry");
+
+        // Every follower converges to the same applied index — proof the entry
+        // replicated to and applied on all three voters.
+        for (id, p) in parts.iter().enumerate() {
+            let raft = &p.raft;
+            let applied = wait_until(3_000, || {
+                raft.metrics()
+                    .borrow()
+                    .last_applied
+                    .map(|l| l.index)
+                    .unwrap_or(0)
+                    >= target
+            })
+            .await;
+            assert!(applied, "node {id} did not apply up to index {target}");
+        }
+
+        for p in parts {
+            p.raft.shutdown().await.expect("clean shutdown");
+        }
     }
 }

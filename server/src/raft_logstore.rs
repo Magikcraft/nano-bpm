@@ -31,6 +31,9 @@
 //! (mirroring [`Journal`]'s group-commit writer) to decouple it from the raft
 //! core task.
 
+// Additive until leader routing mounts it; see `raft.rs` for the rationale.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
