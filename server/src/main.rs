@@ -814,7 +814,7 @@ impl ServerImpl {
         // → applied), not the later `awaitCompletion` wait, so the backpressure
         // gauge measures command-processing concurrency rather than how long a
         // client chooses to block for completion.
-        type CreateOk = (String, i32, String, u64, bool, Commit);
+        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
 
         // Cluster-wide create placement (stage 1): round-robin across EVERY
         // partition in the cluster so a single gateway drives the whole cluster.
@@ -908,12 +908,30 @@ impl ServerImpl {
                         // synchronously within this create command; a process that
                         // parks on a job/timer/etc. is still running.
                         let sync_completed = engine.engine().is_completed(instance_key);
+                        // Collect any cross-partition subscription follow-ups to
+                        // route once durable (none single-partition).
+                        let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
+                            events
+                                .iter()
+                                .filter(|e| {
+                                    matches!(
+                                        e,
+                                        Event::MessageSubscriptionOpening { .. }
+                                            | Event::RemoteMessageCorrelation { .. }
+                                    )
+                                })
+                                .cloned()
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         Ok((
                             process_id,
                             version,
                             definition_key,
                             instance_key,
                             sync_completed,
+                            routable,
                             commit,
                         ))
                     }
@@ -936,7 +954,7 @@ impl ServerImpl {
             .await
         };
 
-        let (process_id, version, definition_key, instance_key, sync_completed, commit) =
+        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
             match outcome {
                 Ok(fields) => fields,
                 Err(resp) => return Ok(*resp),
@@ -948,6 +966,11 @@ impl ServerImpl {
         // Block on durability before acknowledging: a returned 200 means the
         // create is fsynced.
         commit.wait().await;
+        // The instance may have parked on an off-partition message catch: route
+        // the subscription open to its canonical partition (no-op single-node).
+        if !routable.is_empty() {
+            self.drive_subscription_routing(routable).await;
+        }
         // Starting an instance parks it on its first service task, so new jobs
         // may now be activatable: wake any long-pollers.
         self.signal_jobs_available();
@@ -1162,13 +1185,16 @@ impl ServerImpl {
             })
             .await;
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
                 // Record REST job completion
                 crate::metrics::record_job_completion("rest");
                 // REST API: await fsync before replying (synchronous durability).
                 // Contrast with command_stream::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
                 commit.wait().await;
+                // Completing a job may advance the token into an off-partition
+                // message catch: route the resulting subscription open/correlate.
+                self.spawn_routing_if_needed(&events);
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.signal_jobs_available();
@@ -1913,6 +1939,38 @@ impl ServerImpl {
         }
     }
 
+    /// Spawns cross-partition subscription routing for the follow-ups carried in
+    /// `events`, off the caller's path. Used by the pipelined job-completion path
+    /// (which acks before its own fsync): completing a job can advance a token
+    /// into a message catch whose subscription is owned by another partition,
+    /// emitting `MessageSubscriptionOpening`. Routing is idempotent
+    /// (`OpenMessageSubscription` keys on the subscription), so fire-and-forget is
+    /// safe even if the instance partition has not yet fsynced — a crash re-emits
+    /// the Opening on replay and re-routes. A no-op single-partition.
+    fn spawn_routing_if_needed(&self, events: &[Event]) {
+        if self.engine.topology().num_partitions <= 1 {
+            return;
+        }
+        if !Self::has_routable_subscription_events(events) {
+            return;
+        }
+        let routable: Vec<Event> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::MessageSubscriptionOpening { .. }
+                        | Event::RemoteMessageCorrelation { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        let server = self.clone();
+        tokio::spawn(async move {
+            server.drive_subscription_routing(routable).await;
+        });
+    }
+
     /// Applies a routed subscription command on the LOCAL partition `target`,
     /// awaiting its durability, and returns the events it produced (so the caller
     /// can route any further follow-ups). Returns `None` — logging a warning —
@@ -2654,7 +2712,7 @@ impl ServerImpl {
     ) -> Result<serde_json::Value, (u16, String)> {
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
-        type CreateOk = (String, i32, String, u64, bool, Commit);
+        type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
         let outcome: Result<CreateOk, (u16, String)> = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
@@ -2705,12 +2763,28 @@ impl ServerImpl {
                                 .map(|d| (d.key.to_string(), d.version))
                                 .unwrap_or_else(|| (process_id.clone(), 1));
                             let sync_completed = engine.engine().is_completed(instance_key);
+                            let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
+                                events
+                                    .iter()
+                                    .filter(|e| {
+                                        matches!(
+                                            e,
+                                            Event::MessageSubscriptionOpening { .. }
+                                                | Event::RemoteMessageCorrelation { .. }
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
                             Ok((
                                 process_id,
                                 version,
                                 definition_key,
                                 instance_key,
                                 sync_completed,
+                                routable,
                                 commit,
                             ))
                         }
@@ -2722,9 +2796,13 @@ impl ServerImpl {
                 })
                 .await
         };
-        let (process_id, version, definition_key, instance_key, sync_completed, commit) = outcome?;
+        let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
+            outcome?;
         crate::metrics::record_create("rest");
         commit.wait().await;
+        if !routable.is_empty() {
+            self.drive_subscription_routing(routable).await;
+        }
         self.signal_jobs_available();
         let (variables_out, process_completed) = if await_completion {
             self.await_process_completion(instance_key, fetch_variables.as_ref(), request_timeout)
@@ -4654,6 +4732,9 @@ impl ServerImpl {
                 engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
             })
             .await;
+        if let Ok((events, _)) = &result {
+            self.spawn_routing_if_needed(events);
+        }
         Self::map_job_outcome(result)
     }
 
@@ -4672,6 +4753,9 @@ impl ServerImpl {
                 engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
             })
             .await;
+        if let Ok((events, _)) = &result {
+            self.spawn_routing_if_needed(events);
+        }
         Self::map_job_outcome(result)
     }
 
@@ -4693,6 +4777,9 @@ impl ServerImpl {
                 )
             })
             .await;
+        if let Ok((events, _)) = &result {
+            self.spawn_routing_if_needed(events);
+        }
         Self::map_job_outcome(result)
     }
 
@@ -5614,6 +5701,9 @@ async fn main() {
     let idle_engine = server.engine.clone();
     let idle_activity = server.activity.clone();
     let idle_processing = server.processing.clone();
+    // A server handle for the timer tick to route any cross-partition
+    // subscription opens a fired timer advances a token into (no-op single-node).
+    let tick_server = server.clone();
 
     // The unified bidirectional command stream (WebSocket) shares the engine via a
     // clone of `server` and a registry of connections; a single dispatcher pushes
@@ -5645,6 +5735,8 @@ async fn main() {
         let engine = tick_engine;
         let jobs_available = tick_jobs_available;
         let dispatch_wake = tick_dispatch_wake;
+        let tick_server = tick_server;
+        let multi_partition = engine.topology().num_partitions > 1;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             loop {
@@ -5654,23 +5746,47 @@ async fn main() {
                 // Fan out concurrently: each partition's tick is independent, so
                 // running them in parallel keeps the sweep off the critical path
                 // instead of serializing N engine round-trips every 500ms.
-                let produced = futures_util::future::join_all(engine.all().iter().map(|handle| {
+                let outcomes = futures_util::future::join_all(engine.all().iter().map(|handle| {
                     handle.with(move |journal| {
                         let (fired, _commit) = journal.trigger_timers(now);
                         let expired = journal.expire_jobs(now);
                         // Shed dormant instances to disk if hot RAM is over the
                         // high-water mark (cheap no-op below it / when unset).
                         journal.maybe_cold_spill();
+                        // A fired timer may advance a token into an off-partition
+                        // message catch: surface those follow-ups for routing.
+                        let routable: Vec<Event> = if multi_partition {
+                            fired
+                                .iter()
+                                .filter(|e| {
+                                    matches!(
+                                        e,
+                                        Event::MessageSubscriptionOpening { .. }
+                                            | Event::RemoteMessageCorrelation { .. }
+                                    )
+                                })
+                                .cloned()
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                         // Either a fired timer (may create a job) or a reclaimed
                         // job lease (frees a job for redelivery) means there is
                         // pushable work — wake dispatch instead of waiting for
                         // its own backstop tick.
-                        !fired.is_empty() || !expired.is_empty()
+                        (!fired.is_empty() || !expired.is_empty(), routable)
                     })
                 }))
-                .await
-                .into_iter()
-                .any(|p| p);
+                .await;
+                let mut produced = false;
+                let mut routable: Vec<Event> = Vec::new();
+                for (p, mut r) in outcomes {
+                    produced |= p;
+                    routable.append(&mut r);
+                }
+                if !routable.is_empty() {
+                    tick_server.drive_subscription_routing(routable).await;
+                }
                 if produced {
                     jobs_available.notify_waiters();
                     dispatch_wake.notify_one();
@@ -6704,6 +6820,115 @@ mod subscription_placement_tests {
             completed,
             "the instance completes after the cross-partition correlation is routed back"
         );
+    }
+
+    /// start -> serviceTask "work" -> message intermediate catch -> end. The
+    /// token reaches the catch only when the job COMPLETES, exercising the
+    /// completion-path pump (not the create-path pump).
+    const SERVICE_THEN_CATCH_BPMN: &str = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="work-then-wait">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="work" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:intermediateCatchEvent id="await">
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="f1" sourceRef="work" targetRef="await" />
+          <bpmn:sequenceFlow id="f2" sourceRef="await" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="payment-received">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=orderId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+
+    #[tokio::test]
+    async fn cross_partition_catch_after_job_completion_completes() {
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("work-then-wait.bpmn".into(), SERVICE_THEN_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy succeeds");
+
+        // Find a create that parks the (eventual) subscription off the instance
+        // partition. The token is still at the service task here; the catch — and
+        // its Opening — is only reached when the job completes below.
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("svc-order-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, _completed) = server
+                .create_for_stream(Some("work-then-wait".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            let p_inst = nanobpmn_engine_core::partition_of(key);
+            let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if p_sub != p_inst {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) = chosen.expect("a cross-partition placement within 64 creates");
+
+        // Activate and complete this instance's job: the token advances onto the
+        // message catch, emitting an Opening the completion-path pump must route.
+        let p_inst = nanobpmn_engine_core::partition_of(instance_key);
+        let jobs = server
+            .activate_for_stream("work", "w", 64, 60_000, None)
+            .await;
+        let job_key = jobs
+            .iter()
+            .map(|j| j.job_key.0.parse::<u64>().expect("numeric job key"))
+            .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
+            .expect("our instance's job is activatable");
+        server
+            .complete_job_for_stream(job_key, std::collections::HashMap::new())
+            .await
+            .expect("complete succeeds")
+            .wait()
+            .await;
+
+        // Routing is fire-and-forget off the pipelined completion path, so the
+        // canonical Open may not be recorded the instant we publish; retry until
+        // the publish correlates (or give up after a bounded number of tries).
+        let mut correlated = None;
+        for _ in 0..50 {
+            let (_mk, c) = server
+                .correlate_message_local(
+                    "payment-received".into(),
+                    order.clone(),
+                    std::collections::HashMap::new(),
+                )
+                .await;
+            if c == Some(instance_key) {
+                correlated = c;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            correlated,
+            Some(instance_key),
+            "the publish correlates after the completion-path pump opens the sub"
+        );
+
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(completed, "instance completes after the post-job-completion correlation");
     }
 
     #[tokio::test]
