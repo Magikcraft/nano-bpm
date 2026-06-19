@@ -464,6 +464,7 @@ pub struct MessageSubscription {
 /// minting a new instance on every matching message. Keyed in [`State`] by
 /// message name; re-deploying a process with the same start message replaces it.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MessageStartSubscription {
     /// The definition (and version) whose instances this start event creates.
     pub process_definition_key: Key,
@@ -480,6 +481,7 @@ pub struct MessageStartSubscription {
 /// BPMN duration) fires exactly once and is then retained as `due_at = None`.
 /// Keyed in [`State`] by its own `timer_key`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StartTimer {
     pub timer_key: Key,
     /// The definition (and version) whose instances this start event creates.
@@ -498,6 +500,7 @@ pub struct StartTimer {
 /// A deployed process definition together with the identity the engine assigned
 /// it at deploy time.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DeployedProcess {
     /// Unique key for this specific process definition (and version).
     pub key: Key,
@@ -509,6 +512,7 @@ pub struct DeployedProcess {
 
 /// The complete working state of the engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct State {
     /// Latest deployed version of each process, keyed by BPMN process id. New
     /// instances created by id start the latest version.

@@ -500,6 +500,22 @@ impl Journal {
         }
     }
 
+    /// Like [`Journal::in_memory_from_events`] but rebuilds the engine from a
+    /// compact [`EngineSnapshot`](nanobpmn_engine_core::EngineSnapshot) instead of
+    /// replaying an event log — the state-based install path for a bounded Raft
+    /// state-machine snapshot.
+    pub fn in_memory_from_snapshot(snapshot: nanobpmn_engine_core::EngineSnapshot) -> Self {
+        Self {
+            engine: Engine::from_snapshot(snapshot),
+            writer: None,
+            writer_thread: None,
+            exporter: None,
+            fresh: false,
+            spill: None,
+            cold: None,
+        }
+    }
+
     /// Reads and deserializes every event from the journal log at `path` (an
     /// empty vec if the file does not exist). Shared by [`Journal::open`] (to
     /// replay into the engine) and the boot-time read-model catch-up.
@@ -1078,6 +1094,13 @@ impl Journal {
 
     pub fn state(&self) -> &State {
         self.engine.state()
+    }
+
+    /// Captures a compact, serializable snapshot of the engine's live state (see
+    /// [`Engine::snapshot`]). Used to build a bounded Raft state-machine snapshot
+    /// whose size tracks the working set rather than the full event history.
+    pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
+        self.engine.snapshot()
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {

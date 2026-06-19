@@ -30,3 +30,8 @@ path = "src/lib.rs"
 # Kotlin host or the `wasm32-unknown-unknown` target gets a loadable artifact
 # exporting the `ffi` functions (built with `--features ffi`).
 crate-type = ["lib", "cdylib"]
+
+[dev-dependencies]
+# Used only by the `serde`-gated snapshot round-trip test to exercise actual
+# (de)serialization (catches issues like non-string map keys).
+serde_json = "1"

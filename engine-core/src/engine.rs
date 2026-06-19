@@ -18,6 +18,21 @@ use crate::event::Event;
 use crate::model::{ElementId, ElementKind, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
+/// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
+/// plus the scalar generator and clock metadata required to resume operation
+/// identically. Produced by [`Engine::snapshot`] and consumed by
+/// [`Engine::from_snapshot`]; the body of a bounded Raft state-machine snapshot.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct EngineSnapshot {
+    pub state: State,
+    pub partition_id: u64,
+    pub next_local: u64,
+    pub num_partitions: u64,
+    pub now: u64,
+    pub start_dispatch_rr: u64,
+}
+
 /// An embeddable BPMN engine instance.
 ///
 /// Holds all state in memory. It is `Send` and contains no threads, locks or I/O,
@@ -114,6 +129,45 @@ impl Engine {
     /// Read-only access to the full engine state (useful for queries and tests).
     pub fn state(&self) -> &State {
         &self.state
+    }
+
+    /// Captures a complete, compact snapshot of this engine: the materialized
+    /// [`State`] (already pruned of terminal instances) plus the scalar
+    /// generator/clock metadata needed to resume minting keys and placing
+    /// subscriptions without collision. Unlike an event log, its size tracks the
+    /// *live* working set rather than growing with every command ever applied —
+    /// the basis for bounded Raft state-machine snapshots.
+    #[cfg(feature = "serde")]
+    pub fn snapshot(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            state: self.state.clone(),
+            partition_id: self.partition_id,
+            next_local: self.next_local,
+            num_partitions: self.num_partitions,
+            now: self.now,
+            start_dispatch_rr: self.start_dispatch_rr,
+        }
+    }
+
+    /// Rebuilds an engine from an [`Engine::snapshot`] — the state-based
+    /// counterpart to [`Engine::replay_partition`], restoring the exact
+    /// materialized state and generator position in one step (no replay).
+    #[cfg(feature = "serde")]
+    pub fn from_snapshot(snapshot: EngineSnapshot) -> Self {
+        assert!(
+            snapshot.partition_id <= state::MAX_PARTITION_ID,
+            "partition id {} exceeds MAX_PARTITION_ID {}",
+            snapshot.partition_id,
+            state::MAX_PARTITION_ID
+        );
+        Self {
+            state: snapshot.state,
+            partition_id: snapshot.partition_id,
+            next_local: snapshot.next_local,
+            num_partitions: snapshot.num_partitions.max(1),
+            now: snapshot.now,
+            start_dispatch_rr: snapshot.start_dispatch_rr,
+        }
     }
 
     /// Sets the cluster-wide partition count used to place message
@@ -3709,6 +3763,59 @@ mod tests {
         assert!(completion
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn engine_snapshot_round_trips_state_and_key_generator() {
+        // A state snapshot must reproduce the materialized state exactly and
+        // resume the key generator where it left off, so a node rebuilt from a
+        // snapshot serves identical state and never mints a colliding key — the
+        // correctness contract for bounded, state-based Raft snapshots.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        // One instance driven to completion (terminal; pruned from hot state but
+        // retained for audit)...
+        engine.apply_command(Command::create_instance("order")).unwrap();
+        complete_one(&mut engine, "payment");
+        // ...and one left parked on its job (live working state).
+        let e2 = engine.apply_command(Command::create_instance("order")).unwrap();
+        let parked = e2.iter().find_map(|e| e.instance_key()).unwrap();
+
+        let snapshot = engine.snapshot();
+        let serialized = serde_json::to_vec(&snapshot).expect("snapshot serializes");
+        let decoded: EngineSnapshot =
+            serde_json::from_slice(&serialized).expect("snapshot deserializes");
+        let mut restored = Engine::from_snapshot(decoded);
+
+        assert_eq!(
+            restored.state(),
+            engine.state(),
+            "restored state equals the source state byte-for-byte"
+        );
+
+        // The parked instance and its job survive the round-trip and remain
+        // completable on the restored engine.
+        assert!(restored.instance(parked).is_some());
+        let done = complete_one(&mut restored, "payment");
+        assert!(done.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceCompleted { instance_key } if *instance_key == parked
+        )));
+
+        // The restored engine resumes minting keys without colliding with any key
+        // the source engine already assigned.
+        let e3 = restored
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let k3 = e3.iter().find_map(|e| e.instance_key()).unwrap();
+        assert!(
+            !engine.state().instances.contains_key(&k3),
+            "next minted key {k3} must not collide with a pre-snapshot key"
+        );
+        assert_ne!(k3, parked);
     }
 
     #[test]

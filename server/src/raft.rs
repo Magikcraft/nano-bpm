@@ -259,10 +259,10 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
     }
 }
 
-/// A persisted snapshot: the metadata plus the serialized event history that
-/// reconstructs the engine via replay (we snapshot the event log, not the
-/// in-memory `State`, because `Event` is `serde` and `Journal` already rebuilds
-/// from events — the same mechanism as crash recovery).
+/// A persisted snapshot: the metadata plus the serialized [`EngineSnapshot`] that
+/// reconstructs the engine directly (state-based, not event-replay — its size
+/// tracks the live working set rather than growing with every command ever
+/// applied, so the Raft log can be compacted without unbounded memory growth).
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
@@ -270,15 +270,14 @@ struct StoredSnapshot {
 }
 
 /// Metadata held by the Raft state machine: the last applied log id and
-/// membership, plus the full applied-event history used to build snapshots. The
-/// materialized engine state itself lives on the partition's [`EngineHandle`]
-/// (driven by [`apply`](RaftStateMachine::apply)), not here.
+/// membership. The materialized engine state itself lives on the partition's
+/// [`EngineHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
+/// captured on demand for snapshots, so the state machine retains no event
+/// history of its own.
 struct SmMeta {
     partition_id: u64,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
-    /// Every event applied so far, in apply order — the replayable snapshot body.
-    history: Vec<Event>,
 }
 
 /// The Raft state machine for one partition. Committed commands are applied to
@@ -304,7 +303,6 @@ impl PartitionStateMachine {
                 partition_id,
                 last_applied: None,
                 last_membership: StoredMembership::default(),
-                history: Vec::new(),
             }),
             snapshot_idx: AtomicU64::new(0),
             current_snapshot: Mutex::new(None),
@@ -312,28 +310,36 @@ impl PartitionStateMachine {
     }
 }
 
-impl RaftSnapshotBuilder<RaftConfig> for Arc<PartitionStateMachine> {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<RaftConfig>, StorageError<NodeId>> {
-        let (data, last_applied, last_membership) = {
-            let inner = self.inner.lock().unwrap();
-            let data = serde_json::to_vec(&inner.history)
-                .map_err(|e| StorageIOError::read_state_machine(&e))?;
-            (data, inner.last_applied, inner.last_membership.clone())
-        };
+/// A point-in-time snapshot builder: holds an [`EngineSnapshot`] and metadata
+/// captured atomically (relative to `apply`) when the state-machine worker minted
+/// it, so [`build_snapshot`](RaftSnapshotBuilder::build_snapshot) only has to
+/// serialize an already-consistent state — no engine round-trip, no race with a
+/// concurrent apply.
+pub struct PartitionSnapshotBuilder {
+    sm: Arc<PartitionStateMachine>,
+    captured: nanobpmn_engine_core::EngineSnapshot,
+    last_applied: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
+}
 
-        let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_id = if let Some(last) = last_applied {
+impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
+    async fn build_snapshot(&mut self) -> Result<Snapshot<RaftConfig>, StorageError<NodeId>> {
+        let data = serde_json::to_vec(&self.captured)
+            .map_err(|e| StorageIOError::read_state_machine(&e))?;
+
+        let snapshot_idx = self.sm.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot_id = if let Some(last) = self.last_applied {
             format!("{}-{}-{}", last.leader_id, last.index, snapshot_idx)
         } else {
             format!("--{snapshot_idx}")
         };
 
         let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
+            last_log_id: self.last_applied,
+            last_membership: self.last_membership.clone(),
             snapshot_id,
         };
-        *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
+        *self.sm.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
             meta: meta.clone(),
             data: data.clone(),
         });
@@ -346,7 +352,7 @@ impl RaftSnapshotBuilder<RaftConfig> for Arc<PartitionStateMachine> {
 }
 
 impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
-    type SnapshotBuilder = Self;
+    type SnapshotBuilder = PartitionSnapshotBuilder;
 
     async fn applied_state(
         &mut self,
@@ -399,10 +405,6 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         match outcome {
                             Ok((events, commit)) => {
                                 commit.wait().await;
-                                {
-                                    let mut inner = self.inner.lock().unwrap();
-                                    inner.history.extend(events.iter().cloned());
-                                }
                                 items.push(ReplicatedItem {
                                     events: events.to_vec(),
                                     error: None,
@@ -434,7 +436,22 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
+        // Capture the engine's materialized state and the applied metadata as a
+        // consistent pair. This runs on the state-machine worker, which drives
+        // `apply` and snapshot building sequentially, so no command is applied
+        // between the engine read and the `last_applied`/membership read — the
+        // captured state corresponds exactly to `last_applied`.
+        let captured = self.engine.with(|journal| journal.engine_snapshot()).await;
+        let (last_applied, last_membership) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.last_applied, inner.last_membership.clone())
+        };
+        PartitionSnapshotBuilder {
+            sm: self.clone(),
+            captured,
+            last_applied,
+            last_membership,
+        }
     }
 
     async fn begin_receiving_snapshot(
@@ -449,23 +466,20 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let history: Vec<Event> = serde_json::from_slice(&data)
+        let captured: nanobpmn_engine_core::EngineSnapshot = serde_json::from_slice(&data)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
-        let partition_id = self.inner.lock().unwrap().partition_id;
-        // Rebuild the engine actor's state from the snapshot's event history. The
-        // engine journal is in-memory under Raft (the Raft log is the durable
+        // Rebuild the engine actor's state directly from the captured snapshot.
+        // The engine journal is in-memory under Raft (the Raft log is the durable
         // tier), so replacing it wholesale is the install.
-        let hist = history.clone();
         self.engine
             .with(move |journal| {
-                *journal = Journal::in_memory_from_events(partition_id, hist);
+                *journal = Journal::in_memory_from_snapshot(captured);
             })
             .await;
 
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.history = history;
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
         }
@@ -508,6 +522,14 @@ fn raft_config() -> Config {
         heartbeat_interval: env_u64("NANOBPMN_RAFT_HEARTBEAT_MS", 250),
         election_timeout_min: env_u64("NANOBPMN_RAFT_ELECTION_MIN_MS", 500),
         election_timeout_max: env_u64("NANOBPMN_RAFT_ELECTION_MAX_MS", 1000),
+        // Snapshot every N applied log entries to compact the log (openraft
+        // default 5000). Env-tunable so a deployment can trade snapshot frequency
+        // (memory/IO) against log length, and so tests can force the snapshot
+        // build/install path with a small threshold.
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(env_u64(
+            "NANOBPMN_RAFT_SNAPSHOT_LOGS",
+            5000,
+        )),
         ..Default::default()
     }
 }
@@ -849,6 +871,63 @@ mod tests {
         );
 
         part.raft.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn snapshot_captures_compact_state_and_installs_into_a_fresh_replica() {
+        // A source state machine accrues live state directly through its engine
+        // actor (the same effect `apply` has), then snapshots it.
+        let src = EngineHandle::spawn(Journal::in_memory_partition(0), None);
+        src.with(|j| {
+            let _ = j.apply_command_at(deploy_command(), 1).expect("deploy applies");
+        })
+        .await;
+        src.with(|j| {
+            let _ = j
+                .apply_command_at(
+                    Command::CreateInstance {
+                        process_id: "p".into(),
+                        variables: Default::default(),
+                        tags: Vec::new(),
+                        business_id: None,
+                    },
+                    2,
+                )
+                .expect("create applies");
+        })
+        .await;
+
+        let mut src_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new(src.clone(), 0));
+        let mut builder = src_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("build snapshot");
+        let bytes = (*snap.snapshot).into_inner();
+
+        // The body is a compact EngineSnapshot, not an event log: it deserializes
+        // straight back into an EngineSnapshot.
+        let _: nanobpmn_engine_core::EngineSnapshot =
+            serde_json::from_slice(&bytes).expect("snapshot body is a state capture");
+
+        // A brand-new, empty replica installs the snapshot and ends up with
+        // byte-for-byte identical engine state — the cross-node catch-up path.
+        let dst = EngineHandle::spawn(Journal::in_memory_partition(0), None);
+        let mut dst_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new(dst.clone(), 0));
+        dst_sm
+            .install_snapshot(&snap.meta, Box::new(Cursor::new(bytes)))
+            .await
+            .expect("install snapshot");
+
+        let src_state = src.with(|j| j.state().clone()).await;
+        let dst_state = dst.with(|j| j.state().clone()).await;
+        assert_eq!(
+            src_state, dst_state,
+            "the installed replica's state matches the source exactly"
+        );
+        assert!(
+            !dst_state.processes.is_empty(),
+            "the deployed definition transferred in the snapshot"
+        );
     }
 
     fn unique_log_dir(tag: &str) -> std::path::PathBuf {
