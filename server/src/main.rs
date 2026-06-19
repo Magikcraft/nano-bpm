@@ -1742,6 +1742,51 @@ impl ServerImpl {
         }
     }
 
+    /// Serves the verbatim BPMN XML for a deployed process definition
+    /// (`getProcessDefinitionXML`). Read from the read model, which projects it
+    /// from the journaled `ProcessDeployed` event (so it is durable and the same
+    /// on every node). Only the latest version per process id is retained, so an
+    /// older version's key yields 404. A definition built programmatically (no
+    /// source XML) is reported as 204.
+    async fn get_process_definition_xml_impl(
+        &self,
+        path_params: &models::GetProcessDefinitionXmlPathParams,
+    ) -> Result<apis::process_definition::GetProcessDefinitionXmlResponse, ()> {
+        use apis::process_definition::GetProcessDefinitionXmlResponse as Resp;
+
+        let key: u64 = match path_params.process_definition_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(
+                    problem(
+                        "Process definition not found",
+                        404,
+                        format!(
+                            "Process definition key '{}' is not a valid key.",
+                            path_params.process_definition_key
+                        ),
+                    ),
+                ));
+            }
+        };
+
+        match self.store.process_definition_xml(key) {
+            Some(xml) if !xml.is_empty() => {
+                Ok(Resp::Status200_TheXMLOfTheProcessDefinitionIsSuccessfullyReturned(xml))
+            }
+            Some(_) => Ok(Resp::Status204_TheProcessDefinitionWasFoundButDoesNotHaveXML(
+                String::new(),
+            )),
+            None => Ok(Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(
+                problem(
+                    "Process definition not found",
+                    404,
+                    format!("No process definition with key {key}."),
+                ),
+            )),
+        }
+    }
+
     /// Reports the real cluster topology: one broker per node, each advertising
     /// the partitions it owns (deterministic `partition % num_nodes` ownership).
     /// Partition ids are surfaced 1-based (Camunda convention) over nano's 0-based

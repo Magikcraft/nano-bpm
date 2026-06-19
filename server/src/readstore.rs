@@ -30,13 +30,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped whenever the schema or projection changes; a stored database with a
 /// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
     process_id TEXT PRIMARY KEY,
     key        INTEGER NOT NULL,
-    version    INTEGER NOT NULL
+    version    INTEGER NOT NULL,
+    xml        TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE process_instances (
     key                    INTEGER PRIMARY KEY,
@@ -520,6 +521,21 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// The verbatim BPMN XML for the process definition with `key`, or `None`
+    /// when no such definition is projected (only the latest version per process
+    /// id is retained, mirroring the engine). Empty-string XML (a definition
+    /// built programmatically rather than parsed) is returned as `Some("")`.
+    pub fn process_definition_xml(&self, key: Key) -> Option<String> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT xml FROM process_definitions WHERE key = ?1",
+            params![key as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query process_definition_xml")
+    }
+
     pub fn variables(&self) -> Vec<VariableRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -729,10 +745,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         } => {
             // Only the latest version of a process id is searchable, mirroring
             // the engine's `state.processes` (keyed by id); a redeploy replaces.
+            // The verbatim BPMN XML rides on the deploy event (engine state) and
+            // is projected here so getProcessDefinitionXML / the console diagram
+            // can serve it by key without querying the engine actor.
             tx.execute(
-                "INSERT INTO process_definitions (process_id, key, version) VALUES (?1, ?2, ?3) \
-                 ON CONFLICT(process_id) DO UPDATE SET key = excluded.key, version = excluded.version",
-                params![process.id, *process_definition_key as i64, version],
+                "INSERT INTO process_definitions (process_id, key, version, xml) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(process_id) DO UPDATE SET key = excluded.key, version = excluded.version, xml = excluded.xml",
+                params![process.id, *process_definition_key as i64, version, process.xml],
             )?;
         }
 
@@ -1170,5 +1189,48 @@ mod writability_tests {
         perms.set_mode(0o644);
         std::fs::set_permissions(&path, perms).unwrap();
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod definition_xml_tests {
+    use super::ReadStore;
+    use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
+
+    fn deployed_event(key: u64, xml: &str) -> Event {
+        let mut def: ProcessDefinition = ProcessBuilder::new("p")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .unwrap();
+        def.xml = xml.to_string();
+        Event::ProcessDeployed {
+            deployment_key: 1,
+            process_definition_key: key,
+            version: 1,
+            process: def,
+        }
+    }
+
+    #[test]
+    fn projects_and_serves_the_deployment_xml_by_key() {
+        let store = ReadStore::open(None).unwrap();
+        let xml = "<bpmn:definitions>…verbatim…</bpmn:definitions>";
+        let event = deployed_event(42, xml);
+        store.export(&[&event]).unwrap();
+
+        assert_eq!(store.process_definition_xml(42).as_deref(), Some(xml));
+        // Unknown key has no XML.
+        assert_eq!(store.process_definition_xml(999), None);
+    }
+
+    #[test]
+    fn programmatic_definition_has_empty_xml() {
+        let store = ReadStore::open(None).unwrap();
+        let event = deployed_event(7, "");
+        store.export(&[&event]).unwrap();
+        // Present but empty — the handler maps this to a 204, not a 404.
+        assert_eq!(store.process_definition_xml(7).as_deref(), Some(""));
     }
 }

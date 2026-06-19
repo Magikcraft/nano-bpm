@@ -454,6 +454,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     processes
         .into_iter()
         .map(|acc| acc.build(&errors, &messages))
+        // Retain the verbatim source XML on each parsed definition so it can be
+        // served back (getProcessDefinitionXML / console diagram). Every process
+        // in one resource shares that resource's XML.
+        .map(|def| {
+            def.map(|d| ProcessDefinition {
+                xml: xml.to_string(),
+                ..d
+            })
+        })
         .collect()
 }
 

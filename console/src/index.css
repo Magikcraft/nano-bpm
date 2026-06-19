@@ -16,3 +16,16 @@ body {
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
     Arial, sans-serif;
 }
+
+/* BPMN diagram overlay markers (diagram-js adds these classes to shapes). */
+.nano-active .djs-visual > :nth-child(1) {
+  stroke: #38bdf8 !important;
+  stroke-width: 3px !important;
+  fill: #0c4a6e !important;
+}
+
+.nano-incident .djs-visual > :nth-child(1) {
+  stroke: #f87171 !important;
+  stroke-width: 3px !important;
+  fill: #7f1d1d !important;
+}

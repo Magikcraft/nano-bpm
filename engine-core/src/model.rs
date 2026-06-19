@@ -339,6 +339,15 @@ pub struct ProcessDefinition {
     pub id: String,
     pub elements: HashMap<ElementId, Element>,
     pub start_event: ElementId,
+    /// The original BPMN XML this definition was parsed from, retained verbatim
+    /// so it can be served back (e.g. Camunda's `getProcessDefinitionXML`, the
+    /// console's diagram view). Empty for definitions built programmatically via
+    /// [`ProcessBuilder`] rather than parsed from XML, and defaulted empty when
+    /// deserializing journals/snapshots written before this field existed. It is
+    /// non-executable metadata: it travels with the deployment (journaled and
+    /// snapshotted) but no engine logic reads it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub xml: String,
 }
 
 impl ProcessDefinition {
@@ -779,6 +788,9 @@ impl ProcessBuilder {
             id: self.id,
             elements,
             start_event,
+            // Programmatically built definitions have no source XML; parse_bpmn
+            // overwrites this with the verbatim resource for parsed deployments.
+            xml: String::new(),
         })
     }
 }

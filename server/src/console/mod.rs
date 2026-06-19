@@ -15,13 +15,19 @@
 
 use axum::{
     Router,
-    extract::State,
+    extract::{Path, State},
     http::{StatusCode, header},
-    response::{IntoResponse, Json, Response},
+    response::{
+        IntoResponse, Json, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::get,
 };
+use futures_util::stream::{Stream, unfold};
 use rust_embed::RustEmbed;
 use serde::Serialize;
+use std::convert::Infallible;
+use std::time::Duration;
 
 use crate::ServerImpl;
 
@@ -35,11 +41,20 @@ struct Assets;
 pub fn router(server: ServerImpl) -> Router {
     Router::new()
         .route("/console/api/topology", get(topology))
+        .route("/console/api/instances", get(instances))
+        .route("/console/api/instances/{key}", get(instance_detail))
+        .route("/console/api/stream", get(stream))
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
         .with_state(server)
 }
+
+// The `*path` catch-all must not swallow `/console/api/*`. axum's matchit router
+// ranks literal segments above wildcards, so the API routes above always win;
+// the catch-all only handles SPA asset/deep-link requests. The list of
+// `/console/api/...` routes is registered explicitly to keep that guarantee
+// obvious rather than relying on registration order.
 
 // ---------------------------------------------------------------------------
 // Static asset serving (SPA)
@@ -169,4 +184,177 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
         nodes,
         partitions,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Process Instance Explorer API
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct InstanceDto {
+    /// u64 engine key rendered as a string — keys exceed JS's safe integer range.
+    key: String,
+    process_id: String,
+    process_definition_key: String,
+    version: i32,
+    /// `Active` | `Completed` | `Terminated`.
+    state: String,
+    start_date_ms: u64,
+    has_incident: bool,
+    business_id: Option<String>,
+    tags: Vec<String>,
+}
+
+impl From<&crate::readstore::ProcessInstanceRow> for InstanceDto {
+    fn from(r: &crate::readstore::ProcessInstanceRow) -> Self {
+        InstanceDto {
+            key: r.key.to_string(),
+            process_id: r.process_id.clone(),
+            process_definition_key: r.process_definition_key.clone(),
+            version: r.version,
+            state: format!("{:?}", r.state),
+            start_date_ms: r.start_date_ms,
+            has_incident: r.has_incident,
+            business_id: r.business_id.clone(),
+            tags: r.tags.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct VariableDto {
+    name: String,
+    /// Serialized-JSON value string, mirroring Camunda's wire representation.
+    value: String,
+    scope_key: String,
+}
+
+#[derive(Serialize)]
+struct JobDto {
+    key: String,
+    element_id: String,
+    job_type: String,
+    state: String,
+    retries: i32,
+    worker: Option<String>,
+    deadline_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct IncidentDto {
+    key: String,
+    element_id: String,
+    kind: String,
+    state: String,
+    reason: String,
+    created_at_ms: u64,
+}
+
+#[derive(Serialize)]
+struct InstanceDetailDto {
+    instance: InstanceDto,
+    variables: Vec<VariableDto>,
+    jobs: Vec<JobDto>,
+    incidents: Vec<IncidentDto>,
+}
+
+/// `GET /console/api/instances` — process-instance list, newest first.
+async fn instances(State(server): State<ServerImpl>) -> Json<Vec<InstanceDto>> {
+    let mut rows = server.store.process_instances();
+    // Newest first: most useful default ordering for an ops view.
+    rows.sort_by(|a, b| b.start_date_ms.cmp(&a.start_date_ms));
+    Json(rows.iter().map(InstanceDto::from).collect())
+}
+
+/// `GET /console/api/instances/{key}` — one instance with its variables, jobs,
+/// and incidents. 404 when the key is malformed or unknown.
+async fn instance_detail(
+    State(server): State<ServerImpl>,
+    Path(key): Path<String>,
+) -> Response {
+    let Ok(key) = key.parse::<u64>() else {
+        return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
+    };
+    let Some(row) = server.store.process_instance(key) else {
+        return (StatusCode::NOT_FOUND, "no such process instance").into_response();
+    };
+
+    let variables: Vec<VariableDto> = server
+        .store
+        .instance_variables(key)
+        .iter()
+        .map(|v| VariableDto {
+            name: v.name.clone(),
+            value: v.value.clone(),
+            scope_key: v.scope_key.to_string(),
+        })
+        .collect();
+
+    let jobs: Vec<JobDto> = server
+        .store
+        .jobs()
+        .iter()
+        .filter(|j| j.instance_key == key)
+        .map(|j| JobDto {
+            key: j.key.to_string(),
+            element_id: j.element_id.clone(),
+            job_type: j.job_type.clone(),
+            state: format!("{:?}", j.state),
+            retries: j.retries,
+            worker: j.worker.clone(),
+            deadline_ms: j.deadline_ms,
+        })
+        .collect();
+
+    let incidents: Vec<IncidentDto> = server
+        .store
+        .incidents()
+        .iter()
+        .filter(|i| i.instance_key == key)
+        .map(|i| IncidentDto {
+            key: i.key.to_string(),
+            element_id: i.element_id.clone(),
+            kind: format!("{:?}", i.kind),
+            state: format!("{:?}", i.state),
+            reason: i.reason.clone(),
+            created_at_ms: i.created_at_ms,
+        })
+        .collect();
+
+    Json(InstanceDetailDto {
+        instance: InstanceDto::from(&row),
+        variables,
+        jobs,
+        incidents,
+    })
+    .into_response()
+}
+
+/// `GET /console/api/stream` — Server-Sent Events feed for live updates.
+///
+/// Emits an `instances` event whenever the read model's exported position
+/// advances (i.e. the projection consumed new events). The position is a cheap
+/// change signal: the client reacts by refetching the list/detail it cares
+/// about, so the server stays stateless about *what* changed. An initial event
+/// fires immediately so the client syncs on connect; keep-alive comments keep
+/// intermediaries from dropping an idle connection.
+async fn stream(
+    State(server): State<ServerImpl>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let store = server.store.clone();
+    // `usize::MAX` as the seed guarantees the first poll differs, emitting an
+    // immediate snapshot on connect.
+    let s = unfold((store, usize::MAX), |(store, last)| async move {
+        loop {
+            let position = store.exported_position();
+            if position != last {
+                let active = store.active_instance_count();
+                let data = format!(r#"{{"position":{position},"active":{active}}}"#);
+                let event = Event::default().event("instances").data(data);
+                return Some((Ok(event), (store, position)));
+            }
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+    });
+    Sse::new(s).keep_alive(KeepAlive::default())
 }
