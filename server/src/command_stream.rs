@@ -881,7 +881,7 @@ async fn handle_client_frame(
             // Cluster: a worker attached here may complete a job a peer owns
             // (job aggregation). Forward to the owner; local jobs stay on the
             // pipelined fast path. Single-node always owns every key.
-            if let Some(node) = server.remote_owner_of(key) {
+            if let Some(node) = server.job_route(key) {
                 let server = server.clone();
                 spawn_forward_stream_reply(conn, corr, async move {
                     server.forward_complete_job_stream(node, key, variables).await
@@ -905,7 +905,7 @@ async fn handle_client_frame(
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
-            if let Some(node) = server.remote_owner_of(key) {
+            if let Some(node) = server.job_route(key) {
                 let server = server.clone();
                 let retries = retries.unwrap_or(0);
                 let error_message = error_message.unwrap_or_default();
@@ -930,7 +930,7 @@ async fn handle_client_frame(
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
-            if let Some(node) = server.remote_owner_of(key) {
+            if let Some(node) = server.job_route(key) {
                 let server = server.clone();
                 let error_code = error_code.clone();
                 let error_message = error_message.clone().unwrap_or_default();

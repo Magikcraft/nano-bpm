@@ -2303,6 +2303,36 @@ impl ServerImpl {
         self.engine.remote_owner(key)
     }
 
+    /// Routing target for a by-key job command (complete / fail / throw): `None`
+    /// means handle it locally, `Some(node)` means forward to peer `node`.
+    ///
+    /// When this node hosts Raft groups, routing follows the partition's CURRENT
+    /// Raft leader rather than the static owner map, so a command for a partition
+    /// whose leadership moved (after the owner failed and a replica was elected)
+    /// reaches the new leader instead of the dead owner. A transient no-leader
+    /// window routes locally so [`propose_job_for_stream`](Self::propose_job_for_stream)
+    /// returns a retryable 503. With Raft off this is exactly `remote_owner_of`,
+    /// so the non-Raft path is unchanged.
+    ///
+    /// NOTE (s3-perf/robustness): the forwarded peer re-routes via this same map,
+    /// so during an election flux two nodes with stale, disagreeing metrics could
+    /// briefly ping-pong a command. A forward hop-limit is future work; in the
+    /// stable post-election state every node agrees on the leader and routes once.
+    pub(crate) fn job_route(&self, key: u64) -> Option<u32> {
+        if !self.raft.is_empty() {
+            let p = partition_of(key);
+            if let Some(part) = self.raft.get(p) {
+                let node_id = self.engine.topology().node_id as u64;
+                return match part.raft.metrics().borrow().current_leader {
+                    Some(l) if l == node_id => None,
+                    None => None,
+                    Some(l) => Some(l as u32),
+                };
+            }
+        }
+        self.remote_owner_of(key)
+    }
+
     /// Remote node ids this gateway forwards to (every peer that owns at least one
     /// partition this node does not). Empty on a single-node cluster, so the
     /// dispatcher's job-aggregation fan-out is a no-op and the hot path is
@@ -4686,6 +4716,36 @@ impl ServerImpl {
             .clone()
     }
 
+    /// The partitions this node currently LEADS: every partition for which it
+    /// hosts a Raft group whose current leader is this node. In steady state this
+    /// equals the statically owned set; after a failover it also includes
+    /// partitions this node only replicates but was elected to lead. The serving
+    /// paths (activation, clock tick) fan out over THIS set so serving follows
+    /// leadership, not static ownership — the new leader of a failed partition
+    /// drives its jobs and timers.
+    fn led_partitions(&self) -> Vec<u64> {
+        let node_id = self.engine.topology().node_id as u64;
+        (0..self.engine.topology().num_partitions)
+            .filter(|&p| {
+                self.raft
+                    .get(p)
+                    .is_some_and(|part| part.raft.metrics().borrow().current_leader == Some(node_id))
+            })
+            .collect()
+    }
+
+    /// The engine actor materializing partition `p` on this node: the owned actor
+    /// if this node owns `p`, else the Raft replica actor (present when this node
+    /// replicates `p`). `None` if this node neither owns nor replicates `p`. Used
+    /// by the serving paths to reach a partition this node leads after a failover
+    /// even though it does not statically own it.
+    fn engine_handle_for(&self, p: u64) -> Option<EngineHandle> {
+        if let Some(h) = self.engine.local_for_partition(p) {
+            return Some(h.clone());
+        }
+        self.raft_replicas.lock().unwrap().get(&p).cloned()
+    }
+
     /// Fans a deployment into every replica engine actor (followers under RF>1) so
     /// a replicated `CreateInstance` for the new definition applies successfully on
     /// every replica. A no-op (and zero overhead) when this node hosts no replica
@@ -4846,18 +4906,21 @@ impl ServerImpl {
         // per-partition shares to `activate_on_raft`, which proposes `ActivateJobs`
         // on partitions this node leads and skips the rest (their leader activates).
         if !self.raft.is_empty() {
-            let owned = self.engine.topology().local_partitions();
-            debug_assert_eq!(owned.len(), n, "all() and local_partitions() agree in order");
-            let start = self.engine.activate_start();
-            let base = max_jobs / n;
-            let rem = max_jobs % n;
-            let mut futures = Vec::with_capacity(n);
-            for off in 0..n {
+            let led = self.led_partitions();
+            let ln = led.len();
+            if ln == 0 {
+                return Vec::new();
+            }
+            let start = self.engine.activate_start() % ln;
+            let base = max_jobs / ln;
+            let rem = max_jobs % ln;
+            let mut futures = Vec::with_capacity(ln);
+            for off in 0..ln {
                 let want = base + usize::from(off < rem);
                 if want == 0 {
                     continue;
                 }
-                let p = owned[(start + off) % n];
+                let p = led[(start + off) % ln];
                 futures.push(self.activate_on_raft(p, job_type, worker, want, timeout));
             }
             let activated: Vec<ActivatedJobWithIdentity> =
@@ -5003,7 +5066,7 @@ impl ServerImpl {
         if job_keys.is_empty() {
             return Vec::new();
         }
-        let Some(handle) = self.engine.local_for_partition(p) else {
+        let Some(handle) = self.engine_handle_for(p) else {
             return Vec::new();
         };
         handle
@@ -5057,7 +5120,7 @@ impl ServerImpl {
         if part.raft.metrics().borrow().current_leader != Some(node_id) {
             return (false, Vec::new());
         }
-        let Some(handle) = self.engine.local_for_partition(p) else {
+        let Some(handle) = self.engine_handle_for(p) else {
             return (false, Vec::new());
         };
         // One read on the leader: cold-spill + what (if anything) is due now. Only
@@ -6447,10 +6510,9 @@ async fn main() {
                 // Raft log (followers apply in lockstep). Non-Raft uses the direct
                 // local path below, byte-identical to the pre-cluster behaviour.
                 let outcomes: Vec<(bool, Vec<Event>)> = if !tick_server.raft.is_empty() {
-                    let owned = engine.topology().local_partitions();
+                    let led = tick_server.led_partitions();
                     futures_util::future::join_all(
-                        owned
-                            .iter()
+                        led.iter()
                             .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
                     )
                     .await
@@ -8215,6 +8277,191 @@ mod clustered_startup_tests {
 
         for node in [&node0, &node1] {
             for p in 0..4u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn killing_the_leader_keeps_the_partition_serving_on_the_new_leader() {
+        // s3-failover continuity: a 3-node RF=3 group commits an instance through
+        // partition 0's leader (node 0). We then SHUT DOWN node 0's Raft groups.
+        // The two survivors {1,2} re-elect a leader for partition 0 (quorum 2/3).
+        // Because serving now follows leadership (`led_partitions()` /
+        // `engine_handle_for()`), the new leader — which only REPLICATED partition 0
+        // before — can now activate the parked job and complete the instance over a
+        // fresh quorum. Proves data survival + write continuity past a leader loss.
+        use crate::raft::RaftPartition;
+
+        let mut listeners = Vec::new();
+        let mut ports = Vec::new();
+        for i in 0..3u32 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|_| panic!("bind node {i}"));
+            ports.push(l.local_addr().expect("addr").port());
+            listeners.push(l);
+        }
+        let peers: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{p}")).collect();
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 3,
+                replication_factor: 3,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+        let node2 = build_node(2);
+
+        let proc = ProcessBuilder::new("intake")
+            .start_event("start")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        let (_r, events) = node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+        node2.install_replicated_deployment(events.to_vec()).await;
+
+        let served = [
+            (node0.clone(), listeners.remove(0)),
+            (node1.clone(), listeners.remove(0)),
+            (node2.clone(), listeners.remove(0)),
+        ];
+        for (server, listener) in served {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+        tokio::join!(
+            node0.raft_bootstrap(),
+            node1.raft_bootstrap(),
+            node2.raft_bootstrap()
+        );
+
+        let leader_of = |node: &ServerImpl, p: u64| -> Option<u64> {
+            node.raft_registry()
+                .get(p)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+        };
+
+        // Node 0 must lead partition 0 before we create through it.
+        let mut ok = false;
+        for _ in 0..500 {
+            if leader_of(&node0, 0) == Some(0) {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "node 0 must lead partition 0");
+
+        let (instance_key, _completed) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(
+            nanobpmn_engine_core::partition_of(instance_key),
+            0,
+            "the instance is minted on node 0's owned partition 0"
+        );
+
+        // Kill the leader: shut down ALL of node 0's Raft groups.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+
+        // The survivors {1,2} must elect a new leader for partition 0.
+        let survivors = [&node1, &node2];
+        let mut new_leader: Option<&ServerImpl> = None;
+        'elect: for _ in 0..500 {
+            for node in survivors {
+                match leader_of(node, 0) {
+                    Some(l) if l != 0 => {
+                        new_leader = Some(if l == 1 { &node1 } else { &node2 });
+                        break 'elect;
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let new_leader = new_leader.expect("survivors must re-elect a leader for partition 0");
+
+        // Data survived the failover: the parked instance exists on the new leader's
+        // engine handle for partition 0 (which it only replicated before).
+        let survived = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0")
+            .with(move |journal| journal.engine().instance(instance_key).is_some())
+            .await;
+        assert!(survived, "the committed instance must survive the leader loss");
+
+        // Write continuity: activate + complete on the NEW leader over a fresh quorum.
+        let mut job_key = None;
+        for _ in 0..200 {
+            let jobs = new_leader
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the parked job activates on the new leader after failover");
+        new_leader
+            .complete_job_for_stream(job_key, Default::default())
+            .await
+            .expect("complete commits via the new quorum")
+            .wait()
+            .await;
+
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        let mut completed = false;
+        for _ in 0..400 {
+            if handle
+                .with(move |journal| journal.engine().is_completed(instance_key))
+                .await
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            completed,
+            "the instance completes on the NEW leader after the original leader was killed"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
                 }
