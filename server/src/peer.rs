@@ -76,8 +76,14 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<PeerResult>>>>;
 /// Allocates its own `corr` space, independent of the peer's other clients.
 #[derive(Clone)]
 pub struct PeerLink {
-    out: mpsc::Sender<Message>,
-    pending: Pending,
+    /// App-forwarding lane (forwarded creates, jobs, queries, user-task ops).
+    out_app: mpsc::Sender<Message>,
+    pending_app: Pending,
+    /// Dedicated Raft lane: AppendEntries / Vote / InstallSnapshot ride their own
+    /// socket so a backlog of forwarded app commands can never delay a
+    /// replication RPC past its election deadline (head-of-line isolation).
+    out_raft: mpsc::Sender<Message>,
+    pending_raft: Pending,
     next_corr: Arc<AtomicU64>,
     connected: Arc<AtomicBool>,
 }
@@ -88,15 +94,41 @@ impl PeerLink {
     /// socket closes, at which point the link is marked disconnected and every
     /// outstanding request fails with [`PeerError::Closed`].
     pub async fn connect(base_url: &str) -> Result<Self, PeerError> {
-        let ws_url = ws_url(base_url);
-        let (ws, _resp) = tokio_tungstenite::connect_async(&ws_url)
+        let connected = Arc::new(AtomicBool::new(true));
+        let pending_app: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending_raft: Pending = Arc::new(Mutex::new(HashMap::new()));
+        // App-forwarding traffic and Raft RPCs ride separate sockets so a backlog
+        // of forwarded creates/jobs can never delay an AppendEntries/Vote past its
+        // election deadline (head-of-line isolation for the replication transport).
+        let out_app = Self::dial(&ws_url(base_url), pending_app.clone(), connected.clone()).await?;
+        let out_raft =
+            Self::dial(&raft_ws_url(base_url), pending_raft.clone(), connected.clone()).await?;
+
+        Ok(Self {
+            out_app,
+            pending_app,
+            out_raft,
+            pending_raft,
+            next_corr: Arc::new(AtomicU64::new(1)),
+            connected,
+        })
+    }
+
+    /// Opens one command-stream socket to `ws_url`, spawning its writer and reader
+    /// tasks. Returns the outbound sender; the reader resolves peer responses into
+    /// `pending` and flips `connected` to false (failing every waiter) when the
+    /// socket drops.
+    async fn dial(
+        ws_url: &str,
+        pending: Pending,
+        connected: Arc<AtomicBool>,
+    ) -> Result<mpsc::Sender<Message>, PeerError> {
+        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| PeerError::Connect(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
 
         let (out, mut out_rx) = mpsc::channel::<Message>(1024);
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let connected = Arc::new(AtomicBool::new(true));
 
         // Writer: serialize outbound frames onto the socket in submission order.
         tokio::spawn(async move {
@@ -140,12 +172,7 @@ impl PeerLink {
             }
         });
 
-        Ok(Self {
-            out,
-            pending,
-            next_corr: Arc::new(AtomicU64::new(1)),
-            connected,
-        })
+        Ok(out)
     }
 
     /// Whether the link is still up.
@@ -161,6 +188,23 @@ impl PeerLink {
     where
         F: FnOnce(u64) -> ClientFrame,
     {
+        self.request_on(&self.out_app, &self.pending_app, build)
+            .await
+    }
+
+    /// Sends `build(corr)` on the given lane and awaits the peer's matching
+    /// `CommandResult`. Shared by the app-forwarding lane ([`request`]) and the
+    /// dedicated Raft lane ([`raft_rpc`]); each lane carries its own socket and
+    /// pending table, so neither can stall the other.
+    async fn request_on<F>(
+        &self,
+        out: &mpsc::Sender<Message>,
+        pending: &Pending,
+        build: F,
+    ) -> Result<PeerResult, PeerError>
+    where
+        F: FnOnce(u64) -> ClientFrame,
+    {
         if !self.is_connected() {
             return Err(PeerError::Closed);
         }
@@ -169,10 +213,10 @@ impl PeerLink {
         let txt = serde_json::to_string(&frame).expect("ClientFrame serializes");
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(corr, tx);
+        pending.lock().await.insert(corr, tx);
 
-        if self.out.send(Message::Text(txt.into())).await.is_err() {
-            self.pending.lock().await.remove(&corr);
+        if out.send(Message::Text(txt.into())).await.is_err() {
+            pending.lock().await.remove(&corr);
             return Err(PeerError::Closed);
         }
 
@@ -180,7 +224,7 @@ impl PeerLink {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(PeerError::Closed),
             Err(_) => {
-                self.pending.lock().await.remove(&corr);
+                pending.lock().await.remove(&corr);
                 Err(PeerError::Timeout)
             }
         }
@@ -258,7 +302,7 @@ impl PeerLink {
     /// serialized `RaftRpcResponse`. This is the command-stream binding of the
     /// per-partition Raft network (stage 3 leader routing).
     pub async fn raft_rpc(&self, partition: u64, rpc: Value) -> Result<PeerResult, PeerError> {
-        self.request(|corr| ClientFrame::Raft {
+        self.request_on(&self.out_raft, &self.pending_raft, |corr| ClientFrame::Raft {
             corr,
             partition,
             rpc,
@@ -546,6 +590,15 @@ fn ws_url(base_url: &str) -> String {
         format!("ws://{trimmed}")
     };
     format!("{ws_base}/command-stream")
+}
+
+/// The dedicated Raft-lane socket URL: the command-stream WS tagged `?raft=1`.
+/// The tag lets the peer (and operators reading logs) tell the replication
+/// socket apart from app-forwarding sockets; functionally the server serves both
+/// identically, but isolating Raft RPCs on their own connection keeps them clear
+/// of any app-command backlog.
+fn raft_ws_url(base_url: &str) -> String {
+    format!("{}?raft=1", ws_url(base_url))
 }
 
 fn request_timeout() -> Duration {
