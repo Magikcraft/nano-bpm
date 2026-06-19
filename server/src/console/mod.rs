@@ -24,12 +24,15 @@ use axum::{
     routing::get,
 };
 use futures_util::stream::{Stream, unfold};
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 use rust_embed::RustEmbed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Duration;
 
 use crate::ServerImpl;
+
+pub mod workspace;
 
 /// The built frontend bundle. Path is relative to this source file
 /// (`server/src/console/`), so it points at the repo-level `console/dist`.
@@ -44,6 +47,14 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/instances", get(instances))
         .route("/console/api/instances/{key}", get(instance_detail))
         .route("/console/api/stream", get(stream))
+        .route(
+            "/console/api/models",
+            get(models).post(model_create),
+        )
+        .route(
+            "/console/api/models/{name}",
+            get(model_get).put(model_save).delete(model_delete),
+        )
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
@@ -357,4 +368,242 @@ async fn stream(
         }
     });
     Sse::new(s).keep_alive(KeepAlive::default())
+}
+
+// ---------------------------------------------------------------------------
+// Modeler API — workspace-backed BPMN model library
+// ---------------------------------------------------------------------------
+//
+// Models live on disk in the console workspace (see `workspace`), which is the
+// authoring source of truth and is separate from the engine data dir. The engine
+// holds *deployed* definitions (with their verbatim XML); the console reconciles
+// the two. Deploy/pull/duplicate are intentionally **not** endpoints here: the
+// frontend deploys via the standard `POST /v2/deployments`, pulls a deployed
+// model via `GET /v2/process-definitions/{key}/xml`, and duplicates client-side
+// (clone + rename the process id in bpmn-js, then save as a new model). This API
+// is therefore pure workspace file CRUD plus a computed deploy status.
+
+/// `not_deployed` (no deployed definition for the model's primary process id),
+/// `in_sync` (deployed XML is byte-for-byte the file), `modified` (a definition
+/// is deployed but differs), or `unparsable` (the file is not valid BPMN).
+fn deploy_status_of(server: &ServerImpl, xml: &str) -> ModelStatus {
+    let process_ids: Vec<String> = match parse_bpmn(xml) {
+        Ok(defs) => defs.iter().map(|d| d.id.clone()).collect(),
+        Err(_) => {
+            return ModelStatus {
+                process_ids: Vec::new(),
+                deploy_status: "unparsable".into(),
+                deployed_version: None,
+                deployed_key: None,
+            };
+        }
+    };
+    // Status is reported against the file's primary (first) process id; a
+    // multi-process resource is rare in the modeler.
+    let primary = process_ids.first().cloned();
+    let deployed = primary
+        .as_ref()
+        .and_then(|id| {
+            server
+                .store
+                .process_definitions()
+                .into_iter()
+                .find(|d| &d.process_id == id)
+        });
+    let (deploy_status, deployed_version, deployed_key) = match deployed {
+        None => ("not_deployed", None, None),
+        Some(row) => {
+            let deployed_xml = server.store.process_definition_xml(row.key).unwrap_or_default();
+            let status = if deployed_xml == xml { "in_sync" } else { "modified" };
+            (status, Some(row.version), Some(row.key.to_string()))
+        }
+    };
+    ModelStatus {
+        process_ids,
+        deploy_status: deploy_status.into(),
+        deployed_version,
+        deployed_key,
+    }
+}
+
+struct ModelStatus {
+    process_ids: Vec<String>,
+    deploy_status: String,
+    deployed_version: Option<i32>,
+    deployed_key: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ModelSummaryDto {
+    name: String,
+    process_ids: Vec<String>,
+    deploy_status: String,
+    deployed_version: Option<i32>,
+    deployed_key: Option<String>,
+    updated_at_ms: u64,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct ModelDto {
+    name: String,
+    xml: String,
+    process_ids: Vec<String>,
+    deploy_status: String,
+    deployed_version: Option<i32>,
+    deployed_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateModelBody {
+    name: String,
+    /// Initial BPMN XML; the frontend supplies a blank diagram from bpmn-js.
+    xml: String,
+}
+
+/// `GET /console/api/models` — the model library, with each model's deploy
+/// status relative to the engine. Sorted by name.
+async fn models(State(server): State<ServerImpl>) -> Response {
+    let names = match workspace::list_model_names() {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read workspace: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(path) = workspace::model_path(&name) else {
+            continue;
+        };
+        let xml = std::fs::read_to_string(&path).unwrap_or_default();
+        let (updated_at_ms, size) = workspace::file_meta(&path);
+        let status = deploy_status_of(&server, &xml);
+        out.push(ModelSummaryDto {
+            name,
+            process_ids: status.process_ids,
+            deploy_status: status.deploy_status,
+            deployed_version: status.deployed_version,
+            deployed_key: status.deployed_key,
+            updated_at_ms,
+            size,
+        });
+    }
+    Json(out).into_response()
+}
+
+/// `GET /console/api/models/{name}` — one model's XML and deploy status.
+async fn model_get(State(server): State<ServerImpl>, Path(name): Path<String>) -> Response {
+    let Some(path) = workspace::model_path(&name) else {
+        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+    };
+    let xml = match std::fs::read_to_string(&path) {
+        Ok(x) => x,
+        Err(_) => return (StatusCode::NOT_FOUND, "no such model").into_response(),
+    };
+    let status = deploy_status_of(&server, &xml);
+    Json(ModelDto {
+        name,
+        xml,
+        process_ids: status.process_ids,
+        deploy_status: status.deploy_status,
+        deployed_version: status.deployed_version,
+        deployed_key: status.deployed_key,
+    })
+    .into_response()
+}
+
+/// `PUT /console/api/models/{name}` — overwrite (save) a model's XML. The body
+/// is the raw BPMN XML. The model must already exist (use POST to create).
+async fn model_save(
+    State(server): State<ServerImpl>,
+    Path(name): Path<String>,
+    xml: String,
+) -> Response {
+    let Some(path) = workspace::model_path(&name) else {
+        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+    };
+    if !path.exists() {
+        return (StatusCode::NOT_FOUND, "no such model — create it first").into_response();
+    }
+    if let Err(e) = std::fs::write(&path, &xml) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save model: {e}"),
+        )
+            .into_response();
+    }
+    let status = deploy_status_of(&server, &xml);
+    Json(ModelDto {
+        name,
+        xml,
+        process_ids: status.process_ids,
+        deploy_status: status.deploy_status,
+        deployed_version: status.deployed_version,
+        deployed_key: status.deployed_key,
+    })
+    .into_response()
+}
+
+/// `POST /console/api/models` — create a new model. 409 if a model with the
+/// same name already exists.
+async fn model_create(
+    State(server): State<ServerImpl>,
+    Json(body): Json<CreateModelBody>,
+) -> Response {
+    let Some(path) = workspace::model_path(&body.name) else {
+        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+    };
+    if let Err(e) = workspace::ensure_models_dir() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create workspace: {e}"),
+        )
+            .into_response();
+    }
+    if path.exists() {
+        return (StatusCode::CONFLICT, "a model with that name already exists").into_response();
+    }
+    if let Err(e) = std::fs::write(&path, &body.xml) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create model: {e}"),
+        )
+            .into_response();
+    }
+    let status = deploy_status_of(&server, &body.xml);
+    (
+        StatusCode::CREATED,
+        Json(ModelDto {
+            name: body.name,
+            xml: body.xml,
+            process_ids: status.process_ids,
+            deploy_status: status.deploy_status,
+            deployed_version: status.deployed_version,
+            deployed_key: status.deployed_key,
+        }),
+    )
+        .into_response()
+}
+
+/// `DELETE /console/api/models/{name}` — remove a model from the workspace.
+/// This never touches the engine; an already-deployed definition stays deployed.
+async fn model_delete(Path(name): Path<String>) -> Response {
+    let Some(path) = workspace::model_path(&name) else {
+        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "no such model").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not delete model: {e}"),
+        )
+            .into_response(),
+    }
 }

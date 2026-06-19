@@ -79,12 +79,88 @@ async function getJson<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+// --- Modeler: workspace-backed BPMN models ---------------------------------
+
+/// `not_deployed`, `in_sync`, `modified`, or `unparsable`.
+export type DeployStatus =
+  | "not_deployed"
+  | "in_sync"
+  | "modified"
+  | "unparsable";
+
+export interface ModelSummary {
+  name: string;
+  process_ids: string[];
+  deploy_status: DeployStatus;
+  deployed_version: number | null;
+  deployed_key: string | null;
+  updated_at_ms: number;
+  size: number;
+}
+
+export interface Model {
+  name: string;
+  xml: string;
+  process_ids: string[];
+  deploy_status: DeployStatus;
+  deployed_version: number | null;
+  deployed_key: string | null;
+}
+
+async function send<T>(
+  method: string,
+  path: string,
+  body?: BodyInit,
+  contentType?: string,
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (contentType) headers["Content-Type"] = contentType;
+  const res = await fetch(`/console/api${path}`, { method, headers, body });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `${path} → HTTP ${res.status}`);
+  }
+  if (res.status === 204) return undefined as T;
+  return (await res.json()) as T;
+}
+
 export const api = {
   topology: () => getJson<Topology>("/topology"),
   instances: () => getJson<Instance[]>("/instances"),
   instanceDetail: (key: string) =>
     getJson<InstanceDetail>(`/instances/${key}`),
+  models: () => getJson<ModelSummary[]>("/models"),
+  model: (name: string) => getJson<Model>(`/models/${encodeURIComponent(name)}`),
+  saveModel: (name: string, xml: string) =>
+    send<Model>("PUT", `/models/${encodeURIComponent(name)}`, xml, "text/xml"),
+  createModel: (name: string, xml: string) =>
+    send<Model>(
+      "POST",
+      "/models",
+      JSON.stringify({ name, xml }),
+      "application/json",
+    ),
+  deleteModel: (name: string) =>
+    send<void>("DELETE", `/models/${encodeURIComponent(name)}`),
 };
+
+/// Deploys BPMN XML to the engine through the standard Camunda deployment
+/// endpoint (not a console API). Resolves on success; throws with the server's
+/// problem detail otherwise. Deployment is idempotent, so deploying an unchanged
+/// model is a safe no-op.
+export async function deployXml(name: string, xml: string): Promise<void> {
+  const form = new FormData();
+  form.append(
+    "resources",
+    new Blob([xml], { type: "text/xml" }),
+    `${name}.bpmn`,
+  );
+  const res = await fetch("/v2/deployments", { method: "POST", body: form });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `deploy → HTTP ${res.status}`);
+  }
+}
 
 /// The verbatim BPMN XML for a process definition, served by the gateway's
 /// generated Camunda endpoint (getProcessDefinitionXML) — not a console API.
