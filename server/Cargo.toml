@@ -31,6 +31,14 @@ tracing-subscriber = "0.3"
 openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
 anyhow = "1.0.102"
 
+# Embedded web console assets (the built Vite/React SPA under ../console/dist).
+# Feature-gated so the default gateway build is byte-identical and never needs a
+# built frontend. In debug builds rust-embed reads the files from disk (live
+# reload); release builds bake them into the binary for a self-contained
+# single-file distribution.
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
+
 # jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
 # Linux glibc), it returns freed memory to the OS on a decay schedule and exposes
 # a portable `mallctl` purge knob, so an idle server's resident footprint falls
@@ -44,6 +52,13 @@ tikv-jemalloc-sys = "0.6"
 
 [dev-dependencies]
 serde_json = "1"
+
+# The self-contained single-node distribution: bundle the web console (cluster
+# console, BPMN modeler, process-instance explorer, embedded workers) into the
+# gateway binary. Off by default — the production gateway build is unaffected and
+# does not require a built frontend under ../console/dist.
+[features]
+console = ["dep:rust-embed", "dep:mime_guess"]
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate

@@ -13,6 +13,8 @@ mod backpressure;
 mod cluster;
 mod coldspill;
 mod command_stream;
+#[cfg(feature = "console")]
+mod console;
 mod engine_actor;
 mod journal;
 mod memory;
@@ -7009,9 +7011,22 @@ async fn main() {
     // over the command stream and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
 
+    // Self-contained single-node distribution: build the embedded web console
+    // router (SPA + /console/api/*) before `server` is moved into the generated
+    // router. Feature-gated; the default gateway build never includes it and the
+    // non-console path keeps consuming `server` directly (byte-identical).
+    #[cfg(feature = "console")]
+    let console_router = crate::console::router(server.clone());
+
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route("/metrics", axum::routing::get(metrics_handler));
+
+    #[cfg(feature = "console")]
+    {
+        app = app.merge(console_router);
+        tracing::info!("console enabled: web UI at /console, API under /console/api");
+    }
 
     if debug_rest_enabled() {
         app = app.layer(axum::middleware::from_fn(log_rest));

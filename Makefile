@@ -8,6 +8,7 @@ PROJECT_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 GENERATED_DIR := $(PROJECT_ROOT)/generated
 STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
 ENGINE_DIR := $(PROJECT_ROOT)/engine-core
+CONSOLE_DIR := $(PROJECT_ROOT)/console
 
 .DEFAULT_GOAL := build
 
@@ -30,6 +31,19 @@ build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate 
 release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimized production server binary
 	cd $(PROJECT_ROOT)/server && cargo build --release
 	@echo "Built $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
+
+.PHONY: console-frontend
+console-frontend: ## Build the web console SPA (console/ -> console/dist)
+	cd $(CONSOLE_DIR) && npm install && npm run build
+
+.PHONY: console
+console: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Build the self-contained single-node distribution (gateway + embedded web console)
+	cd $(PROJECT_ROOT)/server && cargo build --release --features console
+	@echo "Built self-contained distribution: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server (console at /console)"
+
+.PHONY: console-dev
+console-dev: ## Run the console frontend dev server (Vite); proxies /console/api to a gateway on :8080
+	cd $(CONSOLE_DIR) && npm run dev
 
 .PHONY: run
 run: $(STUB_IMPLS) ## Run the stub server (PORT overrides the default 8080)
