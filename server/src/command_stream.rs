@@ -219,6 +219,16 @@ pub enum ClientFrame {
     /// `CommandResult` (204 on success, 404 unknown instance, 4xx/5xx otherwise).
     #[serde(rename_all = "camelCase")]
     CancelInstance { corr: u64, instance_key: String },
+    /// **Intra-cluster only.** Routes a cross-partition subscription follow-up
+    /// (a `MessageSubscriptionOpening` opening a canonical subscription on its
+    /// `hash(correlationKey)` partition, or a `RemoteMessageCorrelation` advancing
+    /// a parked token on its instance's partition) to the node owning the target
+    /// partition. The owner applies the corresponding routed command on its own
+    /// engine and drives its own pump for any further follow-ups (which may route
+    /// on again), so there is no central fan-out. Answered by a `CommandResult`
+    /// (200) once applied + durable.
+    #[serde(rename_all = "camelCase")]
+    RouteSubscription { corr: u64, event: Event },
     /// **Intra-cluster only.** A gateway forwards a by-key job-retries update to
     /// the peer that owns the job's partition. Answered by a `CommandResult`.
     #[serde(rename_all = "camelCase")]
@@ -746,6 +756,7 @@ async fn handle_client_frame(
         ClientFrame::InstallDeployment { .. } => "install_deployment",
         ClientFrame::PublishMessage { .. } => "publish_message",
         ClientFrame::CancelInstance { .. } => "cancel_instance",
+        ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
@@ -1012,6 +1023,16 @@ async fn handle_client_frame(
                 server.cancel_instance_local(key).await
             })
             .await;
+        }
+        ClientFrame::RouteSubscription { corr, event } => {
+            // The owner applies the routed subscription command locally and drives
+            // its own pump for any further follow-ups, then acknowledges.
+            server.apply_routed_subscription_remote(event).await;
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 200,
+                body: None,
+            });
         }
         ClientFrame::UpdateJobRetries {
             corr,

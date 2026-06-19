@@ -351,6 +351,18 @@ impl PeerLink {
             .await
     }
 
+    /// Forwards a cross-partition subscription follow-up event (a
+    /// `MessageSubscriptionOpening` or `RemoteMessageCorrelation`) to the peer
+    /// that owns the target partition, so it applies the corresponding routed
+    /// command on its own engine. Answered by a `CommandResult` (200).
+    pub async fn route_subscription(
+        &self,
+        event: nanobpmn_engine_core::Event,
+    ) -> Result<PeerResult, PeerError> {
+        self.request(|corr| ClientFrame::RouteSubscription { corr, event })
+            .await
+    }
+
     /// Forwards a job-retries update to the peer that owns the job's partition.
     pub async fn update_job_retries(
         &self,

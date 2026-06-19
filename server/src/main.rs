@@ -1841,7 +1841,19 @@ impl ServerImpl {
 
         if self.peers.has_peers() {
             let topology = self.engine.topology();
-            for node in 0..topology.num_nodes() {
+            // With canonical placement a published message can only match
+            // subscriptions on two partitions: the correlation-key hash partition
+            // (catch/boundary subs) and partition 0 (message-start subs). So fan
+            // the publish out to just the NODES owning those two partitions
+            // (deduplicated, excluding self) instead of every peer.
+            let hash_partition = nanobpmn_engine_core::subscription_partition(
+                &correlation_key,
+                topology.num_partitions,
+            );
+            let mut target_nodes = vec![topology.owner_of(hash_partition), topology.owner_of(0)];
+            target_nodes.sort_unstable();
+            target_nodes.dedup();
+            for node in target_nodes {
                 if node == topology.node_id {
                     continue;
                 }
@@ -1898,8 +1910,13 @@ impl ServerImpl {
         })
     }
 
-    /// Routes the cross-partition subscription follow-ups carried in `events`
-    /// (and any they transitively produce) to the owning local partitions.
+    /// Routes the cross-partition subscription follow-ups carried in `events` (and
+    /// any they transitively produce) to the partition that must apply them. When
+    /// the target partition is owned by **this** node it is applied locally and
+    /// its follow-ups are folded back into the worklist; when it is owned by a
+    /// **peer**, the source event is forwarded over the command stream and the
+    /// owning node drives its own pump (so the recursion continues there). A
+    /// no-op single-partition.
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
         let num_partitions = self.engine.topology().num_partitions;
         if num_partitions <= 1 {
@@ -1907,59 +1924,114 @@ impl ServerImpl {
         }
         let mut work = events;
         while let Some(event) = work.pop() {
-            match event {
-                Event::MessageSubscriptionOpening {
-                    subscription_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    message_name,
-                    correlation_key,
-                    kind,
-                } => {
-                    let target = nanobpmn_engine_core::subscription_partition(
-                        &correlation_key,
-                        num_partitions,
-                    );
-                    let command = Command::OpenMessageSubscription {
-                        subscription_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        message_name,
-                        correlation_key,
-                        kind,
-                    };
-                    if let Some(produced) = self.apply_routed_local(target, command).await {
-                        work.extend(produced);
-                    }
+            let Some((target, command)) = Self::route_event(&event, num_partitions) else {
+                continue;
+            };
+            match self.engine.local_for_partition(target) {
+                Some(handle) => {
+                    let (produced, commit) = handle
+                        .with(move |engine| {
+                            engine
+                                .apply_command_at(command, now_millis())
+                                .expect("routed subscription command never fails")
+                        })
+                        .await;
+                    commit.wait().await;
+                    work.extend(produced.iter().cloned());
                 }
-                Event::RemoteMessageCorrelation {
-                    subscription_key,
-                    message_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    kind,
-                    variables,
-                } => {
-                    let target = nanobpmn_engine_core::partition_of(instance_key);
-                    let command = Command::CorrelateMessageSubscription {
-                        subscription_key,
-                        message_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind,
-                        variables,
-                    };
-                    if let Some(produced) = self.apply_routed_local(target, command).await {
-                        work.extend(produced);
-                    }
+                None => {
+                    // The target partition is owned by a peer: forward the source
+                    // event so the owner applies it (and drives any further
+                    // routing) on its own engine.
+                    self.forward_route_subscription(target, event).await;
                 }
-                _ => {}
             }
         }
+    }
+
+    /// Derives the `(target partition, command)` a cross-partition follow-up event
+    /// must be applied as: a `MessageSubscriptionOpening` opens the canonical
+    /// subscription on `subscription_partition(correlation_key)`; a
+    /// `RemoteMessageCorrelation` advances the parked token on the instance's
+    /// partition. Returns `None` for any other event.
+    fn route_event(event: &Event, num_partitions: u64) -> Option<(u64, Command)> {
+        match event {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                message_name,
+                correlation_key,
+                kind,
+            } => {
+                let target =
+                    nanobpmn_engine_core::subscription_partition(correlation_key, num_partitions);
+                let command = Command::OpenMessageSubscription {
+                    subscription_key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    message_name: message_name.clone(),
+                    correlation_key: correlation_key.clone(),
+                    kind: kind.clone(),
+                };
+                Some((target, command))
+            }
+            Event::RemoteMessageCorrelation {
+                subscription_key,
+                message_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                kind,
+                variables,
+            } => {
+                let target = nanobpmn_engine_core::partition_of(*instance_key);
+                let command = Command::CorrelateMessageSubscription {
+                    subscription_key: *subscription_key,
+                    message_key: *message_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    kind: kind.clone(),
+                    variables: variables.clone(),
+                };
+                Some((target, command))
+            }
+            _ => None,
+        }
+    }
+
+    /// Forwards a cross-partition subscription follow-up `event` to the peer that
+    /// owns `target_partition`, over the command stream. The owner applies it and
+    /// drives its own pump for any further follow-ups. Best-effort: a delivery
+    /// failure is logged and dropped (idempotent — the source command re-emits the
+    /// event on replay; at RF=1 a lost open just leaves the instance parked until
+    /// a retry/restart re-routes it).
+    async fn forward_route_subscription(&self, target_partition: u64, event: Event) {
+        let owner = self.engine.topology().owner_of(target_partition);
+        match self.peers.link(owner).await {
+            Ok(link) => {
+                if let Err(e) = link.route_subscription(event).await {
+                    tracing::warn!(
+                        "subscription routing to node {owner} (partition {target_partition}) failed: {e}"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                "subscription routing: node {owner} (partition {target_partition}) unreachable: {e}"
+            ),
+        }
+    }
+
+    /// Peer-side handler for a forwarded subscription follow-up: the owning node
+    /// drives its own pump for `event` (it now owns the target partition, so the
+    /// apply is local), recursing into any further cross-node follow-ups. Wakes
+    /// pollers in case the correlation advanced a token onto a service task.
+    pub(crate) async fn apply_routed_subscription_remote(&self, event: Event) {
+        self.drive_subscription_routing(vec![event]).await;
+        self.signal_jobs_available();
     }
 
     /// Spawns cross-partition subscription routing for the follow-ups carried in
@@ -1992,33 +2064,6 @@ impl ServerImpl {
         tokio::spawn(async move {
             server.drive_subscription_routing(routable).await;
         });
-    }
-
-    /// Applies a routed subscription command on the LOCAL partition `target`,
-    /// awaiting its durability, and returns the events it produced (so the caller
-    /// can route any further follow-ups). Returns `None` — logging a warning —
-    /// when `target` is owned by a peer (cross-node routing is a later increment);
-    /// at RF=1 the message is simply dropped, matching the no-buffer model.
-    async fn apply_routed_local(&self, target: u64, command: Command) -> Option<Vec<Event>> {
-        match self.engine.local_for_partition(target) {
-            Some(handle) => {
-                let (events, commit) = handle
-                    .with(move |engine| {
-                        engine
-                            .apply_command_at(command, now_millis())
-                            .expect("routed subscription command never fails")
-                    })
-                    .await;
-                commit.wait().await;
-                Some(events.to_vec())
-            }
-            None => {
-                tracing::warn!(
-                    "subscription routing: partition {target} is remote; cross-node routing not yet wired"
-                );
-                None
-            }
-        }
     }
 
     // ---- By-key forwarding (stage 1) -------------------------------------
@@ -6232,6 +6277,119 @@ mod clustered_startup_tests {
             nanobpmn_engine_core::partition_of(instance),
             0,
             "the message-start instance lives on the owner's partition 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_node_message_catch_routes_open_and_correlation_over_the_wire() {
+        // The full canonical-placement protocol across a NODE boundary:
+        //  - the instance is created on node 0 (instance owner),
+        //  - its correlation key hashes to a partition owned by node 1 (the
+        //    subscription's canonical home), so the Opening is routed node0->node1,
+        //  - the publish, fanned to node 1, correlates the canonical sub and emits
+        //    a RemoteMessageCorrelation whose continuation is routed node1->node0,
+        //    advancing the parked token to completion.
+        // Both nodes must serve each other, so we pre-bind both listeners, embed
+        // each other's real URL, then serve.
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+
+        // Deploy the message-catch process on the deployment owner (node 0) and
+        // replicate the definition to node 1 so it can mint instances too.
+        let proc = ProcessBuilder::new("await-payment")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "payment-received", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("await-payment".to_string(), "await.bpmn".to_string());
+        let (_result, events) = node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+
+        // Serve both nodes' command-stream endpoints on their pre-bound ports.
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // A correlation key that hashes onto a node-1 partition (1 or 3), so the
+        // canonical subscription is placed off the instance's node.
+        let order = (0..)
+            .map(|i| format!("ord-{i}"))
+            .find(|k| {
+                let p = nanobpmn_engine_core::subscription_partition(k, 4);
+                p == 1 || p == 3
+            })
+            .expect("a key hashing to a node-1 partition exists");
+
+        // Create the instance via node 0; it lands on a node-0 partition (0 or 2)
+        // and parks at the catch. The create path routes the Opening to node 1.
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("orderId".to_string(), Value::Str(order.clone()));
+        let (instance_key, completed) = node0
+            .create_for_stream(Some("await-payment".into()), None, variables)
+            .await
+            .expect("create on node 0");
+        assert!(!completed, "the instance parks at the message catch");
+        let p_inst = nanobpmn_engine_core::partition_of(instance_key);
+        assert!(p_inst == 0 || p_inst == 2, "instance on a node-0 partition, got {p_inst}");
+
+        // Publish at node 0: it has no local match (the canonical sub is on node
+        // 1), so the publish fans to node 1, which correlates and routes the
+        // continuation back to node 0 to advance the parked token.
+        let (_message_key, correlated) = node0
+            .correlate_message_cluster("payment-received".into(), order.clone(), None)
+            .await;
+        assert_eq!(
+            correlated,
+            Some(instance_key),
+            "the cross-node publish correlates the parked instance"
+        );
+
+        // The token really advanced on node 0 (the instance owner): it completes.
+        let (_vars, completed) = node0
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(
+            completed,
+            "the instance completes after the correlation is routed back over the wire"
         );
     }
 
