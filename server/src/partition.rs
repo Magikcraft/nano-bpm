@@ -298,21 +298,6 @@ impl Partitions {
     }
 
 
-    /// Like [`for_create`](Self::for_create) but returns the **global partition
-    /// id** chosen (round-robin over this node's owned partitions), not the
-    /// handle. Used by the Raft write path to look up the partition's Raft group
-    /// before proposing. Shares no counter with `for_create` — it is a parallel
-    /// chooser, fine since both only need to spread load.
-    pub fn for_create_partition(&self) -> u64 {
-        let owned = self.router.topology().local_partitions();
-        debug_assert!(!owned.is_empty(), "a node always owns at least one partition");
-        if owned.len() == 1 {
-            return owned[0];
-        }
-        let i = self.next_create.fetch_add(1, Ordering::Relaxed) % owned.len();
-        owned[i]
-    }
-
     /// round-robin across the partitions **this node owns**. An instance lives on
     /// the partition that created it for its whole life (its key embeds the
     /// partition). In a single-node cluster the owned set is every partition in
@@ -363,6 +348,23 @@ impl Partitions {
             return 0;
         }
         self.next_activate.fetch_add(1, Ordering::Relaxed) % n
+    }
+
+    /// Like [`for_create`](Self::for_create) but restricted to an explicit
+    /// `candidates` set (the partitions this node currently *leads*,
+    /// which after a failover differs from the statically owned set). Round-robins
+    /// over the candidates using the shared create counter so create load spreads
+    /// across every partition this node can commit to without a cross-node hop.
+    /// Returns `None` when `candidates` is empty (this node leads nothing).
+    pub fn for_create_among(&self, candidates: &[u64]) -> Option<u64> {
+        match candidates.len() {
+            0 => None,
+            1 => Some(candidates[0]),
+            n => {
+                let i = self.next_create.fetch_add(1, Ordering::Relaxed) % n;
+                Some(candidates[i])
+            }
+        }
     }
 
     /// The partition that owns deployments. Deployments are processed and

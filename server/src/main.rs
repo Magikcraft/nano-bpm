@@ -2942,7 +2942,28 @@ impl ServerImpl {
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
         type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
-        let outcome: Result<CreateOk, (u16, String)> = {
+        // Under Raft, a forwarded create must be REPLICATED through this node's
+        // Raft log, not applied directly to the local engine — otherwise the
+        // instance would not survive this node's failure. Route it through the
+        // shared Raft create core (durability is awaited inside the propose, so
+        // the returned commit is already ready).
+        let outcome: Result<CreateOk, (u16, String)> = if !self.raft.is_empty() {
+            self.raft_create_core(by_id, by_key, variables, tags, business_id)
+                .await
+                .map(
+                    |(process_id, version, definition_key, instance_key, sync_completed, routable)| {
+                        (
+                            process_id,
+                            version,
+                            definition_key,
+                            instance_key,
+                            sync_completed,
+                            routable,
+                            Commit::ready(),
+                        )
+                    },
+                )
+        } else {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
                 .for_create()
@@ -5328,12 +5349,20 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
-    /// The Raft create path (experimental): resolve the process id, then replicate
-    /// `CreateInstance` through the chosen partition's Raft leader. The state
+    /// The Raft create path (experimental): pick a partition this node currently
+    /// LEADS and replicate `CreateInstance` through its Raft log. The state
     /// machine applies the committed command to the same engine actor the rest of
     /// the server reads from, so durability and serving share one materialized
     /// copy. Returns the minted instance key and whether it completed
     /// synchronously (no async jobs), matching [`Self::create_for_stream`].
+    ///
+    /// Choosing among the *led* partitions (rather than the statically owned set)
+    /// means a create commits locally whenever this node leads any partition —
+    /// after a failover it routes to a partition this node was elected to lead
+    /// instead of shedding a 503 on a partition whose leadership moved away. When
+    /// this node leads NO partition (a transient window right after losing every
+    /// leadership), the create is FORWARDED to a peer that leads one rather than
+    /// returning a retryable 503.
     async fn create_via_raft(
         &self,
         by_id: Option<String>,
@@ -5343,15 +5372,78 @@ impl ServerImpl {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
         }
-        let p = self.engine.for_create_partition();
-        let Some(handle) = self.engine.local_for_partition(p) else {
+        // This node leads nothing right now: forward to a peer leader instead of
+        // shedding a 503 the client would have to retry.
+        if self.led_partitions().is_empty() {
+            return self.forward_create_to_leader(by_id, by_key, variables).await;
+        }
+        // Attempt a local quorum-commit on a led partition. Retain the inputs
+        // (cheap clone of small/empty maps, off the single-writer thread) so that
+        // if our leadership view turns out to be stale — e.g. metrics still name
+        // us leader of a group that has since stopped or moved — we fall back to
+        // forwarding to the current leader instead of surfacing a 500 the client
+        // would have to retry.
+        match self
+            .raft_create_core(by_id.clone(), by_key.clone(), variables.clone(), Vec::new(), None)
+            .await
+        {
+            Ok((_process_id, _version, _definition_key, instance_key, sync_completed, routable)) => {
+                if !routable.is_empty() {
+                    self.drive_subscription_routing(routable).await;
+                }
+                self.signal_jobs_available();
+                Ok((instance_key, sync_completed))
+            }
+            Err(e) if Self::create_should_forward(&e) => {
+                self.forward_create_to_leader(by_id, by_key, variables).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether a failed local Raft create should be retried by forwarding to a
+    /// peer leader. A leadership/propose failure (this node's view of leading the
+    /// chosen partition was stale — the group stopped, stepped down, or the
+    /// leadership moved) is forwardable; a genuine client rejection (a 400/409
+    /// from validation or the engine state machine) must be returned as-is.
+    fn create_should_forward(err: &(u16, String)) -> bool {
+        let (status, message) = err;
+        *status == 503
+            || (*status == 500
+                && (message.contains("raft propose failed")
+                    || message.contains("has no Raft group")
+                    || message.contains("no local engine actor")))
+    }
+
+    /// Shared Raft create core: pick a partition this node leads, resolve the
+    /// process-definition id, replicate `CreateInstance` through that partition's
+    /// Raft log, and return the rich result fields both the stream create
+    /// ([`create_via_raft`](Self::create_via_raft)) and the forwarded REST create
+    /// ([`create_forwarded`](Self::create_forwarded)) need. Returns a retryable
+    /// 503 if this node leads no partition (the caller decides whether to forward
+    /// or shed).
+    #[allow(clippy::type_complexity)]
+    async fn raft_create_core(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: std::collections::HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+    ) -> Result<(String, i32, String, nanobpmn_engine_core::Key, bool, Vec<Event>), (u16, String)>
+    {
+        let led = self.led_partitions();
+        let Some(p) = self.engine.for_create_among(&led) else {
+            return Err((503, "this node leads no partition; retry".to_string()));
+        };
+        let Some(handle) = self.engine_handle_for(p) else {
             return Err((500, format!("no local engine actor for partition {p}")));
         };
 
         // Resolve the process-definition id (a by-key create needs a read of the
         // engine's deployed-process table) before proposing — the command carries
         // a concrete `process_id`.
-        let resolve = handle
+        let process_id = handle
             .with(move |journal| match (by_id, by_key) {
                 (Some(id), _) => Ok(id),
                 (None, Some(requested)) => journal
@@ -5366,23 +5458,14 @@ impl ServerImpl {
                     "A processDefinitionId or processDefinitionKey is required.".to_string(),
                 )),
             })
-            .await;
-        let process_id = resolve?;
+            .await?;
 
         let Some(part) = self.raft.get(p) else {
             return Err((500, format!("partition {p} has no Raft group")));
         };
-        let node_id = self.engine.topology().node_id as u64;
-        if part.raft.metrics().borrow().current_leader != Some(node_id) {
-            // A non-leader replica cannot accept writes. Under the static
-            // leader_of map this only happens transiently during an election;
-            // the stream client retries on 503.
-            return Err((503, format!("partition {p} leader unavailable; retry")));
-        }
-
         let response = part
             .propose_result(
-                Command::create_instance_with(process_id, variables),
+                Command::create_instance_full(process_id.clone(), variables, tags, business_id),
                 now_millis(),
             )
             .await
@@ -5399,6 +5482,19 @@ impl ServerImpl {
         let sync_completed = events.iter().any(|e| {
             matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
         });
+        // Project the deployed key + version now the instance exists, so by-id and
+        // by-key creates report the same definition identity.
+        let pid_for_read = process_id.clone();
+        let (definition_key, version) = handle
+            .with(move |journal| {
+                journal
+                    .state()
+                    .processes
+                    .get(&pid_for_read)
+                    .map(|d| (d.key.to_string(), d.version))
+                    .unwrap_or((pid_for_read, 1))
+            })
+            .await;
         let routable: Vec<Event> = events
             .into_iter()
             .filter(|e| {
@@ -5411,11 +5507,74 @@ impl ServerImpl {
                 )
             })
             .collect();
-        if !routable.is_empty() {
-            self.drive_subscription_routing(routable).await;
+        Ok((
+            process_id,
+            version,
+            definition_key,
+            instance_key,
+            sync_completed,
+            routable,
+        ))
+    }
+
+    /// Forwards a stream create to a peer that currently leads a partition, used
+    /// when THIS node leads none. Picks any partition with a known remote leader
+    /// and routes the create over the cluster create-forwarding seam (the peer
+    /// commits it through its own Raft), mapping the peer's REST result back to
+    /// the `(key, sync_completed)` shape the stream create returns. Falls back to
+    /// a retryable 503 only when no partition has a reachable leader yet.
+    async fn forward_create_to_leader(
+        &self,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: std::collections::HashMap<String, Value>,
+    ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        use apis::process_instance::CreateProcessInstanceResponse as R;
+        let node_id = self.engine.topology().node_id as u64;
+        let leader = (0..self.engine.topology().num_partitions).find_map(|p| {
+            self.raft
+                .get(p)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                .filter(|l| *l != node_id)
+        });
+        let Some(leader) = leader else {
+            return Err((503, "no partition leader reachable; retry".to_string()));
+        };
+        let wire_vars = if variables.is_empty() {
+            None
+        } else {
+            Some(
+                variables
+                    .iter()
+                    .map(|(k, v)| (k.clone(), value_to_json(v)))
+                    .collect(),
+            )
+        };
+        match self
+            .forward_create(
+                leader as u32,
+                by_id,
+                by_key,
+                wire_vars,
+                Vec::new(),
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+        {
+            R::Status200_TheProcessInstanceWasCreated(result) => result
+                .process_instance_key
+                .0
+                .parse::<u64>()
+                .map(|key| (key, result.process_completed))
+                .map_err(|_| (500, "peer returned a non-numeric instance key".to_string())),
+            R::Status400_TheProvidedDataIsNotValid(p) => Err((400, p.detail)),
+            R::Status503_TheServiceIsCurrentlyUnavailable(p) => Err((503, p.detail)),
+            R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p) => Err((500, p.detail)),
+            _ => Err((500, "unexpected peer create response".to_string())),
         }
-        self.signal_jobs_available();
-        Ok((instance_key, sync_completed))
     }
 
     /// The Raft job-mutation path (experimental): replicate `command` through the
@@ -8841,6 +9000,65 @@ mod clustered_startup_tests {
         assert!(
             completed,
             "the instance completes after a REST mutation routed through the new leader"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_on_a_node_that_leads_nothing_forwards_to_a_peer_leader() {
+        // s3-create-forward: when a node leads NO partition (here because its Raft
+        // groups were shut down while its gateway/peer links stay up), a stream
+        // create must FORWARD to a peer that leads a partition and commit there,
+        // instead of shedding a retryable 503. Exercises both the leads-nothing
+        // forward and the Raft-aware peer-side create_forwarded path.
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        // Shut down node 0's Raft groups: node 0 now leads nothing, but its
+        // ServerImpl and peer uplinks remain alive. Survivors re-elect.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        // Every partition must have a survivor leader before node 0 forwards.
+        for p in 0..3u64 {
+            let _ = wait_new_leader(&node1, &node2, p).await;
+        }
+
+        // The create on node 0 (which leads nothing) must succeed by forwarding to
+        // a peer leader rather than returning 503/500.
+        let (instance_key, _sync) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("a create on a node that leads nothing forwards to a peer leader");
+
+        // The instance is committed on a survivor that leads its partition.
+        let p = nanobpmn_engine_core::partition_of(instance_key);
+        let leader = wait_new_leader(&node1, &node2, p).await;
+        let handle = leader
+            .engine_handle_for(p)
+            .expect("the leader materializes the instance's partition");
+        let mut present = false;
+        for _ in 0..200 {
+            if handle
+                .with(move |journal| journal.engine().instance(instance_key).is_some())
+                .await
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            present,
+            "the forwarded create is committed on the peer leader's partition"
         );
 
         for node in [&node1, &node2] {
