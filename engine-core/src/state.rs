@@ -1251,6 +1251,11 @@ pub fn apply(state: &mut State, event: &Event) {
                 start_timer.due_at = *next_due_at;
             }
         }
+
+        // A routing marker on the deploy partition: the instance is created on
+        // the target partition (driven by the host's DispatchStartInstance), so
+        // there is no local state to mutate here.
+        Event::StartInstanceDispatched { .. } => {}
     }
 }
 

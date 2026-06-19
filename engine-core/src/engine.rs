@@ -46,6 +46,12 @@ pub struct Engine {
     /// never reads a wall clock itself; replay is unaffected because the
     /// timestamp is carried on the event.
     now: u64,
+    /// Round-robin cursor for spreading start-triggered (message-/timer-start)
+    /// instances across the cluster's partitions. Not journaled — at RF=1 it
+    /// only balances load (the chosen target is baked onto the emitted
+    /// `StartInstanceDispatched` event, so replay is unaffected); a restart
+    /// simply resumes the rotation from zero.
+    start_dispatch_rr: u64,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -101,6 +107,7 @@ impl Engine {
             next_local: 0,
             num_partitions: 1,
             now: 0,
+            start_dispatch_rr: 0,
         }
     }
 
@@ -179,6 +186,7 @@ impl Engine {
             next_local,
             num_partitions: 1,
             now: 0,
+            start_dispatch_rr: 0,
         }
     }
 
@@ -845,6 +853,48 @@ impl Engine {
         instance_key
     }
 
+    /// Places a start-triggered (message-start / timer-start) instance. On a
+    /// single-partition host it creates it locally — byte-identical to the
+    /// historical path. In a multi-partition cluster it round-robins a target
+    /// partition: a local target creates inline; a remote target emits a routable
+    /// [`Event::StartInstanceDispatched`] carrying the full creation payload, and
+    /// the host routes a `DispatchStartInstance` to that partition (which mints
+    /// the instance in its own namespace). This spreads start-triggered load
+    /// across the cluster instead of piling every such instance onto the deploy
+    /// partition.
+    fn start_or_dispatch_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        process_id: String,
+        start_event: ElementId,
+        variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+    ) {
+        if self.num_partitions <= 1 {
+            self.start_instance(log, queue, process_id, start_event, variables, tags, business_id);
+            return;
+        }
+        let target = self.start_dispatch_rr % self.num_partitions;
+        self.start_dispatch_rr = self.start_dispatch_rr.wrapping_add(1);
+        if target == self.partition_id {
+            self.start_instance(log, queue, process_id, start_event, variables, tags, business_id);
+        } else {
+            self.emit(
+                log,
+                Event::StartInstanceDispatched {
+                    process_id,
+                    start_element_id: start_event,
+                    variables,
+                    tags,
+                    business_id,
+                    target_partition: target,
+                },
+            );
+        }
+    }
+
     /// Validates and registers a batch of process definitions as one deployment.
     ///
     /// All processes are validated first, so the deployment is atomic: if any is
@@ -1354,7 +1404,7 @@ impl Engine {
                             next_due_at,
                         },
                     );
-                    self.start_instance(
+                    self.start_or_dispatch_instance(
                         &mut log,
                         &mut queue,
                         process_id,
@@ -1749,7 +1799,7 @@ impl Engine {
                     .collect();
                 started.sort_unstable();
                 for (process_id, start_element_id) in started {
-                    self.start_instance(
+                    self.start_or_dispatch_instance(
                         &mut log,
                         &mut queue,
                         process_id,
@@ -1967,6 +2017,27 @@ impl Engine {
                     self.emit(&mut log, event);
                 }
                 self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
+            }
+
+            Command::DispatchStartInstance {
+                process_id,
+                start_element_id,
+                variables,
+                tags,
+                business_id,
+            } => {
+                // Routed from the deploy partition's StartInstanceDispatched: mint
+                // the start-triggered instance here, in this partition's namespace,
+                // so start-triggered load spreads across the cluster.
+                self.start_instance(
+                    &mut log,
+                    &mut queue,
+                    process_id,
+                    start_element_id,
+                    variables,
+                    tags,
+                    business_id,
+                );
             }
         }
 
@@ -6426,6 +6497,99 @@ mod tests {
         engine.correlate_message("order-placed", "", HashMap::new(), 0);
         assert_eq!(engine.state().instances.len(), 2);
     }
+
+    #[test]
+    fn message_start_distributes_created_instances_across_partitions() {
+        // On a multi-partition deploy owner, message-start correlations must NOT
+        // pile every created instance onto the deploy partition. The round-robin
+        // dispatcher keeps the first inline (target == self) and emits a routable
+        // `StartInstanceDispatched` (carrying the chosen target) for the rest.
+        const N: u64 = 4;
+        let mut engine = Engine::with_partition(0);
+        engine.set_num_partitions(N);
+        engine
+            .apply_command(Command::DeployProcess(process_with_message_start()))
+            .unwrap();
+
+        let mut dispatched_targets = Vec::new();
+        let mut inline_instances = 0;
+        for _ in 0..N {
+            let fired = engine.correlate_message("order-placed", "", HashMap::new(), 0);
+            for e in &fired {
+                match e {
+                    Event::ProcessInstanceCreated { .. } => inline_instances += 1,
+                    Event::StartInstanceDispatched {
+                        process_id,
+                        target_partition,
+                        ..
+                    } => {
+                        assert_eq!(process_id, "order-flow");
+                        dispatched_targets.push(*target_partition);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Exactly one lands inline (rr=0 -> target 0 == self); the other three
+        // dispatch to partitions 1, 2, 3 in round-robin order.
+        assert_eq!(inline_instances, 1, "the first correlation creates inline");
+        assert_eq!(
+            dispatched_targets,
+            vec![1, 2, 3],
+            "subsequent correlations dispatch round-robin to the other partitions"
+        );
+        assert_eq!(
+            engine.state().instances.len(),
+            1,
+            "only the inline instance lives on the deploy partition"
+        );
+    }
+
+    #[test]
+    fn dispatch_start_instance_mints_the_instance_locally() {
+        // The command a routed `StartInstanceDispatched` becomes on the target
+        // partition: it mints the start-triggered instance in that partition's
+        // own key namespace and runs it.
+        const N: u64 = 4;
+        let mut target = Engine::with_partition(2);
+        target.set_num_partitions(N);
+        target
+            .apply_command(Command::DeployProcess(process_with_message_start()))
+            .unwrap();
+        assert!(target.state().instances.is_empty());
+
+        let fired = target
+            .apply_command(Command::DispatchStartInstance {
+                process_id: "order-flow".into(),
+                start_element_id: "start".into(),
+                variables: vars(&[("amount", Value::Int(9))]),
+                tags: Vec::new(),
+                business_id: None,
+            })
+            .unwrap();
+
+        let instance_key = fired
+            .iter()
+            .find_map(|e| match e {
+                Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                _ => None,
+            })
+            .expect("the dispatch mints an instance");
+        assert_eq!(
+            crate::state::partition_of(instance_key),
+            2,
+            "the instance is minted in the target partition's namespace"
+        );
+        assert_eq!(
+            target.state().instances[&instance_key]
+                .variables
+                .get("amount"),
+            Some(&Value::Int(9)),
+            "the dispatched variables seed the instance"
+        );
+    }
+
 
     #[test]
     fn should_recover_a_message_start_subscription_via_replay() {

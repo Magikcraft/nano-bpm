@@ -919,6 +919,7 @@ impl ServerImpl {
                                         Event::MessageSubscriptionOpening { .. }
                                             | Event::RemoteMessageCorrelation { .. }
                                             | Event::MessageSubscriptionClosing { .. }
+                                            | Event::StartInstanceDispatched { .. }
                                     )
                                 })
                                 .cloned()
@@ -1773,16 +1774,11 @@ impl ServerImpl {
         }
         // Drive the token advance for any subscription whose instance lives on
         // another partition (the publish settled it here via
-        // `RemoteMessageCorrelation`). A no-op single-partition.
+        // `RemoteMessageCorrelation`), plus any start-instance dispatch a
+        // message-start fan-out produced. A no-op single-partition.
         if Self::has_routable_subscription_events(&all_events) {
-            self.drive_subscription_routing(
-                all_events
-                    .iter()
-                    .filter(|e| matches!(e, Event::RemoteMessageCorrelation { .. }))
-                    .cloned()
-                    .collect(),
-            )
-            .await;
+            self.drive_subscription_routing(Self::routable_events(&all_events))
+                .await;
         }
         all_events
     }
@@ -1904,14 +1900,29 @@ impl ServerImpl {
     /// True when `events` carry any cross-partition follow-up the pump must route.
     /// Cheap early-out so callers can hand every command's output to the pump.
     fn has_routable_subscription_events(events: &[Event]) -> bool {
-        events.iter().any(|e| {
-            matches!(
-                e,
-                Event::MessageSubscriptionOpening { .. }
-                    | Event::RemoteMessageCorrelation { .. }
-                    | Event::MessageSubscriptionClosing { .. }
-            )
-        })
+        events.iter().any(Self::is_routable_event)
+    }
+
+    /// Whether `e` is a cross-partition follow-up the host pump must route to
+    /// another partition: a subscription open/correlate/close, or a
+    /// start-instance dispatch.
+    fn is_routable_event(e: &Event) -> bool {
+        matches!(
+            e,
+            Event::MessageSubscriptionOpening { .. }
+                | Event::RemoteMessageCorrelation { .. }
+                | Event::MessageSubscriptionClosing { .. }
+                | Event::StartInstanceDispatched { .. }
+        )
+    }
+
+    /// The cross-partition follow-ups carried in `events`, cloned for routing.
+    fn routable_events(events: &[Event]) -> Vec<Event> {
+        events
+            .iter()
+            .filter(|e| Self::is_routable_event(e))
+            .cloned()
+            .collect()
     }
 
     /// Routes the cross-partition subscription follow-ups carried in `events` (and
@@ -2021,6 +2032,23 @@ impl ServerImpl {
                 };
                 Some((target, command))
             }
+            Event::StartInstanceDispatched {
+                process_id,
+                start_element_id,
+                variables,
+                tags,
+                business_id,
+                target_partition,
+            } => {
+                let command = Command::DispatchStartInstance {
+                    process_id: process_id.clone(),
+                    start_element_id: start_element_id.clone(),
+                    variables: variables.clone(),
+                    tags: tags.clone(),
+                    business_id: business_id.clone(),
+                };
+                Some((*target_partition, command))
+            }
             _ => None,
         }
     }
@@ -2079,6 +2107,7 @@ impl ServerImpl {
                     Event::MessageSubscriptionOpening { .. }
                         | Event::RemoteMessageCorrelation { .. }
                         | Event::MessageSubscriptionClosing { .. }
+                        | Event::StartInstanceDispatched { .. }
                 )
             })
             .cloned()
@@ -2864,6 +2893,7 @@ impl ServerImpl {
                                             Event::MessageSubscriptionOpening { .. }
                                                 | Event::RemoteMessageCorrelation { .. }
                                                 | Event::MessageSubscriptionClosing { .. }
+                                                | Event::StartInstanceDispatched { .. }
                                         )
                                     })
                                     .cloned()
@@ -4772,6 +4802,7 @@ impl ServerImpl {
                                             Event::MessageSubscriptionOpening { .. }
                                                 | Event::RemoteMessageCorrelation { .. }
                                                 | Event::MessageSubscriptionClosing { .. }
+                                                | Event::StartInstanceDispatched { .. }
                                         )
                                     })
                                     .cloned()
@@ -5858,6 +5889,7 @@ async fn main() {
                                         Event::MessageSubscriptionOpening { .. }
                                             | Event::RemoteMessageCorrelation { .. }
                                             | Event::MessageSubscriptionClosing { .. }
+                                            | Event::StartInstanceDispatched { .. }
                                     )
                                 })
                                 .cloned()
@@ -6419,6 +6451,107 @@ mod clustered_startup_tests {
             "the instance completes after the correlation is routed back over the wire"
         );
     }
+
+    #[tokio::test]
+    async fn message_start_dispatches_instances_across_the_node_boundary() {
+        // Message-start subscriptions live only on the deploy owner (node 0). The
+        // round-robin start dispatcher must spread the created instances over the
+        // WHOLE cluster, routing a StartInstanceDispatched to node 1 (which owns
+        // partitions 1 & 3) over the command stream so node 1 mints its share.
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+
+        // Deploy a message-start process (parks at a service task so the created
+        // instances persist) on the owner and replicate the definition to node 1.
+        let proc = ProcessBuilder::new("intake")
+            .message_start_event("start", "order-placed")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        let (_result, events) = node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+
+        // Serve both nodes' command-stream endpoints on their pre-bound ports.
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // Publish many distinctly-keyed messages at the owner; each fires the
+        // message-start subscription on partition 0 and dispatches the created
+        // instance round-robin across all four partitions (1 & 3 on node 1).
+        for i in 0..16u32 {
+            node0
+                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None)
+                .await;
+        }
+
+        let count_instances = |server: ServerImpl| async move {
+            let mut total = 0usize;
+            for handle in server.engine.all() {
+                total += handle
+                    .with(|engine| engine.engine().state().instances.len())
+                    .await;
+            }
+            total
+        };
+        let on_node0 = count_instances(node0.clone()).await;
+        let on_node1 = count_instances(node1.clone()).await;
+        assert_eq!(
+            on_node0 + on_node1,
+            16,
+            "every publish created exactly one instance (n0={on_node0}, n1={on_node1})"
+        );
+        assert!(
+            on_node1 > 0,
+            "the dispatcher must place some start instances on node 1 over the wire \
+             (n0={on_node0}, n1={on_node1})"
+        );
+        assert!(
+            on_node0 > 0,
+            "the dispatcher must also keep some on node 0 (n0={on_node0}, n1={on_node1})"
+        );
+    }
+
 
     #[tokio::test]
     async fn complete_job_forwards_to_the_owning_peer() {
@@ -7166,7 +7299,63 @@ mod subscription_placement_tests {
         );
     }
 
-    /// start -> serviceTask "work" -> message intermediate catch -> end. The
+    #[tokio::test]
+    async fn message_start_distributes_instances_off_the_deploy_partition() {
+        // Message-start subscriptions live solely on the deploy partition (0), so
+        // every publish fires there. Without distribution every created instance
+        // would pile onto partition 0; the round-robin dispatcher must spread them
+        // across all partitions (routed via the host pump as DispatchStartInstance).
+        let server = single_node_multi_partition();
+        let proc = ProcessBuilder::new("intake")
+            .message_start_event("start", "order-placed")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        server
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy the message-start process on every owned partition");
+
+        // Publish many distinctly-keyed messages; each fires the message-start
+        // subscription on partition 0 and dispatches the created instance round-
+        // robin across the four partitions.
+        for i in 0..16u32 {
+            server
+                .correlate_message_everywhere(
+                    "order-placed".into(),
+                    format!("order-{i}"),
+                    std::collections::HashMap::new(),
+                )
+                .await;
+        }
+
+        // Count the parked instances per partition directly from each engine.
+        let mut per_partition = Vec::new();
+        for handle in server.engine.all() {
+            let n = handle
+                .with(|engine| engine.engine().state().instances.len())
+                .await;
+            per_partition.push(n);
+        }
+        let total: usize = per_partition.iter().sum();
+        assert_eq!(total, 16, "every publish created exactly one instance");
+        let partitions_used = per_partition.iter().filter(|&&n| n > 0).count();
+        assert!(
+            partitions_used >= 2,
+            "instances must spread off partition 0 (per-partition counts: {per_partition:?})"
+        );
+        assert!(
+            per_partition[0] < 16,
+            "partition 0 must NOT hold every instance (per-partition counts: {per_partition:?})"
+        );
+    }
+
+
     /// token reaches the catch only when the job COMPLETES, exercising the
     /// completion-path pump (not the create-path pump).
     const SERVICE_THEN_CATCH_BPMN: &str = r#"

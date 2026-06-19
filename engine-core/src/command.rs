@@ -176,6 +176,18 @@ pub enum Command {
     /// `Terminated` (it does *not* complete). Only an active instance can be
     /// cancelled; an unknown or already-finished instance is rejected.
     CancelInstance { instance_key: Key },
+    /// Create a start-triggered instance on this partition, routed by the host
+    /// from the deploy partition's [`crate::Event::StartInstanceDispatched`] so
+    /// message-/timer-start instances spread across the cluster instead of all
+    /// landing on partition 0. The instance is minted in this partition's
+    /// namespace and started at `start_element_id` with the carried payload.
+    DispatchStartInstance {
+        process_id: String,
+        start_element_id: String,
+        variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+    },
 }
 
 /// The attributes that an [`Command::UpdateUserTask`] may change. Each field is

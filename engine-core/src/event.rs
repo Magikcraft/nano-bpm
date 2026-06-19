@@ -406,6 +406,25 @@ pub enum Event {
         timer_key: Key,
         next_due_at: Option<u64>,
     },
+    /// A start event (message-start or timer-start, both hosted on the deploy
+    /// partition) fired but, in a multi-partition cluster, the new instance is
+    /// placed on `target_partition` instead of being created locally — so
+    /// start-triggered instances spread across the cluster rather than piling
+    /// onto partition 0. Carries the full creation payload; the host routes a
+    /// [`crate::Command::DispatchStartInstance`] to `target_partition`, which
+    /// mints the instance in its own namespace. Only emitted when
+    /// `num_partitions > 1` and the chosen target is not this partition, so a
+    /// single-partition log never produces it and stays byte-identical.
+    StartInstanceDispatched {
+        process_id: String,
+        start_element_id: ElementId,
+        variables: HashMap<String, Value>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        tags: Vec<String>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        business_id: Option<String>,
+        target_partition: u64,
+    },
 }
 
 impl Event {
@@ -455,7 +474,8 @@ impl Event {
             | Event::MessagePublished { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
-            | Event::ProcessStartTimerFired { .. } => None,
+            | Event::ProcessStartTimerFired { .. }
+            | Event::StartInstanceDispatched { .. } => None,
         }
     }
 
