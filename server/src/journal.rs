@@ -1046,6 +1046,13 @@ impl Journal {
         &self.engine
     }
 
+    /// Sets the cluster-wide partition count on the underlying engine so it
+    /// places message subscriptions on the partition owning their correlation
+    /// key (see [`Engine::set_num_partitions`]). A no-op effect when `1`.
+    pub fn set_num_partitions(&mut self, num_partitions: u64) {
+        self.engine.set_num_partitions(num_partitions);
+    }
+
     // --- Read delegations mirroring the engine API the server uses. ---
 
     pub fn state(&self) -> &State {

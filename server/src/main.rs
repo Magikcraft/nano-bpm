@@ -191,6 +191,13 @@ impl ServerImpl {
     /// projected.
     pub fn new(mut journals: Vec<Journal>, store: Arc<ReadStore>, topology: cluster::Topology) -> Self {
         assert!(!journals.is_empty(), "at least one partition is required");
+        // Teach every owned partition the cluster-wide partition count so the
+        // engine places message subscriptions on the partition owning their
+        // correlation key (`hash(correlation_key)`). With a single partition this
+        // is `1`, so placement stays local and behaviour is unchanged.
+        for journal in journals.iter_mut() {
+            journal.set_num_partitions(topology.num_partitions);
+        }
         // The deployment partition (id 0) is the only one that seeds the demo
         // process and owns the message-/timer-start subscriptions. In a clustered
         // deployment only the node that owns partition 0 holds it (and it is its
@@ -1713,6 +1720,19 @@ impl ServerImpl {
             commit.wait().await;
             all_events.extend(events.iter().cloned());
         }
+        // Drive the token advance for any subscription whose instance lives on
+        // another partition (the publish settled it here via
+        // `RemoteMessageCorrelation`). A no-op single-partition.
+        if Self::has_routable_subscription_events(&all_events) {
+            self.drive_subscription_routing(
+                all_events
+                    .iter()
+                    .filter(|e| matches!(e, Event::RemoteMessageCorrelation { .. }))
+                    .cloned()
+                    .collect(),
+            )
+            .await;
+        }
         all_events
     }
 
@@ -1733,6 +1753,10 @@ impl ServerImpl {
         let message_key = message_key_of(&events);
         let instance = events.iter().find_map(|e| match e {
             Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
+            // A cross-partition correlation: the instance advanced on its own
+            // partition via the routed continuation, but the match was recorded
+            // here as a remote correlation.
+            Event::RemoteMessageCorrelation { instance_key, .. } => Some(*instance_key),
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
@@ -1797,6 +1821,123 @@ impl ServerImpl {
             }
         }
         (message_key, instance)
+    }
+
+    // ---- Cross-partition subscription routing (stage 2, s2-subindex) -------
+    //
+    // The host half of the engine's two-phase placement protocol. When a token
+    // parks on a message catch/boundary whose correlation key hashes to a
+    // *different* partition, the engine emits `MessageSubscriptionOpening`; when
+    // a publish correlates on a message partition for an instance that lives
+    // elsewhere, it emits `RemoteMessageCorrelation`. This pump routes the
+    // follow-up command to the partition that must apply it (today: any partition
+    // this node owns; cross-node routing is a later increment), and recurses,
+    // because advancing a token can itself reach another off-partition catch.
+    //
+    // Single-partition (or single-node, single-partition) hosts never produce
+    // those events, so `drive_subscription_routing` is an immediate no-op and the
+    // hot path is unchanged.
+
+    /// True when `events` carry any cross-partition follow-up the pump must route.
+    /// Cheap early-out so callers can hand every command's output to the pump.
+    fn has_routable_subscription_events(events: &[Event]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                Event::MessageSubscriptionOpening { .. } | Event::RemoteMessageCorrelation { .. }
+            )
+        })
+    }
+
+    /// Routes the cross-partition subscription follow-ups carried in `events`
+    /// (and any they transitively produce) to the owning local partitions.
+    async fn drive_subscription_routing(&self, events: Vec<Event>) {
+        let num_partitions = self.engine.topology().num_partitions;
+        if num_partitions <= 1 {
+            return;
+        }
+        let mut work = events;
+        while let Some(event) = work.pop() {
+            match event {
+                Event::MessageSubscriptionOpening {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    message_name,
+                    correlation_key,
+                    kind,
+                } => {
+                    let target = nanobpmn_engine_core::subscription_partition(
+                        &correlation_key,
+                        num_partitions,
+                    );
+                    let command = Command::OpenMessageSubscription {
+                        subscription_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        message_name,
+                        correlation_key,
+                        kind,
+                    };
+                    if let Some(produced) = self.apply_routed_local(target, command).await {
+                        work.extend(produced);
+                    }
+                }
+                Event::RemoteMessageCorrelation {
+                    subscription_key,
+                    message_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    kind,
+                    variables,
+                } => {
+                    let target = nanobpmn_engine_core::partition_of(instance_key);
+                    let command = Command::CorrelateMessageSubscription {
+                        subscription_key,
+                        message_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind,
+                        variables,
+                    };
+                    if let Some(produced) = self.apply_routed_local(target, command).await {
+                        work.extend(produced);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Applies a routed subscription command on the LOCAL partition `target`,
+    /// awaiting its durability, and returns the events it produced (so the caller
+    /// can route any further follow-ups). Returns `None` — logging a warning —
+    /// when `target` is owned by a peer (cross-node routing is a later increment);
+    /// at RF=1 the message is simply dropped, matching the no-buffer model.
+    async fn apply_routed_local(&self, target: u64, command: Command) -> Option<Vec<Event>> {
+        match self.engine.local_for_partition(target) {
+            Some(handle) => {
+                let (events, commit) = handle
+                    .with(move |engine| {
+                        engine
+                            .apply_command_at(command, now_millis())
+                            .expect("routed subscription command never fails")
+                    })
+                    .await;
+                commit.wait().await;
+                Some(events.to_vec())
+            }
+            None => {
+                tracing::warn!(
+                    "subscription routing: partition {target} is remote; cross-node routing not yet wired"
+                );
+                None
+            }
+        }
     }
 
     // ---- By-key forwarding (stage 1) -------------------------------------
@@ -4410,7 +4551,7 @@ impl ServerImpl {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
         }
-        let outcome: Result<(nanobpmn_engine_core::Key, bool, Commit), (u16, String)> = {
+        let outcome: Result<(nanobpmn_engine_core::Key, bool, Vec<Event>, Commit), (u16, String)> = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
                 .for_create()
@@ -4449,7 +4590,24 @@ impl ServerImpl {
                                 .find_map(Event::instance_key)
                                 .expect("created instance has a key");
                             let sync_completed = engine.engine().is_completed(instance_key);
-                            Ok((instance_key, sync_completed, commit))
+                            // Collect any cross-partition subscription follow-ups
+                            // to route once durable (none single-partition).
+                            let routable = if engine.engine().num_partitions() > 1 {
+                                events
+                                    .iter()
+                                    .filter(|e| {
+                                        matches!(
+                                            e,
+                                            Event::MessageSubscriptionOpening { .. }
+                                                | Event::RemoteMessageCorrelation { .. }
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            Ok((instance_key, sync_completed, routable, commit))
                         }
                         Err(EngineError::ProcessNotFound { process_id }) => {
                             Err((400, format!("No deployed process with id '{process_id}'.")))
@@ -4459,8 +4617,11 @@ impl ServerImpl {
                 })
                 .await
         };
-        let (instance_key, sync_completed, commit) = outcome?;
+        let (instance_key, sync_completed, routable, commit) = outcome?;
         commit.wait().await;
+        if !routable.is_empty() {
+            self.drive_subscription_routing(routable).await;
+        }
         self.signal_jobs_available();
         Ok((instance_key, sync_completed))
     }
@@ -6432,6 +6593,154 @@ mod clustered_startup_tests {
         let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
         let p = nanobpmn_engine_core::partition_of(job_key);
         assert!(p == 0 || p == 2, "the aggregated job lives on a node-0 partition, got {p}");
+    }
+}
+
+#[cfg(test)]
+mod subscription_placement_tests {
+    use super::*;
+
+    /// A single node owning ALL 4 partitions (num_nodes = 1), so every partition
+    /// is local and the host pump can route subscription open/correlate across
+    /// them without a peer hop. This exercises the cross-partition placement
+    /// machinery end-to-end inside one process.
+    fn single_node_multi_partition() -> ServerImpl {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into()],
+            num_partitions: 4,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        build_server(journals, store, topology)
+    }
+
+    /// A process whose only wait state is a message intermediate catch keyed on
+    /// `orderId` — the canonical subscription lives on `hash(orderId) % P`, which
+    /// is generally a different partition than the instance.
+    const MESSAGE_CATCH_BPMN: &str = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="await-payment">
+          <bpmn:startEvent id="s" />
+          <bpmn:intermediateCatchEvent id="await">
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="await" />
+          <bpmn:sequenceFlow id="f1" sourceRef="await" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="payment-received">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=orderId" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+
+    #[tokio::test]
+    async fn cross_partition_message_catch_completes_via_the_pump() {
+        let server = single_node_multi_partition();
+        assert_eq!(server.engine.all().len(), 4, "node owns all 4 partitions");
+        assert!(!server.engine.is_single());
+
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the message-catch process deploys onto every partition");
+
+        // Create instances with unique correlation keys until one lands on a
+        // partition DIFFERENT from where its subscription is canonically placed —
+        // the cross-partition case the host pump must stitch together. Each
+        // instance carries a unique key, so a later publish matches exactly one.
+        let mut chosen: Option<(String, nanobpmn_engine_core::Key)> = None;
+        for i in 0..64u32 {
+            let order = format!("order-{i}");
+            let mut variables = std::collections::HashMap::new();
+            variables.insert("orderId".to_string(), Value::Str(order.clone()));
+            let (key, completed) = server
+                .create_for_stream(Some("await-payment".into()), None, variables)
+                .await
+                .expect("create succeeds");
+            assert!(!completed, "the instance parks at the message catch");
+            let p_inst = nanobpmn_engine_core::partition_of(key);
+            let p_sub = nanobpmn_engine_core::subscription_partition(&order, 4);
+            if p_sub != p_inst {
+                chosen = Some((order, key));
+                break;
+            }
+        }
+        let (order, instance_key) =
+            chosen.expect("a cross-partition placement appears within 64 creates");
+
+        // Publishing the message must (a) reach the subscription partition where
+        // the pump routed the Open, match the canonical sub, and (b) route the
+        // resulting correlation back to the instance partition to advance and
+        // complete the parked token.
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".into(),
+                order.clone(),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        assert_eq!(
+            correlated,
+            Some(instance_key),
+            "the publish correlates the cross-partition parked instance"
+        );
+
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(
+            completed,
+            "the instance completes after the cross-partition correlation is routed back"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_partition_message_catch_is_byte_identical() {
+        // With one partition the pump must never engage: the engine takes the
+        // inline local path, correlation completes the instance directly.
+        let server = ServerImpl::default();
+        assert!(server.engine.is_single());
+        server
+            .deploy_centralized(
+                vec![("await-payment.bpmn".into(), MESSAGE_CATCH_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("orderId".to_string(), Value::Str("order-x".into()));
+        let (instance_key, completed) = server
+            .create_for_stream(Some("await-payment".into()), None, variables)
+            .await
+            .expect("create succeeds");
+        assert!(!completed, "parks at the catch");
+
+        let (_message_key, correlated) = server
+            .correlate_message_local(
+                "payment-received".into(),
+                "order-x".into(),
+                std::collections::HashMap::new(),
+            )
+            .await;
+        assert_eq!(correlated, Some(instance_key));
+
+        let (_vars, completed) = server
+            .await_completion_for_stream(instance_key, None, Some(2000))
+            .await;
+        assert!(completed, "single-partition correlation completes inline");
     }
 }
 
