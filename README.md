@@ -350,6 +350,112 @@ keeping every command serialized within its partition.
 | --- | --- |
 | `NANOBPMN_PARTITIONS=<n>` | Number of single-writer partitions. Default `1`. Clamped to `[1, 8192]`. Changing this requires fresh data directories (the journal layout differs). |
 
+## Clustering, replication, and availability
+
+A deployment is one or more **nodes** (processes). Every node is both a **broker**
+(owning a subset of partitions — an engine actor + journal each) and a **gateway**
+(accepts client connections for the *whole* cluster, forwarding operations it does
+not own to the node that does). Partition→node placement is deterministic
+(`partition_id % num_nodes`), so every node computes the same ownership map from
+static config with no coordinator. Single-node (the default, `NANOBPMN_NODES`
+unset) is byte-for-byte the historical behaviour.
+
+Two independent axes:
+
+- **Distribution** (`NANOBPMN_NODES` / `NANOBPMN_NODE_ID`): spread partitions across
+  nodes for throughput. Each partition still lives on exactly one node.
+- **Replication** (`NANOBPMN_RAFT=on` + `NANOBPMN_RF=<k>`): replicate each partition
+  across `k` nodes as a per-partition **Raft** group, for durability and failover.
+
+### Replication factor and quorum
+
+With `NANOBPMN_RF=k`, each partition's replica set is `k` consecutive nodes
+(`[owner, owner+1, …]`), the first being its initial leader, and writes commit
+through Raft. `RF` is clamped to `[1, num_nodes]`. **A `k`-voter Raft group
+commits only with a quorum of ⌊k/2⌋+1 replicas and therefore tolerates ⌊(k−1)/2⌋
+failures:**
+
+| Nodes (RF = nodes) | Quorum | Faults tolerated | On one node loss |
+| --- | --- | --- | --- |
+| 1 | 1 | 0 | total outage |
+| **2** | **2** | **0** | **total write outage** (see warning) |
+| 3 | 2 | 1 | stays up — sub-second leadership blip |
+| 5 | 3 | 2 | stays up |
+
+Raft deployments use **odd** node counts. The first size that survives a failure
+is **3** (quorum 2, tolerates 1).
+
+> ⚠️ **Two-node clusters are a trap.** A 2-node `RF=2` group has quorum 2 — *both*
+> nodes are required to commit — so it tolerates **zero** faults, the *same* as a
+> single node, while *doubling* the number of machines whose failure halts all
+> writes. It buys **durability only** (every commit on two disks), **not
+> availability**. A network partition between the two halts writes on *both* sides
+> (neither has quorum). Use 3+ for fault tolerance; `RF=2`/2-node is a stepping
+> stone, not a resilient deployment.
+
+### What happens when a node is lost
+
+nanobpmn is **CP** (consistency over availability): a partition without a quorum
+refuses to commit rather than diverge — so there is **no split-brain and no data
+loss**, ever. Behaviour depends on which side of the cut you are on:
+
+- **Majority side (e.g. lose 1 of 3, `RF=3`).** The survivors hold quorum (2/3),
+  **re-elect a new leader for the lost node's partitions within the election
+  timeout (~sub-second)**, and keep serving. In-flight writes that were forwarded
+  to the now-dead leader fail fast and retry on the new leader (see *Failover
+  write path* below). Measured: throughput through a node loss holds at ~98% of
+  baseline with a sub-second p99 blip, then full recovery on rejoin — no data loss.
+- **Minority side (e.g. a single node taken off the network — "laptop leaves the
+  office").** That node can reach no quorum for *any* partition, so it becomes
+  **write-unavailable**: every create/complete/activate fails fast (the orphaned
+  leader steps down within ~one election timeout rather than hanging). Reads are
+  still served from its **local applied state — consistent but frozen/stale** (no
+  new writes land). Workers connected to it stay connected (same machine) but get
+  errors/zero jobs; if that node is their only gateway address they are stuck until
+  it rejoins. **No writes it attempted while isolated are ever acknowledged or
+  retained.**
+- **RF=1 (no replication, the default).** There is no quorum concept; each partition
+  is single-homed. Losing a node keeps the **survivor fully serving its own
+  partitions** (partition-level fault isolation), but the **dead node's partitions
+  go offline** until it returns and its recent writes are not replicated anywhere.
+
+### Rejoin
+
+A returning node reconnects, catches up via Raft `AppendEntries` (or an
+`InstallSnapshot` if it fell more than `NANOBPMN_RAFT_SNAPSHOT_LOGS` behind),
+**discards any uncommitted entries it proposed while isolated** (overwritten by the
+higher-term majority log), and resumes as a follower. Membership is not changed on
+a transient outage, so no operator action is needed.
+
+### Failover write path
+
+So a single leader failure does not stall a closed-loop client, fast non-await peer
+forwards (job complete/fail/throw, activation pulls, by-key reads/mutations, and
+non-await create) use a **short per-attempt deadline** (default 2500 ms, just above
+the election ceiling) instead of the 30 s general peer timeout; a forward racing a
+leader failure fails fast and the create path **re-resolves the new leader and
+retries** within a budget (default 5000 ms) before surfacing a retryable `503`.
+`awaitCompletion` creates keep the long timeout (they legitimately block until the
+instance finishes).
+
+### Cluster configuration
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_NODES=<url,url,…>` | Comma-separated node base URLs, **index = node id** (e.g. `http://10.0.0.1:8080,http://10.0.0.2:8080`). Unset (or one entry) ⇒ single node. |
+| `NANOBPMN_NODE_ID=<i>` | This node's id (index into `NANOBPMN_NODES`). Default `0`. |
+| `NANOBPMN_RAFT=on` | Enable per-partition Raft replication. Off ⇒ the single-homed, byte-identical path. |
+| `NANOBPMN_RF=<k>` | Replication factor: nodes per partition. Default `1`. Clamped to `[1, num_nodes]`. Use an odd node count with `RF=num_nodes` for fault tolerance. |
+| `NANOBPMN_RAFT_HEARTBEAT_MS=<ms>` | Leader heartbeat interval. Default `250`. |
+| `NANOBPMN_RAFT_ELECTION_MIN_MS` / `_MAX_MS` | Randomized election timeout window. Defaults `500` / `1000`. |
+| `NANOBPMN_RAFT_SNAPSHOT_LOGS=<n>` | Snapshot every `n` applied entries (log compaction; also the catch-up→snapshot threshold). Default `5000`. |
+| `NANOBPMN_PEER_TIMEOUT_MS=<ms>` | General peer-forward timeout (await-create, deploy, message publish). Default `30000`. |
+| `NANOBPMN_WRITE_FORWARD_TIMEOUT_MS=<ms>` | Per-attempt deadline for fast non-await write forwards. Default `2500`. |
+| `NANOBPMN_WRITE_FORWARD_RETRY_MS=<ms>` | Total leader-re-resolution retry budget for a forwarded create. Default `5000`. |
+
+See [`docs/distributed-scaling-design.md`](docs/distributed-scaling-design.md) for
+the full design rationale.
+
 ## Command stream (WebSocket)
 
 Alongside the REST API, the server exposes a single **bidirectional WebSocket**
@@ -449,10 +555,11 @@ REST API `/jobs/{key}/completion` endpoint still awaits fsync before replying; o
 the command stream pipelines. Analogous to Kafka `acks=1` or RabbitMQ async
 confirms.
 
-> **Multi-node future:** When nanobpmn adds Raft replication (multi-broker
-> distribution like Zeebe), this would change to await quorum-fsync before acking,
-> trading the 5ms durability window for the ~30ms cross-datacenter Raft round-trip
-> that provides true distributed durability.
+> **Multi-node durability:** With `NANOBPMN_RAFT=on` and `NANOBPMN_RF>1` (see
+> [Clustering, replication, and availability](#clustering-replication-and-availability)),
+> a partition's writes commit through Raft — replicated to a quorum of replicas
+> before they are durable cluster-wide — instead of the single-node ack-before-fsync
+> window described here. The stream's at-least-once contract is unchanged.
 
 See [`docs/command-stream-design.md`](docs/command-stream-design.md) for the full
 design rationale,
