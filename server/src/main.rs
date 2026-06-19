@@ -4513,6 +4513,101 @@ impl ServerImpl {
         });
     }
 
+    /// Env-gated (`NANOBPMN_RAFT`) per-partition Raft bootstrap. For every
+    /// partition this node replicates, host a Raft group member whose RPCs ride
+    /// the command stream; then, for the partitions this node leads, form the
+    /// group from its replica set. A no-op unless `NANOBPMN_RAFT` is set, so the
+    /// default single-writer path is untouched.
+    ///
+    /// Runs as a background task because the local command-stream endpoint isn't
+    /// serving until `main()` calls `axum::serve`, and peers may still be booting.
+    /// A member that can't yet be reached is simply retried by openraft's network
+    /// (an unreachable peer slows the group, never loses an entry), and the
+    /// leader's `initialize` is idempotent (skipped on an already-formed group),
+    /// so the multi-process startup race is tolerated rather than coordinated.
+    fn spawn_raft_bootstrap(&self) {
+        if !raft_enabled() {
+            return;
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            server.raft_bootstrap().await;
+        });
+    }
+
+    /// The body of [`Self::spawn_raft_bootstrap`], factored out so tests can drive
+    /// it directly (without the env gate or a detached task). Hosts a Raft member
+    /// for every partition this node replicates, then forms the groups it leads.
+    async fn raft_bootstrap(&self) {
+        let server = self;
+        {
+            let topology = server.engine.topology().clone();
+            let transport = server.raft_transport();
+
+            // Host a member for every partition this node replicates, registering
+            // it so inbound RPCs from peers can reach it as soon as it exists.
+            for p in topology.replica_partitions() {
+                match crate::raft::RaftPartition::bootstrap_member(
+                    topology.node_id as u64,
+                    p,
+                    Journal::in_memory_partition(p),
+                    transport.clone(),
+                )
+                .await
+                {
+                    Ok(part) => {
+                        server.raft_registry().insert(Arc::new(part));
+                        tracing::info!(
+                            "raft: node {} hosting a member for partition {p}",
+                            topology.node_id
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("raft: failed to host partition {p}: {e}");
+                    }
+                }
+            }
+
+            // Form each group this node leads from its replica set. `initialize`
+            // is idempotent and does not require peers to be up (they catch up via
+            // replication), but we retry to ride out a transient failure.
+            for p in topology.replica_partitions() {
+                if topology.leader_of(p) != topology.node_id {
+                    continue;
+                }
+                let Some(part) = server.raft_registry().get(p) else {
+                    continue;
+                };
+                let members: std::collections::BTreeMap<u64, openraft::BasicNode> = topology
+                    .replicas_of(p)
+                    .into_iter()
+                    .map(|n| {
+                        let addr = topology.peer_addr(n).unwrap_or("").to_string();
+                        (n as u64, openraft::BasicNode::new(addr))
+                    })
+                    .collect();
+                loop {
+                    match part.initialize(members.clone()).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                "raft: node {} formed the group for partition {p} (members {:?})",
+                                topology.node_id,
+                                topology.replicas_of(p)
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "raft: initialize partition {p} failed: {e}; retrying"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            }
+        }
+    }
+
     /// Replicates a deployment's process definitions to every partition other
     /// than the deployment partition (0), so a `createProcessInstance` routed to
     /// any partition finds the definition. A no-op for a single partition. Only
@@ -5594,6 +5689,20 @@ fn debug_rest_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether per-partition Raft replication is enabled (env `NANOBPMN_RAFT`). Off
+/// by default, so the classic single-writer path is byte-identical and carries
+/// zero Raft overhead unless a deployer explicitly opts in.
+fn raft_enabled() -> bool {
+    std::env::var("NANOBPMN_RAFT")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Renders a body as a single-line, length-prefixed preview for logging,
 /// truncating long payloads and collapsing newlines so each request stays on
 /// one log line. An empty body renders as the empty string.
@@ -5889,6 +5998,10 @@ async fn main() {
     // retrying until each peer (which may still be booting) acknowledges.
     // No-op for a single-node cluster.
     server.spawn_seed_broadcast();
+
+    // Env-gated (NANOBPMN_RAFT): bring up this node's per-partition Raft groups
+    // over the command stream and form the ones it leads. No-op by default.
+    server.spawn_raft_bootstrap();
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
@@ -7267,6 +7380,102 @@ mod clustered_startup_tests {
 
         part0.raft.shutdown().await.expect("clean shutdown node 0");
         part1.raft.shutdown().await.expect("clean shutdown node 1");
+    }
+
+    #[tokio::test]
+    async fn raft_bootstrap_forms_every_group_and_elects_leaders_across_two_nodes() {
+        // L2a: the env-gated startup orchestration. Two served nodes (RF=2, so
+        // each replicates all 4 partitions) run `raft_bootstrap`; afterwards every
+        // partition must have formed its group and elected its owner as leader —
+        // entirely over the command stream, with the multi-process startup race
+        // (a peer still booting when initialize runs) absorbed by retry.
+        use crate::raft::RaftPartition;
+
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+                replication_factor: 2,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // Both nodes bootstrap concurrently — exactly as the two `main()`s would.
+        tokio::join!(node0.raft_bootstrap(), node1.raft_bootstrap());
+
+        // Each node hosts a member for all 4 partitions (RF=2, 2 nodes).
+        for (node, who) in [(&node0, 0u32), (&node1, 1u32)] {
+            for p in 0..4u64 {
+                assert!(
+                    node.raft_registry().get(p).is_some(),
+                    "node {who} should host a member for partition {p}"
+                );
+            }
+        }
+
+        // Every partition's owner becomes its leader, observed via that owner's
+        // hosted member — the whole 4-group cluster converged over the wire.
+        let leader_of = |node: &ServerImpl, p: u64| -> Option<u64> {
+            node.raft_registry()
+                .get(p)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+        };
+        for p in 0..4u64 {
+            let owner = (p % 2) as u64; // owner_of(p) for 2 nodes
+            let owner_node = if owner == 0 { &node0 } else { &node1 };
+            let mut elected = false;
+            for _ in 0..400 {
+                if leader_of(owner_node, p) == Some(owner) {
+                    elected = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                elected,
+                "partition {p} did not elect its owner (node {owner}) as leader"
+            );
+        }
+
+        // Clean up every hosted group on both nodes.
+        for node in [&node0, &node1] {
+            for p in 0..4u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
     }
 }
 
