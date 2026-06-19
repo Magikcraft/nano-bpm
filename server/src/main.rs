@@ -24,6 +24,7 @@ mod metrics;
 mod peer;
 mod partition;
 mod query;
+mod raft;
 mod readstore;
 mod stub_impls;
 mod varspill;

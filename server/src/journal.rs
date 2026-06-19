@@ -479,6 +479,27 @@ impl Journal {
         }
     }
 
+    /// Like [`Journal::in_memory_partition`] but seeds the engine by replaying
+    /// `events` (non-persistent). Used to rebuild a volatile state machine from a
+    /// snapshot body (a serialized event history) — the same replay path as crash
+    /// recovery, minus the writer.
+    pub fn in_memory_from_events(partition_id: u64, events: Vec<Event>) -> Self {
+        let engine = if events.is_empty() {
+            Engine::with_partition(partition_id)
+        } else {
+            Engine::replay_partition(partition_id, events)
+        };
+        Self {
+            engine,
+            writer: None,
+            writer_thread: None,
+            exporter: None,
+            fresh: false,
+            spill: None,
+            cold: None,
+        }
+    }
+
     /// Reads and deserializes every event from the journal log at `path` (an
     /// empty vec if the file does not exist). Shared by [`Journal::open`] (to
     /// replay into the engine) and the boot-time read-model catch-up.

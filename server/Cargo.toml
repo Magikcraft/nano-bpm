@@ -28,6 +28,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+anyhow = "1.0.102"
 
 # jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
 # Linux glibc), it returns freed memory to the OS on a decay schedule and exposes

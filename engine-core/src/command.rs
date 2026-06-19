@@ -10,6 +10,7 @@ use crate::state::{Key, MessageSubscriptionKind};
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Command {
     /// Register a single process definition. Deployed under its own deployment
     /// key; equivalent to a [`Command::DeployResources`] with one process.
@@ -194,6 +195,7 @@ pub enum Command {
 /// `Some` only when the caller is changing that attribute; `None` leaves it
 /// untouched. An empty list or an empty/`None` date *resets* the attribute.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UserTaskChangeset {
     /// New candidate groups (empty list clears them).
     pub candidate_groups: Option<Vec<String>>,
