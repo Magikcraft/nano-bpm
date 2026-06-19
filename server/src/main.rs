@@ -1158,7 +1158,7 @@ impl ServerImpl {
             }
         };
 
-        if let Some(node) = self.remote_owner_of(instance_key) {
+        if let Some(node) = self.route_by_leader(instance_key) {
             return Ok(self.forward_cancel_instance(node, instance_key).await);
         }
 
@@ -1223,7 +1223,7 @@ impl ServerImpl {
 
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
-        if let Some(node) = self.remote_owner_of(job_key) {
+        if let Some(node) = self.route_by_leader(job_key) {
             let wire = body
                 .as_ref()
                 .and_then(|b| b.variables.as_ref())
@@ -1312,7 +1312,7 @@ impl ServerImpl {
             .and_then(|b| b.error_message.clone())
             .unwrap_or_default();
 
-        if let Some(node) = self.remote_owner_of(job_key) {
+        if let Some(node) = self.route_by_leader(job_key) {
             return Ok(self.forward_fail_job(node, job_key, retries, error_message).await);
         }
 
@@ -1390,7 +1390,7 @@ impl ServerImpl {
         };
         let body_error_code = body.error_code.clone();
 
-        if let Some(node) = self.remote_owner_of(job_key) {
+        if let Some(node) = self.route_by_leader(job_key) {
             return Ok(self
                 .forward_throw_error(node, job_key, body_error_code, error_message)
                 .await);
@@ -1472,7 +1472,7 @@ impl ServerImpl {
             }
         };
 
-        if let Some(node) = self.remote_owner_of(job_key) {
+        if let Some(node) = self.route_by_leader(job_key) {
             return Ok(self.forward_update_job(node, job_key, retries).await);
         }
 
@@ -1537,7 +1537,7 @@ impl ServerImpl {
 
         let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
 
-        if let Some(node) = self.remote_owner_of(incident_key) {
+        if let Some(node) = self.route_by_leader(incident_key) {
             return Ok(self
                 .forward_resolve_incident(node, incident_key, operation_reference)
                 .await);
@@ -1613,7 +1613,7 @@ impl ServerImpl {
 
         let variables = from_object_map(&body.variables);
 
-        if let Some(node) = self.remote_owner_of(scope_key) {
+        if let Some(node) = self.route_by_leader(scope_key) {
             return Ok(self
                 .forward_set_variables(node, scope_key, wire_variables(Some(&body.variables)))
                 .await);
@@ -2428,10 +2428,11 @@ impl ServerImpl {
     }
 
     /// Peer-side of user-task forwarding: re-applies the original REST mutation
-    /// locally (this node owns the task's partition, so the per-handler
-    /// `remote_owner_of` check resolves Local — no forwarding loop) and reports
-    /// the REST status plus an optional problem detail. The gateway maps the
-    /// status back to its typed response.
+    /// locally (the forward targets the partition's current leader, so the
+    /// per-handler `route_by_leader` check resolves Local — no forwarding loop
+    /// in the stable post-election state) and reports the REST status plus an
+    /// optional problem detail. The gateway maps the status back to its typed
+    /// response.
     pub(crate) async fn apply_user_task_forwarded(
         &self,
         op: crate::command_stream::UserTaskOp,
@@ -3565,7 +3566,7 @@ impl ServerImpl {
             Some(types::Nullable::Present(v)) => *v,
             _ => true,
         };
-        if let Some(node) = self.remote_owner_of(user_task_key) {
+        if let Some(node) = self.route_by_leader(user_task_key) {
             let payload = serde_json::to_value(body).ok();
             let (status, detail) = self
                 .forward_user_task(
@@ -3672,7 +3673,7 @@ impl ServerImpl {
 
         // Variables the human submits are merged into the instance so they can
         // drive downstream gateway routing.
-        if let Some(node) = self.remote_owner_of(user_task_key) {
+        if let Some(node) = self.route_by_leader(user_task_key) {
             let payload = serde_json::to_value(body).ok();
             let (status, detail) = self
                 .forward_user_task(
@@ -3843,7 +3844,7 @@ impl ServerImpl {
         };
 
         let command = Command::unassign_user_task(user_task_key);
-        if let Some(node) = self.remote_owner_of(user_task_key) {
+        if let Some(node) = self.route_by_leader(user_task_key) {
             let (status, detail) = self
                 .forward_user_task(
                     node,
@@ -3934,7 +3935,7 @@ impl ServerImpl {
             }
         };
 
-        if let Some(node) = self.remote_owner_of(user_task_key) {
+        if let Some(node) = self.route_by_leader(user_task_key) {
             let payload = serde_json::to_value(body).ok();
             let (status, detail) = self
                 .forward_user_task(
@@ -8750,6 +8751,96 @@ mod clustered_startup_tests {
             other.read_route(instance_key),
             Some(0),
             "the read must not route to the killed owner"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rest_mutations_follow_leadership_across_a_failover() {
+        // s3-query-follow: a by-key REST MUTATION (here completeJob) issued
+        // against a node that is NOT the partition's leader must forward to the
+        // CURRENT leader, not the dead static owner. After the owner is killed,
+        // a REST completeJob sent to the surviving follower must reach the
+        // re-elected leader and drive the instance to completion.
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        // Kill the leader/owner: shut down all of node 0's Raft groups.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+        let new_leader_id = new_leader.engine.topology().node_id;
+        let other = if new_leader_id == node1.engine.topology().node_id {
+            &node2
+        } else {
+            &node1
+        };
+
+        // Activate the parked job on the new leader to obtain its key.
+        let mut job_key = None;
+        for _ in 0..400 {
+            let jobs = new_leader
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the parked job activates on the new leader");
+
+        // Complete the job via the REST handler on the NON-leader survivor. Its
+        // route_by_leader must forward to the new leader (not the dead owner),
+        // so the call succeeds rather than 502-ing against node 0.
+        let path = models::CompleteJobPathParams {
+            job_key: job_key.to_string(),
+        };
+        let resp = other
+            .complete_job_impl(&path, &None)
+            .await
+            .expect("complete_job_impl returns Ok");
+        assert!(
+            matches!(
+                resp,
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "a REST completeJob on a follower forwards to the new leader and succeeds after failover"
+        );
+
+        // The instance reaches completion on the new leader.
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        let mut completed = false;
+        for _ in 0..400 {
+            if handle
+                .with(move |journal| journal.engine().is_completed(instance_key))
+                .await
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            completed,
+            "the instance completes after a REST mutation routed through the new leader"
         );
 
         for node in [&node1, &node2] {
