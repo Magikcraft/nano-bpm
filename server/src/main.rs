@@ -8468,6 +8468,306 @@ mod clustered_startup_tests {
             }
         }
     }
+
+    /// Boots a 3-node RF=3 cluster (3 partitions; node i owns partition i, every
+    /// node replicates every partition) hosting the `intake` process, serves all
+    /// three over the real command stream, bootstraps the Raft groups, and waits
+    /// until node 0 leads partition 0. Returns the three nodes. Used by the
+    /// broadened failover tests below.
+    async fn boot_rf3_intake_cluster() -> (ServerImpl, ServerImpl, ServerImpl) {
+        use crate::raft::RaftPartition;
+
+        let mut listeners = Vec::new();
+        let mut ports = Vec::new();
+        for i in 0..3u32 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|_| panic!("bind node {i}"));
+            ports.push(l.local_addr().expect("addr").port());
+            listeners.push(l);
+        }
+        let peers: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{p}")).collect();
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 3,
+                replication_factor: 3,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+            build_server(journals, store, topology)
+        };
+        let node0 = build_node(0);
+        let node1 = build_node(1);
+        let node2 = build_node(2);
+
+        let proc = ProcessBuilder::new("intake")
+            .start_event("start")
+            .service_task("work", "do-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("intake".to_string(), "intake.bpmn".to_string());
+        let (_r, events) = node0
+            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .await
+            .expect("deploy on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+        node2.install_replicated_deployment(events.to_vec()).await;
+
+        let served = [
+            (node0.clone(), listeners.remove(0)),
+            (node1.clone(), listeners.remove(0)),
+            (node2.clone(), listeners.remove(0)),
+        ];
+        for (server, listener) in served {
+            let registry = command_stream::Registry::new();
+            command_stream::spawn_dispatcher(server.clone(), registry.clone());
+            let app = command_stream::router(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+        tokio::join!(
+            node0.raft_bootstrap(),
+            node1.raft_bootstrap(),
+            node2.raft_bootstrap()
+        );
+
+        let mut ok = false;
+        for _ in 0..500 {
+            if node0
+                .raft_registry()
+                .get(0)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+                == Some(0)
+            {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ok, "node 0 must lead partition 0");
+        (node0, node1, node2)
+    }
+
+    /// Re-election helper: polls survivors {n1, n2} until partition `p` has a leader
+    /// that is not the killed node, returning the survivor that won.
+    async fn wait_new_leader<'a>(
+        n1: &'a ServerImpl,
+        n2: &'a ServerImpl,
+        p: u64,
+    ) -> &'a ServerImpl {
+        use crate::raft::RaftPartition;
+        let leader_of = |node: &ServerImpl, p: u64| -> Option<u64> {
+            node.raft_registry()
+                .get(p)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+        };
+        for _ in 0..500 {
+            for node in [n1, n2] {
+                if let Some(l) = leader_of(node, p) {
+                    if l != 0 {
+                        return if l == n1.engine.topology().node_id as u64 {
+                            n1
+                        } else {
+                            n2
+                        };
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("survivors must re-elect a leader for partition {p}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failover_preserves_every_in_flight_instance() {
+        // s3-test: quorum-scale survival. Many instances commit through partition
+        // 0's leader; after the leader is killed, the NEW leader must activate and
+        // complete EVERY one of them (no data loss across the failover, not just a
+        // single instance).
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        const N: usize = 12;
+        let mut instances = Vec::new();
+        for _ in 0..N {
+            let (key, _c) = node0
+                .create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("raft-routed create commits via quorum");
+            assert_eq!(nanobpmn_engine_core::partition_of(key), 0);
+            instances.push(key);
+        }
+
+        // Kill the leader.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+
+        // Drain + complete every parked job on the new leader.
+        let mut completed = 0usize;
+        for _ in 0..2000 {
+            let jobs = new_leader
+                .activate_for_stream("do-work", "w", N, 60_000, None)
+                .await;
+            for j in jobs {
+                let job_key = j.job_key.0.parse::<u64>().expect("numeric job key");
+                new_leader
+                    .complete_job_for_stream(job_key, Default::default())
+                    .await
+                    .expect("complete commits via the new quorum")
+                    .wait()
+                    .await;
+                completed += 1;
+            }
+            if completed >= N {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(completed, N, "every job re-offers on the new leader");
+
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        for key in instances {
+            let mut done = false;
+            for _ in 0..400 {
+                if handle
+                    .with(move |journal| journal.engine().is_completed(key))
+                    .await
+                {
+                    done = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(done, "instance {key} must complete on the new leader");
+        }
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_job_leased_on_the_killed_leader_re_activates_on_the_new_leader() {
+        // s3-test: at-least-once ACROSS failover. A job activated (leased) on the
+        // old leader but NOT completed before it dies must NOT be lost: the new
+        // leader expires the stale lease (logged ExpireJobs via the Raft tick) and
+        // re-offers the job, then completes the instance. Because activation is a
+        // LOGGED command, the lease state replicated to the survivors, so the new
+        // leader knows the job was outstanding.
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        // Lease the job on the OLD leader (short timeout) and DO NOT complete it.
+        let mut leased = false;
+        for _ in 0..200 {
+            let jobs = node0
+                .activate_for_stream("do-work", "w", 10, 500, None)
+                .await;
+            if !jobs.is_empty() {
+                leased = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leased, "the job leases on the original leader");
+
+        // Kill the leader before the job is completed.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+
+        // The new leader expires the stale lease via a LOGGED ExpireJobs tick (the
+        // tick loop is not spawned in-test, so drive one partition tick directly
+        // with a far-future `now`), which returns the job to the activatable index.
+        let multi_partition = new_leader.engine.topology().num_partitions > 1;
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 600_000;
+        for _ in 0..50 {
+            new_leader
+                .tick_partition_via_raft(0, far_future, multi_partition)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // The re-offered job must now activate on the new leader and complete.
+        let mut job_key = None;
+        for _ in 0..200 {
+            let jobs = new_leader
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the leased-but-uncompleted job re-activates after failover");
+        new_leader
+            .complete_job_for_stream(job_key, Default::default())
+            .await
+            .expect("complete commits via the new quorum")
+            .wait()
+            .await;
+
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        let mut done = false;
+        for _ in 0..400 {
+            if handle
+                .with(move |journal| journal.engine().is_completed(instance_key))
+                .await
+            {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            done,
+            "the job survives the leader loss (at-least-once) and the instance completes"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
