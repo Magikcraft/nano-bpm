@@ -25,6 +25,7 @@ mod peer;
 mod partition;
 mod query;
 mod raft;
+mod raft_logstore;
 mod readstore;
 mod stub_impls;
 mod varspill;

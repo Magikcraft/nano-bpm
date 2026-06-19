@@ -13,15 +13,24 @@
 //! itself, so commit is immediate and the network layer is never exercised.
 //!
 //! Deliberately **additive**: this does not yet replace the server's
-//! [`EngineHandle`](crate::engine_actor::EngineHandle) write path. Two pieces
-//! remain for the durable, multi-node story (separate milestones):
-//!   1. Replace the in-memory [`MemLogStore`] log with a `RaftLogStorage`
-//!      backed by our `Journal`, so the *replicated log itself* is crash-durable
-//!      (today only the applied engine state is, via `Commit`; the memstore log
-//!      is volatile — acceptable only because RF=1 single-voter never recovers
-//!      from a peer).
-//!   2. Implement the [`RaftNetwork`] over the command stream so followers
-//!      receive AppendEntries/Vote, raising RF to 3 without touching routing.
+//! [`EngineHandle`](crate::engine_actor::EngineHandle) write path.
+//!
+//! # Milestone B: crash-durable log (done)
+//!
+//! [`bootstrap_single_durable`](RaftPartition::bootstrap_single_durable) backs the
+//! Raft log with [`RaftLogStore`](crate::raft_logstore::RaftLogStore), an
+//! `fsync`-on-append disk log. By the Raft model the **log is the source of
+//! truth**: a client-acked command is durable once it is in that log, and a
+//! restart replays the durable log back through the (volatile) state machine to
+//! reconstruct engine state — so the engine [`Journal`] itself can stay
+//! in-memory. [`bootstrap_single`](RaftPartition::bootstrap_single) keeps the
+//! original in-memory [`MemLogStore`] for tests that don't need durability.
+//!
+//! # Remaining
+//!
+//! One piece remains for the multi-node story: implement the [`RaftNetwork`] over
+//! the command stream so followers receive AppendEntries/Vote, raising RF to 3
+//! without touching routing.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -491,6 +500,55 @@ impl RaftPartition {
         })
     }
 
+    /// Boots a single-voter (RF=1) Raft group whose **log is crash-durable**,
+    /// stored under `log_dir` (milestone B). Unlike [`bootstrap_single`], the
+    /// replicated log survives a restart: reopening the same `log_dir` replays the
+    /// durable entries back through the (volatile) state machine to reconstruct
+    /// engine state. `initialize` is skipped when the log already exists, so this
+    /// is the same call for a first boot and a recovery boot.
+    pub async fn bootstrap_single_durable(
+        node_id: NodeId,
+        partition_id: u64,
+        addr: String,
+        journal: Journal,
+        log_dir: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let config = Arc::new(
+            Config {
+                heartbeat_interval: 250,
+                election_timeout_min: 500,
+                election_timeout_max: 1000,
+                ..Default::default()
+            }
+            .validate()?,
+        );
+
+        let log_store = crate::raft_logstore::RaftLogStore::open(log_dir)?;
+        let state_machine = Arc::new(PartitionStateMachine::new(journal, partition_id));
+        let raft = openraft::Raft::new(
+            node_id,
+            config,
+            PartitionNetwork,
+            log_store,
+            state_machine,
+        )
+        .await?;
+
+        // A fresh log needs the one-shot membership bootstrap; a recovered log
+        // already carries it, so initializing again would be an error.
+        if !raft.is_initialized().await? {
+            let mut members = BTreeMap::new();
+            members.insert(node_id, BasicNode::new(addr));
+            raft.initialize(members).await?;
+        }
+
+        Ok(Self {
+            raft,
+            node_id,
+            partition_id,
+        })
+    }
+
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
     /// it once committed, returning the events it produced. At RF=1 this commits
     /// as soon as the local log write lands.
@@ -570,5 +628,84 @@ mod tests {
         );
 
         part.raft.shutdown().await.expect("clean shutdown");
+    }
+
+    fn unique_log_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nanobpmn-raftlog-{}-{tag}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn durable_log_survives_restart_and_replays() {
+        let log_dir = unique_log_dir("restart");
+
+        // Boot 1: deploy a process through a crash-durable Raft log, then stop the
+        // node (simulating a crash) — the engine state machine is volatile, so all
+        // that persists is the durable log under `log_dir`.
+        {
+            let part = RaftPartition::bootstrap_single_durable(
+                0,
+                0,
+                "http://self".into(),
+                Journal::in_memory_partition(0),
+                &log_dir,
+            )
+            .await
+            .expect("bootstrap durable raft");
+
+            let deploy_events = part.propose(deploy_command(), 1_000).await.expect("deploy");
+            assert!(
+                deploy_events
+                    .iter()
+                    .any(|e| matches!(e, Event::ProcessDeployed { .. })),
+                "deploy applied on first boot (got {deploy_events:?})"
+            );
+            part.raft.shutdown().await.expect("clean shutdown");
+        }
+
+        // Boot 2: a brand-new, EMPTY engine + state machine reopens the same log
+        // directory. If the durable log replays correctly, the previously deployed
+        // process is known again — so creating an instance of it must succeed even
+        // though nothing about the deploy lived in this process's memory.
+        {
+            let part = RaftPartition::bootstrap_single_durable(
+                0,
+                0,
+                "http://self".into(),
+                Journal::in_memory_partition(0),
+                &log_dir,
+            )
+            .await
+            .expect("recover durable raft");
+
+            let create_events = part
+                .propose(
+                    Command::CreateInstance {
+                        process_id: "p".into(),
+                        variables: Default::default(),
+                        tags: Vec::new(),
+                        business_id: None,
+                    },
+                    2_000,
+                )
+                .await
+                .expect("create after recovery");
+            assert!(
+                create_events
+                    .iter()
+                    .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })),
+                "the deploy replayed from the durable log, so create succeeded \
+                 after restart (got {create_events:?})"
+            );
+            part.raft.shutdown().await.expect("clean shutdown");
+        }
+
+        let _ = std::fs::remove_dir_all(&log_dir);
     }
 }
