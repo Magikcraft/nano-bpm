@@ -323,3 +323,77 @@ pub fn record_create(protocol: &str) {
 pub fn record_job_completion(protocol: &str) {
     METRICS.job_completions_total.with_label_values(&[protocol]).inc();
 }
+
+/// A plain, dependency-free snapshot of the current metric values, taken in one
+/// pass over the process-global registry handles. The console maps this to a
+/// JSON DTO; throughput **rates** are derived client-side from the deltas of two
+/// successive snapshots (so this stays a pure point-in-time reading).
+///
+/// Every field is a cheap atomic load (`get`) or a histogram sum/count read — no
+/// text encoding, no allocation, no labels lookup beyond the two protocol-split
+/// counters. Safe to poll at ~1 Hz from the dashboard with negligible overhead.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+pub struct MetricsSnapshot {
+    // Throughput counters (monotonic; rates derived from deltas).
+    pub creates_rest: u64,
+    pub creates_stream: u64,
+    pub completions_rest: u64,
+    pub completions_stream: u64,
+
+    // Live gauges.
+    pub stream_connections_active: i64,
+    pub commit_inflight: i64,
+
+    // Journal / durability counters.
+    pub commits_total: u64,
+    pub writes_total: u64,
+    pub bytes_total: u64,
+    pub stream_credit_stalls_total: u64,
+
+    // Histogram aggregates (sum is in the metric's unit; mean = sum/count).
+    pub fsync_seconds_sum: f64,
+    pub fsync_count: u64,
+    pub commit_wait_seconds_sum: f64,
+    pub commit_wait_count: u64,
+    pub commit_batch_size_sum: f64,
+    pub commit_batch_count: u64,
+    pub frame_processing_seconds_sum: f64,
+    pub frame_processing_count: u64,
+
+    // Writer duty-cycle counters (busy / (busy+idle) = saturation).
+    pub writer_idle_seconds: f64,
+    pub writer_busy_seconds: f64,
+}
+
+/// Reads every metric handle once and returns a point-in-time snapshot.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+pub fn snapshot() -> MetricsSnapshot {
+    let m = &*METRICS;
+    MetricsSnapshot {
+        creates_rest: m.creates_total.with_label_values(&["rest"]).get(),
+        creates_stream: m.creates_total.with_label_values(&["stream"]).get(),
+        completions_rest: m.job_completions_total.with_label_values(&["rest"]).get(),
+        completions_stream: m.job_completions_total.with_label_values(&["stream"]).get(),
+
+        stream_connections_active: m.stream_connections_active.get(),
+        commit_inflight: m.inflight.get(),
+
+        commits_total: m.commits_total.get(),
+        writes_total: m.writes_total.get(),
+        bytes_total: m.bytes_total.get(),
+        stream_credit_stalls_total: m.stream_credit_stalls_total.get(),
+
+        fsync_seconds_sum: m.fsync_seconds.get_sample_sum(),
+        fsync_count: m.fsync_seconds.get_sample_count(),
+        commit_wait_seconds_sum: m.commit_wait_seconds.get_sample_sum(),
+        commit_wait_count: m.commit_wait_seconds.get_sample_count(),
+        commit_batch_size_sum: m.commit_batch_size.get_sample_sum(),
+        commit_batch_count: m.commit_batch_size.get_sample_count(),
+        frame_processing_seconds_sum: m.stream_frame_processing_seconds.get_sample_sum(),
+        frame_processing_count: m.stream_frame_processing_seconds.get_sample_count(),
+
+        writer_idle_seconds: m.writer_idle_seconds.get(),
+        writer_busy_seconds: m.writer_busy_seconds.get(),
+    }
+}

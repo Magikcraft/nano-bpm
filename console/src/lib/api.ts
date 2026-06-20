@@ -148,6 +148,37 @@ export interface WorkerLogLine {
   text: string;
 }
 
+// ---- Metrics dashboard ----------------------------------------------------
+
+/// A point-in-time snapshot from `/console/api/metrics`. Counters are monotonic;
+/// the dashboard derives throughput rates from the deltas of successive polls.
+export interface MetricsSnapshot {
+  timestampMs: number;
+  activeInstances: number;
+
+  createsRest: number;
+  createsStream: number;
+  createsTotal: number;
+  completionsRest: number;
+  completionsStream: number;
+  completionsTotal: number;
+
+  connectionsActive: number;
+  commitInflight: number;
+
+  commitsTotal: number;
+  writesTotal: number;
+  bytesTotal: number;
+  creditStallsTotal: number;
+
+  fsyncMeanMs: number;
+  commitWaitMeanMs: number;
+  commitBatchMean: number;
+  frameProcessingMeanMs: number;
+
+  writerBusyRatio: number;
+}
+
 /// Fetches a plaintext body from the console API (used for worker file content,
 /// which is served as text/plain rather than JSON).
 async function getText(path: string): Promise<string> {
@@ -178,6 +209,7 @@ async function send<T>(
 
 export const api = {
   topology: () => getJson<Topology>("/topology"),
+  metrics: () => getJson<MetricsSnapshot>("/metrics"),
   instances: () => getJson<Instance[]>("/instances"),
   instanceDetail: (key: string) =>
     getJson<InstanceDetail>(`/instances/${key}`),

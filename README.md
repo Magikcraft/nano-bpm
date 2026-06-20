@@ -782,9 +782,15 @@ time and embedded alongside the UI, so nothing is fetched from a CDN. (These
 root routes are part of the `console` feature; the default gateway build serves
 neither and keeps its original startup output.)
 
-The console has four tabs:
+The console has five tabs:
 
 - **Topology** — cluster/partition/Raft overview.
+- **Metrics** — a live performance dashboard (process starts/s, jobs/s, active
+  processes, connected clients, commit pipeline depth, journal/fsync/commit-wait
+  means, writer duty cycle) with inline sparklines. Throughput rates are derived
+  client-side from the gateway's Prometheus surface (`/metrics`);
+  active-process count is read on demand only while the dashboard is open, so it
+  never perturbs a running load test. Handy for performance demos and debugging.
 - **Modeler** — a bpmn-js editor backed by a workspace model library. Create,
   edit, deploy (idempotent), pull a deployed model back from the engine, and
   duplicate. Each model shows its deploy status relative to the engine

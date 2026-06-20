@@ -3,9 +3,11 @@ import Topology from "./views/Topology";
 import Modeler from "./views/Modeler";
 import Explorer from "./views/Explorer";
 import Workers from "./views/Workers";
+import Metrics from "./views/Metrics";
 
 const navItems = [
   { to: "/topology", label: "Topology" },
+  { to: "/metrics", label: "Metrics" },
   { to: "/modeler", label: "Modeler" },
   { to: "/explorer", label: "Explorer" },
   { to: "/workers", label: "Workers" },
@@ -42,6 +44,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/topology" replace />} />
           <Route path="/topology" element={<Topology />} />
+          <Route path="/metrics" element={<Metrics />} />
           <Route path="/modeler" element={<Modeler />} />
           <Route path="/explorer" element={<Explorer />} />
           <Route path="/workers" element={<Workers />} />

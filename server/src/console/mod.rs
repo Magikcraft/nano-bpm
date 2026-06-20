@@ -54,6 +54,7 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/swagger/", get(swagger_index))
         .route("/swagger/{*path}", get(swagger_asset))
         .route("/console/api/topology", get(topology))
+        .route("/console/api/metrics", get(metrics_snapshot))
         .route("/console/api/instances", get(instances))
         .route("/console/api/instances/{key}", get(instance_detail))
         .route("/console/api/stream", get(stream))
@@ -243,6 +244,101 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
         gateway_version: env!("CARGO_PKG_VERSION").to_string(),
         nodes,
         partitions,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Metrics dashboard API
+// ---------------------------------------------------------------------------
+
+/// A point-in-time metrics snapshot for the dashboard. Counters are monotonic;
+/// the frontend derives throughput **rates** from the deltas of two successive
+/// polls (so this endpoint stays a cheap, stateless reading). `activeInstances`
+/// is read on demand from the read model only when this endpoint is polled — it
+/// is deliberately NOT an always-on `COUNT` in the engine tick loop, so opening
+/// the dashboard never perturbs a running performance demo.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetricsDto {
+    /// Server clock at snapshot time (ms). The frontend uses successive
+    /// timestamps as the exact dt for rate computation.
+    timestamp_ms: u64,
+    /// Active (non-terminal) process instances in this node's read model.
+    active_instances: i64,
+
+    // Throughput counters (monotonic, split by protocol).
+    creates_rest: u64,
+    creates_stream: u64,
+    creates_total: u64,
+    completions_rest: u64,
+    completions_stream: u64,
+    completions_total: u64,
+
+    // Live gauges.
+    connections_active: i64,
+    commit_inflight: i64,
+
+    // Durability counters.
+    commits_total: u64,
+    writes_total: u64,
+    bytes_total: u64,
+    credit_stalls_total: u64,
+
+    // Derived means (ms / count) from histogram aggregates — convenient for the
+    // cards; the frontend doesn't have to carry sum+count itself.
+    fsync_mean_ms: f64,
+    commit_wait_mean_ms: f64,
+    commit_batch_mean: f64,
+    frame_processing_mean_ms: f64,
+
+    // Writer duty cycle: busy / (busy + idle) over all time. A value near 1.0
+    // means the single journal writer is saturated.
+    writer_busy_ratio: f64,
+}
+
+/// `GET /console/api/metrics` — the metrics dashboard's data source. Reads the
+/// process-global Prometheus handles in one pass plus the live active-instance
+/// count, and maps them to a camelCase DTO with a few convenience means.
+async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> {
+    let s = crate::metrics::snapshot();
+
+    let mean_ms = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 * 1000.0 };
+    let mean = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 };
+    let busy_ratio = {
+        let total = s.writer_busy_seconds + s.writer_idle_seconds;
+        if total == 0.0 { 0.0 } else { s.writer_busy_seconds / total }
+    };
+
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Json(MetricsDto {
+        timestamp_ms,
+        active_instances: server.store.active_instance_count() as i64,
+
+        creates_rest: s.creates_rest,
+        creates_stream: s.creates_stream,
+        creates_total: s.creates_rest + s.creates_stream,
+        completions_rest: s.completions_rest,
+        completions_stream: s.completions_stream,
+        completions_total: s.completions_rest + s.completions_stream,
+
+        connections_active: s.stream_connections_active,
+        commit_inflight: s.commit_inflight,
+
+        commits_total: s.commits_total,
+        writes_total: s.writes_total,
+        bytes_total: s.bytes_total,
+        credit_stalls_total: s.stream_credit_stalls_total,
+
+        fsync_mean_ms: mean_ms(s.fsync_seconds_sum, s.fsync_count),
+        commit_wait_mean_ms: mean_ms(s.commit_wait_seconds_sum, s.commit_wait_count),
+        commit_batch_mean: mean(s.commit_batch_size_sum, s.commit_batch_count),
+        frame_processing_mean_ms: mean_ms(s.frame_processing_seconds_sum, s.frame_processing_count),
+
+        writer_busy_ratio: busy_ratio,
     })
 }
 
