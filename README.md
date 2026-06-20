@@ -790,10 +790,13 @@ The console has five tabs:
   the round-trip latency — so a down or lagging node is visible at a glance.
 - **Metrics** — a live performance dashboard (process starts/s, jobs/s, active
   processes, connected clients, commit pipeline depth, journal/fsync/commit-wait
-  means, writer duty cycle) with inline sparklines. Throughput rates are derived
-  client-side from the gateway's Prometheus surface (`/metrics`);
-  active-process count is read on demand only while the dashboard is open, so it
-  never perturbs a running load test. Handy for performance demos and debugging.
+  means, writer duty cycle, resident memory) with inline sparklines. Throughput
+  rates are derived client-side from the gateway's Prometheus surface
+  (`/metrics`); active-process count is read on demand only while the dashboard
+  is open, so it never perturbs a running load test. In a multi-node cluster it
+  also shows a **per-node breakdown** (active/created/completed/clients/memory)
+  plus a reachable-node aggregate, by probing each peer's
+  `GET /console/api/metrics`. Handy for performance demos and debugging.
 - **Modeler** — a bpmn-js editor backed by a workspace model library. Create,
   edit, deploy (idempotent), pull a deployed model back from the engine, and
   duplicate. Each model shows its deploy status relative to the engine

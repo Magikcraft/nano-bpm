@@ -59,6 +59,35 @@ export default function Metrics() {
     setSamples([]);
   };
 
+  // Cluster-wide metrics: per-node breakdown + aggregate. Probes every peer, so
+  // a slower cadence than the local 1 Hz poll. Cluster throughput is derived
+  // from successive deltas of the aggregate counters.
+  const { data: cluster } = useQuery({
+    queryKey: ["clusterMetrics"],
+    queryFn: api.clusterMetrics,
+    refetchInterval: paused ? false : 2000,
+  });
+  const clusterPrev = useRef<{ t: number; creates: number; completions: number } | null>(null);
+  const [clusterRates, setClusterRates] = useState<{ starts: number; jobs: number } | null>(null);
+  useEffect(() => {
+    if (!cluster) return;
+    const agg = cluster.aggregate;
+    const p = clusterPrev.current;
+    clusterPrev.current = {
+      t: cluster.checkedAtMs,
+      creates: agg.createsTotal,
+      completions: agg.completionsTotal,
+    };
+    if (p && cluster.checkedAtMs > p.t) {
+      const dt = (cluster.checkedAtMs - p.t) / 1000;
+      setClusterRates({
+        starts: Math.max(0, (agg.createsTotal - p.creates) / dt),
+        jobs: Math.max(0, (agg.completionsTotal - p.completions) / dt),
+      });
+    }
+  }, [cluster]);
+  const isCluster = (cluster?.aggregate.totalNodes ?? 1) > 1;
+
   const latest = samples[samples.length - 1];
 
   return (
@@ -147,8 +176,77 @@ export default function Metrics() {
               <Stat label="Jobs completed" value={data.completionsTotal.toLocaleString()} sub={`rest ${data.completionsRest.toLocaleString()} · stream ${data.completionsStream.toLocaleString()}`} />
               <Stat label="Journal written" value={fmtBytes(data.bytesTotal)} sub={`${data.writesTotal.toLocaleString()} writes`} />
               <Stat label="Group commits" value={data.commitsTotal.toLocaleString()} />
+              {data.residentBytes != null && (
+                <Stat label="Memory (resident)" value={fmtBytes(data.residentBytes)} />
+              )}
             </div>
           </section>
+
+          {/* Cluster breakdown (only when this is a multi-node cluster) */}
+          {isCluster && cluster && (
+            <section>
+              <div className="mb-3 flex items-baseline justify-between">
+                <h2 className="text-sm font-medium uppercase tracking-wide text-zinc-500">
+                  Cluster
+                </h2>
+                <span className="text-xs text-zinc-500">
+                  {cluster.aggregate.reachableNodes}/{cluster.aggregate.totalNodes} nodes up
+                </span>
+              </div>
+              <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+                <Stat label="Cluster starts/s" value={fmt(clusterRates?.starts ?? 0, 0)} accent="emerald" />
+                <Stat label="Cluster jobs/s" value={fmt(clusterRates?.jobs ?? 0, 0)} accent="sky" />
+                <Stat label="Active (cluster)" value={cluster.aggregate.activeInstances.toLocaleString()} />
+                <Stat label="Clients (cluster)" value={cluster.aggregate.connectionsActive.toLocaleString()} />
+                <Stat label="Memory (cluster)" value={fmtBytes(cluster.aggregate.residentBytes)} />
+              </div>
+              <div className="overflow-x-auto rounded-lg border border-zinc-800">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-800 text-left text-zinc-500">
+                      <th className="px-3 py-2 font-medium">Node</th>
+                      <th className="px-3 py-2 font-medium">Status</th>
+                      <th className="px-3 py-2 text-right font-medium">Active</th>
+                      <th className="px-3 py-2 text-right font-medium">Created</th>
+                      <th className="px-3 py-2 text-right font-medium">Completed</th>
+                      <th className="px-3 py-2 text-right font-medium">Clients</th>
+                      <th className="px-3 py-2 text-right font-medium">In-flight</th>
+                      <th className="px-3 py-2 text-right font-medium">Memory</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cluster.nodes.map((n) => (
+                      <tr key={n.nodeId} className="border-b border-zinc-900 last:border-0">
+                        <td className="px-3 py-2">
+                          <span className="font-medium">node {n.nodeId}</span>
+                          {n.isSelf && (
+                            <span className="ml-2 rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
+                              this
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2">
+                          {n.reachable ? (
+                            <span className="text-emerald-400">● up</span>
+                          ) : (
+                            <span className="text-red-400" title={n.error ?? ""}>
+                              ● {n.error ?? "down"}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.activeInstances.toLocaleString() ?? "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.createsTotal.toLocaleString() ?? "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.completionsTotal.toLocaleString() ?? "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.connectionsActive.toLocaleString() ?? "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.commitInflight.toLocaleString() ?? "—"}</td>
+                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.residentBytes != null ? fmtBytes(n.metrics.residentBytes) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
 
           <section>
             <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">

@@ -56,6 +56,7 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/topology", get(topology))
         .route("/console/api/cluster/health", get(cluster_health))
         .route("/console/api/metrics", get(metrics_snapshot))
+        .route("/console/api/cluster/metrics", get(cluster_metrics))
         .route("/console/api/instances", get(instances))
         .route("/console/api/instances/{key}", get(instance_detail))
         .route("/console/api/stream", get(stream))
@@ -406,7 +407,7 @@ async fn probe_peer(base_url: &str) -> Result<(Option<String>, Duration), String
 /// is read on demand from the read model only when this endpoint is polled — it
 /// is deliberately NOT an always-on `COUNT` in the engine tick loop, so opening
 /// the dashboard never perturbs a running performance demo.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MetricsDto {
     /// Server clock at snapshot time (ms). The frontend uses successive
@@ -443,12 +444,17 @@ struct MetricsDto {
     // Writer duty cycle: busy / (busy + idle) over all time. A value near 1.0
     // means the single journal writer is saturated.
     writer_busy_ratio: f64,
+
+    /// Resident memory (jemalloc `stats.resident`, bytes) — the figure that
+    /// tracks the process's real footprint. `null` on non-jemalloc targets.
+    #[serde(default)]
+    resident_bytes: Option<u64>,
 }
 
-/// `GET /console/api/metrics` — the metrics dashboard's data source. Reads the
-/// process-global Prometheus handles in one pass plus the live active-instance
-/// count, and maps them to a camelCase DTO with a few convenience means.
-async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> {
+/// Builds this node's metrics snapshot DTO. Shared by `GET /console/api/metrics`
+/// (the local dashboard) and the self entry of the cluster-wide aggregation, so
+/// both report identical numbers.
+fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
     let s = crate::metrics::snapshot();
 
     let mean_ms = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 * 1000.0 };
@@ -463,7 +469,7 @@ async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> 
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    Json(MetricsDto {
+    MetricsDto {
         timestamp_ms,
         active_instances: server.store.active_instance_count() as i64,
 
@@ -488,7 +494,172 @@ async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> 
         frame_processing_mean_ms: mean_ms(s.frame_processing_seconds_sum, s.frame_processing_count),
 
         writer_busy_ratio: busy_ratio,
-    })
+
+        resident_bytes: crate::memory::resident_bytes().map(|b| b as u64),
+    }
+}
+
+/// `GET /console/api/metrics` — the metrics dashboard's data source. Reads the
+/// process-global Prometheus handles in one pass plus the live active-instance
+/// count, and maps them to a camelCase DTO with a few convenience means.
+async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> {
+    Json(build_local_metrics(&server))
+}
+
+// ---------------------------------------------------------------------------
+// Cluster-wide metrics (per-node aggregation)
+// ---------------------------------------------------------------------------
+
+/// Per-node metrics plus a cluster aggregate, for the dashboard's cluster view.
+/// Each peer's `GET /console/api/metrics` is probed concurrently; unreachable
+/// peers are reported with `reachable=false` and contribute nothing to the
+/// aggregate. Self is read locally (no round-trip).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterMetricsDto {
+    checked_at_ms: u64,
+    nodes: Vec<NodeMetricsDto>,
+    aggregate: AggregateMetricsDto,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeMetricsDto {
+    node_id: u32,
+    address: String,
+    is_self: bool,
+    reachable: bool,
+    error: Option<String>,
+    metrics: Option<MetricsDto>,
+}
+
+/// Sums of the headline counters/gauges over all reachable nodes. Cluster-wide
+/// throughput is derived client-side from successive deltas of `*_total`.
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AggregateMetricsDto {
+    reachable_nodes: u32,
+    total_nodes: u32,
+    active_instances: i64,
+    creates_total: u64,
+    completions_total: u64,
+    connections_active: i64,
+    commit_inflight: i64,
+    resident_bytes: u64,
+}
+
+/// `GET /console/api/cluster/metrics` — probes every node's metrics and returns
+/// the per-node breakdown plus a reachable-node aggregate.
+async fn cluster_metrics(State(server): State<ServerImpl>) -> Json<ClusterMetricsDto> {
+    let topology = server.engine.topology();
+    let self_id = topology.node_id;
+    let num_nodes = topology.num_nodes();
+
+    let probes = (0..num_nodes).map(|node| {
+        let is_self = node == self_id;
+        let address = topology.peer_addr(node).unwrap_or("").to_string();
+        let server = server.clone();
+        async move {
+            if is_self {
+                return NodeMetricsDto {
+                    node_id: node,
+                    address,
+                    is_self: true,
+                    reachable: true,
+                    error: None,
+                    metrics: Some(build_local_metrics(&server)),
+                };
+            }
+            match probe_peer_metrics(&address).await {
+                Ok(metrics) => NodeMetricsDto {
+                    node_id: node,
+                    address,
+                    is_self: false,
+                    reachable: true,
+                    error: None,
+                    metrics: Some(metrics),
+                },
+                Err(err) => NodeMetricsDto {
+                    node_id: node,
+                    address,
+                    is_self: false,
+                    reachable: false,
+                    error: Some(err),
+                    metrics: None,
+                },
+            }
+        }
+    });
+
+    let nodes = futures_util::future::join_all(probes).await;
+
+    let mut aggregate = AggregateMetricsDto {
+        total_nodes: num_nodes,
+        ..Default::default()
+    };
+    for n in &nodes {
+        if let Some(m) = &n.metrics {
+            aggregate.reachable_nodes += 1;
+            aggregate.active_instances += m.active_instances;
+            aggregate.creates_total += m.creates_total;
+            aggregate.completions_total += m.completions_total;
+            aggregate.connections_active += m.connections_active;
+            aggregate.commit_inflight += m.commit_inflight;
+            aggregate.resident_bytes += m.resident_bytes.unwrap_or(0);
+        }
+    }
+
+    let checked_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Json(ClusterMetricsDto { checked_at_ms, nodes, aggregate })
+}
+
+/// Probes one peer's `GET {base_url}/console/api/metrics` and parses its
+/// [`MetricsDto`]. A peer built without the `console` feature returns 404 here
+/// (mapped to an error string); the always-on health probe still reports it up.
+async fn probe_peer_metrics(base_url: &str) -> Result<MetricsDto, String> {
+    use http_body_util::BodyExt;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    if base_url.is_empty() {
+        return Err("no address configured".to_string());
+    }
+
+    let uri: hyper::Uri = format!("{}/console/api/metrics", base_url.trim_end_matches('/'))
+        .parse()
+        .map_err(|e| format!("bad peer url: {e}"))?;
+
+    let client: Client<_, http_body_util::Empty<hyper::body::Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let fut = async {
+        let resp = client.get(uri).await.map_err(|e| format!("connect: {e}"))?;
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("read: {e}"))?
+            .to_bytes();
+        Ok::<_, String>((status, body))
+    };
+
+    let (status, body) = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, fut)
+        .await
+        .map_err(|_| "timeout".to_string())??;
+
+    if status.as_u16() == 404 {
+        return Err("no console on peer".to_string());
+    }
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+
+    serde_json::from_slice::<MetricsDto>(&body).map_err(|e| format!("parse: {e}"))
 }
 
 // ---------------------------------------------------------------------------

@@ -194,6 +194,34 @@ export interface MetricsSnapshot {
   frameProcessingMeanMs: number;
 
   writerBusyRatio: number;
+  residentBytes: number | null;
+}
+
+/// Per-node metrics + cluster aggregate from `/console/api/cluster/metrics`.
+export interface NodeMetrics {
+  nodeId: number;
+  address: string;
+  isSelf: boolean;
+  reachable: boolean;
+  error: string | null;
+  metrics: MetricsSnapshot | null;
+}
+
+export interface AggregateMetrics {
+  reachableNodes: number;
+  totalNodes: number;
+  activeInstances: number;
+  createsTotal: number;
+  completionsTotal: number;
+  connectionsActive: number;
+  commitInflight: number;
+  residentBytes: number;
+}
+
+export interface ClusterMetrics {
+  checkedAtMs: number;
+  nodes: NodeMetrics[];
+  aggregate: AggregateMetrics;
 }
 
 /// Fetches a plaintext body from the console API (used for worker file content,
@@ -228,6 +256,7 @@ export const api = {
   topology: () => getJson<Topology>("/topology"),
   clusterHealth: () => getJson<ClusterHealth>("/cluster/health"),
   metrics: () => getJson<MetricsSnapshot>("/metrics"),
+  clusterMetrics: () => getJson<ClusterMetrics>("/cluster/metrics"),
   instances: () => getJson<Instance[]>("/instances"),
   instanceDetail: (key: string) =>
     getJson<InstanceDetail>(`/instances/${key}`),
