@@ -21,12 +21,16 @@
 mod example;
 mod hypothesize;
 mod llm;
+mod production;
 mod rank;
 mod sim;
 
 pub use example::example_scenario;
 pub use hypothesize::run_hypothesis;
 pub use llm::{LlmConfig, LlmOverride};
+pub use production::build_baseline;
+#[allow(unused_imports)]
+pub use production::ProductionBaseline;
 #[allow(unused_imports)]
 pub use rank::{run_scenario, HarnessReport, VariantResult};
 

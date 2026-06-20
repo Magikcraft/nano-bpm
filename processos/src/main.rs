@@ -25,7 +25,9 @@ use axum::{
 use serde::Deserialize;
 
 use crate::contracts::NanoClient;
-use crate::harness::{example_scenario, run_hypothesis, run_scenario, LlmConfig, LlmOverride, Scenario};
+use crate::harness::{
+    build_baseline, example_scenario, run_hypothesis, run_scenario, LlmConfig, LlmOverride, Scenario,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -75,6 +77,7 @@ async fn main() {
         .route("/api/harness/example/run", get(harness_example_run))
         .route("/api/harness/run", post(harness_run))
         .route("/api/harness/hypothesize", post(harness_hypothesize))
+        .route("/api/harness/production", get(harness_production))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -187,6 +190,45 @@ async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoRe
     }
     match run_hypothesis(&req.scenario, &cfg, req.include_baked).await {
         Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// Query for the production live-source baseline path.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionQuery {
+    /// Which process to baseline. When absent, the busiest sampled process is used.
+    process_id: Option<String>,
+    /// How many recent trace summaries to scan.
+    limit: Option<usize>,
+    /// How many of those to pull full detail for (per-element aggregation).
+    sample: Option<usize>,
+}
+
+/// `GET /api/harness/production` — the **generation-skipped** production path:
+/// fold the live cluster's traces (T1 contract) into the baseline a candidate
+/// search must beat for one process. On a Nano read failure we return 502; on an
+/// empty/unknown process we return 422.
+async fn harness_production(
+    State(state): State<AppState>,
+    Query(q): Query<ProductionQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let sample = q.sample.unwrap_or(50).clamp(1, 500);
+    match build_baseline(&state.nano, q.process_id.as_deref(), limit, sample).await {
+        Ok(baseline) => Json(baseline).into_response(),
+        // A read-contract failure surfaces the underlying GET error; an empty or
+        // unknown-process result is a request the caller can fix, so 422.
+        Err(e) if e.starts_with("GET ") || e.starts_with("decode ") => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),

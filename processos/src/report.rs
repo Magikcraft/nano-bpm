@@ -44,6 +44,9 @@ pub struct ProcessInsight {
     pub incident_instances: usize,
     pub avg_duration_ms: Option<u64>,
     pub p95_duration_ms: Option<u64>,
+    /// p99 end-to-end duration — the tail the `process-optimization` doc (§2)
+    /// flags as a signal means alone hide; the live/cluster path must surface it.
+    pub p99_duration_ms: Option<u64>,
     /// The element with the highest average self-duration — the headline bottleneck.
     pub bottleneck: Option<ElementInsight>,
     pub elements: Vec<ElementInsight>,
@@ -212,6 +215,7 @@ fn fold_processes(details: &[InstanceTrace]) -> Vec<ProcessInsight> {
                 incident_instances: p.incident_instances,
                 avg_duration_ms: mean(p.durations.iter().sum(), p.durations.len()),
                 p95_duration_ms: percentile(&p.durations, 95.0),
+                p99_duration_ms: percentile(&p.durations, 99.0),
                 bottleneck,
                 elements,
             }

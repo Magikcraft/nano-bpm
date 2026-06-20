@@ -276,6 +276,52 @@ still measures and ranks every proposal with the SimRunner, so a hallucinated
 reported in `llm.rejected`. This keeps the load-bearing one-way boundary intact:
 the LLM is an *input to ProcessOS's reasoning*, never a path back into Nano.
 
+### 7.5 M3 — what the latent-exploration analysis changes (and doesn't)
+
+`docs/processos-latent-process-exploration.md` widens the *future* optimization
+surface, but it **sharpens and constrains M3 rather than redefining it**:
+
+- **Transform space for M3 stays worker-swaps.** The pattern catalogue (§1) and
+  the discovery loop (§3) are explicitly later work that "changes no engine code."
+  M3 must not pull structural rewrites or pattern discovery forward; it proves
+  *realism, scale, and the production loop* on the existing transform space.
+- **The `ClusterRunner` is the home of the signals the `SimRunner` structurally
+  cannot produce.** The SimRunner runs each input on a *fresh* engine,
+  sequentially — it measures clean per-instance latency/cost but **no
+  cross-instance throughput, no tail under contention, no queue-vs-service split
+  under load**. The exploration doc's §2 names exactly these as missing —
+  *distributions not means (p99/p999), queueMs vs serviceMs, contention context
+  (concurrency, queue depth)*. So the `ClusterRunner`'s result type must be
+  **richer than the SimRunner's** `(avgLatency, avgCost)`: it reports throughput,
+  tail latency (p95/p99), and the queue/service decomposition the live T1 contract
+  already carries per job (`contracts.rs` `queueMs`/`serviceMs`).
+- **Public-surface-only, restated.** Per the exploration doc's footer, every
+  Nano-side need is "a ProcessOS-driven extension to Nano's public surfaces, never
+  an engine-core change." The `ClusterRunner` therefore *creates instances and
+  deploys over the public REST/command-stream*, and *reads over the T1 console
+  contract* — never engine-core, never the journal/read-DB.
+- **No auto-apply in M3.** The doc's safety spectrum (§0) plus its two deferred
+  data investments — a **per-task side-effect/purity profile** and a **delayed
+  correctness signal** — are the prerequisites for *autonomous* application. M3
+  stays in *measure → rank → suggest*; worker swaps are safe to *measure* for
+  cost/latency, and quality-affecting swaps remain gated by the harness's existing
+  expected-output correctness score, never promoted on their own.
+
+**M3 build slices** (in order; each verifiable on its own):
+
+1. **Production live-source baseline (generation-skipped path).** Read the live
+   dataset through the T1 contract and fold it into the *baseline a candidate
+   search must beat* — including the doc's tail signals (p95/**p99**) and the
+   queue/service split. Verifiable against a mock Nano, no cluster required.
+2. **`ClusterRunner` load backend.** Drive a real Nano gateway under concurrent
+   load with workers generated from the scenario's `WorkerModel`s (sleep
+   `latencyMs`, fail at `failureRate`, emit `output`), reusing the perf-matrix
+   load path. Captures throughput + tail + contention. Doubles as a Nano stress
+   test and the live demo.
+3. **Unify candidate evaluation across backends.** A candidate is evaluated by the
+   SimRunner (fast offline what-if) or the ClusterRunner (at-scale realism); the
+   ranking step (§7.2 step 5) is unchanged.
+
 ## 8. Invariants ProcessOS must honour
 
 - **One-way dependency, build-enforced.** Nano never imports ProcessOS; ProcessOS
