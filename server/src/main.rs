@@ -898,6 +898,32 @@ impl ServerImpl {
                 }
             }
             .and_then(|m| wire_variables(Some(m)));
+            // Cluster-wide create placement under Raft, mirroring the Raft-off
+            // path below: round-robin across EVERY partition in the cluster so a
+            // single gateway spreads creates over the whole cluster instead of
+            // concentrating them on the partitions THIS node leads. A placement
+            // that lands on a peer-owned partition is forwarded there; the peer's
+            // `create_forwarded` is Raft-aware and replicates it through its own
+            // partition leader's log (durability preserved). A local placement
+            // (`None`) falls through to `create_rest_via_raft`, which proposes on
+            // a led partition. Without this, a producer connected to one gateway
+            // placed every instance on that node's led partitions only, starving
+            // the rest of the cluster (RF>=2 create imbalance).
+            if let Some(node) = self.engine.next_create_placement() {
+                return Ok(self
+                    .forward_create(
+                        node,
+                        by_id,
+                        by_key,
+                        wire_vars,
+                        tags_vec,
+                        business_id_str,
+                        await_completion,
+                        fetch_variables.cloned(),
+                        request_timeout,
+                    )
+                    .await);
+            }
             return Ok(self
                 .create_rest_via_raft(
                     by_id,
@@ -9711,6 +9737,55 @@ mod clustered_startup_tests {
         );
 
         for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rest_creates_under_raft_spread_across_the_whole_cluster() {
+        // Regression for the RF>=2 create-imbalance bug: a producer connected to
+        // ONE gateway must spread createProcessInstance across EVERY partition in
+        // the cluster (forwarding peer-owned placements to their leaders), not
+        // concentrate every instance on the partitions THIS node leads. Before the
+        // fix the Raft REST create path placed only among `led_partitions()`, so
+        // all creates from node 0 landed on partition 0, starving nodes 1 and 2.
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        // 12 creates over 3 partitions round-robin -> 4 each, so every partition
+        // (and thus every node's leader) must receive instances.
+        let mut partitions = std::collections::BTreeSet::new();
+        for _ in 0..12 {
+            let body = models::ProcessInstanceCreationInstruction::from(
+                models::ProcessInstanceCreationInstructionById::new("intake".to_string()),
+            );
+            let resp = node0
+                .create_process_instance_impl(&body)
+                .await
+                .expect("rest create returns a response");
+            let result = match resp {
+                Resp::Status200_TheProcessInstanceWasCreated(r) => r,
+                other => panic!("rest create through raft should be 200, got {other:?}"),
+            };
+            let instance_key: u64 = result
+                .process_instance_key
+                .0
+                .parse()
+                .expect("numeric instance key");
+            partitions.insert(nanobpmn_engine_core::partition_of(instance_key));
+        }
+
+        assert_eq!(
+            partitions,
+            std::collections::BTreeSet::from([0u64, 1, 2]),
+            "creates from one gateway must spread across all partitions/nodes, got {partitions:?}"
+        );
+
+        for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
