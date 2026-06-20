@@ -164,25 +164,94 @@ Privacy/retention: input bundles contain business data, so Tier B is opt-in,
 per-tenant, with TTL and field-level redaction hooks. Tier A traces can be stored
 with variables reduced to **lineage + hashes** by default.
 
-## 5. Simulation harness — the WASM payoff
+## 5. The role of WASM — cheap, safe, exact simulation
 
-`engine-core` already builds for `wasm32` and is "Send, no threads/locks/I/O." That
-makes it cheap to instantiate **thousands of ephemeral, deterministic engines** in
-a sandbox (server worker pool *or* the browser) and run Monte-Carlo experiments
-**before touching production**:
+WASM is not decoration here; it is specifically what makes the *experimentation*
+half of the loop (§7) economical and trustworthy. The whole canary/optimization
+loop stands on being able to **simulate a candidate before deploying it**, and WASM
+is the leg that holds that up.
 
-- **Trace-driven replay sim:** drive a candidate version with Tier-B bundles
-  sampled from real traffic → high-fidelity estimate of effect on *this* workload.
+### 5.1 Why the engine is WASM-ready by construction
+
+`engine-core` already builds for `wasm32-unknown-unknown` (`engine-core/Cargo.toml`
+states it explicitly) and is a pure `(state, command, now) → events` state machine
+with "no threads, locks or I/O" (`engine.rs`). Two properties follow, and both are
+load-bearing:
+
+- **It is a sandboxable leaf.** No syscalls, no clock, no network — so it drops into
+  a WASM sandbox with nothing to stub, mock, or trust. The host injects time and
+  feeds commands; the module computes and returns events.
+- **It is deterministic across environments.** Because the clock is *injected*
+  (`apply_command_at(cmd, now)`) and the engine reads no ambient state, the same
+  inputs produce the same events **bit-for-bit** whether the module runs on the
+  server, in a browser tab, or on an edge runtime. A simulation result is therefore
+  the *same* answer production would have given — not an approximation of it.
+
+### 5.2 Simulation harness — the headline payoff
+
+Each engine instance is tiny, isolated and I/O-free, so the host can instantiate
+**thousands of ephemeral, deterministic engines** in a sandbox pool (server worker
+threads *or* the browser) and run Monte-Carlo experiments **before touching
+production**:
+
+- **Trace-driven replay sim:** drive a candidate version with Tier-B bundles (§4)
+  sampled from real traffic → a high-fidelity estimate of the effect on *this*
+  workload, not a generic model.
 - **Distributional sim:** fit per-job service-time + arrival + branch-probability
-  distributions from Tier-A aggregates, then generate synthetic load → explore
+  distributions from Tier-A aggregates (§3), then generate synthetic load → explore
   load/scale regimes that have not occurred yet.
 - **Virtual clock:** simulations advance `now` themselves (the engine already takes
-  `now` as a parameter and drives timers via `trigger_timers(now)`), so a day of
-  process time runs in milliseconds and timer-heavy processes are exact.
+  `now` as a parameter and drives timers via `trigger_timers(now)` /
+  `expire_jobs(now)`), so a day of process time runs in milliseconds and
+  timer-heavy processes are reproduced exactly.
+- **Snapshot/restore for branching:** `EngineSnapshot` (state + key-gen/clock
+  scalars) lets a sim fork from any point — run N candidate variants from an
+  identical mid-process state and compare, cheaply.
+
+Single-threadedness is a non-issue: the engine is single-writer by design, so
+parallelism comes from running **many instances** across worker threads, never from
+threads *inside* one engine. That maps perfectly onto the WASM execution model.
 
 This is the differentiator. Few engines can spin up high-fidelity, faster-than-real
-deterministic replicas of themselves at this density; a JVM + Elasticsearch stack
+deterministic replicas of *themselves* at this density; a JVM + Elasticsearch stack
 cannot. It turns "deploy and pray" into "simulate, rank, then canary."
+
+### 5.3 WASM as the safety boundary for machine-generated processes
+
+The optimizer executes process definitions an LLM proposed (§8). Running those — and
+the verification gate's *empirical* leg (replay recorded bundles, diff outcomes) —
+inside a WASM sandbox gives a hard isolation boundary with no host capabilities,
+strict memory bounds, and clean teardown. Untrusted candidate logic cannot reach the
+network, the disk, or other tenants' data; a misbehaving or runaway candidate is
+contained to its module and discarded. This is what makes it tolerable to let an
+autonomous reasoner *generate and run* code at all.
+
+### 5.4 WASM beyond the loop (adjacent payoffs)
+
+The same artifact unlocks capabilities outside the optimization loop, which is why
+investing in the JS/wasm glue compounds:
+
+- **In-browser modeling & simulation:** the console modeler can run the *real*
+  engine locally — a "play this model" button that executes in the browser with no
+  server round-trip and identical semantics, including a token animation driven by
+  the actual event stream.
+- **Edge / mobile execution:** the same engine runs offline on a phone (FFI) or in
+  a Cloudflare/Fastly-style WASM runtime — process execution at the edge. This is
+  also the concrete substance behind the "runs on phones / in a browser" pillar on
+  the public features page.
+
+### 5.5 Honest caveats
+
+- The wasm32 *build target* exists today; the **JS / `wasm-bindgen` glue** to drive
+  the engine from the browser console (or a server-side `wasmtime`/`wasmer` host) is
+  **net-new work**, not yet wired up. The simulation harness assumes that host.
+- **Float determinism** across platforms has minor edge cases. The engine's keys,
+  clock and counters are integers (deterministic everywhere); only `Value`-typed
+  variable conditions could involve floats, and any future *stochastic* construct
+  must take an explicit recorded seed (§2) to stay replayable.
+- A WASM sim host is a **capacity** decision: thousands of instances cost memory
+  even at a few hundred KB each. Pool, cap, and stream results — the same
+  resource-discipline the server already applies.
 
 ## 6. Cost / value model — the objective function
 
