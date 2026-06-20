@@ -328,6 +328,28 @@ surface, but it **sharpens and constrains M3 rather than redefining it**:
    SimRunner (fast offline what-if) or the ClusterRunner (at-scale realism); the
    ranking step (§7.2 step 5) is unchanged.
 
+### 7.6 M3 in the three-regime / co-optimization frame
+
+`docs/processos-deployment-cooptimization.md` reframes structure / binding /
+resourcing as coupled layers of one process→deployment mapping, and adds an
+orthogonal **observability/actuation axis**: (a) offline engine sim, (b)
+queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
+
+- The **SimRunner is regime (a)** (logic-faithful, isolated, no contention model).
+- The **ClusterRunner measurement (slice 2a) is the regime-(c) foundation** —
+  act-and-measure on a real cluster — **and** it produces exactly the
+  distributions a future **regime-(b)** queueing simulator must be *fitted from*:
+  throughput, the e2e tail, and — now — the **per-job-type queue-vs-service split**
+  (`ClusterRunSummary.byJobType`). That split is the discriminator the resource
+  layer turns on: high queue / low service ⇒ *too few workers* (scale); low queue
+  / high service ⇒ *slow worker* (bind/substitute).
+- **Deferred (not M3), recorded so M3 doesn't accidentally encroach):** a regime-(b)
+  discrete-event simulator; a **third (scaling/fleet) control verb**
+  (recommend-by-default, actuate-opt-in, its own public-API design); and
+  **portfolio scope** (cross-process contention ⇒ cross-process resource
+  attribution in ingest + an aggregate objective). M3 stays *measure → rank →
+  suggest* on the existing per-process, worker-swap loop; these widen scope later.
+
 ## 8. Invariants ProcessOS must honour
 
 - **One-way dependency, build-enforced.** Nano never imports ProcessOS; ProcessOS

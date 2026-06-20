@@ -50,6 +50,27 @@ pub struct ClusterRunSummary {
     /// change". Populated only when trace *details* are supplied.
     pub avg_queue_ms: Option<u64>,
     pub avg_service_ms: Option<u64>,
+    /// Per-job-type resource breakdown — the granularity the worker-count question
+    /// ("how many workers does *this job type* need to hold p99 < X?") and the
+    /// regime-(b) queueing simulator are fitted from (see
+    /// `processos-deployment-cooptimization.md` §4.2). Empty when no details.
+    pub by_job_type: Vec<JobTypeStat>,
+}
+
+/// One job type's contention profile across the sampled run: how many jobs ran,
+/// and the queue (broker-wait) vs service (worker) split. A high `avg_queue_ms`
+/// with low `avg_service_ms` points at *too few workers* (scale); the reverse
+/// points at a *slow worker* (bind/substitute) — the lever the split discriminates.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobTypeStat {
+    pub job_type: String,
+    /// Number of sampled job occurrences of this type.
+    pub samples: usize,
+    pub avg_queue_ms: Option<u64>,
+    pub avg_service_ms: Option<u64>,
+    /// Total job failures observed for this type.
+    pub failures: u32,
 }
 
 /// Summarize a cluster run for `process_id` from its live traces. `summaries`
@@ -102,25 +123,47 @@ pub fn summarize_run(
         .filter(|w| *w > 0)
         .map(|w| completed as f64 / (w as f64 / 1000.0));
 
-    // Queue/service split from details (optional, more expensive to fetch).
+    // Queue/service split from details (optional, more expensive to fetch), kept
+    // both in aggregate and broken down per job type.
     let mut queue_sum = 0u64;
     let mut queue_n = 0usize;
     let mut service_sum = 0u64;
     let mut service_n = 0usize;
+    // job_type -> (queue_sum, queue_n, service_sum, service_n, samples, failures)
+    let mut by_type: std::collections::BTreeMap<String, JobTypeAcc> =
+        std::collections::BTreeMap::new();
     for t in details.iter().filter(|t| t.process_id == process_id) {
         for e in &t.elements {
             if let Some(j) = &e.job {
+                let acc = by_type.entry(j.job_type.clone()).or_default();
+                acc.samples += 1;
+                acc.failures += j.failures;
                 if let Some(q) = j.queue_ms {
                     queue_sum += q;
                     queue_n += 1;
+                    acc.queue_sum += q;
+                    acc.queue_n += 1;
                 }
                 if let Some(sv) = j.service_ms {
                     service_sum += sv;
                     service_n += 1;
+                    acc.service_sum += sv;
+                    acc.service_n += 1;
                 }
             }
         }
     }
+
+    let by_job_type: Vec<JobTypeStat> = by_type
+        .into_iter()
+        .map(|(job_type, a)| JobTypeStat {
+            job_type,
+            samples: a.samples,
+            avg_queue_ms: mean(a.queue_sum, a.queue_n),
+            avg_service_ms: mean(a.service_sum, a.service_n),
+            failures: a.failures,
+        })
+        .collect();
 
     ClusterRunSummary {
         process_id: process_id.to_string(),
@@ -136,7 +179,19 @@ pub fn summarize_run(
         e2e_p99_ms: percentile(&durations, 99.0),
         avg_queue_ms: mean(queue_sum, queue_n),
         avg_service_ms: mean(service_sum, service_n),
+        by_job_type,
     }
+}
+
+/// Per-job-type running aggregate while folding trace details.
+#[derive(Default)]
+struct JobTypeAcc {
+    samples: usize,
+    failures: u32,
+    queue_sum: u64,
+    queue_n: usize,
+    service_sum: u64,
+    service_n: usize,
 }
 
 /// Read the live dataset from Nano and summarize the at-scale run for `process_id`
@@ -295,6 +350,51 @@ mod tests {
         let s = summarize_run("order", &summaries, &[detail]);
         assert_eq!(s.avg_queue_ms, Some(60));
         assert_eq!(s.avg_service_ms, Some(20));
+        // The same split appears per job type.
+        assert_eq!(s.by_job_type.len(), 1);
+        let jt = &s.by_job_type[0];
+        assert_eq!(jt.job_type, "payment");
+        assert_eq!(jt.samples, 1);
+        assert_eq!(jt.avg_queue_ms, Some(60));
+        assert_eq!(jt.avg_service_ms, Some(20));
+    }
+
+    #[test]
+    fn per_job_type_breakdown_discriminates_the_lever() {
+        use crate::contracts::{Element, InstanceTrace, Job};
+        // `classify` is queue-bound (60 queue / 5 service => scale workers);
+        // `summarize` is service-bound (5 queue / 90 service => slow worker).
+        let job = |ty: &str, q: u64, sv: u64, f: u32| Element {
+            element_id: ty.into(),
+            duration_ms: Some(q + sv),
+            incidents: 0,
+            job: Some(Job {
+                job_type: ty.into(),
+                queue_ms: Some(q),
+                service_ms: Some(sv),
+                failures: f,
+            }),
+        };
+        let detail = InstanceTrace {
+            instance_key: "1".into(),
+            process_id: "order".into(),
+            version: Some(1),
+            outcome: "completed".into(),
+            duration_ms: Some(160),
+            elements: vec![job("classify", 60, 5, 0), job("summarize", 5, 90, 2)],
+            incidents: vec![],
+        };
+        let summaries = vec![summary("1", "order", "completed", 0, 160, 160)];
+        let s = summarize_run("order", &summaries, &[detail]);
+        let by: std::collections::HashMap<_, _> =
+            s.by_job_type.iter().map(|j| (j.job_type.as_str(), j)).collect();
+        let classify = by["classify"];
+        let summarize = by["summarize"];
+        // queue-bound: queue >> service
+        assert!(classify.avg_queue_ms.unwrap() > classify.avg_service_ms.unwrap());
+        // service-bound: service >> queue, and its failures are attributed here
+        assert!(summarize.avg_service_ms.unwrap() > summarize.avg_queue_ms.unwrap());
+        assert_eq!(summarize.failures, 2);
     }
 
     #[test]
