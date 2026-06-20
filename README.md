@@ -460,6 +460,13 @@ instance finishes).
 See [`docs/distributed-scaling-design.md`](docs/distributed-scaling-design.md) for
 the full design rationale.
 
+> **Roadmap:** beyond the Camunda-compatible engine, see
+> [`docs/process-optimization-design.md`](docs/process-optimization-design.md) for
+> the closed-loop **runtime process optimization** direction — execution trace
+> export, deterministic recorded-input replay, WASM-powered simulation, a cost/SLA
+> model, canary experiments, and an LLM-in-the-loop reasoning plane built on the
+> engine's event-sourced core.
+
 ## Command stream (WebSocket)
 
 Alongside the REST API, the server exposes a single **bidirectional WebSocket**
