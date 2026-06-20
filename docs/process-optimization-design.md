@@ -285,6 +285,31 @@ redeploy is a no-op; a changed model is a new version) and a **create-time route
 - **Traffic-split router** at `CreateInstance`: a policy selects the process version
   per instance by **cohort** (tenant, business-key hash, or %) — e.g. 5% to the
   candidate. Routing already happens at create; this adds version selection.
+
+> **The one engine-side concession: a *generic* routing primitive.** Everything else
+> in the optimization loop lives outside the engine (see §11 / the ProcessOS split),
+> but cohort-based version selection is the single mechanism that *must* exist inside
+> Nano, because only the engine sees the `CreateInstance` and owns version resolution.
+> Keep it strictly **mechanism, not policy**:
+> - Nano exposes a deterministic **version-selection hook** at create time that maps
+>   `(processId, cohort key, deployed versions, a routing table)` → the concrete
+>   `processDefinitionVersion` to instantiate. The routing table is plain data
+>   (`{ processId, weights | cohort predicates → version, default }`), set through the
+>   **public control surface** (a nanobpmn-extension endpoint under `/console/api` or a
+>   `spec-patches` REST addition) and journaled like any other deploy-time fact, so the
+>   decision is durable, auditable, and survives failover.
+> - The cohort key is derived from data the engine already has at create (tenant,
+>   business id / its hash, or a per-instance random draw for a blind %-split). No new
+>   inputs, no wall-clock, **no hidden I/O** — determinism (§11) is preserved: the same
+>   create with the same routing table always resolves to the same version.
+> - **Nano must not know ProcessOS exists.** It stores and applies a routing table;
+>   it has no concept of "experiment", "candidate", "guardrail", or "rollback". Those
+>   are ProcessOS policy that compile *down to* routing-table edits and read back through
+>   the trace/metrics surface. Auto-rollback is just ProcessOS rewriting the table to
+>   100% incumbent — the engine sees an ordinary routing update.
+> - Default/empty table ⇒ today's behaviour exactly (latest version, zero overhead),
+>   honouring the "zero hot-path cost when disabled" invariant.
+
 - **Guardrails + auto-rollback:** watch the candidate's incident-rate / p99 / cost
   vs the incumbent and auto-revert on regression. Use **sequential tests / CUSUM**
   so a decision needs far fewer samples than a fixed-horizon A/B. (This is the same
@@ -376,6 +401,18 @@ record what happened.
 - **Determinism is sacred.** Nothing may introduce a wall-clock read or hidden I/O
   into the engine; all time enters via injected `now`. This is non-negotiable —
   every counterfactual depends on it.
+- **The optimizer is a separate component (ProcessOS), and the dependency is one-way.**
+  Nano handles production; **ProcessOS** (its own crate + webserver) handles
+  optimization — reasoning, simulation, experiment statistics, the LLM and static-
+  analysis tooling, and the cost/feedback ledgers. ProcessOS depends only on Nano's
+  **public surfaces** (the Camunda API it already exposes, the §3 trace/metrics export,
+  and the generic routing-table control endpoint); **Nano never depends on ProcessOS**.
+  Enforce the one-way edge as a build rule, not a guideline — Nano builds and runs with
+  ProcessOS entirely absent. This keeps the engine lean/low-resource/WASM-able and keeps
+  the heavyweight, network-egressing, key-holding reasoning plane behind its own
+  security and scaling boundary. The single engine-side concession is the policy-free
+  routing primitive above (§7); everything else is ProcessOS policy expressed over
+  Nano's public contracts. (Full ProcessOS design: `docs/processos-design.md`.)
 
 ## 12. Open questions / risks
 
