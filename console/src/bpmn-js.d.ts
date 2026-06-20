@@ -18,8 +18,14 @@ declare module "bpmn-js/lib/Modeler" {
   export interface SaveResult {
     xml: string;
   }
+  export interface ModelerOptions {
+    container: HTMLElement;
+    propertiesPanel?: { parent: HTMLElement };
+    additionalModules?: unknown[];
+    moddleExtensions?: Record<string, unknown>;
+  }
   export default class Modeler {
-    constructor(options: { container: HTMLElement });
+    constructor(options: ModelerOptions);
     importXML(xml: string): Promise<ImportResult>;
     createDiagram(): Promise<ImportResult>;
     saveXML(options?: { format?: boolean }): Promise<SaveResult>;
@@ -28,4 +34,22 @@ declare module "bpmn-js/lib/Modeler" {
     off(event: string, callback: (...args: unknown[]) => void): void;
     destroy(): void;
   }
+}
+
+declare module "bpmn-js-properties-panel" {
+  const BpmnPropertiesPanelModule: unknown;
+  const BpmnPropertiesProviderModule: unknown;
+  const ZeebePropertiesProviderModule: unknown;
+  const CamundaPlatformPropertiesProviderModule: unknown;
+  export {
+    BpmnPropertiesPanelModule,
+    BpmnPropertiesProviderModule,
+    ZeebePropertiesProviderModule,
+    CamundaPlatformPropertiesProviderModule,
+  };
+}
+
+declare module "zeebe-bpmn-moddle/resources/zeebe.json" {
+  const value: Record<string, unknown>;
+  export default value;
 }

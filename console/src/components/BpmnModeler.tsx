@@ -1,8 +1,15 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import Modeler from "bpmn-js/lib/Modeler";
+import {
+  BpmnPropertiesPanelModule,
+  BpmnPropertiesProviderModule,
+  ZeebePropertiesProviderModule,
+} from "bpmn-js-properties-panel";
+import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
+import "@bpmn-io/properties-panel/dist/assets/properties-panel.css";
 
 interface RootElement {
   id: string;
@@ -43,6 +50,7 @@ interface BpmnModelerProps {
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
   function BpmnModeler({ onChange, onReady }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
+    const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
     // Suppress the change callback for programmatic loads (import/createDiagram),
     // so opening a model doesn't immediately look dirty.
@@ -53,8 +61,17 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     onReadyRef.current = onReady;
 
     useEffect(() => {
-      if (!containerRef.current) return;
-      const modeler = new Modeler({ container: containerRef.current });
+      if (!containerRef.current || !panelRef.current) return;
+      const modeler = new Modeler({
+        container: containerRef.current,
+        propertiesPanel: { parent: panelRef.current },
+        additionalModules: [
+          BpmnPropertiesPanelModule,
+          BpmnPropertiesProviderModule,
+          ZeebePropertiesProviderModule,
+        ],
+        moddleExtensions: { zeebe: ZeebeModdle },
+      });
       modelerRef.current = modeler;
       const handleChanged = () => {
         if (suppressChange.current) return;
@@ -115,7 +132,15 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       },
     }));
 
-    return <div ref={containerRef} className="h-full w-full bg-white" />;
+    return (
+      <div className="flex h-full w-full">
+        <div ref={containerRef} className="h-full min-w-0 flex-1 bg-white" />
+        <div
+          ref={panelRef}
+          className="bpmn-properties h-full w-80 shrink-0 overflow-auto border-l border-zinc-300 bg-white"
+        />
+      </div>
+    );
   },
 );
 

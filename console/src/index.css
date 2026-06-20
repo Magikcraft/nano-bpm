@@ -29,3 +29,42 @@ body {
   stroke-width: 3px !important;
   fill: #7f1d1d !important;
 }
+
+/*
+ * The console runs `color-scheme: dark`, which makes the browser paint bpmn-js's
+ * popup menus (the "replace element" menu, context-pad popups) and form controls
+ * with light default text on their white surfaces — nearly invisible. bpmn-js
+ * and the properties panel are light-themed widgets, so force dark text and
+ * light controls within them.
+ */
+.djs-popup,
+.djs-popup-body,
+.djs-popup-header,
+.djs-popup .entry,
+.djs-popup .djs-popup-label,
+.djs-popup-group .entry-header {
+  color: #18181b;
+}
+
+.djs-popup {
+  background: #ffffff;
+  color-scheme: light;
+}
+
+.djs-popup input,
+.djs-popup textarea,
+.djs-popup select,
+.djs-search-input input {
+  color: #18181b !important;
+  background: #ffffff !important;
+}
+
+/* Properties panel: keep it a light widget regardless of the dark page. */
+.bpmn-properties {
+  color-scheme: light;
+}
+
+.bpmn-properties .bio-properties-panel {
+  --color-text: #18181b;
+}
+

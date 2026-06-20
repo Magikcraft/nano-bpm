@@ -1,10 +1,14 @@
+import { lazy, Suspense } from "react";
 import { NavLink, Navigate, Route, Routes } from "react-router-dom";
 import Topology from "./views/Topology";
-import Modeler from "./views/Modeler";
-import Explorer from "./views/Explorer";
-import Workers from "./views/Workers";
-import Metrics from "./views/Metrics";
-import Traces from "./views/Traces";
+
+// Route views are code-split so heavy editors (bpmn-js modeler + properties
+// panel, monaco) stay out of the initial bundle and load on navigation.
+const Modeler = lazy(() => import("./views/Modeler"));
+const Explorer = lazy(() => import("./views/Explorer"));
+const Workers = lazy(() => import("./views/Workers"));
+const Metrics = lazy(() => import("./views/Metrics"));
+const Traces = lazy(() => import("./views/Traces"));
 
 const navItems = [
   { to: "/topology", label: "Topology" },
@@ -43,16 +47,24 @@ export default function App() {
       </aside>
 
       <main className="min-w-0 flex-1 overflow-auto">
-        <Routes>
-          <Route path="/" element={<Navigate to="/topology" replace />} />
-          <Route path="/topology" element={<Topology />} />
-          <Route path="/metrics" element={<Metrics />} />
-          <Route path="/modeler" element={<Modeler />} />
-          <Route path="/explorer" element={<Explorer />} />
-          <Route path="/traces" element={<Traces />} />
-          <Route path="/workers" element={<Workers />} />
-          <Route path="*" element={<Navigate to="/topology" replace />} />
-        </Routes>
+        <Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+              Loading…
+            </div>
+          }
+        >
+          <Routes>
+            <Route path="/" element={<Navigate to="/topology" replace />} />
+            <Route path="/topology" element={<Topology />} />
+            <Route path="/metrics" element={<Metrics />} />
+            <Route path="/modeler" element={<Modeler />} />
+            <Route path="/explorer" element={<Explorer />} />
+            <Route path="/traces" element={<Traces />} />
+            <Route path="/workers" element={<Workers />} />
+            <Route path="*" element={<Navigate to="/topology" replace />} />
+          </Routes>
+        </Suspense>
       </main>
     </div>
   );
