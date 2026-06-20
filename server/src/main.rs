@@ -5265,7 +5265,9 @@ impl ServerImpl {
     ) -> Vec<ActivatedJobWithIdentity> {
         let job_type = job_type.to_string();
         let worker = worker.to_string();
-        handle
+        #[cfg(feature = "console")]
+        let worker_for_trace = worker.clone();
+        let activated: Vec<ActivatedJobWithIdentity> = handle
             .with(move |engine| {
                 let now = now_millis();
                 engine
@@ -5292,7 +5294,10 @@ impl ServerImpl {
                     })
                     .collect()
             })
-            .await
+            .await;
+        #[cfg(feature = "console")]
+        self.record_trace_activations(&activated, &worker_for_trace);
+        activated
     }
 
     /// The Raft activation path: replicate an `ActivateJobs` pass through partition
@@ -5341,7 +5346,7 @@ impl ServerImpl {
         let Some(handle) = self.engine_handle_for(p) else {
             return Vec::new();
         };
-        handle
+        let activated: Vec<ActivatedJobWithIdentity> = handle
             .with(move |journal| {
                 let engine = journal.engine();
                 job_keys
@@ -5368,7 +5373,28 @@ impl ServerImpl {
                     })
                     .collect()
             })
-            .await
+            .await;
+        #[cfg(feature = "console")]
+        self.record_trace_activations(&activated, worker);
+        activated
+    }
+
+    /// Feeds a batch of just-activated jobs into the console trace projection.
+    /// Job activation locks are ephemeral — never journaled or exported — so the
+    /// exporter-fed projection cannot observe them; this is the dedicated hook
+    /// that lets a trace show `worker` / `queueMs` / `serviceMs` / `attempts`.
+    /// Cheap: a `Vec` of key pairs and one mutex-guarded fold, off the journal
+    /// commit path. Console builds only.
+    #[cfg(feature = "console")]
+    fn record_trace_activations(&self, activated: &[ActivatedJobWithIdentity], worker: &str) {
+        if activated.is_empty() {
+            return;
+        }
+        let acts: Vec<(u64, u64)> = activated
+            .iter()
+            .map(|a| (a.job.instance_key, a.job.key))
+            .collect();
+        self.trace_store.record_activations(&acts, worker, now_millis());
     }
 
     /// The Raft clock tick for partition `p`: when this node leads `p`, replicate

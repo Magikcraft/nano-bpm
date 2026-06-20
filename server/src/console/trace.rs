@@ -54,6 +54,19 @@ struct Inner {
     /// Latest deployed version per process id (best-effort; an instance's exact
     /// definition version is not carried on `ProcessInstanceCreated`).
     versions: HashMap<String, i32>,
+    /// Activations observed before their `JobCreated` was folded. Job activation
+    /// is not journaled/exported (see module docs), so it is fed directly from the
+    /// activation chokepoint via [`TraceStore::record_activations`]; because the
+    /// exporter is async, a fast worker can activate before the create batch
+    /// projects. Buffered here (keyed by job key) and drained on fold.
+    pending_acts: HashMap<u64, PendingAct>,
+}
+
+/// A job activation seen before its `JobCreated` reached the projection.
+struct PendingAct {
+    worker: String,
+    activated_at: u64,
+    attempts: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +146,7 @@ impl TraceStore {
                 instances: HashMap::new(),
                 order: VecDeque::new(),
                 versions: HashMap::new(),
+                pending_acts: HashMap::new(),
             }),
         }
     }
@@ -153,6 +167,22 @@ impl TraceStore {
         let mut inner = self.inner.lock().unwrap();
         for ev in events {
             inner.apply(ev, now);
+        }
+    }
+
+    /// Records a batch of job activations — `(instance_key, job_key)` pairs all
+    /// locked to `worker` at observation time `now`. Activation locks are
+    /// ephemeral (never journaled/exported), so this is fed straight from the
+    /// activation chokepoint; it is what lets `queueMs` / `serviceMs` / `worker`
+    /// / `attempts` populate. Tolerant of the exporter race: an activation seen
+    /// before its `JobCreated` is buffered and applied on fold.
+    pub fn record_activations(&self, acts: &[(u64, u64)], worker: &str, now: u64) {
+        if acts.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        for &(instance_key, job_key) in acts {
+            inner.record_activation(instance_key, job_key, worker, now);
         }
     }
 
@@ -268,10 +298,13 @@ impl Inner {
                 element_id,
                 job_type,
             } => {
+                // Apply any activation that raced ahead of this fold (see
+                // `pending_acts`). Removed before borrowing the instance.
+                let pending = self.pending_acts.remove(job_key);
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
                     let idx = t.element_mut(*element_instance_key, element_id, now);
-                    t.elements[idx].job = Some(JobTrace {
+                    let mut job = JobTrace {
                         job_key: *job_key,
                         job_type: job_type.clone(),
                         worker: None,
@@ -280,7 +313,13 @@ impl Inner {
                         completed_at: None,
                         attempts: 0,
                         failures: 0,
-                    });
+                    };
+                    if let Some(p) = pending {
+                        job.worker = Some(p.worker);
+                        job.activated_at = Some(p.activated_at);
+                        job.attempts = p.attempts;
+                    }
+                    t.elements[idx].job = Some(job);
                     t.by_job.insert(*job_key, idx);
                 }
             }
@@ -395,6 +434,46 @@ impl Inner {
         while self.order.len() > self.capacity {
             if let Some(old) = self.order.pop_front() {
                 self.instances.remove(&old);
+            }
+        }
+    }
+
+    /// Folds one job activation into its trace, or buffers it if the matching
+    /// `JobCreated` has not been projected yet (exporter race). `activated_at` is
+    /// set on the first activation only (so `queueMs` reflects the initial queue
+    /// wait); `attempts` counts every activation (lease re-activations included).
+    fn record_activation(&mut self, instance_key: u64, job_key: u64, worker: &str, now: u64) {
+        if let Some(t) = self.instances.get_mut(&instance_key) {
+            if let Some(&idx) = t.by_job.get(&job_key) {
+                if let Some(job) = t.elements[idx].job.as_mut() {
+                    job.attempts += 1;
+                    job.worker = Some(worker.to_string());
+                    if job.activated_at.is_none() {
+                        job.activated_at = Some(now);
+                    }
+                    if now > t.last_at {
+                        t.last_at = now;
+                    }
+                    return;
+                }
+            }
+        }
+        // JobCreated not folded yet (or the instance was evicted): buffer it.
+        let entry = self.pending_acts.entry(job_key).or_insert(PendingAct {
+            worker: worker.to_string(),
+            activated_at: now,
+            attempts: 0,
+        });
+        entry.attempts += 1;
+        entry.worker = worker.to_string();
+        if now < entry.activated_at {
+            entry.activated_at = now;
+        }
+        // Defensive bound: stale entries only lose activation metadata for a
+        // since-evicted job, never correctness.
+        if self.pending_acts.len() > self.capacity.saturating_mul(4) {
+            if let Some(&k) = self.pending_acts.keys().find(|&&k| k != job_key) {
+                self.pending_acts.remove(&k);
             }
         }
     }

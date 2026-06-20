@@ -86,6 +86,74 @@ export interface InstanceDetail {
   incidents: Incident[];
 }
 
+// ---- Execution traces (Tier-A trace projection, design doc §3) ------------
+
+export type TraceOutcome = "active" | "completed" | "terminated";
+
+export interface TraceSummary {
+  instanceKey: string;
+  processId: string;
+  version: number | null;
+  businessId: string | null;
+  outcome: TraceOutcome;
+  startedAt: number;
+  endedAt: number | null;
+  durationMs: number | null;
+  elementCount: number;
+  incidentCount: number;
+}
+
+export interface TraceJob {
+  type: string;
+  worker: string | null;
+  createdAt: number;
+  activatedAt: number | null;
+  completedAt: number | null;
+  /** Total parked + service time (createdAt → completedAt). Always reliable. */
+  waitMs: number | null;
+  /** Queue time (createdAt → activatedAt). Needs the activation hook. */
+  queueMs: number | null;
+  /** Service time (activatedAt → completedAt). */
+  serviceMs: number | null;
+  attempts: number;
+  failures: number;
+}
+
+export interface TraceElement {
+  elementId: string;
+  elementInstanceKey: string;
+  scope: string;
+  enteredAt: number;
+  exitedAt: number | null;
+  durationMs: number | null;
+  incidents: number;
+  job: TraceJob | null;
+}
+
+export interface TraceIncident {
+  elementId: string;
+  elementInstanceKey: string;
+  kind: string;
+  reason: string;
+  raisedAt: number;
+  resolvedAt: number | null;
+}
+
+export interface InstanceTrace {
+  instanceKey: string;
+  processId: string;
+  version: number | null;
+  businessId: string | null;
+  tags: string[];
+  startedAt: number;
+  endedAt: number | null;
+  durationMs: number | null;
+  outcome: TraceOutcome;
+  elements: TraceElement[];
+  incidents: TraceIncident[];
+  path: string[];
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(`/console/api${path}`, {
     headers: { Accept: "application/json" },
@@ -260,6 +328,8 @@ export const api = {
   instances: () => getJson<Instance[]>("/instances"),
   instanceDetail: (key: string) =>
     getJson<InstanceDetail>(`/instances/${key}`),
+  traces: (limit = 100) => getJson<TraceSummary[]>(`/traces?limit=${limit}`),
+  trace: (key: string) => getJson<InstanceTrace>(`/traces/${key}`),
   models: () => getJson<ModelSummary[]>("/models"),
   model: (name: string) => getJson<Model>(`/models/${encodeURIComponent(name)}`),
   saveModel: (name: string, xml: string) =>
