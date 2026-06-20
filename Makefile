@@ -43,8 +43,18 @@ release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimize
 	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
 .PHONY: console-frontend
-console-frontend: ## Build the web console SPA (console/ -> console/dist)
+console-frontend: console-wasm ## Build the web console SPA (console/ -> console/dist)
 	cd $(CONSOLE_DIR) && npm install && npm run build
+
+.PHONY: console-wasm
+console-wasm: ## Regenerate the in-browser test-run engine (engine-wasm -> console/src/wasm). Needs wasm-pack; falls back to the committed artifacts if absent.
+	@if command -v wasm-pack >/dev/null 2>&1; then \
+		echo "Regenerating console/src/wasm via wasm-pack..."; \
+		cd $(PROJECT_ROOT)/engine-wasm && wasm-pack build --target web --release --out-dir ../console/src/wasm --out-name nanobpmn_engine; \
+		rm -f $(CONSOLE_DIR)/src/wasm/.gitignore; \
+	else \
+		echo "wasm-pack not found; using the committed console/src/wasm artifacts (run 'cargo install wasm-pack' to regenerate)."; \
+	fi
 
 .PHONY: console
 console: release ## Alias for `release` (the self-contained single-node distribution)

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { lazy, Suspense, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
@@ -11,6 +11,10 @@ import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import BpmnModeler, {
   type BpmnModelerHandle,
 } from "../components/BpmnModeler";
+
+// The test-run panel pulls in the wasm engine + bpmn-js viewer; lazy-load it so
+// it stays out of the main bundle and only loads when the user runs a model.
+const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 
 function statusBadge(status: DeployStatus): { label: string; cls: string } {
   switch (status) {
@@ -37,6 +41,12 @@ export default function Modeler() {
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(
     null,
   );
+  const [testXml, setTestXml] = useState<string | null>(null);
+
+  async function startTestRun() {
+    const xml = await modelerRef.current?.getXml();
+    if (xml) setTestXml(xml);
+  }
 
   // The engine read model advances on deploy, refreshing deploy-status badges.
   useLiveInvalidation(["models"]);
@@ -339,6 +349,14 @@ export default function Modeler() {
               Save
             </button>
             <button
+              onClick={startTestRun}
+              disabled={busy}
+              title="Run this model in the browser before deploying"
+              className="rounded-md bg-violet-700 px-3 py-1 text-xs text-white hover:bg-violet-600 disabled:opacity-50"
+            >
+              Test run
+            </button>
+            <button
               onClick={deploy}
               disabled={busy}
               className="rounded-md bg-sky-700 px-3 py-1 text-xs text-white hover:bg-sky-600 disabled:opacity-50"
@@ -377,12 +395,25 @@ export default function Modeler() {
             {message.text}
           </div>
         )}
-        <div className="min-h-0 flex-1">
+        <div className="relative min-h-0 flex-1">
           <BpmnModeler
             ref={modelerRef}
             onChange={() => setDirty(true)}
             onReady={syncProcessId}
           />
+          {testXml && (
+            <div className="absolute inset-0 z-10 bg-zinc-950">
+              <Suspense
+                fallback={
+                  <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+                    Loading the in-browser engine…
+                  </div>
+                }
+              >
+                <TestRunPanel xml={testXml} onClose={() => setTestXml(null)} />
+              </Suspense>
+            </div>
+          )}
         </div>
       </div>
     </div>

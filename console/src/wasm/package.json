@@ -1,0 +1,17 @@
+{
+  "name": "nanobpmn-engine-wasm",
+  "type": "module",
+  "description": "wasm-bindgen wrapper around nanobpmn-engine-core for in-browser (modeler) test execution.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "files": [
+    "nanobpmn_engine_bg.wasm",
+    "nanobpmn_engine.js",
+    "nanobpmn_engine.d.ts"
+  ],
+  "main": "nanobpmn_engine.js",
+  "types": "nanobpmn_engine.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

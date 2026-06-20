@@ -807,7 +807,11 @@ The console has five tabs:
 - **Modeler** — a bpmn-js editor backed by a workspace model library. Create,
   edit, deploy (idempotent), pull a deployed model back from the engine, and
   duplicate. Each model shows its deploy status relative to the engine
-  (*not deployed* / *deployed & in sync* / *modified*).
+  (*not deployed* / *deployed & in sync* / *modified*). **Test run** executes a
+  model entirely in the browser — the engine is compiled to WebAssembly
+  (`engine-wasm`) — so you can start an instance, complete or fail its jobs with
+  mock variables, fast-forward timers on a virtual clock, and watch tokens move
+  on the diagram before deploying anything (no gateway round-trip, fully offline).
 - **Explorer** — a live process-instance explorer (variables, jobs, incidents)
   with BPMN XML.
 - **Workers** — author TypeScript job workers in the browser and run them as
