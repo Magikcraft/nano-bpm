@@ -28,18 +28,26 @@ build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate 
 	cd $(PROJECT_ROOT)/server && cargo build
 
 .PHONY: release
-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimized production server binary
+release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Build the optimized self-contained distribution (gateway + embedded console + Swagger)
+	@# Force the RustEmbed derive to re-run so the just-built console/dist (which
+	@# release builds bake in at compile time) is embedded, even if the gateway
+	@# sources are otherwise unchanged.
+	touch $(PROJECT_ROOT)/server/src/console/mod.rs
+	cd $(PROJECT_ROOT)/server && cargo build --release --features console
+	@echo "Built self-contained distribution: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
+	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
+
+.PHONY: release-gateway
+release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimized API-only gateway (no web console)
 	cd $(PROJECT_ROOT)/server && cargo build --release
-	@echo "Built $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
+	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
 .PHONY: console-frontend
 console-frontend: ## Build the web console SPA (console/ -> console/dist)
 	cd $(CONSOLE_DIR) && npm install && npm run build
 
 .PHONY: console
-console: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Build the self-contained single-node distribution (gateway + embedded web console)
-	cd $(PROJECT_ROOT)/server && cargo build --release --features console
-	@echo "Built self-contained distribution: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server (console at /console)"
+console: release ## Alias for `release` (the self-contained single-node distribution)
 
 .PHONY: console-dev
 console-dev: ## Run the console frontend dev server (Vite); proxies /console/api to a gateway on :8080
@@ -89,4 +97,4 @@ clean: ## Remove all generated artifacts
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
