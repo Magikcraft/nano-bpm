@@ -174,7 +174,91 @@ useful alone:
 and render a report. It is immediately useful (a richer Insights view) and forces us
 to nail the read contract before anything autonomous is built on it.
 
-## 7. Invariants ProcessOS must honour
+## 7. MVP — the optimization harness (evaluation rig)
+
+The first thing to build is **not** the production optimizer but the **harness that
+proves the method works** — and, conveniently, it is the *same loop* with the data
+source swapped. This is where we validate and harden the core value proposition
+("can this find better candidates?") and iterate the algorithm under controlled
+conditions.
+
+### 7.1 A scenario
+
+The harness is driven by a **Scenario** — a self-contained, deterministic test case:
+
+- **Test model** — the starting BPMN process.
+- **Golden model** — a known-better variant we *want exploration to discover*. It is
+  the meta-eval oracle: it lets us score not just a candidate but the **search
+  method itself** ("did it recover the golden? get within X%? beat it?"). Production
+  scenarios have no golden — it exists only to validate the rig.
+- **Worker set** — for each service task, a **mock worker** that is a pure,
+  **seeded** function `(vars, seed) → (vars', cost, latency, outcome)`. Determinism
+  is the whole point: the same input + seed always yields the same result, so base
+  and candidate runs are a clean A/B with variance controlled.
+- **Latent options** — alternative workers the optimizer may swap in, each with its
+  own cost/latency/quality profile (e.g. *a cheaper LLM executor: lower `cost`, but
+  higher latency or a higher incident/lower-quality rate*). These options **are** the
+  MVP transform space — concrete, typed, individually checkable.
+- **Input set with correlated results** — process inputs paired with their
+  **expected outputs**, so a candidate is scored on **correctness** (did it preserve
+  the business outcome?), not only on latency/cost. This is the §8 verifier
+  expressed *empirically*: an optimization that changes outcomes is disqualified, not
+  merely cheaper.
+
+### 7.2 The loop
+
+1. **Collect the base dataset.** Run the test model across every input on a Nano
+   engine; collect `(output, e2e latency, cost, incidents)` per instance — i.e. the
+   §3 trace plus realized cost. This is exactly the **T1 Insights** fold, per run.
+2. **Hypothesise.** The LLM proposes candidate processes from the Insights report,
+   drawing from the latent options + parameter tweaks (retry/timeout). *MVP may start
+   with a **baked** generator — the enumerated worker-swap permutations — to validate
+   the measurement+ranking rig before the LLM is in the loop.*
+3. **Materialise + validate.** Emit each candidate's BPMN; validate it parses and is
+   sound (no deadlock, token-safe) before it is allowed to run.
+4. **Evaluate at scale.** Run every candidate over the **same input set + seeds**,
+   collecting the same dataset. Replaying identical inputs/seeds is what makes the
+   comparison fair.
+5. **Rank.** Present each variant's dataset and a ranking across axes — **e2e
+   latency, cost, incident rate, and correctness-vs-expected** — plus, in test mode,
+   **distance to golden**. Sanity check: feeding the golden in as a candidate must
+   rank it at/near the top, or the rig is wrong.
+
+### 7.3 Two execution backends, one `Runner` interface
+
+The loop is identical; only *where instances run* changes:
+
+- **`SimRunner` (native `engine-core`, virtual clock)** — embeds the real engine with
+  injected `now`; mock workers advance the clock by their modelled latency and emit
+  cost. Fast, deterministic, zero orchestration, CI-friendly. **This is the MVP
+  backend** — it isolates the *algorithm* from infrastructure noise, so we can prove
+  "can we find better candidates?" cheaply and repeatably.
+- **`ClusterRunner` (real Nano engine(s) + embedded Deno workers)** — runs the same
+  scenario on actual gateways for realistic latency/throughput. It doubles as a
+  **Nano stress test** and as the **demo** that shows the live data ProcessOS reasons
+  over. (Reuses the existing perf-matrix-style load path.)
+
+**This unifies test and production.** A Scenario's dataset source is either
+*synthetic* (mock workers + inputs + golden — test/demo) or *live* (a real Nano
+engine's traces — production). In production the harness **skips step 1's generation**
+and reads the live dataset through the §1 read contract; steps 2–5 are unchanged.
+The MVP builds the synthetic `SimRunner` path; the live path is already half-built
+(T1 ingest).
+
+### 7.4 MVP build order
+
+| Slice | Ships | Proves |
+|------:|-------|--------|
+| **M0** | `Scenario` schema + `SimRunner` (engine-core native, seeded mock workers, virtual clock) collecting `(output, latency, cost)` → base dataset | deterministic capture + cost/latency modelling work |
+| **M1** | **Baked** candidate generator (enumerate latent worker-swaps) + BPMN validate + evaluate-all + **ranking** (incl. golden-as-candidate + distance-to-golden) | the measurement + ranking rig is correct end-to-end, *no LLM yet* |
+| **M2** | Replace the baked generator with the **LLM hypothesis** step (typed worker-swap/param transforms) over the Insights report | the search method can discover improvements/the golden |
+| **M3** | `ClusterRunner` (real Nano + Deno workers) for scale/latency realism, Nano stress-test, demo; wire the **production** (live-source, generation-skipped) path | realism, stress, and the production loop |
+
+**Start at M0+M1.** They need no cluster orchestration and no LLM, embed the real
+engine for trustworthy numbers, and directly answer the core question. Only once the
+rig reliably ranks the golden best do we let the LLM (M2) and the cluster (M3) in.
+
+## 8. Invariants ProcessOS must honour
 
 - **One-way dependency, build-enforced.** Nano never imports ProcessOS; ProcessOS
   only touches Nano's three public contracts.
@@ -187,7 +271,7 @@ to nail the read contract before anything autonomous is built on it.
   no hidden I/O enters a replayed run.
 - **Absent-safe.** Removing ProcessOS leaves a fully functional production cluster.
 
-## 8. Open questions
+## 9. Open questions
 
 1. **Routing-table endpoint shape** — predicate language for cohorts (tenant /
    business-key hash / %): how expressive before it becomes policy-in-the-engine?
