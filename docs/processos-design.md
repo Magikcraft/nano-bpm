@@ -313,11 +313,17 @@ surface, but it **sharpens and constrains M3 rather than redefining it**:
    dataset through the T1 contract and fold it into the *baseline a candidate
    search must beat* — including the doc's tail signals (p95/**p99**) and the
    queue/service split. Verifiable against a mock Nano, no cluster required.
-2. **`ClusterRunner` load backend.** Drive a real Nano gateway under concurrent
-   load with workers generated from the scenario's `WorkerModel`s (sleep
-   `latencyMs`, fail at `failureRate`, emit `output`), reusing the perf-matrix
-   load path. Captures throughput + tail + contention. Doubles as a Nano stress
-   test and the live demo.
+2. **`ClusterRunner` — two halves.** (a) *Measure*: from the live traces a real
+   run produced (T1 contract), compute the at-scale signals the SimRunner
+   structurally cannot — **throughput**, **e2e tail (p50/p95/p99)**, and the
+   **queue/service split under contention** (`harness/cluster.rs`,
+   `GET /api/harness/cluster`). Pure + tested; point it at a cluster the
+   perf-matrix is driving. (b) *Drive*: generate concurrent load against a real
+   gateway — producer over the **v2 REST API** (`POST /v2/process-instances`,
+   `/v2/deployments`) + workers over **`/command-stream`**, reusing the
+   perf-matrix load path (its file-barrier Deno/local workers). The science (a)
+   lives in ProcessOS; the load-gen plumbing (b) is the documented integration
+   boundary the perf-matrix already provides.
 3. **Unify candidate evaluation across backends.** A candidate is evaluated by the
    SimRunner (fast offline what-if) or the ClusterRunner (at-scale realism); the
    ranking step (§7.2 step 5) is unchanged.

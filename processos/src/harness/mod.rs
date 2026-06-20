@@ -18,6 +18,7 @@
 //! ranking. `engine-core` is consumed read-only over a `path` dependency and is
 //! never modified.
 
+mod cluster;
 mod example;
 mod hypothesize;
 mod llm;
@@ -25,6 +26,9 @@ mod production;
 mod rank;
 mod sim;
 
+pub use cluster::build_cluster_summary;
+#[allow(unused_imports)]
+pub use cluster::ClusterRunSummary;
 pub use example::example_scenario;
 pub use hypothesize::run_hypothesis;
 pub use llm::{LlmConfig, LlmOverride};
