@@ -3,6 +3,8 @@ import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import init, { TestEngine } from "../wasm/nanobpmn_engine";
+import { TraceTimeline } from "./TraceTimeline";
+import { foldSimTrace, stepFmt, type WasmEvent } from "../lib/simTrace";
 
 interface ActiveEl {
   key: string;
@@ -152,6 +154,9 @@ export default function TestRunPanel({
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [jobVars, setJobVars] = useState<Record<string, string>>({});
   const [advanceMs, setAdvanceMs] = useState("60000");
+  const [leftView, setLeftView] = useState<"diagram" | "trace">("diagram");
+  const [events, setEvents] = useState<WasmEvent[]>([]);
+  const [traceKey, setTraceKey] = useState<string | null>(null);
 
   function deployInto(engine: TestEngine) {
     const res = JSON.parse(engine.deploy(xml)) as { processIds: string[] };
@@ -159,6 +164,8 @@ export default function TestRunPanel({
     setProcess(res.processIds[0] ?? "");
     setSnapshot(null);
     setJobVars({});
+    setEvents([]);
+    setTraceKey(null);
     setError(null);
   }
 
@@ -185,19 +192,24 @@ export default function TestRunPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [xml]);
 
-  function run(fn: (e: TestEngine) => string): void {
+  function run(fn: (e: TestEngine) => string): Snapshot | null {
     const engine = engineRef.current;
-    if (!engine) return;
+    if (!engine) return null;
     try {
-      setSnapshot(JSON.parse(fn(engine)) as Snapshot);
+      const snap = JSON.parse(fn(engine)) as Snapshot;
+      setSnapshot(snap);
+      setEvents(JSON.parse(engine.events()) as WasmEvent[]);
       setError(null);
+      return snap;
     } catch (e) {
       setError(String(e));
+      return null;
     }
   }
 
   function start() {
-    run((e) => e.createInstance(process, startVars || "{}"));
+    const snap = run((e) => e.createInstance(process, startVars || "{}"));
+    if (snap?.created) setTraceKey(snap.created);
   }
   function completeJob(key: string) {
     const vars = jobVars[key]?.trim() || "{}";
@@ -224,6 +236,17 @@ export default function TestRunPanel({
   const incidentIds = snapshot?.incidentElementIds ?? [];
   const started = snapshot !== null;
 
+  const effectiveTraceKey = traceKey ?? snapshot?.instances[0]?.key ?? null;
+  const simProcessId =
+    snapshot?.instances.find((i) => i.key === effectiveTraceKey)?.processId ?? process;
+  const simTrace = useMemo(
+    () =>
+      effectiveTraceKey
+        ? foldSimTrace(events, effectiveTraceKey, simProcessId)
+        : null,
+    [events, effectiveTraceKey, simProcessId],
+  );
+
   const allDone = useMemo(
     () =>
       started &&
@@ -236,22 +259,78 @@ export default function TestRunPanel({
 
   return (
     <div className="flex h-full min-h-0">
-      {/* Simulated diagram with live token highlighting */}
-      <div className="relative min-w-0 flex-1 bg-zinc-950">
-        {started ? (
-          <SimDiagram xml={xml} activeIds={activeIds} incidentIds={incidentIds} />
-        ) : (
-          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
-            {phase === "loading"
-              ? "Loading the in-browser engine…"
-              : "Start an instance to simulate this process."}
+      {/* Simulated diagram / trace with live token highlighting */}
+      <div className="relative flex min-w-0 flex-1 flex-col bg-zinc-950">
+        <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-1.5">
+          <div className="flex gap-1">
+            <button
+              onClick={() => setLeftView("diagram")}
+              className={`rounded px-2.5 py-1 text-xs ${
+                leftView === "diagram"
+                  ? "bg-zinc-700 text-white"
+                  : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+              }`}
+            >
+              Diagram
+            </button>
+            <button
+              onClick={() => setLeftView("trace")}
+              className={`rounded px-2.5 py-1 text-xs ${
+                leftView === "trace"
+                  ? "bg-zinc-700 text-white"
+                  : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+              }`}
+            >
+              Trace
+            </button>
           </div>
-        )}
-        {allDone && (
-          <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-emerald-900/80 px-4 py-1 text-xs font-medium text-emerald-200">
-            ✓ All instances completed
-          </div>
-        )}
+          <span className="rounded bg-violet-900/50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-300">
+            Simulation
+          </span>
+          {leftView === "trace" && started && snapshot!.instances.length > 1 && (
+            <select
+              value={effectiveTraceKey ?? ""}
+              onChange={(e) => setTraceKey(e.target.value)}
+              className="ml-auto rounded border border-zinc-700 bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200"
+            >
+              {snapshot!.instances.map((i) => (
+                <option key={i.key} value={i.key}>
+                  #{i.key}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+        <div className="relative min-h-0 flex-1">
+          {!started ? (
+            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+              {phase === "loading"
+                ? "Loading the in-browser engine…"
+                : "Start an instance to simulate this process."}
+            </div>
+          ) : leftView === "diagram" ? (
+            <SimDiagram xml={xml} activeIds={activeIds} incidentIds={incidentIds} />
+          ) : simTrace ? (
+            <div className="h-full overflow-auto p-6">
+              <p className="mb-4 text-xs text-zinc-500">
+                Folded from the in-browser engine's event log. The simulation's
+                virtual clock only advances on “Advance time”, so the axis is the
+                logical step (event) index, not wall-clock time. This trace is
+                never journaled, exported, or sent to the gateway.
+              </p>
+              <TraceTimeline trace={simTrace} fmt={stepFmt} />
+            </div>
+          ) : (
+            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+              No trace yet.
+            </div>
+          )}
+          {leftView === "diagram" && allDone && (
+            <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-emerald-900/80 px-4 py-1 text-xs font-medium text-emerald-200">
+              ✓ All instances completed
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Control panel */}

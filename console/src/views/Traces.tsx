@@ -1,14 +1,14 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   api,
   type InstanceTrace,
-  type TraceElement,
   type TraceOutcome,
   type TraceSummary,
 } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
+import { TraceTimeline, fmtClock, fmtDuration } from "../components/TraceTimeline";
 
 function outcomeBadge(outcome: TraceOutcome): string {
   switch (outcome) {
@@ -19,24 +19,6 @@ function outcomeBadge(outcome: TraceOutcome): string {
     case "terminated":
       return "bg-zinc-700 text-zinc-300";
   }
-}
-
-function fmtDuration(ms: number | null): string {
-  if (ms == null) return "—";
-  if (ms < 1000) return `${ms} ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(2)} s`;
-  const m = Math.floor(ms / 60_000);
-  const s = ((ms % 60_000) / 1000).toFixed(0);
-  return `${m}m ${s}s`;
-}
-
-function fmtClock(ms: number): string {
-  return new Date(ms).toLocaleTimeString(undefined, {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
 }
 
 export default function Traces() {
@@ -175,201 +157,12 @@ function TraceDetail({ traceKey }: { traceKey: string }) {
 
       <div className="min-h-0 flex-1 overflow-auto p-8">
         {tab === "timeline" ? (
-          <Timeline trace={data} />
+          <TraceTimeline trace={data} />
         ) : (
           <DataView trace={data} traceKey={traceKey} />
         )}
       </div>
     </div>
-  );
-}
-
-function Timeline({ trace }: { trace: InstanceTrace }) {
-  // Time window: instance start → end (or the last observed event for an
-  // in-flight instance). All bar positions are percentages of this span.
-  const { t0, span } = useMemo(() => {
-    const t0 = trace.startedAt;
-    let max = trace.endedAt ?? trace.startedAt;
-    for (const el of trace.elements) {
-      max = Math.max(max, el.enteredAt, el.exitedAt ?? el.enteredAt);
-      if (el.job) {
-        max = Math.max(
-          max,
-          el.job.createdAt,
-          el.job.activatedAt ?? el.job.createdAt,
-          el.job.completedAt ?? el.job.createdAt,
-        );
-      }
-    }
-    return { t0, span: Math.max(max - t0, 1) };
-  }, [trace]);
-
-  const pct = (t: number) => ((t - t0) / span) * 100;
-
-  return (
-    <div>
-      <Legend />
-      <div className="mt-4 space-y-1.5">
-        {trace.elements.map((el) => (
-          <ElementRow key={el.elementInstanceKey} el={el} t0={t0} pct={pct} />
-        ))}
-      </div>
-      <div className="mt-2 flex justify-between border-t border-zinc-800 pt-1 font-mono text-[10px] text-zinc-500">
-        <span>0 ms</span>
-        <span>{fmtDuration(Math.round(span))}</span>
-      </div>
-
-      {trace.incidents.length > 0 && (
-        <section className="mt-8">
-          <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-            Incidents
-          </h2>
-          <table className="w-full border-collapse text-sm">
-            <thead>
-              <tr className="border-b border-zinc-800 text-left text-zinc-500">
-                {["Element", "Kind", "Reason", "Raised", "Resolved"].map((h) => (
-                  <th key={h} className="py-2 pr-4 font-medium">
-                    {h}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {trace.incidents.map((inc, i) => (
-                <tr key={i} className="border-b border-zinc-900">
-                  <td className="py-2 pr-4 font-mono">{inc.elementId}</td>
-                  <td className="py-2 pr-4">{inc.kind}</td>
-                  <td className="py-2 pr-4 text-red-300">{inc.reason}</td>
-                  <td className="py-2 pr-4 font-mono text-zinc-500">
-                    {fmtClock(inc.raisedAt)}
-                  </td>
-                  <td className="py-2 pr-4 font-mono text-zinc-500">
-                    {inc.resolvedAt ? fmtClock(inc.resolvedAt) : "—"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-    </div>
-  );
-}
-
-function ElementRow({
-  el,
-  t0,
-  pct,
-}: {
-  el: TraceElement;
-  t0: number;
-  pct: (t: number) => number;
-}) {
-  const job = el.job;
-  const start = el.enteredAt;
-  const end = el.exitedAt ?? Math.max(el.enteredAt, job?.completedAt ?? el.enteredAt);
-
-  // Element lifetime track (faint). Min width so instantaneous nodes show.
-  const left = pct(start);
-  const width = Math.max(pct(end) - left, 0.6);
-
-  return (
-    <div className="flex items-center gap-3">
-      <div className="w-44 shrink-0 truncate font-mono text-xs text-zinc-300" title={el.elementId}>
-        {el.elementId}
-        {el.incidents > 0 && <span className="ml-1 text-red-400">⚠</span>}
-      </div>
-      <div className="relative h-6 flex-1 rounded bg-zinc-900">
-        {/* Element lifetime */}
-        <div
-          className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-zinc-700"
-          style={{ left: `${left}%`, width: `${width}%` }}
-          title={`${el.elementId} · ${fmtDuration(el.durationMs)}`}
-        />
-        {job && <JobBars job={job} pct={pct} t0={t0} />}
-      </div>
-      <div className="w-28 shrink-0 text-right font-mono text-[11px] text-zinc-500">
-        {job
-          ? job.queueMs != null
-            ? `${fmtDuration(job.queueMs)} q`
-            : fmtDuration(job.waitMs)
-          : fmtDuration(el.durationMs)}
-      </div>
-    </div>
-  );
-}
-
-function JobBars({
-  job,
-  pct,
-}: {
-  job: NonNullable<TraceElement["job"]>;
-  pct: (t: number) => number;
-  t0: number;
-}) {
-  const segments: ReactNode[] = [];
-  const created = job.createdAt;
-  const activated = job.activatedAt;
-  const completed = job.completedAt;
-
-  if (activated != null) {
-    // Queue (created → activated), amber.
-    const qLeft = pct(created);
-    const qWidth = Math.max(pct(activated) - qLeft, 0.4);
-    segments.push(
-      <div
-        key="q"
-        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-l-sm bg-amber-500/80"
-        style={{ left: `${qLeft}%`, width: `${qWidth}%` }}
-        title={`queue ${fmtDuration(job.queueMs)} · worker ${job.worker ?? "—"}`}
-      />,
-    );
-    // Service (activated → completed/open), emerald.
-    const sEnd = completed ?? activated;
-    const sLeft = pct(activated);
-    const sWidth = Math.max(pct(sEnd) - sLeft, 0.4);
-    segments.push(
-      <div
-        key="s"
-        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-r-sm bg-emerald-500/80"
-        style={{ left: `${sLeft}%`, width: `${sWidth}%` }}
-        title={`service ${fmtDuration(job.serviceMs)} · worker ${job.worker ?? "—"}`}
-      />,
-    );
-  } else {
-    // Activation not observed: a single "wait" bar (created → completed/open).
-    const end = completed ?? created;
-    const left = pct(created);
-    const width = Math.max(pct(end) - left, 0.4);
-    segments.push(
-      <div
-        key="w"
-        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-sm bg-amber-600/70"
-        style={{ left: `${left}%`, width: `${width}%` }}
-        title={`wait ${fmtDuration(job.waitMs)} (activation not observed)`}
-      />,
-    );
-  }
-  return <>{segments}</>;
-}
-
-function Legend() {
-  return (
-    <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-400">
-      <Swatch className="bg-zinc-700">element</Swatch>
-      <Swatch className="bg-amber-500/80">job queue</Swatch>
-      <Swatch className="bg-emerald-500/80">job service</Swatch>
-      <Swatch className="bg-amber-600/70">job wait (activation unobserved)</Swatch>
-    </div>
-  );
-}
-
-function Swatch({ className, children }: { className: string; children: ReactNode }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      <span className={`inline-block h-3 w-3 rounded-sm ${className}`} />
-      {children}
-    </span>
   );
 }
 
