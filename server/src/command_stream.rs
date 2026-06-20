@@ -1541,30 +1541,76 @@ async fn dispatch_to_connection(
         }
         let mut pushed = 0i64;
 
-        // 1. Local partitions first — the hot path, no network hop.
-        let local = server
-            .activate_for_stream(
-                &job_type,
-                &sub.worker,
-                want,
-                sub.timeout,
-                sub.fetch_variable.as_deref(),
-            )
-            .await;
-        for job in local {
-            let value = serde_json::to_value(&job).unwrap_or(Value::Null);
-            if conn.send(ServerFrame::Job { job: value }) {
-                pushed += 1;
-            }
-        }
+        if !activation_fairness() || peers.is_empty() {
+            // Historical local-first dispatch (and the only path on a single
+            // node, where `peers` is empty): drain local, then pull the
+            // shortfall from peers in fixed id order.
 
-        // 2. Cluster: pull the shortfall from peers' partitions so a worker
-        //    attached to this gateway is fed by the whole cluster. The peer leases
-        //    each job under `sub.timeout`, preserving at-least-once if this gateway
-        //    dies before the worker completes (the lease expires on the owner).
-        let mut remaining = want.saturating_sub(pushed as usize);
-        if remaining > 0 && !peers.is_empty() {
-            for &node in &peers {
+            // 1. Local partitions first — the hot path, no network hop.
+            let local = server
+                .activate_for_stream(
+                    &job_type,
+                    &sub.worker,
+                    want,
+                    sub.timeout,
+                    sub.fetch_variable.as_deref(),
+                )
+                .await;
+            for job in local {
+                let value = serde_json::to_value(&job).unwrap_or(Value::Null);
+                if conn.send(ServerFrame::Job { job: value }) {
+                    pushed += 1;
+                }
+            }
+
+            // 2. Cluster: pull the shortfall from peers' partitions so a worker
+            //    attached to this gateway is fed by the whole cluster. The peer
+            //    leases each job under `sub.timeout`, preserving at-least-once if
+            //    this gateway dies before the worker completes (the lease expires
+            //    on the owner).
+            let mut remaining = want.saturating_sub(pushed as usize);
+            if remaining > 0 && !peers.is_empty() {
+                for &node in &peers {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let room_now = conn.tx.capacity() as i64;
+                    if room_now <= 0 {
+                        conn.wants_redispatch.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    let ask = remaining.min(room_now as usize);
+                    let jobs = server
+                        .activate_from_peer(
+                            node,
+                            &job_type,
+                            &sub.worker,
+                            ask,
+                            sub.timeout,
+                            sub.fetch_variable.as_deref(),
+                        )
+                        .await;
+                    for job in jobs {
+                        let value = serde_json::to_value(&job).unwrap_or(Value::Null);
+                        if conn.send(ServerFrame::Job { job: value }) {
+                            pushed += 1;
+                            remaining = remaining.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fairness-aware dispatch (multi-node). Sources are the local engine
+            // (index 0) and each peer (1..=peers.len()). `fair_plan` rotates the
+            // source order per pass and quota-caps each source on the first lap so
+            // a fat backlog on one node cannot consume the whole lease budget,
+            // then a second lap soaks any leftover (from sources that ran dry).
+            // Leases remain exclusive on each owner's single-writer actor, so this
+            // only redistributes *where* a worker draws from, never correctness.
+            let num_sources = peers.len() + 1;
+            let start = (DISPATCH_ROTATION.fetch_add(1, Ordering::Relaxed) as usize) % num_sources;
+            for (src, cap) in fair_plan(want, num_sources, start) {
+                let remaining = want.saturating_sub(pushed as usize);
                 if remaining == 0 {
                     break;
                 }
@@ -1573,22 +1619,36 @@ async fn dispatch_to_connection(
                     conn.wants_redispatch.store(true, Ordering::Relaxed);
                     break;
                 }
-                let ask = remaining.min(room_now as usize);
-                let jobs = server
-                    .activate_from_peer(
-                        node,
-                        &job_type,
-                        &sub.worker,
-                        ask,
-                        sub.timeout,
-                        sub.fetch_variable.as_deref(),
-                    )
-                    .await;
+                let ask = cap.min(remaining).min(room_now as usize);
+                if ask == 0 {
+                    continue;
+                }
+                let jobs = if src == 0 {
+                    server
+                        .activate_for_stream(
+                            &job_type,
+                            &sub.worker,
+                            ask,
+                            sub.timeout,
+                            sub.fetch_variable.as_deref(),
+                        )
+                        .await
+                } else {
+                    server
+                        .activate_from_peer(
+                            peers[src - 1],
+                            &job_type,
+                            &sub.worker,
+                            ask,
+                            sub.timeout,
+                            sub.fetch_variable.as_deref(),
+                        )
+                        .await
+                };
                 for job in jobs {
                     let value = serde_json::to_value(&job).unwrap_or(Value::Null);
                     if conn.send(ServerFrame::Job { job: value }) {
                         pushed += 1;
-                        remaining = remaining.saturating_sub(1);
                     }
                 }
             }
@@ -1598,6 +1658,63 @@ async fn dispatch_to_connection(
             sub.credits.fetch_sub(pushed, Ordering::Relaxed);
         }
     }
+}
+
+/// Rotates the source order (local + each peer) across activation passes so a
+/// worker is not always fed local-partition-first. Process-global; a relaxed
+/// counter is all the fairness rotation needs.
+static DISPATCH_ROTATION: AtomicU64 = AtomicU64::new(0);
+
+/// Plans how a worker's lease budget (`want` jobs) is spread across `num_sources`
+/// activation sources (local + each peer), starting from rotated source `start`.
+///
+/// Returns an ordered list of `(source_index, cap)` probes the dispatcher walks,
+/// stopping once `want` is met:
+///   * **Lap 1** caps each source at `ceil(want / num_sources)` so no single
+///     source (a fat local backlog in particular) can monopolise the budget —
+///     this is what breaks the local-first starvation.
+///   * **Lap 2** revisits every source with an uncapped allowance so demand left
+///     unmet by sources that ran dry is soaked up, keeping the worker full when
+///     the cluster as a whole has the jobs.
+///
+/// Pure and deterministic given its inputs; the async dispatcher executes the
+/// plan, computing each actual `ask` from the live remaining demand and socket
+/// room. `num_sources == 1` (single node / no peers) yields a single uncapped
+/// local probe, i.e. the historical behaviour.
+fn fair_plan(want: usize, num_sources: usize, start: usize) -> Vec<(usize, usize)> {
+    if num_sources <= 1 {
+        return vec![(0, want)];
+    }
+    let base_quota = want.div_ceil(num_sources).max(1);
+    let mut plan = Vec::with_capacity(num_sources * 2);
+    // Lap 1: rotated order, each source capped at its quota.
+    for k in 0..num_sources {
+        plan.push(((start + k) % num_sources, base_quota));
+    }
+    // Lap 2: rotated order, uncapped — soaks leftover from dry sources.
+    for k in 0..num_sources {
+        plan.push(((start + k) % num_sources, want));
+    }
+    plan
+}
+
+/// Whether to use fairness-aware activation routing across cluster nodes.
+///
+/// Default (off): strict local-first, then peers in fixed id order — the
+/// historical behaviour, byte-identical on a single node and unchanged for
+/// existing benchmarks. When enabled (`NANOBPMN_ACTIVATION_FAIRNESS=1`), a
+/// worker's lease budget is rotated and quota-split across `{local, peers}` so a
+/// fat local backlog cannot monopolise a worker while peers' partitions starve
+/// (Stage 1: stateless rotation + per-source quota; no protocol change). Only
+/// affects multi-node clusters — with no peers there is a single source and the
+/// path collapses to the historical local-only dispatch.
+fn activation_fairness() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("NANOBPMN_ACTIVATION_FAIRNESS")
+            .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+            .unwrap_or(false)
+    })
 }
 
 /// Number of connections the dispatcher services concurrently in one pass.
@@ -1630,5 +1747,87 @@ fn topup_submission_credits(server: &ServerImpl, registry: &Arc<Registry>) {
                 .fetch_add(grant, Ordering::Relaxed);
             conn.send(ServerFrame::SubmissionCredits { n: grant });
         }
+    }
+}
+
+#[cfg(test)]
+mod fair_plan_tests {
+    use super::fair_plan;
+
+    /// Executes a `fair_plan` against a per-source supply (how many jobs each
+    /// source can actually yield), returning the per-source counts the worker
+    /// would receive. Mirrors the dispatcher loop: each probe takes
+    /// `min(cap, remaining, supply_left)` from its source.
+    fn run(want: usize, supply: &[usize], start: usize) -> Vec<usize> {
+        let n = supply.len();
+        let mut got = vec![0usize; n];
+        let mut pushed = 0usize;
+        let mut left: Vec<usize> = supply.to_vec();
+        for (src, cap) in fair_plan(want, n, start) {
+            let remaining = want - pushed;
+            if remaining == 0 {
+                break;
+            }
+            let ask = cap.min(remaining).min(left[src]);
+            got[src] += ask;
+            left[src] -= ask;
+            pushed += ask;
+        }
+        got
+    }
+
+    #[test]
+    fn single_source_takes_everything_uncapped() {
+        // No peers (num_sources == 1): historical local-only behaviour.
+        assert_eq!(fair_plan(64, 1, 0), vec![(0, 64)]);
+        assert_eq!(run(64, &[1000], 0), vec![64]);
+    }
+
+    #[test]
+    fn abundant_supply_spreads_evenly_no_monopoly() {
+        // Local (src 0) has a huge backlog but must not monopolise the budget:
+        // each source is quota-capped to ceil(64/3)=22 on lap 1.
+        let got = run(64, &[10_000, 10_000, 10_000], 0);
+        assert_eq!(got.iter().sum::<usize>(), 64);
+        // Every source contributes; the spread is within one quota of even.
+        assert!(got.iter().all(|&c| c > 0), "no source starved: {got:?}");
+        assert!(*got.iter().max().unwrap() - *got.iter().min().unwrap() <= 22);
+    }
+
+    #[test]
+    fn local_backlog_does_not_starve_a_backed_up_peer() {
+        // The reported bug: local always has jobs, so strict local-first never
+        // reaches the peer. With fairness, peers still get drawn from.
+        let got = run(60, &[10_000, 500, 500], 0);
+        assert_eq!(got.iter().sum::<usize>(), 60);
+        assert!(got[1] > 0 && got[2] > 0, "peers must be served: {got:?}");
+    }
+
+    #[test]
+    fn leftover_from_dry_sources_is_soaked_by_others() {
+        // Peers are empty; lap 2 lets the local source soak the full budget so
+        // the worker still fills rather than going hungry.
+        let got = run(64, &[10_000, 0, 0], 0);
+        assert_eq!(got, vec![64, 0, 0]);
+    }
+
+    #[test]
+    fn conserves_to_total_supply_when_cluster_is_underfull() {
+        // Total available (30) < want (64): take everything, no over-count.
+        let got = run(64, &[10, 10, 10], 1);
+        assert_eq!(got, vec![10, 10, 10]);
+    }
+
+    #[test]
+    fn rotation_changes_which_source_is_short() {
+        // An uneven split (65 over 3) shorts the LAST source served by one unit;
+        // rotating `start` moves that disadvantage around so no source is
+        // permanently penalised over many passes.
+        let a = run(65, &[10_000, 10_000, 10_000], 0); // order 0,1,2 -> src2 short
+        let b = run(65, &[10_000, 10_000, 10_000], 1); // order 1,2,0 -> src0 short
+        assert_eq!(a.iter().sum::<usize>(), 65);
+        assert_eq!(b.iter().sum::<usize>(), 65);
+        assert_eq!(a, vec![22, 22, 21]);
+        assert_eq!(b, vec![21, 22, 22]);
     }
 }

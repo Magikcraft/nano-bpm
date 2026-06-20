@@ -457,6 +457,7 @@ instance finishes).
 | `NANOBPMN_PEER_TIMEOUT_MS=<ms>` | General peer-forward timeout (await-create, deploy, message publish). Default `30000`. |
 | `NANOBPMN_WRITE_FORWARD_TIMEOUT_MS=<ms>` | Per-attempt deadline for fast non-await write forwards. Default `2500`. |
 | `NANOBPMN_WRITE_FORWARD_RETRY_MS=<ms>` | Total leader-re-resolution retry budget for a forwarded create. Default `5000`. |
+| `NANOBPMN_ACTIVATION_FAIRNESS=1` | Fairness-aware job-activation routing across cluster nodes. **Off by default** (strict local-first, then peers in fixed id order — highest aggregate throughput, but a node a worker connects to can starve peers' partitions, skewing the e2e-latency distribution). When on, a worker's lease budget is rotated and quota-split across `{local, peers}` so a fat local backlog cannot monopolise a worker while peers back up. No effect on a single node. |
 
 See [`docs/distributed-scaling-design.md`](docs/distributed-scaling-design.md) for
 the full design rationale.
