@@ -68,3 +68,22 @@ body {
   --color-text: #18181b;
 }
 
+/*
+ * Context pad: the floating icon toolbar next to a selected element (add element /
+ * change type). Its icon glyphs are a webfont whose color is inherited, so on the
+ * dark page they paint nearly white-on-white. Give the pad a light surface and
+ * dark icons so the actions are legible.
+ */
+.djs-context-pad {
+  color-scheme: light;
+}
+
+.djs-context-pad .entry {
+  color: #18181b !important;
+  background: #ffffff;
+}
+
+.djs-context-pad .entry:hover {
+  background: #e4e4e7;
+}
+

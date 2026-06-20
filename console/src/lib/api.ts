@@ -404,6 +404,44 @@ export async function deployXml(name: string, xml: string): Promise<void> {
   }
 }
 
+/// The result of starting a process instance, as returned by the Camunda
+/// `createProcessInstance` endpoint. Only the fields the console needs are typed.
+export interface CreateInstanceResult {
+  processInstanceKey: string;
+  processDefinitionId: string;
+  processDefinitionVersion: number;
+  processCompleted: boolean;
+}
+
+/// Starts a process instance on the connected cluster through the standard
+/// Camunda endpoint `POST /v2/process-instances` (not a console API). The process
+/// must already be deployed; the gateway picks the latest deployed version of
+/// `processId`. When `awaitCompletion` is set the request blocks until the
+/// instance reaches a terminal state (or the gateway's request timeout elapses),
+/// reflected in `processInstanceCompleted`. Throws with the server's problem
+/// detail on failure (e.g. 404 not-deployed, 503 RESOURCE_EXHAUSTED).
+export async function createProcessInstance(opts: {
+  processId: string;
+  variables?: Record<string, unknown>;
+  awaitCompletion?: boolean;
+}): Promise<CreateInstanceResult> {
+  const body: Record<string, unknown> = {
+    processDefinitionId: opts.processId,
+    variables: opts.variables ?? {},
+  };
+  if (opts.awaitCompletion) body.awaitCompletion = true;
+  const res = await fetch("/v2/process-instances", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `start instance → HTTP ${res.status}`);
+  }
+  return (await res.json()) as CreateInstanceResult;
+}
+
 /// The verbatim BPMN XML for a process definition, served by the gateway's
 /// generated Camunda endpoint (getProcessDefinitionXML) — not a console API.
 export async function fetchProcessXml(

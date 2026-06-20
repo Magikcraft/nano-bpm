@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, type Instance } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
@@ -20,6 +21,19 @@ function stateBadge(state: string, hasIncident: boolean): string {
 
 export default function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Allow deep-linking to a specific instance (e.g. from the modeler's "Start
+  // instance" success link): ?instance=<key> preselects it, then the param is
+  // cleared so it doesn't pin the selection on later navigation.
+  useEffect(() => {
+    const key = searchParams.get("instance");
+    if (key) {
+      setSelected(key);
+      searchParams.delete("instance");
+      setSearchParams(searchParams, { replace: true });
+    }
+  }, [searchParams, setSearchParams]);
 
   // Live: the SSE feed invalidates the list whenever the read model advances.
   useLiveInvalidation(["instances"]);

@@ -1,7 +1,9 @@
-import { lazy, Suspense, useRef, useState } from "react";
+import { lazy, Suspense, useRef, useState, type ReactNode } from "react";
+import { Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
+  createProcessInstance,
   deployXml,
   fetchProcessXml,
   type DeployStatus,
@@ -38,10 +40,11 @@ export default function Modeler() {
   const [dirty, setDirty] = useState(false);
   const [processId, setProcessId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(
+  const [message, setMessage] = useState<{ kind: "ok" | "err"; text: ReactNode } | null>(
     null,
   );
   const [testXml, setTestXml] = useState<string | null>(null);
+  const [startOpen, setStartOpen] = useState(false);
 
   async function startTestRun() {
     const xml = await modelerRef.current?.getXml();
@@ -62,7 +65,7 @@ export default function Modeler() {
   const refreshModels = () =>
     queryClient.invalidateQueries({ queryKey: ["models"] });
 
-  const flash = (kind: "ok" | "err", text: string) => {
+  const flash = (kind: "ok" | "err", text: ReactNode) => {
     setMessage({ kind, text });
     if (kind === "ok") setTimeout(() => setMessage(null), 3000);
   };
@@ -176,6 +179,56 @@ export default function Modeler() {
       refreshModels();
     } catch (e) {
       flash("err", `Deploy failed: ${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startInstance(
+    variables: Record<string, unknown>,
+    awaitCompletion: boolean,
+  ): Promise<boolean> {
+    const pid = modelerRef.current?.getProcessId() ?? processId;
+    if (!pid) {
+      flash("err", "Set a process id before starting an instance.");
+      return false;
+    }
+    setBusy(true);
+    try {
+      // Auto-deploy the current model first so the instance runs exactly what's
+      // in the editor (save → deploy is idempotent, so an unchanged model is a
+      // no-op). Then start the instance on the connected cluster by process id.
+      const name = await save();
+      if (!name) return false;
+      const xml = await modelerRef.current?.getXml();
+      if (xml == null) return false;
+      await deployXml(name, xml);
+      refreshModels();
+
+      const result = await createProcessInstance({
+        processId: pid,
+        variables,
+        awaitCompletion,
+      });
+      queryClient.invalidateQueries({ queryKey: ["instances"] });
+      flash(
+        "ok",
+        <span>
+          Started instance{" "}
+          <Link
+            to={`/explorer?instance=${encodeURIComponent(result.processInstanceKey)}`}
+            className="font-mono underline hover:text-emerald-200"
+          >
+            {result.processInstanceKey}
+          </Link>
+          {awaitCompletion &&
+            (result.processCompleted ? " — completed." : " — still running.")}
+        </span>,
+      );
+      return true;
+    } catch (e) {
+      flash("err", `Start failed: ${String(e)}`);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -364,6 +417,18 @@ export default function Modeler() {
               Deploy
             </button>
             <button
+              onClick={() => setStartOpen(true)}
+              disabled={busy || !processId}
+              title={
+                processId
+                  ? "Deploy and start an instance on the connected cluster"
+                  : "Set a process id first"
+              }
+              className="rounded-md bg-emerald-700 px-3 py-1 text-xs text-white hover:bg-emerald-600 disabled:opacity-40"
+            >
+              Start instance
+            </button>
+            <button
               onClick={pull}
               disabled={busy || !current?.deployed_key}
               title={
@@ -414,6 +479,106 @@ export default function Modeler() {
               </Suspense>
             </div>
           )}
+        </div>
+      </div>
+      {startOpen && (
+        <StartDialog
+          processId={processId ?? ""}
+          busy={busy}
+          onCancel={() => setStartOpen(false)}
+          onStart={async (vars, awaitCompletion) => {
+            const ok = await startInstance(vars, awaitCompletion);
+            if (ok) setStartOpen(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/// Modal for starting a process instance: an optional variables-JSON textarea and
+/// an "await completion" toggle. Validates the JSON locally before handing parsed
+/// variables to the parent, which auto-deploys then creates the instance.
+function StartDialog({
+  processId,
+  busy,
+  onCancel,
+  onStart,
+}: {
+  processId: string;
+  busy: boolean;
+  onCancel: () => void;
+  onStart: (vars: Record<string, unknown>, awaitCompletion: boolean) => void;
+}) {
+  const [vars, setVars] = useState("{}");
+  const [awaitCompletion, setAwaitCompletion] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  function submit() {
+    let parsed: unknown;
+    try {
+      parsed = vars.trim() === "" ? {} : JSON.parse(vars);
+    } catch (e) {
+      setError(`Invalid JSON: ${String(e)}`);
+      return;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      setError("Variables must be a JSON object, e.g. { \"amount\": 42 }.");
+      return;
+    }
+    setError(null);
+    onStart(parsed as Record<string, unknown>, awaitCompletion);
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-30 flex items-center justify-center bg-black/60"
+      onClick={onCancel}
+    >
+      <div
+        className="w-[28rem] max-w-[92vw] rounded-lg border border-zinc-700 bg-zinc-900 p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-base font-semibold text-zinc-100">Start instance</h2>
+        <p className="mt-1 text-xs text-zinc-400">
+          Deploys the current model, then starts an instance of{" "}
+          <span className="font-mono text-zinc-300">{processId || "—"}</span> on the
+          connected cluster.
+        </p>
+        <label className="mt-4 block text-xs font-medium text-zinc-400">
+          Variables (JSON)
+        </label>
+        <textarea
+          value={vars}
+          onChange={(e) => setVars(e.target.value)}
+          spellCheck={false}
+          rows={6}
+          className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1.5 font-mono text-xs text-zinc-200 focus:border-emerald-600 focus:outline-none"
+        />
+        <label className="mt-3 flex items-center gap-2 text-xs text-zinc-300">
+          <input
+            type="checkbox"
+            checked={awaitCompletion}
+            onChange={(e) => setAwaitCompletion(e.target.checked)}
+          />
+          Await completion (block until the instance reaches a terminal state)
+        </label>
+        {error && <p className="mt-3 text-xs text-red-400">{error}</p>}
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            className="rounded-md bg-zinc-800 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={submit}
+            disabled={busy || !processId}
+            className="rounded-md bg-emerald-700 px-3 py-1 text-xs text-white hover:bg-emerald-600 disabled:opacity-50"
+          >
+            {busy ? "Starting…" : "Start"}
+          </button>
         </div>
       </div>
     </div>
