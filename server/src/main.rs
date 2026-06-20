@@ -7281,6 +7281,7 @@ async fn main() {
         println!("\nNano BPM is up:");
         println!("  Landing page   {base}/");
         println!("  Why Nano BPM   {base}/features");
+        println!("  Roadmap        {base}/optimization");
         println!("  Web console    {base}/console");
         println!("  API reference  {base}/swagger");
         println!("  REST API       {base}{}", nanobpm_gateway_rest::BASE_PATH);

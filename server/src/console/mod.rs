@@ -50,11 +50,16 @@ const LANDING_HTML: &str = include_str!("landing.html");
 /// `/features`.
 const FEATURES_HTML: &str = include_str!("features.html");
 
+/// The standalone runtime process-optimization explainer (self-contained,
+/// inline SVG diagrams), served at `/optimization`.
+const OPTIMIZATION_HTML: &str = include_str!("optimization.html");
+
 /// Mounts the console SPA and its JSON API onto the gateway.
 pub fn router(server: ServerImpl) -> Router {
     Router::new()
         .route("/", get(landing))
         .route("/features", get(features))
+        .route("/optimization", get(optimization))
         .route("/swagger", get(swagger_index))
         .route("/swagger/", get(swagger_index))
         .route("/swagger/{*path}", get(swagger_asset))
@@ -161,6 +166,16 @@ async fn features() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         FEATURES_HTML,
+    )
+        .into_response()
+}
+
+/// Serves the standalone runtime process-optimization explainer at
+/// `/optimization`.
+async fn optimization() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        OPTIMIZATION_HTML,
     )
         .into_response()
 }
