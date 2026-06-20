@@ -737,12 +737,29 @@ feature-gated** — the default gateway build does not include them and is
 unaffected.
 
 ```bash
-# Build + run with the console enabled
+# 1. Build the frontend bundle (also vendors Swagger UI + bundles the spec).
+#    Required before any console build — the gateway embeds ../console/dist.
+cd console && npm install && npm run build && cd ..
+
+# 2a. Debug: rust-embed reads ../console/dist from disk at runtime, so frontend
+#     rebuilds are picked up live without recompiling the gateway.
 cargo build --features console --bin nanobpm-gateway-rest-server
 NANOBPMN_DATA_DIR=./nanobpm.data PORT=8080 \
   ./server/target/debug/nanobpm-gateway-rest-server
+
+# 2b. Release: assets are baked into the binary at compile time for a
+#     single-file distribution. Build the frontend FIRST (step 1), then:
+cargo build --release --features console --bin nanobpm-gateway-rest-server
+# If you rebuild the frontend afterwards, force a re-embed so the new assets
+# are baked in: `touch server/src/console/mod.rs` before rebuilding the gateway.
+
 # open http://localhost:8080/console
 ```
+
+> **Note:** the `console` feature is required. A plain `cargo build` (or
+> `cargo build --release`) without `--features console` produces the default
+> gateway, which serves no console, landing page, or Swagger UI — `/console`
+> returns 404.
 
 When started with the `console` feature, the gateway prints the human-facing
 URLs at startup:
