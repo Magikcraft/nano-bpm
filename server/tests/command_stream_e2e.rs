@@ -75,7 +75,10 @@ fn read_listening_port(child: &mut Child) -> u16 {
                         && let Ok(port) = rest.parse::<u16>()
                     {
                         let _ = tx.send(port);
-                        return;
+                        // Keep draining stdout to EOF rather than returning:
+                        // dropping the read end here SIGPIPEs the child's later
+                        // startup banner (the `console` build prints one),
+                        // panicking and killing the server before it serves.
                     }
                 }
             }

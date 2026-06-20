@@ -177,6 +177,11 @@ pub struct ServerImpl {
     /// path (reads and job dispatch always go to the leader's owned actor). Empty
     /// unless per-partition Raft is enabled with RF>1 — zero overhead otherwise.
     raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, EngineHandle>>>,
+    /// Tier-A execution-trace projection, folded off the engine event stream by
+    /// the exporter thread (process-optimization design doc §3). In-memory and
+    /// bounded; served under `/console/api/traces`. Console builds only.
+    #[cfg(feature = "console")]
+    pub trace_store: Arc<console::trace::TraceStore>,
 }
 
 /// RAII counter for the request-processing concurrency gauge: bumps the gauge on
@@ -380,6 +385,8 @@ impl ServerImpl {
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            #[cfg(feature = "console")]
+            trace_store: Arc::new(console::trace::TraceStore::from_env()),
         }
     }
 }
@@ -504,6 +511,8 @@ fn build_server(
         server.instances_changed.clone(),
         server.inflight.clone(),
         server.activity.clone(),
+        #[cfg(feature = "console")]
+        server.trace_store.clone(),
     );
     server
 }
@@ -522,6 +531,7 @@ fn spawn_exporter(
     instances_changed: Arc<tokio::sync::Notify>,
     inflight: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
+    #[cfg(feature = "console")] trace_store: Arc<console::trace::TraceStore>,
 ) {
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
@@ -537,6 +547,15 @@ fn spawn_exporter(
                 // Borrow every command's events as a flat slice of references —
                 // the payloads stay in their original `Arc`s, never copied here.
                 let refs: Vec<&Event> = batch.iter().flat_map(|events| events.iter()).collect();
+                // Tier-A trace projection (process-optimization design doc §3).
+                // Folded here because the exporter is the single ordered point all
+                // events flow through, and it is already off the command-commit/ack
+                // hot path. Stamp the batch with the server's observation time: the
+                // engine clock is injected (not on most events), and ingestion time
+                // is exact for the key queue-vs-service diagnostic (those transitions
+                // are separate commands at genuinely different instants).
+                #[cfg(feature = "console")]
+                trace_store.ingest(&refs, now_millis());
                 let created = refs
                     .iter()
                     .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))

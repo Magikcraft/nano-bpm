@@ -33,6 +33,7 @@ use tokio::sync::broadcast;
 
 use crate::ServerImpl;
 
+pub mod trace;
 pub mod workers;
 pub mod workspace;
 
@@ -70,6 +71,9 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/instances", get(instances))
         .route("/console/api/instances/{key}", get(instance_detail))
         .route("/console/api/stream", get(stream))
+        .route("/console/api/traces", get(traces))
+        .route("/console/api/traces/{key}", get(trace_detail))
+        .route("/console/api/traces/{key}/otel", get(trace_otel))
         .route(
             "/console/api/models",
             get(models).post(model_create),
@@ -834,6 +838,48 @@ async fn instance_detail(
     })
     .into_response()
 }
+
+/// `GET /console/api/traces?limit=N` — recent execution-trace summaries
+/// (most-recent first). Backed by the in-memory [`trace::TraceStore`] folded
+/// off the engine event stream (process-optimization design doc §3, Tier A).
+async fn traces(
+    State(server): State<ServerImpl>,
+    Query(q): Query<TraceListQuery>,
+) -> Json<Vec<trace::TraceSummaryDto>> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    Json(server.trace_store.list(limit))
+}
+
+/// `GET /console/api/traces/{key}` — the full per-element trace for one
+/// instance. 404 when the key is malformed or no longer retained in the ring.
+async fn trace_detail(State(server): State<ServerImpl>, Path(key): Path<String>) -> Response {
+    let Ok(key) = key.parse::<u64>() else {
+        return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
+    };
+    match server.trace_store.get(key) {
+        Some(t) => Json(t).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such trace").into_response(),
+    }
+}
+
+/// `GET /console/api/traces/{key}/otel` — the instance trace rendered as an
+/// OTLP/JSON trace document (root process span + per-element + per-job spans),
+/// ingestible by an OpenTelemetry collector.
+async fn trace_otel(State(server): State<ServerImpl>, Path(key): Path<String>) -> Response {
+    let Ok(key) = key.parse::<u64>() else {
+        return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
+    };
+    match server.trace_store.otel(key) {
+        Some(v) => Json(v).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such trace").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TraceListQuery {
+    limit: Option<usize>,
+}
+
 
 /// `GET /console/api/stream` — Server-Sent Events feed for live updates.
 ///
