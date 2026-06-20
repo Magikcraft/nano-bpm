@@ -422,6 +422,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanobpmn-engine-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -471,6 +478,7 @@ name = "processos"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "nanobpmn-engine-core",
  "reqwest",
  "serde",
  "serde_json",

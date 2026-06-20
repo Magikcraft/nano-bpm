@@ -21,6 +21,11 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# The MVP optimization harness (SimRunner) embeds the REAL engine for
+# trustworthy native replay — exactly as production runs it. engine-core is
+# lean/zero-dependency and std-only; this is a one-way `path` dependency (Nano's
+# engine never links ProcessOS). `serde` enables natural JSON variable I/O.
+nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 
 [profile.release]
 opt-level = "s"

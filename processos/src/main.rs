@@ -10,6 +10,7 @@
 //! production is unaffected.
 
 mod contracts;
+mod harness;
 mod report;
 
 use std::net::SocketAddr;
@@ -18,12 +19,13 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 
 use crate::contracts::NanoClient;
+use crate::harness::{example_scenario, run_scenario, Scenario};
 
 #[derive(Clone)]
 struct AppState {
@@ -68,6 +70,10 @@ async fn main() {
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/api/insights", get(insights))
+        .route("/harness", get(harness_dashboard))
+        .route("/api/harness/example", get(harness_example))
+        .route("/api/harness/example/run", get(harness_example_run))
+        .route("/api/harness/run", post(harness_run))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -127,6 +133,47 @@ async fn insights(
 /// that proxies to this server (see docs/processos-design.md §4).
 async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+// --- The optimization harness (MVP, design §7) ----------------------------------
+
+/// `GET /api/harness/example` — the bundled example scenario JSON, so callers have
+/// a ready template to copy and adapt.
+async fn harness_example() -> impl IntoResponse {
+    Json(example_scenario())
+}
+
+/// `GET /api/harness/example/run` — run the bundled example and return its ranking.
+async fn harness_example_run() -> impl IntoResponse {
+    run_scenario_blocking(example_scenario()).await
+}
+
+/// `POST /api/harness/run` — run a caller-supplied scenario and return its ranking.
+async fn harness_run(Json(scenario): Json<Scenario>) -> impl IntoResponse {
+    run_scenario_blocking(scenario).await
+}
+
+/// Run a scenario off the async runtime (the SimRunner is synchronous CPU work).
+async fn run_scenario_blocking(scenario: Scenario) -> axum::response::Response {
+    let result = tokio::task::spawn_blocking(move || run_scenario(&scenario)).await;
+    match result {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("harness task failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /harness` — a tiny dashboard that runs the example and renders the ranking.
+async fn harness_dashboard() -> Html<&'static str> {
+    Html(HARNESS_HTML)
 }
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
@@ -218,3 +265,96 @@ load();
 </body>
 </html>
 "#;
+
+/// The harness dashboard: runs the bundled example and renders the ranked
+/// candidates. Dependency-free; the richer UX is the console "Optimization" tab.
+const HARNESS_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ProcessOS — Optimization Harness</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  header { padding: 20px 24px; border-bottom: 1px solid #27272a; }
+  h1 { margin: 0; font-size: 18px; }
+  .sub { color: #a1a1aa; margin-top: 4px; }
+  main { padding: 24px; max-width: 1000px; }
+  .card { background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+  .notes { color: #a1a1aa; font-size: 13px; }
+  .notes li { margin: 2px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #27272a; }
+  th { color: #a1a1aa; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok { color: #4ade80; }
+  .bad { color: #f87171; }
+  .best { background: #14532d33; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #27272a; }
+  .pill.win { color: #4ade80; border-color: #14532d; }
+  code { color: #fbbf24; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ProcessOS — Optimization Harness</h1>
+  <div class="sub">SimRunner over the bundled example scenario (worker-swap transform space). The same loop runs in production against live Nano traces.</div>
+</header>
+<main id="root">Running the example scenario…</main>
+<script>
+function pct(x) { return (x * 100).toFixed(0) + "%"; }
+function num(x, d) { return Number(x).toFixed(d === undefined ? 2 : d); }
+async function load() {
+  const root = document.getElementById("root");
+  try {
+    const res = await fetch("/api/harness/example/run");
+    if (!res.ok) { root.textContent = "Harness error: " + res.status; return; }
+    const r = await res.json();
+    const golden = r.golden ? r.golden.name : "—";
+    const rows = r.variants.map((v, i) => {
+      const cls = i === 0 ? "best" : "";
+      const feas = v.feasible ? '<span class="ok">yes</span>' : '<span class="bad">no</span>';
+      return `<tr class="${cls}">
+        <td>${i + 1}</td>
+        <td>${v.name}${i === 0 ? ' <span class="pill win">best</span>' : ''}</td>
+        <td class="num">${num(v.avgCost)}</td>
+        <td class="num">${num(v.avgLatencyMs, 0)}</td>
+        <td class="num">${pct(v.correctnessRate)}</td>
+        <td class="num">${pct(v.incidentRate)}</td>
+        <td class="num">${pct(v.completionRate)}</td>
+        <td class="num">${feas}</td>
+      </tr>`;
+    }).join("");
+    root.innerHTML = `
+      <div class="card">
+        <div><strong>${r.scenario}</strong> &middot; process <code>${r.processId}</code> &middot; ${r.inputs} inputs &middot; minimize <code>${r.objective.minimize}</code></div>
+        <div class="sub" style="margin-top:6px">
+          Golden: <code>${golden}</code> &middot;
+          recovered: ${r.recoveredGolden ? '<span class="ok">yes</span>' : '<span class="bad">no</span>'}
+          ${r.goldenDistance != null ? ` (distance ${r.goldenDistance})` : ''}
+          &middot; best: <code>${r.best}</code>
+        </div>
+      </div>
+      <div class="card">
+        <table>
+          <thead><tr>
+            <th>#</th><th>candidate</th><th class="num">avg cost</th><th class="num">avg latency (ms)</th>
+            <th class="num">correct</th><th class="num">incidents</th><th class="num">completed</th><th class="num">feasible</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div class="card notes">
+        <strong>Notes</strong>
+        <ul>${r.notes.map(n => `<li>${n}</li>`).join("")}</ul>
+      </div>`;
+  } catch (e) {
+    root.textContent = "Harness error: " + e;
+  }
+}
+load();
+</script>
+</body>
+</html>
+"##;
