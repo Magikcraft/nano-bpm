@@ -338,6 +338,14 @@ surface, but it **sharpens and constrains M3 rather than redefining it**:
    > instances (not 102), p99 e2e 1540 ms, and `avgQueueMs 6166 ≫ avgServiceMs 67`
    > — the queue-bound (scale-the-workers) signature, produced from real
    > contention the SimRunner cannot generate.
+   >
+   > **Per-node sensing (`byNode`).** The same cluster-aware read also surfaces each
+   > node's share of the run plus its *live* backlog gauge (`activeInstances`,
+   > `completionsTotal` from `/console/api/metrics`). On a deliberately skewed
+   > partial-drain it reported node 0 `active=0 / completions=152`, node 1
+   > `active=40 / 112`, node 2 `active=50 / 100` — i.e. the cross-node backlog
+   > **imbalance** (the fairness signal) a single aggregate throughput number hides.
+   > This is the distributed-sensing input distributed *scaling* will act on.
 3. **Unify candidate evaluation across backends.** A candidate is evaluated by the
    SimRunner (fast offline what-if) or the ClusterRunner (at-scale realism); the
    ranking step (§7.2 step 5) is unchanged.

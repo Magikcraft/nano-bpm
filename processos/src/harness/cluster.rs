@@ -55,6 +55,29 @@ pub struct ClusterRunSummary {
     /// regime-(b) queueing simulator are fitted from (see
     /// `processos-deployment-cooptimization.md` §4.2). Empty when no details.
     pub by_job_type: Vec<JobTypeStat>,
+    /// Per-node distribution of the run across the cluster — the **distributed
+    /// sensing** signal. Trace data is partition-local, so each node contributes a
+    /// slice; uneven `instances`/`active_instances` here is the cross-node backlog
+    /// skew (the fairness signal) that a cluster-wide throughput number alone hides.
+    /// Populated only by the cluster-aware reader; empty for a pure summarize.
+    pub by_node: Vec<NodeStat>,
+}
+
+/// One cluster node's contribution to the run plus its live load gauge. `instances`
+/// is how many of this run's traces that node served (its partitions' share);
+/// `active_instances` is the node's *current* in-flight backlog. A node with a high
+/// `active_instances` while others sit near zero is being starved/over-loaded — the
+/// imbalance distributed scaling must sense and correct.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeStat {
+    pub endpoint: String,
+    /// Traces of the target process this node served (partition-local share).
+    pub instances: usize,
+    /// Live in-flight instances on this node at read time (`/console/api/metrics`).
+    pub active_instances: Option<i64>,
+    /// Cumulative completions this node has recorded (`/console/api/metrics`).
+    pub completions_total: Option<u64>,
 }
 
 /// One job type's contention profile across the sampled run: how many jobs ran,
@@ -180,6 +203,7 @@ pub fn summarize_run(
         avg_queue_ms: mean(queue_sum, queue_n),
         avg_service_ms: mean(service_sum, service_n),
         by_job_type,
+        by_node: Vec::new(),
     }
 }
 
@@ -270,7 +294,29 @@ pub async fn build_cluster_summary_over(
         }
     }
 
-    Ok(summarize_run(&target, &summaries, &details))
+    let mut summary = summarize_run(&target, &summaries, &details);
+
+    // Per-node distribution (the distributed-sensing signal): each node's share of
+    // the target process plus its live backlog gauge. A node's live metrics failing
+    // is non-fatal — it just leaves the gauges `None`.
+    let mut by_node: Vec<NodeStat> = Vec::with_capacity(clients.len());
+    for (i, c) in clients.iter().enumerate() {
+        let instances = summaries
+            .iter()
+            .enumerate()
+            .filter(|(idx, s)| owner[*idx] == i && s.process_id == target)
+            .count();
+        let m = c.metrics().await.ok();
+        by_node.push(NodeStat {
+            endpoint: c.base_url().to_string(),
+            instances,
+            active_instances: m.as_ref().map(|m| m.active_instances),
+            completions_total: m.as_ref().map(|m| m.completions_total),
+        });
+    }
+    summary.by_node = by_node;
+
+    Ok(summary)
 }
 
 /// Derive one console base URL per cluster node from a topology response. Trace data
