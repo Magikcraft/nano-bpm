@@ -46,10 +46,15 @@ struct Assets;
 /// effect, no external assets), served at `/`.
 const LANDING_HTML: &str = include_str!("landing.html");
 
+/// The standalone feature-comparison page (self-contained), served at
+/// `/features`.
+const FEATURES_HTML: &str = include_str!("features.html");
+
 /// Mounts the console SPA and its JSON API onto the gateway.
 pub fn router(server: ServerImpl) -> Router {
     Router::new()
         .route("/", get(landing))
+        .route("/features", get(features))
         .route("/swagger", get(swagger_index))
         .route("/swagger/", get(swagger_index))
         .route("/swagger/{*path}", get(swagger_asset))
@@ -147,6 +152,15 @@ async fn landing() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         LANDING_HTML,
+    )
+        .into_response()
+}
+
+/// Serves the standalone feature-comparison page at `/features`.
+async fn features() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        FEATURES_HTML,
     )
         .into_response()
 }
