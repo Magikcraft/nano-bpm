@@ -54,6 +54,7 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/swagger/", get(swagger_index))
         .route("/swagger/{*path}", get(swagger_asset))
         .route("/console/api/topology", get(topology))
+        .route("/console/api/cluster/health", get(cluster_health))
         .route("/console/api/metrics", get(metrics_snapshot))
         .route("/console/api/instances", get(instances))
         .route("/console/api/instances/{key}", get(instance_detail))
@@ -245,6 +246,154 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
         nodes,
         partitions,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Cluster health (live per-node liveness probe)
+// ---------------------------------------------------------------------------
+
+/// Live health of every node in the cluster, as seen from this gateway. Unlike
+/// [`topology`] (which reports the *configured* membership), this actively
+/// probes each peer's always-on `GET /v2/topology` to report whether it is
+/// reachable right now, its gateway version, and the round-trip latency.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterHealthDto {
+    checked_at_ms: u64,
+    nodes: Vec<NodeHealthDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NodeHealthDto {
+    node_id: u32,
+    /// `http://host:port` base URL (empty for self in a single-node cluster).
+    address: String,
+    is_self: bool,
+    /// Whether the node answered the probe within the timeout.
+    reachable: bool,
+    /// The node's reported gateway version (when reachable).
+    version: Option<String>,
+    /// Probe round-trip time in milliseconds (when reachable).
+    latency_ms: Option<u64>,
+    /// Why the probe failed (when unreachable).
+    error: Option<String>,
+}
+
+/// Per-peer probe timeout. Generous enough for a loaded node to answer, short
+/// enough that one dead peer doesn't stall the whole health response (all peers
+/// are probed concurrently, so the endpoint resolves in ~one timeout at worst).
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// `GET /console/api/cluster/health` — probes every peer concurrently and
+/// reports live reachability/version/latency. Self is reported without a network
+/// round-trip (it is, by definition, up and serving this request).
+async fn cluster_health(State(server): State<ServerImpl>) -> Json<ClusterHealthDto> {
+    let topology = server.engine.topology();
+    let self_id = topology.node_id;
+    let self_version = env!("CARGO_PKG_VERSION").to_string();
+    let num_nodes = topology.num_nodes();
+
+    let probes = (0..num_nodes).map(|node| {
+        let is_self = node == self_id;
+        let address = topology.peer_addr(node).unwrap_or("").to_string();
+        let self_version = self_version.clone();
+        async move {
+            if is_self {
+                return NodeHealthDto {
+                    node_id: node,
+                    address,
+                    is_self: true,
+                    reachable: true,
+                    version: Some(self_version),
+                    latency_ms: Some(0),
+                    error: None,
+                };
+            }
+            match probe_peer(&address).await {
+                Ok((version, latency)) => NodeHealthDto {
+                    node_id: node,
+                    address,
+                    is_self: false,
+                    reachable: true,
+                    version,
+                    latency_ms: Some(latency.as_millis() as u64),
+                    error: None,
+                },
+                Err(err) => NodeHealthDto {
+                    node_id: node,
+                    address,
+                    is_self: false,
+                    reachable: false,
+                    version: None,
+                    latency_ms: None,
+                    error: Some(err),
+                },
+            }
+        }
+    });
+
+    let nodes = futures_util::future::join_all(probes).await;
+    let checked_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Json(ClusterHealthDto { checked_at_ms, nodes })
+}
+
+/// Probes one peer's `GET {base_url}/v2/topology`, returning its reported
+/// `gatewayVersion` and the round-trip latency. Plain HTTP/1.1 (peers are
+/// TLS-less, like the command-stream uplink). Any transport error, non-2xx
+/// status, or timeout is mapped to a short human-readable string.
+async fn probe_peer(base_url: &str) -> Result<(Option<String>, Duration), String> {
+    use http_body_util::BodyExt;
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    if base_url.is_empty() {
+        return Err("no address configured".to_string());
+    }
+
+    let uri: hyper::Uri = format!("{}/v2/topology", base_url.trim_end_matches('/'))
+        .parse()
+        .map_err(|e| format!("bad peer url: {e}"))?;
+
+    let client: Client<_, http_body_util::Empty<hyper::body::Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let started = std::time::Instant::now();
+    let fut = async {
+        let resp = client.get(uri).await.map_err(|e| format!("connect: {e}"))?;
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("read: {e}"))?
+            .to_bytes();
+        Ok::<_, String>((status, body))
+    };
+
+    let (status, body) = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, fut)
+        .await
+        .map_err(|_| "timeout".to_string())??;
+
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+
+    // gatewayVersion is best-effort: a reachable node with an unparseable body
+    // is still "up", just without a version string.
+    let version = serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| {
+            v.get("gatewayVersion")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        });
+
+    Ok((version, started.elapsed()))
 }
 
 // ---------------------------------------------------------------------------

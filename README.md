@@ -784,7 +784,10 @@ neither and keeps its original startup output.)
 
 The console has five tabs:
 
-- **Topology** — cluster/partition/Raft overview.
+- **Topology** — cluster/partition/Raft overview with **live per-node health**:
+  each peer's always-on `GET /v2/topology` is probed (concurrently, on a 5 s
+  cadence) to show whether it's reachable right now, its gateway version, and
+  the round-trip latency — so a down or lagging node is visible at a glance.
 - **Metrics** — a live performance dashboard (process starts/s, jobs/s, active
   processes, connected clients, commit pipeline depth, journal/fsync/commit-wait
   means, writer duty cycle) with inline sparklines. Throughput rates are derived

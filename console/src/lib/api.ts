@@ -25,6 +25,23 @@ export interface Topology {
   partitions: PartitionInfo[];
 }
 
+/// Live per-node liveness from `/console/api/cluster/health` — each peer's
+/// always-on `GET /v2/topology` is probed for reachability/version/latency.
+export interface NodeHealth {
+  nodeId: number;
+  address: string;
+  isSelf: boolean;
+  reachable: boolean;
+  version: string | null;
+  latencyMs: number | null;
+  error: string | null;
+}
+
+export interface ClusterHealth {
+  checkedAtMs: number;
+  nodes: NodeHealth[];
+}
+
 export interface Instance {
   key: string;
   process_id: string;
@@ -209,6 +226,7 @@ async function send<T>(
 
 export const api = {
   topology: () => getJson<Topology>("/topology"),
+  clusterHealth: () => getJson<ClusterHealth>("/cluster/health"),
   metrics: () => getJson<MetricsSnapshot>("/metrics"),
   instances: () => getJson<Instance[]>("/instances"),
   instanceDetail: (key: string) =>

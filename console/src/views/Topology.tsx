@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { api } from "../lib/api";
+import { api, type NodeHealth } from "../lib/api";
 
 export default function Topology() {
   const { data, isLoading, error } = useQuery({
@@ -8,6 +8,17 @@ export default function Topology() {
     queryFn: api.topology,
     refetchInterval: 2000,
   });
+
+  // Live per-node liveness, probed independently (slower cadence: each refresh
+  // probes every peer over the network).
+  const { data: health } = useQuery({
+    queryKey: ["clusterHealth"],
+    queryFn: api.clusterHealth,
+    refetchInterval: 5000,
+  });
+
+  const healthOf = (nodeId: number): NodeHealth | undefined =>
+    health?.nodes.find((n) => n.nodeId === nodeId);
 
   return (
     <div className="p-8">
@@ -41,28 +52,71 @@ export default function Topology() {
               Nodes
             </h2>
             <div className="flex flex-wrap gap-3">
-              {data.nodes.map((n) => (
-                <div
-                  key={n.node_id}
-                  className={`rounded-lg border px-4 py-3 ${
-                    n.is_self
-                      ? "border-emerald-700 bg-emerald-950/40"
-                      : "border-zinc-800 bg-zinc-900"
-                  }`}
-                >
-                  <div className="font-medium">
-                    node {n.node_id}
-                    {n.is_self && (
-                      <span className="ml-2 rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
-                        this
-                      </span>
-                    )}
+              {data.nodes.map((n) => {
+                const h = healthOf(n.node_id);
+                const down = h && !h.reachable && !n.is_self;
+                return (
+                  <div
+                    key={n.node_id}
+                    className={`min-w-[12rem] rounded-lg border px-4 py-3 ${
+                      down
+                        ? "border-red-800 bg-red-950/30"
+                        : n.is_self
+                          ? "border-emerald-700 bg-emerald-950/40"
+                          : "border-zinc-800 bg-zinc-900"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+                          h
+                            ? h.reachable
+                              ? "bg-emerald-400"
+                              : "bg-red-500"
+                            : "bg-zinc-600"
+                        }`}
+                        title={
+                          h
+                            ? h.reachable
+                              ? "reachable"
+                              : `unreachable: ${h.error ?? "no response"}`
+                            : "probing…"
+                        }
+                      />
+                      <span className="font-medium">node {n.node_id}</span>
+                      {n.is_self && (
+                        <span className="rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
+                          this
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-1 text-xs text-zinc-500">
+                      {n.address || "local"}
+                    </div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
+                      {h?.reachable ? (
+                        <>
+                          {h.version && (
+                            <span className="text-zinc-400">v{h.version}</span>
+                          )}
+                          {h.latencyMs != null && !n.is_self && (
+                            <span className="text-zinc-500">{h.latencyMs} ms</span>
+                          )}
+                          {n.is_self && (
+                            <span className="text-emerald-400">healthy</span>
+                          )}
+                        </>
+                      ) : h ? (
+                        <span className="text-red-400">
+                          unreachable{h.error ? ` · ${h.error}` : ""}
+                        </span>
+                      ) : (
+                        <span className="text-zinc-600">probing…</span>
+                      )}
+                    </div>
                   </div>
-                  <div className="text-xs text-zinc-500">
-                    {n.address || "local"}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
 

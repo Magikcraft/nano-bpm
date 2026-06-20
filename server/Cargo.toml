@@ -39,6 +39,16 @@ anyhow = "1.0.102"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 
+# Console-only HTTP client for the cluster-health probe: each node probes its
+# peers' always-on `GET /v2/topology` to report remote liveness/version/latency
+# in the Topology tab. hyper(-util) is already in the tree via axum, and peers
+# speak plain HTTP (no TLS — same as the command-stream uplink), so this adds no
+# new TLS stack. serde_json (already a dependency) parses the probed
+# `gatewayVersion`.
+hyper = { version = "1", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+
 # jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
 # Linux glibc), it returns freed memory to the OS on a decay schedule and exposes
 # a portable `mallctl` purge knob, so an idle server's resident footprint falls
@@ -58,7 +68,7 @@ serde_json = "1"
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:rust-embed", "dep:mime_guess", "tokio/process", "tokio/io-util"]
+console = ["dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/process", "tokio/io-util"]
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate
