@@ -408,6 +408,59 @@ impl ReadStore {
         Ok(completed)
     }
 
+    /// Caps retained *terminal* (Completed/Terminated) process instances at
+    /// `max_keep`, deleting the oldest beyond the cap together with all their
+    /// dependent rows (variables, jobs, incidents, user tasks). Active instances
+    /// are never touched. Returns the number of instances evicted.
+    ///
+    /// This bounds read-model memory to the working set instead of letting it
+    /// grow without limit with cumulative throughput: without it, every
+    /// completed instance — and its full variable payload — is retained forever,
+    /// so a long-running engine's memory climbs indefinitely even with no active
+    /// processes. An in-memory (`:memory:`) store never returns freed pages to
+    /// the OS, so the win is *prevention* — pruning continuously keeps the page
+    /// arena from ballooning in the first place (freed pages are reused by new
+    /// instances). `max_keep == 0` disables pruning (unbounded history, the
+    /// default — see `NANOBPMN_HISTORY_MAX_INSTANCES`).
+    ///
+    /// Terminal instances are ordered by `key`, which is monotonic in creation
+    /// order, so the most recently created terminal instances are retained.
+    pub fn prune_terminal_instances(&self, max_keep: usize) -> rusqlite::Result<usize> {
+        if max_keep == 0 {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().expect("read store poisoned");
+        let tx = conn.transaction()?;
+        // Materialize the keys to evict: every terminal instance EXCEPT the most
+        // recent `max_keep` (LIMIT -1 OFFSET n = "all rows after the first n").
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _evict(key INTEGER PRIMARY KEY);
+             DELETE FROM _evict;",
+        )?;
+        let evicted = tx.execute(
+            "INSERT INTO _evict(key) \
+             SELECT key FROM process_instances WHERE state IN (1, 2) \
+             ORDER BY key DESC LIMIT -1 OFFSET ?1",
+            params![max_keep as i64],
+        )?;
+        if evicted == 0 {
+            tx.commit()?;
+            return Ok(0);
+        }
+        for table in ["variables", "jobs", "incidents", "user_tasks"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE instance_key IN (SELECT key FROM _evict)"),
+                [],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM process_instances WHERE key IN (SELECT key FROM _evict)",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(evicted)
+    }
+
     // --- queries used by the search/get handlers ---
 
     /// The number of non-terminal (Active) process instances currently in the
@@ -1232,5 +1285,50 @@ mod definition_xml_tests {
         store.export(&[&event]).unwrap();
         // Present but empty — the handler maps this to a 204, not a 404.
         assert_eq!(store.process_definition_xml(7).as_deref(), Some(""));
+    }
+
+    fn created_event(instance_key: super::Key) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+        }
+    }
+
+    #[test]
+    fn prune_terminal_instances_caps_history_keeping_active_and_newest() {
+        let store = ReadStore::open(None).unwrap();
+        // 5 terminal instances (keys 1..=5) + 2 active (keys 100, 101).
+        for k in 1..=5u64 {
+            let created = created_event(k);
+            let done = Event::ProcessInstanceCompleted { instance_key: k };
+            store.export(&[&created, &done]).unwrap();
+        }
+        for k in [100u64, 101] {
+            let created = created_event(k);
+            store.export(&[&created]).unwrap();
+        }
+
+        // max_keep == 0 disables pruning.
+        assert_eq!(store.prune_terminal_instances(0).unwrap(), 0);
+        assert!(store.process_instance(1).is_some());
+
+        // Keep the 2 newest terminal instances (keys 4, 5); evict keys 1,2,3.
+        let evicted = store.prune_terminal_instances(2).unwrap();
+        assert_eq!(evicted, 3);
+        assert!(store.process_instance(1).is_none());
+        assert!(store.process_instance(3).is_none());
+        assert!(store.process_instance(4).is_some());
+        assert!(store.process_instance(5).is_some());
+        // Active instances are never evicted.
+        assert!(store.process_instance(100).is_some());
+        assert!(store.process_instance(101).is_some());
+        assert_eq!(store.active_instance_count(), 2);
+
+        // Re-pruning at the same cap is a no-op (nothing beyond the cap).
+        assert_eq!(store.prune_terminal_instances(2).unwrap(), 0);
     }
 }

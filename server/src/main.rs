@@ -533,9 +533,18 @@ fn spawn_exporter(
     activity: Arc<AtomicU64>,
     #[cfg(feature = "console")] trace_store: Arc<console::trace::TraceStore>,
 ) {
+    // Read-model history cap: how many terminal (Completed/Terminated) instances
+    // to retain before the oldest are evicted (with their variables/jobs/etc.).
+    // 0 = unbounded (default). Bounds read-model memory to the working set so a
+    // long-running engine does not climb indefinitely as completed instances
+    // accumulate. Pruned in this thread (the single SQLite writer), throttled by
+    // accumulated completions so the transaction cost is amortized.
+    let history_cap = history_max_instances_from_env();
+    let prune_threshold = (history_cap / 4).clamp(64, 4096);
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
         .spawn(move || {
+            let mut since_prune = 0usize;
             while let Ok(first) = rx.recv() {
                 let mut batch = vec![first];
                 while let Ok(next) = rx.try_recv() {
@@ -579,6 +588,7 @@ fn spawn_exporter(
                 // `awaitCompletion` requests so they can observe a terminal
                 // state. notify_waiters() is a no-op when nobody is waiting.
                 instances_changed.notify_waiters();
+                since_prune += completed.len();
                 if !completed.is_empty() {
                     // Reclaim hot state for the whole batch; no per-batch
                     // shrink_to_fit (reallocating every map needlessly throttles
@@ -610,6 +620,20 @@ fn spawn_exporter(
                                 });
                             }
                         }
+                    }
+                }
+                // History retention: once enough instances have reached a terminal
+                // state since the last sweep, cap the retained terminal set so the
+                // read model tracks the working set rather than cumulative
+                // throughput. Disabled (no-op) when history_cap == 0.
+                if history_cap != 0 && since_prune >= prune_threshold {
+                    since_prune = 0;
+                    match store.prune_terminal_instances(history_cap) {
+                        Ok(n) if n > 0 => {
+                            tracing::debug!("history retention: evicted {n} terminal instances")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("history retention prune failed: {e}"),
                     }
                 }
             }
@@ -678,6 +702,21 @@ fn admission_max_backlog_from_env() -> usize {
 /// disables it (the default).
 fn admission_max_create_queue_from_env() -> usize {
     std::env::var("NANOBPMN_ADMISSION_MAX_CREATE_QUEUE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// How many terminal (Completed/Terminated) process instances the read model
+/// retains before the oldest are evicted with all their dependent rows
+/// (variables, jobs, incidents, user tasks). Bounds read-model memory to the
+/// working set: without it, every completed instance — and its full variable
+/// payload — is kept forever, so a long-running engine's memory climbs
+/// indefinitely even with no active processes. Unset or `0` = unbounded history
+/// (the default, byte-for-byte today's behaviour). Active instances are never
+/// evicted regardless of this cap.
+fn history_max_instances_from_env() -> usize {
+    std::env::var("NANOBPMN_HISTORY_MAX_INSTANCES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0)

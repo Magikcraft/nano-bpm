@@ -289,6 +289,7 @@ working set.
 | Variable | Effect |
 | --- | --- |
 | `NANOBPMN_IDLE_PURGE_MS=<n>` | Quiescence (ms) the server must be idle before it compacts hot state and returns freed memory to the OS. Default `5000`; `0` disables the idle-purge tick. |
+| `NANOBPMN_HISTORY_MAX_INSTANCES=<n>` | Caps how many *completed/terminated* instances the read model retains (with their variables, jobs and incidents); the oldest beyond the cap are evicted continuously on the exporter thread. Active instances are never evicted. Default `0` = unbounded history. Set it to bound read-model memory to the working set: the in-memory read store retains every completed instance forever otherwise, so idle footprint climbs with cumulative throughput even with no active processes. |
 
 ### Tiered hot state: variable spill and cold spill
 
