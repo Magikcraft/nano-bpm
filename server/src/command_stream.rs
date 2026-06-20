@@ -1143,7 +1143,13 @@ async fn handle_client_frame(
                     )
                     .await
             };
-            let body = serde_json::to_value(&jobs).unwrap_or(Value::Null);
+            let body = serde_json::json!({
+                "jobs": jobs,
+                // Piggybacked per-node backlog (active instances) so the
+                // requesting gateway can weight future activation toward the
+                // genuinely-deepest node (Stage 2) with no extra round-trip.
+                "backlog": server.active_backlog(),
+            });
             conn.send(ServerFrame::CommandResult {
                 corr,
                 status: 200,
@@ -1541,7 +1547,8 @@ async fn dispatch_to_connection(
         }
         let mut pushed = 0i64;
 
-        if !activation_fairness() || peers.is_empty() {
+        let mode = activation_mode();
+        if mode == FairnessMode::Off || peers.is_empty() {
             // Historical local-first dispatch (and the only path on a single
             // node, where `peers` is empty): drain local, then pull the
             // shortfall from peers in fixed id order.
@@ -1601,15 +1608,42 @@ async fn dispatch_to_connection(
             }
         } else {
             // Fairness-aware dispatch (multi-node). Sources are the local engine
-            // (index 0) and each peer (1..=peers.len()). `fair_plan` rotates the
-            // source order per pass and quota-caps each source on the first lap so
-            // a fat backlog on one node cannot consume the whole lease budget,
-            // then a second lap soaks any leftover (from sources that ran dry).
+            // (index 0) and each peer (1..=peers.len()). The plan is an ordered list
+            // of `(source, cap)` probes that the loop walks until `want` is met.
+            //   * Stage 1 (`=1`): `fair_plan` rotates the source order and quota-caps
+            //     each source equally so a fat backlog on one node cannot consume the
+            //     whole budget — purely stateless.
+            //   * Stage 2 (`=2`): `fair_plan_weighted` caps each source proportional
+            //     to its current backlog (local read live, peers piggybacked on their
+            //     activation responses — no extra round-trip), so budget is steered
+            //     toward where the jobs actually are — fewer wasted probes on
+            //     shallow/empty sources and faster drain of the deepest. Collapses to
+            //     Stage 1 when backlogs are balanced.
             // Leases remain exclusive on each owner's single-writer actor, so this
             // only redistributes *where* a worker draws from, never correctness.
             let num_sources = peers.len() + 1;
             let start = (DISPATCH_ROTATION.fetch_add(1, Ordering::Relaxed) as usize) % num_sources;
-            for (src, cap) in fair_plan(want, num_sources, start) {
+            let plan = if mode == FairnessMode::Stage2 {
+                // Source backlogs: local is read live (cheap atomic); peers come
+                // from the value each piggybacked on its last activation response.
+                // A peer not yet probed is seeded with the local backlog so it is
+                // not starved before its first sample (the rotation/soak laps probe
+                // it and replace the seed with its real depth).
+                let local = server.active_backlog();
+                let hints: Vec<i64> = (0..num_sources)
+                    .map(|s| {
+                        if s == 0 {
+                            local
+                        } else {
+                            read_peer_backlog(source_node(s, &peers)).unwrap_or(local)
+                        }
+                    })
+                    .collect();
+                fair_plan_weighted(want, &hints, start)
+            } else {
+                fair_plan(want, num_sources, start)
+            };
+            for (src, cap) in plan {
                 let remaining = want.saturating_sub(pushed as usize);
                 if remaining == 0 {
                     break;
@@ -1634,6 +1668,8 @@ async fn dispatch_to_connection(
                         )
                         .await
                 } else {
+                    // `activate_from_peer` records the peer's piggybacked backlog
+                    // into the cache, refreshing this source's hint for free.
                     server
                         .activate_from_peer(
                             peers[src - 1],
@@ -1698,23 +1734,130 @@ fn fair_plan(want: usize, num_sources: usize, start: usize) -> Vec<(usize, usize
     plan
 }
 
-/// Whether to use fairness-aware activation routing across cluster nodes.
+/// Whether (and how) to use fairness-aware activation routing across cluster
+/// nodes.
 ///
-/// Default (off): strict local-first, then peers in fixed id order — the
-/// historical behaviour, byte-identical on a single node and unchanged for
-/// existing benchmarks. When enabled (`NANOBPMN_ACTIVATION_FAIRNESS=1`), a
-/// worker's lease budget is rotated and quota-split across `{local, peers}` so a
-/// fat local backlog cannot monopolise a worker while peers' partitions starve
-/// (Stage 1: stateless rotation + per-source quota; no protocol change). Only
-/// affects multi-node clusters — with no peers there is a single source and the
-/// path collapses to the historical local-only dispatch.
-fn activation_fairness() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| {
-        std::env::var("NANOBPMN_ACTIVATION_FAIRNESS")
-            .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
-            .unwrap_or(false)
+/// `NANOBPMN_ACTIVATION_FAIRNESS` selects the mode:
+///   * unset / `0` / `off` → `Off`: strict local-first, then peers in fixed id
+///     order — the historical behaviour, byte-identical on a single node and
+///     unchanged for existing benchmarks.
+///   * `1` / `true` / `on` / `yes` → `Stage1`: stateless rotation + per-source
+///     quota. Spreads a worker's lease budget evenly across `{local, peers}` so a
+///     fat local backlog cannot monopolise a worker while peers' partitions
+///     starve. No protocol change.
+///   * `2` / `weighted` / `stage2` → `Stage2`: backlog-weighted routing. Caps each
+///     source proportional to its current backlog — local read live, peers from a
+///     value each piggybacks on its activation response (no extra round-trip, no
+///     new RPC) — steering budget toward where the jobs are. Collapses to Stage 1
+///     when backlogs are balanced.
+///
+/// Only affects multi-node clusters — with no peers there is a single source and
+/// every mode collapses to the historical local-only dispatch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FairnessMode {
+    Off,
+    Stage1,
+    Stage2,
+}
+
+fn activation_mode() -> FairnessMode {
+    static M: std::sync::OnceLock<FairnessMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        match std::env::var("NANOBPMN_ACTIVATION_FAIRNESS")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("2") | Some("weighted") | Some("stage2") => FairnessMode::Stage2,
+            Some("1") | Some("true") | Some("on") | Some("yes") => FairnessMode::Stage1,
+            _ => FairnessMode::Off,
+        }
     })
+}
+
+/// Sentinel node id for the local engine in the backlog-hint cache (real peer ids
+/// are small; `u32::MAX` cannot collide).
+const LOCAL_SOURCE_NODE: u32 = u32::MAX;
+
+/// Maps a dispatch source index to its node id: source 0 is the local engine;
+/// source `k` (k≥1) is `peers[k-1]`.
+fn source_node(src: usize, peers: &[u32]) -> u32 {
+    if src == 0 {
+        LOCAL_SOURCE_NODE
+    } else {
+        peers[src - 1]
+    }
+}
+
+/// Last-known per-peer backlog (active-instance count), refreshed every time we
+/// activate from that peer — the peer piggybacks its current backlog on the
+/// activation response, so this costs no extra round-trip. Process-global; a tiny
+/// critical section under a mutex is nothing next to the network hop that fills
+/// it. `None` for a peer we have not probed yet.
+fn peer_backlog_cache() -> &'static Mutex<HashMap<u32, i64>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<u32, i64>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records a peer's piggybacked backlog. Called from `activate_from_peer` (in
+/// `main`) on every successful activation response.
+pub(crate) fn record_peer_backlog(node: u32, backlog: i64) {
+    peer_backlog_cache()
+        .lock()
+        .unwrap()
+        .insert(node, backlog.max(0));
+}
+
+fn read_peer_backlog(node: u32) -> Option<i64> {
+    peer_backlog_cache().lock().unwrap().get(&node).copied()
+}
+
+/// Stage 2 plan: spread a worker's lease budget (`want`) across `num_sources`
+/// sources (local + each peer) *proportional to each source's backlog* `hints`,
+/// walking sources in rotated order from `start`.
+///
+///   * **Lap 1** caps each source at `ceil(want · hint_i / Σhint)` so deeper
+///     backlogs draw a larger share and shallow/empty ones are barely probed —
+///     this both equalises backlogs (drains the deepest fastest, the negative
+///     feedback that closes the SLA gap a static even split leaves under skew) and
+///     avoids the wasted round-trips Stage 1's blind even split spends on shallow
+///     sources. The rotation-start source keeps a floor of 1 so a believed-empty
+///     source is periodically re-checked and its hint refreshed.
+///   * **Lap 2** revisits every source uncapped (rotated order) to soak any demand
+///     left unmet, keeping the worker full when the cluster has the jobs.
+///
+/// When all hints are 0 it falls back to the Stage 1 even split so every source is
+/// probed and learns a hint. When backlogs are balanced the proportional caps
+/// equal `ceil(want / num_sources)` — i.e. identical to Stage 1, so a balanced
+/// cluster sees no behaviour change. Pure and deterministic.
+fn fair_plan_weighted(want: usize, hints: &[i64], start: usize) -> Vec<(usize, usize)> {
+    let n = hints.len();
+    if n <= 1 {
+        return vec![(0, want)];
+    }
+    let total: i64 = hints.iter().map(|h| (*h).max(0)).sum();
+    if total <= 0 || want == 0 {
+        // Cold start / nothing believed available: even split so we probe and learn.
+        return fair_plan(want, n, start);
+    }
+    let mut plan = Vec::with_capacity(n * 2);
+    // Lap 1: rotated order, proportional caps.
+    for k in 0..n {
+        let src = (start + k) % n;
+        let w = hints[src].max(0);
+        let mut cap = ((want as i64 * w + total - 1) / total) as usize; // ceil
+        if k == 0 {
+            cap = cap.max(1); // refresh the rotation-start source
+        }
+        if cap > 0 {
+            plan.push((src, cap));
+        }
+    }
+    // Lap 2: rotated order, uncapped — soaks leftover from sources that filled.
+    for k in 0..n {
+        plan.push(((start + k) % n, want));
+    }
+    plan
 }
 
 /// Number of connections the dispatcher services concurrently in one pass.
@@ -1829,5 +1972,91 @@ mod fair_plan_tests {
         assert_eq!(b.iter().sum::<usize>(), 65);
         assert_eq!(a, vec![22, 22, 21]);
         assert_eq!(b, vec![21, 22, 22]);
+    }
+}
+
+#[cfg(test)]
+mod fair_plan_weighted_tests {
+    use super::{fair_plan, fair_plan_weighted};
+
+    /// Executes a weighted plan against a per-source supply, mirroring the
+    /// dispatcher loop (each probe takes `min(cap, remaining, supply_left)`).
+    fn run(want: usize, hints: &[i64], supply: &[usize], start: usize) -> Vec<usize> {
+        let n = supply.len();
+        let mut got = vec![0usize; n];
+        let mut pushed = 0usize;
+        let mut left: Vec<usize> = supply.to_vec();
+        for (src, cap) in fair_plan_weighted(want, hints, start) {
+            let remaining = want - pushed;
+            if remaining == 0 {
+                break;
+            }
+            let ask = cap.min(remaining).min(left[src]);
+            got[src] += ask;
+            left[src] -= ask;
+            pushed += ask;
+        }
+        got
+    }
+
+    #[test]
+    fn single_source_takes_everything() {
+        assert_eq!(fair_plan_weighted(64, &[10_000], 0), vec![(0, 64)]);
+    }
+
+    #[test]
+    fn cold_start_falls_back_to_even_split() {
+        // All hints 0 (nothing learned yet): identical to the Stage 1 even split,
+        // so every source is probed and learns a hint.
+        assert_eq!(
+            fair_plan_weighted(64, &[0, 0, 0], 0),
+            fair_plan(64, 3, 0)
+        );
+    }
+
+    #[test]
+    fn balanced_backlog_matches_stage1() {
+        // Equal hints ⇒ proportional caps equal ceil(want/n) ⇒ no behaviour change
+        // versus Stage 1 on a balanced cluster.
+        let w = fair_plan_weighted(64, &[500, 500, 500], 0);
+        let s1 = fair_plan(64, 3, 0);
+        // Lap-1 caps match (lap-2 soak is identical by construction).
+        assert_eq!(&w[..3], &s1[..3]);
+    }
+
+    #[test]
+    fn skewed_backlog_steers_budget_to_the_deepest() {
+        // Source 1 holds the lion's share of the backlog; it should draw the
+        // largest cap and thus the most jobs, draining the deepest fastest.
+        let hints = [100, 800, 100];
+        let got = run(64, &hints, &[10_000, 10_000, 10_000], 0);
+        assert_eq!(got.iter().sum::<usize>(), 64);
+        assert!(
+            got[1] > got[0] && got[1] > got[2],
+            "deepest source should be served most: {got:?}"
+        );
+    }
+
+    #[test]
+    fn empty_sources_are_barely_probed_but_not_starved_of_refresh() {
+        // Sources 1,2 believed empty; nearly all budget goes to the deep source 0,
+        // but the rotation-start source still gets a refresh probe of >= 1.
+        let plan = fair_plan_weighted(60, &[600, 0, 0], 0);
+        // Start source (0) is deep and first; give a skewed-empty start a refresh.
+        let plan2 = fair_plan_weighted(60, &[0, 600, 0], 0);
+        let start_cap = plan2.iter().find(|(s, _)| *s == 0).map(|(_, c)| *c).unwrap();
+        assert!(start_cap >= 1, "rotation-start source keeps a refresh probe");
+        // The deep source still carries the bulk.
+        let deep_cap: usize = plan.iter().filter(|(s, _)| *s == 0).map(|(_, c)| *c).max().unwrap();
+        assert!(deep_cap >= 30, "deep source carries the budget: {plan:?}");
+    }
+
+    #[test]
+    fn soaks_residual_when_deep_estimate_was_stale() {
+        // Hint says source 0 is deep, but it only has 5 jobs now; the uncapped lap 2
+        // soaks the rest from the genuinely-available peers so the worker fills.
+        let got = run(60, &[1000, 10, 10], &[5, 10_000, 10_000], 0);
+        assert_eq!(got.iter().sum::<usize>(), 60);
+        assert_eq!(got[0], 5, "drained the shallow-but-believed-deep source");
     }
 }

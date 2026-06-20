@@ -2937,10 +2937,21 @@ impl ServerImpl {
             )
             .await;
         match res {
-            Ok(r) if is_ok_status(r.status) => r
-                .body
-                .and_then(|b| serde_json::from_value::<Vec<models::ActivatedJobResult>>(b).ok())
-                .unwrap_or_default(),
+            Ok(r) if is_ok_status(r.status) => {
+                let body = match r.body {
+                    Some(b) => b,
+                    None => return Vec::new(),
+                };
+                // Tolerant parse: the current wire shape is
+                // `{ jobs: [...], backlog: N }`; fall back to a bare jobs array for
+                // safety. The piggybacked backlog feeds Stage 2 fairness weighting.
+                if let Some(backlog) = body.get("backlog").and_then(|v| v.as_i64()) {
+                    crate::command_stream::record_peer_backlog(node, backlog);
+                }
+                let jobs_val = body.get("jobs").cloned().unwrap_or(body);
+                serde_json::from_value::<Vec<models::ActivatedJobResult>>(jobs_val)
+                    .unwrap_or_default()
+            }
             _ => Vec::new(),
         }
     }
@@ -6225,6 +6236,14 @@ impl ServerImpl {
     pub(crate) fn submission_pressure(&self) -> bool {
         let processing = self.processing.load(Ordering::Relaxed);
         self.backpressure.should_shed(processing)
+    }
+
+    /// This node's active (non-terminal) instance count — the cheap, live gauge
+    /// maintained for admission control. Used as a per-node backlog proxy for
+    /// Stage 2 fairness routing (piggybacked to peers on activation responses). A
+    /// relaxed atomic load; no engine round-trip.
+    pub(crate) fn active_backlog(&self) -> i64 {
+        self.inflight.load(Ordering::Relaxed) as i64
     }
 
     /// Active-backlog / create-queue admission gate. When either
