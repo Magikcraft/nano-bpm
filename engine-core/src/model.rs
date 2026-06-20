@@ -166,8 +166,15 @@ pub enum ElementKind {
     /// process instance.
     EndEvent,
     /// A service task. On activation it creates a job of `job_type` and the token
-    /// rests until the job is completed.
-    ServiceTask { job_type: String },
+    /// rests until the job is completed. `priority` is the *raw* (un-evaluated)
+    /// job-priority expression declared via `zeebe:priorityDefinition` (a literal
+    /// or a FEEL expression); it is resolved against the instance variables when
+    /// the job is created and controls activation order (higher first). `None`
+    /// means no declaration, which resolves to the default priority.
+    ServiceTask {
+        job_type: String,
+        priority: Option<String>,
+    },
     /// A (native/Zeebe) user task. On activation it creates a user task that a
     /// human claims and completes; the token rests until the user task is
     /// completed ([`crate::Command::CompleteUserTask`]). Unlike a service task it
@@ -466,6 +473,25 @@ impl ProcessBuilder {
             id,
             ElementKind::ServiceTask {
                 job_type: job_type.into(),
+                priority: None,
+            },
+        )
+    }
+
+    /// Adds a service task whose jobs carry the given (raw) `zeebe:priorityDefinition`
+    /// expression — a literal or FEEL expression resolved at job creation that
+    /// controls activation order (higher priority is activated first).
+    pub fn service_task_with_priority(
+        self,
+        id: impl Into<String>,
+        job_type: impl Into<String>,
+        priority: Option<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ServiceTask {
+                job_type: job_type.into(),
+                priority,
             },
         )
     }

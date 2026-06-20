@@ -144,6 +144,36 @@ pub struct Job {
     /// and updated by `FailJob`. A failure that drops it to zero raises an
     /// incident and parks the job ([`JobState::Failed`]).
     pub retries: i32,
+    /// Activation priority (0..=100; default [`DEFAULT_JOB_PRIORITY`]), resolved
+    /// from the service task's `zeebe:priorityDefinition` at job creation. Higher
+    /// priority is activated first; equal priorities fall back to oldest-first
+    /// (key order). Immutable for the job's lifetime.
+    #[cfg_attr(feature = "serde", serde(default = "default_job_priority"))]
+    pub priority: i32,
+    /// The logical instant the job was created (the `now` carried on the creating
+    /// command), in milliseconds since the Unix epoch. Used to observe activation
+    /// age. `0` for jobs created before the engine carried this field.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub created_at: u64,
+}
+
+/// Default job-activation priority when no `zeebe:priorityDefinition` is declared.
+pub const DEFAULT_JOB_PRIORITY: i32 = 50;
+
+/// serde default for [`Job::priority`] / [`crate::Event::JobCreated`] on records
+/// serialized before the field existed.
+#[cfg(feature = "serde")]
+pub fn default_job_priority() -> i32 {
+    DEFAULT_JOB_PRIORITY
+}
+
+/// The ordering position of an activatable job in the per-type index: highest
+/// priority first (stored negated so a `BTreeSet`'s ascending order yields it
+/// first), then lowest key (oldest-first — keys are monotonic with creation
+/// within a partition — as the SLA/age tiebreak).
+#[inline]
+pub(crate) fn activation_order(priority: i32, key: Key) -> (i32, Key) {
+    (-priority, key)
 }
 
 /// Retries a job starts with when first created.
@@ -543,14 +573,15 @@ pub struct State {
     /// `due_at = None`.
     pub start_timers: HashMap<Key, StartTimer>,
     /// Index of jobs eligible to be *considered* for activation, grouped by job
-    /// type and ordered by key. A job is a member iff its state is `Created` or
-    /// `Activated` (an activated job may still be re-activatable once its lock
-    /// deadline passes, so it stays indexed and is filtered by deadline at
-    /// activation time). This lets `ActivateJobs` serve a worker poll in roughly
-    /// `O(max_jobs)` instead of scanning every job in the system — critical when
-    /// a large backlog of pending jobs accumulates under load. It is fully
-    /// derived from `jobs` and kept in lockstep by [`resync_job_index`].
-    pub activatable_jobs: HashMap<String, BTreeSet<Key>>,
+    /// type and ordered by `(−priority, key)` — highest priority first, then
+    /// oldest (lowest key) as the age/SLA tiebreak. A job is a member iff its
+    /// state is `Created` (an `Activated` job is removed when it locks and re-added
+    /// by `JobLockExpired` when its lock expires). This lets `ActivateJobs` serve a
+    /// worker poll in roughly `O(max_jobs)` instead of scanning every job in the
+    /// system — critical when a large backlog of pending jobs accumulates under
+    /// load. It is fully derived from `jobs` and kept in lockstep by
+    /// [`resync_job_index`].
+    pub activatable_jobs: HashMap<String, BTreeSet<(i32, Key)>>,
     /// The keys of all jobs currently in the `Activated` state (holding a lock).
     /// Bounded by the number of concurrently working workers, so it lets
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning
@@ -602,10 +633,11 @@ impl State {
     /// Removes `key` from both job indices (the activatable set under
     /// `job_type`, and the activated set), pruning an emptied per-type set.
     /// Used when a job is dropped from `jobs` entirely (eviction), where
-    /// [`resync_job_index`] cannot run because the job is already gone.
-    pub fn deindex_job(&mut self, job_type: &str, key: Key) {
+    /// [`resync_job_index`] cannot run because the job is already gone. `priority`
+    /// is the dropped job's priority, needed to locate its ordering slot.
+    pub fn deindex_job(&mut self, job_type: &str, key: Key, priority: i32) {
         if let Some(set) = self.activatable_jobs.get_mut(job_type) {
-            set.remove(&key);
+            set.remove(&activation_order(priority, key));
             if set.is_empty() {
                 self.activatable_jobs.remove(job_type);
             }
@@ -634,14 +666,15 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     };
     let job_type = job.job_type.clone();
     let job_state = job.state;
+    let order = activation_order(job.priority, job_key);
     if job_state == JobState::Created {
         state
             .activatable_jobs
             .entry(job_type)
             .or_default()
-            .insert(job_key);
+            .insert(order);
     } else if let Some(set) = state.activatable_jobs.get_mut(&job_type) {
-        set.remove(&job_key);
+        set.remove(&order);
         if set.is_empty() {
             state.activatable_jobs.remove(&job_type);
         }
@@ -785,6 +818,8 @@ pub fn apply(state: &mut State, event: &Event) {
             element_instance_key,
             element_id,
             job_type,
+            created_at,
+            priority,
         } => {
             state.jobs.insert(
                 *job_key,
@@ -799,6 +834,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     deadline: None,
                     activated: false,
                     retries: DEFAULT_JOB_RETRIES,
+                    priority: *priority,
+                    created_at: *created_at,
                 },
             );
             resync_job_index(state, *job_key);

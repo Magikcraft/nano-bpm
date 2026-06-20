@@ -248,6 +248,8 @@ mod tests {
             deadline: None,
             activated: false,
             retries: 3,
+            priority: nanobpmn_engine_core::DEFAULT_JOB_PRIORITY,
+            created_at: 0,
         }
     }
 

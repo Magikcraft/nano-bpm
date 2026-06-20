@@ -109,13 +109,20 @@ pub enum Event {
     },
 
     /// A job was created for a service task; the token now rests until the job
-    /// is completed.
+    /// is completed. `created_at` is the logical instant it was created (carried
+    /// on the event so replay reconstructs the same timestamp). `priority` is the
+    /// *resolved* job-activation priority (FEEL evaluated against the instance
+    /// variables, or a literal; default 50) — higher priority is activated first.
     JobCreated {
         job_key: Key,
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
         job_type: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        created_at: u64,
+        #[cfg_attr(feature = "serde", serde(default = "crate::state::default_job_priority"))]
+        priority: i32,
     },
     /// A job was activated by a worker and locked until `deadline` (a logical
     /// instant supplied by the caller). Another worker cannot activate it until

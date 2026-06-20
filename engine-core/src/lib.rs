@@ -92,7 +92,8 @@ pub use model::{
     SequenceFlow, UserTaskProps, Value,
 };
 pub use state::{
-    DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind, IncidentState, InstanceSnapshot,
+    DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind,
+    IncidentState, InstanceSnapshot,
     Job, JobState, Key, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, MessageStartSubscription,
     MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, PARTITION_BITS,
     ProcessInstance, ProcessInstanceState, StartTimer, State, Timer, TimerKind, TimerState,

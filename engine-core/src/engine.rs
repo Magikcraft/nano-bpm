@@ -285,7 +285,7 @@ impl Engine {
         if let Some(job_keys) = self.state.jobs_by_instance.remove(&key) {
             for job_key in job_keys {
                 if let Some(job) = self.state.jobs.remove(&job_key) {
-                    self.state.deindex_job(&job.job_type, job_key);
+                    self.state.deindex_job(&job.job_type, job_key, job.priority);
                 }
             }
         }
@@ -328,7 +328,7 @@ impl Engine {
             if let Some(job_keys) = self.state.jobs_by_instance.remove(key) {
                 for job_key in job_keys {
                     if let Some(job) = self.state.jobs.remove(&job_key) {
-                        self.state.deindex_job(&job.job_type, job_key);
+                        self.state.deindex_job(&job.job_type, job_key, job.priority);
                     }
                 }
             }
@@ -616,7 +616,7 @@ impl Engine {
         if let Some(job_keys) = self.state.jobs_by_instance.remove(&key) {
             for job_key in job_keys {
                 if let Some(job) = self.state.jobs.remove(&job_key) {
-                    self.state.deindex_job(&job.job_type, job_key);
+                    self.state.deindex_job(&job.job_type, job_key, job.priority);
                     jobs.push(job);
                 }
             }
@@ -1310,17 +1310,19 @@ impl Engine {
                 now,
             } => {
                 let deadline = now.saturating_add(timeout);
-                // Deterministic selection: walk the per-type activatable index
-                // (keys ascending) and take the first `max_jobs`. The index holds
-                // only `Created` jobs (an `Activated` job is removed when it locks
-                // and re-added by `JobLockExpired` when its lock expires), so the
-                // walk is O(`max_jobs`) even with a large in-flight backlog rather
-                // than rescanning and skipping every locked job on each poll. The
-                // `job_activatable` check is a defensive guard against any stale
+                // Deterministic selection: walk the per-type activatable index in
+                // its order — `(−priority, key)`, i.e. highest priority first then
+                // oldest (lowest key) — and take the first `max_jobs`. The index
+                // holds only `Created` jobs (an `Activated` job is removed when it
+                // locks and re-added by `JobLockExpired` when its lock expires), so
+                // the walk is O(`max_jobs`) even with a large in-flight backlog
+                // rather than rescanning and skipping every locked job on each poll.
+                // The `job_activatable` check is a defensive guard against any stale
                 // key (none expected).
                 let keys: Vec<Key> = match self.state.activatable_jobs.get(&job_type) {
                     Some(set) => set
                         .iter()
+                        .map(|&(_, k)| k)
                         .filter(|k| {
                             self.state
                                 .jobs
@@ -1328,7 +1330,6 @@ impl Engine {
                                 .is_some_and(|j| job_activatable(j, now))
                         })
                         .take(max_jobs)
-                        .copied()
                         .collect(),
                     None => Vec::new(),
                 };
@@ -2408,15 +2409,18 @@ impl Engine {
 
         match kind {
             // A service task creates a job and parks the token.
-            Some(ElementKind::ServiceTask { job_type }) => {
+            Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(instance_key, &job_type);
+                let priority = self.resolve_priority(instance_key, priority.as_deref());
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
                     element_instance_key,
                     element_id: element_id.clone(),
                     job_type,
+                    created_at: self.now,
+                    priority,
                 });
                 // Arm timers/subscriptions for every attached boundary event.
                 events.extend(self.arm_boundary_events(
@@ -2444,7 +2448,7 @@ impl Engine {
                 let follow_up_date = self
                     .resolve_user_task_string(instance_key, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
-                let priority = self.resolve_user_task_priority(instance_key, props.priority.as_deref());
+                let priority = self.resolve_priority(instance_key, props.priority.as_deref());
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
@@ -2609,9 +2613,10 @@ impl Engine {
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
         match self.element_kind(instance_key, &element_id) {
-            Some(ElementKind::ServiceTask { job_type }) => {
+            Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(instance_key, &job_type);
+                let priority = self.resolve_priority(instance_key, priority.as_deref());
                 (
                     vec![Event::JobCreated {
                         job_key,
@@ -2619,6 +2624,8 @@ impl Engine {
                         element_instance_key,
                         element_id,
                         job_type,
+                        created_at: self.now,
+                        priority,
                     }],
                     Vec::new(),
                 )
@@ -3460,7 +3467,11 @@ impl Engine {
     /// Resolves a user-task priority expression. A literal integer or a FEEL
     /// expression yielding a number is clamped to `0..=100`; anything
     /// unresolvable (or absent) defaults to `50`.
-    fn resolve_user_task_priority(&self, instance_key: Key, raw: Option<&str>) -> i32 {
+    /// Resolves a raw priority expression (literal or `=FEEL`) against the
+    /// instance variables to a `0..=100` value, defaulting to 50 when absent or
+    /// unresolvable. Shared by user-task scheduling priority and service-task job
+    /// (activation) priority.
+    fn resolve_priority(&self, instance_key: Key, raw: Option<&str>) -> i32 {
         const DEFAULT_PRIORITY: i32 = 50;
         let Some(raw) = raw else {
             return DEFAULT_PRIORITY;
@@ -3704,6 +3715,89 @@ mod tests {
             .connect("charge", "end")
             .build()
             .unwrap()
+    }
+
+    /// A linear process whose single service task emits `work` jobs at the given
+    /// (literal) priority. Distinct `proc_id`s let several share one job type.
+    fn task_with_priority(proc_id: &str, priority: &str) -> ProcessDefinition {
+        ProcessBuilder::new(proc_id)
+            .start_event("start")
+            .service_task_with_priority("do", "work", Some(priority.to_string()))
+            .end_event("end")
+            .connect("start", "do")
+            .connect("do", "end")
+            .build()
+            .unwrap()
+    }
+
+    fn create_instance_key(engine: &mut Engine, proc_id: &str) -> Key {
+        engine
+            .apply_command(Command::create_instance(proc_id))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap()
+    }
+
+    #[test]
+    fn higher_priority_jobs_activate_before_older_lower_priority_jobs() {
+        // Two processes emit the same `work` job type at different priorities.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(task_with_priority("low", "10")))
+            .unwrap();
+        engine
+            .apply_command(Command::DeployProcess(task_with_priority("high", "90")))
+            .unwrap();
+        // Create the LOW-priority instance first (older, lower key), then HIGH.
+        let low = create_instance_key(&mut engine, "low");
+        let high = create_instance_key(&mut engine, "high");
+        // Activation order is priority-first: the newer high-priority job wins.
+        let jobs = engine.activate_jobs("work", "W", 10, 1_000, 0);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs[0].instance_key, high,
+            "higher priority activates first despite being newer"
+        );
+        assert_eq!(jobs[1].instance_key, low, "lower priority follows");
+    }
+
+    #[test]
+    fn equal_priority_jobs_activate_oldest_first() {
+        // Same priority (default 50) => FIFO by creation (key) is preserved.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        let first = create_instance_key(&mut engine, "order");
+        let second = create_instance_key(&mut engine, "order");
+        let jobs = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].instance_key, first, "oldest first");
+        assert_eq!(jobs[1].instance_key, second);
+    }
+
+    #[test]
+    fn job_created_at_and_default_priority_are_stamped() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command_at(Command::create_instance("order"), 12_345)
+            .unwrap();
+        let job = engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.job_type == "payment")
+            .expect("a payment job");
+        assert_eq!(job.created_at, 12_345, "created_at carries the command clock");
+        assert_eq!(
+            job.priority,
+            state::DEFAULT_JOB_PRIORITY,
+            "no priorityDefinition => default priority"
+        );
     }
 
     #[test]
@@ -7047,11 +7141,14 @@ mod tests {
     /// `Created`/`Activated`, grouped by type. Asserts that invariant.
     fn assert_job_index_consistent(engine: &Engine) {
         use std::collections::{BTreeSet, HashMap, HashSet};
-        let mut expected: HashMap<String, BTreeSet<Key>> = HashMap::new();
+        let mut expected: HashMap<String, BTreeSet<(i32, Key)>> = HashMap::new();
         let mut expected_activated: HashSet<Key> = HashSet::new();
         for job in engine.state().jobs.values() {
             if job.state == state::JobState::Created {
-                expected.entry(job.job_type.clone()).or_default().insert(job.key);
+                expected
+                    .entry(job.job_type.clone())
+                    .or_default()
+                    .insert(state::activation_order(job.priority, job.key));
             }
             if job.state == state::JobState::Activated {
                 expected_activated.insert(job.key);
@@ -7122,7 +7219,9 @@ mod tests {
         // Expiry of another worker's lock returns the job to the index.
         let locked = engine.activate_jobs("payment", "B", 1, 1_000, 0)[0].key;
         engine.expire_jobs(5_000);
-        assert!(engine.state().activatable_jobs["payment"].contains(&locked));
+        assert!(engine.state().activatable_jobs["payment"]
+            .iter()
+            .any(|&(_, k)| k == locked));
         assert_job_index_consistent(&engine);
 
         // Evicting a completed instance drops its (already-deindexed) job and

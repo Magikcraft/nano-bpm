@@ -315,9 +315,14 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "priorityDefinition" => {
-                                // zeebe:priorityDefinition inside a user task.
+                                // zeebe:priorityDefinition inside a user task
+                                // (task scheduling) or a service task (job
+                                // activation priority).
                                 if let Some(idx) = cur_user_task {
                                     acc.nodes[idx].user_task.priority =
+                                        attr(attrs, "priority").map(str::to_string);
+                                } else if let Some(idx) = cur_service_task {
+                                    acc.nodes[idx].job_priority =
                                         attr(attrs, "priority").map(str::to_string);
                                 }
                             }
@@ -472,6 +477,10 @@ struct NodeAcc {
     kind: NodeKind,
     /// For service tasks: the resolved job type (defaults to the id at build).
     job_type: Option<String>,
+    /// For service tasks: the raw `zeebe:priorityDefinition` job-priority
+    /// expression (literal or FEEL), resolved at job creation. Controls
+    /// activation order; `None` means no declaration (default priority).
+    job_priority: Option<String>,
     /// For timer intermediate catch events: the parsed timer duration in
     /// milliseconds (from a nested `timerEventDefinition`/`timeDuration`).
     duration_millis: Option<u64>,
@@ -561,6 +570,7 @@ impl ProcessAcc {
             id: id.to_string(),
             kind,
             job_type: None,
+            job_priority: None,
             duration_millis: None,
             message_ref: None,
             timer_repeating: None,
@@ -635,7 +645,7 @@ impl ProcessAcc {
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
                 NodeKind::Service => {
                     let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
-                    builder.service_task(node.id, job_type)
+                    builder.service_task_with_priority(node.id, job_type, node.job_priority)
                 }
                 NodeKind::User => builder.user_task_with(node.id, node.user_task),
                 NodeKind::IntermediateCatch => {
@@ -1128,7 +1138,8 @@ mod tests {
         assert_eq!(
             def.element("charge").unwrap().kind,
             ElementKind::ServiceTask {
-                job_type: "payment".to_string()
+                job_type: "payment".to_string(),
+                priority: None,
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
@@ -1208,6 +1219,67 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_service_task_job_priority() {
+        // given: a service task carrying a zeebe:priorityDefinition (job priority),
+        // alongside its taskDefinition, as Camunda 8.10 emits it.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="payment" />
+                  <zeebe:priorityDefinition priority="=urgency" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="b" sourceRef="charge" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the raw priority expression rides on the service task element.
+        assert_eq!(
+            def.element("charge").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "payment".to_string(),
+                priority: Some("=urgency".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn should_default_service_task_priority_to_none_when_absent() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="payment" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="b" sourceRef="charge" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(
+            def.element("charge").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "payment".to_string(),
+                priority: None,
+            }
+        );
+    }
+
+    #[test]
     fn should_default_service_task_job_type_to_its_id() {
         // given
         let xml = r#"
@@ -1228,7 +1300,8 @@ mod tests {
         assert_eq!(
             def.element("work").unwrap().kind,
             ElementKind::ServiceTask {
-                job_type: "work".to_string()
+                job_type: "work".to_string(),
+                priority: None,
             }
         );
     }

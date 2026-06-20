@@ -297,6 +297,7 @@ impl Inner {
                 element_instance_key,
                 element_id,
                 job_type,
+                ..
             } => {
                 // Apply any activation that raced ahead of this fold (see
                 // `pending_acts`). Removed before borrowing the instance.

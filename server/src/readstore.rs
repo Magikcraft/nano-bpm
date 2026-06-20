@@ -890,6 +890,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             element_instance_key,
             element_id,
             job_type,
+            ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
             tx.execute(
