@@ -58,7 +58,7 @@ serde_json = "1"
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:rust-embed", "dep:mime_guess"]
+console = ["dep:rust-embed", "dep:mime_guess", "tokio/process", "tokio/io-util"]
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate

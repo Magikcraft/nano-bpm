@@ -6,6 +6,9 @@
 //! Layout under the workspace root:
 //! ```text
 //! <workspace>/models/<name>.bpmn
+//! <workspace>/workers/<name>/{worker.ts, deno.json, ...}
+//! <workspace>/.nanobpm/worker-sdk.ts   (the embedded Deno worker SDK)
+//! <workspace>/.deno-cache/             (DENO_DIR for worker dependency caching)
 //! ```
 //! The root defaults to `./nanobpm-workspace` (relative to the server's cwd) and
 //! is overridden by `NANOBPMN_WORKSPACE_DIR`. Unlike the engine data dir — which
@@ -89,6 +92,104 @@ pub fn list_model_names() -> std::io::Result<Vec<String>> {
     Ok(names)
 }
 
+// ---------------------------------------------------------------------------
+// Workers — each worker is a directory of source files under `workers/<name>/`.
+// ---------------------------------------------------------------------------
+
+/// Directory holding worker subdirectories.
+pub fn workers_dir() -> PathBuf {
+    workspace_dir().join("workers")
+}
+
+/// Ensures the workers directory exists and returns it.
+pub fn ensure_workers_dir() -> std::io::Result<PathBuf> {
+    let dir = workers_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The on-disk directory for worker `name` (`<workers>/<name>`), or `None` when
+/// the name is unsafe.
+pub fn worker_dir(name: &str) -> Option<PathBuf> {
+    is_safe_name(name).then(|| workers_dir().join(name))
+}
+
+/// Whether `file` is a safe, flat filename within a worker directory: no path
+/// separators or `..`, and a tidy name. Workers are flat dirs in v1 (the only
+/// nested content is the hidden Deno dependency cache, which is not exposed).
+pub fn is_safe_worker_file(file: &str) -> bool {
+    is_safe_name(file)
+}
+
+/// The on-disk path for `file` inside worker `name`, or `None` if either the
+/// worker name or the file name is unsafe.
+pub fn worker_file_path(name: &str, file: &str) -> Option<PathBuf> {
+    if !is_safe_worker_file(file) {
+        return None;
+    }
+    worker_dir(name).map(|d| d.join(file))
+}
+
+/// Lists worker directory names in the workspace, ensuring the directory exists
+/// first. Hidden entries (dot-prefixed) are skipped.
+pub fn list_worker_names() -> std::io::Result<Vec<String>> {
+    let dir = ensure_workers_dir()?;
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str()
+            && is_safe_name(name)
+        {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Lists the flat source files in worker `name` (sorted), excluding hidden and
+/// nested entries. Returns an error if the worker directory cannot be read.
+pub fn list_worker_files(name: &str) -> std::io::Result<Vec<String>> {
+    let Some(dir) = worker_dir(name) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid worker name",
+        ));
+    };
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if let Some(f) = entry.file_name().to_str()
+            && is_safe_worker_file(f)
+        {
+            files.push(f.to_string());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// The hidden directory holding the embedded Deno worker SDK.
+pub fn sdk_dir() -> PathBuf {
+    workspace_dir().join(".nanobpm")
+}
+
+/// Path to the embedded worker SDK file (`.nanobpm/worker-sdk.ts`).
+pub fn sdk_path() -> PathBuf {
+    sdk_dir().join("worker-sdk.ts")
+}
+
+/// The Deno dependency cache directory (`DENO_DIR`) for sandboxed workers.
+pub fn deno_cache_dir() -> PathBuf {
+    workspace_dir().join(".deno-cache")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +212,18 @@ mod tests {
         assert!(is_safe_name("order_2.final"));
         let p = model_path("order").unwrap();
         assert!(p.ends_with("order.bpmn"));
+    }
+
+    #[test]
+    fn worker_paths_are_contained() {
+        // Worker names reuse the same safety predicate as models.
+        assert!(worker_dir("../escape").is_none());
+        assert!(worker_dir("order-worker").is_some());
+        // A file within a worker must be a safe flat filename.
+        assert!(worker_file_path("w", "worker.ts").is_some());
+        assert!(worker_file_path("w", "deno.json").is_some());
+        assert!(worker_file_path("w", "../../etc/passwd").is_none());
+        assert!(worker_file_path("w", "sub/dir.ts").is_none());
+        assert!(worker_file_path("../w", "worker.ts").is_none());
     }
 }

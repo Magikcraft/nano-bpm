@@ -7261,6 +7261,11 @@ async fn main() {
     println!("LISTENING_PORT={local_port}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
+    // Tell the console worker supervisor which port to dial for the command
+    // stream when it spawns Deno worker subprocesses.
+    #[cfg(feature = "console")]
+    crate::console::workers::set_gateway_port(local_port);
+
     tracing::info!(
         "NanoBPM gateway REST stub server listening on http://{addr}{}",
         nanobpm_gateway_rest::BASE_PATH

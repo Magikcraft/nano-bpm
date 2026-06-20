@@ -728,6 +728,81 @@ INFO rest: <-- POST /v2/process-instances 200 OK (39.7ms) [180 bytes] {"processI
 > compiler — `cc`/`clang`, already present on macOS and most Linux toolchains —
 > is required; the resulting binary is still self-contained.)
 
+## Web console
+
+A built-in web console for the self-contained single-node distribution is
+available behind the **`console`** Cargo feature. It serves a single-page app at
+`/console` and a JSON API under `/console/api/*`, both **additive and
+feature-gated** — the default gateway build does not include them and is
+unaffected.
+
+```bash
+# Build + run with the console enabled
+cargo build --features console --bin nanobpm-gateway-rest-server
+NANOBPMN_DATA_DIR=./nanobpm.data PORT=8080 \
+  ./server/target/debug/nanobpm-gateway-rest-server
+# open http://localhost:8080/console
+```
+
+The console has four tabs:
+
+- **Topology** — cluster/partition/Raft overview.
+- **Modeler** — a bpmn-js editor backed by a workspace model library. Create,
+  edit, deploy (idempotent), pull a deployed model back from the engine, and
+  duplicate. Each model shows its deploy status relative to the engine
+  (*not deployed* / *deployed & in sync* / *modified*).
+- **Explorer** — a live process-instance explorer (variables, jobs, incidents)
+  with BPMN XML.
+- **Workers** — author TypeScript job workers in the browser and run them as
+  sandboxed **Deno** subprocesses over the command stream, with a live
+  "Running" fleet view (status, throughput, completed/failed, uptime, restarts)
+  and streamed logs.
+
+### Workspace vs cluster data
+
+The console keeps the user's **authoring source of truth** in a *workspace*
+directory, deliberately separate from the engine's data dir so that deleting
+cluster data leaves your models and workers intact.
+
+```text
+<workspace>/
+├── models/<name>.bpmn          # BPMN models (Modeler)
+├── workers/<name>/             # one directory per worker (worker.ts, deno.json, …)
+├── .nanobpm/worker-sdk.ts       # embedded Deno worker SDK (auto-written)
+└── .deno-cache/                 # DENO_DIR for worker dependency caching
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (models + workers). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
+| `NANOBPMN_DENO_BIN=<path>` | Explicit path to the Deno binary used to run workers. Default: `deno` on `PATH`, else `~/.deno/bin/deno`. |
+
+### Embedded workers (Deno)
+
+Each worker is a directory under `workers/<name>/` whose `worker.ts` imports the
+embedded SDK and declares a handler:
+
+```ts
+import { defineWorker } from "@nanobpm/worker";
+
+defineWorker({
+  type: "my-job",
+  maxParallelJobs: 10,
+  async handle(job) {
+    // job.variables holds the activated job's variables; npm libraries are
+    // available via `npm:` specifiers.
+    return { result: 42 };          // resolves -> completeJob({ result: 42 })
+    // or: job.fail("boom") / job.error("CODE", "msg")
+  },
+});
+```
+
+The supervisor runs one sandboxed `deno run` subprocess per enabled worker
+(`--allow-net`, read-only access to the workspace, writes confined to the Deno
+cache) that speaks the command stream directly. **Deno is optional**: if it is
+not installed the Workers tab still authors code but starting a worker reports
+the runtime as unavailable.
+
 ## Engine (`engine-core`)
 
 The embeddable BPMN engine builds and tests with plain `cargo` — no Docker, no

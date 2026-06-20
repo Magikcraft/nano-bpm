@@ -11,3 +11,7 @@ server/src/stub_impls.rs
 
 # Runtime data directory (NANOBPMN_DATA_DIR: read-model DB + journal).
 .data/
+
+# Console workspace (NANOBPMN_WORKSPACE_DIR: authoring source of truth — BPMN
+# models + worker code). User content, not committed.
+nanobpm-workspace/

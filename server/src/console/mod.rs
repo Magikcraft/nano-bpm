@@ -15,7 +15,7 @@
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{StatusCode, header},
     response::{
         IntoResponse, Json, Response,
@@ -29,9 +29,11 @@ use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 use crate::ServerImpl;
 
+pub mod workers;
 pub mod workspace;
 
 /// The built frontend bundle. Path is relative to this source file
@@ -55,6 +57,21 @@ pub fn router(server: ServerImpl) -> Router {
             "/console/api/models/{name}",
             get(model_get).put(model_save).delete(model_delete),
         )
+        .route("/console/api/workers", get(workers_list).post(worker_create))
+        .route(
+            "/console/api/workers/{name}",
+            get(worker_get).delete(worker_delete),
+        )
+        .route(
+            "/console/api/workers/{name}/file",
+            get(worker_file_get)
+                .put(worker_file_save)
+                .post(worker_file_create)
+                .delete(worker_file_delete),
+        )
+        .route("/console/api/workers/{name}/start", axum::routing::post(worker_start))
+        .route("/console/api/workers/{name}/stop", axum::routing::post(worker_stop))
+        .route("/console/api/workers/{name}/logs", get(worker_logs))
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
@@ -605,5 +622,322 @@ async fn model_delete(Path(name): Path<String>) -> Response {
             format!("could not delete model: {e}"),
         )
             .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workers API — workspace-backed worker code + a Deno subprocess supervisor
+// ---------------------------------------------------------------------------
+//
+// A worker is a directory of source files under `workers/<name>/` (an entry
+// `worker.ts` plus optional helpers and a `deno.json`). The supervisor (see
+// `workers`) runs each enabled worker as a sandboxed Deno subprocess that speaks
+// the command stream. This API is workspace file CRUD plus start/stop and a live
+// log/metrics view; it never touches the engine data dir.
+
+/// Default `worker.ts` scaffold for a new worker. Imports the embedded SDK via
+/// the import map in `deno.json` and echoes the job's input back as output.
+fn worker_scaffold_ts(job_type: &str) -> String {
+    format!(
+        r#"import {{ defineWorker }} from "@nanobpm/worker";
+
+// A worker handles jobs of one BPMN job type. Return output variables to
+// complete the job, or call job.fail(...) / job.error(code, msg). Throwing
+// fails the job. You can `import` npm packages with `npm:` specifiers.
+defineWorker({{
+  type: "{job_type}",
+  maxParallelJobs: 10,
+  async handle(job) {{
+    console.log(`handling job ${{job.jobKey}} for instance ${{job.processInstanceKey}}`);
+    // ...do your work here, using job.variables...
+    return {{ handledBy: "{job_type}" }};
+  }},
+}});
+"#
+    )
+}
+
+/// `deno.json` mapping the `@nanobpm/worker` specifier to the embedded SDK.
+const WORKER_DENO_JSON: &str = r#"{
+  "imports": {
+    "@nanobpm/worker": "../../.nanobpm/worker-sdk.ts"
+  }
+}
+"#;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerSummaryDto {
+    name: String,
+    files: Vec<String>,
+    updated_at_ms: u64,
+    runtime: workers::WorkerRuntimeDto,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateWorkerBody {
+    name: String,
+    /// Job type the scaffolded worker subscribes to. Defaults to the name.
+    #[serde(default)]
+    job_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FilePathQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct CreateFileBody {
+    path: String,
+}
+
+async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
+    let dir = workspace::worker_dir(name)?;
+    if !dir.is_dir() {
+        return None;
+    }
+    let files = workspace::list_worker_files(name).unwrap_or_default();
+    let (updated_at_ms, _) = workspace::file_meta(&dir);
+    let runtime = workers::supervisor().runtime(name).await;
+    Some(WorkerSummaryDto {
+        name: name.to_string(),
+        files,
+        updated_at_ms,
+        runtime,
+    })
+}
+
+/// `GET /console/api/workers` — list workers with files and runtime status.
+async fn workers_list() -> Response {
+    let names = match workspace::list_worker_names() {
+        Ok(n) => n,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read workspace: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if let Some(s) = worker_summary(&name).await {
+            out.push(s);
+        }
+    }
+    Json(serde_json::json!({
+        "workers": out,
+        "denoAvailable": workers::supervisor().deno_available(),
+    }))
+    .into_response()
+}
+
+/// `POST /console/api/workers` — scaffold a new worker directory.
+async fn worker_create(Json(body): Json<CreateWorkerBody>) -> Response {
+    let Some(dir) = workspace::worker_dir(&body.name) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    };
+    if dir.exists() {
+        return (StatusCode::CONFLICT, "a worker with that name already exists").into_response();
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create worker: {e}"),
+        )
+            .into_response();
+    }
+    let job_type = body.job_type.unwrap_or_else(|| body.name.clone());
+    if let Err(e) = std::fs::write(dir.join("worker.ts"), worker_scaffold_ts(&job_type)) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not write worker.ts: {e}"),
+        )
+            .into_response();
+    }
+    let _ = std::fs::write(dir.join("deno.json"), WORKER_DENO_JSON);
+    match worker_summary(&body.name).await {
+        Some(s) => (StatusCode::CREATED, Json(s)).into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `GET /console/api/workers/{name}` — one worker's files and runtime status.
+async fn worker_get(Path(name): Path<String>) -> Response {
+    match worker_summary(&name).await {
+        Some(s) => Json(s).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such worker").into_response(),
+    }
+}
+
+/// `DELETE /console/api/workers/{name}` — remove a worker (must be stopped).
+async fn worker_delete(Path(name): Path<String>) -> Response {
+    let Some(dir) = workspace::worker_dir(&name) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    };
+    if workers::supervisor().is_active(&name).await {
+        return (StatusCode::CONFLICT, "stop the worker before deleting it").into_response();
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "no such worker").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not delete worker: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /console/api/workers/{name}/file?path=worker.ts` — read a worker file.
+async fn worker_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
+    let Some(path) = workspace::worker_file_path(&name, &q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text.into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
+    }
+}
+
+/// `PUT /console/api/workers/{name}/file?path=worker.ts` — save (create or
+/// overwrite) a worker file. Body is the raw file content.
+async fn worker_file_save(
+    Path(name): Path<String>,
+    Query(q): Query<FilePathQuery>,
+    body: String,
+) -> Response {
+    let Some(dir) = workspace::worker_dir(&name) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    };
+    if !dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "no such worker").into_response();
+    }
+    let Some(path) = workspace::worker_file_path(&name, &q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::write(&path, &body) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save file: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /console/api/workers/{name}/file` — create a new empty worker file.
+async fn worker_file_create(Path(name): Path<String>, Json(body): Json<CreateFileBody>) -> Response {
+    let Some(dir) = workspace::worker_dir(&name) else {
+        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+    };
+    if !dir.is_dir() {
+        return (StatusCode::NOT_FOUND, "no such worker").into_response();
+    }
+    let Some(path) = workspace::worker_file_path(&name, &body.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    if path.exists() {
+        return (StatusCode::CONFLICT, "a file with that name already exists").into_response();
+    }
+    match std::fs::write(&path, "") {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create file: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /console/api/workers/{name}/file?path=...` — remove a worker file.
+async fn worker_file_delete(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
+    let Some(path) = workspace::worker_file_path(&name, &q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "no such file").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not delete file: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /console/api/workers/{name}/start` — start the worker subprocess.
+async fn worker_start(Path(name): Path<String>) -> Response {
+    let sup = workers::supervisor();
+    match sup.start(&name).await {
+        Ok(()) => Json(sup.runtime(&name).await).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// `POST /console/api/workers/{name}/stop` — stop the worker subprocess.
+async fn worker_stop(Path(name): Path<String>) -> Response {
+    let sup = workers::supervisor();
+    match sup.stop(&name).await {
+        Ok(()) => Json(sup.runtime(&name).await).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// Live state for the worker-log SSE stream: replay the history buffer, then
+/// stream live lines from the broadcast receiver.
+enum LogStreamState {
+    History(
+        std::vec::IntoIter<workers::LogLine>,
+        broadcast::Receiver<workers::LogLine>,
+    ),
+    Live(broadcast::Receiver<workers::LogLine>),
+}
+
+/// `GET /console/api/workers/{name}/logs` — SSE stream of a worker's logs.
+/// Replays the recent buffer on connect, then streams live lines.
+async fn worker_logs(
+    Path(name): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let sup = workers::supervisor();
+    let history = sup.log_history(&name).await;
+    let rx = sup.subscribe(&name).await;
+
+    let stream = unfold(
+        LogStreamState::History(history.into_iter(), rx),
+        |st| async move {
+            match st {
+                LogStreamState::History(mut it, rx) => match it.next() {
+                    Some(line) => Some((Ok(log_event(&line)), LogStreamState::History(it, rx))),
+                    None => recv_live(rx).await,
+                },
+                LogStreamState::Live(rx) => recv_live(rx).await,
+            }
+        },
+    );
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn log_event(line: &workers::LogLine) -> Event {
+    let data = serde_json::to_string(line).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event("log").data(data)
+}
+
+/// Pulls the next live log line, skipping lag and ending the stream on close.
+async fn recv_live(
+    mut rx: broadcast::Receiver<workers::LogLine>,
+) -> Option<(Result<Event, Infallible>, LogStreamState)> {
+    loop {
+        match rx.recv().await {
+            Ok(line) => return Some((Ok(log_event(&line)), LogStreamState::Live(rx))),
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
     }
 }

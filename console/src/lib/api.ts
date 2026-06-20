@@ -107,6 +107,58 @@ export interface Model {
   deployed_key: string | null;
 }
 
+// ---- Workers -------------------------------------------------------------
+
+export type WorkerPhase = "stopped" | "starting" | "running" | "crashed";
+
+export interface WorkerMetrics {
+  completed: number;
+  failed: number;
+  inFlight: number;
+  throughput: number;
+  uptimeMs: number;
+  connected: boolean;
+}
+
+export interface WorkerRuntime {
+  status: WorkerPhase;
+  pid: number | null;
+  startedAtMs: number | null;
+  restarts: number;
+  lastError: string | null;
+  metrics: WorkerMetrics;
+}
+
+export interface WorkerSummary {
+  name: string;
+  files: string[];
+  updatedAtMs: number;
+  runtime: WorkerRuntime;
+}
+
+export interface WorkersResponse {
+  workers: WorkerSummary[];
+  /** Whether a Deno runtime is available to actually run workers. */
+  denoAvailable: boolean;
+}
+
+export interface WorkerLogLine {
+  tsMs: number;
+  stream: "out" | "err" | "sys";
+  text: string;
+}
+
+/// Fetches a plaintext body from the console API (used for worker file content,
+/// which is served as text/plain rather than JSON).
+async function getText(path: string): Promise<string> {
+  const res = await fetch(`/console/api${path}`);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `${path} → HTTP ${res.status}`);
+  }
+  return res.text();
+}
+
 async function send<T>(
   method: string,
   path: string,
@@ -142,6 +194,47 @@ export const api = {
     ),
   deleteModel: (name: string) =>
     send<void>("DELETE", `/models/${encodeURIComponent(name)}`),
+
+  // ---- Workers -----------------------------------------------------------
+  workers: () => getJson<WorkersResponse>("/workers"),
+  worker: (name: string) =>
+    getJson<WorkerSummary>(`/workers/${encodeURIComponent(name)}`),
+  createWorker: (name: string, jobType: string) =>
+    send<WorkerSummary>(
+      "POST",
+      "/workers",
+      JSON.stringify({ name, jobType }),
+      "application/json",
+    ),
+  deleteWorker: (name: string) =>
+    send<void>("DELETE", `/workers/${encodeURIComponent(name)}`),
+  workerFile: (name: string, path: string) =>
+    getText(
+      `/workers/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+    ),
+  saveWorkerFile: (name: string, path: string, content: string) =>
+    send<void>(
+      "PUT",
+      `/workers/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+      content,
+      "text/plain",
+    ),
+  createWorkerFile: (name: string, path: string) =>
+    send<void>(
+      "POST",
+      `/workers/${encodeURIComponent(name)}/file`,
+      JSON.stringify({ path }),
+      "application/json",
+    ),
+  deleteWorkerFile: (name: string, path: string) =>
+    send<void>(
+      "DELETE",
+      `/workers/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+    ),
+  startWorker: (name: string) =>
+    send<WorkerRuntime>("POST", `/workers/${encodeURIComponent(name)}/start`),
+  stopWorker: (name: string) =>
+    send<WorkerRuntime>("POST", `/workers/${encodeURIComponent(name)}/stop`),
 };
 
 /// Deploys BPMN XML to the engine through the standard Camunda deployment
