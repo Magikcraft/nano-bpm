@@ -247,16 +247,34 @@ The MVP builds the synthetic `SimRunner` path; the live path is already half-bui
 
 ### 7.4 MVP build order
 
-| Slice | Ships | Proves |
-|------:|-------|--------|
-| **M0** | `Scenario` schema + `SimRunner` (engine-core native, seeded mock workers, virtual clock) collecting `(output, latency, cost)` → base dataset | deterministic capture + cost/latency modelling work |
-| **M1** | **Baked** candidate generator (enumerate latent worker-swaps) + BPMN validate + evaluate-all + **ranking** (incl. golden-as-candidate + distance-to-golden) | the measurement + ranking rig is correct end-to-end, *no LLM yet* |
-| **M2** | Replace the baked generator with the **LLM hypothesis** step (typed worker-swap/param transforms) over the Insights report | the search method can discover improvements/the golden |
-| **M3** | `ClusterRunner` (real Nano + Deno workers) for scale/latency realism, Nano stress-test, demo; wire the **production** (live-source, generation-skipped) path | realism, stress, and the production loop |
+| Slice | Ships | Proves | Status |
+|------:|-------|--------|--------|
+| **M0** | `Scenario` schema + `SimRunner` (engine-core native, seeded mock workers, virtual clock) collecting `(output, latency, cost)` → base dataset | deterministic capture + cost/latency modelling work | ✅ done |
+| **M1** | **Baked** candidate generator (enumerate latent worker-swaps) + BPMN validate + evaluate-all + **ranking** (incl. golden-as-candidate + distance-to-golden) | the measurement + ranking rig is correct end-to-end, *no LLM yet* | ✅ done |
+| **M2** | The **LLM hypothesis** step: the model proposes candidates (worker-swaps and optional structural BPMN rewrites), which are validated then run through the same SimRunner + ranking | the search method can discover improvements/the golden | ✅ done |
+| **M3** | `ClusterRunner` (real Nano + Deno workers) for scale/latency realism, Nano stress-test, demo; wire the **production** (live-source, generation-skipped) path | realism, stress, and the production loop | ⏳ next |
 
 **Start at M0+M1.** They need no cluster orchestration and no LLM, embed the real
 engine for trustworthy numbers, and directly answer the core question. Only once the
 rig reliably ranks the golden best do we let the LLM (M2) and the cluster (M3) in.
+
+**M2 LLM provider abstraction (implemented).** The hypothesis step reaches the
+model through a pluggable client (`harness/llm.rs`) with two providers, so the same
+path serves a model anywhere on the spectrum:
+
+* `openai` — the OpenAI **chat-completions** wire shape, which local `llama.cpp`
+  (`--api`), Ollama (`/v1`), vLLM, LM Studio, and OpenAI all speak. This is the
+  default; point `baseUrl` at a local model on the network.
+* `anthropic` — the Anthropic **messages** API.
+
+Provider/baseUrl/model/key/limits are read from the environment
+(`PROCESSOS_LLM_*`) and overridable per request, so a local model can be A/B'd
+against a hosted one without a restart. The model only *proposes*; the harness
+still measures and ranks every proposal with the SimRunner, so a hallucinated
+"improvement" that doesn't help is caught by the numbers. Invalid proposals
+(unknown worker ids, unparsable rewritten BPMN) are rejected with a reason and
+reported in `llm.rejected`. This keeps the load-bearing one-way boundary intact:
+the LLM is an *input to ProcessOS's reasoning*, never a path back into Nano.
 
 ## 8. Invariants ProcessOS must honour
 

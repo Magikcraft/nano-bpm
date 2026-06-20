@@ -25,7 +25,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::contracts::NanoClient;
-use crate::harness::{example_scenario, run_scenario, Scenario};
+use crate::harness::{example_scenario, run_hypothesis, run_scenario, LlmConfig, LlmOverride, Scenario};
 
 #[derive(Clone)]
 struct AppState {
@@ -74,6 +74,7 @@ async fn main() {
         .route("/api/harness/example", get(harness_example))
         .route("/api/harness/example/run", get(harness_example_run))
         .route("/api/harness/run", post(harness_run))
+        .route("/api/harness/hypothesize", post(harness_hypothesize))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -151,6 +152,47 @@ async fn harness_example_run() -> impl IntoResponse {
 /// `POST /api/harness/run` — run a caller-supplied scenario and return its ranking.
 async fn harness_run(Json(scenario): Json<Scenario>) -> impl IntoResponse {
     run_scenario_blocking(scenario).await
+}
+
+/// Request body for the LLM hypothesis path: a scenario plus optional LLM
+/// overrides and a flag to also evaluate the baked grid for comparison.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HypothesizeRequest {
+    scenario: Scenario,
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    #[serde(default)]
+    include_baked: bool,
+}
+
+/// `POST /api/harness/hypothesize` — ask the configured LLM to propose candidates,
+/// evaluate + rank them with the SimRunner, and return the report. The model is
+/// reached via the pluggable client (local llama.cpp / Ollama / vLLM, or Anthropic).
+async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoResponse {
+    let mut cfg = LlmConfig::from_env();
+    if let Some(o) = &req.llm {
+        cfg = cfg.with_override(o);
+    }
+    if !cfg.is_ready() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no LLM model configured; set PROCESSOS_LLM_MODEL (and \
+                          PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER as needed) \
+                          or pass an `llm` object with at least `model` in the request body"
+            })),
+        )
+            .into_response();
+    }
+    match run_hypothesis(&req.scenario, &cfg, req.include_baked).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 /// Run a scenario off the async runtime (the SimRunner is synchronous CPU work).
@@ -318,6 +360,7 @@ async function load() {
       return `<tr class="${cls}">
         <td>${i + 1}</td>
         <td>${v.name}${i === 0 ? ' <span class="pill win">best</span>' : ''}</td>
+        <td>${v.source}</td>
         <td class="num">${num(v.avgCost)}</td>
         <td class="num">${num(v.avgLatencyMs, 0)}</td>
         <td class="num">${pct(v.correctnessRate)}</td>
@@ -339,7 +382,7 @@ async function load() {
       <div class="card">
         <table>
           <thead><tr>
-            <th>#</th><th>candidate</th><th class="num">avg cost</th><th class="num">avg latency (ms)</th>
+            <th>#</th><th>candidate</th><th>source</th><th class="num">avg cost</th><th class="num">avg latency (ms)</th>
             <th class="num">correct</th><th class="num">incidents</th><th class="num">completed</th><th class="num">feasible</th>
           </tr></thead>
           <tbody>${rows}</tbody>

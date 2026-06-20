@@ -19,10 +19,14 @@
 //! never modified.
 
 mod example;
+mod hypothesize;
+mod llm;
 mod rank;
 mod sim;
 
 pub use example::example_scenario;
+pub use hypothesize::run_hypothesis;
+pub use llm::{LlmConfig, LlmOverride};
 #[allow(unused_imports)]
 pub use rank::{run_scenario, HarnessReport, VariantResult};
 

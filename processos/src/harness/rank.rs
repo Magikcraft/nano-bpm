@@ -22,6 +22,11 @@ use super::{mix_seed, Objective, Scenario};
 #[serde(rename_all = "camelCase")]
 pub struct VariantResult {
     pub name: String,
+    /// Where this candidate came from: `baseline`, `baked`, `golden`, or `llm`.
+    pub source: String,
+    /// Optional free-text rationale (the LLM's reasoning for an `llm` candidate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
     /// The full effective `job_type -> worker_id` assignment.
     pub assignment: BTreeMap<String, String>,
     pub runs: usize,
@@ -33,6 +38,28 @@ pub struct VariantResult {
     pub total_cost: f64,
     /// Whether this candidate meets the objective's feasibility gates.
     pub feasible: bool,
+}
+
+/// Metadata about an LLM hypothesis pass, attached to the report when the
+/// `/api/harness/hypothesize` path is used.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmMeta {
+    pub provider: String,
+    pub model: String,
+    /// Candidates the model proposed.
+    pub proposed: usize,
+    /// Proposals that validated and were evaluated.
+    pub accepted: usize,
+    /// Rejected proposals with the reason (bad worker id, unparsable model, …).
+    pub rejected: Vec<RejectedCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RejectedCandidate {
+    pub name: String,
+    pub reason: String,
 }
 
 /// The harness output: the base dataset folded into ranked candidates.
@@ -55,13 +82,16 @@ pub struct HarnessReport {
     pub recovered_golden: bool,
     /// Number of task assignments by which the best candidate differs from golden.
     pub golden_distance: Option<usize>,
+    /// LLM hypothesis metadata, present only on the hypothesize path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<LlmMeta>,
     /// Human-readable observations (transform space, caps applied, recovery).
     pub notes: Vec<String>,
 }
 
-/// Run a scenario end-to-end: parse, enumerate candidates, evaluate, rank.
-/// Pure CPU work; the HTTP layer runs it on a blocking task.
-pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
+/// Parse + validate a scenario's model, returning its definitions and the
+/// resolved process id. Shared by the baked and LLM-hypothesis paths.
+pub(crate) fn prepare(scenario: &Scenario) -> Result<(Vec<ProcessDefinition>, String), String> {
     let defs = parse_bpmn(&scenario.test_model)
         .map_err(|e| format!("test model failed to parse: {e:?}"))?;
     if defs.is_empty() {
@@ -79,13 +109,68 @@ pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
     if scenario.inputs.is_empty() {
         return Err("scenario has no inputs to evaluate".to_string());
     }
+    Ok((defs, process_id))
+}
+
+/// Run a scenario end-to-end with the deterministic baked candidate generator:
+/// parse, enumerate worker-swaps, evaluate, rank. Pure CPU work; the HTTP layer
+/// runs it on a blocking task. No network, no LLM.
+pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
+    let (defs, process_id) = prepare(scenario)?;
 
     let mut notes = Vec::new();
     notes.push(
-        "MVP transform space: worker swaps over the test model (same BPMN); \
-         structural rewrites arrive with the LLM stage (M2)."
+        "Baked transform space: worker swaps over the test model (same BPMN). \
+         The LLM hypothesis path may also propose structural rewrites."
             .to_string(),
     );
+
+    let baseline_assignment = effective_assignment(scenario, &HashMap::new());
+    let baseline = evaluate(
+        scenario,
+        &defs,
+        &process_id,
+        "baseline",
+        "baseline",
+        None,
+        &baseline_assignment,
+    );
+
+    let (mut variants, baked_notes) = baked_candidates(scenario, &defs, &process_id);
+    notes.extend(baked_notes);
+
+    let golden = scenario.golden.as_ref().map(|g| {
+        let assignment = effective_assignment(scenario, &g.assignment);
+        evaluate(
+            scenario,
+            &defs,
+            &process_id,
+            &g.name,
+            "golden",
+            None,
+            &assignment,
+        )
+    });
+
+    Ok(finalize(
+        scenario,
+        process_id,
+        baseline,
+        golden,
+        std::mem::take(&mut variants),
+        notes,
+        None,
+    ))
+}
+
+/// Enumerate and evaluate the baked worker-swap candidate grid. Returns the
+/// evaluated variants and any notes (e.g. a cap warning).
+pub(crate) fn baked_candidates(
+    scenario: &Scenario,
+    defs: &[ProcessDefinition],
+    process_id: &str,
+) -> (Vec<VariantResult>, Vec<String>) {
+    let mut notes = Vec::new();
 
     // The swappable job types and their option sets ({default} ∪ latent options).
     let mut swap_types: Vec<String> = scenario.latent_options.keys().cloned().collect();
@@ -133,11 +218,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
         ));
     }
 
-    // Evaluate the baseline (defaults only).
     let baseline_assignment = effective_assignment(scenario, &HashMap::new());
-    let baseline = evaluate(scenario, &defs, &process_id, "baseline", &baseline_assignment);
-
-    // Evaluate every enumerated candidate.
     let mut variants: Vec<VariantResult> = Vec::with_capacity(combos.len());
     for combo in &combos {
         let mut overrides: HashMap<String, String> = HashMap::new();
@@ -147,17 +228,33 @@ pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
         }
         let assignment = effective_assignment(scenario, &overrides);
         let name = candidate_name(&option_lists, combo, &baseline_assignment, &assignment);
-        variants.push(evaluate(scenario, &defs, &process_id, &name, &assignment));
+        let source = if name == "baseline" { "baseline" } else { "baked" };
+        variants.push(evaluate(
+            scenario,
+            defs,
+            process_id,
+            &name,
+            source,
+            None,
+            &assignment,
+        ));
     }
+    (variants, notes)
+}
 
-    // Evaluate golden as a candidate, if supplied.
-    let golden_assignment: Option<BTreeMap<String, String>> = scenario.golden.as_ref().map(|g| {
-        effective_assignment(scenario, &g.assignment)
-    });
-    let golden = scenario.golden.as_ref().map(|g| {
-        let assignment = effective_assignment(scenario, &g.assignment);
-        evaluate(scenario, &defs, &process_id, &g.name, &assignment)
-    });
+/// Rank a candidate set, compute golden recovery, and assemble the final report.
+/// Shared by the baked and LLM-hypothesis paths.
+pub(crate) fn finalize(
+    scenario: &Scenario,
+    process_id: String,
+    baseline: VariantResult,
+    golden: Option<VariantResult>,
+    mut variants: Vec<VariantResult>,
+    mut notes: Vec<String>,
+    llm: Option<LlmMeta>,
+) -> HarnessReport {
+    let golden_assignment: Option<BTreeMap<String, String>> =
+        golden.as_ref().map(|g| g.assignment.clone());
 
     rank(&mut variants, &scenario.objective);
 
@@ -188,7 +285,7 @@ pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
         }
     }
 
-    Ok(HarnessReport {
+    HarnessReport {
         scenario: scenario.name.clone(),
         process_id,
         inputs: scenario.inputs.len(),
@@ -199,12 +296,13 @@ pub fn run_scenario(scenario: &Scenario) -> Result<HarnessReport, String> {
         best,
         recovered_golden,
         golden_distance,
+        llm,
         notes,
-    })
+    }
 }
 
 /// Merge per-task overrides onto the scenario defaults into a full assignment.
-fn effective_assignment(
+pub(crate) fn effective_assignment(
     scenario: &Scenario,
     overrides: &HashMap<String, String>,
 ) -> BTreeMap<String, String> {
@@ -243,11 +341,13 @@ fn candidate_name(
 }
 
 /// Evaluate one assignment over all scenario inputs into an aggregate result.
-fn evaluate(
+pub(crate) fn evaluate(
     scenario: &Scenario,
     defs: &[ProcessDefinition],
     process_id: &str,
     name: &str,
+    source: &str,
+    rationale: Option<String>,
     assignment: &BTreeMap<String, String>,
 ) -> VariantResult {
     let lookup: HashMap<String, String> = assignment.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -292,6 +392,8 @@ fn evaluate(
 
     VariantResult {
         name: name.to_string(),
+        source: source.to_string(),
+        rationale,
         assignment: assignment.clone(),
         runs: n,
         completion_rate,

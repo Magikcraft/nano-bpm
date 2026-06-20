@@ -49,6 +49,41 @@ curl http://localhost:8090/api/harness/example/run | jq
 open http://localhost:8090/harness
 ```
 
+### LLM hypothesis (M2)
+
+Instead of (or alongside) the baked worker-swap grid, an LLM can *propose*
+candidates. The model only generates hypotheses — the harness still measures and
+ranks them with the SimRunner, so an improvement that doesn't actually help is
+exposed by the numbers. The model is reached through a **pluggable client**, so the
+same path serves a local model on your network and a hosted API:
+
+- `openai` — the OpenAI **chat-completions** shape, spoken by local `llama.cpp`
+  (`--api`), Ollama (`/v1`), vLLM, LM Studio, and OpenAI. **Default.**
+- `anthropic` — the Anthropic **messages** API.
+
+Configure by environment (overridable per request):
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `PROCESSOS_LLM_PROVIDER` | `openai` | `openai` (local/llama.cpp/ollama/vllm) or `anthropic` |
+| `PROCESSOS_LLM_BASE_URL` | `http://127.0.0.1:8080/v1` (openai) / `https://api.anthropic.com` (anthropic) | Endpoint base |
+| `PROCESSOS_LLM_MODEL` | _(required)_ | Model name |
+| `PROCESSOS_LLM_API_KEY` | _(none)_ | Bearer / `x-api-key`; local models usually need none |
+| `PROCESSOS_LLM_MAX_TOKENS` | `2048` | Completion budget |
+| `PROCESSOS_LLM_TEMPERATURE` | `0.2` | Sampling temperature |
+
+```sh
+# Local llama.cpp/Ollama on the network (OpenAI-compatible)
+curl -s http://localhost:8090/api/harness/example | \
+  jq '{scenario: ., llm: {provider:"openai", baseUrl:"http://gpu-box.lan:8080/v1", model:"qwen3"}, includeBaked:true}' | \
+  curl -s -X POST http://localhost:8090/api/harness/hypothesize -H 'content-type: application/json' -d @- | jq
+
+# Anthropic
+curl -s http://localhost:8090/api/harness/example | \
+  jq '{scenario: ., llm: {provider:"anthropic", model:"claude-3-5-sonnet-latest", apiKey:"sk-ant-…"}}' | \
+  curl -s -X POST http://localhost:8090/api/harness/hypothesize -H 'content-type: application/json' -d @- | jq
+```
+
 ## Run
 
 ```sh
@@ -82,6 +117,7 @@ curl http://localhost:8090/api/insights | jq
 | `GET` | `/api/harness/example` | The bundled example scenario JSON (a template to copy) |
 | `GET` | `/api/harness/example/run` | Run the example scenario, return the ranked report |
 | `POST` | `/api/harness/run` | Run a caller-supplied scenario, return the ranked report |
+| `POST` | `/api/harness/hypothesize` | LLM proposes candidates; harness evaluates + ranks them (body: `{scenario, llm?, includeBaked?}`) |
 
 ## Layout
 
@@ -91,10 +127,12 @@ src/
   contracts.rs   typed mirror of Nano's read-contract DTOs + the HTTP client
   report.rs      pure aggregation: traces -> Insights (with unit tests)
   harness/
-    mod.rs       scenario / worker / variant types + seeded PRNG
-    sim.rs       SimRunner: drives engine-core on a virtual clock (M0)
-    rank.rs      candidate enumeration + evaluation + ranking (M1)
-    example.rs   the bundled Classify->Summarize worker-swap demo
+    mod.rs         scenario / worker / variant types + seeded PRNG
+    sim.rs         SimRunner: drives engine-core on a virtual clock (M0)
+    rank.rs        candidate enumeration + evaluation + ranking (M1)
+    llm.rs         pluggable LLM client: openai-compatible + anthropic (M2)
+    hypothesize.rs LLM proposes candidates, validate + evaluate + rank (M2)
+    example.rs     the bundled Classify->Summarize worker-swap demo
 ```
 
 Future stages (T2+: verification, canary, reasoning) add modules here. The MVP
