@@ -744,6 +744,26 @@ NANOBPMN_DATA_DIR=./nanobpm.data PORT=8080 \
 # open http://localhost:8080/console
 ```
 
+When started with the `console` feature, the gateway prints the human-facing
+URLs at startup:
+
+```text
+Nano BPM is up:
+  Landing page   http://127.0.0.1:8080/
+  Web console    http://127.0.0.1:8080/console
+  API reference  http://127.0.0.1:8080/swagger
+  REST API       http://127.0.0.1:8080/v2
+  Metrics        http://127.0.0.1:8080/metrics
+```
+
+The root path `/` serves a small self-contained landing page (an inline canvas
+particle effect, no external assets) linking to the console and the API
+reference. `/swagger` serves an **offline** Swagger UI: the multi-file OpenAPI
+spec under `spec/` is bundled into a single `openapi.json` at frontend-build
+time and embedded alongside the UI, so nothing is fetched from a CDN. (These
+root routes are part of the `console` feature; the default gateway build serves
+neither and keeps its original startup output.)
+
 The console has four tabs:
 
 - **Topology** — cluster/partition/Raft overview.

@@ -7271,6 +7271,23 @@ async fn main() {
         nanobpm_gateway_rest::BASE_PATH
     );
 
+    // A friendly, copy-pasteable summary of where the human-facing surfaces live.
+    // Console feature only, so the default gateway build's startup output is
+    // unchanged. Printed to stdout so it shows up plainly when starting the
+    // self-contained distribution.
+    #[cfg(feature = "console")]
+    {
+        let base = format!("http://127.0.0.1:{local_port}");
+        println!("\nNano BPM is up:");
+        println!("  Landing page   {base}/");
+        println!("  Web console    {base}/console");
+        println!("  API reference  {base}/swagger");
+        println!("  REST API       {base}{}", nanobpm_gateway_rest::BASE_PATH);
+        println!("  Metrics        {base}/metrics");
+        println!();
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

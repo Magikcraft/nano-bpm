@@ -42,9 +42,17 @@ pub mod workspace;
 #[folder = "../console/dist"]
 struct Assets;
 
+/// The standalone marketing landing page (self-contained: inline canvas particle
+/// effect, no external assets), served at `/`.
+const LANDING_HTML: &str = include_str!("landing.html");
+
 /// Mounts the console SPA and its JSON API onto the gateway.
 pub fn router(server: ServerImpl) -> Router {
     Router::new()
+        .route("/", get(landing))
+        .route("/swagger", get(swagger_index))
+        .route("/swagger/", get(swagger_index))
+        .route("/swagger/{*path}", get(swagger_asset))
         .route("/console/api/topology", get(topology))
         .route("/console/api/instances", get(instances))
         .route("/console/api/instances/{key}", get(instance_detail))
@@ -128,8 +136,32 @@ fn serve_embedded(path: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Console API
+// Landing page + Swagger UI (root-level, console feature only)
 // ---------------------------------------------------------------------------
+
+/// Serves the standalone marketing landing page at `/`.
+async fn landing() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        LANDING_HTML,
+    )
+        .into_response()
+}
+
+/// Serves the Swagger UI shell at `/swagger`.
+async fn swagger_index() -> Response {
+    serve_embedded("swagger/index.html")
+}
+
+/// Serves Swagger UI assets and the bundled OpenAPI spec under `/swagger/`. All
+/// files (the UI assets and `openapi.json`) are built into the frontend bundle
+/// under `dist/swagger/`.
+async fn swagger_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let path = path.trim_start_matches('/');
+    serve_embedded(&format!("swagger/{path}"))
+}
+
+
 
 #[derive(Serialize)]
 struct TopologyDto {

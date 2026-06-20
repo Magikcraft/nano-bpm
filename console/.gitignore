@@ -2,3 +2,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+
+# swagger-ui-dist assets copied at build time from the pinned devDependency
+# (see scripts/copy-swagger.mjs); only index.html under public/swagger is tracked.
+public/swagger/swagger-ui.css
+public/swagger/swagger-ui-bundle.js
+public/swagger/openapi.json

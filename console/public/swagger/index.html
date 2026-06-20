@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nano BPM · API reference</title>
+    <link rel="stylesheet" href="/swagger/swagger-ui.css" />
+    <style>
+      body {
+        margin: 0;
+        background: #18181b;
+      }
+      /* A slim brand bar above the Swagger UI, matching the console theme. */
+      .nbpm-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.6rem 1rem;
+        background: #0a0a0a;
+        border-bottom: 1px solid #27272a;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        color: #e4e4e7;
+      }
+      .nbpm-bar strong {
+        font-weight: 600;
+      }
+      .nbpm-bar .dot {
+        width: 0.6rem;
+        height: 0.6rem;
+        border-radius: 9999px;
+        background: linear-gradient(135deg, #34d399, #38bdf8);
+      }
+      .nbpm-bar a {
+        color: #38bdf8;
+        text-decoration: none;
+        font-size: 0.85rem;
+      }
+      .nbpm-bar a:hover {
+        text-decoration: underline;
+      }
+      .nbpm-bar .spacer {
+        flex: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="nbpm-bar">
+      <span class="dot"></span>
+      <strong>Nano BPM</strong>
+      <span style="color: #71717a; font-size: 0.85rem">API reference</span>
+      <span class="spacer"></span>
+      <a href="/">Home</a>
+      <a href="/console">Web console</a>
+    </div>
+    <div id="swagger-ui"></div>
+    <script src="/swagger/swagger-ui-bundle.js" charset="utf-8"></script>
+    <script>
+      window.ui = SwaggerUIBundle({
+        // A single self-contained spec bundled at build time from the multi-file
+        // source under ../spec (see scripts/copy-swagger.mjs), so every $ref is
+        // internal and resolves offline.
+        url: "/swagger/openapi.json",
+        dom_id: "#swagger-ui",
+        deepLinking: true,
+        presets: [SwaggerUIBundle.presets.apis],
+        layout: "BaseLayout",
+        tryItOutEnabled: true,
+        defaultModelsExpandDepth: 0,
+      });
+    </script>
+  </body>
+</html>

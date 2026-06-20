@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nano BPM</title>
+    <style>
+      :root {
+        --emerald: #34d399;
+        --sky: #38bdf8;
+        --ink: #e4e4e7;
+        --muted: #a1a1aa;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #08080a;
+        color: var(--ink);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      /* Particle field sits behind everything. */
+      #field {
+        position: fixed;
+        inset: 0;
+        display: block;
+        z-index: 0;
+      }
+      /* Radial brand glow over the particles. */
+      .glow {
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        background:
+          radial-gradient(60% 60% at 50% 38%, rgba(56, 189, 248, 0.12), transparent 70%),
+          radial-gradient(50% 50% at 70% 70%, rgba(52, 211, 153, 0.1), transparent 70%);
+      }
+      .wrap {
+        position: relative;
+        z-index: 2;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: 2rem;
+      }
+      .mark {
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+        margin-bottom: 1.2rem;
+      }
+      .mark .dot {
+        width: 0.85rem;
+        height: 0.85rem;
+        border-radius: 9999px;
+        background: linear-gradient(135deg, var(--emerald), var(--sky));
+        box-shadow: 0 0 18px rgba(56, 189, 248, 0.6);
+      }
+      h1 {
+        font-size: clamp(2.6rem, 8vw, 4.8rem);
+        line-height: 1.02;
+        margin: 0;
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        background: linear-gradient(135deg, #ffffff 0%, var(--sky) 55%, var(--emerald) 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      p.tag {
+        margin: 1.1rem 0 0;
+        max-width: 34rem;
+        font-size: clamp(1rem, 2.4vw, 1.2rem);
+        color: var(--muted);
+        line-height: 1.5;
+      }
+      .actions {
+        margin-top: 2.4rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.9rem;
+        justify-content: center;
+      }
+      a.btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.8rem 1.5rem;
+        border-radius: 0.7rem;
+        font-size: 0.98rem;
+        font-weight: 600;
+        text-decoration: none;
+        transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+      }
+      a.btn:hover {
+        transform: translateY(-2px);
+      }
+      a.primary {
+        color: #052e1a;
+        background: linear-gradient(135deg, var(--emerald), var(--sky));
+        box-shadow: 0 8px 30px rgba(56, 189, 248, 0.3);
+      }
+      a.ghost {
+        color: var(--ink);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+      }
+      a.ghost:hover {
+        background: rgba(255, 255, 255, 0.09);
+      }
+      .links {
+        margin-top: 2rem;
+        display: flex;
+        gap: 1.3rem;
+        font-size: 0.85rem;
+      }
+      .links a {
+        color: var(--muted);
+        text-decoration: none;
+      }
+      .links a:hover {
+        color: var(--sky);
+      }
+      footer {
+        position: fixed;
+        bottom: 1rem;
+        left: 0;
+        right: 0;
+        z-index: 2;
+        text-align: center;
+        font-size: 0.75rem;
+        color: #52525b;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="field"></canvas>
+    <div class="glow"></div>
+
+    <div class="wrap">
+      <div class="mark">
+        <span class="dot"></span>
+        <span style="font-weight: 600; letter-spacing: 0.04em; color: var(--muted)">NANO BPM</span>
+      </div>
+      <h1>Process orchestration,<br />in a single binary.</h1>
+      <p class="tag">
+        A self-contained BPMN engine and gateway — modeler, live process explorer,
+        embedded workers, and a Camunda-compatible REST API, all in one node.
+      </p>
+      <div class="actions">
+        <a class="btn primary" href="/console">Open the web console →</a>
+        <a class="btn ghost" href="/swagger">API reference (Swagger)</a>
+      </div>
+      <div class="links">
+        <a href="/v2/topology">/v2 REST API</a>
+        <a href="/metrics">/metrics</a>
+      </div>
+    </div>
+
+    <footer>Single-node distribution · BPMN 2.0 · command-stream workers</footer>
+
+    <script>
+      // A rotating "constellation" particle field: points drift, the whole field
+      // slowly rotates around the centre, and nearby points are linked by lines
+      // whose opacity falls off with distance. Pure canvas, no dependencies, so
+      // the page stays self-contained and works offline.
+      const canvas = document.getElementById("field");
+      const ctx = canvas.getContext("2d");
+      let w, h, cx, cy, points, dpr;
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);
+        w = canvas.width = Math.floor(innerWidth * dpr);
+        h = canvas.height = Math.floor(innerHeight * dpr);
+        canvas.style.width = innerWidth + "px";
+        canvas.style.height = innerHeight + "px";
+        cx = w / 2;
+        cy = h / 2;
+        seed();
+      }
+
+      function seed() {
+        // Scale particle count to viewport area (capped) for consistent density.
+        const count = Math.min(140, Math.floor((w * h) / (22000 * dpr)));
+        points = [];
+        for (let i = 0; i < count; i++) {
+          const ang = Math.random() * Math.PI * 2;
+          const rad = Math.pow(Math.random(), 0.6) * Math.min(w, h) * 0.55;
+          points.push({
+            // Position stored as angle/radius around centre so we can rotate the
+            // whole field cheaply, plus a small drift velocity.
+            a: ang,
+            r: rad,
+            vx: (Math.random() - 0.5) * 0.25 * dpr,
+            vy: (Math.random() - 0.5) * 0.25 * dpr,
+            x: 0,
+            y: 0,
+          });
+        }
+      }
+
+      const LINK = 130; // px (css) link distance
+      let rot = 0;
+
+      function frame() {
+        rot += 0.0006; // slow global rotation
+        ctx.clearRect(0, 0, w, h);
+
+        const cosR = Math.cos(rot);
+        const sinR = Math.sin(rot);
+        const link = LINK * dpr;
+
+        for (const p of points) {
+          // Base position from rotating polar coords + accumulated drift.
+          const bx = Math.cos(p.a) * p.r;
+          const by = Math.sin(p.a) * p.r;
+          p.driftX = (p.driftX || 0) + p.vx;
+          p.driftY = (p.driftY || 0) + p.vy;
+          // Keep drift bounded so particles don't escape.
+          if (Math.abs(p.driftX) > 60 * dpr) p.vx *= -1;
+          if (Math.abs(p.driftY) > 60 * dpr) p.vy *= -1;
+          const rx = bx * cosR - by * sinR + p.driftX;
+          const ry = bx * sinR + by * cosR + p.driftY;
+          p.x = cx + rx;
+          p.y = cy + ry;
+        }
+
+        // Links.
+        for (let i = 0; i < points.length; i++) {
+          for (let j = i + 1; j < points.length; j++) {
+            const a = points[i];
+            const b = points[j];
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            const d = Math.hypot(dx, dy);
+            if (d < link) {
+              const t = 1 - d / link;
+              ctx.strokeStyle = `rgba(80, 200, 230, ${0.18 * t})`;
+              ctx.lineWidth = dpr * 0.6;
+              ctx.beginPath();
+              ctx.moveTo(a.x, a.y);
+              ctx.lineTo(b.x, b.y);
+              ctx.stroke();
+            }
+          }
+        }
+
+        // Dots.
+        for (const p of points) {
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, dpr * 1.6, 0, Math.PI * 2);
+          ctx.fillStyle = "rgba(150, 230, 220, 0.85)";
+          ctx.fill();
+        }
+
+        requestAnimationFrame(frame);
+      }
+
+      addEventListener("resize", resize);
+      resize();
+      frame();
+    </script>
+  </body>
+</html>
