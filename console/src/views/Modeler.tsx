@@ -28,6 +28,7 @@ function statusBadge(status: DeployStatus): { label: string; cls: string } {
 export default function Modeler() {
   const queryClient = useQueryClient();
   const modelerRef = useRef<BpmnModelerHandle>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [selected, setSelected] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -83,6 +84,47 @@ export default function Modeler() {
     setDirty(false);
     syncProcessId();
     setMessage(null);
+  }
+
+  // Imports a BPMN file picked from disk into the modeler and saves it as a new
+  // workspace model so it persists alongside the other models. The on-disk file
+  // is the source; we derive a default model name from its basename. A name
+  // collision falls back to a prompt so we never silently overwrite.
+  async function importFromDisk(file: File) {
+    if (dirty && !confirm("Discard unsaved changes?")) return;
+    setBusy(true);
+    try {
+      const xml = await file.text();
+      // Validate/normalise by round-tripping through the modeler before saving.
+      await modelerRef.current?.importXml(xml);
+      const normalised = (await modelerRef.current?.getXml()) ?? xml;
+
+      const base = file.name.replace(/\.(bpmn|xml)$/i, "").trim();
+      const taken = new Set((models ?? []).map((m) => m.name));
+      let name = base || "imported";
+      if (taken.has(name)) {
+        const input = prompt(
+          `A model named "${name}" already exists. Import as:`,
+          `${name}-copy`,
+        );
+        if (!input) {
+          setBusy(false);
+          return;
+        }
+        name = input.trim();
+      }
+
+      await api.createModel(name, normalised);
+      setSelected(name);
+      setDirty(false);
+      syncProcessId();
+      refreshModels();
+      flash("ok", `Imported ${file.name} as "${name}".`);
+    } catch (e) {
+      flash("err", `Import failed: ${String(e)}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function save(): Promise<string | null> {
@@ -198,12 +240,33 @@ export default function Modeler() {
       <div className="flex w-72 shrink-0 flex-col border-r border-zinc-800">
         <header className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
           <h1 className="text-lg font-semibold">Models</h1>
-          <button
-            onClick={newModel}
-            className="rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
-          >
-            + New
-          </button>
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
+              title="Import a .bpmn file from disk"
+            >
+              Import
+            </button>
+            <button
+              onClick={newModel}
+              className="rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
+            >
+              + New
+            </button>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".bpmn,.xml,application/xml,text/xml"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              // Reset so selecting the same file again re-triggers onChange.
+              e.target.value = "";
+              if (file) void importFromDisk(file);
+            }}
+          />
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
           {models && models.length === 0 && (
