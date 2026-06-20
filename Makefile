@@ -88,6 +88,18 @@ engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (need
 	cd $(ENGINE_DIR) && cargo build --release --features ffi --target wasm32-unknown-unknown
 	node $(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs
 
+.PHONY: processos-build
+processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
+	cd processos && cargo build
+
+.PHONY: processos-test
+processos-test: ## Test the ProcessOS crate
+	cd processos && cargo test
+
+.PHONY: processos-run
+processos-run: ## Run ProcessOS (PROCESSOS_PORT=8090, NANO_BASE_URL=http://localhost:8080)
+	cd processos && cargo run
+
 .PHONY: fmt
 fmt: $(GENERATED_DIR)/Cargo.toml ## Format the generated crate, the stub server and engine-core
 	cd $(GENERATED_DIR) && cargo fmt

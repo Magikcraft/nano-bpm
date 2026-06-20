@@ -1,0 +1,27 @@
+[package]
+name = "processos"
+version = "0.1.0"
+edition = "2021"
+description = "ProcessOS — the runtime process-optimization plane for Nano BPM. Stage T1: ingest Nano's trace/metrics export and serve an Insights report. Talks to Nano only over its public contracts; Nano never depends on this crate."
+
+# Independent crate, sibling to engine-core / server / engine-wasm (no root
+# workspace, per repo convention). The dependency edge is one-way: ProcessOS may
+# read Nano's public HTTP surfaces; Nano never links ProcessOS.
+[[bin]]
+name = "processos"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTTP client for the read/control contracts. Localhost gateway is plain HTTP, so
+# we drop the TLS backends to keep the build lean and offline-friendly.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
