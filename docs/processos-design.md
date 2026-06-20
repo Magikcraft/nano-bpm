@@ -320,10 +320,24 @@ surface, but it **sharpens and constrains M3 rather than redefining it**:
    `GET /api/harness/cluster`). Pure + tested; point it at a cluster the
    perf-matrix is driving. (b) *Drive*: generate concurrent load against a real
    gateway — producer over the **v2 REST API** (`POST /v2/process-instances`,
-   `/v2/deployments`) + workers over **`/command-stream`**, reusing the
-   perf-matrix load path (its file-barrier Deno/local workers). The science (a)
+   `/v2/deployments`) + workers over the **v2 job APIs**
+   (`POST /v2/jobs/activation`, `POST /v2/jobs/{key}/completion`) or
+   `/command-stream`, reusing the perf-matrix load path. The science (a)
    lives in ProcessOS; the load-gen plumbing (b) is the documented integration
    boundary the perf-matrix already provides.
+
+   > **Measured fact — trace data is partition-local.** Validated on a live
+   > `c8 nano start 3` cluster (RF=1, 3 partitions): each node's
+   > `/console/api/traces` returns only the instances **its** partitions own
+   > (observed ~102 / 102 / 100 of 304 instances on nodes 0/1/2). A single
+   > `NANO_BASE_URL` therefore measures one partition's slice, not the cluster.
+   > The ClusterRunner now discovers every node via `GET /v2/topology` and
+   > **unions their traces** (`cluster_endpoints` + `build_cluster_summary_over`,
+   > deduping by instance key; trace *detail* is fetched from each instance's
+   > owning node). End-to-end check: pointed at node 0 it reported all **304**
+   > instances (not 102), p99 e2e 1540 ms, and `avgQueueMs 6166 ≫ avgServiceMs 67`
+   > — the queue-bound (scale-the-workers) signature, produced from real
+   > contention the SimRunner cannot generate.
 3. **Unify candidate evaluation across backends.** A candidate is evaluated by the
    SimRunner (fast offline what-if) or the ClusterRunner (at-scale realism); the
    ranking step (§7.2 step 5) is unchanged.

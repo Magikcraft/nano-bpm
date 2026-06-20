@@ -16,7 +16,7 @@
 
 use serde::Serialize;
 
-use crate::contracts::{InstanceTrace, NanoClient, TraceSummary};
+use crate::contracts::{InstanceTrace, NanoClient, Topology, TraceSummary};
 
 /// The at-scale result of a cluster run for one process: throughput + latency
 /// distribution + the queue/service decomposition under load. This is the
@@ -194,17 +194,51 @@ struct JobTypeAcc {
     service_n: usize,
 }
 
-/// Read the live dataset from Nano and summarize the at-scale run for `process_id`
-/// (or the busiest sampled process when `None`). Network I/O is confined here; the
-/// aggregation is the pure [`summarize_run`]. Errors only on a read-contract
-/// failure or when no live traces exist.
+/// Read the live dataset from the **whole cluster** and summarize the at-scale run
+/// for `process_id` (or the busiest sampled process when `None`). Trace data is
+/// partition-local, so this discovers every node via `/v2/topology` and unions
+/// their traces before aggregating; on a topology-read failure it falls back to the
+/// single `nano` endpoint. Network I/O is confined here; the aggregation is the pure
+/// [`summarize_run`]. Errors only on a read-contract failure or when no live traces
+/// exist.
 pub async fn build_cluster_summary(
     nano: &NanoClient,
     process_id: Option<&str>,
     limit: usize,
     sample: usize,
 ) -> Result<ClusterRunSummary, String> {
-    let summaries = nano.list_traces(limit).await?;
+    let endpoints = match nano.topology().await {
+        Ok(topo) => cluster_endpoints(nano.base_url(), &topo),
+        // A single-node deployment (or no topology) is still measurable on its own.
+        Err(_) => vec![nano.base_url().to_string()],
+    };
+    let clients: Vec<NanoClient> = endpoints.into_iter().map(NanoClient::new).collect();
+    build_cluster_summary_over(&clients, process_id, limit, sample).await
+}
+
+/// The cluster-aware core: list traces from every node (deduping by instance key
+/// since each instance lives on exactly one partition), pick the target process,
+/// then pull a bounded detail sample **from each instance's owning node** (trace
+/// detail is only served by the node that owns it). Pure aggregation is delegated to
+/// [`summarize_run`]. Factored out so a fixed endpoint set is unit-testable and so a
+/// single-node read is just the one-client case.
+pub async fn build_cluster_summary_over(
+    clients: &[NanoClient],
+    process_id: Option<&str>,
+    limit: usize,
+    sample: usize,
+) -> Result<ClusterRunSummary, String> {
+    let mut summaries: Vec<TraceSummary> = Vec::new();
+    let mut owner: Vec<usize> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, c) in clients.iter().enumerate() {
+        for s in c.list_traces(limit).await? {
+            if seen.insert(s.instance_key.clone()) {
+                owner.push(i);
+                summaries.push(s);
+            }
+        }
+    }
     if summaries.is_empty() {
         return Err(
             "no live traces to summarize; load the cluster (e.g. via the perf-matrix) first"
@@ -221,16 +255,54 @@ pub async fn build_cluster_summary(
         return Err(format!("process id '{target}' has no sampled live traces"));
     }
 
-    // Pull a bounded sample of details (for the queue/service split).
-    let take = sample.min(summaries.len());
-    let mut details: Vec<InstanceTrace> = Vec::with_capacity(take);
-    for s in summaries.iter().filter(|s| s.process_id == target).take(take) {
-        if let Ok(t) = nano.trace(&s.instance_key).await {
+    // Pull a bounded sample of details (for the queue/service split), each from the
+    // node that owns the instance.
+    let mut details: Vec<InstanceTrace> = Vec::new();
+    for (idx, s) in summaries.iter().enumerate() {
+        if details.len() >= sample {
+            break;
+        }
+        if s.process_id != target {
+            continue;
+        }
+        if let Ok(t) = clients[owner[idx]].trace(&s.instance_key).await {
             details.push(t);
         }
     }
 
     Ok(summarize_run(&target, &summaries, &details))
+}
+
+/// Derive one console base URL per cluster node from a topology response. Trace data
+/// is partition-local, so the measurement must read every node. The base node's
+/// scheme+host are reused for every endpoint (a broker's advertised `host` can be a
+/// non-dialable bind address such as `0.0.0.0`); only the per-node `port` is taken
+/// from topology. Ports are deduped and sorted for a stable endpoint set. An empty
+/// topology degrades to the single base URL.
+pub fn cluster_endpoints(base_url: &str, topo: &Topology) -> Vec<String> {
+    if topo.brokers.is_empty() {
+        return vec![base_url.trim_end_matches('/').to_string()];
+    }
+    let (scheme, host) = base_scheme_host(base_url);
+    let mut ports: Vec<u16> = topo.brokers.iter().map(|b| b.port).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+        .into_iter()
+        .map(|p| format!("{scheme}://{host}:{p}"))
+        .collect()
+}
+
+/// Split a base URL into its scheme and host, dropping any port and path. Defaults to
+/// `http` and treats the whole string as the host when no scheme is present.
+fn base_scheme_host(base_url: &str) -> (String, String) {
+    let (scheme, rest) = base_url.split_once("://").unwrap_or(("http", base_url));
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority);
+    (scheme.to_string(), host.to_string())
 }
 
 /// The process id with the most rows in `summaries`.
@@ -404,5 +476,34 @@ mod tests {
         let s = summarize_run("p", &summaries, &[]);
         assert_eq!(s.window_ms, None);
         assert_eq!(s.throughput_per_sec, None);
+    }
+
+    #[test]
+    fn endpoints_reuse_base_host_and_topology_ports() {
+        use crate::contracts::{Broker, Topology};
+        let topo = Topology {
+            brokers: vec![
+                // node 0 advertises a non-dialable bind address; we must NOT use it.
+                Broker { node_id: 0, host: "0.0.0.0".into(), port: 8080 },
+                Broker { node_id: 1, host: "127.0.0.1".into(), port: 8081 },
+                Broker { node_id: 2, host: "127.0.0.1".into(), port: 8082 },
+            ],
+        };
+        let eps = cluster_endpoints("http://127.0.0.1:8080", &topo);
+        assert_eq!(
+            eps,
+            vec![
+                "http://127.0.0.1:8080".to_string(),
+                "http://127.0.0.1:8081".to_string(),
+                "http://127.0.0.1:8082".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_topology_degrades_to_single_base() {
+        use crate::contracts::Topology;
+        let eps = cluster_endpoints("http://host:8080/", &Topology { brokers: vec![] });
+        assert_eq!(eps, vec!["http://host:8080".to_string()]);
     }
 }

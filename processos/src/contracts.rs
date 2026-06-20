@@ -98,6 +98,25 @@ pub struct Metrics {
     pub resident_bytes: Option<u64>,
 }
 
+/// `GET /v2/topology` — the cluster's brokers. ProcessOS reads it to discover the
+/// per-node console endpoints, because trace data is **partition-local**: a single
+/// node's `/console/api/traces` only sees the instances its partitions own, so a
+/// cluster-wide measurement must union every node.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Topology {
+    #[serde(default)]
+    pub brokers: Vec<Broker>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Broker {
+    pub node_id: i32,
+    pub host: String,
+    pub port: u16,
+}
+
 /// HTTP client for Nano's public read contract. One-way: it only ever issues GETs
 /// against the gateway's `/console/api` surface — never the journal, read DB, or
 /// engine internals.
@@ -134,6 +153,13 @@ impl NanoClient {
     /// `GET /console/api/metrics` — live node gauges.
     pub async fn metrics(&self) -> Result<Metrics, String> {
         let url = format!("{}/console/api/metrics", self.base_url);
+        self.get_json(&url).await
+    }
+
+    /// `GET /v2/topology` — the cluster's brokers, used to discover per-node
+    /// console endpoints for a cluster-wide (all-partition) trace union.
+    pub async fn topology(&self) -> Result<Topology, String> {
+        let url = format!("{}/v2/topology", self.base_url);
         self.get_json(&url).await
     }
 
