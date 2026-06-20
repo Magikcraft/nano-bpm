@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
@@ -6,6 +6,11 @@ import {
   type WorkerPhase,
   type WorkerSummary,
 } from "../lib/api";
+import { languageForFile } from "../lib/editorLang";
+
+// Monaco is multi-MB; load it as a separate chunk only when an editor is shown
+// so the initial console bundle stays lean.
+const CodeEditor = lazy(() => import("../components/CodeEditor"));
 
 function phaseBadge(phase: WorkerPhase): { label: string; cls: string; dot: string } {
   switch (phase) {
@@ -463,32 +468,25 @@ function WorkerEditor({
         </button>
       </div>
 
-      {/* Code editor (textarea) */}
-      <textarea
-        value={content}
-        spellCheck={false}
-        onChange={(e) => {
-          setContent(e.target.value);
-          setDirty(true);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Tab") {
-            e.preventDefault();
-            const t = e.currentTarget;
-            const s = t.selectionStart;
-            const v = t.value;
-            const next = v.slice(0, s) + "  " + v.slice(t.selectionEnd);
-            setContent(next);
-            setDirty(true);
-            requestAnimationFrame(() => {
-              t.selectionStart = t.selectionEnd = s + 2;
-            });
-          }
-        }}
-        disabled={loadedFile !== file}
-        className="min-h-0 flex-1 resize-none bg-zinc-950 p-4 font-mono text-sm text-zinc-100 outline-none"
-        placeholder={loadedFile !== file ? "Loading…" : ""}
-      />
+      {/* Code editor (Monaco) */}
+      <div className="min-h-0 flex-1 bg-[#1e1e1e]">
+        <Suspense
+          fallback={<div className="p-4 text-sm text-zinc-500">Loading editor…</div>}
+        >
+          <CodeEditor
+            value={loadedFile === file ? content : ""}
+            language={languageForFile(file)}
+            readOnly={loadedFile !== file}
+            onChange={(v) => {
+              setContent(v);
+              setDirty(true);
+            }}
+            onSave={() => {
+              if (dirty) void save();
+            }}
+          />
+        </Suspense>
+      </div>
 
       <LogPanel worker={worker.name} />
     </>
