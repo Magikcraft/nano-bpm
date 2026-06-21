@@ -20,10 +20,6 @@ use tokio::process::{Child, Command};
 
 use crate::contracts::NanoClient;
 
-/// The pilot process body, embedded so the supervisor can deploy it regardless of
-/// the working directory the binary is launched from.
-const PILOT_BPMN: &str = include_str!("../pilot/pilot-self-optimize.bpmn");
-
 /// How the supervisor should start the own engine. Built from the environment; the
 /// feature is opt-in (absent `PROCESSOS_SPAWN_NANO` ⇒ `None`, ProcessOS points
 /// `PROCESSOS_NANO_URL` at an externally-managed engine as before).
@@ -85,7 +81,10 @@ pub struct OwnNano {
 
 impl OwnNano {
     /// Spawn the gateway, wait for it to bind + serve, and deploy the pilot process.
-    pub async fn spawn(cfg: &SpawnConfig) -> Result<Self, String> {
+    /// `pilot_xml` is the (possibly operator-forked) pilot BPMN the [`crate::pilot`]
+    /// store resolved — surface (a) of §10. Deploy is idempotent: a byte-identical
+    /// redeploy is a no-op on the engine.
+    pub async fn spawn(cfg: &SpawnConfig, pilot_xml: &str) -> Result<Self, String> {
         if !cfg.bin.exists() {
             return Err(format!(
                 "own-Nano binary not found at {} (set PROCESSOS_NANO_BIN)",
@@ -142,7 +141,7 @@ impl OwnNano {
         // Install the pilot process so the cockpit can create experiments on it.
         // Idempotent: a byte-identical redeploy is a no-op on the engine.
         client
-            .deploy_bpmn("pilot-self-optimize.bpmn", PILOT_BPMN)
+            .deploy_bpmn(crate::pilot::DEPLOY_FILENAME, pilot_xml)
             .await
             .map_err(|e| format!("deploy pilot process: {e}"))?;
 
@@ -222,10 +221,5 @@ mod tests {
         for v in ["0", "false", "no", "off", ""] {
             assert!(!truthy(v), "{v:?} should be falsy");
         }
-    }
-
-    #[test]
-    fn the_embedded_pilot_bpmn_is_the_pilot_process() {
-        assert!(PILOT_BPMN.contains("pilotSelfOptimize"));
     }
 }

@@ -13,6 +13,7 @@ mod contracts;
 mod cockpit;
 mod conversation;
 mod harness;
+mod pilot;
 mod report;
 mod supervisor;
 
@@ -55,6 +56,10 @@ struct AppState {
     /// Durable cockpit conversations (§10) — the persisted pilot ↔ droid dialogue,
     /// one append-only log per experiment.
     conversations: Arc<conversation::ConversationStore>,
+    /// The pilot process (§10 plastic surface **a**) — the forkable BPMN choreography
+    /// that drives the optimization loop. File-backed; the supervisor deploys it on
+    /// boot, and `PUT /api/pilot` re-forks it and hot-redeploys to the own engine.
+    pilot: Arc<pilot::PilotStore>,
 }
 
 /// Server configuration, all overridable by environment.
@@ -132,6 +137,10 @@ async fn main() {
         }
     }
 
+    // The pilot process (§10 surface a) — file-backed under the data dir, seeded with
+    // the built-in default on first boot. The supervisor deploys whatever it resolves.
+    let pilot = Arc::new(pilot::PilotStore::open(&cfg.data_dir));
+
     // If configured, spawn ProcessOS's OWN Nano engine (the client's production
     // engine is the read-only target; ProcessOS runs its pilot loop here). The
     // spawned engine's URL overrides `own_url`. Held to shutdown so we don't orphan
@@ -144,10 +153,11 @@ async fn main() {
                 data_dir = %spawn_cfg.data_dir.display(),
                 "starting ProcessOS's own Nano engine"
             );
-            match supervisor::OwnNano::spawn(&spawn_cfg).await {
+            match supervisor::OwnNano::spawn(&spawn_cfg, &pilot.current_xml()).await {
                 Ok(engine) => {
                     let url = engine.base_url.clone();
-                    tracing::info!(own = %url, "own Nano engine ready; pilot process deployed");
+                    let src = pilot.doc().source;
+                    tracing::info!(own = %url, pilot = %src, "own Nano engine ready; pilot process deployed");
                     own_engine = Some(engine);
                     url
                 }
@@ -162,6 +172,7 @@ async fn main() {
         own: NanoClient::new(&own_url),
         prompts: Arc::new(RwLock::new(library)),
         conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
+        pilot,
     };
 
     let app = Router::new()
@@ -193,6 +204,8 @@ async fn main() {
         .route("/api/harness/cluster", get(harness_cluster))
         .route("/api/prompts", get(prompts_list).post(prompts_upsert))
         .route("/api/prompts/{id}", get(prompts_get).delete(prompts_delete))
+        .route("/api/pilot", get(pilot_get).put(pilot_put))
+        .route("/api/pilot/reset", post(pilot_reset))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -1165,6 +1178,78 @@ async fn prompts_delete(
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// A pilot fork submitted by the operator.
+#[derive(Debug, Deserialize)]
+struct PilotUpdate {
+    /// The forked pilot BPMN XML.
+    xml: String,
+}
+
+/// `GET /api/pilot` — the current pilot process (§10 surface a): its source
+/// (`default`/`forked`), declared process ids, and XML.
+async fn pilot_get(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.pilot.doc())
+}
+
+/// `PUT /api/pilot` — author a fork of the pilot process. Validates the BPMN, persists
+/// it durably, then **hot-redeploys it to the own engine** so the next experiment runs
+/// the operator's choreography. 422 on invalid BPMN (nothing changes); 502 if the
+/// engine deploy fails after a successful save (the fork is kept). The response carries
+/// the new doc plus a `warning` when the cockpit's expected process id is absent.
+async fn pilot_put(
+    State(state): State<AppState>,
+    Json(body): Json<PilotUpdate>,
+) -> impl IntoResponse {
+    let doc = match state.pilot.save(&body.xml) {
+        Ok(doc) => doc,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    redeploy_pilot(&state, doc).await
+}
+
+/// `POST /api/pilot/reset` — restore the built-in default pilot and hot-redeploy it.
+async fn pilot_reset(State(state): State<AppState>) -> impl IntoResponse {
+    let doc = state.pilot.reset();
+    redeploy_pilot(&state, doc).await
+}
+
+/// Deploy the (already-persisted) pilot doc to the own engine and shape the response.
+async fn redeploy_pilot(state: &AppState, doc: pilot::PilotDoc) -> axum::response::Response {
+    let warning = (!doc.process_ids.iter().any(|id| id == cockpit::PILOT_PROCESS_ID)).then(|| {
+        format!(
+            "pilot declares {:?}, not '{}' — the cockpit creates experiments on '{}', so they will fail until the process id matches",
+            doc.process_ids, cockpit::PILOT_PROCESS_ID, cockpit::PILOT_PROCESS_ID
+        )
+    });
+    match state.own.deploy_bpmn(doc.deploy_filename, &doc.xml).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "pilot": doc,
+                "deployed": true,
+                "warning": warning,
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "pilot": doc,
+                "deployed": false,
+                "error": format!("saved, but redeploy to own engine failed: {e}"),
+                "warning": warning,
+            })),
         )
             .into_response(),
     }
