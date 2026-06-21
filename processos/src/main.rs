@@ -27,10 +27,12 @@ use serde::Deserialize;
 
 use crate::contracts::NanoClient;
 use crate::harness::{
-    apply_calibration, build_baseline, build_cluster_summary, calibrate_from_measured,
-    example_scenario, rank_candidates_by_replay, replay_dataset, replay_instance, run_hypothesis,
-    run_scenario, staff_for_summary, CandidateModel, LlmConfig, LlmOverride, MeasuredJobType,
-    Prompt, PromptLibrary, RecordedInstance, Scenario, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
+    apply_calibration, build_baseline, build_cluster_summary, build_evolve_prompt,
+    calibrate_from_measured, example_scenario, llm_complete, parse_structural_candidates,
+    rank_candidates_by_replay, replay_dataset, replay_instance, run_hypothesis, run_scenario,
+    staff_for_summary, summarize_dataset, CandidateModel, LlmConfig, LlmOverride, MeasuredJobType,
+    Prompt, PromptLibrary, RecordedInstance, Scenario, DEFAULT_EVOLVE_SYSTEM_PROMPT,
+    DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 
@@ -109,6 +111,7 @@ async fn main() {
         .route("/api/harness/replay", post(harness_replay))
         .route("/api/harness/replay-batch", post(harness_replay_batch))
         .route("/api/harness/replay-rank", post(harness_replay_rank))
+        .route("/api/harness/evolve", post(harness_evolve))
         .route("/api/harness/production", get(harness_production))
         .route("/api/harness/cluster", get(harness_cluster))
         .route("/api/prompts", get(prompts_list).post(prompts_upsert))
@@ -653,8 +656,159 @@ async fn harness_replay_rank(
     .into_response()
 }
 
+/// Request body for the LLM-propose → replay-rank loop.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvolveRequest {
+    /// BPMN XML of the current/baseline model the LLM redesigns from.
+    baseline_model: String,
+    /// Process whose recorded instances form the dataset + signal. Defaults to the
+    /// baseline's first process id.
+    #[serde(default)]
+    process_id: Option<String>,
+    /// How many recent trace summaries to scan for matching instances.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Override the Nano gateway base url; defaults to the server's configured one.
+    #[serde(default)]
+    base_url: Option<String>,
+    /// Per-request LLM overrides (model, base_url, provider, …).
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    /// Inline system prompt override (wins over `promptId`).
+    #[serde(default)]
+    prompt: Option<String>,
+    /// Select a library prompt by id; falls back to the built-in evolve prompt.
+    #[serde(default)]
+    prompt_id: Option<String>,
+}
 
+/// `POST /api/harness/evolve` — the gradient-driven loop end-to-end (§7.9): distil
+/// the recorded production signal, ask the LLM to propose structural candidate
+/// models, and rank them by replaying against the *real* recorded traces. The
+/// droid proposes; the engine proves. Single-shot for now (the iterative loop is
+/// authored as a Nano process in a later brick).
+async fn harness_evolve(
+    State(state): State<AppState>,
+    Json(req): Json<EvolveRequest>,
+) -> impl IntoResponse {
+    // Resolve LLM config (env + per-request override); a model name is required.
+    let mut cfg = LlmConfig::from_env();
+    if let Some(o) = &req.llm {
+        cfg = cfg.with_override(o);
+    }
+    if !cfg.is_ready() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no LLM model configured; set PROCESSOS_LLM_MODEL (and \
+                          PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER as needed) \
+                          or pass an `llm` object with at least `model`"
+            })),
+        )
+            .into_response();
+    }
 
+    // The baseline must parse so we can derive the default process id and ground
+    // the prompt; a broken baseline is the caller's error.
+    let defs = match parse_bpmn(&req.baseline_model) {
+        Ok(d) if !d.is_empty() => d,
+        _ => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": "baseline model failed to parse" })),
+            )
+                .into_response();
+        }
+    };
+    let process_id = req.process_id.clone().unwrap_or_else(|| defs[0].id.clone());
+
+    // Resolve the system prompt: inline override, else library prompt, else default.
+    let system_prompt = match (&req.prompt, &req.prompt_id) {
+        (Some(inline), _) => inline.clone(),
+        (None, Some(id)) => match state.prompts.read().unwrap().system_of(id) {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": format!("unknown prompt id: {id}") })),
+                )
+                    .into_response();
+            }
+        },
+        (None, None) => DEFAULT_EVOLVE_SYSTEM_PROMPT.to_string(),
+    };
+
+    // Fetch + distil the recorded dataset (this is the fitness data).
+    let client = match &req.base_url {
+        Some(url) if !url.is_empty() => NanoClient::new(url),
+        _ => state.nano.clone(),
+    };
+    let limit = req.limit.unwrap_or(200);
+    let summaries = match client.list_traces(limit).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    let (dataset, matched, skipped, skip_reasons) =
+        distil_recorded_dataset(&client, &process_id, &summaries).await;
+    if dataset.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "no replayable recorded instances for this process \
+                          (was the gateway run with --capture?)",
+                "processId": process_id,
+                "matchedInstances": matched,
+                "skipped": skipped,
+                "skipReasons": skip_reasons,
+            })),
+        )
+            .into_response();
+    }
+
+    // Distil the production signal and ask the model to propose redesigns.
+    let signal = summarize_dataset(&process_id, &dataset);
+    let user_prompt = build_evolve_prompt(&signal, &req.baseline_model);
+    let raw = match llm_complete(&cfg, &system_prompt, &user_prompt).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e, "signal": signal })),
+            )
+                .into_response();
+        }
+    };
+    let candidates: Vec<CandidateModel> = match parse_structural_candidates(&raw) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": e, "signal": signal, "llmRaw": raw })),
+            )
+                .into_response();
+        }
+    };
+
+    // Prove each proposal against the recorded history.
+    let ranking = rank_candidates_by_replay(&candidates, &dataset, Some(&process_id));
+    Json(serde_json::json!({
+        "processId": process_id,
+        "matchedInstances": matched,
+        "skipped": skipped,
+        "skipReasons": skip_reasons,
+        "signal": signal,
+        "proposed": candidates.len(),
+        "ranking": ranking,
+    }))
+    .into_response()
+}
 /// `GET /api/prompts` — list every prompt in the library (built-in + authored).
 async fn prompts_list(State(state): State<AppState>) -> impl IntoResponse {
     let list = state.prompts.read().unwrap().list();

@@ -19,6 +19,7 @@
 //! never modified.
 
 mod cluster;
+mod evolve;
 mod example;
 mod hypothesize;
 mod llm;
@@ -40,8 +41,13 @@ pub use cluster::build_cluster_summary;
 #[allow(unused_imports)]
 pub use cluster::ClusterRunSummary;
 pub use example::example_scenario;
+#[allow(unused_imports)]
+pub use evolve::{
+    build_evolve_prompt, parse_structural_candidates, summarize_dataset, DatasetSignal,
+    DEFAULT_EVOLVE_SYSTEM_PROMPT,
+};
 pub use hypothesize::run_hypothesis;
-pub use llm::{LlmConfig, LlmOverride};
+pub use llm::{complete as llm_complete, LlmConfig, LlmOverride};
 pub use production::build_baseline;
 #[allow(unused_imports)]
 pub use production::ProductionBaseline;
