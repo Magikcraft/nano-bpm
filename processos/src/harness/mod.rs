@@ -51,8 +51,8 @@ pub use queueing::WorkerStaffing;
 pub use rank::{run_scenario, HarnessReport, VariantResult};
 #[allow(unused_imports)]
 pub use replay::{
-    replay_instance, JobCoverage, RecordedInstance, RecordedStimulus, ReplayResult,
-    ReplayUnavailable, VarDivergence,
+    replay_dataset, replay_instance, JobCoverage, KeyCount, RecordedInstance, RecordedStimulus,
+    ReplayReport, ReplayResult, ReplayUnavailable, VarDivergence,
 };
 
 use std::collections::HashMap;

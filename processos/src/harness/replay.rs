@@ -439,8 +439,151 @@ fn invalid(rec: &RecordedInstance, error: String) -> ReplayResult {
     }
 }
 
-// --- Value <-> JSON converters (mirror sim.rs / engine-wasm) ---------------------
+// --- Dataset scoring: the verifier as a Level-2 candidate scorer ------------------
 
+/// How often a given recorded-terminal output key diverged across the dataset —
+/// the candidate's most actionable failure signal (where it fails to reproduce
+/// history), sorted most-divergent first.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyCount {
+    pub key: String,
+    pub count: u32,
+}
+
+/// A candidate's **Level-2 scorecard**: the aggregate gradient over a recorded
+/// dataset (§7.7/§7.9). This is what the hypothesis loop ranks candidates by — a
+/// fidelity-tiered, confidence-bearing summary, never a single verdict.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayReport {
+    /// Recorded instances replayed against this candidate.
+    pub instances_total: u32,
+    /// Of those, how many the candidate could deploy + create + run (the rest are
+    /// validity failures — a structurally broken candidate fails all of them).
+    pub valid: u32,
+    /// How many reached the `Completed` terminal state.
+    pub completed: u32,
+    /// How many preserved the recorded boundary (completed, fully covered, no
+    /// divergence) — the headline fidelity number.
+    pub conserved: u32,
+    /// `conserved / instances_total` in `[0,1]`; `0.0` when nothing was replayable.
+    pub conserved_rate: f64,
+    /// Union of job types the candidate issued that history never produced an
+    /// output for — i.e. the workers a deploy of this candidate would require.
+    pub uncovered_job_types: Vec<String>,
+    /// Recorded-terminal keys the candidate most often failed to reproduce.
+    pub divergent_keys: Vec<KeyCount>,
+    /// Mean replayed end-to-end latency over completed instances (ms).
+    pub avg_e2e_latency_ms: f64,
+    /// 99th-percentile replayed end-to-end latency over completed instances (ms).
+    pub p99_e2e_latency_ms: u64,
+    /// Set when the candidate is structurally invalid for the whole dataset (every
+    /// instance failed validity) — the loop should treat this as a compiler error.
+    pub error: Option<String>,
+    /// Per-instance detail for drill-down (the loop can ignore it and rank on the
+    /// aggregate).
+    pub results: Vec<ReplayResult>,
+}
+
+/// Score one candidate against a recorded dataset by replaying every instance and
+/// folding the per-instance gradients into a [`ReplayReport`]. Pure and
+/// deterministic; the dataset is fetched by the caller (I/O stays out of here).
+pub fn replay_dataset(
+    defs: &[ProcessDefinition],
+    process_id: &str,
+    dataset: &[RecordedInstance],
+) -> ReplayReport {
+    let results: Vec<ReplayResult> = dataset
+        .iter()
+        .map(|rec| replay_instance(defs, process_id, rec))
+        .collect();
+
+    let instances_total = results.len() as u32;
+    let valid = results.iter().filter(|r| r.valid).count() as u32;
+    let completed = results.iter().filter(|r| r.completed).count() as u32;
+    let conserved = results.iter().filter(|r| r.conserved).count() as u32;
+
+    // Union of uncovered job types (requires-new-workers), sorted + deduped.
+    let mut uncovered: Vec<String> = results
+        .iter()
+        .flat_map(|r| r.uncovered_job_types.iter().cloned())
+        .collect();
+    uncovered.sort();
+    uncovered.dedup();
+
+    // Which recorded-terminal keys diverge most across the dataset.
+    let mut key_counts: HashMap<String, u32> = HashMap::new();
+    for r in &results {
+        for d in &r.divergences {
+            *key_counts.entry(d.key.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut divergent_keys: Vec<KeyCount> = key_counts
+        .into_iter()
+        .map(|(key, count)| KeyCount { key, count })
+        .collect();
+    // Most-divergent first; ties broken by key for determinism.
+    divergent_keys.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
+
+    // Latency aggregates over completed instances.
+    let mut lat: Vec<u64> = results
+        .iter()
+        .filter(|r| r.completed)
+        .map(|r| r.e2e_latency_ms)
+        .collect();
+    lat.sort_unstable();
+    let avg_e2e_latency_ms = if lat.is_empty() {
+        0.0
+    } else {
+        lat.iter().sum::<u64>() as f64 / lat.len() as f64
+    };
+    let p99_e2e_latency_ms = percentile(&lat, 99);
+
+    let conserved_rate = if instances_total == 0 {
+        0.0
+    } else {
+        conserved as f64 / instances_total as f64
+    };
+
+    // Whole-dataset validity failure ⇒ compiler-class error for the loop.
+    let error = if instances_total > 0 && valid == 0 {
+        results
+            .iter()
+            .find_map(|r| r.error.clone())
+            .or_else(|| Some("candidate is invalid for every recorded instance".to_string()))
+    } else if instances_total == 0 {
+        Some("no replayable instances in the dataset (was the cluster run with --capture?)".to_string())
+    } else {
+        None
+    };
+
+    ReplayReport {
+        instances_total,
+        valid,
+        completed,
+        conserved,
+        conserved_rate,
+        uncovered_job_types: uncovered,
+        divergent_keys,
+        avg_e2e_latency_ms,
+        p99_e2e_latency_ms,
+        error,
+        results,
+    }
+}
+
+/// Nearest-rank percentile over a pre-sorted ascending slice (`p` in `1..=100`).
+fn percentile(sorted: &[u64], p: u64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((p as f64 / 100.0) * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+// --- Value <-> JSON converters (mirror sim.rs / engine-wasm) ---------------------
 fn value_to_json(v: &Value) -> Json {
     match v {
         Value::Null => Json::Null,
@@ -758,5 +901,80 @@ mod tests {
         assert_eq!(r.stimuli[0].seq, 1);
         assert_eq!(r.stimuli[0].reference.as_deref(), Some("classify"));
         assert_eq!(r.stimuli[1].seq, 2);
+    }
+
+    #[test]
+    fn replay_dataset_aggregates_conservation_and_divergence() {
+        // Three recorded instances, each with classify + summarize outputs.
+        let mk = |k: &str| {
+            rec(
+                &[("input", json!("x"))],
+                vec![
+                    job(1, 1100, "classify", Some(&[("label", json!("A"))])),
+                    job(2, 1300, "summarize", Some(&[("summary", json!(k))])),
+                ],
+            )
+        };
+        let dataset = vec![mk("S1"), mk("S2"), mk("S3")];
+
+        // Identical model: every instance conserves the boundary.
+        let two = parse_bpmn(TWO_TASK).unwrap();
+        let good = replay_dataset(&two, "P", &dataset);
+        assert_eq!(good.instances_total, 3);
+        assert_eq!(good.valid, 3);
+        assert_eq!(good.conserved, 3);
+        assert!((good.conserved_rate - 1.0).abs() < 1e-9);
+        assert!(good.divergent_keys.is_empty());
+        assert!(good.uncovered_job_types.is_empty());
+        assert_eq!(good.avg_e2e_latency_ms, 300.0);
+        assert_eq!(good.p99_e2e_latency_ms, 300);
+        assert!(good.error.is_none());
+
+        // Candidate that drops Summarize: every instance diverges on `summary`.
+        let one = parse_bpmn(ONE_TASK).unwrap();
+        let bad = replay_dataset(&one, "P", &dataset);
+        assert_eq!(bad.conserved, 0);
+        assert!((bad.conserved_rate - 0.0).abs() < 1e-9);
+        assert_eq!(bad.divergent_keys.len(), 1);
+        assert_eq!(bad.divergent_keys[0].key, "summary");
+        assert_eq!(bad.divergent_keys[0].count, 3);
+    }
+
+    #[test]
+    fn replay_dataset_unions_uncovered_job_types() {
+        // History recorded only classify; candidate (TWO_TASK) also issues summarize.
+        let dataset = vec![
+            rec(
+                &[("input", json!("x"))],
+                vec![job(1, 1100, "classify", Some(&[("label", json!("A"))]))],
+            ),
+            rec(
+                &[("input", json!("y"))],
+                vec![job(1, 1100, "classify", Some(&[("label", json!("B"))]))],
+            ),
+        ];
+        let two = parse_bpmn(TWO_TASK).unwrap();
+        let report = replay_dataset(&two, "P", &dataset);
+        assert_eq!(report.uncovered_job_types, vec!["summarize".to_string()]);
+        assert_eq!(report.conserved, 0);
+    }
+
+    #[test]
+    fn replay_dataset_empty_is_flagged() {
+        let two = parse_bpmn(TWO_TASK).unwrap();
+        let report = replay_dataset(&two, "P", &[]);
+        assert_eq!(report.instances_total, 0);
+        assert_eq!(report.conserved_rate, 0.0);
+        assert!(report.error.is_some());
+    }
+
+    #[test]
+    fn replay_dataset_flags_wholly_invalid_candidate() {
+        let dataset = vec![rec(&[("input", json!("x"))], vec![])];
+        let two = parse_bpmn(TWO_TASK).unwrap();
+        // Wrong process id ⇒ every instance is a validity failure.
+        let report = replay_dataset(&two, "Nope", &dataset);
+        assert_eq!(report.valid, 0);
+        assert!(report.error.is_some());
     }
 }

@@ -28,9 +28,9 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, calibrate_from_measured,
-    example_scenario, replay_instance, run_hypothesis, run_scenario, staff_for_summary,
-    LlmConfig, LlmOverride, MeasuredJobType, Prompt, PromptLibrary, RecordedInstance, Scenario,
-    DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
+    example_scenario, replay_dataset, replay_instance, run_hypothesis, run_scenario,
+    staff_for_summary, LlmConfig, LlmOverride, MeasuredJobType, Prompt, PromptLibrary,
+    RecordedInstance, Scenario, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 
@@ -107,6 +107,7 @@ async fn main() {
         .route("/api/harness/calibrate", post(harness_calibrate))
         .route("/api/harness/hypothesize", post(harness_hypothesize))
         .route("/api/harness/replay", post(harness_replay))
+        .route("/api/harness/replay-batch", post(harness_replay_batch))
         .route("/api/harness/production", get(harness_production))
         .route("/api/harness/cluster", get(harness_cluster))
         .route("/api/prompts", get(prompts_list).post(prompts_upsert))
@@ -422,6 +423,111 @@ async fn harness_replay(
         .unwrap_or_else(|| rec.process_id.clone());
     let result = replay_instance(&defs, &process_id, &rec);
     Json(result).into_response()
+}
+
+/// Request body for the batch replay verifier.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayBatchRequest {
+    /// BPMN XML of the candidate model to score against the recorded dataset.
+    candidate_model: String,
+    /// Process whose recorded instances form the dataset. Defaults to the
+    /// candidate's first process id.
+    #[serde(default)]
+    process_id: Option<String>,
+    /// How many recent trace summaries to scan for matching instances.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Override the Nano gateway base url; defaults to the server's configured one.
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+/// `POST /api/harness/replay-batch` — score one candidate against a **recorded
+/// dataset** (§7.7 Level-2 / §7.9). Fetch the recent recorded instances of a
+/// process, replay each against the candidate, and fold the per-instance gradients
+/// into a single scorecard (`conservedRate`, `uncoveredJobTypes`, `divergentKeys`,
+/// latency). This is the candidate scorer the hypothesis loop ranks with.
+async fn harness_replay_batch(
+    State(state): State<AppState>,
+    Json(req): Json<ReplayBatchRequest>,
+) -> impl IntoResponse {
+    let client = match &req.base_url {
+        Some(url) if !url.is_empty() => NanoClient::new(url),
+        _ => state.nano.clone(),
+    };
+    let defs = match parse_bpmn(&req.candidate_model) {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "candidate model contained no process definitions"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("candidate model failed to parse: {e:?}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let process_id = req
+        .process_id
+        .clone()
+        .unwrap_or_else(|| defs[0].id.clone());
+
+    let limit = req.limit.unwrap_or(200);
+    let summaries = match client.list_traces(limit).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    // Distil the recorded instances of this process, tracking why any are skipped
+    // (capture off, truncated log/snapshot) so the operator can fix the source.
+    let mut dataset: Vec<RecordedInstance> = Vec::new();
+    let mut skipped = 0u32;
+    let mut skip_reasons: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut matched = 0u32;
+    for s in summaries.iter().filter(|s| s.process_id == process_id) {
+        matched += 1;
+        let trace = match client.trace(&s.instance_key).await {
+            Ok(t) => t,
+            Err(_) => {
+                skipped += 1;
+                *skip_reasons.entry("trace fetch failed".to_string()).or_insert(0) += 1;
+                continue;
+            }
+        };
+        match RecordedInstance::from_trace(&trace) {
+            Ok(r) => dataset.push(r),
+            Err(why) => {
+                skipped += 1;
+                *skip_reasons.entry(why.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let report = replay_dataset(&defs, &process_id, &dataset);
+    Json(serde_json::json!({
+        "processId": process_id,
+        "matchedInstances": matched,
+        "skipped": skipped,
+        "skipReasons": skip_reasons,
+        "report": report,
+    }))
+    .into_response()
 }
 
 
