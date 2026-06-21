@@ -636,6 +636,72 @@ proposes** — nothing becomes a candidate without passing `validate`/replay.
 5. **Multi-cluster** — one ProcessOS per cluster vs a fleet view; the contracts are
    per-gateway, so federation is a ProcessOS concern, not Nano's.
 
+## 10. The cybernetic framing — the craft, the pilot, and the droid
+
+"Self-optimizing" usually means an autonomous loop with a human babysitter. The truer
+framing is an **X-wing**: a craft flown by a pilot and a droid — cybernetic in the
+original sense (*kubernetes* = steersman; feedback-governed steering with the human
+*inside* the loop). The observe → hypothesize → verify → deploy machinery of §7 is not
+the system; it is the **airframe and instruments**. The system is *human + droid (LLM) +
+craft (ProcessOS over Nano)*, coupled into one joint cognitive system. The loop is
+human-**steered** self-optimization, not autonomy.
+
+The deepest consequence of **"the first target is always itself"**: operation and
+improvement become the *same activity*. You do not learn to fly the craft and then
+optimize it — learning to fly it *is* tuning it. Dogfooding stops being a test strategy
+and becomes **pedagogy**; the pair's first and continuous subject is its own flight.
+
+**10.1 Empty cockpit, empty droid slot — individuation.** Factory-fresh, every instance
+is generic; it individuates through use across **three plastic surfaces**: (a) the **BPM
+model that drives ProcessOS itself** (the *pilot process* — the choreography); (b) the
+**system prompts** (the droid's skills — *already exists* as the prompt library, §7.6);
+(c) **accrued experience** (calibration + trace memory — the logbook). The operator
+steers by editing (a) and (b); (c) accrues. Two instances diverge the way two people's
+toolchains diverge, and that divergence *is* the value. Honest cost: lock-in / bus-factor
+(coevolved instances are idiosyncratic, non-portable); mitigation is that these surfaces
+are **explicit, versioned, inspectable artifacts** — the tuning lives in prompts and
+BPMN, not in someone's head.
+
+This forces an architectural commitment (previously filed as future work): the §7.9
+orchestration must be authored as a **deployable BPMN process living in the instance** —
+observable in the same console, optimizable by the same loop — *not hardcoded in Rust*.
+The pilot process must be forkable, because it is the first thing the operator reshapes.
+
+**10.2 The user task — conversation, not dispatch.** The §7.9 loop as first framed was
+autonomous. Putting a **user task in the pilot process** changes the interaction model
+from a *job queue* to a *cockpit*: the human is a participant in the loop, not its
+dispatcher. User tasks are the human's turns; LLM tasks are the droid's turns; engine
+tasks are the craft responding. **The BPM model literally is the choreography of the
+human–droid pairing.** The most generative corollary: **the placement of the user tasks
+is the delegation dial.** Early/learning-phase models have many human gates; as the pair
+grows fluent and trust accrues, the operator moves user tasks later or removes them,
+ceding more to the droid. The model therefore *encodes the current trust boundary*
+between human and droid, and reshaping it *is* the coevolution — "learning to fly it with
+a droid copilot" is the operator editing where the user tasks sit.
+
+This reshapes §7.8: the 4-step stepper is the right *structure*, but each step becomes a
+**conversation surface with a co-present droid**, not a form you submit. The shared
+instrument both pilot and droid read is the verifier's **gradient** (§7.7/§7.9) — which
+is *why* legible, per-key feedback matters: a copilot you cannot interrogate is not a
+copilot.
+
+**10.3 The tension to hold.** Cybernetics and aviation both warn of the **out-of-the-loop
+problem**: a droid that does too much atrophies pilot skill and erodes the human's ability
+to still judge "better." The user-task dial is the defence, and "first target is itself"
+is partly a *training regime* — you keep hands on the craft by continuously tuning it.
+Relatedly, **"better" is the pilot's to define**: the objective is a plastic *input* the
+human keeps redefining, not a constant — "rank not truth" (§7.7) taken to its conclusion,
+where beyond even the Phase-4 production measurement the human is the final arbiter of
+rank.
+
+**Architectural commitments that fall out.** (1) Author the §7.9 pilot process as
+first-class editable BPMN deployed on Nano (with ≥1 user task), not Rust. (2) Evolve the
+§7.8 console into a **cockpit**: a persistent droid-conversation pane alongside the
+stepper; user tasks surface as the human's turns. (3) **Per-instance persistence and
+individuation** of the three plastic surfaces (cockpit prefs + objective definition;
+droid slot = selected/authored prompts + model; experience = calibration) — the prompt
+library is the first such surface; the pilot process and objective are next.
+
 ---
 
 *This document proposes where the optimizer lives and the seams it binds to. It
