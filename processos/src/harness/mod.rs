@@ -26,6 +26,7 @@ mod production;
 mod queueing;
 mod rank;
 mod replay;
+mod replay_rank;
 mod sim;
 mod calibrate;
 mod prompts;
@@ -53,6 +54,10 @@ pub use rank::{run_scenario, HarnessReport, VariantResult};
 pub use replay::{
     replay_dataset, replay_instance, JobCoverage, KeyCount, RecordedInstance, RecordedStimulus,
     ReplayReport, ReplayResult, ReplayUnavailable, VarDivergence,
+};
+#[allow(unused_imports)]
+pub use replay_rank::{
+    rank_candidates_by_replay, CandidateModel, RankedCandidate, ReplayRanking,
 };
 
 use std::collections::HashMap;

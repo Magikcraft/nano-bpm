@@ -28,9 +28,9 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, calibrate_from_measured,
-    example_scenario, replay_dataset, replay_instance, run_hypothesis, run_scenario,
-    staff_for_summary, LlmConfig, LlmOverride, MeasuredJobType, Prompt, PromptLibrary,
-    RecordedInstance, Scenario, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
+    example_scenario, rank_candidates_by_replay, replay_dataset, replay_instance, run_hypothesis,
+    run_scenario, staff_for_summary, CandidateModel, LlmConfig, LlmOverride, MeasuredJobType,
+    Prompt, PromptLibrary, RecordedInstance, Scenario, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 
@@ -108,6 +108,7 @@ async fn main() {
         .route("/api/harness/hypothesize", post(harness_hypothesize))
         .route("/api/harness/replay", post(harness_replay))
         .route("/api/harness/replay-batch", post(harness_replay_batch))
+        .route("/api/harness/replay-rank", post(harness_replay_rank))
         .route("/api/harness/production", get(harness_production))
         .route("/api/harness/cluster", get(harness_cluster))
         .route("/api/prompts", get(prompts_list).post(prompts_upsert))
@@ -496,6 +497,35 @@ async fn harness_replay_batch(
 
     // Distil the recorded instances of this process, tracking why any are skipped
     // (capture off, truncated log/snapshot) so the operator can fix the source.
+    let (dataset, matched, skipped, skip_reasons) =
+        distil_recorded_dataset(&client, &process_id, &summaries).await;
+
+    let report = replay_dataset(&defs, &process_id, &dataset);
+    Json(serde_json::json!({
+        "processId": process_id,
+        "matchedInstances": matched,
+        "skipped": skipped,
+        "skipReasons": skip_reasons,
+        "report": report,
+    }))
+    .into_response()
+}
+
+/// Distil the replayable recorded instances of a process from a list of trace
+/// summaries (already fetched from Nano's read contract). Returns the dataset
+/// plus skip accounting (matched, skipped, reasons) so callers can tell the
+/// operator *why* instances were dropped (capture off, truncated log/snapshot,
+/// fetch failure). Shared by replay-batch and replay-rank.
+async fn distil_recorded_dataset(
+    client: &NanoClient,
+    process_id: &str,
+    summaries: &[crate::contracts::TraceSummary],
+) -> (
+    Vec<RecordedInstance>,
+    u32,
+    u32,
+    std::collections::HashMap<String, u32>,
+) {
     let mut dataset: Vec<RecordedInstance> = Vec::new();
     let mut skipped = 0u32;
     let mut skip_reasons: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -518,14 +548,107 @@ async fn harness_replay_batch(
             }
         }
     }
+    (dataset, matched, skipped, skip_reasons)
+}
 
-    let report = replay_dataset(&defs, &process_id, &dataset);
+/// One candidate model in a replay-rank request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RankCandidateBody {
+    /// Display name for the candidate.
+    name: String,
+    /// Why it was proposed (carried through to the scorecard).
+    #[serde(default)]
+    rationale: Option<String>,
+    /// BPMN XML of the candidate model.
+    model: String,
+}
+
+/// Request body for the replay-rank population scorer.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayRankRequest {
+    /// The candidate population to score against the recorded dataset.
+    candidates: Vec<RankCandidateBody>,
+    /// Process whose recorded instances form the dataset. Required (the dataset is
+    /// process-scoped and candidates may rename their process id).
+    process_id: String,
+    /// How many recent trace summaries to scan for matching instances.
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Override the Nano gateway base url; defaults to the server's configured one.
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+/// `POST /api/harness/replay-rank` — score a **population** of candidate models
+/// against the same recorded dataset and rank them by the fidelity gradient
+/// (§7.9). This is the gradient-driven loop's evaluation step: fan a set of
+/// proposed redesigns over real production traces, rank fidelity-first
+/// (`conservedRate`, then latency, then fewer required new workers), and hand the
+/// operator a scorecard per candidate to decide on. The harness ranks; the human
+/// (or the pilot process) decides.
+async fn harness_replay_rank(
+    State(state): State<AppState>,
+    Json(req): Json<ReplayRankRequest>,
+) -> impl IntoResponse {
+    if req.candidates.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "no candidates supplied" })),
+        )
+            .into_response();
+    }
+    let client = match &req.base_url {
+        Some(url) if !url.is_empty() => NanoClient::new(url),
+        _ => state.nano.clone(),
+    };
+    let limit = req.limit.unwrap_or(200);
+    let summaries = match client.list_traces(limit).await {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    let (dataset, matched, skipped, skip_reasons) =
+        distil_recorded_dataset(&client, &req.process_id, &summaries).await;
+
+    if dataset.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "no replayable recorded instances for this process \
+                          (was the gateway run with --capture?)",
+                "processId": req.process_id,
+                "matchedInstances": matched,
+                "skipped": skipped,
+                "skipReasons": skip_reasons,
+            })),
+        )
+            .into_response();
+    }
+
+    let candidates: Vec<CandidateModel> = req
+        .candidates
+        .into_iter()
+        .map(|c| CandidateModel {
+            name: c.name,
+            rationale: c.rationale,
+            model: c.model,
+        })
+        .collect();
+
+    let ranking = rank_candidates_by_replay(&candidates, &dataset, Some(&req.process_id));
     Json(serde_json::json!({
-        "processId": process_id,
+        "processId": req.process_id,
         "matchedInstances": matched,
         "skipped": skipped,
         "skipReasons": skip_reasons,
-        "report": report,
+        "ranking": ranking,
     }))
     .into_response()
 }
