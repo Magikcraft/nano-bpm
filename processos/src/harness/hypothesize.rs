@@ -20,6 +20,7 @@ use super::llm::{self, LlmConfig};
 use super::rank::{
     self, HarnessReport, LlmMeta, RejectedCandidate,
 };
+use super::calibrate::MeasuredJobType;
 use super::Scenario;
 
 /// One candidate as proposed by the model.
@@ -49,10 +50,17 @@ workers where they do not raise the incident rate or lower correctness.";
 
 /// Run the LLM-hypothesis loop: prompt the model, validate + evaluate its
 /// proposals, and rank them (optionally alongside the baked grid).
+///
+/// `measured` carries the per-job-type signal production actually observed. When
+/// non-empty it is folded into the prompt so the model reasons over where the real
+/// service-time and failure cost lives, rather than only the synthetic baseline.
+/// (The caller typically also *calibrates* the scenario from the same data, so the
+/// baseline the candidates are scored against reflects that reality too.)
 pub async fn run_hypothesis(
     scenario: &Scenario,
     cfg: &LlmConfig,
     include_baked: bool,
+    measured: &[MeasuredJobType],
 ) -> Result<HarnessReport, String> {
     let (defs, process_id) = rank::prepare(scenario)?;
 
@@ -68,7 +76,7 @@ pub async fn run_hypothesis(
         &baseline_assignment,
     );
 
-    let user_prompt = build_prompt(scenario, &baseline);
+    let user_prompt = build_prompt(scenario, &baseline, measured);
     let raw = llm::complete(cfg, SYSTEM_PROMPT, &user_prompt).await?;
     let proposed = parse_candidates(&raw)?;
 
@@ -182,8 +190,13 @@ pub async fn run_hypothesis(
     ))
 }
 
-/// Build the user prompt: objective, worker catalogue, task options, baseline.
-fn build_prompt(scenario: &Scenario, baseline: &rank::VariantResult) -> String {
+/// Build the user prompt: objective, worker catalogue, task options, baseline, and
+/// — when supplied — the measured production signal per job type.
+fn build_prompt(
+    scenario: &Scenario,
+    baseline: &rank::VariantResult,
+    measured: &[MeasuredJobType],
+) -> String {
     let obj = &scenario.objective;
     let mut s = String::new();
     s.push_str(&format!("Scenario: {}\n", scenario.name));
@@ -241,6 +254,36 @@ fn build_prompt(scenario: &Scenario, baseline: &rank::VariantResult) -> String {
         baseline.correctness_rate,
         baseline.incident_rate
     ));
+
+    // Fold in what production actually measured, so the model targets the real
+    // bottleneck rather than reasoning purely off the synthetic baseline.
+    let signal: Vec<&MeasuredJobType> = measured.iter().filter(|m| m.samples > 0).collect();
+    if !signal.is_empty() {
+        s.push_str(
+            "\nMeasured production signal (per job type, observed live — target these):\n",
+        );
+        let mut rows: Vec<&MeasuredJobType> = signal;
+        rows.sort_by(|a, b| a.job_type.cmp(&b.job_type));
+        for m in rows {
+            let fail_rate = if m.samples > 0 {
+                m.failures as f64 / m.samples as f64
+            } else {
+                0.0
+            };
+            let svc = m
+                .avg_service_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "n/a".to_string());
+            s.push_str(&format!(
+                "  - {}: observedServiceMs={}, observedFailureRate={:.3} (over {} samples)\n",
+                m.job_type,
+                svc,
+                fail_rate.min(1.0),
+                m.samples
+            ));
+        }
+    }
+
     s.push_str(
         "\nPropose up to 6 candidate assignments that should beat the baseline on the \
          objective while staying within the gates. Reply with ONLY the JSON array.",
@@ -345,10 +388,41 @@ mod tests {
         let (defs, pid) = rank::prepare(&scenario).unwrap();
         let base_assign = rank::effective_assignment(&scenario, &HashMap::new());
         let baseline = rank::evaluate(&scenario, &defs, &pid, "baseline", "baseline", None, &base_assign);
-        let prompt = build_prompt(&scenario, &baseline);
+        let prompt = build_prompt(&scenario, &baseline, &[]);
         assert!(prompt.contains("cheap-llm"));
         assert!(prompt.contains("classify"));
         assert!(prompt.contains("Baseline"));
         assert!(prompt.contains("minimize cost"));
+        // With no measured data, the production-signal block is absent.
+        assert!(!prompt.contains("Measured production signal"));
+    }
+
+    #[test]
+    fn prompt_includes_measured_production_signal() {
+        let scenario = crate::harness::example_scenario();
+        let (defs, pid) = rank::prepare(&scenario).unwrap();
+        let base_assign = rank::effective_assignment(&scenario, &HashMap::new());
+        let baseline = rank::evaluate(&scenario, &defs, &pid, "baseline", "baseline", None, &base_assign);
+        let measured = vec![
+            MeasuredJobType {
+                job_type: "classify".to_string(),
+                avg_service_ms: Some(910),
+                samples: 100,
+                failures: 25,
+            },
+            // Zero-sample rows carry no signal and must be skipped.
+            MeasuredJobType {
+                job_type: "summarize".to_string(),
+                avg_service_ms: Some(5),
+                samples: 0,
+                failures: 0,
+            },
+        ];
+        let prompt = build_prompt(&scenario, &baseline, &measured);
+        assert!(prompt.contains("Measured production signal"));
+        assert!(prompt.contains("observedServiceMs=910"));
+        assert!(prompt.contains("observedFailureRate=0.250"));
+        // The zero-sample job type is not listed.
+        assert!(!prompt.contains("summarize: observedServiceMs"));
     }
 }

@@ -270,7 +270,7 @@ async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoRe
         let calibration = calibrate_from_measured(&req.scenario, &req.measured);
         apply_calibration(&req.scenario, &calibration)
     };
-    match run_hypothesis(&scenario, &cfg, req.include_baked).await {
+    match run_hypothesis(&scenario, &cfg, req.include_baked, &req.measured).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,

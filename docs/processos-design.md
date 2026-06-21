@@ -396,6 +396,20 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   from the modelled 2100 ms to a calibrated 1350 ms at 0.5 correctness, with
   `calibrated:[classify] uncalibrated:[summarize]` reported. This is the first of the
   three wires that close the loop on **real** data.
+- **Production signal → hypothesis prompt — the second wire (now exists)**
+  (`harness/hypothesize.rs`): `run_hypothesis` now takes the measured per-job-type
+  signal and folds it into the LLM prompt as a *"Measured production signal (per job
+  type, observed live — target these)"* block — observed service time and failure
+  rate per task, over its sample count. The model therefore reasons about where the
+  **real** cost and unreliability live, not only the synthetic baseline; paired with
+  calibration (same `measured` payload), the baseline the proposals are *scored*
+  against also reflects that reality. Wired through the optional `measured` field on
+  `POST /api/harness/hypothesize`. Zero-sample rows carry no signal and are skipped.
+  Still synthetic: the *inputs* replayed through the engine remain authored scenario
+  inputs — the third wire, **T2 recorded-input replay** of *historical* production
+  inputs, requires Nano to expose each instance's **creation** variables (the
+  `/console/api/instances/{key}` read returns *current* merged variables, not the
+  original inputs), so it stays the documented integration boundary.
 - **Still deferred (not M3):** the fuller regime-(b) **discrete-event** simulator
   (multi-job-type consolidation what-ifs, cross-process contention — beyond the
   single-pool Erlang-C estimate); the **third (scaling/fleet) control verb** that
