@@ -39,7 +39,9 @@ struct ProposedCandidate {
     test_model: Option<String>,
 }
 
-const SYSTEM_PROMPT: &str = "You are a process-optimization assistant. Given a BPMN \
+/// The built-in default system prompt for hypothesis generation. Seeds the prompt
+/// library's `default` entry; callers may select or author alternatives.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a process-optimization assistant. Given a BPMN \
 process, a catalogue of interchangeable workers (each with a cost, latency, and \
 failure rate), and the measured baseline performance, you propose candidate \
 configurations that should improve the objective without violating its correctness \
@@ -61,6 +63,7 @@ pub async fn run_hypothesis(
     cfg: &LlmConfig,
     include_baked: bool,
     measured: &[MeasuredJobType],
+    system_prompt: &str,
 ) -> Result<HarnessReport, String> {
     let (defs, process_id) = rank::prepare(scenario)?;
 
@@ -77,7 +80,7 @@ pub async fn run_hypothesis(
     );
 
     let user_prompt = build_prompt(scenario, &baseline, measured);
-    let raw = llm::complete(cfg, SYSTEM_PROMPT, &user_prompt).await?;
+    let raw = llm::complete(cfg, system_prompt, &user_prompt).await?;
     let proposed = parse_candidates(&raw)?;
 
     let mut variants = Vec::new();

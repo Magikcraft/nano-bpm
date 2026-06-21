@@ -14,9 +14,10 @@ mod harness;
 mod report;
 
 use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -28,18 +29,23 @@ use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, calibrate_from_measured,
     example_scenario, run_hypothesis, run_scenario, staff_for_summary, LlmConfig, LlmOverride,
-    MeasuredJobType, Scenario,
+    MeasuredJobType, Prompt, PromptLibrary, Scenario, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
 
 #[derive(Clone)]
 struct AppState {
     nano: NanoClient,
+    /// The prompt library — import / select / author the system prompts that drive
+    /// hypothesis generation. Shared, interior-mutable so authoring is live.
+    prompts: Arc<RwLock<PromptLibrary>>,
 }
 
 /// Server configuration, all overridable by environment.
 struct Config {
     port: u16,
     nano_base_url: String,
+    /// Optional directory to import prompts from on startup (`PROCESSOS_PROMPTS_DIR`).
+    prompts_dir: Option<String>,
 }
 
 impl Config {
@@ -52,9 +58,13 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "http://localhost:8080".to_string());
+        let prompts_dir = std::env::var("PROCESSOS_PROMPTS_DIR")
+            .ok()
+            .filter(|s| !s.is_empty());
         Self {
             port,
             nano_base_url,
+            prompts_dir,
         }
     }
 }
@@ -66,8 +76,20 @@ async fn main() {
         .init();
 
     let cfg = Config::from_env();
+
+    // Seed the prompt library with the built-in default, then import any prompts the
+    // operator dropped in PROCESSOS_PROMPTS_DIR.
+    let mut library = PromptLibrary::seeded(DEFAULT_SYSTEM_PROMPT);
+    if let Some(dir) = &cfg.prompts_dir {
+        match library.import_dir(std::path::Path::new(dir)) {
+            Ok(n) => tracing::info!(dir = %dir, imported = n, "imported prompts"),
+            Err(e) => tracing::warn!(dir = %dir, error = %e, "prompt import failed"),
+        }
+    }
+
     let state = AppState {
         nano: NanoClient::new(&cfg.nano_base_url),
+        prompts: Arc::new(RwLock::new(library)),
     };
 
     let app = Router::new()
@@ -84,6 +106,8 @@ async fn main() {
         .route("/api/harness/hypothesize", post(harness_hypothesize))
         .route("/api/harness/production", get(harness_production))
         .route("/api/harness/cluster", get(harness_cluster))
+        .route("/api/prompts", get(prompts_list).post(prompts_upsert))
+        .route("/api/prompts/{id}", get(prompts_get).delete(prompts_delete))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -240,12 +264,23 @@ struct HypothesizeRequest {
     /// reflects measured reality, not hand-authored numbers.
     #[serde(default)]
     measured: Vec<MeasuredJobType>,
+    /// Select a system prompt from the library by id. Defaults to the built-in
+    /// `default` when absent.
+    #[serde(default)]
+    prompt_id: Option<String>,
+    /// Inline system-prompt override (highest precedence) — author/experiment with a
+    /// prompt for this single run without storing it.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 /// `POST /api/harness/hypothesize` — ask the configured LLM to propose candidates,
 /// evaluate + rank them with the SimRunner, and return the report. The model is
 /// reached via the pluggable client (local llama.cpp / Ollama / vLLM, or Anthropic).
-async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoResponse {
+async fn harness_hypothesize(
+    State(state): State<AppState>,
+    Json(req): Json<HypothesizeRequest>,
+) -> impl IntoResponse {
     let mut cfg = LlmConfig::from_env();
     if let Some(o) = &req.llm {
         cfg = cfg.with_override(o);
@@ -261,6 +296,29 @@ async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoRe
         )
             .into_response();
     }
+
+    // Resolve the system prompt: an inline override wins; otherwise a selected
+    // library prompt; otherwise the built-in default.
+    let system_prompt = match (&req.prompt, &req.prompt_id) {
+        (Some(inline), _) => inline.clone(),
+        (None, Some(id)) => match state.prompts.read().unwrap().system_of(id) {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": format!("unknown prompt id: {id}") })),
+                )
+                    .into_response();
+            }
+        },
+        (None, None) => state
+            .prompts
+            .read()
+            .unwrap()
+            .system_of(DEFAULT_PROMPT_ID)
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+    };
+
     // Ground the baseline in production when measured distributions are supplied,
     // so the LLM reasons over — and every candidate is scored against — the service
     // times and failure rates the cluster actually observed.
@@ -270,8 +328,60 @@ async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoRe
         let calibration = calibrate_from_measured(&req.scenario, &req.measured);
         apply_calibration(&req.scenario, &calibration)
     };
-    match run_hypothesis(&scenario, &cfg, req.include_baked, &req.measured).await {
+    match run_hypothesis(&scenario, &cfg, req.include_baked, &req.measured, &system_prompt).await {
         Ok(report) => Json(report).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+// --- Prompt library: import / select / author ------------------------------------
+
+/// `GET /api/prompts` — list every prompt in the library (built-in + authored).
+async fn prompts_list(State(state): State<AppState>) -> impl IntoResponse {
+    let list = state.prompts.read().unwrap().list();
+    Json(list)
+}
+
+/// `GET /api/prompts/{id}` — one prompt, or 404.
+async fn prompts_get(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+    match state.prompts.read().unwrap().get(&id) {
+        Some(p) => Json(p).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no such prompt: {id}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/prompts` — author or import a prompt (create/update by id). Returns the
+/// stored prompt. 422 on a validation failure (empty id or system text).
+async fn prompts_upsert(
+    State(state): State<AppState>,
+    Json(prompt): Json<Prompt>,
+) -> impl IntoResponse {
+    match state.prompts.write().unwrap().upsert(prompt) {
+        Ok(stored) => (StatusCode::OK, Json(stored)).into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /api/prompts/{id}` — remove an authored prompt. 422 when it is built-in or
+/// unknown (the message distinguishes the two).
+async fn prompts_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.prompts.write().unwrap().remove(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": e })),

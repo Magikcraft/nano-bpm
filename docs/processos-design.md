@@ -410,6 +410,21 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   inputs, requires Nano to expose each instance's **creation** variables (the
   `/console/api/instances/{key}` read returns *current* merged variables, not the
   original inputs), so it stays the documented integration boundary.
+- **Prompt library — the LLM/prompt as an experimental variable (now exists)**
+  (`harness/prompts.rs`): the experimental phase varies not only the candidate
+  *models* but the *prompts and LLMs* used to generate them. The LLM was already a
+  per-request knob (`LlmOverride`); the system prompt was the one hard-coded lever
+  (`DEFAULT_SYSTEM_PROMPT`). It is now an authorable, selectable object. An in-memory
+  `PromptLibrary` is seeded with the built-in default, optionally imported from
+  `PROCESSOS_PROMPTS_DIR` at startup (`*.json` → full prompt, `*.md/*.txt/*.prompt`
+  → `{id=name=stem, system=contents}`), and managed over a small CRUD surface:
+  `GET /api/prompts`, `GET /api/prompts/{id}`, `POST /api/prompts` (author/import —
+  the server controls the `builtin` flag), `DELETE /api/prompts/{id}` (refuses
+  built-ins). `POST /api/harness/hypothesize` selects a prompt by precedence
+  **inline `prompt` > `promptId` (library lookup) > built-in default**. The same
+  verifier discipline still applies: whatever prompt produced a candidate, the
+  SimRunner scores and ranks its output, so a worse prompt is exposed by the numbers,
+  not trusted. (UI is deferred — this slice is API-first.)
 - **Still deferred (not M3):** the fuller regime-(b) **discrete-event** simulator
   (multi-job-type consolidation what-ifs, cross-process contention — beyond the
   single-pool Erlang-C estimate); the **third (scaling/fleet) control verb** that

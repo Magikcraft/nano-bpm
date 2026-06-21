@@ -27,10 +27,13 @@ mod queueing;
 mod rank;
 mod sim;
 mod calibrate;
+mod prompts;
 
 pub use calibrate::{apply as apply_calibration, calibrate_from_measured};
 #[allow(unused_imports)]
 pub use calibrate::{calibrate_from_cluster, Calibration, MeasuredJobType};
+pub use hypothesize::DEFAULT_SYSTEM_PROMPT;
+pub use prompts::{Prompt, PromptLibrary, DEFAULT_ID as DEFAULT_PROMPT_ID};
 pub use cluster::build_cluster_summary;
 #[allow(unused_imports)]
 pub use cluster::ClusterRunSummary;
