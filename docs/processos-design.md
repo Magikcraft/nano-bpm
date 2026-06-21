@@ -421,6 +421,20 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   LLM. The same retained creation-variable snapshot also serves modeler **test-mode
   FEEL debugging** (snapshot at the incident + failing expression + error). The
   integration boundary was therefore a *projection gap*, not a contract gap.
+- **Variables on the trace — Tier 1 (now exists)** (`server/src/console/trace.rs`):
+  the projection now folds, when enabled, each instance's **creation inputs**
+  (`ProcessInstanceCreated.variables`) and a **variable snapshot at every incident**
+  (the running instance variables — seeded from creation, merged on `VariablesUpdated`
+  — that a failing FEEL expression saw). Exposed on `GET /console/api/traces/{key}` as
+  `creationVariables` and per-incident `variables`, rendered as natural JSON (via the
+  shared `value_to_json`, not the engine `Value`'s tagged form). Opt-in
+  (`NANOBPMN_TRACE_VARIABLES`, off by default) and size-capped per snapshot
+  (`NANOBPMN_TRACE_VARIABLES_MAX_BYTES`, default 16384 — an oversized map is dropped,
+  reporting only `truncated: true` + `bytes`, so the bounded in-memory ring can't be
+  ballooned). This hands ProcessOS T2 its replay *inputs* and gives the modeler its
+  FEEL-debug snapshot. Still ahead: **Tier 2** — recording the ordered *external
+  stimuli* (job-completion outputs, message/timer vars) for fully faithful
+  recorded-input replay against candidate models.
 - **Prompt library — the LLM/prompt as an experimental variable (now exists)**
   (`harness/prompts.rs`): the experimental phase varies not only the candidate
   *models* but the *prompts and LLMs* used to generate them. The LLM was already a

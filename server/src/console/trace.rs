@@ -35,10 +35,67 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use nanobpmn_engine_core::Event;
+use nanobpmn_engine_core::{Event, Value};
 use serde::Serialize;
 
 const DEFAULT_CAPACITY: usize = 2000;
+
+/// Default per-instance/per-incident cap on a captured variable snapshot,
+/// measured as the serialized JSON byte length. A snapshot larger than this is
+/// dropped (only its size is reported) so the bounded in-memory store can never
+/// be ballooned by a single large payload. Override with
+/// `NANOBPMN_TRACE_VARIABLES_MAX_BYTES`.
+const DEFAULT_VARS_MAX_BYTES: usize = 16 * 1024;
+
+/// A captured variable map (instance creation inputs, or the state at an
+/// incident). Kept only when variable capture is enabled. When the serialized
+/// map exceeds the configured byte cap, `values` is dropped and `truncated` is
+/// set — the consumer still learns the snapshot existed and how big it was,
+/// without the store paying to retain it.
+#[derive(Clone)]
+struct VarSnapshot {
+    values: Option<serde_json::Value>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl VarSnapshot {
+    fn dto(&self) -> VariablesDto {
+        VariablesDto {
+            truncated: self.truncated,
+            bytes: self.bytes,
+            values: self.values.clone(),
+        }
+    }
+}
+
+/// Serializes a variable map to JSON and either retains it (within the cap) or
+/// records only its size (over the cap). Never panics on a non-serializable map
+/// — `serde_json` cannot fail for a `HashMap<String, Value>`.
+fn snapshot_vars(vars: &HashMap<String, Value>, max_bytes: usize) -> VarSnapshot {
+    // Render natural JSON (e.g. `5`, not `{"Int":5}`) to match the console's
+    // existing variable wire shape — the engine `Value` enum serializes
+    // externally-tagged, which is not what consumers expect.
+    let value = serde_json::Value::Object(
+        vars.iter()
+            .map(|(k, v)| (k.clone(), crate::value_to_json(v)))
+            .collect(),
+    );
+    let bytes = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(0);
+    if bytes > max_bytes {
+        VarSnapshot {
+            values: None,
+            bytes,
+            truncated: true,
+        }
+    } else {
+        VarSnapshot {
+            values: Some(value),
+            bytes,
+            truncated: false,
+        }
+    }
+}
 
 /// A bounded, in-memory projection of recent process-instance execution traces.
 pub struct TraceStore {
@@ -47,6 +104,13 @@ pub struct TraceStore {
 
 struct Inner {
     capacity: usize,
+    /// When true, fold instance creation variables and an incident-time variable
+    /// snapshot onto the trace (see `NANOBPMN_TRACE_VARIABLES`). Off by default:
+    /// variable payloads can be large (the engine has a spill path for exactly
+    /// this) and are a privacy surface once exported / shipped to an LLM.
+    capture_vars: bool,
+    /// Byte cap applied to each captured variable snapshot.
+    vars_max_bytes: usize,
     /// Trace per instance key.
     instances: HashMap<u64, InstanceTrace>,
     /// Instance keys in insertion order (oldest at the front) for ring eviction.
@@ -103,6 +167,14 @@ struct InstanceTrace {
     by_job: HashMap<u64, usize>,
     incidents: Vec<IncidentRec>,
     path: Vec<String>,
+    /// The instance's creation inputs (`ProcessInstanceCreated.variables`), kept
+    /// only when variable capture is enabled. This is the signal ProcessOS T2
+    /// replay needs (the original inputs, not the current merged state).
+    creation_variables: Option<VarSnapshot>,
+    /// Running merged instance variables, maintained only while capture is on so
+    /// an incident can snapshot the state the failing expression saw. Not
+    /// serialized directly — only sampled into `IncidentRec::variables`.
+    current_variables: Option<HashMap<String, Value>>,
 }
 
 #[derive(Clone)]
@@ -136,13 +208,28 @@ struct IncidentRec {
     reason: String,
     raised_at: u64,
     resolved_at: Option<u64>,
+    /// The instance variables visible when the incident was raised — what a FEEL
+    /// expression that threw was evaluated against. `None` unless capture is on.
+    variables: Option<VarSnapshot>,
 }
 
 impl TraceStore {
     pub fn new(capacity: usize) -> Self {
+        Self::build(capacity, false, DEFAULT_VARS_MAX_BYTES)
+    }
+
+    /// Like [`new`], but with variable capture enabled and a snapshot byte cap.
+    /// Used where the caller explicitly opts into capturing variables.
+    pub fn with_variables(capacity: usize, vars_max_bytes: usize) -> Self {
+        Self::build(capacity, true, vars_max_bytes.max(1))
+    }
+
+    fn build(capacity: usize, capture_vars: bool, vars_max_bytes: usize) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 capacity: capacity.max(1),
+                capture_vars,
+                vars_max_bytes,
                 instances: HashMap::new(),
                 order: VecDeque::new(),
                 versions: HashMap::new(),
@@ -152,13 +239,25 @@ impl TraceStore {
     }
 
     /// Builds a store sized from `NANOBPMN_TRACE_CAPACITY` (default 2000).
+    /// Variable capture is opt-in via `NANOBPMN_TRACE_VARIABLES` (truthy), with
+    /// the per-snapshot byte cap from `NANOBPMN_TRACE_VARIABLES_MAX_BYTES`
+    /// (default 16384).
     pub fn from_env() -> Self {
         let cap = std::env::var("NANOBPMN_TRACE_CAPACITY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_CAPACITY);
-        Self::new(cap)
+        let capture_vars = std::env::var("NANOBPMN_TRACE_VARIABLES")
+            .ok()
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false);
+        let vars_max_bytes = std::env::var("NANOBPMN_TRACE_VARIABLES_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_VARS_MAX_BYTES);
+        Self::build(cap, capture_vars, vars_max_bytes)
     }
 
     /// Folds one exporter batch into the trace store. `now` is the server's
@@ -228,13 +327,21 @@ impl Inner {
             Event::ProcessInstanceCreated {
                 instance_key,
                 process_id,
+                variables,
                 created_at,
                 tags,
                 business_id,
-                ..
             } => {
                 let version = self.versions.get(process_id).copied();
                 let started = if *created_at != 0 { *created_at } else { now };
+                let (creation_variables, current_variables) = if self.capture_vars {
+                    (
+                        Some(snapshot_vars(variables, self.vars_max_bytes)),
+                        Some(variables.clone()),
+                    )
+                } else {
+                    (None, None)
+                };
                 let trace = InstanceTrace {
                     instance_key: *instance_key,
                     process_id: process_id.clone(),
@@ -250,8 +357,25 @@ impl Inner {
                     by_job: HashMap::new(),
                     incidents: Vec::new(),
                     path: Vec::new(),
+                    creation_variables,
+                    current_variables,
                 };
                 self.insert(*instance_key, trace);
+            }
+            Event::VariablesUpdated {
+                instance_key,
+                variables,
+            } => {
+                if !self.capture_vars {
+                    return;
+                }
+                if let Some(t) = self.instances.get_mut(instance_key) {
+                    t.last_at = now;
+                    let running = t.current_variables.get_or_insert_with(HashMap::new);
+                    for (k, v) in variables {
+                        running.insert(k.clone(), v.clone());
+                    }
+                }
             }
             Event::ElementActivating {
                 instance_key,
@@ -385,6 +509,13 @@ impl Inner {
                     if let Some(&idx) = t.by_eik.get(element_instance_key) {
                         t.elements[idx].incidents += 1;
                     }
+                    let variables = if self.capture_vars {
+                        t.current_variables
+                            .as_ref()
+                            .map(|m| snapshot_vars(m, self.vars_max_bytes))
+                    } else {
+                        None
+                    };
                     t.incidents.push(IncidentRec {
                         element_id: element_id.clone(),
                         element_instance_key: *element_instance_key,
@@ -392,6 +523,7 @@ impl Inner {
                         reason: reason.clone(),
                         raised_at: raised,
                         resolved_at: None,
+                        variables,
                     });
                 }
             }
@@ -573,9 +705,11 @@ impl InstanceTrace {
                     reason: i.reason.clone(),
                     raised_at: i.raised_at,
                     resolved_at: i.resolved_at,
+                    variables: i.variables.as_ref().map(VarSnapshot::dto),
                 })
                 .collect(),
             path: self.path.clone(),
+            creation_variables: self.creation_variables.as_ref().map(VarSnapshot::dto),
         }
     }
 
@@ -727,6 +861,22 @@ pub struct InstanceTraceDto {
     pub elements: Vec<ElementDto>,
     pub incidents: Vec<IncidentDto>,
     pub path: Vec<String>,
+    /// The instance creation inputs, when variable capture is enabled. Omitted
+    /// from the JSON entirely when capture is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creation_variables: Option<VariablesDto>,
+}
+
+/// A captured variable map exposed on the trace. `values` is the JSON object of
+/// variable name → value; it is omitted (with `truncated: true`) when the
+/// snapshot exceeded the configured byte cap.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VariablesDto {
+    pub truncated: bool,
+    pub bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -767,4 +917,88 @@ pub struct IncidentDto {
     pub reason: String,
     pub raised_at: u64,
     pub resolved_at: Option<u64>,
+    /// The instance variables the failing element saw, when capture is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables: Option<VariablesDto>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanobpmn_engine_core::IncidentKind;
+
+    fn created(key: u64, vars: &[(&str, Value)]) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key: key,
+            process_id: "p".to_string(),
+            variables: vars.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            created_at: 100,
+            tags: vec![],
+            business_id: None,
+        }
+    }
+
+    fn incident(key: u64, eik: u64) -> Event {
+        Event::IncidentRaised {
+            incident_key: 9,
+            instance_key: key,
+            element_instance_key: eik,
+            element_id: "gw".to_string(),
+            kind: IncidentKind::ExpressionEvaluation,
+            reason: "FEEL: '+'(amount, null)".to_string(),
+            job_key: None,
+            created_at: 200,
+        }
+    }
+
+    #[test]
+    fn capture_off_keeps_no_variables() {
+        let store = TraceStore::new(8);
+        store.ingest(&[&created(1, &[("amount", Value::Int(5))])], 1000);
+        store.ingest(&[&incident(1, 0)], 1100);
+        let dto = store.get(1).unwrap();
+        assert!(dto.creation_variables.is_none());
+        assert!(dto.incidents[0].variables.is_none());
+    }
+
+    #[test]
+    fn captures_creation_inputs_and_incident_snapshot() {
+        let store = TraceStore::with_variables(8, 16 * 1024);
+        store.ingest(&[&created(1, &[("amount", Value::Int(5))])], 1000);
+        // A later merge should be visible to the incident snapshot.
+        store.ingest(
+            &[&Event::VariablesUpdated {
+                instance_key: 1,
+                variables: [("fee".to_string(), Value::Str("late".to_string()))]
+                    .into_iter()
+                    .collect(),
+            }],
+            1050,
+        );
+        store.ingest(&[&incident(1, 0)], 1100);
+        let dto = store.get(1).unwrap();
+
+        let creation = dto.creation_variables.expect("creation vars");
+        assert!(!creation.truncated);
+        let cv = creation.values.unwrap();
+        assert_eq!(cv["amount"], serde_json::json!(5));
+        assert!(cv.get("fee").is_none(), "creation snapshot is the original inputs only");
+
+        let snap = dto.incidents[0].variables.as_ref().expect("incident vars");
+        let sv = snap.values.as_ref().unwrap();
+        assert_eq!(sv["amount"], serde_json::json!(5));
+        assert_eq!(sv["fee"], serde_json::json!("late"), "snapshot reflects merges at incident time");
+    }
+
+    #[test]
+    fn oversized_snapshot_is_truncated_not_retained() {
+        let store = TraceStore::with_variables(8, 16);
+        let big = "x".repeat(1024);
+        store.ingest(&[&created(1, &[("blob", Value::Str(big))])], 1000);
+        let dto = store.get(1).unwrap();
+        let creation = dto.creation_variables.unwrap();
+        assert!(creation.truncated);
+        assert!(creation.values.is_none());
+        assert!(creation.bytes > 16);
+    }
 }
