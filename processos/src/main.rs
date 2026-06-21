@@ -28,9 +28,11 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, calibrate_from_measured,
-    example_scenario, run_hypothesis, run_scenario, staff_for_summary, LlmConfig, LlmOverride,
-    MeasuredJobType, Prompt, PromptLibrary, Scenario, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
+    example_scenario, replay_instance, run_hypothesis, run_scenario, staff_for_summary,
+    LlmConfig, LlmOverride, MeasuredJobType, Prompt, PromptLibrary, RecordedInstance, Scenario,
+    DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 
 #[derive(Clone)]
 struct AppState {
@@ -104,6 +106,7 @@ async fn main() {
         .route("/api/harness/run", post(harness_run))
         .route("/api/harness/calibrate", post(harness_calibrate))
         .route("/api/harness/hypothesize", post(harness_hypothesize))
+        .route("/api/harness/replay", post(harness_replay))
         .route("/api/harness/production", get(harness_production))
         .route("/api/harness/cluster", get(harness_cluster))
         .route("/api/prompts", get(prompts_list).post(prompts_upsert))
@@ -338,7 +341,90 @@ async fn harness_hypothesize(
     }
 }
 
-// --- Prompt library: import / select / author ------------------------------------
+/// Request body for the recorded-input replay verifier.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReplayRequest {
+    /// The recorded instance to replay. Its trace must carry the Tier-2 stimulus
+    /// log — capture the source cluster with `c8 nano --capture`.
+    instance_key: String,
+    /// BPMN XML of the candidate model to evaluate against the recorded inputs.
+    candidate_model: String,
+    /// Process id to start; defaults to the recorded trace's own process id.
+    #[serde(default)]
+    process_id: Option<String>,
+    /// Override the Nano gateway base url; defaults to the server's configured one.
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+/// `POST /api/harness/replay` — the **Level-2 verifier** (§7.7/§7.9). Fetch one
+/// recorded instance's trace, replay its creation inputs + recorded job outputs
+/// against the supplied candidate model on the real engine, and return the
+/// **gradient**: validity, completion, per-job-type coverage (`uncoveredJobTypes`
+/// ⇒ requires new workers) and boundary-conservation `divergences`. This is the
+/// idempotent, directly-callable eval an agentic loop iterates against.
+async fn harness_replay(
+    State(state): State<AppState>,
+    Json(req): Json<ReplayRequest>,
+) -> impl IntoResponse {
+    let client = match &req.base_url {
+        Some(url) if !url.is_empty() => NanoClient::new(url),
+        _ => state.nano.clone(),
+    };
+    let trace = match client.trace(&req.instance_key).await {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    let rec = match RecordedInstance::from_trace(&trace) {
+        Ok(r) => r,
+        Err(why) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": why.to_string(),
+                    "instanceKey": req.instance_key,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let defs = match parse_bpmn(&req.candidate_model) {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": "candidate model contained no process definitions"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("candidate model failed to parse: {e:?}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    let process_id = req
+        .process_id
+        .clone()
+        .unwrap_or_else(|| rec.process_id.clone());
+    let result = replay_instance(&defs, &process_id, &rec);
+    Json(result).into_response()
+}
+
+
 
 /// `GET /api/prompts` — list every prompt in the library (built-in + authored).
 async fn prompts_list(State(state): State<AppState>) -> impl IntoResponse {

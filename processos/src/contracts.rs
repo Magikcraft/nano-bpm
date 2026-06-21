@@ -42,11 +42,57 @@ pub struct InstanceTrace {
     pub version: Option<i32>,
     pub outcome: String,
     #[serde(default)]
+    pub started_at: u64,
+    #[serde(default)]
     pub duration_ms: Option<u64>,
     #[serde(default)]
     pub elements: Vec<Element>,
     #[serde(default)]
     pub incidents: Vec<Incident>,
+    /// Instance creation inputs (Tier-1 capture). Present only when the source
+    /// node ran with `NANOBPMN_TRACE_VARIABLES`/`NANOBPMN_TRACE_STIMULI` (i.e.
+    /// `c8 nano --capture`); `None` otherwise. Drives recorded-input replay.
+    #[serde(default)]
+    pub creation_variables: Option<Variables>,
+    /// The ordered Tier-2 recorded-input stimulus log. Present only under
+    /// `NANOBPMN_TRACE_STIMULI`; `None` otherwise.
+    #[serde(default)]
+    pub stimuli: Option<Vec<Stimulus>>,
+    /// True when the per-instance stimulus cap dropped later inputs — the log is
+    /// then incomplete and the instance is not safe to replay.
+    #[serde(default)]
+    pub stimuli_truncated: bool,
+}
+
+/// A captured variable map on a trace (mirrors the gateway's `VariablesDto`).
+/// When the snapshot exceeded the node's byte cap, `values` is `None` and
+/// `truncated` is true — the instance is then not replayable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Variables {
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub bytes: usize,
+    #[serde(default)]
+    pub values: Option<serde_json::Value>,
+}
+
+/// One recorded external input on the Tier-2 log (mirrors `StimulusDto`). `kind`
+/// is one of `jobCompleted` | `userTaskCompleted` | `message` | `timer` |
+/// `variablesSet`; `reference` is the job *type* for `jobCompleted` (so replay
+/// matches by semantic type, not element position) and the element id for
+/// message/timer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stimulus {
+    pub seq: u32,
+    pub at: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub variables: Option<Variables>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

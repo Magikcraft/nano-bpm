@@ -1,0 +1,762 @@
+//! Recorded-input **replay** evaluator — ProcessOS §7.7 Level-2 fidelity and the
+//! verifier of the §7.9 hypothesis loop.
+//!
+//! Where [`super::sim`] serves a candidate's jobs from *modelled* mock workers
+//! (Level-1, distributional), this replays a **real recorded instance** against a
+//! candidate model: the instance's creation inputs seed it, and each job the
+//! candidate issues is served from the recorded output of *that job type* (the
+//! Tier-2 stimulus log, captured by `c8 nano --capture`). Routing therefore uses
+//! the real historical variable values, and the end state is checkable against the
+//! recorded boundary — this is the *backtest* that lets a candidate be scored on
+//! how it would have handled history.
+//!
+//! The result is a **gradient**, not pass/fail (§7.9): validity (compiler-class),
+//! completion, per-job-type **coverage** (a job type the candidate issues that
+//! history never produced an output for ⇒ *requires a new worker*), and
+//! **boundary-conservation** divergence (terminal variables vs the recorded
+//! terminal, key by key). That is the actionable feedback an LLM iterates against.
+//!
+//! Pure and deterministic; `engine-core` is consumed read-only and unmodified. The
+//! recorded timeline is authoritative, so no virtual-clock model is needed — the
+//! replay walks the recorded `at` timestamps.
+//!
+//! **Scope of this first slice.** Job-driven replay is the dominant
+//! input-compatible case and is handled fully. Catch-event *messages* cannot be
+//! injected without a correlation key, so a candidate that introduces message
+//! waits history did not satisfy will simply not complete (reported honestly as
+//! `completed: false`); timers auto-advance as in `sim`. Truncated captures are
+//! rejected up front (an incomplete log is not safe to replay).
+
+use std::collections::HashMap;
+
+use nanobpmn_engine_core::{
+    Command, Engine, JobState, ProcessDefinition, ProcessInstanceState, TimerState, Value,
+};
+use serde_json::Value as Json;
+
+use crate::contracts::{InstanceTrace, Variables};
+
+/// A recorded instance distilled from a [`InstanceTrace`] into exactly what replay
+/// needs: the creation inputs and the ordered stimulus log with its values
+/// resolved to natural JSON.
+#[derive(Clone, Debug)]
+pub struct RecordedInstance {
+    pub instance_key: String,
+    pub process_id: String,
+    pub started_at: u64,
+    pub creation_variables: HashMap<String, Json>,
+    pub stimuli: Vec<RecordedStimulus>,
+}
+
+/// One recorded input, values resolved (and `None` when the stimulus carried no
+/// payload — e.g. a timer fire or an empty-output job).
+#[derive(Clone, Debug)]
+pub struct RecordedStimulus {
+    pub seq: u32,
+    pub at: u64,
+    pub kind: String,
+    pub reference: Option<String>,
+    pub variables: Option<HashMap<String, Json>>,
+}
+
+/// Why a trace cannot be replayed (as opposed to a candidate scoring poorly).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayUnavailable {
+    /// Capture was off on the source node — no stimulus log present.
+    NoCapture,
+    /// The per-instance stimulus cap dropped later inputs; the log is incomplete.
+    Truncated,
+    /// A captured snapshot exceeded the byte cap, so its values are absent.
+    SnapshotTruncated,
+}
+
+impl std::fmt::Display for ReplayUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoCapture => write!(
+                f,
+                "trace has no recorded-input log (run the source node with c8 nano --capture)"
+            ),
+            Self::Truncated => write!(
+                f,
+                "stimulus log was truncated (NANOBPMN_TRACE_STIMULI_MAX reached); not replayable"
+            ),
+            Self::SnapshotTruncated => write!(
+                f,
+                "a captured variable snapshot exceeded the byte cap; values unavailable"
+            ),
+        }
+    }
+}
+
+impl RecordedInstance {
+    /// Distil a fetched [`InstanceTrace`] into a replayable instance, or explain
+    /// why it cannot be replayed. Snapshots whose values were dropped by the byte
+    /// cap make the trace unreplayable — partial inputs would silently corrupt the
+    /// backtest.
+    pub fn from_trace(trace: &InstanceTrace) -> Result<Self, ReplayUnavailable> {
+        if trace.stimuli_truncated {
+            return Err(ReplayUnavailable::Truncated);
+        }
+        let stimuli_src = trace.stimuli.as_ref().ok_or(ReplayUnavailable::NoCapture)?;
+
+        let creation_variables = match &trace.creation_variables {
+            Some(v) => resolve(v)?,
+            // Stimuli present but no creation snapshot: an instance created with no
+            // variables. Treat as empty inputs rather than unavailable.
+            None => HashMap::new(),
+        };
+
+        let mut stimuli = Vec::with_capacity(stimuli_src.len());
+        for s in stimuli_src {
+            let variables = match &s.variables {
+                Some(v) => Some(resolve(v)?),
+                None => None,
+            };
+            stimuli.push(RecordedStimulus {
+                seq: s.seq,
+                at: s.at,
+                kind: s.kind.clone(),
+                reference: s.reference.clone(),
+                variables,
+            });
+        }
+        // The log is authoritative in `seq` order; the gateway emits it ordered,
+        // but sort defensively so attribution never depends on transport order.
+        stimuli.sort_by_key(|s| s.seq);
+
+        Ok(Self {
+            instance_key: trace.instance_key.clone(),
+            process_id: trace.process_id.clone(),
+            started_at: trace.started_at,
+            creation_variables,
+            stimuli,
+        })
+    }
+}
+
+/// Resolve a captured [`Variables`] snapshot to a JSON object map, rejecting a
+/// truncated snapshot (its values are absent, so replay would be wrong).
+fn resolve(v: &Variables) -> Result<HashMap<String, Json>, ReplayUnavailable> {
+    if v.truncated {
+        return Err(ReplayUnavailable::SnapshotTruncated);
+    }
+    match &v.values {
+        Some(Json::Object(map)) => Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        // A non-object or absent value with truncated == false means "no variables".
+        _ => Ok(HashMap::new()),
+    }
+}
+
+/// Per-job-type coverage of a replay: how many jobs of this type the candidate
+/// issued versus how many recorded outputs of that type the history held.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobCoverage {
+    pub job_type: String,
+    pub issued: u32,
+    pub recorded: u32,
+}
+
+/// One boundary-conservation difference: a key present in the recorded terminal
+/// whose replayed value differs (or is missing).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VarDivergence {
+    pub key: String,
+    pub expected: Json,
+    pub got: Option<Json>,
+}
+
+/// The gradient a single replay yields (§7.9): validity, completion, coverage, and
+/// boundary divergence — the actionable feedback, never collapsed to a verdict.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayResult {
+    pub instance_key: String,
+    /// The candidate deployed and the instance was created (compiler-class check).
+    pub valid: bool,
+    /// Validity-failure detail when `valid` is false (parse/deploy/create error).
+    pub error: Option<String>,
+    /// The instance reached the `Completed` terminal state under replay.
+    pub completed: bool,
+    /// Replayed end-to-end latency along the recorded timeline (last consumed
+    /// input's timestamp minus instance start).
+    pub e2e_latency_ms: u64,
+    /// Engine driver steps taken (a loop-safety / complexity signal).
+    pub steps: u32,
+    /// Per-job-type issued-vs-recorded counts.
+    pub coverage: Vec<JobCoverage>,
+    /// Job types the candidate issued more often than history recorded — these
+    /// have no historical output to replay ⇒ *requires a new worker* to deploy.
+    pub uncovered_job_types: Vec<String>,
+    /// Keys of the recorded terminal output the replay failed to reproduce.
+    pub divergences: Vec<VarDivergence>,
+    /// Boundary conservation held: completed, fully covered, no divergence.
+    pub conserved: bool,
+}
+
+/// Replay one recorded instance against a candidate model. `defs` is the parsed
+/// candidate (via `engine_core::bpmn::parse_bpmn`); `process_id` is the process to
+/// start (the recorded instance's process id is the natural choice).
+pub fn replay_instance(
+    defs: &[ProcessDefinition],
+    process_id: &str,
+    rec: &RecordedInstance,
+) -> ReplayResult {
+    // The recorded terminal output: creation inputs folded with every stimulus
+    // delta in order (last-writer-wins) — what the original run left behind, and
+    // the boundary the candidate must conserve.
+    let recorded_terminal = recorded_terminal(rec);
+
+    // FIFO of recorded job outputs, keyed by job type. Each entry is that
+    // completion's output delta (empty when the job recorded no output).
+    let mut job_outputs: HashMap<String, std::collections::VecDeque<HashMap<String, Json>>> =
+        HashMap::new();
+    let mut recorded_counts: HashMap<String, u32> = HashMap::new();
+    for s in &rec.stimuli {
+        if s.kind == "jobCompleted" {
+            if let Some(job_type) = &s.reference {
+                job_outputs
+                    .entry(job_type.clone())
+                    .or_default()
+                    .push_back(s.variables.clone().unwrap_or_default());
+                *recorded_counts.entry(job_type.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut engine = Engine::new();
+    let mut clock: u64 = rec.started_at;
+
+    if let Err(e) = engine.apply_command_at(Command::DeployResources(defs.to_vec()), clock) {
+        return invalid(rec, format!("candidate failed to deploy: {e:?}"));
+    }
+    let vars: HashMap<String, Value> = rec
+        .creation_variables
+        .iter()
+        .map(|(k, v)| (k.clone(), json_to_value(v)))
+        .collect();
+    if let Err(e) = engine.apply_command_at(
+        Command::CreateInstance {
+            process_id: process_id.to_string(),
+            variables: vars,
+            tags: Vec::new(),
+            business_id: None,
+        },
+        clock,
+    ) {
+        return invalid(rec, format!("candidate failed to create instance: {e:?}"));
+    }
+
+    let mut issued: HashMap<String, u32> = HashMap::new();
+    let mut uncovered: Vec<String> = Vec::new();
+
+    // Walk the recorded stimulus timeline only for its timestamps: each job we
+    // complete advances the clock to the next recorded input's `at`, so the
+    // replayed latency tracks the real timeline rather than a model.
+    let mut next_at: std::collections::VecDeque<u64> =
+        rec.stimuli.iter().map(|s| s.at).collect();
+    let mut last_consumed_at = rec.started_at;
+
+    let max_steps = 100_000usize;
+    let mut steps = 0u32;
+    loop {
+        steps += 1;
+        if steps as usize > max_steps {
+            break;
+        }
+
+        let pending: Vec<(u64, String, bool)> = engine
+            .state()
+            .jobs
+            .values()
+            .filter(|j| matches!(j.state, JobState::Created | JobState::Activated))
+            .map(|j| (j.key, j.job_type.clone(), j.state == JobState::Created))
+            .collect();
+
+        if pending.is_empty() {
+            // No runnable jobs: advance to the earliest armed timer, if any.
+            let next_due = engine
+                .state()
+                .timers
+                .values()
+                .filter(|t| t.state == TimerState::Created)
+                .map(|t| t.due_at)
+                .min();
+            match next_due {
+                Some(due) => {
+                    clock = clock.max(due);
+                    let _ = engine.apply_command_at(Command::TriggerTimers { now: clock }, clock);
+                    let _ = engine.apply_command_at(Command::ExpireJobs { now: clock }, clock);
+                    continue;
+                }
+                // Settled: completed, terminated, or parked waiting on an input
+                // (e.g. a message) the recorded history never supplied.
+                None => break,
+            }
+        }
+
+        for (job_key, job_type, needs_activation) in pending {
+            *issued.entry(job_type.clone()).or_insert(0) += 1;
+
+            if needs_activation {
+                let _ = engine.apply_command_at(
+                    Command::ActivateJobs {
+                        job_type: job_type.clone(),
+                        worker: "replay".to_string(),
+                        max_jobs: 100_000,
+                        timeout: u64::MAX / 4,
+                        now: clock,
+                    },
+                    clock,
+                );
+            }
+
+            // Serve from the next recorded output of this job type. Advance the
+            // clock to the next recorded timestamp so timing tracks history.
+            if let Some(at) = next_at.pop_front() {
+                clock = clock.max(at);
+                last_consumed_at = at;
+            }
+            let output = job_outputs.get_mut(&job_type).and_then(|q| q.pop_front());
+            match output {
+                Some(out_vars) => {
+                    let out: HashMap<String, Value> = out_vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json_to_value(v)))
+                        .collect();
+                    let _ = engine.apply_command_at(
+                        Command::CompleteJob {
+                            job_key,
+                            variables: out,
+                        },
+                        clock,
+                    );
+                }
+                None => {
+                    // No recorded output of this type remains: the candidate issues
+                    // a job history never produced ⇒ requires a new worker. Complete
+                    // empty to keep the token moving and surface it in coverage.
+                    if !uncovered.contains(&job_type) {
+                        uncovered.push(job_type.clone());
+                    }
+                    let _ = engine.apply_command_at(
+                        Command::CompleteJob {
+                            job_key,
+                            variables: HashMap::new(),
+                        },
+                        clock,
+                    );
+                }
+            }
+        }
+    }
+
+    let state = engine.state();
+    let inst = state.instances.values().next();
+    let completed = inst
+        .map(|i| i.state == ProcessInstanceState::Completed)
+        .unwrap_or(false);
+    let produced: HashMap<String, Json> = inst
+        .map(|i| {
+            i.variables
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Boundary conservation: every key in the recorded terminal must reappear
+    // with an equal value. Extra keys the candidate adds are not divergences.
+    let mut divergences: Vec<VarDivergence> = recorded_terminal
+        .iter()
+        .filter_map(|(k, expected)| match produced.get(k) {
+            Some(got) if got == expected => None,
+            other => Some(VarDivergence {
+                key: k.clone(),
+                expected: expected.clone(),
+                got: other.cloned(),
+            }),
+        })
+        .collect();
+    divergences.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let mut coverage: Vec<JobCoverage> = issued
+        .iter()
+        .map(|(job_type, &issued_n)| JobCoverage {
+            job_type: job_type.clone(),
+            issued: issued_n,
+            recorded: recorded_counts.get(job_type).copied().unwrap_or(0),
+        })
+        .collect();
+    coverage.sort_by(|a, b| a.job_type.cmp(&b.job_type));
+    uncovered.sort();
+
+    let e2e_latency_ms = last_consumed_at.saturating_sub(rec.started_at);
+    let conserved = completed && uncovered.is_empty() && divergences.is_empty();
+
+    ReplayResult {
+        instance_key: rec.instance_key.clone(),
+        valid: true,
+        error: None,
+        completed,
+        e2e_latency_ms,
+        steps,
+        coverage,
+        uncovered_job_types: uncovered,
+        divergences,
+        conserved,
+    }
+}
+
+/// The recorded terminal variable state: creation inputs merged with every
+/// stimulus delta in `seq` order (last-writer-wins) — the original run's output.
+fn recorded_terminal(rec: &RecordedInstance) -> HashMap<String, Json> {
+    let mut acc = rec.creation_variables.clone();
+    for s in &rec.stimuli {
+        if let Some(vars) = &s.variables {
+            for (k, v) in vars {
+                acc.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    acc
+}
+
+fn invalid(rec: &RecordedInstance, error: String) -> ReplayResult {
+    ReplayResult {
+        instance_key: rec.instance_key.clone(),
+        valid: false,
+        error: Some(error),
+        completed: false,
+        e2e_latency_ms: 0,
+        steps: 0,
+        coverage: Vec::new(),
+        uncovered_job_types: Vec::new(),
+        divergences: Vec::new(),
+        conserved: false,
+    }
+}
+
+// --- Value <-> JSON converters (mirror sim.rs / engine-wasm) ---------------------
+
+fn value_to_json(v: &Value) -> Json {
+    match v {
+        Value::Null => Json::Null,
+        Value::Bool(b) => Json::Bool(*b),
+        Value::Int(i) => Json::Number((*i).into()),
+        Value::Double(d) => serde_json::Number::from_f64(*d)
+            .map(Json::Number)
+            .unwrap_or(Json::Null),
+        Value::Str(s) => Json::String(s.clone()),
+        Value::List(items) => Json::Array(items.iter().map(value_to_json).collect()),
+        Value::Map(entries) => {
+            let mut m = serde_json::Map::new();
+            for (k, val) in entries {
+                m.insert(k.clone(), value_to_json(val));
+            }
+            Json::Object(m)
+        }
+    }
+}
+
+fn json_to_value(v: &Json) -> Value {
+    match v {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(*b),
+        Json::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(u) = n.as_u64() {
+                Value::Int(u as i64)
+            } else {
+                Value::Double(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        Json::String(s) => Value::Str(s.clone()),
+        Json::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
+        Json::Object(map) => {
+            Value::Map(map.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanobpmn_engine_core::bpmn::parse_bpmn;
+    use serde_json::json;
+
+    // Classify -> Summarize (two service tasks, jobs "classify" then "summarize").
+    const TWO_TASK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Defs" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="P" name="P" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Classify" />
+    <bpmn:serviceTask id="Classify" name="Classify">
+      <bpmn:extensionElements><zeebe:taskDefinition type="classify" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Classify" targetRef="Summarize" />
+    <bpmn:serviceTask id="Summarize" name="Summarize">
+      <bpmn:extensionElements><zeebe:taskDefinition type="summarize" /></bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Summarize" targetRef="End" />
+    <bpmn:endEvent id="End"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    // Classify only (one service task) — a candidate that drops Summarize.
+    const ONE_TASK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Defs" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="P" name="P" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Classify" />
+    <bpmn:serviceTask id="Classify" name="Classify">
+      <bpmn:extensionElements><zeebe:taskDefinition type="classify" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Classify" targetRef="End" />
+    <bpmn:endEvent id="End"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    fn job(seq: u32, at: u64, job_type: &str, out: Option<&[(&str, Json)]>) -> RecordedStimulus {
+        RecordedStimulus {
+            seq,
+            at,
+            kind: "jobCompleted".to_string(),
+            reference: Some(job_type.to_string()),
+            variables: out.map(map),
+        }
+    }
+
+    fn rec(creation: &[(&str, Json)], stimuli: Vec<RecordedStimulus>) -> RecordedInstance {
+        RecordedInstance {
+            instance_key: "1".to_string(),
+            process_id: "P".to_string(),
+            started_at: 1000,
+            creation_variables: map(creation),
+            stimuli,
+        }
+    }
+
+    #[test]
+    fn boundary_conservation_holds_for_identical_model() {
+        let r = rec(
+            &[("input", json!("x"))],
+            vec![
+                job(1, 1100, "classify", Some(&[("label", json!("A"))])),
+                job(2, 1300, "summarize", Some(&[("summary", json!("S"))])),
+            ],
+        );
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+        let res = replay_instance(&defs, "P", &r);
+
+        assert!(res.valid && res.completed, "{:?}", res.error);
+        assert!(res.conserved, "divergences: {:?}", res.divergences);
+        assert!(res.divergences.is_empty());
+        assert!(res.uncovered_job_types.is_empty());
+        assert_eq!(res.e2e_latency_ms, 300); // 1300 - 1000
+        assert_eq!(
+            res.coverage,
+            vec![
+                JobCoverage { job_type: "classify".into(), issued: 1, recorded: 1 },
+                JobCoverage { job_type: "summarize".into(), issued: 1, recorded: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_a_task_diverges_on_the_missing_output_key() {
+        // History produced label + summary; the candidate model omits Summarize, so
+        // the recorded terminal key `summary` is never reproduced.
+        let r = rec(
+            &[("input", json!("x"))],
+            vec![
+                job(1, 1100, "classify", Some(&[("label", json!("A"))])),
+                job(2, 1300, "summarize", Some(&[("summary", json!("S"))])),
+            ],
+        );
+        let defs = parse_bpmn(ONE_TASK).unwrap();
+        let res = replay_instance(&defs, "P", &r);
+
+        assert!(res.valid && res.completed);
+        assert!(!res.conserved);
+        assert_eq!(res.divergences.len(), 1);
+        assert_eq!(res.divergences[0].key, "summary");
+        assert_eq!(res.divergences[0].expected, json!("S"));
+        assert_eq!(res.divergences[0].got, None);
+        // Only classify was issued.
+        assert_eq!(res.coverage.len(), 1);
+        assert_eq!(res.coverage[0].job_type, "classify");
+    }
+
+    #[test]
+    fn issuing_an_unrecorded_job_type_is_flagged_uncovered() {
+        // History recorded only a classify output; the candidate also issues
+        // summarize, which has no recorded output ⇒ requires a new worker.
+        let r = rec(
+            &[("input", json!("x"))],
+            vec![job(1, 1100, "classify", Some(&[("label", json!("A"))]))],
+        );
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+        let res = replay_instance(&defs, "P", &r);
+
+        assert!(res.valid && res.completed);
+        assert_eq!(res.uncovered_job_types, vec!["summarize".to_string()]);
+        assert!(!res.conserved, "uncovered jobs must break conservation");
+        // summarize shows issued 1 / recorded 0.
+        let cov: HashMap<_, _> = res
+            .coverage
+            .iter()
+            .map(|c| (c.job_type.clone(), (c.issued, c.recorded)))
+            .collect();
+        assert_eq!(cov["summarize"], (1, 0));
+        assert_eq!(cov["classify"], (1, 1));
+    }
+
+    #[test]
+    fn invalid_candidate_reports_validity_failure() {
+        let r = rec(&[("input", json!("x"))], vec![]);
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+        // Start a process id the model doesn't define.
+        let res = replay_instance(&defs, "DoesNotExist", &r);
+        assert!(!res.valid);
+        assert!(res.error.is_some());
+        assert!(!res.completed);
+    }
+
+    #[test]
+    fn from_trace_rejects_truncated_log() {
+        let trace = InstanceTrace {
+            instance_key: "1".into(),
+            process_id: "P".into(),
+            version: None,
+            outcome: "COMPLETED".into(),
+            started_at: 0,
+            duration_ms: None,
+            elements: vec![],
+            incidents: vec![],
+            creation_variables: None,
+            stimuli: Some(vec![]),
+            stimuli_truncated: true,
+        };
+        assert!(matches!(
+            RecordedInstance::from_trace(&trace),
+            Err(ReplayUnavailable::Truncated)
+        ));
+    }
+
+    #[test]
+    fn from_trace_rejects_missing_capture() {
+        let trace = InstanceTrace {
+            instance_key: "1".into(),
+            process_id: "P".into(),
+            version: None,
+            outcome: "COMPLETED".into(),
+            started_at: 0,
+            duration_ms: None,
+            elements: vec![],
+            incidents: vec![],
+            creation_variables: None,
+            stimuli: None,
+            stimuli_truncated: false,
+        };
+        assert!(matches!(
+            RecordedInstance::from_trace(&trace),
+            Err(ReplayUnavailable::NoCapture)
+        ));
+    }
+
+    #[test]
+    fn from_trace_rejects_truncated_snapshot() {
+        use crate::contracts::{Stimulus, Variables};
+        let trace = InstanceTrace {
+            instance_key: "1".into(),
+            process_id: "P".into(),
+            version: None,
+            outcome: "COMPLETED".into(),
+            started_at: 0,
+            duration_ms: None,
+            elements: vec![],
+            incidents: vec![],
+            creation_variables: Some(Variables { truncated: true, bytes: 99999, values: None }),
+            stimuli: Some(vec![Stimulus {
+                seq: 1,
+                at: 1,
+                kind: "jobCompleted".into(),
+                reference: Some("classify".into()),
+                variables: None,
+            }]),
+            stimuli_truncated: false,
+        };
+        assert!(matches!(
+            RecordedInstance::from_trace(&trace),
+            Err(ReplayUnavailable::SnapshotTruncated)
+        ));
+    }
+
+    #[test]
+    fn from_trace_distils_stimuli_in_seq_order() {
+        use crate::contracts::{Stimulus, Variables};
+        let trace = InstanceTrace {
+            instance_key: "7".into(),
+            process_id: "P".into(),
+            version: None,
+            outcome: "COMPLETED".into(),
+            started_at: 500,
+            duration_ms: None,
+            elements: vec![],
+            incidents: vec![],
+            creation_variables: Some(Variables {
+                truncated: false,
+                bytes: 10,
+                values: Some(json!({ "input": "x" })),
+            }),
+            // Deliberately out of order to prove the sort.
+            stimuli: Some(vec![
+                Stimulus {
+                    seq: 2,
+                    at: 700,
+                    kind: "jobCompleted".into(),
+                    reference: Some("summarize".into()),
+                    variables: Some(Variables {
+                        truncated: false,
+                        bytes: 5,
+                        values: Some(json!({ "summary": "S" })),
+                    }),
+                },
+                Stimulus {
+                    seq: 1,
+                    at: 600,
+                    kind: "jobCompleted".into(),
+                    reference: Some("classify".into()),
+                    variables: Some(Variables {
+                        truncated: false,
+                        bytes: 5,
+                        values: Some(json!({ "label": "A" })),
+                    }),
+                },
+            ]),
+            stimuli_truncated: false,
+        };
+        let r = RecordedInstance::from_trace(&trace).unwrap();
+        assert_eq!(r.started_at, 500);
+        assert_eq!(r.creation_variables["input"], json!("x"));
+        assert_eq!(r.stimuli.len(), 2);
+        assert_eq!(r.stimuli[0].seq, 1);
+        assert_eq!(r.stimuli[0].reference.as_deref(), Some("classify"));
+        assert_eq!(r.stimuli[1].seq, 2);
+    }
+}

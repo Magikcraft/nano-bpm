@@ -25,6 +25,7 @@ mod llm;
 mod production;
 mod queueing;
 mod rank;
+mod replay;
 mod sim;
 mod calibrate;
 mod prompts;
@@ -48,6 +49,11 @@ pub use queueing::staff_for_summary;
 pub use queueing::WorkerStaffing;
 #[allow(unused_imports)]
 pub use rank::{run_scenario, HarnessReport, VariantResult};
+#[allow(unused_imports)]
+pub use replay::{
+    replay_instance, JobCoverage, RecordedInstance, RecordedStimulus, ReplayResult,
+    ReplayUnavailable, VarDivergence,
+};
 
 use std::collections::HashMap;
 

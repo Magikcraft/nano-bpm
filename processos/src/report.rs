@@ -333,6 +333,10 @@ mod tests {
                 kind: "JOB_NO_RETRIES".into(),
                 reason: "boom".into(),
             }],
+            started_at: 0,
+            creation_variables: None,
+            stimuli: None,
+            stimuli_truncated: false,
         };
         let procs = fold_processes(&[t.clone()]);
         assert_eq!(procs.len(), 1);

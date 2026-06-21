@@ -463,6 +463,10 @@ mod tests {
                 }),
             }],
             incidents: vec![],
+            started_at: 0,
+            creation_variables: None,
+            stimuli: None,
+            stimuli_truncated: false,
         };
         let summaries = vec![summary("1", "order", "completed", 0, 100, 100)];
         let s = summarize_run("order", &summaries, &[detail]);
@@ -501,6 +505,10 @@ mod tests {
             duration_ms: Some(160),
             elements: vec![job("classify", 60, 5, 0), job("summarize", 5, 90, 2)],
             incidents: vec![],
+            started_at: 0,
+            creation_variables: None,
+            stimuli: None,
+            stimuli_truncated: false,
         };
         let summaries = vec![summary("1", "order", "completed", 0, 160, 160)];
         let s = summarize_run("order", &summaries, &[detail]);
