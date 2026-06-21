@@ -558,6 +558,56 @@ experimental-variable library).
   global **Experiments** list serves the "what's running everywhere" need.
 
 
+### 7.9 The hypothesis loop as a Nano process (agentic search with the engine as verifier)
+
+The hypothesis→evaluate loop (§7.2 steps 2–5) is best run as **an agentic loop with a fast,
+truthful verifier**, the same reason coding agents converge: an LLM with a compiler/test in
+the loop beats one-shot reasoning. The verifier already exists in three parts — the embedded
+engine (`SimRunner`), recorded-input replay (the Tier-2 stimulus log, switchable via
+`c8 nano --capture`), and the golden set. Orchestrate that loop **as a Nano BPMN process**:
+LLM-proposal and engine-eval are tasks; the engine is the verifier the LLM iterates against.
+
+- **Process owns the body; LLM owns the judgment.** BPMN is the right skeleton for the
+  *durable orchestration* — bounded iteration counter, wall-clock budget (boundary timer),
+  cost ceiling, candidate persistence, parallel fan-out, audit. It is the wrong place for the
+  *reasoning*. The LLM's decision (iterate / file-as-candidate / give-up) returns as a
+  **variable**; a gateway routes on it. Keep reasoning out of the gateways.
+- **Gradient, not pass/fail.** "Intersection/disjoint with golden" is a linker error; agents
+  need compiler errors. The eval worker returns: **validity** (schema/FEEL/soundness, with
+  location), **per-instance replay divergence** (which golden instances failed to reconstruct
+  and *how* — which output var, expected vs got), **coverage** (fraction input-compatible;
+  unreplayable candidates that need new workers are *flagged*, not penalized — §7.7), and
+  **objective metrics** on the replayable subset. That converts random search into
+  hill-climbing with a slope.
+- **Eval = a pure, reusable capability; then orchestrate it.** Make `validate + replay + score`
+  idempotent with a stable `(candidate-hash, input-set-hash)` cache key (agents re-propose
+  near-duplicates). Expose it as a Nano job worker *and* keep it directly callable. The BPMN
+  loop buys durability, fan-out, and budget enforcement for free; the pure capability keeps it
+  testable. This is the same eval engine §7.7's fidelity ladder runs on.
+- **Population over single chain.** A lone "iterate until exhausted" trajectory is where LLM
+  reasoning gets stuck. BPMN multi-instance lets you **fan out N candidates, evaluate all, keep
+  top-k, then ask the LLM to mutate/cross survivors** — evolutionary search with the engine as
+  fitness function. The model expresses this naturally and is far more robust.
+- **Guardrails.** (a) A cheap **deterministic pre-pass** (schema/FEEL lint) catches
+  compiler-class errors before spending an LLM turn or a replay — reserve iterations for
+  *semantic* divergence. (b) **Train/holdout split** of the golden set + rank-not-truth (§7.7)
+  to resist overfitting / reward-hacking the recorded outputs. (c) **Exhaustion is measured**:
+  stop on no improvement beyond the reconstruct-history noise floor for *k* iterations — never
+  trust the LLM's self-assessed "out of ideas". (d) Don't hand the LLM the whole golden set
+  (cost, PII, overfit) — aggregate divergence + a few representative failing instances; the
+  stimulus log already supports sampling.
+- **It dogfoods.** Once the optimizer loop is itself a Nano process emitting traces, ProcessOS's
+  first customer is *itself*: it can optimize its own search (which prompt / LLM / fan-out shape
+  / budget converges fastest and cheapest). The recursive ratchet — and the exit-reason
+  distribution (converged / budget / exhausted / invalid) feeds the prompt-experiment loop.
+
+Alternative framing considered: **LLM-as-agent calling the engine as a tool** (function-calling/
+MCP) instead of **process-as-agent calling the LLM as a task**. Not exclusive — same pure eval
+capability underneath. Choose the BPMN-orchestrated form as the backbone (durability, fan-out,
+budget, audit, dogfooding come free); reach for tool-calling only for fast interactive
+exploration. The invariant from §8 holds: **the verifier is authoritative; the LLM only
+proposes** — nothing becomes a candidate without passing `validate`/replay.
+
 ## 8. Invariants ProcessOS must honour
 
 - **One-way dependency, build-enforced.** Nano never imports ProcessOS; ProcessOS
