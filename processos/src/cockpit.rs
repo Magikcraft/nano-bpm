@@ -58,6 +58,8 @@ pub struct ExperimentSummary {
     pub max_iterations: Option<i64>,
     pub best_name: Option<String>,
     pub best_conserved_rate: Option<f64>,
+    /// The library prompt id driving the droid (the experimental variable), if set.
+    pub prompt_id: Option<String>,
     /// True when a `Review` user task is open — the pilot's turn.
     pub awaiting_pilot: bool,
 }
@@ -164,6 +166,7 @@ fn summarize(
         max_iterations: as_i64(vars.get("maxIterations")),
         best_name: as_string(vars.get("bestName")),
         best_conserved_rate: as_f64(vars.get("bestConservedRate")),
+        prompt_id: as_string(vars.get("promptId")),
         awaiting_pilot,
     }
 }
@@ -412,21 +415,27 @@ pub async fn latest_process_xml(nano: &NanoClient, process_id: &str) -> Result<S
 }
 
 /// Start an experiment: create a `pilotSelfOptimize` instance for a target
-/// process. Returns the new instance key.
+/// process. `prompt_id`, when given, names the library system prompt the droid
+/// uses to hypothesize (the experimental variable, §7.8 step 2). Returns the new
+/// instance key.
 pub async fn create_experiment(
     nano: &NanoClient,
     target_process_id: &str,
     baseline_model: String,
     max_iterations: i64,
+    prompt_id: Option<String>,
 ) -> Result<String, String> {
+    let mut variables = serde_json::Map::new();
+    variables.insert("processId".into(), json!(target_process_id));
+    variables.insert("baselineModel".into(), json!(baseline_model));
+    variables.insert("maxIterations".into(), json!(max_iterations));
+    variables.insert("iteration".into(), json!(0));
+    if let Some(pid) = prompt_id.filter(|s| !s.trim().is_empty()) {
+        variables.insert("promptId".into(), json!(pid));
+    }
     let body = json!({
         "processDefinitionId": PILOT_PROCESS_ID,
-        "variables": {
-            "processId": target_process_id,
-            "baselineModel": baseline_model,
-            "maxIterations": max_iterations,
-            "iteration": 0,
-        },
+        "variables": Value::Object(variables),
     });
     let res: Value = nano.post_json("/v2/process-instances", &body).await?;
     res.get("processInstanceKey")

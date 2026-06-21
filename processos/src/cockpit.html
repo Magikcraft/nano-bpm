@@ -86,6 +86,10 @@
   .dlg-body { padding: 20px 22px; }
   .dlg-body label { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
   .dlg-body input, .dlg-body select { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
+  .lbl { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
+  #promptEditor input, #promptEditor textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
+  #promptEditor textarea { font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
+  #promptEditor input:disabled, #promptEditor textarea:disabled { opacity: .6; }
   .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid #26262b; }
 </style>
 </head>
@@ -108,6 +112,8 @@
   <div class="dlg-body">
     <h2 style="margin-top:0">New experiment</h2>
     <p class="muted" style="font-size:12px">Fork an experiment on <b id="dlgProc" style="font-family:ui-monospace,monospace;color:#c7d2fe"></b>. The droid proposes redesigns; the engine proves them on the recorded dataset; you decide.</p>
+    <label>Droid prompt (the experimental variable)</label>
+    <select id="dlgPrompt"></select>
     <label>Iteration budget (max rounds)</label>
     <input id="dlgIters" type="number" min="1" max="50" value="2" />
   </div>
@@ -229,7 +235,9 @@ async function renderExp(key){
   const s = d.summary;
   let h = '<div class="crumbs"><a onclick="renderExperiments()">Experiments</a> / #'+esc(key)+'</div>';
   h += '<div style="display:flex;align-items:baseline;gap:12px"><h1>Experiment #'+esc(key)+'</h1>'+expPill(s)+'</div>';
-  h += '<p class="lede">Optimizing <b style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(s.targetProcessId||'—')+'</b>. The shared instrument is the verifier’s gradient — the conserved-rate of the production boundary on real recorded traces.</p>';
+  h += '<p class="lede">Optimizing <b style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(s.targetProcessId||'—')+'</b>'
+     + (s.promptId ? ' · droid prompt <b style="color:#a5b4fc">'+esc(s.promptId)+'</b>' : ' · built-in prompt')
+     + '. The shared instrument is the verifier’s gradient — the conserved-rate of the production boundary on real recorded traces.</p>';
 
   // stepper
   h += '<div class="stepper">'+d.steps.map(st => {
@@ -273,30 +281,91 @@ async function decide(key, decision){
   setTimeout(()=>renderExp(key), 600);
 }
 
-// ---- Prompts ----
+// ---- Prompts (authoring) ----
+let PROMPTS = [];
 async function renderPrompts(){
   STATE.view='prompts'; setActive(); main.innerHTML='Loading…';
-  let xs; try { xs = await api('/api/prompts'); } catch(e){ return fail(e); }
-  const list = Array.isArray(xs) ? xs : (xs.prompts||[]);
-  let h = '<h1>Prompts</h1><p class="lede">The droid’s skills — the system prompts that drive hypothesis generation. The experimental-variable library, reused across processes.</p>';
-  if(!list.length){ h += '<p class="muted">No prompts.</p>'; main.innerHTML=h; return; }
-  h += '<div class="grid">'+list.map(p =>
-    '<div class="tile"><h3>'+esc(p.id||p.name||'prompt')+'</h3><div class="meta">'+esc((p.description||p.body||'').slice(0,160))+'</div></div>'
-  ).join('')+'</div>';
+  try { const xs = await api('/api/prompts'); PROMPTS = Array.isArray(xs)?xs:(xs.prompts||[]); }
+  catch(e){ return fail(e); }
+  drawPrompts(PROMPTS.length ? PROMPTS[0].id : null);
+}
+function drawPrompts(selId){
+  let h = '<h1>Prompts</h1><p class="lede">The droid’s skills — the system prompts that drive hypothesis generation. The experimental-variable library, reused across processes. Author one, then select it when you start an experiment.</p>';
+  h += '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
+  // list
+  h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editPrompt(null)">+ New prompt</button>';
+  for(const p of PROMPTS){
+    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    h += '<div class="tile"'+active+' onclick="editPrompt(\''+esc(p.id)+'\')">'
+      + '<h3 style="font-size:14px">'+esc(p.name||p.id)+(p.builtin?' <span class="muted" style="font-size:11px">built-in</span>':'')+'</h3>'
+      + '<div class="meta">'+esc((p.description||'').slice(0,80))+'</div></div>';
+  }
+  h += '</div>';
+  // editor
+  h += '<div id="promptEditor" class="pane"></div></div>';
   main.innerHTML = h;
+  editPrompt(selId);
+}
+function editPrompt(id){
+  const ed = $('#promptEditor'); if(!ed) return;
+  // highlight selection
+  if(id!==null) drawSelection(id);
+  const p = id===null ? {id:'',name:'',description:'',system:'',builtin:false} : (PROMPTS.find(x=>x.id===id)||{id:'',name:'',description:'',system:'',builtin:false});
+  const isNew = id===null;
+  let h = '<h2 style="margin-top:0">'+(isNew?'New prompt':'Edit prompt')+'</h2>';
+  h += '<label class="lbl">Id</label><input id="pId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. latency-hawk" />';
+  h += '<label class="lbl">Name</label><input id="pName" value="'+esc(p.name)+'" '+(p.builtin?'disabled':'')+' />';
+  h += '<label class="lbl">Description</label><input id="pDesc" value="'+esc(p.description)+'" '+(p.builtin?'disabled':'')+' />';
+  h += '<label class="lbl">System prompt</label><textarea id="pSystem" rows="14" '+(p.builtin?'disabled':'')+'>'+esc(p.system)+'</textarea>';
+  h += '<div class="actions">';
+  if(p.builtin){
+    h += '<span class="muted" style="font-size:12px">Built-in prompts are read-only. Create a new prompt to author your own.</span>';
+  } else {
+    h += '<button class="btn primary" onclick="savePrompt()">Save</button>';
+    if(!isNew) h += '<button class="btn ghost" onclick="deletePrompt(\''+esc(p.id)+'\')">Delete</button>';
+  }
+  h += '</div>';
+  ed.innerHTML = h;
+}
+function drawSelection(id){
+  document.querySelectorAll('#main .tile').forEach(t=>{ t.removeAttribute('style'); });
+}
+async function savePrompt(){
+  const body = { id: $('#pId').value.trim(), name: $('#pName').value.trim(), description: $('#pDesc').value.trim(), system: $('#pSystem').value };
+  if(!body.id || !body.system.trim()){ alert('Id and system prompt are required.'); return; }
+  try { await api('/api/prompts', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+  catch(e){ alert('Save failed: '+e.message); return; }
+  const sel = body.id; const xs = await api('/api/prompts'); PROMPTS = Array.isArray(xs)?xs:[]; drawPrompts(sel);
+}
+async function deletePrompt(id){
+  if(!confirm('Delete prompt “'+id+'”?')) return;
+  try { await api('/api/prompts/'+encodeURIComponent(id), {method:'DELETE'}); }
+  catch(e){ alert('Delete failed: '+e.message); return; }
+  const xs = await api('/api/prompts'); PROMPTS = Array.isArray(xs)?xs:[]; drawPrompts(PROMPTS.length?PROMPTS[0].id:null);
 }
 
 // ---- New experiment dialog ----
-function openNew(pid){
+async function openNew(pid){
   $('#dlgProc').textContent = pid;
+  const sel = $('#dlgPrompt');
+  sel.innerHTML = '<option value="">Built-in default</option>';
+  try {
+    const xs = await api('/api/prompts');
+    for(const p of (Array.isArray(xs)?xs:[])){
+      const o = document.createElement('option');
+      o.value = p.id; o.textContent = (p.name||p.id) + (p.builtin?' (built-in)':'');
+      sel.appendChild(o);
+    }
+  } catch(e){ /* leave default only */ }
   const dlg = $('#newDlg'); dlg.dataset.proc = pid; dlg.showModal();
 }
 $('#dlgGo').onclick = async () => {
   const dlg = $('#newDlg'); const pid = dlg.dataset.proc;
   const iters = parseInt($('#dlgIters').value, 10) || 2;
+  const promptId = $('#dlgPrompt').value || undefined;
   $('#dlgGo').disabled = true;
   try {
-    const r = await api('/api/cockpit/experiments', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({processId:pid, maxIterations:iters})});
+    const r = await api('/api/cockpit/experiments', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({processId:pid, maxIterations:iters, promptId})});
     dlg.close(); goExp(r.instanceKey);
   } catch(e){ alert('Could not start experiment: '+e.message); }
   finally { $('#dlgGo').disabled = false; }

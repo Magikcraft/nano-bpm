@@ -259,7 +259,7 @@ async fn cockpit_create(
         },
     };
     let max_iterations = req.max_iterations.unwrap_or(2).clamp(1, 50);
-    match cockpit::create_experiment(&state.nano, &req.process_id, baseline, max_iterations).await {
+    match cockpit::create_experiment(&state.nano, &req.process_id, baseline, max_iterations, req.prompt_id).await {
         Ok(key) => Json(serde_json::json!({ "instanceKey": key })).into_response(),
         Err(e) => bad_gateway(e),
     }
@@ -293,6 +293,9 @@ struct CockpitCreateRequest {
     baseline_model: Option<String>,
     #[serde(default)]
     max_iterations: Option<i64>,
+    /// Library prompt id to drive the droid (the experimental variable, §7.8 step 2).
+    #[serde(default)]
+    prompt_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

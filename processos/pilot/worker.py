@@ -64,7 +64,7 @@ def activate():
             "worker": WORKER,
             "timeout": JOB_TIMEOUT_MS,
             "maxJobsToActivate": 1,
-            "fetchVariable": ["processId", "baselineModel", "iteration", "maxIterations"],
+            "fetchVariable": ["processId", "baselineModel", "iteration", "maxIterations", "promptId"],
         },
         timeout=30,
     ).get("jobs", [])
@@ -88,14 +88,19 @@ def run_round(job):
     process_id = v.get("processId")
     baseline = v.get("baselineModel")
     iteration = int(v.get("iteration", 0))
+    prompt_id = v.get("promptId")
     if not process_id or not baseline:
         raise ValueError("job is missing processId/baselineModel variables")
 
-    print(f"[round {iteration}] evolving '{process_id}' …", flush=True)
+    print(f"[round {iteration}] evolving '{process_id}'"
+          + (f" with prompt '{prompt_id}'" if prompt_id else "") + " …", flush=True)
+    payload = {"processId": process_id, "baselineModel": baseline}
+    if prompt_id:
+        payload["promptId"] = prompt_id
     res = _post(
         PROCESSOS,
         "/api/harness/evolve",
-        {"processId": process_id, "baselineModel": baseline},
+        payload,
         timeout=JOB_TIMEOUT_MS / 1000.0,
     )
     ranking = res.get("ranking", {})
