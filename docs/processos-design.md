@@ -77,6 +77,30 @@ ProcessOS does **not** get privileged access. If it needs something Nano can't y
 express (e.g. shadow-execution dry-run worker semantics, idempotency keys), that is
 a *Nano public-API* addition designed on its own merits, not a ProcessOS hook.
 
+### 1.4 Two engines — the client's target vs. ProcessOS's own
+
+The three contracts above bind ProcessOS to the **client's production Nano — the
+read-only analysis target**. But ProcessOS's own optimization loop is *itself* a Nano
+process (§7.9, §10): hypothesise / evaluate are tasks, the engine is the verifier, and
+a human user task makes it a cockpit. That meta-workload **cannot run on the client's
+target** — the target is read-only, and the consultants (ProcessOS + human + droid) do
+not deploy their own choreography onto the client's engine. So ProcessOS runs its
+**own** Nano engine for the pilot loop, distinct from the target it analyses:
+
+- **target** (`NANO_TARGET_URL`) — the client's production engine; read over §1.1,
+  written only via the §1.2 deploy/route verbs when promoting a cohort. Never hosts
+  ProcessOS's pilot loop.
+- **own** (`PROCESSOS_NANO_URL`, or a child engine ProcessOS supervises) — hosts the
+  pilot process and the meta-workers that drive it. ProcessOS can **spawn and
+  supervise** this engine itself (opt-in): learn its bound port from the gateway's
+  stdout, health-check it, **deploy the pilot BPMN on boot**, and reap it on shutdown —
+  so a factory-fresh instance comes up self-hosting with no external setup. In a
+  single-Nano dev box both resolve to one URL (back-compatible).
+
+This is the physical substrate for "the first target is always itself" (§10): the
+self-optimizing loop runs on an engine ProcessOS owns, while the client's engine stays
+a pure read-only target.
+
 ## 2. Internal architecture (inside the ProcessOS crate)
 
 A pipeline of independently-testable stages, mirroring the optimization design's
@@ -148,6 +172,13 @@ separation underneath.
 - **Separate process / service**, co-located or remote. Scales independently of the
   gateway (the reasoning/sim plane is bursty and CPU/GPU-heavy; the gateway is the
   steady hot path).
+- **Two engines, not one (§1.4).** ProcessOS reads the client's production Nano (the
+  read-only *target*) but runs its pilot loop on its **own** Nano engine, which it can
+  spawn and supervise as a child process (learn port, health-check, deploy the pilot on
+  boot, reap on shutdown). The client's engine never hosts ProcessOS's meta-workload;
+  the own engine is where "the first target is itself" (§10) physically runs. The own
+  engine is a normal Nano build (console + capture, so its own pilot traces feed back
+  through the §1.1 read contract).
 - **Read path is push:** Nano's exporter is pointed at ProcessOS's OTLP/stream
   ingest, so optimization never adds latency or polling load to production.
 - **Security boundary:** LLM keys, outbound network egress, and business-data-bearing
@@ -700,7 +731,12 @@ first-class editable BPMN deployed on Nano (with ≥1 user task), not Rust. (2) 
 stepper; user tasks surface as the human's turns. (3) **Per-instance persistence and
 individuation** of the three plastic surfaces (cockpit prefs + objective definition;
 droid slot = selected/authored prompts + model; experience = calibration) — the prompt
-library is the first such surface; the pilot process and objective are next.
+library is the first such surface; the pilot process and objective are next. (4) Give
+ProcessOS its **own** engine for the pilot loop (§1.4): the client's Nano is the
+read-only target, so the self-optimizing loop, its meta-workers, and the forkable pilot
+process live on an engine ProcessOS supervises (spawns on boot, deploys the pilot into,
+reaps on shutdown) — never the client's. An instance ships self-hosting: empty cockpit,
+empty droid slot, *and its own craft to fly*.
 
 ---
 
