@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The ProcessOS pilot loop, authored as a deployable Nano BPMN process (design
+  §7.9 / §10). This is "the first target is itself": the optimization loop is
+  itself a process the Nano engine runs.
+
+  The PROCESS owns the durable body — the iteration budget, the human review
+  gate, the routing, and the journal. The LLM owns judgment and the engine owns
+  proof, both inside the `pilot-evolve` service task (which calls ProcessOS's
+  /api/harness/evolve: distil production -> LLM proposes structural candidates ->
+  replay-rank proves them on real recorded traces). The human is in the cockpit
+  at the `Review` user task, steering with a droid copilot rather than firing a
+  task off to the cloud.
+
+  Instance variables expected at creation:
+    processId      string  the target process to optimize (its recorded traces
+                           are the fitness data)
+    baselineModel  string  BPMN XML the LLM redesigns from
+    maxIterations  number  iteration budget (the loop's hard stop)
+    iteration      number  start at 0; the worker increments it each round
+
+  Job types the worker must serve:
+    pilot-evolve   propose + prove one round; completes with bestName,
+                   bestConservedRate, proposed, ranking, iteration (incremented)
+
+  Routing on the operator's `decision` at Review:
+    "accept"   -> Accepted   (a human-approved, engine-proven candidate)
+    "iterate"  -> back to Evolve, while iteration < maxIterations
+    otherwise  -> Stopped    (the default/unconditional flow, declared last)
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="Definitions_pilot"
+                  targetNamespace="http://nanobpmn.dev/processos">
+  <bpmn:process id="pilotSelfOptimize" name="ProcessOS Pilot Loop" isExecutable="true">
+
+    <bpmn:startEvent id="Start" name="Begin optimization">
+      <bpmn:outgoing>toEvolve</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <bpmn:sequenceFlow id="toEvolve" sourceRef="Start" targetRef="Evolve" />
+
+    <bpmn:serviceTask id="Evolve" name="Propose &amp; prove a round">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="pilot-evolve" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>toEvolve</bpmn:incoming>
+      <bpmn:incoming>flowIterate</bpmn:incoming>
+      <bpmn:outgoing>toReview</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:sequenceFlow id="toReview" sourceRef="Evolve" targetRef="Review" />
+
+    <bpmn:userTask id="Review" name="Review candidates &amp; decide">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+      </bpmn:extensionElements>
+      <bpmn:incoming>toReview</bpmn:incoming>
+      <bpmn:outgoing>toDecide</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:sequenceFlow id="toDecide" sourceRef="Review" targetRef="Decide" />
+
+    <bpmn:exclusiveGateway id="Decide" name="Operator decision">
+      <bpmn:incoming>toDecide</bpmn:incoming>
+      <bpmn:outgoing>flowAccept</bpmn:outgoing>
+      <bpmn:outgoing>flowIterate</bpmn:outgoing>
+      <bpmn:outgoing>flowStop</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <!-- Order matters: conditional flows first, the unconditional default LAST,
+         because the engine selects the first unconditional flow it encounters. -->
+    <bpmn:sequenceFlow id="flowAccept" sourceRef="Decide" targetRef="Accepted">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">= decision = "accept"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+
+    <bpmn:sequenceFlow id="flowIterate" sourceRef="Decide" targetRef="Evolve">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">= decision = "iterate" and iteration &lt; maxIterations</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+
+    <bpmn:sequenceFlow id="flowStop" sourceRef="Decide" targetRef="Stopped" />
+
+    <bpmn:endEvent id="Accepted" name="Candidate accepted">
+      <bpmn:incoming>flowAccept</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:endEvent id="Stopped" name="Loop stopped">
+      <bpmn:incoming>flowStop</bpmn:incoming>
+    </bpmn:endEvent>
+
+  </bpmn:process>
+</bpmn:definitions>
