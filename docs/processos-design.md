@@ -360,17 +360,29 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
 - The **SimRunner is regime (a)** (logic-faithful, isolated, no contention model).
 - The **ClusterRunner measurement (slice 2a) is the regime-(c) foundation** —
   act-and-measure on a real cluster — **and** it produces exactly the
-  distributions a future **regime-(b)** queueing simulator must be *fitted from*:
-  throughput, the e2e tail, and — now — the **per-job-type queue-vs-service split**
+  distributions the **regime-(b)** queueing model is *fitted from*:
+  throughput, the e2e tail, and the **per-job-type queue-vs-service split**
   (`ClusterRunSummary.byJobType`). That split is the discriminator the resource
   layer turns on: high queue / low service ⇒ *too few workers* (scale); low queue
   / high service ⇒ *slow worker* (bind/substitute).
-- **Deferred (not M3), recorded so M3 doesn't accidentally encroach):** a regime-(b)
-  discrete-event simulator; a **third (scaling/fleet) control verb**
-  (recommend-by-default, actuate-opt-in, its own public-API design); and
-  **portfolio scope** (cross-process contention ⇒ cross-process resource
-  attribution in ingest + an aggregate objective). M3 stays *measure → rank →
-  suggest* on the existing per-process, worker-swap loop; these widen scope later.
+- The **first regime-(b) increment now exists** (`harness/queueing.rs`): an
+  `M/M/c` (Erlang-C) worker-pool model fitted from the measured per-job-type λ
+  (`samples` over the run window) and S (`avgServiceMs`), answering the
+  co-optimization doc's §4.2 question — *how many workers to hold p99 queue-wait
+  < X?* It is exposed as `GET /api/harness/cluster?...&targetP99Ms=`, which
+  attaches a per-job-type `staffing` recommendation. It is **advisory only** —
+  it actuates nothing. *Verified live:* on a 144 jobs/s run (≈10 Erlangs offered)
+  it recommended 11 / 12 / 14 / 18 workers to hold a 500 / 200 / 50 / 10 ms p99
+  queue-wait — monotonic in the target, each prediction under it, ρ < 1
+  throughout. This closes distributed *sensing* → a grounded distributed *scaling*
+  **recommendation**.
+- **Still deferred (not M3):** the fuller regime-(b) **discrete-event** simulator
+  (multi-job-type consolidation what-ifs, cross-process contention — beyond the
+  single-pool Erlang-C estimate); the **third (scaling/fleet) control verb** that
+  would *apply* a recommendation (actuate-opt-in, its own public-API design); and
+  **portfolio scope** (cross-process resource attribution in ingest + an aggregate
+  objective). M3 stays *measure → rank → suggest* on the per-process loop; an
+  Erlang-C *suggestion* fits squarely in "suggest" without crossing into actuation.
 
 ## 8. Invariants ProcessOS must honour
 

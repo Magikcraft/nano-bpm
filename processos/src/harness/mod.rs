@@ -23,6 +23,7 @@ mod example;
 mod hypothesize;
 mod llm;
 mod production;
+mod queueing;
 mod rank;
 mod sim;
 
@@ -35,6 +36,9 @@ pub use llm::{LlmConfig, LlmOverride};
 pub use production::build_baseline;
 #[allow(unused_imports)]
 pub use production::ProductionBaseline;
+pub use queueing::staff_for_summary;
+#[allow(unused_imports)]
+pub use queueing::WorkerStaffing;
 #[allow(unused_imports)]
 pub use rank::{run_scenario, HarnessReport, VariantResult};
 

@@ -27,7 +27,7 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     build_baseline, build_cluster_summary, example_scenario, run_hypothesis, run_scenario,
-    LlmConfig, LlmOverride, Scenario,
+    staff_for_summary, LlmConfig, LlmOverride, Scenario,
 };
 
 #[derive(Clone)]
@@ -212,6 +212,20 @@ struct ProductionQuery {
     sample: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClusterQuery {
+    /// Which process to summarize. When absent, the busiest sampled process is used.
+    process_id: Option<String>,
+    /// How many recent trace summaries to scan (per node).
+    limit: Option<usize>,
+    /// How many of those to pull full detail for (the queue/service split).
+    sample: Option<usize>,
+    /// When set, attach the regime-(b) queueing model's per-job-type staffing
+    /// recommendation that holds this p99 queue-wait (ms).
+    target_p99_ms: Option<u64>,
+}
+
 /// `GET /api/harness/production` — the **generation-skipped** production path:
 /// fold the live cluster's traces (T1 contract) into the baseline a candidate
 /// search must beat for one process. On a Nano read failure we return 502; on an
@@ -240,18 +254,35 @@ async fn harness_production(
 }
 
 /// `GET /api/harness/cluster` — the **at-scale measurement** half of the M3
-/// ClusterRunner: summarize a live run (throughput, e2e tail p50/p95/p99, and the
-/// queue/service split under load) for one process from Nano's traces. Point it at
-/// a cluster the perf-matrix is driving. 502 on a Nano read failure, 422 on an
-/// empty/unknown process.
+/// ClusterRunner: summarize a live run (throughput, e2e tail p50/p95/p99, the
+/// queue/service split under load, per-job-type breakdown, and per-node backlog
+/// sensing) for one process, unioned across every cluster node. When
+/// `targetP99Ms` is supplied, it also attaches `staffing`: the regime-(b) queueing
+/// model's per-job-type worker-count recommendation to hold that p99 queue-wait.
+/// Point it at a cluster the perf-matrix is driving. 502 on a Nano read failure, 422
+/// on an empty/unknown process.
 async fn harness_cluster(
     State(state): State<AppState>,
-    Query(q): Query<ProductionQuery>,
+    Query(q): Query<ClusterQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
     match build_cluster_summary(&state.nano, q.process_id.as_deref(), limit, sample).await {
-        Ok(summary) => Json(summary).into_response(),
+        Ok(summary) => match q.target_p99_ms {
+            // Attach the staffing recommendation derived from the measured run.
+            Some(target) => {
+                let staffing = staff_for_summary(&summary, target);
+                let mut body = serde_json::to_value(&summary).unwrap_or_default();
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert(
+                        "staffing".to_string(),
+                        serde_json::to_value(staffing).unwrap_or_default(),
+                    );
+                }
+                Json(body).into_response()
+            }
+            None => Json(summary).into_response(),
+        },
         Err(e) if e.starts_with("GET ") || e.starts_with("decode ") => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": e })),
