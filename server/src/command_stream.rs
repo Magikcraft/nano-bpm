@@ -476,15 +476,24 @@ impl Registry {
         self.conns.lock().expect("registry poisoned").insert(conn.id, conn);
     }
 
-    fn unregister(&self, id: ConnId) {
+    /// Removes a connection. Idempotent: returns `true` only the first time a
+    /// given id is removed (when the disconnect is counted), `false` on a repeat
+    /// call for an already-removed id. Both the reaper (on liveness timeout) and
+    /// `handle_socket` (after the reader loop returns) call this for the same
+    /// connection; without the guard the `nanobpm_stream_connections_active`
+    /// gauge would double-decrement and drift negative.
+    fn unregister(&self, id: ConnId) -> bool {
+        let removed = self.conns.lock().expect("registry poisoned").remove(&id);
+        let Some(conn) = removed else {
+            return false;
+        };
+        conn.closed.store(true, Ordering::Relaxed);
         crate::metrics::stream_connection_dec();
-        if let Some(conn) = self.conns.lock().expect("registry poisoned").remove(&id) {
-            conn.closed.store(true, Ordering::Relaxed);
-        }
         let mut by_type = self.by_type.lock().expect("registry poisoned");
         for ids in by_type.values_mut() {
             ids.retain(|&other| other != id);
         }
+        true
     }
 
     /// Indexes `id` under `job_type` for dispatch (idempotent).
@@ -1972,6 +1981,49 @@ mod fair_plan_tests {
         assert_eq!(b.iter().sum::<usize>(), 65);
         assert_eq!(a, vec![22, 22, 21]);
         assert_eq!(b, vec![21, 22, 22]);
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn test_connection(id: ConnId) -> Arc<Connection> {
+        let (tx, _rx) = mpsc::channel::<ServerFrame>(1);
+        Arc::new(Connection {
+            id,
+            tx,
+            subs: Mutex::new(HashMap::new()),
+            submission_outstanding: AtomicI64::new(0),
+            submission_window: 0,
+            closed: AtomicBool::new(false),
+            wants_redispatch: Arc::new(AtomicBool::new(false)),
+            last_seen_ms: AtomicU64::new(0),
+            shutdown: Notify::new(),
+        })
+    }
+
+    #[test]
+    fn unregister_is_idempotent_so_the_active_gauge_cannot_drift_negative() {
+        // The reaper and handle_socket can both unregister the SAME connection
+        // (reaper marks it dead + unregisters; the reader loop then returns and
+        // handle_socket unregisters again). The disconnect must be counted exactly
+        // once — the second call returns false and does NOT decrement the gauge.
+        let registry = Registry::new();
+        let conn = test_connection(7);
+        registry.register(conn.clone());
+
+        assert_eq!(registry.all_connections().len(), 1, "registered once");
+        assert!(registry.unregister(7), "first unregister removes + counts");
+        assert!(registry.all_connections().is_empty(), "connection gone");
+        assert!(
+            !registry.unregister(7),
+            "second unregister is a no-op: it must not decrement the gauge again"
+        );
+        assert!(
+            !registry.unregister(999),
+            "unregistering an unknown id is a no-op too"
+        );
     }
 }
 

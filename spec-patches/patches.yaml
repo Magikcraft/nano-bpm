@@ -39,3 +39,49 @@
   target: components.schemas.CreateProcessInstanceResult.required
   append:
     - processCompleted
+
+# --- topology: advertise the nanobpmn engine -------------------------------
+#
+# nanobpmn is a superset of the Camunda Orchestration Cluster API. The topology
+# response gains an OPTIONAL `nano` object so SDK clients can detect, from a
+# single unauthenticated /v2/topology call, that they are talking to a nanobpmn
+# gateway (not stock Camunda) and may upgrade to the bidirectional command
+# stream (workers/producers over a single WebSocket) instead of REST long-poll.
+#
+# `nano` is deliberately NOT marked `required`: its ABSENCE means a stock Camunda
+# gateway, its PRESENCE means nanobpmn. Generated as `Option<NanoEngineInfo>` in
+# Rust, so a nano-aware SDK can deserialize either engine's topology unchanged.
+- file: cluster.yaml
+  target: components.schemas
+  merge:
+    NanoEngineInfo:
+      description: |
+        Present only on nanobpmn gateways. Signals that this engine implements a
+        superset of the Camunda Orchestration Cluster API and advertises the
+        streaming command-stream endpoint that clients may upgrade to.
+      type: object
+      required:
+        - engine
+        - commandStreamPath
+      properties:
+        engine:
+          description: Engine identifier. Always "nanobpmn".
+          type: string
+          example: nanobpmn
+        version:
+          description: The nanobpmn gateway version.
+          type: string
+          example: 0.1.0
+        commandStreamPath:
+          description: |
+            Path of the bidirectional command-stream WebSocket. Clients may
+            upgrade to this endpoint to create instances and drain jobs over a
+            single connection instead of REST long-poll.
+          type: string
+          example: /command-stream
+
+- file: cluster.yaml
+  target: components.schemas.TopologyResponse.properties
+  merge:
+    nano:
+      $ref: '#/components/schemas/NanoEngineInfo'

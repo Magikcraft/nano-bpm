@@ -1929,8 +1929,16 @@ impl ServerImpl {
             cluster_size: num_nodes as i32,
             partitions_count: num_partitions as i32,
             replication_factor: 1,
-            gateway_version: version,
+            gateway_version: version.clone(),
             last_completed_change_id: String::new(),
+            // Advertise that this is a nanobpmn gateway (a superset of the Camunda
+            // Orchestration Cluster API). Its presence lets SDK clients detect nano
+            // from a single /v2/topology call and upgrade to the command stream.
+            nano: Some(models::NanoEngineInfo {
+                engine: "nanobpmn".to_string(),
+                version: Some(version),
+                command_stream_path: "/command-stream".to_string(),
+            }),
         };
 
         Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology_response))
@@ -8262,6 +8270,13 @@ mod clustered_startup_tests {
         // 1-based partition ids: node 0 owns internal {0,2} -> {1,3}; node 1 {1,3} -> {2,4}.
         assert_eq!(by_node.get(&0), Some(&vec![1, 3]), "node 0 owns partitions 1 & 3 (1-based)");
         assert_eq!(by_node.get(&1), Some(&vec![2, 4]), "node 1 owns partitions 2 & 4 (1-based)");
+
+        // The response advertises that this is a nanobpmn gateway so SDK clients
+        // can detect the engine and upgrade to the command stream.
+        let nano = t.nano.expect("nanobpmn topology must advertise the `nano` object");
+        assert_eq!(nano.engine, "nanobpmn");
+        assert_eq!(nano.command_stream_path, "/command-stream");
+        assert!(nano.version.is_some(), "nano advertises the gateway version");
     }
 
     #[test]
