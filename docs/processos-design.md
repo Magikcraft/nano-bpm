@@ -407,9 +407,20 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   `POST /api/harness/hypothesize`. Zero-sample rows carry no signal and are skipped.
   Still synthetic: the *inputs* replayed through the engine remain authored scenario
   inputs — the third wire, **T2 recorded-input replay** of *historical* production
-  inputs, requires Nano to expose each instance's **creation** variables (the
-  `/console/api/instances/{key}` read returns *current* merged variables, not the
-  original inputs), so it stays the documented integration boundary.
+  inputs. **Re-scoped (2026-06):** this does *not* require an engine-core change or a
+  journal-reach as previously documented. `Event::ProcessInstanceCreated` already
+  carries `variables` (the creation inputs), and those events already flow through the
+  same exporter batches the Tier-A `TraceStore` consumes — the projection simply
+  *discards* the field today (`server/src/console/trace.rs` folds the create arm with
+  `..`). So T2 is a **server/console trace feature**, inside Nano's existing observe
+  leg: retain creation variables (and, for faithful replay, the ordered external
+  stimuli — job-completion outputs, message/timer vars — also already on the stream)
+  on the trace and expose them on `/console/api/traces/{key}`. Must be size-capped +
+  opt-in (`NANOBPMN_TRACE_VARIABLES`): payloads can be large (the engine has a
+  `variables_spilled` spill path) and variables are a PII surface once shipped to an
+  LLM. The same retained creation-variable snapshot also serves modeler **test-mode
+  FEEL debugging** (snapshot at the incident + failing expression + error). The
+  integration boundary was therefore a *projection gap*, not a contract gap.
 - **Prompt library — the LLM/prompt as an experimental variable (now exists)**
   (`harness/prompts.rs`): the experimental phase varies not only the candidate
   *models* but the *prompts and LLMs* used to generate them. The LLM was already a
