@@ -478,6 +478,86 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   per-process loop; calibration and an Erlang-C *suggestion* fit squarely in
   "suggest" without crossing into actuation.
 
+### 7.7 Evaluation fidelity & the mocking infra (design rationale)
+
+A BPMN model is a **coordination skeleton**; its semantics live in the workers (FEEL +
+external job logic). So a candidate model cannot be evaluated in isolation from the
+business logic that materializes it — to evaluate a *re-decomposition* you need a model
+of what the new pieces *do*. The tractable framing is a **fidelity ladder**, with the
+rung chosen per candidate by how far it diverges from the baseline:
+
+1. **Distributional** (what `SimRunner` does today): each job type carries a calibrated
+   service-time + failure distribution; the real engine runs, jobs are served
+   statistically. Evaluates timing / cost / structural changes (parallelize, batch,
+   reorder, retries, priority). Needs distributions, not per-instance inputs. **No mock
+   infra.**
+2. **Recorded-input replay** (Tier-2 stimulus log): replay creation inputs + recorded
+   job/message outputs. Higher fidelity — routing uses *real* variable values and the
+   end-state is checkable. **Works only for input-compatible candidates**: every job the
+   candidate issues has a recorded output *of that job type* (hence the stimulus
+   `reference` is the job type, not the element position) and routing stays on
+   historically-observed paths.
+3. **Generative mock**: for candidates that re-draw task boundaries / add job types
+   history never exercised, the same LLM lever generates a *mock* `(job_type,
+   input_vars) → (output_vars, service_time)`, not just a candidate model.
+
+Key principles that make Level 3 safe and cheap enough to be useful:
+
+- **Reconstruct-history gate.** A generated mock must first reproduce the *original*
+  model's historical outputs/latency within tolerance (original model + baseline mock vs
+  the recorded inputs). A mock that can't reproduce the past hasn't earned the right to
+  score a counterfactual. Its residual is the **noise floor** — candidate differences
+  below it aren't real. (This is backtesting; history is the holdout.)
+- **Boundary conservation.** However the middle is re-decomposed, the instance-level
+  `(creation inputs) → (terminal outputs)` mapping should be preserved for replayed
+  historical cases. The stimulus log is thus also the **acceptance test** for any
+  higher-level mock: free internally, falsifiable at the process boundary.
+- **Rank, don't truth.** Phase 4 (production cohort) is the real arbiter; the simulator
+  only has to *shortlist* (pick the 2–3 of N worth a real cohort). That drops the
+  fidelity bar enormously and is continuously checkable — every cohort yields ground
+  truth, so *sim rank-correlation with production* can be measured and the mocks
+  recalibrated. The capability **bootstraps**: early experiments are Level-1-only
+  (conservative, high trust); as the mock library earns validation the residual shrinks
+  and more divergent candidates unlock. It ratchets — it need not be complete on day one.
+- **The customer app stays decoupled.** What's needed is a *contract-level* model of the
+  workers, not the live app. The real app is the offline calibration/validation source
+  (from the recorded traces) and the Phase-4 runtime (real anyway); evaluation runs
+  against the mock. The **plastic layer is the mock**; the engine stays real; Nano stays
+  read-only. The deformable "integrated system" = real engine + generated/calibrated
+  mock.
+
+Two costs to **surface, not hide**: (a) a candidate that introduces new job types needs
+new workers to deploy — flag *requires new workers: [job types]* per candidate (note the
+alignment: candidates cheapest to *evaluate* (replay) are cheapest to *deploy* (existing
+workers); divergence costs on both ends). (b) Evaluation must never collapse tiers into
+one number — **fidelity tier + confidence are first-class outputs** (a Level-1 result is
+"measured ±replay-residual"; a Level-3 result is "simulated, mock-validated ±X").
+
+### 7.8 Console UX — the four phases as one experiment's lifecycle
+
+The four phases (production analysis → hypothesis generation → stress-test & ranking →
+production cohort + evaluation) are a **pipeline**, not four destinations; making them
+top-level nav would feel disjoint. Navigation is **Console → Process → Experiment**, with
+a global left rail of **Console · Processes · Prompts · Experiments** (Prompts and
+Experiments are global because both are reused across processes — Prompts is the
+experimental-variable library).
+
+- **Console**: fleet stats + deployed processes with per-process stats (throughput,
+  p50/p99 e2e, cost proxy, incident rate, # running experiments) — Phase 1 at fleet level.
+- **Process page**: Phase-1 scoped to one process (calibrated baseline + backing data
+  window) on top; its experiments list + *New experiment* below.
+- **Experiment page** = the spine: a horizontal **4-step stepper** mirroring observe →
+  hypothesize → test → confirm: (1) **Baseline/Analysis** — the calibrated snapshot +
+  recorded-input dataset it forked from; (2) **Hypotheses** — pick/author prompt + choose
+  LLM → generate candidates (validation status); (3) **Stress-test & rank** — select
+  candidates → evaluate → ranked rows showing **fidelity tier, metrics, confidence band,
+  reconstruct-history pass/fail, "requires new workers"**; (4) **Production cohort** —
+  promote a shortlist, measure live e2e + cost, and show the **predicted-vs-measured
+  delta** as the hero number (the trust signal for the whole apparatus). A stepper is
+  linearly navigable, one CTA per step, and teaches the mental model by walking it; the
+  global **Experiments** list serves the "what's running everywhere" need.
+
+
 ## 8. Invariants ProcessOS must honour
 
 - **One-way dependency, build-enforced.** Nano never imports ProcessOS; ProcessOS
