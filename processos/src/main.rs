@@ -10,6 +10,7 @@
 //! production is unaffected.
 
 mod contracts;
+mod cockpit;
 mod harness;
 mod report;
 
@@ -100,8 +101,13 @@ async fn main() {
         .route("/", get(landing))
         .route("/features", get(features))
         .route("/console", get(dashboard))
+        .route("/cockpit", get(cockpit_page))
         .route("/health", get(health))
         .route("/api/insights", get(insights))
+        .route("/api/cockpit/overview", get(cockpit_overview))
+        .route("/api/cockpit/experiments", get(cockpit_experiments).post(cockpit_create))
+        .route("/api/cockpit/experiments/{key}", get(cockpit_experiment))
+        .route("/api/cockpit/experiments/{key}/decision", post(cockpit_decision))
         .route("/harness", get(harness_dashboard))
         .route("/api/harness/example", get(harness_example))
         .route("/api/harness/example/run", get(harness_example_run))
@@ -194,6 +200,114 @@ async fn features() -> Html<&'static str> {
 async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
+
+// --- The cockpit — Console → Process → Experiment (design §7.8 / §10) ------------
+
+/// `GET /cockpit` — the single-file cockpit app (left rail, process drilldown,
+/// the four-step experiment stepper, and the persistent droid-conversation pane).
+async fn cockpit_page() -> Html<&'static str> {
+    Html(COCKPIT_HTML)
+}
+
+/// `GET /api/cockpit/overview` — target-process cards + the experiments list.
+async fn cockpit_overview(
+    State(state): State<AppState>,
+    Query(q): Query<InsightsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let sample = q.sample.unwrap_or(50).clamp(1, 500);
+    match cockpit::overview(&state.nano, limit, sample).await {
+        Ok(o) => Json(o).into_response(),
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// `GET /api/cockpit/experiments` — every experiment (pilot instance), newest first.
+async fn cockpit_experiments(
+    State(state): State<AppState>,
+    Query(q): Query<InsightsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    match cockpit::list_experiments(&state.nano, limit).await {
+        Ok(xs) => Json(xs).into_response(),
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// `GET /api/cockpit/experiments/{key}` — the full cockpit view of one experiment.
+async fn cockpit_experiment(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    match cockpit::experiment_detail(&state.nano, &key).await {
+        Ok(d) => Json(d).into_response(),
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// `POST /api/cockpit/experiments` — start an experiment for a target process. If
+/// no `baselineModel` is supplied, the latest deployed BPMN for `processId` is used.
+async fn cockpit_create(
+    State(state): State<AppState>,
+    Json(req): Json<CockpitCreateRequest>,
+) -> impl IntoResponse {
+    let baseline = match req.baseline_model {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => match cockpit::latest_process_xml(&state.nano, &req.process_id).await {
+            Ok(xml) => xml,
+            Err(e) => return bad_gateway(e),
+        },
+    };
+    let max_iterations = req.max_iterations.unwrap_or(2).clamp(1, 50);
+    match cockpit::create_experiment(&state.nano, &req.process_id, baseline, max_iterations).await {
+        Ok(key) => Json(serde_json::json!({ "instanceKey": key })).into_response(),
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// `POST /api/cockpit/experiments/{key}/decision` — the pilot's turn at `Review`.
+async fn cockpit_decision(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<CockpitDecisionRequest>,
+) -> impl IntoResponse {
+    let decision = req.decision.trim();
+    if !matches!(decision, "accept" | "iterate" | "stop") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "decision must be accept | iterate | stop" })),
+        )
+            .into_response();
+    }
+    match cockpit::submit_decision(&state.nano, &key, decision).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => bad_gateway(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CockpitCreateRequest {
+    process_id: String,
+    #[serde(default)]
+    baseline_model: Option<String>,
+    #[serde(default)]
+    max_iterations: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CockpitDecisionRequest {
+    decision: String,
+}
+
+fn bad_gateway(e: String) -> axum::response::Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({ "error": e })),
+    )
+        .into_response()
+}
+
 
 // --- The optimization harness (MVP, design §7) ----------------------------------
 
@@ -977,6 +1091,9 @@ async fn run_scenario_blocking(scenario: Scenario) -> axum::response::Response {
 async fn harness_dashboard() -> Html<&'static str> {
     Html(HARNESS_HTML)
 }
+
+/// The cockpit single-file app (design §7.8 / §10), served at `/cockpit`.
+const COCKPIT_HTML: &str = include_str!("cockpit.html");
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
 <html lang="en">

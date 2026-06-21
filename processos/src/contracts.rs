@@ -209,6 +209,76 @@ impl NanoClient {
         self.get_json(&url).await
     }
 
+    /// POST `path` (relative to the base URL) with a JSON body and decode the JSON
+    /// response. Used by the cockpit to drive the control surface (create pilot
+    /// instances, search user tasks / variables) over Nano's public v2 REST API.
+    pub async fn post_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<T, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let res = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("POST {url}: HTTP {}", res.status()));
+        }
+        res.json::<T>()
+            .await
+            .map_err(|e| format!("decode {url}: {e}"))
+    }
+
+    /// POST `path` expecting a success status with no body of interest (e.g. a
+    /// `204` user-task completion). Returns `Ok(())` on any 2xx.
+    pub async fn post_no_content(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<(), String> {
+        let url = format!("{}{}", self.base_url, path);
+        let res = self
+            .http
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("POST {url}: HTTP {}", res.status()));
+        }
+        Ok(())
+    }
+
+    /// GET `path` (relative to the base URL) and decode the JSON response. Used to
+    /// fetch a deployed process definition's BPMN XML for forking an experiment.
+    pub async fn get_path<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, String> {
+        let url = format!("{}{}", self.base_url, path);
+        self.get_json(&url).await
+    }
+
+    /// GET `path` (relative to the base URL) and return the raw response body as a
+    /// string (the process-definition XML endpoint returns `text/xml`, not JSON).
+    pub async fn get_text(&self, path: &str) -> Result<String, String> {
+        let url = format!("{}{}", self.base_url, path);
+        let res = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("GET {url}: HTTP {}", res.status()));
+        }
+        res.text()
+            .await
+            .map_err(|e| format!("read {url}: {e}"))
+    }
+
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, String> {
         let res = self
             .http

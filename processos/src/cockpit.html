@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ProcessOS — Cockpit</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  a { color: inherit; text-decoration: none; }
+  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  /* left rail */
+  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
+  .brand { font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
+  .brand .dot { color: #a5b4fc; }
+  .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
+  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; cursor: pointer; }
+  .nav a:hover { background: #18181b; color: #e4e4e7; }
+  .nav a.active { background: #1d1d22; color: #c7d2fe; }
+  /* main */
+  main { padding: 26px 30px; max-width: 1180px; }
+  .crumbs { color: #71717a; font-size: 12px; margin-bottom: 14px; }
+  .crumbs a { color: #a5b4fc; cursor: pointer; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  h2 { font-size: 12px; color: #a1a1aa; text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
+  .lede { color: #a1a1aa; font-size: 13px; margin: 0 0 18px; max-width: 720px; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; }
+  .card { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 13px 16px; min-width: 120px; }
+  .card .n { font-size: 22px; font-weight: 650; }
+  .card .l { color: #8b8b93; font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 12px; }
+  .tile { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
+  .tile:hover { border-color: #3f3f6a; transform: translateY(-1px); }
+  .tile h3 { margin: 0 0 4px; font-size: 15px; font-family: ui-monospace, monospace; color: #c7d2fe; }
+  .tile .meta { color: #8b8b93; font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.run { background: #0c2a4a; color: #93c5fd; }
+  .pill.wait { background: #3a2e07; color: #fcd34d; }
+  .pill.accept { background: #06301c; color: #6ee7b7; }
+  .pill.stop { background: #2a0a0a; color: #fca5a5; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #1f1f23; }
+  th { color: #8b8b93; font-weight: 500; font-size: 12px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .btn { background: #1d1d22; color: #e4e4e7; border: 1px solid #34343c; border-radius: 8px; padding: 7px 14px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  .btn:hover { border-color: #555; }
+  .btn.primary { background: #4338ca; border-color: #4338ca; color: #eef2ff; }
+  .btn.primary:hover { background: #4f46e5; }
+  .btn.ghost { background: transparent; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .err { color: #fca5a5; background: #1f0a0a; border: 1px solid #3a1414; padding: 12px 16px; border-radius: 8px; }
+  .muted { color: #71717a; }
+  /* stepper */
+  .stepper { display: flex; gap: 0; margin: 8px 0 24px; }
+  .step { flex: 1; position: relative; padding: 14px 16px; border: 1px solid #26262b; background: #131316; }
+  .step:first-child { border-radius: 10px 0 0 10px; }
+  .step:last-child { border-radius: 0 10px 10px 0; }
+  .step + .step { border-left: none; }
+  .step .k { font-size: 11px; color: #6b6b73; text-transform: uppercase; letter-spacing: .05em; }
+  .step .t { font-weight: 650; margin: 3px 0; }
+  .step .d { font-size: 12px; color: #9b9ba3; min-height: 16px; }
+  .step.done { border-color: #1f3a2a; background: #0e1a12; }
+  .step.done .t { color: #6ee7b7; }
+  .step.active { border-color: #4338ca; background: #14132a; box-shadow: inset 0 2px 0 #6366f1; }
+  .step.active .t { color: #c7d2fe; }
+  .step .badge { position: absolute; top: 12px; right: 14px; font-size: 13px; }
+  /* cockpit layout: detail + droid pane */
+  .cockpit { display: grid; grid-template-columns: 1fr 360px; gap: 20px; align-items: start; }
+  .pane { background: #0e0e11; border: 1px solid #26262b; border-radius: 12px; padding: 14px 16px; }
+  .pane h2 { margin-top: 0; }
+  .convo { display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow-y: auto; }
+  .turn { padding: 9px 12px; border-radius: 10px; font-size: 13px; }
+  .turn .who { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
+  .turn.engine { background: #121216; border: 1px solid #26262b; }
+  .turn.engine .who { color: #8b8b93; }
+  .turn.droid { background: #11142a; border: 1px solid #28306a; }
+  .turn.droid .who { color: #a5b4fc; }
+  .turn.pilot { background: #1b1407; border: 1px solid #4a3a12; }
+  .turn.pilot .who { color: #fcd34d; }
+  .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+  .hero { font-size: 30px; font-weight: 700; color: #6ee7b7; }
+  .hero.sub { font-size: 12px; color: #8b8b93; font-weight: 400; }
+  dialog { background: #141417; color: #e4e4e7; border: 1px solid #34343c; border-radius: 12px; padding: 0; max-width: 520px; }
+  dialog::backdrop { background: rgba(0,0,0,.6); }
+  .dlg-body { padding: 20px 22px; }
+  .dlg-body label { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
+  .dlg-body input, .dlg-body select { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
+  .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid #26262b; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">Process<span class="dot">OS</span></div>
+    <div class="tag">the cockpit</div>
+    <nav class="nav">
+      <a data-view="console">Console</a>
+      <a data-view="processes">Processes</a>
+      <a data-view="prompts">Prompts</a>
+      <a data-view="experiments">Experiments</a>
+    </nav>
+  </aside>
+  <main id="main">Loading…</main>
+</div>
+
+<dialog id="newDlg">
+  <div class="dlg-body">
+    <h2 style="margin-top:0">New experiment</h2>
+    <p class="muted" style="font-size:12px">Fork an experiment on <b id="dlgProc" style="font-family:ui-monospace,monospace;color:#c7d2fe"></b>. The droid proposes redesigns; the engine proves them on the recorded dataset; you decide.</p>
+    <label>Iteration budget (max rounds)</label>
+    <input id="dlgIters" type="number" min="1" max="50" value="2" />
+  </div>
+  <div class="dlg-foot">
+    <button class="btn ghost" onclick="document.getElementById('newDlg').close()">Cancel</button>
+    <button class="btn primary" id="dlgGo">Start experiment</button>
+  </div>
+</dialog>
+
+<script>
+const $ = s => document.querySelector(s);
+const main = $('#main');
+let STATE = { view: 'console', proc: null, exp: null };
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function ms(v){ return v==null ? '—' : (v>=1000 ? (v/1000).toFixed(2)+'s' : Math.round(v)+'ms'); }
+function pct(v){ return v==null ? '—' : (v*100).toFixed(1)+'%'; }
+function ago(t){ if(!t) return ''; const s=(Date.now()-t)/1000; if(s<60) return Math.round(s)+'s ago'; if(s<3600) return Math.round(s/60)+'m ago'; return Math.round(s/3600)+'h ago'; }
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const txt = await r.text();
+  const d = txt ? JSON.parse(txt) : {};
+  if(!r.ok) throw new Error(d.error || ('HTTP '+r.status));
+  return d;
+}
+
+function setActive(){ document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('active', a.dataset.view===STATE.view)); }
+
+function expPill(e){
+  if(e.awaitingPilot) return '<span class="pill wait">awaiting you</span>';
+  if(e.outcome!=='completed') return '<span class="pill run">running</span>';
+  return '<span class="pill accept">done</span>';
+}
+
+// ---- Console ----
+async function renderConsole(){
+  STATE.view='console'; setActive(); main.innerHTML='Loading…';
+  let d; try { d = await api('/api/cockpit/overview'); } catch(e){ return fail(e); }
+  const totI = d.processes.reduce((a,p)=>a+p.instances,0);
+  const totX = d.experiments.length;
+  const waiting = d.experiments.filter(e=>e.awaitingPilot).length;
+  let h = '<h1>Console</h1><p class="lede">Processes that optimize themselves — with a human copilot in the loop. Read production, hypothesize better variants, prove them on real engines, roll winners to production in cohorts.</p>';
+  h += '<div class="cards">'
+     + card(d.processes.length,'processes') + card(totI,'instances (sampled)')
+     + card(totX,'experiments') + card(waiting,'awaiting you') + '</div>';
+  h += '<h2>Processes</h2>';
+  h += d.processes.length ? '<div class="grid">'+d.processes.map(procTile).join('')+'</div>'
+     : '<p class="muted">No target processes sampled yet. Start some instances on the cluster.</p>';
+  h += '<h2>Recent experiments</h2>' + expTable(d.experiments.slice(0,8));
+  main.innerHTML = h;
+}
+function card(n,l){ return '<div class="card"><div class="n">'+n+'</div><div class="l">'+esc(l)+'</div></div>'; }
+function procTile(p){
+  return '<div class="tile" onclick="goProcess(\''+esc(p.processId)+'\')">'
+    + '<h3>'+esc(p.processId)+'</h3>'
+    + '<div class="meta">'+p.instances+' instances · '+p.completed+' completed · avg '+ms(p.avgDurationMs)+' · p95 '+ms(p.p95DurationMs)+'</div>'
+    + '<div class="meta" style="margin-top:6px">'+(p.bottleneck?('bottleneck <b style="color:#fca5a5">'+esc(p.bottleneck)+'</b> · '):'')
+    + '<b style="color:#c7d2fe">'+p.experiments+'</b> experiment'+(p.experiments===1?'':'s')+'</div></div>';
+}
+
+// ---- Processes ----
+async function renderProcesses(){
+  STATE.view='processes'; setActive(); main.innerHTML='Loading…';
+  let d; try { d = await api('/api/cockpit/overview'); } catch(e){ return fail(e); }
+  let h = '<h1>Processes</h1><p class="lede">Deployed target processes. Open one to see its production baseline and its experiments.</p>';
+  h += d.processes.length ? '<div class="grid">'+d.processes.map(procTile).join('')+'</div>' : '<p class="muted">No processes yet.</p>';
+  main.innerHTML = h;
+}
+
+function goProcess(pid){ STATE.proc=pid; renderProcess(pid); }
+async function renderProcess(pid){
+  STATE.view='processes'; setActive(); main.innerHTML='Loading…';
+  let d; try { d = await api('/api/cockpit/overview'); } catch(e){ return fail(e); }
+  const p = d.processes.find(x=>x.processId===pid);
+  const xs = d.experiments.filter(e=>e.targetProcessId===pid);
+  let h = '<div class="crumbs"><a onclick="renderProcesses()">Processes</a> / '+esc(pid)+'</div>';
+  h += '<h1 style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(pid)+'</h1>';
+  if(p){
+    h += '<div class="cards" style="margin-top:10px">'
+       + card(p.instances,'instances') + card(p.completed,'completed')
+       + card(ms(p.avgDurationMs),'avg e2e') + card(ms(p.p95DurationMs),'p95 e2e')
+       + card(p.incidentInstances,'with incidents') + '</div>';
+  }
+  h += '<div style="display:flex;align-items:center;justify-content:space-between"><h2>Experiments</h2>'
+     + '<button class="btn primary" onclick="openNew(\''+esc(pid)+'\')">+ New experiment</button></div>';
+  h += expTable(xs);
+  main.innerHTML = h;
+}
+
+// ---- Experiments list ----
+async function renderExperiments(){
+  STATE.view='experiments'; setActive(); main.innerHTML='Loading…';
+  let xs; try { xs = await api('/api/cockpit/experiments'); } catch(e){ return fail(e); }
+  let h = '<h1>Experiments</h1><p class="lede">Every optimization run across the fleet. An experiment is a pilot loop on the engine: the droid proposes, the engine proves, you decide.</p>';
+  h += expTable(xs);
+  main.innerHTML = h;
+}
+function expTable(xs){
+  if(!xs || !xs.length) return '<p class="muted">No experiments yet.</p>';
+  let h = '<table><thead><tr><th>Experiment</th><th>Target</th><th>Best candidate</th><th class="num">conserved</th><th class="num">round</th><th>status</th></tr></thead><tbody>';
+  for(const e of xs){
+    h += '<tr style="cursor:pointer" onclick="goExp(\''+esc(e.instanceKey)+'\')">'
+      + '<td><b>#'+esc(e.instanceKey)+'</b> <span class="muted">'+ago(e.startedAt)+'</span></td>'
+      + '<td style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(e.targetProcessId||'—')+'</td>'
+      + '<td>'+esc(e.bestName||'—')+'</td>'
+      + '<td class="num">'+pct(e.bestConservedRate)+'</td>'
+      + '<td class="num">'+(e.iteration==null?'—':e.iteration+(e.maxIterations?(' / '+e.maxIterations):''))+'</td>'
+      + '<td>'+expPill(e)+'</td></tr>';
+  }
+  return h+'</tbody></table>';
+}
+
+// ---- Experiment detail (the cockpit) ----
+function goExp(key){ STATE.exp=key; renderExp(key); }
+async function renderExp(key){
+  STATE.view='experiments'; setActive(); main.innerHTML='Loading…';
+  let d; try { d = await api('/api/cockpit/experiments/'+key); } catch(e){ return fail(e); }
+  const s = d.summary;
+  let h = '<div class="crumbs"><a onclick="renderExperiments()">Experiments</a> / #'+esc(key)+'</div>';
+  h += '<div style="display:flex;align-items:baseline;gap:12px"><h1>Experiment #'+esc(key)+'</h1>'+expPill(s)+'</div>';
+  h += '<p class="lede">Optimizing <b style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(s.targetProcessId||'—')+'</b>. The shared instrument is the verifier’s gradient — the conserved-rate of the production boundary on real recorded traces.</p>';
+
+  // stepper
+  h += '<div class="stepper">'+d.steps.map(st => {
+    const badge = st.status==='done' ? '✓' : (st.status==='active' ? '◆' : '');
+    return '<div class="step '+st.status+'"><div class="badge">'+badge+'</div>'
+      + '<div class="k">'+esc(st.label)+'</div>'
+      + '<div class="t">'+({baseline:'Observe',hypotheses:'Hypothesize',rank:'Test',decision:'Confirm'}[st.id]||'')+'</div>'
+      + '<div class="d">'+esc(st.detail||'')+'</div></div>';
+  }).join('')+'</div>';
+
+  // cockpit: hero + decision on the left, droid pane on the right
+  h += '<div class="cockpit"><div>';
+  h += '<div class="pane"><h2>Verifier gradient</h2>'
+     + '<div class="hero">'+pct(s.bestConservedRate)+'</div>'
+     + '<div class="hero sub">boundary conserved by “'+esc(s.bestName||'—')+'” on real traces</div>';
+  if(d.pendingUserTaskKey){
+    h += '<div class="actions">'
+      + '<button class="btn primary" onclick="decide(\''+esc(key)+'\',\'accept\')">Accept</button>'
+      + '<button class="btn" onclick="decide(\''+esc(key)+'\',\'iterate\')">Ask droid to iterate</button>'
+      + '<button class="btn ghost" onclick="decide(\''+esc(key)+'\',\'stop\')">Stop loop</button></div>'
+      + '<p class="muted" style="font-size:12px;margin-top:8px">Iterate is available while round &lt; budget ('+(s.maxIterations||'?')+').</p>';
+  } else if(s.outcome==='completed'){
+    h += '<p class="muted" style="margin-top:12px">Loop finished — '+esc(d.finalOutcome||'')+'.</p>';
+  } else {
+    h += '<p class="muted" style="margin-top:12px">The droid is working — proposing and proving a round on the engine…</p>';
+  }
+  h += '</div></div>';
+
+  // droid pane
+  h += '<div class="pane"><h2>Cockpit conversation</h2><div class="convo">'
+     + d.conversation.map(t => '<div class="turn '+esc(t.role)+'"><div class="who">'+({engine:'Engine',droid:'Droid',pilot:'Pilot'}[t.role]||t.role)+'</div>'+esc(t.text)+'</div>').join('')
+     + '</div></div>';
+  h += '</div>';
+  main.innerHTML = h;
+}
+
+async function decide(key, decision){
+  document.querySelectorAll('.actions .btn').forEach(b=>b.disabled=true);
+  try { await api('/api/cockpit/experiments/'+key+'/decision', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decision})}); }
+  catch(e){ alert('Decision failed: '+e.message); }
+  setTimeout(()=>renderExp(key), 600);
+}
+
+// ---- Prompts ----
+async function renderPrompts(){
+  STATE.view='prompts'; setActive(); main.innerHTML='Loading…';
+  let xs; try { xs = await api('/api/prompts'); } catch(e){ return fail(e); }
+  const list = Array.isArray(xs) ? xs : (xs.prompts||[]);
+  let h = '<h1>Prompts</h1><p class="lede">The droid’s skills — the system prompts that drive hypothesis generation. The experimental-variable library, reused across processes.</p>';
+  if(!list.length){ h += '<p class="muted">No prompts.</p>'; main.innerHTML=h; return; }
+  h += '<div class="grid">'+list.map(p =>
+    '<div class="tile"><h3>'+esc(p.id||p.name||'prompt')+'</h3><div class="meta">'+esc((p.description||p.body||'').slice(0,160))+'</div></div>'
+  ).join('')+'</div>';
+  main.innerHTML = h;
+}
+
+// ---- New experiment dialog ----
+function openNew(pid){
+  $('#dlgProc').textContent = pid;
+  const dlg = $('#newDlg'); dlg.dataset.proc = pid; dlg.showModal();
+}
+$('#dlgGo').onclick = async () => {
+  const dlg = $('#newDlg'); const pid = dlg.dataset.proc;
+  const iters = parseInt($('#dlgIters').value, 10) || 2;
+  $('#dlgGo').disabled = true;
+  try {
+    const r = await api('/api/cockpit/experiments', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({processId:pid, maxIterations:iters})});
+    dlg.close(); goExp(r.instanceKey);
+  } catch(e){ alert('Could not start experiment: '+e.message); }
+  finally { $('#dlgGo').disabled = false; }
+};
+
+function fail(e){ main.innerHTML = '<div class="err">'+esc(e.message||e)+'</div>'; }
+
+document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
+  const v = a.dataset.view;
+  if(v==='console') renderConsole();
+  else if(v==='processes') renderProcesses();
+  else if(v==='prompts') renderPrompts();
+  else if(v==='experiments') renderExperiments();
+});
+
+renderConsole();
+</script>
+</body>
+</html>
