@@ -102,7 +102,11 @@ array and no prose. Each element is an object: {\"name\": string, \"rationale\":
 \"model\": string} where \"model\" is the full BPMN XML of the candidate.";
 
 /// Build the user prompt: the baseline model plus the distilled production signal.
-pub fn build_evolve_prompt(signal: &DatasetSignal, baseline_model: &str) -> String {
+pub fn build_evolve_prompt(
+    signal: &DatasetSignal,
+    baseline_model: &str,
+    pilot_note: Option<&str>,
+) -> String {
     let job_types = if signal.job_types.is_empty() {
         "(none recorded)".to_string()
     } else {
@@ -115,12 +119,20 @@ pub fn build_evolve_prompt(signal: &DatasetSignal, baseline_model: &str) -> Stri
     };
     let sample = serde_json::to_string(&signal.sample_input).unwrap_or_else(|_| "null".to_string());
 
+    // The pilot's free-text steer for this round (§10) — surfaced prominently so the
+    // droid conditions its redesigns on the human's intent, not just the metrics.
+    let guidance = match pilot_note.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(note) => format!("Operator guidance for this round (prioritise this): {note}\n\n"),
+        None => String::new(),
+    };
+
     format!(
         "Process id: {pid}\n\
          Recorded instances summarised: {count}\n\
          Service-task job types completed in production: {jobs}\n\
          Boundary data keys the process is observed to produce: {keys}\n\
          Sample creation input: {sample}\n\n\
+         {guidance}\
          Current executable BPMN model:\n{model}\n\n\
          Propose 1-3 alternative executable BPMN models (same process id `{pid}`) that could \
          improve this process while still producing the boundary keys above. Reply with ONLY the \
@@ -130,6 +142,7 @@ pub fn build_evolve_prompt(signal: &DatasetSignal, baseline_model: &str) -> Stri
         jobs = job_types,
         keys = boundary_keys,
         sample = sample,
+        guidance = guidance,
         model = baseline_model,
     )
 }
@@ -278,11 +291,26 @@ mod tests {
             "P",
             &[rec(&[("input", json!("x"))], vec![job(1, 1100, "classify", &[("label", json!("A"))])])],
         );
-        let p = build_evolve_prompt(&sig, "<bpmn:definitions/>");
+        let p = build_evolve_prompt(&sig, "<bpmn:definitions/>", None);
         assert!(p.contains("Process id: P"));
         assert!(p.contains("classify"));
         assert!(p.contains("label"));
         assert!(p.contains("<bpmn:definitions/>"));
+        assert!(!p.contains("Operator guidance"));
+    }
+
+    #[test]
+    fn prompt_includes_pilot_guidance_when_present() {
+        let sig = summarize_dataset(
+            "P",
+            &[rec(&[("input", json!("x"))], vec![job(1, 1100, "classify", &[("label", json!("A"))])])],
+        );
+        let p = build_evolve_prompt(&sig, "<bpmn:definitions/>", Some("cut the tail latency"));
+        assert!(p.contains("Operator guidance for this round"));
+        assert!(p.contains("cut the tail latency"));
+        // A blank/whitespace note is treated as no guidance.
+        let blank = build_evolve_prompt(&sig, "<bpmn:definitions/>", Some("   "));
+        assert!(!blank.contains("Operator guidance"));
     }
 
     #[test]

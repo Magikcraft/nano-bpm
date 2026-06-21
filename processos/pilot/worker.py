@@ -64,7 +64,7 @@ def activate():
             "worker": WORKER,
             "timeout": JOB_TIMEOUT_MS,
             "maxJobsToActivate": 1,
-            "fetchVariable": ["processId", "baselineModel", "iteration", "maxIterations", "promptId"],
+            "fetchVariable": ["processId", "baselineModel", "iteration", "maxIterations", "promptId", "pilotNote"],
         },
         timeout=30,
     ).get("jobs", [])
@@ -83,20 +83,40 @@ def fail(job_key, retries, message):
     )
 
 
+def _record_turn(instance_key, role, text, round_):
+    """Best-effort durable conversation write to ProcessOS; never fails the round."""
+    if not instance_key:
+        return
+    try:
+        _post(
+            PROCESSOS,
+            f"/api/cockpit/experiments/{instance_key}/conversation",
+            {"role": role, "text": text, "round": round_},
+            timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001 — persistence is best-effort
+        print(f"conversation write failed: {e}", flush=True)
+
+
 def run_round(job):
     v = job.get("variables", {})
     process_id = v.get("processId")
     baseline = v.get("baselineModel")
     iteration = int(v.get("iteration", 0))
     prompt_id = v.get("promptId")
+    pilot_note = (v.get("pilotNote") or "").strip()
+    instance_key = str(job.get("processInstanceKey", "")) or None
     if not process_id or not baseline:
         raise ValueError("job is missing processId/baselineModel variables")
 
     print(f"[round {iteration}] evolving '{process_id}'"
-          + (f" with prompt '{prompt_id}'" if prompt_id else "") + " …", flush=True)
+          + (f" with prompt '{prompt_id}'" if prompt_id else "")
+          + (f" | pilot note: {pilot_note!r}" if pilot_note else "") + " …", flush=True)
     payload = {"processId": process_id, "baselineModel": baseline}
     if prompt_id:
         payload["promptId"] = prompt_id
+    if pilot_note:
+        payload["pilotNote"] = pilot_note
     res = _post(
         PROCESSOS,
         "/api/harness/evolve",
@@ -140,6 +160,21 @@ def run_round(job):
         f"proposed={out['proposed']}",
         flush=True,
     )
+    # Record the droid's turn in the durable conversation (§10) so the dialogue is a
+    # complete running history, not a snapshot reconstructed from the latest round.
+    best = next((c for c in summary if c.get("name") == best_name), None)
+    if best is not None:
+        rate_txt = f"{best_rate*100:.1f}%" if isinstance(best_rate, (int, float)) else "—"
+        tier = best.get("fidelityTier") or "—"
+        new_workers = best.get("requiresNewWorkers") or []
+        nw_txt = (" · needs new workers: " + ", ".join(new_workers)) if new_workers else ""
+        droid_text = (
+            f"Round {iteration + 1}: best redesign is “{best_name}” [{tier}] — "
+            f"conserved {rate_txt} of the production boundary on real traces{nw_txt}."
+        )
+    else:
+        droid_text = f"Round {iteration + 1}: no feasible candidate this round."
+    _record_turn(instance_key, "droid", droid_text, iteration + 1)
     return out
 
 

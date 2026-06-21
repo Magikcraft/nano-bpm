@@ -100,6 +100,7 @@
   #promptEditor input, #promptEditor textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
   #promptEditor textarea { font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
   #promptEditor input:disabled, #promptEditor textarea:disabled { opacity: .6; }
+  #pilotNote { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; }
   .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid #26262b; }
 </style>
 </head>
@@ -272,11 +273,13 @@ async function renderExp(key){
      + '<div class="hero">'+pct(s.bestConservedRate)+'</div>'
      + '<div class="hero sub">boundary conserved by “'+esc(s.bestName||'—')+'” on real traces</div>';
   if(d.pendingUserTaskKey){
+    h += '<label class="lbl" for="pilotNote" style="margin-top:14px">Note to the droid (optional — steers the next round)</label>'
+       + '<textarea id="pilotNote" rows="2" placeholder="e.g. cut the tail latency; keep the summarize step"></textarea>';
     h += '<div class="actions">'
       + '<button class="btn primary" onclick="decide(\''+esc(key)+'\',\'accept\')">Accept</button>'
       + '<button class="btn" onclick="decide(\''+esc(key)+'\',\'iterate\')">Ask droid to iterate</button>'
       + '<button class="btn ghost" onclick="decide(\''+esc(key)+'\',\'stop\')">Stop loop</button></div>'
-      + '<p class="muted" style="font-size:12px;margin-top:8px">Iterate is available while round &lt; budget ('+(s.maxIterations||'?')+').</p>';
+      + '<p class="muted" style="font-size:12px;margin-top:8px">Iterate is available while round &lt; budget ('+(s.maxIterations||'?')+'). Your note is saved to the conversation and fed to the droid.</p>';
   } else if(s.outcome==='completed'){
     h += '<p class="muted" style="margin-top:12px">Loop finished — '+esc(d.finalOutcome||'')+'.</p>';
   } else {
@@ -313,7 +316,9 @@ async function renderExp(key){
 
 async function decide(key, decision){
   document.querySelectorAll('.actions .btn').forEach(b=>b.disabled=true);
-  try { await api('/api/cockpit/experiments/'+key+'/decision', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decision})}); }
+  const noteEl = document.getElementById('pilotNote');
+  const note = noteEl ? noteEl.value.trim() : '';
+  try { await api('/api/cockpit/experiments/'+key+'/decision', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decision, note})}); }
   catch(e){ alert('Decision failed: '+e.message); }
   setTimeout(()=>renderExp(key), 600);
 }

@@ -476,11 +476,18 @@ pub async fn submit_decision(
     nano: &NanoClient,
     instance_key: &str,
     decision: &str,
+    pilot_note: Option<&str>,
 ) -> Result<(), String> {
     let task = pending_review_task(nano, instance_key)
         .await
         .ok_or_else(|| format!("no open Review task for experiment {instance_key}"))?;
-    let body = json!({ "variables": { "decision": decision } });
+    let mut variables = serde_json::Map::new();
+    variables.insert("decision".into(), json!(decision));
+    // Carry the pilot's free-text guidance into the loop so the next Evolve round can
+    // condition the droid on it (the §10 pairing closes here). Always set the variable
+    // so a note-less round clears any guidance left over from a prior one.
+    variables.insert("pilotNote".into(), json!(pilot_note.unwrap_or("")));
+    let body = json!({ "variables": Value::Object(variables) });
     nano.post_no_content(&format!("/v2/user-tasks/{task}/completion"), &body)
         .await
 }

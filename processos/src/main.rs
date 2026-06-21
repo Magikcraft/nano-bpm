@@ -11,6 +11,7 @@
 
 mod contracts;
 mod cockpit;
+mod conversation;
 mod harness;
 mod report;
 
@@ -43,6 +44,9 @@ struct AppState {
     /// The prompt library — import / select / author the system prompts that drive
     /// hypothesis generation. Shared, interior-mutable so authoring is live.
     prompts: Arc<RwLock<PromptLibrary>>,
+    /// Durable cockpit conversations (§10) — the persisted pilot ↔ droid dialogue,
+    /// one append-only log per experiment.
+    conversations: Arc<conversation::ConversationStore>,
 }
 
 /// Server configuration, all overridable by environment.
@@ -51,6 +55,9 @@ struct Config {
     nano_base_url: String,
     /// Optional directory to import prompts from on startup (`PROCESSOS_PROMPTS_DIR`).
     prompts_dir: Option<String>,
+    /// Directory for durable state — currently cockpit conversations
+    /// (`PROCESSOS_DATA_DIR`, default `./.processos-data`).
+    data_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -70,6 +77,7 @@ impl Config {
             port,
             nano_base_url,
             prompts_dir,
+            data_dir: conversation::data_dir_from_env(),
         }
     }
 }
@@ -95,6 +103,7 @@ async fn main() {
     let state = AppState {
         nano: NanoClient::new(&cfg.nano_base_url),
         prompts: Arc::new(RwLock::new(library)),
+        conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
     };
 
     let app = Router::new()
@@ -108,6 +117,10 @@ async fn main() {
         .route("/api/cockpit/experiments", get(cockpit_experiments).post(cockpit_create))
         .route("/api/cockpit/experiments/{key}", get(cockpit_experiment))
         .route("/api/cockpit/experiments/{key}/decision", post(cockpit_decision))
+        .route(
+            "/api/cockpit/experiments/{key}/conversation",
+            get(cockpit_conversation).post(cockpit_message),
+        )
         .route("/harness", get(harness_dashboard))
         .route("/api/harness/example", get(harness_example))
         .route("/api/harness/example/run", get(harness_example_run))
@@ -132,6 +145,7 @@ async fn main() {
     tracing::info!(
         %addr,
         nano = %cfg.nano_base_url,
+        data_dir = %cfg.data_dir.display(),
         "ProcessOS (T1: Insights) listening; reading Nano over the public trace/metrics contract"
     );
     println!("PROCESSOS_PORT={}", cfg.port);
@@ -240,7 +254,24 @@ async fn cockpit_experiment(
     Path(key): Path<String>,
 ) -> impl IntoResponse {
     match cockpit::experiment_detail(&state.nano, &key).await {
-        Ok(d) => Json(d).into_response(),
+        Ok(mut d) => {
+            // Prefer the durable dialogue: once an experiment has a persisted log
+            // (engine framing at creation, a droid turn per round, the pilot's
+            // notes/decisions), that log is the true running history. The
+            // reconstructed snapshot remains the fallback for legacy experiments
+            // created before conversations were persisted.
+            let log = state.conversations.read(&key);
+            if !log.is_empty() {
+                d.conversation = log
+                    .into_iter()
+                    .map(|m| cockpit::Turn {
+                        role: m.role,
+                        text: m.text,
+                    })
+                    .collect();
+            }
+            Json(d).into_response()
+        }
         Err(e) => bad_gateway(e),
     }
 }
@@ -259,8 +290,26 @@ async fn cockpit_create(
         },
     };
     let max_iterations = req.max_iterations.unwrap_or(2).clamp(1, 50);
-    match cockpit::create_experiment(&state.nano, &req.process_id, baseline, max_iterations, req.prompt_id).await {
-        Ok(key) => Json(serde_json::json!({ "instanceKey": key })).into_response(),
+    match cockpit::create_experiment(&state.nano, &req.process_id, baseline, max_iterations, req.prompt_id.clone()).await {
+        Ok(key) => {
+            // Seed the durable conversation with the engine's framing turn so the log
+            // is a complete dialogue from the first render, not just from round 1.
+            let prompt_note = req
+                .prompt_id
+                .as_deref()
+                .map(|p| format!(" Droid prompt: {p}."))
+                .unwrap_or_default();
+            state.conversations.append(
+                &key,
+                "engine",
+                &format!(
+                    "Experiment forked from “{}”. The recorded production dataset is the fitness data; the engine replays every candidate against it.{prompt_note}",
+                    req.process_id
+                ),
+                Some(0),
+            );
+            Json(serde_json::json!({ "instanceKey": key })).into_response()
+        }
         Err(e) => bad_gateway(e),
     }
 }
@@ -279,10 +328,51 @@ async fn cockpit_decision(
         )
             .into_response();
     }
-    match cockpit::submit_decision(&state.nano, &key, decision).await {
+    let note = req.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    // Persist the pilot's turn (decision + any free-text guidance) before acting, so
+    // the dialogue is durable even if the engine call below fails.
+    let pilot_text = match note {
+        Some(n) => format!("[{decision}] {n}"),
+        None => format!("[{decision}]"),
+    };
+    state.conversations.append(&key, "pilot", &pilot_text, None);
+    match cockpit::submit_decision(&state.nano, &key, decision, note).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => bad_gateway(e),
     }
+}
+
+/// `GET /api/cockpit/experiments/{key}/conversation` — the persisted pilot ↔ droid log.
+async fn cockpit_conversation(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    Json(state.conversations.read(&key))
+}
+
+/// `POST /api/cockpit/experiments/{key}/conversation` — append a turn to the
+/// persisted conversation. Used by the pilot to chat with the droid out of band, and
+/// by the worker to record the droid's per-round result. Role defaults to `pilot`.
+async fn cockpit_message(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(req): Json<CockpitMessageRequest>,
+) -> impl IntoResponse {
+    let text = req.text.trim();
+    if text.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "message text must not be empty" })),
+        )
+            .into_response();
+    }
+    let role = match req.role.as_deref().map(str::trim) {
+        Some("droid") => "droid",
+        Some("engine") => "engine",
+        _ => "pilot",
+    };
+    let msg = state.conversations.append(&key, role, text, req.round);
+    (StatusCode::CREATED, Json(msg)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +391,22 @@ struct CockpitCreateRequest {
 #[derive(Debug, Deserialize)]
 struct CockpitDecisionRequest {
     decision: String,
+    /// Optional free-text guidance from the pilot for the next round — persisted to
+    /// the conversation and threaded into the BPMN as `pilotNote` so the droid sees it.
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CockpitMessageRequest {
+    text: String,
+    /// `pilot` (default), `droid`, or `engine`.
+    #[serde(default)]
+    role: Option<String>,
+    /// The optimization round this turn belongs to, when known.
+    #[serde(default)]
+    round: Option<i64>,
 }
 
 fn bad_gateway(e: String) -> axum::response::Response {
@@ -798,6 +904,10 @@ struct EvolveRequest {
     /// Select a library prompt by id; falls back to the built-in evolve prompt.
     #[serde(default)]
     prompt_id: Option<String>,
+    /// The pilot's free-text steer for this round (§10) — threaded into the user
+    /// prompt so the droid conditions its redesigns on the human's intent.
+    #[serde(default)]
+    pilot_note: Option<String>,
 }
 
 /// `POST /api/harness/evolve` — the gradient-driven loop end-to-end (§7.9): distil
@@ -891,7 +1001,7 @@ async fn harness_evolve(
 
     // Distil the production signal and ask the model to propose redesigns.
     let signal = summarize_dataset(&process_id, &dataset);
-    let user_prompt = build_evolve_prompt(&signal, &req.baseline_model);
+    let user_prompt = build_evolve_prompt(&signal, &req.baseline_model, req.pilot_note.as_deref());
     let raw = match llm_complete(&cfg, &system_prompt, &user_prompt).await {
         Ok(r) => r,
         Err(e) => {
