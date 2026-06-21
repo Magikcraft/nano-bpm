@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Nano Process OS · Features</title>
+    <style>
+      :root {
+        --violet: #a78bfa;
+        --sky: #38bdf8;
+        --ink: #e4e4e7;
+        --muted: #a1a1aa;
+        --faint: #71717a;
+        --card: rgba(255, 255, 255, 0.035);
+        --border: rgba(255, 255, 255, 0.1);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        margin: 0;
+        background: #08080a;
+        color: var(--ink);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        line-height: 1.6;
+      }
+      a {
+        color: var(--sky);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      /* ---- top bar ---- */
+      header.bar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        display: flex;
+        align-items: center;
+        gap: 0.7rem;
+        padding: 0.9rem 1.4rem;
+        background: rgba(8, 8, 10, 0.82);
+        backdrop-filter: blur(10px);
+        border-bottom: 1px solid var(--border);
+      }
+      header.bar .dot {
+        width: 0.8rem;
+        height: 0.8rem;
+        border-radius: 9999px;
+        background: linear-gradient(135deg, var(--violet), var(--sky));
+        box-shadow: 0 0 16px rgba(167, 139, 250, 0.6);
+      }
+      header.bar .brand {
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+      }
+      header.bar .spacer {
+        flex: 1;
+      }
+      header.bar a.navlink {
+        color: var(--muted);
+        font-size: 0.88rem;
+        margin-left: 1.1rem;
+      }
+      header.bar a.navlink:hover {
+        color: var(--sky);
+        text-decoration: none;
+      }
+      /* ---- hero ---- */
+      .hero {
+        position: relative;
+        padding: 3.4rem 1.4rem 2.4rem;
+        text-align: center;
+        overflow: hidden;
+        border-bottom: 1px solid var(--border);
+        background:
+          radial-gradient(60% 120% at 50% 0%, rgba(167, 139, 250, 0.13), transparent 70%),
+          radial-gradient(50% 120% at 80% 0%, rgba(56, 189, 248, 0.1), transparent 70%);
+      }
+      .hero h1 {
+        margin: 0;
+        font-size: clamp(2rem, 6vw, 3.4rem);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        background: linear-gradient(135deg, #ffffff 0%, var(--violet) 55%, var(--sky) 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hero p {
+        margin: 1rem auto 0;
+        max-width: 46rem;
+        color: var(--muted);
+        font-size: clamp(1rem, 2.2vw, 1.15rem);
+      }
+      .hero .loop {
+        margin: 1.8rem auto 0;
+        max-width: 52rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        justify-content: center;
+        font-size: 0.82rem;
+        color: var(--faint);
+      }
+      .hero .loop span {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 9999px;
+        padding: 0.25rem 0.8rem;
+      }
+      .hero .loop .arr {
+        border: none;
+        background: none;
+        color: var(--violet);
+        padding: 0.25rem 0.1rem;
+      }
+      /* ---- layout ---- */
+      main {
+        max-width: 54rem;
+        margin: 0 auto;
+        padding: 2.6rem 1.4rem 5rem;
+      }
+      section.feat {
+        margin-bottom: 2.8rem;
+        scroll-margin-top: 5rem;
+      }
+      section.feat.lead {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 1rem;
+        padding: 1.6rem 1.7rem;
+      }
+      .kicker {
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        font-size: 0.7rem;
+        color: var(--faint);
+        margin-bottom: 0.7rem;
+      }
+      section.feat > h2 {
+        font-size: clamp(1.4rem, 3.4vw, 1.95rem);
+        margin: 0 0 0.35rem;
+        letter-spacing: -0.02em;
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 0.7rem;
+      }
+      .pill {
+        font-size: 0.64rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.07em;
+        border-radius: 9999px;
+        padding: 0.12rem 0.55rem;
+        vertical-align: middle;
+        white-space: nowrap;
+      }
+      .pill.live {
+        color: var(--violet);
+        border: 1px solid rgba(167, 139, 250, 0.45);
+      }
+      .pill.design {
+        color: var(--sky);
+        border: 1px solid rgba(56, 189, 248, 0.4);
+      }
+      section.feat > .lede {
+        color: var(--muted);
+        margin: 0 0 1.1rem;
+        font-size: 1.04rem;
+      }
+      section.feat p {
+        margin: 0.6rem 0;
+        color: var(--ink);
+      }
+      section.feat ul {
+        margin: 0.6rem 0;
+        padding-left: 1.2rem;
+        color: var(--muted);
+      }
+      section.feat li {
+        margin: 0.3rem 0;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 0.85em;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+        border-radius: 0.35rem;
+        padding: 0.05rem 0.35rem;
+        color: #c4b5fd;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+        gap: 1rem;
+        margin-top: 1.4rem;
+      }
+      .grid .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 0.8rem;
+        padding: 1.05rem 1.2rem;
+      }
+      .grid .card h3 {
+        margin: 0 0 0.35rem;
+        font-size: 1.02rem;
+      }
+      .grid .card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+      .divider {
+        height: 1px;
+        background: var(--border);
+        margin: 2.4rem 0;
+      }
+      .principle {
+        text-align: center;
+        color: var(--muted);
+        font-size: 0.95rem;
+        max-width: 40rem;
+        margin: 0 auto;
+      }
+      .cta {
+        margin-top: 2.6rem;
+        display: flex;
+        gap: 0.8rem;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      a.btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.7rem 1.3rem;
+        border-radius: 0.65rem;
+        font-size: 0.95rem;
+        font-weight: 600;
+      }
+      a.btn:hover {
+        text-decoration: none;
+        transform: translateY(-1px);
+      }
+      a.primary {
+        color: #1a0a2e;
+        background: linear-gradient(135deg, var(--violet), var(--sky));
+      }
+      a.ghost {
+        color: var(--ink);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="bar">
+      <span class="dot"></span>
+      <span class="brand">NANO PROCESS OS</span>
+      <span class="spacer"></span>
+      <a class="navlink" href="/">Home</a>
+      <a class="navlink" href="/console">Console</a>
+      <a class="navlink" href="/harness">Harness</a>
+    </header>
+
+    <div class="hero">
+      <h1>The optimization plane for Nano BPM</h1>
+      <p>
+        Nano runs production. Process OS watches it, reasons about better ways to run
+        each process, proves them on real engines before anything changes, and promotes
+        the winners gradually. A closed loop with the engine — not the LLM — as the
+        final authority.
+      </p>
+      <div class="loop">
+        <span>Observe traces</span><span class="arr">→</span>
+        <span>Hypothesize variants</span><span class="arr">→</span>
+        <span>Speculatively execute</span><span class="arr">→</span>
+        <span>Rank &amp; gate</span><span class="arr">→</span>
+        <span>Deploy to a cohort</span>
+      </div>
+    </div>
+
+    <main>
+      <section class="feat lead">
+        <div class="kicker">Flagship capability</div>
+        <h2>
+          Speculative Execution of Variant Hypotheses
+          <span class="pill live">Live</span>
+        </h2>
+        <p class="lede">
+          Ask a model for better ways to run a process — then prove every suggestion on
+          the real engine before trusting it. The LLM proposes; the engine decides.
+        </p>
+        <p>
+          Process OS folds production traces into a performance report (objective,
+          per-task worker catalogue with cost / latency / quality, measured baseline)
+          and hands that report — not a firehose of raw events — to a reasoning model.
+          The model returns candidate variants: which worker should run each task, and
+          optionally a restructured BPMN model.
+        </p>
+        <p>
+          Each candidate is then <strong>speculatively executed</strong>: every input is
+          replayed through a fresh instance of the <em>real</em>
+          <code>engine-core</code> — the same engine production runs — on a virtual
+          clock, collecting end-to-end latency, cost, incidents, and correctness. A
+          hallucinated &ldquo;improvement&rdquo; that does not actually measure better is
+          caught by the numbers and ranked below the baseline; structurally invalid
+          proposals are rejected with a reason.
+        </p>
+        <ul>
+          <li>
+            Model-agnostic and OpenAI-compatible &mdash; points at a local
+            <code>llama.cpp</code>, Ollama, vLLM, or a hosted provider; keys and egress
+            stay inside the optimization boundary.
+          </li>
+          <li>
+            Every candidate is feasibility-gated on correctness and incident rate, then
+            ordered by the scenario objective (cost, latency, or incidents).
+          </li>
+          <li>
+            Rejected proposals are reported, not hidden &mdash; you see what the model
+            tried and why it was discarded.
+          </li>
+        </ul>
+        <p style="color: var(--faint); font-size: 0.9rem">
+          Try it: <code>POST /api/harness/hypothesize</code>, or open the
+          <a href="/harness">harness console</a>.
+        </p>
+      </section>
+
+      <section class="feat lead">
+        <div class="kicker">Flagship capability</div>
+        <h2>
+          Cohort Deployment to Production
+          <span class="pill design">In design</span>
+        </h2>
+        <p class="lede">
+          A proven variant earns a slice of real traffic before it earns all of it.
+          Promotion is gradual, measured, and reversible.
+        </p>
+        <p>
+          A winning hypothesis is not flipped on globally. Process OS deploys it to a
+          <strong>cohort</strong> &mdash; a bounded fraction of live instances routed to
+          the new variant &mdash; while the rest continue on the incumbent. Both cohorts
+          are measured against the same objective from the same live trace contract, so
+          the comparison is apples-to-apples on production load rather than on a
+          simulator.
+        </p>
+        <p>
+          If the cohort holds its gains and its gates, its share grows; if it regresses,
+          it is rolled back automatically. This is the actuation half of the loop and the
+          one place the engine exposes a control surface to the optimizer &mdash; a
+          deliberate, auditable routing primitive rather than ad-hoc rewiring.
+        </p>
+        <ul>
+          <li>Bounded blast radius: a bad variant can only ever affect its cohort.</li>
+          <li>
+            Live A/B on the objective, not a synthetic proxy &mdash; the production
+            numbers decide whether the rollout advances.
+          </li>
+          <li>
+            Reversible by construction: every promotion step has a defined rollback.
+          </li>
+        </ul>
+        <p style="color: var(--faint); font-size: 0.9rem">
+          Status: the routing/actuation primitive is specified in the design series and
+          is the next keystone on the roadmap; today the loop runs up to ranked,
+          gate-passing recommendations.
+        </p>
+      </section>
+
+      <div class="divider"></div>
+
+      <h2 style="font-size: 1.3rem; margin: 0 0 0.3rem; letter-spacing: -0.02em">
+        The substrate underneath
+      </h2>
+      <p style="color: var(--muted); margin-top: 0">
+        The two flagship capabilities stand on a small set of disciplined primitives.
+      </p>
+      <div class="grid">
+        <div class="card">
+          <h3>Insights from the trace contract</h3>
+          <p>
+            Reads Nano over its public trace / metrics export and folds it into a
+            per-process, per-element report: durations, queue vs. service time,
+            bottlenecks, and incident clusters. <code>GET /api/insights</code>.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Real-engine simulation</h3>
+          <p>
+            The SimRunner drives the actual <code>engine-core</code> on a virtual clock,
+            so measured latency, cost, and correctness transfer to production rather than
+            modelling an approximation of it.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Live cluster measurement</h3>
+          <p>
+            The ClusterRunner acts and measures against a running multi-node cluster,
+            unioning partition-local traces cluster-wide and sensing per-node backlog.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Queueing-model staffing</h3>
+          <p>
+            An Erlang-C M/M/c model fitted from measured per-job-type arrival and service
+            times recommends how many workers hold a target p99 queue-wait.
+            <code>GET /api/harness/cluster?targetP99Ms=</code>.
+          </p>
+        </div>
+        <div class="card">
+          <h3>One-way dependency</h3>
+          <p>
+            Process OS runs as its own process and only ever <em>reads</em> Nano over
+            HTTP. Nano never links or knows about it &mdash; run production without it and
+            nothing changes.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Advisory by default</h3>
+          <p>
+            Everything short of cohort deployment is a recommendation. The engine and the
+            measured numbers are authoritative; the optimizer never silently rewires a
+            running system.
+          </p>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <p class="principle">
+        <strong>The governing principle:</strong> the LLM may propose anything, but
+        nothing reaches production unproven. Simulation measures, gates feasibility, and
+        cohorts contain the risk &mdash; the engine, not the model, has the final word.
+      </p>
+
+      <div class="cta">
+        <a class="btn primary" href="/console">Open the console →</a>
+        <a class="btn ghost" href="/harness">Run the harness</a>
+        <a class="btn ghost" href="/">Back to home</a>
+      </div>
+    </main>
+  </body>
+</html>

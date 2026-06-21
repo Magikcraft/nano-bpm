@@ -70,7 +70,9 @@ async fn main() {
     };
 
     let app = Router::new()
-        .route("/", get(dashboard))
+        .route("/", get(landing))
+        .route("/features", get(features))
+        .route("/console", get(dashboard))
         .route("/health", get(health))
         .route("/api/insights", get(insights))
         .route("/harness", get(harness_dashboard))
@@ -134,9 +136,27 @@ async fn insights(
     }
 }
 
+/// The standalone marketing landing page for Nano Process OS (self-contained:
+/// inline canvas particle field, no external assets). Served at `/`.
+const LANDING_HTML: &str = include_str!("landing.html");
+
+/// The features page, leading with the two flagship capabilities. Served at
+/// `/features`.
+const FEATURES_HTML: &str = include_str!("features.html");
+
+/// `GET /` — the Nano Process OS landing page.
+async fn landing() -> Html<&'static str> {
+    Html(LANDING_HTML)
+}
+
+/// `GET /features` — what Process OS does.
+async fn features() -> Html<&'static str> {
+    Html(FEATURES_HTML)
+}
+
 /// A dependency-free single-file dashboard that fetches `/api/insights` and renders
-/// the report. Intentionally tiny — the richer UX is the console "Optimization" tab
-/// that proxies to this server (see docs/processos-design.md §4).
+/// the report. Served at `/console`. Intentionally tiny — the richer UX is the console
+/// "Optimization" tab that proxies to this server (see docs/processos-design.md §4).
 async fn dashboard() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
 }
@@ -351,7 +371,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 <header>
   <h1>ProcessOS</h1>
   <span class="sub">Insights (T1) · <span id="nano"></span></span>
-  <span style="margin-left:auto"><button onclick="load()">Refresh</button></span>
+  <nav style="margin-left:auto;display:flex;align-items:center;gap:14px">
+    <a href="/" style="color:#a1a1aa;text-decoration:none;font-size:13px">Home</a>
+    <a href="/features" style="color:#a1a1aa;text-decoration:none;font-size:13px">Features</a>
+    <a href="/harness" style="color:#a1a1aa;text-decoration:none;font-size:13px">Harness</a>
+    <button onclick="load()">Refresh</button>
+  </nav>
 </header>
 <main id="out">Loading…</main>
 <script>
@@ -443,6 +468,7 @@ const HARNESS_HTML: &str = r##"<!doctype html>
 <header>
   <h1>ProcessOS — Optimization Harness</h1>
   <div class="sub">SimRunner over the bundled example scenario (worker-swap transform space). The same loop runs in production against live Nano traces.</div>
+  <div class="sub" style="margin-top:8px"><a href="/" style="color:#a5b4fc;text-decoration:none">Home</a> · <a href="/features" style="color:#a5b4fc;text-decoration:none">Features</a> · <a href="/console" style="color:#a5b4fc;text-decoration:none">Console</a></div>
 </header>
 <main id="root">Running the example scenario…</main>
 <script>
