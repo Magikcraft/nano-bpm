@@ -63,7 +63,7 @@ pub use replay::{
 };
 #[allow(unused_imports)]
 pub use replay_rank::{
-    rank_candidates_by_replay, CandidateModel, RankedCandidate, ReplayRanking,
+    rank_candidates_by_replay, CandidateModel, FidelityTier, RankedCandidate, ReplayRanking,
 };
 
 use std::collections::HashMap;

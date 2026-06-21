@@ -147,6 +147,16 @@ fn as_string(v: Option<&Value>) -> Option<String> {
     v.and_then(|x| x.as_str().map(str::to_string))
 }
 
+/// Render a candidate's §7.7 fidelity tier as a short operator-facing badge label.
+fn tier_label(tier: Option<&str>) -> &'static str {
+    match tier {
+        Some("recorded-replay") => "L2 · replay",
+        Some("requires-generative-mock") => "L3 · mock",
+        Some("infeasible") => "infeasible",
+        _ => "—",
+    }
+}
+
 /// Build an experiment summary from a pilot instance's trace summary + variables.
 fn summarize(
     instance_key: &str,
@@ -355,11 +365,27 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
                 .unwrap_or_else(|| "—".into());
             let feasible = c.get("feasible").and_then(|f| f.as_bool()).unwrap_or(true);
             let why = as_string(c.get("rationale")).unwrap_or_default();
+            let tier = tier_label(as_string(c.get("fidelityTier")).as_deref());
+            let new_workers = c
+                .get("requiresNewWorkers")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
             conversation.push(Turn {
                 role: "droid".into(),
                 text: format!(
-                    "• {name} — conserved {rate}{}{}",
+                    "• {name} [{tier}] — conserved {rate}{}{}{}",
                     if feasible { "" } else { " (infeasible)" },
+                    if new_workers.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · needs new workers: {new_workers}")
+                    },
                     if why.is_empty() { String::new() } else { format!(" — {why}") },
                 ),
             });

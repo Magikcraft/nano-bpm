@@ -114,6 +114,9 @@ def run_round(job):
             {
                 "name": c.get("name"),
                 "feasible": c.get("feasible"),
+                "fidelityTier": c.get("fidelityTier"),
+                "requiresNewWorkers": c.get("requiresNewWorkers"),
+                "confidence": c.get("confidence"),
                 "conservedRate": rep.get("conservedRate"),
                 "avgE2eLatencyMs": rep.get("avgE2eLatencyMs"),
                 "uncoveredJobTypes": rep.get("uncoveredJobTypes"),
