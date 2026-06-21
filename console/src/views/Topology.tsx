@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { api, type NodeHealth } from "../lib/api";
+import { api, nodeConsoleUrl, type NodeHealth } from "../lib/api";
 
 export default function Topology() {
   const { data, isLoading, error } = useQuery({
@@ -55,17 +55,24 @@ export default function Topology() {
               {data.nodes.map((n) => {
                 const h = healthOf(n.node_id);
                 const down = h && !h.reachable && !n.is_self;
-                return (
-                  <div
-                    key={n.node_id}
-                    className={`min-w-[12rem] rounded-lg border px-4 py-3 ${
-                      down
-                        ? "border-red-800 bg-red-950/30"
-                        : n.is_self
-                          ? "border-emerald-700 bg-emerald-950/40"
-                          : "border-zinc-800 bg-zinc-900"
-                    }`}
-                  >
+                // Other nodes link to the equivalent page on their own IP; the
+                // self node (empty address) is the current page, so not a link.
+                const href = n.is_self
+                  ? null
+                  : nodeConsoleUrl(n.address, "/topology");
+                const cls = `block min-w-[12rem] rounded-lg border px-4 py-3 ${
+                  down
+                    ? "border-red-800 bg-red-950/30"
+                    : n.is_self
+                      ? "border-emerald-700 bg-emerald-950/40"
+                      : "border-zinc-800 bg-zinc-900"
+                }${
+                  href
+                    ? " cursor-pointer transition-colors hover:border-sky-600 hover:bg-zinc-800"
+                    : ""
+                }`;
+                const inner = (
+                  <>
                     <div className="flex items-center gap-2">
                       <span
                         className={`inline-block h-2 w-2 shrink-0 rounded-full ${
@@ -87,6 +94,14 @@ export default function Topology() {
                       {n.is_self && (
                         <span className="rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
                           this
+                        </span>
+                      )}
+                      {href && (
+                        <span
+                          className="ml-auto text-xs text-sky-400"
+                          aria-hidden
+                        >
+                          open ↗
                         </span>
                       )}
                     </div>
@@ -114,6 +129,22 @@ export default function Topology() {
                         <span className="text-zinc-600">probing…</span>
                       )}
                     </div>
+                  </>
+                );
+                return href ? (
+                  <a
+                    key={n.node_id}
+                    href={href}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={`Open node ${n.node_id} console (${n.address})`}
+                    className={cls}
+                  >
+                    {inner}
+                  </a>
+                ) : (
+                  <div key={n.node_id} className={cls}>
+                    {inner}
                   </div>
                 );
               })}

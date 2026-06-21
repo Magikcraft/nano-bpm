@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, type MetricsSnapshot } from "../lib/api";
+import { api, nodeConsoleUrl, type MetricsSnapshot } from "../lib/api";
 
 /// How many derived samples to retain for the sparklines (~2 min at 1 Hz).
 const MAX_SAMPLES = 120;
@@ -215,14 +215,37 @@ export default function Metrics() {
                     </tr>
                   </thead>
                   <tbody>
-                    {cluster.nodes.map((n) => (
+                    {cluster.nodes.map((n) => {
+                      const href = n.isSelf
+                        ? null
+                        : nodeConsoleUrl(n.address, "/metrics");
+                      return (
                       <tr key={n.nodeId} className="border-b border-zinc-900 last:border-0">
                         <td className="px-3 py-2">
-                          <span className="font-medium">node {n.nodeId}</span>
-                          {n.isSelf && (
-                            <span className="ml-2 rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
-                              this
-                            </span>
+                          <div className="flex items-center gap-2">
+                            {href ? (
+                              <a
+                                href={href}
+                                target="_blank"
+                                rel="noreferrer"
+                                title={`Open node ${n.nodeId} console (${n.address})`}
+                                className="font-medium text-sky-400 hover:underline"
+                              >
+                                node {n.nodeId} ↗
+                              </a>
+                            ) : (
+                              <span className="font-medium">node {n.nodeId}</span>
+                            )}
+                            {n.isSelf && (
+                              <span className="rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
+                                this
+                              </span>
+                            )}
+                          </div>
+                          {n.address && (
+                            <div className="mt-0.5 text-xs text-zinc-500">
+                              {n.address}
+                            </div>
                           )}
                         </td>
                         <td className="px-3 py-2">
@@ -241,7 +264,8 @@ export default function Metrics() {
                         <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.commitInflight.toLocaleString() ?? "—"}</td>
                         <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.residentBytes != null ? fmtBytes(n.metrics.residentBytes) : "—"}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>

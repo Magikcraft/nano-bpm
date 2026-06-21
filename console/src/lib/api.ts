@@ -7,6 +7,22 @@ export interface NodeInfo {
   is_self: boolean;
 }
 
+/**
+ * Build a link to the equivalent console page on another cluster node.
+ * `address` is that node's advertised base URL (`http://host:port`, from the
+ * topology); `path` is the in-app route (e.g. "/topology"). Returns null when
+ * there's no usable address — e.g. the self/local node, whose address is empty.
+ */
+export function nodeConsoleUrl(
+  address: string | undefined | null,
+  path: string,
+): string | null {
+  if (!address) return null;
+  const base = address.replace(/\/+$/, "");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${base}/console${p}`;
+}
+
 export interface PartitionInfo {
   partition_id: number;
   replicas: number[];
