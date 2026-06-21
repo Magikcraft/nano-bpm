@@ -47,6 +47,17 @@ const DEFAULT_CAPACITY: usize = 2000;
 /// `NANOBPMN_TRACE_VARIABLES_MAX_BYTES`.
 const DEFAULT_VARS_MAX_BYTES: usize = 16 * 1024;
 
+/// Default per-instance cap on the recorded-input stimulus log.
+const DEFAULT_STIMULI_MAX: usize = 1024;
+
+/// Parses a truthy environment flag (`1`/`true`/`yes`/`on`, case-insensitive).
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// A captured variable map (instance creation inputs, or the state at an
 /// incident). Kept only when variable capture is enabled. When the serialized
 /// map exceeds the configured byte cap, `values` is dropped and `truncated` is
@@ -109,8 +120,18 @@ struct Inner {
     /// variable payloads can be large (the engine has a spill path for exactly
     /// this) and are a privacy surface once exported / shipped to an LLM.
     capture_vars: bool,
+    /// When true, fold an ordered per-instance *recorded-input* log — the external
+    /// stimuli the engine consumed (job / user-task outputs, message variables,
+    /// timer fires, set-variables deltas) — so a historical instance can be
+    /// replayed against a candidate model (ProcessOS T2). See
+    /// `NANOBPMN_TRACE_STIMULI`. Same footprint/privacy caveats as `capture_vars`.
+    capture_stimuli: bool,
     /// Byte cap applied to each captured variable snapshot.
     vars_max_bytes: usize,
+    /// Per-instance cap on the number of recorded stimuli (a long-running instance
+    /// could otherwise grow without bound). Beyond it the log stops appending and
+    /// is flagged truncated.
+    stimuli_max: usize,
     /// Trace per instance key.
     instances: HashMap<u64, InstanceTrace>,
     /// Instance keys in insertion order (oldest at the front) for ring eviction.
@@ -175,6 +196,32 @@ struct InstanceTrace {
     /// an incident can snapshot the state the failing expression saw. Not
     /// serialized directly — only sampled into `IncidentRec::variables`.
     current_variables: Option<HashMap<String, Value>>,
+    /// Ordered recorded-input log (Tier 2), kept only when stimulus capture is on.
+    /// Each entry is one external stimulus the instance consumed; replaying the
+    /// creation inputs then these deltas in order reproduces the run's inputs.
+    stimuli: Option<Vec<Stimulus>>,
+    /// Index of the stimulus awaiting its output `VariablesUpdated` (a completion
+    /// event is immediately followed by its variable merge, if any). Bounded to
+    /// the immediate aftermath: cleared once the token advances past the element.
+    pending_stimulus: Option<usize>,
+    /// Set once the per-instance stimulus cap is hit.
+    stimuli_truncated: bool,
+}
+
+/// One external stimulus consumed by an instance, in observed order.
+#[derive(Clone)]
+struct Stimulus {
+    seq: u32,
+    at: u64,
+    /// `jobCompleted` | `userTaskCompleted` | `message` | `timer` | `variablesSet`.
+    kind: &'static str,
+    /// Job type (for `jobCompleted`) or element id (messages / timers); `None`
+    /// where the projection cannot attribute one (e.g. a bare `variablesSet`).
+    reference: Option<String>,
+    /// The variable delta this stimulus carried into the instance (the worker
+    /// output / message payload). `None` for a payload-less stimulus (e.g. a
+    /// timer fire, or a completion with no output).
+    variables: Option<VarSnapshot>,
 }
 
 #[derive(Clone)]
@@ -215,21 +262,39 @@ struct IncidentRec {
 
 impl TraceStore {
     pub fn new(capacity: usize) -> Self {
-        Self::build(capacity, false, DEFAULT_VARS_MAX_BYTES)
+        Self::build(capacity, false, false, DEFAULT_VARS_MAX_BYTES, DEFAULT_STIMULI_MAX)
     }
 
     /// Like [`new`], but with variable capture enabled and a snapshot byte cap.
     /// Used where the caller explicitly opts into capturing variables.
     pub fn with_variables(capacity: usize, vars_max_bytes: usize) -> Self {
-        Self::build(capacity, true, vars_max_bytes.max(1))
+        Self::build(capacity, true, false, vars_max_bytes.max(1), DEFAULT_STIMULI_MAX)
     }
 
-    fn build(capacity: usize, capture_vars: bool, vars_max_bytes: usize) -> Self {
+    /// Like [`new`], but with both variable capture and the recorded-input
+    /// stimulus log (Tier 2) enabled. Used in tests / explicit opt-in.
+    pub fn with_capture(
+        capacity: usize,
+        vars_max_bytes: usize,
+        stimuli_max: usize,
+    ) -> Self {
+        Self::build(capacity, true, true, vars_max_bytes.max(1), stimuli_max.max(1))
+    }
+
+    fn build(
+        capacity: usize,
+        capture_vars: bool,
+        capture_stimuli: bool,
+        vars_max_bytes: usize,
+        stimuli_max: usize,
+    ) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 capacity: capacity.max(1),
                 capture_vars,
+                capture_stimuli,
                 vars_max_bytes,
+                stimuli_max: stimuli_max.max(1),
                 instances: HashMap::new(),
                 order: VecDeque::new(),
                 versions: HashMap::new(),
@@ -241,23 +306,31 @@ impl TraceStore {
     /// Builds a store sized from `NANOBPMN_TRACE_CAPACITY` (default 2000).
     /// Variable capture is opt-in via `NANOBPMN_TRACE_VARIABLES` (truthy), with
     /// the per-snapshot byte cap from `NANOBPMN_TRACE_VARIABLES_MAX_BYTES`
-    /// (default 16384).
+    /// (default 16384). The Tier-2 recorded-input log is opt-in via
+    /// `NANOBPMN_TRACE_STIMULI` (truthy), capped per instance by
+    /// `NANOBPMN_TRACE_STIMULI_MAX` (default 1024); enabling it implies variable
+    /// capture so the replay has both its creation inputs and its deltas.
     pub fn from_env() -> Self {
         let cap = std::env::var("NANOBPMN_TRACE_CAPACITY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_CAPACITY);
-        let capture_vars = std::env::var("NANOBPMN_TRACE_VARIABLES")
-            .ok()
-            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false);
+        let capture_stimuli = env_flag("NANOBPMN_TRACE_STIMULI");
+        // Stimulus capture needs creation inputs to be a complete replay record,
+        // so it implies variable capture.
+        let capture_vars = capture_stimuli || env_flag("NANOBPMN_TRACE_VARIABLES");
         let vars_max_bytes = std::env::var("NANOBPMN_TRACE_VARIABLES_MAX_BYTES")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_VARS_MAX_BYTES);
-        Self::build(cap, capture_vars, vars_max_bytes)
+        let stimuli_max = std::env::var("NANOBPMN_TRACE_STIMULI_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_STIMULI_MAX);
+        Self::build(cap, capture_vars, capture_stimuli, vars_max_bytes, stimuli_max)
     }
 
     /// Folds one exporter batch into the trace store. `now` is the server's
@@ -359,6 +432,13 @@ impl Inner {
                     path: Vec::new(),
                     creation_variables,
                     current_variables,
+                    stimuli: if self.capture_stimuli {
+                        Some(Vec::new())
+                    } else {
+                        None
+                    },
+                    pending_stimulus: None,
+                    stimuli_truncated: false,
                 };
                 self.insert(*instance_key, trace);
             }
@@ -374,6 +454,28 @@ impl Inner {
                     let running = t.current_variables.get_or_insert_with(HashMap::new);
                     for (k, v) in variables {
                         running.insert(k.clone(), v.clone());
+                    }
+                    // Tier 2: attribute this delta to the completion it followed
+                    // (a job/user-task output or a message payload). With no
+                    // pending completion it is a standalone set-variables delta.
+                    if self.capture_stimuli {
+                        let snap = snapshot_vars(variables, self.vars_max_bytes);
+                        match t.pending_stimulus.take() {
+                            Some(idx) => {
+                                if let Some(s) = t.stimuli.as_mut().and_then(|v| v.get_mut(idx)) {
+                                    s.variables = Some(snap);
+                                }
+                            }
+                            None => {
+                                t.record_stimulus(
+                                    "variablesSet",
+                                    None,
+                                    Some(snap),
+                                    now,
+                                    self.stimuli_max,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -413,6 +515,10 @@ impl Inner {
                     if let Some(&idx) = t.by_eik.get(element_instance_key) {
                         t.elements[idx].exited_at = Some(now);
                     }
+                    // The token has advanced past the completed element, so any
+                    // completion still awaiting an output had none — stop a later
+                    // unrelated delta from being mis-attributed to it.
+                    t.pending_stimulus = None;
                 }
             }
             Event::JobCreated {
@@ -473,10 +579,19 @@ impl Inner {
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
+                    let mut job_type = None;
                     if let Some(&idx) = t.by_job.get(job_key) {
                         if let Some(job) = t.elements[idx].job.as_mut() {
                             job.completed_at = Some(now);
+                            job_type = Some(job.job_type.clone());
                         }
+                    }
+                    // Tier 2: a job completion is an external input; its output
+                    // variables (if any) arrive on the next `VariablesUpdated`,
+                    // which attaches to this pending stimulus.
+                    if self.capture_stimuli {
+                        let idx = t.record_stimulus("jobCompleted", job_type, None, now, self.stimuli_max);
+                        t.pending_stimulus = idx;
                     }
                 }
             }
@@ -555,6 +670,78 @@ impl Inner {
                     t.outcome = Outcome::Terminated;
                 }
             }
+            // --- Tier 2 recorded-input stimuli (only when enabled) -------------
+            Event::UserTaskCompleted { instance_key, .. } => {
+                if self.capture_stimuli {
+                    if let Some(t) = self.instances.get_mut(instance_key) {
+                        t.last_at = now;
+                        let idx =
+                            t.record_stimulus("userTaskCompleted", None, None, now, self.stimuli_max);
+                        t.pending_stimulus = idx;
+                    }
+                }
+            }
+            Event::MessageCorrelated {
+                instance_key,
+                element_id,
+                ..
+            } => {
+                if self.capture_stimuli {
+                    if let Some(t) = self.instances.get_mut(instance_key) {
+                        t.last_at = now;
+                        let idx = t.record_stimulus(
+                            "message",
+                            Some(element_id.clone()),
+                            None,
+                            now,
+                            self.stimuli_max,
+                        );
+                        t.pending_stimulus = idx;
+                    }
+                }
+            }
+            Event::RemoteMessageCorrelation {
+                instance_key,
+                element_id,
+                variables,
+                ..
+            } => {
+                // Cross-partition: the message payload is carried inline, so the
+                // stimulus is complete on its own (no following local merge).
+                if self.capture_stimuli {
+                    let snap = snapshot_vars(variables, self.vars_max_bytes);
+                    if let Some(t) = self.instances.get_mut(instance_key) {
+                        t.last_at = now;
+                        t.record_stimulus(
+                            "message",
+                            Some(element_id.clone()),
+                            Some(snap),
+                            now,
+                            self.stimuli_max,
+                        );
+                    }
+                }
+            }
+            Event::TimerTriggered {
+                instance_key,
+                element_id,
+                ..
+            } => {
+                // A timer fire carries no payload, but its occurrence and timing
+                // are part of the recorded input ordering.
+                if self.capture_stimuli {
+                    if let Some(t) = self.instances.get_mut(instance_key) {
+                        t.last_at = now;
+                        t.record_stimulus(
+                            "timer",
+                            Some(element_id.clone()),
+                            None,
+                            now,
+                            self.stimuli_max,
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -630,6 +817,33 @@ impl InstanceTrace {
         });
         self.by_eik.insert(eik, idx);
         idx
+    }
+
+    /// Appends a recorded-input stimulus, honouring the per-instance cap. Returns
+    /// the new index (so a completion's deferred output can be attached later) or
+    /// `None` when capture is off or the cap was reached.
+    fn record_stimulus(
+        &mut self,
+        kind: &'static str,
+        reference: Option<String>,
+        variables: Option<VarSnapshot>,
+        at: u64,
+        max: usize,
+    ) -> Option<usize> {
+        let log = self.stimuli.as_mut()?;
+        if log.len() >= max {
+            self.stimuli_truncated = true;
+            return None;
+        }
+        let idx = log.len();
+        log.push(Stimulus {
+            seq: idx as u32,
+            at,
+            kind,
+            reference,
+            variables,
+        });
+        Some(idx)
     }
 
     fn summary(&self) -> TraceSummaryDto {
@@ -710,6 +924,18 @@ impl InstanceTrace {
                 .collect(),
             path: self.path.clone(),
             creation_variables: self.creation_variables.as_ref().map(VarSnapshot::dto),
+            stimuli: self.stimuli.as_ref().map(|log| {
+                log.iter()
+                    .map(|s| StimulusDto {
+                        seq: s.seq,
+                        at: s.at,
+                        kind: s.kind,
+                        reference: s.reference.clone(),
+                        variables: s.variables.as_ref().map(VarSnapshot::dto),
+                    })
+                    .collect()
+            }),
+            stimuli_truncated: self.stimuli_truncated,
         }
     }
 
@@ -865,6 +1091,27 @@ pub struct InstanceTraceDto {
     /// from the JSON entirely when capture is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creation_variables: Option<VariablesDto>,
+    /// The ordered recorded-input log (Tier 2), when stimulus capture is enabled.
+    /// Omitted from the JSON entirely when capture is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stimuli: Option<Vec<StimulusDto>>,
+    /// True when the per-instance stimulus cap was reached and later inputs were
+    /// dropped from the log.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stimuli_truncated: bool,
+}
+
+/// One recorded external input on the trace's Tier-2 log.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StimulusDto {
+    pub seq: u32,
+    pub at: u64,
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variables: Option<VariablesDto>,
 }
 
 /// A captured variable map exposed on the trace. `values` is the JSON object of
@@ -1000,5 +1247,148 @@ mod tests {
         assert!(creation.truncated);
         assert!(creation.values.is_none());
         assert!(creation.bytes > 16);
+    }
+
+    fn job_created(key: u64, job_key: u64, eik: u64, ty: &str) -> Event {
+        Event::JobCreated {
+            job_key,
+            instance_key: key,
+            element_instance_key: eik,
+            element_id: format!("task-{ty}"),
+            job_type: ty.to_string(),
+            created_at: 0,
+            priority: 50,
+        }
+    }
+
+    fn vars_updated(key: u64, vars: &[(&str, Value)]) -> Event {
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        }
+    }
+
+    #[test]
+    fn stimuli_off_keeps_no_log() {
+        // Tier 1 only: variables captured, but no recorded-input log.
+        let store = TraceStore::with_variables(8, 16 * 1024);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        store.ingest(&[&job_created(1, 10, 2, "classify")], 1010);
+        store.ingest(
+            &[
+                &Event::JobCompleted { job_key: 10, instance_key: 1 },
+                &vars_updated(1, &[("label", Value::Str("vip".into()))]),
+            ],
+            1020,
+        );
+        assert!(store.get(1).unwrap().stimuli.is_none());
+    }
+
+    #[test]
+    fn records_job_output_message_and_timer_in_order() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        store.ingest(&[&job_created(1, 10, 2, "classify")], 1010);
+        // Job completes with output → JobCompleted then its VariablesUpdated.
+        store.ingest(
+            &[
+                &Event::JobCompleted { job_key: 10, instance_key: 1 },
+                &vars_updated(1, &[("label", Value::Str("vip".into()))]),
+                &Event::ElementCompleted {
+                    instance_key: 1,
+                    element_instance_key: 2,
+                    element_id: "task-classify".into(),
+                },
+            ],
+            1020,
+        );
+        // A message correlation with payload.
+        store.ingest(
+            &[
+                &Event::MessageCorrelated {
+                    subscription_key: 5,
+                    message_key: 6,
+                    instance_key: 1,
+                    element_instance_key: 3,
+                    element_id: "catch".into(),
+                },
+                &vars_updated(1, &[("approved", Value::Bool(true))]),
+            ],
+            1030,
+        );
+        // A timer fire (no payload).
+        store.ingest(
+            &[&Event::TimerTriggered {
+                timer_key: 7,
+                instance_key: 1,
+                element_instance_key: 4,
+                element_id: "wait".into(),
+            }],
+            1040,
+        );
+
+        let stimuli = store.get(1).unwrap().stimuli.expect("stimuli log");
+        assert_eq!(stimuli.len(), 3);
+
+        assert_eq!(stimuli[0].kind, "jobCompleted");
+        assert_eq!(stimuli[0].reference.as_deref(), Some("classify"));
+        assert_eq!(
+            stimuli[0].variables.as_ref().unwrap().values.as_ref().unwrap()["label"],
+            serde_json::json!("vip"),
+            "job output delta attributed to its completion"
+        );
+
+        assert_eq!(stimuli[1].kind, "message");
+        assert_eq!(stimuli[1].reference.as_deref(), Some("catch"));
+        assert_eq!(
+            stimuli[1].variables.as_ref().unwrap().values.as_ref().unwrap()["approved"],
+            serde_json::json!(true)
+        );
+
+        assert_eq!(stimuli[2].kind, "timer");
+        assert!(stimuli[2].variables.is_none(), "timer carries no payload");
+    }
+
+    #[test]
+    fn empty_output_job_does_not_swallow_a_later_set_variables() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 1024);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        store.ingest(&[&job_created(1, 10, 2, "noop")], 1010);
+        // Job completes with NO output; the token advances (ElementCompleted).
+        store.ingest(
+            &[
+                &Event::JobCompleted { job_key: 10, instance_key: 1 },
+                &Event::ElementCompleted {
+                    instance_key: 1,
+                    element_instance_key: 2,
+                    element_id: "task-noop".into(),
+                },
+            ],
+            1020,
+        );
+        // A later standalone set-variables delta must NOT attach to the job.
+        store.ingest(&[&vars_updated(1, &[("flag", Value::Bool(true))])], 1030);
+
+        let stimuli = store.get(1).unwrap().stimuli.unwrap();
+        assert_eq!(stimuli.len(), 2);
+        assert_eq!(stimuli[0].kind, "jobCompleted");
+        assert!(stimuli[0].variables.is_none(), "empty-output job stays varless");
+        assert_eq!(stimuli[1].kind, "variablesSet");
+        assert_eq!(
+            stimuli[1].variables.as_ref().unwrap().values.as_ref().unwrap()["flag"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn stimulus_log_is_capped_per_instance() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 2);
+        store.ingest(&[&created(1, &[])], 1000);
+        for i in 0..5u64 {
+            store.ingest(&[&vars_updated(1, &[("n", Value::Int(i as i64))])], 1010 + i);
+        }
+        let dto = store.get(1).unwrap();
+        assert_eq!(dto.stimuli.unwrap().len(), 2);
+        assert!(dto.stimuli_truncated);
     }
 }

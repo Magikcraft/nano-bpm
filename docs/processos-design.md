@@ -432,9 +432,25 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   (`NANOBPMN_TRACE_VARIABLES_MAX_BYTES`, default 16384 — an oversized map is dropped,
   reporting only `truncated: true` + `bytes`, so the bounded in-memory ring can't be
   ballooned). This hands ProcessOS T2 its replay *inputs* and gives the modeler its
-  FEEL-debug snapshot. Still ahead: **Tier 2** — recording the ordered *external
-  stimuli* (job-completion outputs, message/timer vars) for fully faithful
-  recorded-input replay against candidate models.
+  FEEL-debug snapshot.
+- **Recorded-input stimulus log — Tier 2 (now exists)** (`server/src/console/trace.rs`):
+  the projection now also folds, when enabled, an **ordered per-instance log of the
+  external stimuli the engine consumed** — each job/user-task completion output, message
+  correlation payload, timer fire, and standalone set-variables delta, in observed order
+  with its observation timestamp. A completion's output is attributed to it by the
+  engine's emission order (`JobCompleted`/`MessageCorrelated` is immediately followed by
+  its `VariablesUpdated`); the pending attribution is bounded to the element's lifetime
+  (cleared on `ElementCompleted`) so a later unrelated delta can't be mis-attributed.
+  Exposed on `GET /console/api/traces/{key}` as `stimuli` (`[{seq, at, kind, reference,
+  variables}]`, `kind ∈ jobCompleted|userTaskCompleted|message|timer|variablesSet`).
+  Replaying `creationVariables` then these deltas in order reproduces a historical
+  instance's inputs against a candidate model — the missing piece for **real**
+  recorded-input replay (not authored scenario inputs). Opt-in via
+  `NANOBPMN_TRACE_STIMULI` (off by default; implies variable capture so the replay has
+  both its creation inputs and deltas), per-snapshot byte-capped as Tier 1, and
+  per-instance count-capped (`NANOBPMN_TRACE_STIMULI_MAX`, default 1024 — beyond it the
+  log flags `stimuliTruncated` rather than growing without bound). Same footprint/PII
+  posture: off by default, capped when on.
 - **Prompt library — the LLM/prompt as an experimental variable (now exists)**
   (`harness/prompts.rs`): the experimental phase varies not only the candidate
   *models* but the *prompts and LLMs* used to generate them. The LLM was already a
