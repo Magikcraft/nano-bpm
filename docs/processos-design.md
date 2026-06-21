@@ -376,13 +376,37 @@ queueing/DES model sim, (c) live act-and-measure. This *locates* the M3 work:
   queue-wait — monotonic in the target, each prediction under it, ρ < 1
   throughout. This closes distributed *sensing* → a grounded distributed *scaling*
   **recommendation**.
+- **Calibration — the measure → simulate wire (now exists)** (`harness/calibrate.rs`):
+  the SimRunner drives the real `engine-core`, but the per-task service time and
+  failure rate it charges came from each `WorkerModel`'s hand-authored numbers. To
+  *speculatively execute* a hypothesis against a baseline that reflects reality,
+  `calibrate_from_measured(scenario, &[MeasuredJobType])` overrides the **assigned**
+  worker of each measured job type with the sample-weighted measured `avgServiceMs`
+  and pooled `failures / samples` failure rate — preserving cost (no cost channel in
+  the trace contract yet) and leaving **latent candidate** workers (the alternatives
+  the LLM may swap in, for which there is no production data) at their modelled
+  values. `calibrate_from_cluster` adapts a `ClusterRunSummary.byJobType` onto the
+  generic input; `apply` returns a calibrated scenario ready for the ranker /
+  hypothesis loop. Exposed as `POST /api/harness/calibrate` (caller supplies the
+  measured distributions — no LLM or live cluster needed; returns the calibration
+  plus the ranking over the grounded model), and as an optional `measured` field on
+  `POST /api/harness/hypothesize` so the LLM reasons over — and every candidate is
+  scored against — the bar production actually set. *Verified end-to-end:* feeding the
+  bundled example a measured `classify` of 900 ms / 30 % failure moved the baseline
+  from the modelled 2100 ms to a calibrated 1350 ms at 0.5 correctness, with
+  `calibrated:[classify] uncalibrated:[summarize]` reported. This is the first of the
+  three wires that close the loop on **real** data.
 - **Still deferred (not M3):** the fuller regime-(b) **discrete-event** simulator
   (multi-job-type consolidation what-ifs, cross-process contention — beyond the
   single-pool Erlang-C estimate); the **third (scaling/fleet) control verb** that
   would *apply* a recommendation (actuate-opt-in, its own public-API design); and
   **portfolio scope** (cross-process resource attribution in ingest + an aggregate
-  objective). M3 stays *measure → rank → suggest* on the per-process loop; an
-  Erlang-C *suggestion* fits squarely in "suggest" without crossing into actuation.
+  objective). The remaining two closed-loop wires also stay ahead: **T2 recorded-input
+  replay** (replay *historical* production inputs, not authored scenario inputs) and
+  **production-Insights → prompt** (anchor hypothesis generation on the live baseline
+  rather than the synthetic one). M3 stays *measure → rank → suggest* on the
+  per-process loop; calibration and an Erlang-C *suggestion* fit squarely in
+  "suggest" without crossing into actuation.
 
 ## 8. Invariants ProcessOS must honour
 

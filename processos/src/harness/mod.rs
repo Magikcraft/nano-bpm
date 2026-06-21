@@ -26,7 +26,11 @@ mod production;
 mod queueing;
 mod rank;
 mod sim;
+mod calibrate;
 
+pub use calibrate::{apply as apply_calibration, calibrate_from_measured};
+#[allow(unused_imports)]
+pub use calibrate::{calibrate_from_cluster, Calibration, MeasuredJobType};
 pub use cluster::build_cluster_summary;
 #[allow(unused_imports)]
 pub use cluster::ClusterRunSummary;

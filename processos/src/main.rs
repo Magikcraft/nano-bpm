@@ -26,8 +26,9 @@ use serde::Deserialize;
 
 use crate::contracts::NanoClient;
 use crate::harness::{
-    build_baseline, build_cluster_summary, example_scenario, run_hypothesis, run_scenario,
-    staff_for_summary, LlmConfig, LlmOverride, Scenario,
+    apply_calibration, build_baseline, build_cluster_summary, calibrate_from_measured,
+    example_scenario, run_hypothesis, run_scenario, staff_for_summary, LlmConfig, LlmOverride,
+    MeasuredJobType, Scenario,
 };
 
 #[derive(Clone)]
@@ -79,6 +80,7 @@ async fn main() {
         .route("/api/harness/example", get(harness_example))
         .route("/api/harness/example/run", get(harness_example_run))
         .route("/api/harness/run", post(harness_run))
+        .route("/api/harness/calibrate", post(harness_calibrate))
         .route("/api/harness/hypothesize", post(harness_hypothesize))
         .route("/api/harness/production", get(harness_production))
         .route("/api/harness/cluster", get(harness_cluster))
@@ -179,6 +181,49 @@ async fn harness_run(Json(scenario): Json<Scenario>) -> impl IntoResponse {
     run_scenario_blocking(scenario).await
 }
 
+/// Request body for the calibration path: a scenario plus the measured per-job-type
+/// distributions to ground its baseline workers in.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CalibrateRequest {
+    scenario: Scenario,
+    /// Measured per-job-type behaviour (e.g. the `byJobType` array from
+    /// `GET /api/harness/cluster`, or any equivalent observation).
+    #[serde(default)]
+    measured: Vec<MeasuredJobType>,
+}
+
+/// `POST /api/harness/calibrate` — ground a scenario's baseline workers in measured
+/// production, then rank over the calibrated model. Returns the calibration (which
+/// job types were covered, and the resulting worker pool) alongside the ranking, so
+/// the same loop's verdicts reflect the service times and failure rates the cluster
+/// actually observed rather than hand-authored numbers. No LLM or live cluster
+/// required — the caller supplies the measured distributions.
+async fn harness_calibrate(Json(req): Json<CalibrateRequest>) -> impl IntoResponse {
+    let calibration = calibrate_from_measured(&req.scenario, &req.measured);
+    let calibrated_scenario = apply_calibration(&req.scenario, &calibration);
+    let scenario = calibrated_scenario.clone();
+    let ranked =
+        tokio::task::spawn_blocking(move || run_scenario(&scenario)).await;
+    match ranked {
+        Ok(Ok(report)) => Json(serde_json::json!({
+            "calibration": calibration,
+            "report": report,
+        }))
+        .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("join error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 /// Request body for the LLM hypothesis path: a scenario plus optional LLM
 /// overrides and a flag to also evaluate the baked grid for comparison.
 #[derive(Debug, Deserialize)]
@@ -189,6 +234,12 @@ struct HypothesizeRequest {
     llm: Option<LlmOverride>,
     #[serde(default)]
     include_baked: bool,
+    /// Optional measured per-job-type distributions. When present, the scenario's
+    /// baseline workers are calibrated from production before the LLM reasons over
+    /// it and before any candidate is scored — so the bar the hypotheses must beat
+    /// reflects measured reality, not hand-authored numbers.
+    #[serde(default)]
+    measured: Vec<MeasuredJobType>,
 }
 
 /// `POST /api/harness/hypothesize` — ask the configured LLM to propose candidates,
@@ -210,7 +261,16 @@ async fn harness_hypothesize(Json(req): Json<HypothesizeRequest>) -> impl IntoRe
         )
             .into_response();
     }
-    match run_hypothesis(&req.scenario, &cfg, req.include_baked).await {
+    // Ground the baseline in production when measured distributions are supplied,
+    // so the LLM reasons over — and every candidate is scored against — the service
+    // times and failure rates the cluster actually observed.
+    let scenario = if req.measured.is_empty() {
+        req.scenario.clone()
+    } else {
+        let calibration = calibrate_from_measured(&req.scenario, &req.measured);
+        apply_calibration(&req.scenario, &calibration)
+    };
+    match run_hypothesis(&scenario, &cfg, req.include_baked).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
