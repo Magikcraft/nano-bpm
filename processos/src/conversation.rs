@@ -152,7 +152,12 @@ mod tests {
     use super::*;
 
     fn tmp() -> PathBuf {
-        let p = std::env::temp_dir().join(format!("processos-convo-{}", now_ms()));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A monotonic counter guarantees a distinct dir per call even when several
+        // tests run in parallel within the same millisecond.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("processos-convo-{}-{}", now_ms(), n));
         let _ = fs::remove_dir_all(&p);
         p
     }

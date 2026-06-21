@@ -22,7 +22,11 @@ pub const PILOT_PROCESS_ID: &str = "pilotSelfOptimize";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
+    /// The client's production engine ProcessOS analyses (read-only). Kept as
+    /// `nanoBaseUrl` for back-compat; equals `ownBaseUrl` in a single-Nano setup.
     pub nano_base_url: String,
+    /// ProcessOS's own engine, where experiments (the pilot loop) run.
+    pub own_base_url: String,
     /// Deployed target processes (the things an experiment optimizes), excluding
     /// the pilot meta-process itself.
     pub processes: Vec<ProcessCard>,
@@ -204,11 +208,18 @@ pub async fn list_experiments(nano: &NanoClient, limit: usize) -> Result<Vec<Exp
 }
 
 /// The cockpit overview: target-process cards (with experiment counts) + the
-/// experiments list. Target stats are distilled from the same insight report the
-/// `/console` dashboard uses.
-pub async fn overview(nano: &NanoClient, limit: usize, sample: usize) -> Result<Overview, String> {
-    let insights = crate::report::build(nano, limit, sample).await?;
-    let experiments = list_experiments(nano, limit).await?;
+/// experiments list. The process cards are distilled from the client's production
+/// engine (`target`) — the same insight report the `/console` dashboard uses —
+/// while the experiments are `pilotSelfOptimize` instances on ProcessOS's own
+/// engine (`own`). In a single-Nano dev setup the two clients address the same URL.
+pub async fn overview(
+    target: &NanoClient,
+    own: &NanoClient,
+    limit: usize,
+    sample: usize,
+) -> Result<Overview, String> {
+    let insights = crate::report::build(target, limit, sample).await?;
+    let experiments = list_experiments(own, limit).await?;
 
     let mut processes: Vec<ProcessCard> = insights
         .processes
@@ -234,7 +245,8 @@ pub async fn overview(nano: &NanoClient, limit: usize, sample: usize) -> Result<
     processes.sort_by(|a, b| b.instances.cmp(&a.instances));
 
     Ok(Overview {
-        nano_base_url: nano.base_url().to_string(),
+        nano_base_url: target.base_url().to_string(),
+        own_base_url: own.base_url().to_string(),
         processes,
         experiments,
     })

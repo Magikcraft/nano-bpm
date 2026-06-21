@@ -40,7 +40,14 @@ use nanobpmn_engine_core::bpmn::parse_bpmn;
 
 #[derive(Clone)]
 struct AppState {
-    nano: NanoClient,
+    /// The client's production engine — the read-only analysis TARGET. Traces,
+    /// metrics, and the baseline process definition are read from here; ProcessOS
+    /// never runs its own meta-workloads on the client's engine.
+    target: NanoClient,
+    /// ProcessOS's OWN engine — where the `pilotSelfOptimize` loop runs and its
+    /// workers are deployed. The cockpit creates/reads experiments and completes
+    /// the human Review task here.
+    own: NanoClient,
     /// The prompt library — import / select / author the system prompts that drive
     /// hypothesis generation. Shared, interior-mutable so authoring is live.
     prompts: Arc<RwLock<PromptLibrary>>,
@@ -52,7 +59,13 @@ struct AppState {
 /// Server configuration, all overridable by environment.
 struct Config {
     port: u16,
-    nano_base_url: String,
+    /// The client's production engine ProcessOS analyses (read-only). `NANO_TARGET_URL`,
+    /// falling back to `NANO_BASE_URL`, then `http://localhost:8080`.
+    target_url: String,
+    /// ProcessOS's own engine, where the pilot loop + workers run. `PROCESSOS_NANO_URL`,
+    /// falling back to `NANO_BASE_URL`, then `http://localhost:8080`. In a single-Nano
+    /// dev setup this equals `target_url`, keeping the historical behaviour.
+    own_url: String,
     /// Optional directory to import prompts from on startup (`PROCESSOS_PROMPTS_DIR`).
     prompts_dir: Option<String>,
     /// Directory for durable state — currently cockpit conversations
@@ -66,20 +79,38 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(8090);
-        let nano_base_url = std::env::var("NANO_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "http://localhost:8080".to_string());
+        let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+        let (target_url, own_url) = resolve_nano_urls(
+            env("NANO_BASE_URL"),
+            env("NANO_TARGET_URL"),
+            env("PROCESSOS_NANO_URL"),
+        );
         let prompts_dir = std::env::var("PROCESSOS_PROMPTS_DIR")
             .ok()
             .filter(|s| !s.is_empty());
         Self {
             port,
-            nano_base_url,
+            target_url,
+            own_url,
             prompts_dir,
             data_dir: conversation::data_dir_from_env(),
         }
     }
+}
+
+/// Resolve the (target, own) Nano URLs from the three env sources. `NANO_BASE_URL`
+/// is the back-compat alias that defaults BOTH roles; `NANO_TARGET_URL` and
+/// `PROCESSOS_NANO_URL` override each role independently. With none set, both fall
+/// back to the local gateway. Pure so the precedence is unit-testable.
+fn resolve_nano_urls(
+    base: Option<String>,
+    target: Option<String>,
+    own: Option<String>,
+) -> (String, String) {
+    let default = base.unwrap_or_else(|| "http://localhost:8080".to_string());
+    let target_url = target.unwrap_or_else(|| default.clone());
+    let own_url = own.unwrap_or(default);
+    (target_url, own_url)
 }
 
 #[tokio::main]
@@ -101,7 +132,8 @@ async fn main() {
     }
 
     let state = AppState {
-        nano: NanoClient::new(&cfg.nano_base_url),
+        target: NanoClient::new(&cfg.target_url),
+        own: NanoClient::new(&cfg.own_url),
         prompts: Arc::new(RwLock::new(library)),
         conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
     };
@@ -144,9 +176,10 @@ async fn main() {
 
     tracing::info!(
         %addr,
-        nano = %cfg.nano_base_url,
+        target = %cfg.target_url,
+        own = %cfg.own_url,
         data_dir = %cfg.data_dir.display(),
-        "ProcessOS (T1: Insights) listening; reading Nano over the public trace/metrics contract"
+        "ProcessOS listening; reading the client's production engine (target) over the public trace/metrics contract; running the pilot loop on its own engine"
     );
     println!("PROCESSOS_PORT={}", cfg.port);
 
@@ -180,7 +213,7 @@ async fn insights(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match report::build(&state.nano, limit, sample).await {
+    match report::build(&state.target, limit, sample).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
@@ -230,7 +263,7 @@ async fn cockpit_overview(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match cockpit::overview(&state.nano, limit, sample).await {
+    match cockpit::overview(&state.target, &state.own, limit, sample).await {
         Ok(o) => Json(o).into_response(),
         Err(e) => bad_gateway(e),
     }
@@ -242,7 +275,7 @@ async fn cockpit_experiments(
     Query(q): Query<InsightsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    match cockpit::list_experiments(&state.nano, limit).await {
+    match cockpit::list_experiments(&state.own, limit).await {
         Ok(xs) => Json(xs).into_response(),
         Err(e) => bad_gateway(e),
     }
@@ -253,7 +286,7 @@ async fn cockpit_experiment(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    match cockpit::experiment_detail(&state.nano, &key).await {
+    match cockpit::experiment_detail(&state.own, &key).await {
         Ok(mut d) => {
             // Prefer the durable dialogue: once an experiment has a persisted log
             // (engine framing at creation, a droid turn per round, the pilot's
@@ -284,13 +317,13 @@ async fn cockpit_create(
 ) -> impl IntoResponse {
     let baseline = match req.baseline_model {
         Some(b) if !b.trim().is_empty() => b,
-        _ => match cockpit::latest_process_xml(&state.nano, &req.process_id).await {
+        _ => match cockpit::latest_process_xml(&state.target, &req.process_id).await {
             Ok(xml) => xml,
             Err(e) => return bad_gateway(e),
         },
     };
     let max_iterations = req.max_iterations.unwrap_or(2).clamp(1, 50);
-    match cockpit::create_experiment(&state.nano, &req.process_id, baseline, max_iterations, req.prompt_id.clone()).await {
+    match cockpit::create_experiment(&state.own, &req.process_id, baseline, max_iterations, req.prompt_id.clone()).await {
         Ok(key) => {
             // Seed the durable conversation with the engine's framing turn so the log
             // is a complete dialogue from the first render, not just from round 1.
@@ -336,7 +369,7 @@ async fn cockpit_decision(
         None => format!("[{decision}]"),
     };
     state.conversations.append(&key, "pilot", &pilot_text, None);
-    match cockpit::submit_decision(&state.nano, &key, decision, note).await {
+    match cockpit::submit_decision(&state.own, &key, decision, note).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => bad_gateway(e),
     }
@@ -598,7 +631,7 @@ async fn harness_replay(
 ) -> impl IntoResponse {
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.nano.clone(),
+        _ => state.target.clone(),
     };
     let trace = match client.trace(&req.instance_key).await {
         Ok(t) => t,
@@ -681,7 +714,7 @@ async fn harness_replay_batch(
 ) -> impl IntoResponse {
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.nano.clone(),
+        _ => state.target.clone(),
     };
     let defs = match parse_bpmn(&req.candidate_model) {
         Ok(d) if !d.is_empty() => d,
@@ -827,7 +860,7 @@ async fn harness_replay_rank(
     }
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.nano.clone(),
+        _ => state.target.clone(),
     };
     let limit = req.limit.unwrap_or(200);
     let summaries = match client.list_traces(limit).await {
@@ -969,7 +1002,7 @@ async fn harness_evolve(
     // Fetch + distil the recorded dataset (this is the fitness data).
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.nano.clone(),
+        _ => state.target.clone(),
     };
     let limit = req.limit.unwrap_or(200);
     let summaries = match client.list_traces(limit).await {
@@ -1122,7 +1155,7 @@ async fn harness_production(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match build_baseline(&state.nano, q.process_id.as_deref(), limit, sample).await {
+    match build_baseline(&state.target, q.process_id.as_deref(), limit, sample).await {
         Ok(baseline) => Json(baseline).into_response(),
         // A read-contract failure surfaces the underlying GET error; an empty or
         // unknown-process result is a request the caller can fix, so 422.
@@ -1153,7 +1186,7 @@ async fn harness_cluster(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match build_cluster_summary(&state.nano, q.process_id.as_deref(), limit, sample).await {
+    match build_cluster_summary(&state.target, q.process_id.as_deref(), limit, sample).await {
         Ok(summary) => match q.target_p99_ms {
             // Attach the staffing recommendation derived from the measured run.
             Some(target) => {
@@ -1397,3 +1430,41 @@ load();
 </body>
 </html>
 "##;
+
+#[cfg(test)]
+mod config_tests {
+    use super::resolve_nano_urls;
+
+    #[test]
+    fn defaults_both_roles_to_the_local_gateway() {
+        let (t, o) = resolve_nano_urls(None, None, None);
+        assert_eq!(t, "http://localhost:8080");
+        assert_eq!(o, "http://localhost:8080");
+    }
+
+    #[test]
+    fn nano_base_url_aliases_both_roles() {
+        let (t, o) = resolve_nano_urls(Some("http://shared:9".into()), None, None);
+        assert_eq!(t, "http://shared:9");
+        assert_eq!(o, "http://shared:9");
+    }
+
+    #[test]
+    fn role_specific_urls_override_the_alias_independently() {
+        let (t, o) = resolve_nano_urls(
+            Some("http://base:8080".into()),
+            Some("http://client-prod:8080".into()),
+            Some("http://processos-own:8081".into()),
+        );
+        assert_eq!(t, "http://client-prod:8080", "target = client's production");
+        assert_eq!(o, "http://processos-own:8081", "own = ProcessOS's engine");
+    }
+
+    #[test]
+    fn a_single_role_override_leaves_the_other_on_the_alias() {
+        let (t, o) =
+            resolve_nano_urls(Some("http://base:8080".into()), None, Some("http://own:8081".into()));
+        assert_eq!(t, "http://base:8080");
+        assert_eq!(o, "http://own:8081");
+    }
+}
