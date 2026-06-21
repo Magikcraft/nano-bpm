@@ -14,6 +14,7 @@ mod cockpit;
 mod conversation;
 mod harness;
 mod report;
+mod supervisor;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -131,9 +132,34 @@ async fn main() {
         }
     }
 
+    // If configured, spawn ProcessOS's OWN Nano engine (the client's production
+    // engine is the read-only target; ProcessOS runs its pilot loop here). The
+    // spawned engine's URL overrides `own_url`. Held to shutdown so we don't orphan
+    // a gateway across restarts.
+    let mut own_engine: Option<supervisor::OwnNano> = None;
+    let own_url = match supervisor::SpawnConfig::from_env() {
+        Some(spawn_cfg) => {
+            tracing::info!(
+                bin = %spawn_cfg.bin.display(),
+                data_dir = %spawn_cfg.data_dir.display(),
+                "starting ProcessOS's own Nano engine"
+            );
+            match supervisor::OwnNano::spawn(&spawn_cfg).await {
+                Ok(engine) => {
+                    let url = engine.base_url.clone();
+                    tracing::info!(own = %url, "own Nano engine ready; pilot process deployed");
+                    own_engine = Some(engine);
+                    url
+                }
+                Err(e) => panic!("failed to start own Nano engine: {e}"),
+            }
+        }
+        None => cfg.own_url.clone(),
+    };
+
     let state = AppState {
         target: NanoClient::new(&cfg.target_url),
-        own: NanoClient::new(&cfg.own_url),
+        own: NanoClient::new(&own_url),
         prompts: Arc::new(RwLock::new(library)),
         conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
     };
@@ -177,7 +203,7 @@ async fn main() {
     tracing::info!(
         %addr,
         target = %cfg.target_url,
-        own = %cfg.own_url,
+        own = %own_url,
         data_dir = %cfg.data_dir.display(),
         "ProcessOS listening; reading the client's production engine (target) over the public trace/metrics contract; running the pilot loop on its own engine"
     );
@@ -187,10 +213,35 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("ProcessOS server error");
+
+    // Tear down the spawned engine (if any) so it doesn't outlive ProcessOS.
+    if let Some(engine) = own_engine {
+        engine.shutdown().await;
+    }
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
 
 async fn health() -> &'static str {
