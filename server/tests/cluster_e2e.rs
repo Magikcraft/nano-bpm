@@ -362,3 +362,168 @@ fn a_worker_at_one_gateway_drains_jobs_from_the_whole_cluster() {
         "drained jobs must span both nodes' partitions, got {completed_partitions:?}"
     );
 }
+
+// ----------------------------------------------------------------------------
+// Command-stream create placement
+// ----------------------------------------------------------------------------
+
+/// A tiny blocking WebSocket text client — HTTP upgrade, masked client text
+/// frames (a zero mask is the identity transform, valid per RFC 6455), and a
+/// frame reader that skips non-text/control frames. Enough to drive
+/// `createInstance` over `/command-stream` and read each `commandResult`.
+struct WsClient {
+    stream: TcpStream,
+}
+
+impl WsClient {
+    fn connect(port: u16) -> Self {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect ws");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set read timeout");
+        let request = "GET /command-stream HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             \r\n";
+        stream
+            .write_all(request.as_bytes())
+            .expect("write ws handshake");
+        // Read response headers byte-by-byte up to the blank line so following
+        // WebSocket frame bytes stay unread on the socket.
+        let mut headers = Vec::new();
+        let mut byte = [0u8; 1];
+        while stream.read_exact(&mut byte).is_ok() {
+            headers.push(byte[0]);
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let status_line = String::from_utf8_lossy(&headers).to_string();
+        assert!(
+            status_line.contains("101"),
+            "expected 101 Switching Protocols, got: {status_line}"
+        );
+        Self { stream }
+    }
+
+    /// Sends a JSON value as one masked text frame (zero mask = identity).
+    fn send(&mut self, value: &serde_json::Value) {
+        let payload = serde_json::to_vec(value).expect("serialize client frame");
+        let mut frame = vec![0x81u8]; // FIN + text opcode.
+        let len = payload.len();
+        if len < 126 {
+            frame.push(0x80 | len as u8);
+        } else if len <= u16::MAX as usize {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        } else {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+        frame.extend_from_slice(&[0, 0, 0, 0]); // zero mask key.
+        frame.extend_from_slice(&payload);
+        self.stream.write_all(&frame).expect("write ws frame");
+        self.stream.flush().expect("flush ws frame");
+    }
+
+    /// Reads one frame as `(opcode, payload)`, unmasking if needed.
+    fn recv_frame(&mut self) -> (u8, Vec<u8>) {
+        let mut header = [0u8; 2];
+        self.stream.read_exact(&mut header).expect("read ws header");
+        let opcode = header[0] & 0x0F;
+        let masked = header[1] & 0x80 != 0;
+        let mut len = (header[1] & 0x7F) as usize;
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            self.stream.read_exact(&mut ext).expect("read ext len");
+            len = u16::from_be_bytes(ext) as usize;
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            self.stream.read_exact(&mut ext).expect("read ext len");
+            len = u64::from_be_bytes(ext) as usize;
+        }
+        let mut mask = [0u8; 4];
+        if masked {
+            self.stream.read_exact(&mut mask).expect("read mask");
+        }
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).expect("read ws payload");
+        if masked {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+        }
+        (opcode, payload)
+    }
+
+    /// Reads text frames until one whose `"type"` is `wanted`, skipping the
+    /// rest (welcome/submissionCredits/heartbeat/...). Panics on close/timeout.
+    fn recv_until(&mut self, wanted: &str) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let (opcode, payload) = self.recv_frame();
+            match opcode {
+                0x1 => {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&payload).expect("server frame is JSON");
+                    if value["type"].as_str() == Some(wanted) {
+                        return value;
+                    }
+                }
+                0x8 => panic!("server closed the connection while awaiting {wanted}"),
+                _ => {}
+            }
+        }
+        panic!("timed out awaiting {wanted}");
+    }
+}
+
+#[test]
+fn stream_creates_at_one_gateway_are_placed_across_the_whole_cluster() {
+    let scratch = ScratchDir::new();
+    let (node0, node1) = boot_cluster(&scratch);
+
+    // Drive every create through node 0's COMMAND STREAM (fire-and-forget), the
+    // path benchmark producers and the SDK use. Before stream-create placement
+    // existed, all of these landed on node 0's own partitions only; the per-node
+    // metrics then (correctly) showed every instance on one node. Placement must
+    // now round-robin over all four partitions, minting instances on node 0's
+    // (0 & 2, in-process) AND node 1's (1 & 3, forwarded over the command
+    // stream) — matching the REST create-placement guarantee.
+    let mut ws = WsClient::connect(node0.port);
+    let mut seen = [0usize; NUM_PARTITIONS as usize];
+    for corr in 0..(NUM_PARTITIONS * 4) {
+        ws.send(&serde_json::json!({
+            "type": "createInstance",
+            "corr": corr,
+            "processDefinitionId": "demo",
+        }));
+        let result = ws.recv_until("commandResult");
+        assert_eq!(
+            result["status"].as_u64(),
+            Some(200),
+            "stream create failed: {result}"
+        );
+        let key: u64 = result["body"]["processInstanceKey"]
+            .as_str()
+            .expect("processInstanceKey present")
+            .parse()
+            .expect("numeric instance key");
+        seen[partition_of(key) as usize] += 1;
+    }
+    for (p, count) in seen.iter().enumerate() {
+        assert!(
+            *count > 0,
+            "no stream-created instance landed on partition {p}; stream create \
+             placement did not span the cluster: {seen:?}"
+        );
+    }
+
+    // node 1 never received a create directly over its own socket, yet the
+    // cluster minted instances on its partitions — proving node 0 forwarded
+    // fire-and-forget stream creates to it.
+    drop(node1);
+}

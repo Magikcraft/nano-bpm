@@ -839,6 +839,128 @@ async fn handle_client_frame(
                 crate::metrics::record_stream_credit_stall();
             }
 
+            // Cluster-wide create placement (fire-and-forget only). Round-robin
+            // over every partition: when the placement lands on a peer-owned
+            // partition, forward the create there so a producer on one connection
+            // spreads instances across the whole cluster instead of piling every
+            // one onto this gateway's own partitions. `awaitCompletion` creates
+            // skip placement and stay local, because the completion wait reads
+            // this node's per-partition read store and cannot see a peer's
+            // instance. A local placement (`None`) falls through to the in-process
+            // create below. The forwarded create is counted on the owner (its
+            // `create_forwarded`), so per-node metrics reflect the real placement.
+            let awaiting = await_completion.unwrap_or(false);
+            // Under Raft, both `create_for_stream` (local propose) and
+            // `create_forwarded_stream` (peer round-trip) await a full quorum
+            // commit. Awaiting them inline serializes a producer's connection one
+            // commit at a time (~1/commit-latency), the dominant cause of the
+            // cluster create collapse. Fire-and-forget creates are independent and
+            // corr-tagged, so spawn them: the reader loop reads the next frame
+            // immediately and concurrent proposes batch through the per-partition
+            // Raft Batcher. `awaitCompletion` creates stay on the inline path below
+            // (the completion wait must read this node's read store). The non-Raft
+            // single-node fast path is likewise unchanged.
+            if !awaiting && !server.raft_registry().is_empty() {
+                let server = server.clone();
+                let conn = conn.clone();
+                tokio::spawn(async move {
+                    if let Some(node) = server.stream_create_placement() {
+                        match server
+                            .create_forwarded_stream(
+                                node,
+                                process_definition_id,
+                                process_definition_key,
+                                variables,
+                            )
+                            .await
+                        {
+                            Ok((instance_key, sync_completed)) => {
+                                conn.send(ServerFrame::CommandResult {
+                                    corr,
+                                    status: 200,
+                                    body: Some(serde_json::json!({
+                                        "processInstanceKey": instance_key.to_string(),
+                                        "processCompleted": sync_completed,
+                                    })),
+                                });
+                            }
+                            Err((status, message)) => {
+                                conn.send(ServerFrame::CommandResult {
+                                    corr,
+                                    status,
+                                    body: Some(Value::String(message)),
+                                });
+                            }
+                        }
+                    } else {
+                        let vars = to_engine_vars(variables);
+                        match server
+                            .create_for_stream(
+                                process_definition_id,
+                                process_definition_key,
+                                vars,
+                            )
+                            .await
+                        {
+                            Ok((instance_key, sync_completed)) => {
+                                crate::metrics::record_create("stream");
+                                conn.send(ServerFrame::CommandResult {
+                                    corr,
+                                    status: 200,
+                                    body: Some(serde_json::json!({
+                                        "processInstanceKey": instance_key.to_string(),
+                                        "processCompleted": sync_completed,
+                                    })),
+                                });
+                            }
+                            Err((status, message)) => {
+                                conn.send(ServerFrame::CommandResult {
+                                    corr,
+                                    status,
+                                    body: Some(Value::String(message)),
+                                });
+                            }
+                        }
+                    }
+                    grant_submission_credit_if_clear(&server, &conn, 1);
+                });
+                return;
+            }
+            if !awaiting {
+                if let Some(node) = server.stream_create_placement() {
+                    match server
+                        .create_forwarded_stream(
+                            node,
+                            process_definition_id,
+                            process_definition_key,
+                            variables,
+                        )
+                        .await
+                    {
+                        Ok((instance_key, sync_completed)) => {
+                            conn.send(ServerFrame::CommandResult {
+                                corr,
+                                status: 200,
+                                body: Some(serde_json::json!({
+                                    "processInstanceKey": instance_key.to_string(),
+                                    "processCompleted": sync_completed,
+                                })),
+                            });
+                            grant_submission_credit_if_clear(server, conn, 1);
+                        }
+                        Err((status, message)) => {
+                            conn.send(ServerFrame::CommandResult {
+                                corr,
+                                status,
+                                body: Some(Value::String(message)),
+                            });
+                            grant_submission_credit_if_clear(server, conn, 1);
+                        }
+                    }
+                    return;
+                }
+            }
+
             let vars = to_engine_vars(variables);
             match server
                 .create_for_stream(process_definition_id, process_definition_key, vars)
@@ -897,12 +1019,24 @@ async fn handle_client_frame(
                 });
             } else {
                 let vars = to_engine_vars(variables);
-                pipeline_job_command(
-                    server,
-                    conn,
-                    corr,
-                    server.complete_job_for_stream(key, vars).await,
-                );
+                if server.raft_registry().is_empty() {
+                    pipeline_job_command(
+                        server,
+                        conn,
+                        corr,
+                        server.complete_job_for_stream(key, vars).await,
+                    );
+                } else {
+                    // Under Raft, `complete_job_for_stream` awaits the full quorum
+                    // commit; spawn it so the reader loop isn't serialized one commit
+                    // at a time (see `spawn_job_command`).
+                    let server = server.clone();
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let outcome = server.complete_job_for_stream(key, vars).await;
+                        pipeline_job_command(&server, &conn, corr, outcome);
+                    });
+                }
             }
         }
         ClientFrame::FailJob {
@@ -924,10 +1058,20 @@ async fn handle_client_frame(
                         .await
                 });
             } else {
-                let outcome = server
-                    .fail_job_for_stream(key, retries.unwrap_or(0), error_message.unwrap_or_default())
-                    .await;
-                pipeline_job_command(server, conn, corr, outcome);
+                let retries = retries.unwrap_or(0);
+                let error_message = error_message.unwrap_or_default();
+                if server.raft_registry().is_empty() {
+                    let outcome = server.fail_job_for_stream(key, retries, error_message).await;
+                    pipeline_job_command(server, conn, corr, outcome);
+                } else {
+                    let server = server.clone();
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let outcome =
+                            server.fail_job_for_stream(key, retries, error_message).await;
+                        pipeline_job_command(&server, &conn, corr, outcome);
+                    });
+                }
             }
         }
         ClientFrame::ThrowError {
@@ -949,10 +1093,19 @@ async fn handle_client_frame(
                         .await
                 });
             } else {
-                let outcome = server
-                    .throw_error_for_stream(key, error_code, error_message.unwrap_or_default())
-                    .await;
-                pipeline_job_command(server, conn, corr, outcome);
+                let error_message = error_message.unwrap_or_default();
+                if server.raft_registry().is_empty() {
+                    let outcome = server.throw_error_for_stream(key, error_code, error_message).await;
+                    pipeline_job_command(server, conn, corr, outcome);
+                } else {
+                    let server = server.clone();
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let outcome =
+                            server.throw_error_for_stream(key, error_code, error_message).await;
+                        pipeline_job_command(&server, &conn, corr, outcome);
+                    });
+                }
             }
         }
         ClientFrame::AwaitInstance {
@@ -1099,31 +1252,44 @@ async fn handle_client_frame(
             // Local-only: create on one of THIS peer's own partitions and answer
             // with the full result JSON. The peer never re-forwards, so there is
             // no placement loop.
+            //
+            // Spawned (not awaited inline): a forwarded create drives a full Raft
+            // commit (quorum round-trip), so awaiting it here would serialize every
+            // forwarded create at this connection's read loop — one commit at a
+            // time — collapsing cluster create throughput to 1/(commit latency).
+            // Each forwarded create is an independent instance and the reply is
+            // tagged with `corr`, so relaxed reply ordering is safe (same rationale
+            // as `pipeline_job_command` / `spawn_forward_stream_reply`). Spawning
+            // lets concurrent forwarded creates batch through the partition Batcher.
             let vars = to_engine_vars(variables);
-            match server
-                .create_forwarded(
-                    process_definition_id,
-                    process_definition_key,
-                    vars,
-                    tags,
-                    business_id,
-                    await_completion,
-                    fetch_variables,
-                    request_timeout,
-                )
-                .await
-            {
-                Ok(body) => conn.send(ServerFrame::CommandResult {
-                    corr,
-                    status: 200,
-                    body: Some(body),
-                }),
-                Err((status, message)) => conn.send(ServerFrame::CommandResult {
-                    corr,
-                    status,
-                    body: Some(Value::String(message)),
-                }),
-            };
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                match server
+                    .create_forwarded(
+                        process_definition_id,
+                        process_definition_key,
+                        vars,
+                        tags,
+                        business_id,
+                        await_completion,
+                        fetch_variables,
+                        request_timeout,
+                    )
+                    .await
+                {
+                    Ok(body) => conn.send(ServerFrame::CommandResult {
+                        corr,
+                        status: 200,
+                        body: Some(body),
+                    }),
+                    Err((status, message)) => conn.send(ServerFrame::CommandResult {
+                        corr,
+                        status,
+                        body: Some(Value::String(message)),
+                    }),
+                };
+            });
         }
         ClientFrame::ActivateJobs {
             corr,
@@ -1138,31 +1304,42 @@ async fn handle_client_frame(
             // projected jobs. Local-only (the engine owns just this node's
             // partitions) ⇒ no fan-out loop. The lease is held here under `timeout`,
             // so at-least-once survives the gateway dying mid-flight.
-            let want = max_jobs.max(0) as usize;
-            let jobs = if want == 0 {
-                Vec::new()
-            } else {
-                server
-                    .activate_for_stream(
-                        &job_type,
-                        &worker,
-                        want,
-                        timeout.filter(|&t| t > 0).unwrap_or(DEFAULT_JOB_LOCK_MS),
-                        fetch_variable.as_deref().filter(|names| !names.is_empty()),
-                    )
-                    .await
-            };
-            let body = serde_json::json!({
-                "jobs": jobs,
-                // Piggybacked per-node backlog (active instances) so the
-                // requesting gateway can weight future activation toward the
-                // genuinely-deepest node (Stage 2) with no extra round-trip.
-                "backlog": server.active_backlog(),
-            });
-            conn.send(ServerFrame::CommandResult {
-                corr,
-                status: 200,
-                body: Some(body),
+            //
+            // Spawned (not awaited inline): activation is a logged Raft command, so
+            // awaiting it here would serialize every gateway's job-pull at this
+            // connection's read loop — one commit at a time — throttling cluster job
+            // throughput to 1/(commit latency). The reply is `corr`-tagged so
+            // relaxed ordering is safe (same rationale as the forwarded-create and
+            // `pipeline_job_command` paths).
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let want = max_jobs.max(0) as usize;
+                let jobs = if want == 0 {
+                    Vec::new()
+                } else {
+                    server
+                        .activate_for_stream(
+                            &job_type,
+                            &worker,
+                            want,
+                            timeout.filter(|&t| t > 0).unwrap_or(DEFAULT_JOB_LOCK_MS),
+                            fetch_variable.as_deref().filter(|names| !names.is_empty()),
+                        )
+                        .await
+                };
+                let body = serde_json::json!({
+                    "jobs": jobs,
+                    // Piggybacked per-node backlog (active instances) so the
+                    // requesting gateway can weight future activation toward the
+                    // genuinely-deepest node (Stage 2) with no extra round-trip.
+                    "backlog": server.active_backlog(),
+                });
+                conn.send(ServerFrame::CommandResult {
+                    corr,
+                    status: 200,
+                    body: Some(body),
+                });
             });
         }
         ClientFrame::GetByKey { corr, kind, key } => {

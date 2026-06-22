@@ -40,13 +40,74 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use openraft::storage::{LogFlushed, LogState, RaftLogReader, RaftLogStorage};
 use openraft::{Entry, LogId, OptionalSend, StorageError, StorageIOError, Vote};
 use serde::{Deserialize, Serialize};
 
 use crate::raft::{NodeId, RaftConfig};
+
+/// Durability mode for the Raft log store, mirroring the engine journal
+/// ([`crate::journal`]) so a node honours one `NANOBPMN_DURABILITY` setting for
+/// both its applied-state journal and its replicated Raft log.
+///
+/// - `Sync` (default): every `append` is `fsync`ed before its openraft flush
+///   callback fires, and the committed/purge markers are `fsync`ed on write. The
+///   strongest contract, at the cost of a media barrier (an `F_FULLFSYNC` on
+///   macOS) on every replication round.
+/// - `Async`: an `append` is acknowledged once it reaches the OS page cache, and
+///   `fsync` is amortised onto a background cadence (every [`AsyncFlush::interval`]
+///   or [`AsyncFlush::max_bytes`]). The committed marker — an *optional* openraft
+///   optimisation, re-derived from the log on restart — is likewise deferred.
+///   A **process** crash loses nothing (the appended bytes survive in the page
+///   cache and replay on restart); only an **OS crash / power loss** can lose the
+///   unfsynced tail, bounded by the flush interval. The leader's election vote is
+///   still `fsync`ed synchronously in both modes, because Raft safety requires a
+///   vote to be on disk before it is acted on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DurabilityMode {
+    Sync,
+    Async,
+}
+
+/// Async-durability flush policy: `fsync` fires when either the bytes appended
+/// since the last fsync reach `max_bytes`, or `interval` elapses (whichever is
+/// first). Reuses the journal's `NANOBPMN_ASYNC_FLUSH_MS` / `_BYTES` knobs.
+#[derive(Clone, Copy)]
+struct AsyncFlush {
+    interval: Duration,
+    max_bytes: usize,
+}
+
+/// Durability mode from `NANOBPMN_DURABILITY` (`sync` | `async`). Defaults to
+/// `sync` so the strong fsync-before-ack contract is unchanged unless async is
+/// explicitly opted into (same default and variable as the journal).
+fn durability_mode_from_env() -> DurabilityMode {
+    match std::env::var("NANOBPMN_DURABILITY") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("async") => DurabilityMode::Async,
+        _ => DurabilityMode::Sync,
+    }
+}
+
+/// Async flush policy from env. `NANOBPMN_ASYNC_FLUSH_MS` (default 10, clamped to
+/// 1s) bounds the unfsynced time window; `NANOBPMN_ASYNC_FLUSH_BYTES` (default
+/// 8 MiB) bounds the unfsynced byte window. Shared with the journal.
+fn async_flush_from_env() -> AsyncFlush {
+    let interval = match std::env::var("NANOBPMN_ASYNC_FLUSH_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(ms) => Duration::from_millis(ms.clamp(1, 1000)),
+            Err(_) => Duration::from_millis(10),
+        },
+        Err(_) => Duration::from_millis(10),
+    };
+    let max_bytes = match std::env::var("NANOBPMN_ASYNC_FLUSH_BYTES") {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(8 << 20).max(4096),
+        Err(_) => 8 << 20,
+    };
+    AsyncFlush { interval, max_bytes }
+}
 
 /// The durable markers persisted in `state.json`.
 #[derive(Default, Serialize, Deserialize)]
@@ -64,6 +125,46 @@ struct Inner {
     last_purged: Option<LogId<NodeId>>,
     committed: Option<LogId<NodeId>>,
     vote: Option<Vote<NodeId>>,
+    /// Durability mode (`sync`/`async`), fixed at open from the environment.
+    mode: DurabilityMode,
+    /// Async flush thresholds (unused in sync mode).
+    flush: AsyncFlush,
+    /// Async only: bytes appended to `log.ndjson` since the last `fsync`.
+    unsynced_bytes: usize,
+    /// Async only: the committed/purge markers changed in memory but `state.json`
+    /// has not yet been durably rewritten. The background flusher persists it.
+    state_dirty: bool,
+}
+
+impl Inner {
+    /// Async only: `fsync` the appended tail (if any) and durably persist the
+    /// committed/purge markers (if changed) since the last flush. A no-op when
+    /// nothing is outstanding, so the idle-tick path is cheap.
+    fn flush_async(&mut self) -> io::Result<()> {
+        if self.unsynced_bytes > 0 {
+            self.log_file.sync_all()?;
+            self.unsynced_bytes = 0;
+        }
+        if self.state_dirty {
+            let bytes = serde_json::to_vec(&PersistedState {
+                last_purged: self.last_purged,
+                committed: self.committed,
+            })?;
+            atomic_write(&self.dir, &state_path(&self.dir), &bytes)?;
+            self.state_dirty = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // Best-effort flush of the async tail on shutdown so a clean stop leaves
+        // nothing unfsynced (sync mode already fsynced everything inline).
+        if self.mode == DurabilityMode::Async {
+            let _ = self.flush_async();
+        }
+    }
 }
 
 /// A crash-durable Raft log store. Cloning shares the same underlying log (the
@@ -139,7 +240,8 @@ impl RaftLogStore {
             .append(true)
             .open(&lpath)?;
 
-        Ok(Self {
+        let mode = durability_mode_from_env();
+        let store = Self {
             inner: Arc::new(Mutex::new(Inner {
                 dir,
                 log_file,
@@ -147,8 +249,54 @@ impl RaftLogStore {
                 last_purged: state.last_purged,
                 committed: state.committed,
                 vote,
+                mode,
+                flush: async_flush_from_env(),
+                unsynced_bytes: 0,
+                state_dirty: false,
             })),
-        })
+        };
+
+        // Async mode amortises fsync off the append critical path; a background
+        // ticker bounds the unfsynced window even when the partition goes quiet
+        // (an idle follower would otherwise hold an unflushed tail indefinitely).
+        // The ticker holds a `Weak`, so it exits once the Raft instance drops the
+        // store — no explicit shutdown handshake needed.
+        if mode == DurabilityMode::Async {
+            store.spawn_flusher();
+        }
+
+        Ok(store)
+    }
+
+    /// Spawns the async-durability background flusher (async mode only). Wakes
+    /// every `flush.interval` and `fsync`s the appended tail / persists the
+    /// committed marker if anything is outstanding. Exits when the last strong
+    /// reference to the store is dropped.
+    fn spawn_flusher(&self) {
+        let weak: Weak<Mutex<Inner>> = Arc::downgrade(&self.inner);
+        let interval = {
+            let inner = self.inner.lock().unwrap();
+            inner.flush.interval
+        };
+        std::thread::Builder::new()
+            .name("nanobpmn-raft-log-flusher".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    let Some(inner) = weak.upgrade() else {
+                        break; // store dropped — stop ticking
+                    };
+                    let mut inner = inner.lock().unwrap();
+                    if let Err(e) = inner.flush_async() {
+                        tracing::error!(
+                            "raft log flusher fsync failed: {e}; aborting to avoid \
+                             serving non-durable replicated state"
+                        );
+                        std::process::abort();
+                    }
+                }
+            })
+            .ok();
     }
 
     /// Rewrites `log.ndjson` from the in-memory index atomically and reopens the
@@ -167,6 +315,8 @@ impl RaftLogStore {
             .append(true)
             .open(&lpath)
             .map_err(io_err)?;
+        // The atomic rewrite fsynced the whole log, so the async tail is clean.
+        inner.unsynced_bytes = 0;
         Ok(())
     }
 
@@ -259,10 +409,25 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             bytes.push(b'\n');
             staged.push(entry);
         }
-        // Persist to disk before acknowledging: append the serialized lines and
-        // fsync, then publish to the in-memory index and signal completion.
+        // Append the serialized lines, then publish to the in-memory index.
         inner.log_file.write_all(&bytes).map_err(io_err)?;
-        inner.log_file.sync_all().map_err(io_err)?;
+        match inner.mode {
+            // Sync: fsync before acknowledging — a flushed entry is power-loss
+            // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
+            // critical path of every replication round.
+            DurabilityMode::Sync => inner.log_file.sync_all().map_err(io_err)?,
+            // Async: the bytes are in the page cache (process-crash durable);
+            // acknowledge now and let the background flusher amortise the fsync.
+            // A byte-bounded inline flush caps the unfsynced window under a flood,
+            // when the periodic tick alone could fall behind.
+            DurabilityMode::Async => {
+                inner.unsynced_bytes += bytes.len();
+                if inner.unsynced_bytes >= inner.flush.max_bytes {
+                    inner.log_file.sync_all().map_err(io_err)?;
+                    inner.unsynced_bytes = 0;
+                }
+            }
+        }
         for entry in staged {
             inner.log.insert(entry.log_id.index, entry);
         }
@@ -284,6 +449,9 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         inner.last_purged = Some(log_id);
         inner.log = inner.log.split_off(&(log_id.index + 1));
         Self::rewrite_log(&mut inner)?;
+        // Purge fires on snapshot (infrequent), so persist the marker durably now
+        // and clear any deferred state — the rewrite already fsynced the log.
+        inner.state_dirty = false;
         Self::persist_state(&inner)
     }
 
@@ -293,7 +461,17 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock().unwrap();
         inner.committed = committed;
-        Self::persist_state(&inner)
+        match inner.mode {
+            // Sync: persist the committed marker durably (atomic write + fsync).
+            DurabilityMode::Sync => Self::persist_state(&inner),
+            // Async: the committed marker is an *optional* openraft optimisation
+            // (re-derived from the log + membership on restart), so defer it to
+            // the background flusher rather than fsyncing on every commit.
+            DurabilityMode::Async => {
+                inner.state_dirty = true;
+                Ok(())
+            }
+        }
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {

@@ -717,17 +717,38 @@ impl RaftPartition {
     /// [`initialize`](Self::initialize) once on a single member to form the group.
     /// Splitting construction from initialization is required because a voter must
     /// be able to *receive* AppendEntries/Vote before the group is formed.
+    ///
+    /// `log_dir` selects the log store: `Some(dir)` uses the crash-durable
+    /// file-backed [`RaftLogStore`](crate::raft_logstore::RaftLogStore) (one
+    /// directory per partition replica), so a voter — leader *or* follower —
+    /// recovers its replicated log after a restart instead of losing everything
+    /// it had replicated. `None` falls back to the volatile [`MemLogStore`], used
+    /// by in-memory deployments and tests. Either way the log is compacted by
+    /// snapshots (see [`raft_config`]'s `snapshot_policy`), so it does not grow
+    /// without bound.
     pub async fn bootstrap_member(
         node_id: NodeId,
         partition_id: u64,
         engine: EngineHandle,
         transport: Arc<dyn RaftTransport>,
+        log_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(raft_config().validate()?);
-        let log_store = MemLogStore::default();
         let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
         let network = PartitionNetwork::new(transport, partition_id);
-        let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
+        // One `Raft` handle, two possible log stores. The handle erases the log
+        // storage type, so both arms yield the same `RaftPartition`; building the
+        // `Raft` inside each arm avoids needing a common concrete store type.
+        let raft = match log_dir {
+            Some(dir) => {
+                let log_store = crate::raft_logstore::RaftLogStore::open(dir)?;
+                openraft::Raft::new(node_id, config, network, log_store, state_machine).await?
+            }
+            None => {
+                let log_store = MemLogStore::default();
+                openraft::Raft::new(node_id, config, network, log_store, state_machine).await?
+            }
+        };
         let batcher = Batcher::spawn(raft.clone());
         Ok(Self {
             raft,
@@ -1040,6 +1061,7 @@ mod tests {
                 0,
                 EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 transport.clone(),
+                None,
             )
             .await
             .expect("boot member");

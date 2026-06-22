@@ -81,3 +81,17 @@ lto = true
 codegen-units = 1
 panic = "abort"
 
+# Profile for running the test suite with release-level optimizations.
+# `cargo test --release` fails against `panic = "abort"`: the test harness
+# requires stack unwinding (`#[test]` uses `catch_unwind`), so cargo compiles
+# the dependency graph twice (abort + unwind). Under fat LTO this yields two
+# codegen instantiations of the *same* `serde_core`, and derive-generated impls
+# (one panic mode) no longer satisfy `serde_json`'s bounds (the other) — the
+# "multiple different versions of crate `serde_core`" error. Inheriting release
+# with `panic = "unwind"` gives a single, consistent graph. The shipped binary
+# (built via `cargo build --release`) keeps `panic = "abort"`, untouched.
+# Run optimized tests with: cargo test --profile release-test
+[profile.release-test]
+inherits = "release"
+panic = "unwind"
+

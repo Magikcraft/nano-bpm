@@ -67,6 +67,18 @@ pub struct Engine {
     /// `StartInstanceDispatched` event, so replay is unaffected); a restart
     /// simply resumes the rotation from zero.
     start_dispatch_rr: u64,
+    /// When `true`, a `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a
+    /// job that has never been activated (the `activated` latch is not required).
+    /// This supports a clustered mode where the activation lock is *leader-local*
+    /// (not replicated through Raft): a follower's engine never observes the
+    /// `JobActivated` event, so a replicated completion would otherwise fail the
+    /// `JobNotActivated` check and diverge from the leader. Possession of the job
+    /// key *is* the capability (keys are only handed out by activation), so this
+    /// stays within the at-least-once contract. Runtime config (set identically on
+    /// every replica from `NANOBPMN_REPLICATE_ACTIVATION`); NOT part of the
+    /// snapshot, so it never affects replay/snapshot determinism. Defaults to
+    /// `false` — the strict single-node/RF=1 behaviour is unchanged.
+    lenient_completion: bool,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -123,6 +135,7 @@ impl Engine {
             num_partitions: 1,
             now: 0,
             start_dispatch_rr: 0,
+            lenient_completion: false,
         }
     }
 
@@ -167,6 +180,7 @@ impl Engine {
             num_partitions: snapshot.num_partitions.max(1),
             now: snapshot.now,
             start_dispatch_rr: snapshot.start_dispatch_rr,
+            lenient_completion: false,
         }
     }
 
@@ -179,6 +193,21 @@ impl Engine {
     /// of the cluster.
     pub fn set_num_partitions(&mut self, num_partitions: u64) {
         self.num_partitions = num_partitions.max(1);
+    }
+
+    /// Enables (or disables) lenient completion: when `true`, `CompleteJob` /
+    /// `FailJob` / `ThrowJobError` no longer require the job to have been activated
+    /// first. A clustered host sets this from `NANOBPMN_REPLICATE_ACTIVATION=0` so
+    /// the activation lock can stay leader-local (un-replicated) while replicated
+    /// completions still apply cleanly on followers that never saw the activation.
+    /// See the `lenient_completion` field. Must be set identically on every replica.
+    pub fn set_lenient_completion(&mut self, lenient: bool) {
+        self.lenient_completion = lenient;
+    }
+
+    /// Whether lenient completion is enabled (see [`Self::set_lenient_completion`]).
+    pub fn lenient_completion(&self) -> bool {
+        self.lenient_completion
     }
 
     /// The cluster-wide partition count this engine is configured with.
@@ -241,6 +270,7 @@ impl Engine {
             num_partitions: 1,
             now: 0,
             start_dispatch_rr: 0,
+            lenient_completion: false,
         }
     }
 
@@ -1149,8 +1179,11 @@ impl Engine {
                 // Completion is by key alone, but a job must have been activated
                 // at least once first. The current lock holder is irrelevant:
                 // any worker that holds the key may complete it, even after the
-                // lock expired and another worker re-activated it.
-                if !job.activated {
+                // lock expired and another worker re-activated it. Under lenient
+                // completion (leader-local locks; see `lenient_completion`) the
+                // activation may not have been replicated to this engine, so the
+                // latch is not required.
+                if !self.lenient_completion && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -1542,8 +1575,9 @@ impl Engine {
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
-                // Like completion, failing a job requires that it was activated.
-                if !job.activated {
+                // Like completion, failing a job requires that it was activated
+                // (unless lenient completion allows leader-local activation).
+                if !self.lenient_completion && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -1598,7 +1632,7 @@ impl Engine {
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
-                if !job.activated {
+                if !self.lenient_completion && !job.activated {
                     return Err(EngineError::JobNotActivated { job_key });
                 }
                 let instance_key = job.instance_key;
@@ -6538,6 +6572,30 @@ mod tests {
 
         // then it is rejected
         assert_eq!(err, EngineError::JobNotActivated { job_key });
+    }
+
+    #[test]
+    fn lenient_completion_accepts_a_job_that_was_never_activated() {
+        // given a replica engine in lenient-completion mode (leader-local
+        // activation: this replica never saw the job activated)
+        let mut engine = Engine::new();
+        engine.set_lenient_completion(true);
+        assert!(engine.lenient_completion());
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        // when a replicated completion arrives for the un-activated job, it is
+        // applied (the leader held the lock; possession of the key is the
+        // capability) instead of being rejected as JobNotActivated
+        engine.apply_command(Command::complete_job(job_key)).unwrap();
+
+        // then the job is gone and the instance advanced past the service task
+        assert!(engine.pending_jobs().is_empty());
     }
 
     #[test]

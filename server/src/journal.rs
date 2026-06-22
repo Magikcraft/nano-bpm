@@ -1090,6 +1090,15 @@ impl Journal {
         self.engine.set_num_partitions(num_partitions);
     }
 
+    /// Enables leftover-tolerant ("lenient") job completion on the underlying
+    /// engine so a replicated `CompleteJob`/`FailJob`/`ThrowJobError` applies even
+    /// when this engine never observed the (leader-local) activation. See
+    /// [`Engine::set_lenient_completion`]. Set identically on every replica from
+    /// `NANOBPMN_REPLICATE_ACTIVATION=0`.
+    pub fn set_lenient_completion(&mut self, lenient: bool) {
+        self.engine.set_lenient_completion(lenient);
+    }
+
     // --- Read delegations mirroring the engine API the server uses. ---
 
     pub fn state(&self) -> &State {

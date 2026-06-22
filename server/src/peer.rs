@@ -126,6 +126,14 @@ impl PeerLink {
         let (ws, _resp) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| PeerError::Connect(e.to_string()))?;
+        // Disable Nagle on the peer socket: the command stream carries small,
+        // latency-sensitive request/response frames (notably Raft AppendEntries),
+        // and Nagle + delayed-ACK adds ~40ms per round-trip, collapsing Raft
+        // commit throughput. The raft/app RPCs are explicitly framed, so there is
+        // no benefit to coalescing them at the TCP layer.
+        if let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+            let _ = tcp.set_nodelay(true);
+        }
         let (mut sink, mut stream) = ws.split();
 
         let (out, mut out_rx) = mpsc::channel::<Message>(1024);

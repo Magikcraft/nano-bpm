@@ -177,6 +177,27 @@ pub struct ServerImpl {
     /// path (reads and job dispatch always go to the leader's owned actor). Empty
     /// unless per-partition Raft is enabled with RF>1 — zero overhead otherwise.
     raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, EngineHandle>>>,
+    /// Whether the job activation lock is replicated through Raft.
+    ///
+    /// `true` (the default, from `NANOBPMN_REPLICATE_ACTIVATION`) is the original
+    /// fully-replicated lifecycle: `ActivateJobs` and lock-expiry go through the
+    /// log, so every replica holds the lease (3 quorum commits per job).
+    ///
+    /// `false` makes the lock **leader-local**: `ActivateJobs` is NOT proposed
+    /// through the log (the leader locks jobs in its own engine actor only) and
+    /// lock-expiry stays local too. Only the durable progress commands
+    /// (create / complete / fail / throw / timers) are replicated, so each job
+    /// costs 2 quorum commits instead of 3 and per-worker activation commits stop
+    /// fragmenting the per-partition commit budget. Replicas run with lenient
+    /// completion (see [`Engine::set_lenient_completion`]) so a replicated
+    /// completion applies even though they never saw the activation.
+    ///
+    /// No effect on a single node / RF=1 (no Raft). DURABILITY TRADE-OFF in the
+    /// `false` mode: the lease is leader-RAM-only and does NOT survive failover —
+    /// a new leader re-dispatches in-flight jobs immediately (vs. waiting for the
+    /// replicated deadline). Both modes are at-least-once; this one widens the
+    /// failover redelivery window. See [`replicate_activation_from_env`].
+    replicate_activation: bool,
     /// Tier-A execution-trace projection, folded off the engine event stream by
     /// the exporter thread (process-optimization design doc §3). In-memory and
     /// bounded; served under `/console/api/traces`. Console builds only.
@@ -216,8 +237,17 @@ impl ServerImpl {
         // engine places message subscriptions on the partition owning their
         // correlation key (`hash(correlation_key)`). With a single partition this
         // is `1`, so placement stays local and behaviour is unchanged.
+        let replicate_activation = replicate_activation_from_env();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
+            // Leader-local activation mode: replicas must accept a replicated
+            // completion for a job they never saw activated (the lock is not
+            // replicated). Harmless on a single node (no follower ever applies a
+            // completion for an un-activated job in practice, but the relaxed
+            // check is still correct there).
+            if !replicate_activation {
+                journal.set_lenient_completion(true);
+            }
         }
         // The deployment partition (id 0) is the only one that seeds the demo
         // process and owns the message-/timer-start subscriptions. In a clustered
@@ -385,6 +415,7 @@ impl ServerImpl {
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            replicate_activation,
             #[cfg(feature = "console")]
             trace_store: Arc::new(console::trace::TraceStore::from_env()),
         }
@@ -673,6 +704,35 @@ fn parse_host_port(url: &str) -> Option<(String, i32)> {
 /// adaptive) by default.
 fn backpressure_setting_from_env() -> BackpressureSetting {
     parse_backpressure_setting(std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT").ok().as_deref())
+}
+
+/// Whether the job activation lock is replicated through Raft. `true` (the
+/// default) keeps the original fully-replicated lifecycle. Setting
+/// `NANOBPMN_REPLICATE_ACTIVATION=0` (or `false`/`off`/`no`) makes the lock
+/// leader-local: activation and lock-expiry stay off the Raft log, so each job
+/// costs 2 quorum commits instead of 3 and per-worker activation commits stop
+/// fragmenting the per-partition commit budget. Replicas then run with lenient
+/// completion so a replicated completion applies without having seen the
+/// activation. No effect without Raft (single node / RF=1).
+///
+/// DURABILITY TRADE-OFF: the lease (`Activated`/`worker`/`deadline`) then lives
+/// ONLY in the leader's in-memory engine — it is NOT durable and does NOT survive
+/// leader failover. Followers always see an activated job as `Created`, so on
+/// failover a new leader re-dispatches in-flight jobs IMMEDIATELY (it has no
+/// record of the lease or its deadline), versus the default mode which waits for
+/// the replicated lease deadline to expire. Both modes are at-least-once (jobs
+/// must be idempotent); this mode merely widens the failover redelivery window to
+/// "immediate". Durable PROGRESS (create/complete/fail/throw/timers) is still
+/// fully replicated. Prefer the default for workloads that need failover to honor
+/// in-flight lease deadlines; opt in for throughput-bound, idempotent workloads.
+fn replicate_activation_from_env() -> bool {
+    match std::env::var("NANOBPMN_REPLICATE_ACTIVATION").ok().as_deref() {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// Resolves the active-instance-backlog admission limit, or `0` (off) by default.
@@ -1872,12 +1932,13 @@ impl ServerImpl {
     }
 
     /// Reports the real cluster topology: one broker per node, each advertising
-    /// the partitions it owns (deterministic `partition % num_nodes` ownership).
+    /// every partition it is a replica of (deterministic `replicas_of` placement).
     /// Partition ids are surfaced 1-based (Camunda convention) over nano's 0-based
-    /// internal partitions. At replication factor 1 each owned partition has a
-    /// single replica, so its owner is reported as the `leader`. A single-node
-    /// cluster reports one broker owning every partition — equivalent to the
-    /// previous hardcoded response but with the real partition count.
+    /// internal partitions. The replica that leads a partition (`leader_of`, the
+    /// replica-set head today) is reported as `leader`; the other replicas under
+    /// RF>1 are reported as `follower`. `replication_factor` is the cluster's
+    /// `effective_rf()`. A single-node cluster reports one broker leading every
+    /// partition at RF=1.
     async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
@@ -1903,12 +1964,21 @@ impl ServerImpl {
 
         let brokers: Vec<models::BrokerInfo> = (0..num_nodes)
             .map(|node| {
+                // Every partition this node is a replica of (leader OR follower),
+                // not just the ones it owns. `leader_of` (== owner today) marks the
+                // leader; the other replicas in `replicas_of(p)` are followers. This
+                // makes replication visible in the topology under RF>1 instead of
+                // the old owner-only, all-"leader" view.
                 let partitions: Vec<models::Partition> = (0..num_partitions)
-                    .filter(|p| topology.owner_of(*p) == node)
+                    .filter(|p| topology.replicas_of(*p).contains(&node))
                     .map(|p| models::Partition {
                         // 1-based partition id (Camunda convention).
                         partition_id: (p + 1) as i32,
-                        role: "leader".to_string(),
+                        role: if topology.leader_of(p) == node {
+                            "leader".to_string()
+                        } else {
+                            "follower".to_string()
+                        },
                         health: "healthy".to_string(),
                     })
                     .collect();
@@ -1928,7 +1998,7 @@ impl ServerImpl {
             cluster_id: types::Nullable::Null,
             cluster_size: num_nodes as i32,
             partitions_count: num_partitions as i32,
-            replication_factor: 1,
+            replication_factor: topology.effective_rf() as i32,
             gateway_version: version.clone(),
             last_completed_change_id: String::new(),
             // Advertise that this is a nanobpmn gateway (a superset of the Camunda
@@ -4960,6 +5030,7 @@ impl ServerImpl {
                     p,
                     engine,
                     transport.clone(),
+                    raft_log_dir_for(p),
                 )
                 .await
                 {
@@ -5059,6 +5130,9 @@ impl ServerImpl {
         }
         let mut journal = Journal::in_memory_partition(p);
         journal.set_num_partitions(self.engine.topology().num_partitions);
+        if !self.replicate_activation {
+            journal.set_lenient_completion(true);
+        }
         let seed = self.current_deployment_events().await;
         if !seed.is_empty() {
             journal.install_deployment(&seed);
@@ -5268,6 +5342,7 @@ impl ServerImpl {
                 return Vec::new();
             }
             let start = self.engine.activate_start() % ln;
+            use futures_util::FutureExt;
             let base = max_jobs / ln;
             let rem = max_jobs % ln;
             let mut futures = Vec::with_capacity(ln);
@@ -5277,7 +5352,26 @@ impl ServerImpl {
                     continue;
                 }
                 let p = led[(start + off) % ln];
-                futures.push(self.activate_on_raft(p, job_type, worker, want, timeout));
+                if self.replicate_activation {
+                    futures.push(
+                        self.activate_on_raft(p, job_type, worker, want, timeout)
+                            .boxed(),
+                    );
+                } else {
+                    // Leader-local activation: lock the jobs directly on this
+                    // leader's engine actor WITHOUT a Raft round-trip. The lock is
+                    // ephemeral leader state; followers learn of the job only when
+                    // its (replicated) completion arrives, which they apply under
+                    // lenient completion. Saves one quorum commit per activation and
+                    // keeps per-worker activation off the partition's commit budget.
+                    let Some(handle) = self.engine_handle_for(p) else {
+                        continue;
+                    };
+                    futures.push(
+                        self.activate_on_local(handle, job_type, worker, want, timeout)
+                            .boxed(),
+                    );
+                }
             }
             let activated: Vec<ActivatedJobWithIdentity> =
                 futures_util::future::join_all(futures)
@@ -5384,7 +5478,21 @@ impl ServerImpl {
         activated
     }
 
-    /// The Raft activation path: replicate an `ActivateJobs` pass through partition
+    /// Owned-handle variant of [`Self::activate_on`] for the leader-local Raft
+    /// activation path (`NANOBPMN_REPLICATE_ACTIVATION=0`): locks jobs directly on
+    /// the supplied engine actor without proposing through Raft. Takes the handle
+    /// by value so it can be awaited inside a `join_all` over the led partitions.
+    async fn activate_on_local(
+        &self,
+        handle: EngineHandle,
+        job_type: &str,
+        worker: &str,
+        want: usize,
+        timeout: u64,
+    ) -> Vec<ActivatedJobWithIdentity> {
+        self.activate_on(&handle, job_type, worker, want, timeout).await
+    }
+
     /// `p`'s leader so the activation lock is committed to the log and applied on
     /// every replica's engine actor (keeping followers in lockstep for a later
     /// `CompleteJob`). Only the leader activates; a non-leader replica returns
@@ -5546,8 +5654,21 @@ impl ServerImpl {
             }
         }
         if jobs_due {
-            if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await {
-                if resp.error.is_none() && !resp.events.is_empty() {
+            if self.replicate_activation {
+                if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await {
+                    if resp.error.is_none() && !resp.events.is_empty() {
+                        produced = true;
+                    }
+                }
+            } else {
+                // Leader-local activation: the job lock lives ONLY on this leader's
+                // engine actor (it was never replicated), so expiring leases must
+                // stay leader-local too. Proposing `ExpireJobs` through Raft would
+                // emit `JobLockExpired` on the leader (job is Activated) but nothing
+                // on followers (their job is still Created), diverging the replicated
+                // event stream. Expire directly on the leader's engine actor.
+                let expired = handle.with(move |journal| journal.expire_jobs(now)).await;
+                if !expired.is_empty() {
                     produced = true;
                 }
             }
@@ -5683,6 +5804,70 @@ impl ServerImpl {
             self.drive_subscription_routing(routable).await;
         }
         self.signal_jobs_available();
+        Ok((instance_key, sync_completed))
+    }
+
+    /// Cluster-wide create *placement* for the command-stream create path, the
+    /// stream sibling of the REST `create_process_instance` seam. Round-robins
+    /// over every partition in the cluster and returns the remote node that owns
+    /// the chosen one, or `None` when the placement is local (create here).
+    ///
+    /// Without this, a stream create only ever ran on the entry gateway's own
+    /// partitions (`for_create`), so a producer on a single command-stream
+    /// connection concentrated *every* instance on one node — while REST creates,
+    /// which already use [`next_create_placement`](crate::partition::Partitions::next_create_placement),
+    /// spread across the whole cluster. The per-node console metrics faithfully
+    /// reported that real imbalance ("all instances created on one node").
+    ///
+    /// The Raft path keeps its own leader-aware forwarding in
+    /// [`create_via_raft`](Self::create_via_raft), so placement is disabled when
+    /// this node hosts Raft groups; the non-Raft cluster path is the one balanced
+    /// here.
+    pub(crate) fn stream_create_placement(&self) -> Option<u32> {
+        if !self.raft.is_empty() {
+            return None;
+        }
+        self.engine.next_create_placement()
+    }
+
+    /// Command-stream sibling of [`forward_create`](Self::forward_create): forwards
+    /// a **fire-and-forget** stream create to the peer that owns the placed
+    /// partition (over the shared `ForwardCreate` seam, which the peer answers via
+    /// [`create_forwarded`](Self::create_forwarded)) and returns the minted
+    /// `(instance_key, sync_completed)` so the stream handler can answer its
+    /// `CommandResult`.
+    ///
+    /// Fire-and-forget only: `awaitCompletion` stream creates stay local because
+    /// the completion wait ([`await_process_completion`](Self::await_process_completion))
+    /// reads this node's per-partition read store and cannot observe an instance
+    /// that lives on a peer. The stream handler enforces that split.
+    pub(crate) async fn create_forwarded_stream(
+        &self,
+        node: u32,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        let link = self.peer_link(node).await?;
+        let res = link
+            .forward_create(by_id, by_key, variables, Vec::new(), None, false, None, None)
+            .await
+            .map_err(|e| (502u16, e.to_string()))?;
+        if !is_ok_status(res.status) {
+            return Err((res.status, peer_detail(&res)));
+        }
+        let body = res
+            .body
+            .ok_or((502u16, "peer returned no create result body".to_string()))?;
+        let instance_key = body
+            .get("processInstanceKey")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<nanobpmn_engine_core::Key>().ok())
+            .ok_or((502u16, "peer create result missing processInstanceKey".to_string()))?;
+        let sync_completed = body
+            .get("processCompleted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Ok((instance_key, sync_completed))
     }
 
@@ -6960,6 +7145,39 @@ async fn log_rest(req: axum::extract::Request, next: axum::middleware::Next) -> 
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// An [`axum::serve::Listener`] wrapper that disables Nagle (`TCP_NODELAY`) on
+/// every accepted connection. The gateway's WebSocket surfaces — the SDK command
+/// stream and the inter-node peer/Raft lane — exchange small, latency-sensitive
+/// request/response frames; with Nagle + delayed-ACK each round-trip can stall
+/// ~40 ms, which collapses Raft commit and job-stream throughput. The frames are
+/// explicitly length-delimited, so there is nothing to gain from TCP-level
+/// coalescing. (The client/dialling side sets the same option in [`crate::peer`].)
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => {
+                    let _ = stream.set_nodelay(true);
+                    return (stream, addr);
+                }
+                // Mirror axum's own TcpListener accept: a transient accept error
+                // (e.g. fd exhaustion) is retried after a short backoff rather
+                // than tearing down the server.
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
@@ -7383,7 +7601,6 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
@@ -7427,7 +7644,7 @@ async fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
-    axum::serve(listener, app)
+    axum::serve(NoDelayListener(listener), app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
@@ -7484,6 +7701,23 @@ fn resolve_data_paths() -> (Option<PathBuf>, Option<PathBuf>) {
         }
         _ => (None, None),
     }
+}
+
+/// The per-partition Raft log directory for this node, or `None` when no data
+/// directory is configured (an in-memory deployment, where the Raft log stays in
+/// [`MemLogStore`](crate::raft::MemLogStore) like the engine journal).
+///
+/// Derived from the same root as the engine journal/read-model (see
+/// [`resolve_data_paths`]): each partition replica gets its own subdirectory
+/// `<data_dir>/raft/p<partition>`, so a node hosting several replicas keeps their
+/// durable logs separated. Returning `Some(dir)` routes the multi-voter path
+/// through the crash-durable [`RaftLogStore`](crate::raft_logstore::RaftLogStore),
+/// so a follower recovers its replicated log after a restart instead of losing
+/// everything it had replicated.
+fn raft_log_dir_for(partition: u64) -> Option<PathBuf> {
+    let (journal, _) = resolve_data_paths();
+    let root = journal?.parent()?.to_path_buf();
+    Some(root.join("raft").join(format!("p{partition}")))
 }
 
 /// Number of engine partitions to run, from `NANOBPMN_PARTITIONS`.
@@ -8279,6 +8513,58 @@ mod clustered_startup_tests {
         assert!(nano.version.is_some(), "nano advertises the gateway version");
     }
 
+    #[tokio::test]
+    async fn topology_reports_replication_factor_and_follower_roles() {
+        // A 3-node, 3-partition cluster at RF=3: every node is a replica of every
+        // partition, leading the one it owns and following the other two. The
+        // topology must surface RF=3 and a leader/follower role per partition —
+        // not the old hardcoded RF=1, owner-only, all-"leader" view.
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into(), "http://n1".into(), "http://n2".into()],
+            num_partitions: 3,
+            replication_factor: 3,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
+        let node0 = build_server(journals, store, topology);
+
+        use apis::cluster::GetTopologyResponse as Resp;
+        let t = match node0.get_topology_impl().await.unwrap() {
+            Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(t) => t,
+            other => panic!("expected 200 topology, got {other:?}"),
+        };
+
+        assert_eq!(t.replication_factor, 3, "RF=3 is reported, not hardcoded 1");
+        assert_eq!(t.brokers.len(), 3, "one broker per node");
+
+        // Every broker replicates all 3 partitions, leading exactly one of them.
+        for b in &t.brokers {
+            assert_eq!(
+                b.partitions.len(),
+                3,
+                "node {} replicates all 3 partitions under RF=3",
+                b.node_id
+            );
+            let leaders = b.partitions.iter().filter(|p| p.role == "leader").count();
+            let followers = b.partitions.iter().filter(|p| p.role == "follower").count();
+            assert_eq!(leaders, 1, "node {} leads exactly one partition", b.node_id);
+            assert_eq!(followers, 2, "node {} follows the other two", b.node_id);
+            // The partition a node leads is the one it owns (1-based).
+            let led: Vec<i32> = b
+                .partitions
+                .iter()
+                .filter(|p| p.role == "leader")
+                .map(|p| p.partition_id)
+                .collect();
+            assert_eq!(led, vec![b.node_id + 1], "node leads its owned partition");
+        }
+    }
+
     #[test]
     fn parse_host_port_extracts_authority() {
         assert_eq!(
@@ -8558,6 +8844,7 @@ mod clustered_startup_tests {
                 0,
                 EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 node0.raft_transport(),
+                None,
             )
             .await
             .expect("boot raft member on node 0"),
@@ -8570,6 +8857,7 @@ mod clustered_startup_tests {
                 0,
                 EngineHandle::spawn(Journal::in_memory_partition(0), None),
                 node1.raft_transport(),
+                None,
             )
             .await
             .expect("boot raft member on node 1"),

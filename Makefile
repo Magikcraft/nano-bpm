@@ -71,6 +71,10 @@ run: $(STUB_IMPLS) ## Run the stub server (PORT overrides the default 8080)
 server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server (incl. journal-replay e2e tests)
 	cd $(PROJECT_ROOT)/server && cargo test
 
+.PHONY: server-test-release
+server-test-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
+	cd $(PROJECT_ROOT)/server && cargo test --profile release-test --features console
+
 .PHONY: engine-build
 engine-build: ## Build the embeddable BPMN engine-core crate (no Docker, no codegen)
 	cd $(ENGINE_DIR) && cargo build
