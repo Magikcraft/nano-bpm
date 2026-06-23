@@ -157,6 +157,42 @@ rate to an Erlang-C staffing recommendation, and classifies the domain — then 
 grades that against `expected.json` (domain + job + window = 3 points). The generator is
 the symmetric write-side of `replay.rs`, so a corpus also feeds `replay-rank`/`evolve`.
 
+## LLM-driven investigation — open-ended sensing over the data (`src/analysis.rs`, `agent.rs`, `investigate.rs`)
+
+The pre-built analyzers above (`corpus::infer`, `queueing`, `cluster`) encode *our*
+priors. The research goal is the opposite: can the cockpit droid **reason over the trace
+data and form its own hypotheses**? To open the hypothesis space, ProcessOS flattens a
+bound trace source into in-memory **DuckDB** tables and gives the model a single
+**read-only** `query_traces(sql)` tool — so it writes SQL, sees the result, and reasons,
+instead of picking from a fixed menu.
+
+- `analysis.rs` — flattens traces into `instances` / `jobs` / `incidents` tables with the
+  cheap temporal primitives pre-derived (`hour`, `dow`, `is_weekend`, a real
+  `started_ts`) but **no** pre-bucketed "windows" (that labelling is the inference we want
+  the droid to perform). `query()` admits a single `SELECT`/`WITH` only — DDL/DML are
+  rejected — over an ephemeral in-memory connection.
+- `agent.rs` — a provider-agnostic tool-calling loop (`run_agent`) over an `AgentStep`
+  transport (OpenAI/llama.cpp `chat/completions` tool-calls today), unit-testable with a
+  deterministic mock. Every query+result is recorded as a reproducible **lab notebook**.
+- `investigate.rs` — wires the two: a system prompt that imposes analytical discipline
+  (state a hypothesis before querying, report effect size + sample size, replicate on a
+  held-out slice before concluding) and emits a gradeable JSON conclusion.
+
+```bash
+# Point the configured LLM at a workspace process bound to a dataset:
+curl -XPOST .../customers/{c}/processes/{p}/investigate \
+  -d '{"llm":{"model":"local-model"},"maxRounds":12}'
+# -> { dataset:{instances,jobs,incidents},
+#      run:{ answer:"{\"bottleneckJob\":\"credit-check\",\"window\":\"weekday-morning\",…}",
+#            steps:[{tool:"query_traces", arguments:{sql}, result}], rounds } }
+```
+
+The DuckDB connection is `!Send`, so the endpoint runs the whole loop on a dedicated
+current-thread runtime via `spawn_blocking`. The labelled corpus is the **eval substrate**:
+`investigate.rs` tests drive the loop over a generated corpus and assert it recovers the
+planted `credit-check` / `weekday-morning` fault through the full model→tool→DuckDB→model
+path. A Python escape hatch (`run_python`) for novel methods is the deferred next tier.
+
 ## The cockpit & pilot loop (§10)
 
 The optimization loop is itself authored as **editable BPMN** (the *pilot process*,
@@ -246,6 +282,7 @@ for it automatically.
 | `POST` | `/api/workspace/customers/{c}/processes` | Create a process (bind `targetUrl` or `dataset`) |
 | `GET`/`PUT` | `/api/workspace/customers/{c}/processes/{p}` | Read / update a process config |
 | `GET` | `/api/workspace/customers/{c}/processes/{p}/insights` | Insights folded over the process's bound source |
+| `POST` | `/api/workspace/customers/{c}/processes/{p}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool |
 
 ## Layout
 
@@ -259,6 +296,9 @@ src/
   workspace.rs    customers/processes tree + persistence + CRUD + source binding
   dataset.rs      DatasetSource (loaded trace folder) + TraceSource enum (live | dataset)
   corpus.rs       synthetic labelled trace corpus: generator + inference + scorer
+  analysis.rs     flatten traces into in-memory DuckDB; read-only query_traces surface
+  agent.rs        provider-agnostic tool-calling loop (OpenAI transport) + lab notebook
+  investigate.rs  LLM-driven investigation: analysis ToolBox + disciplined system prompt
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
   conversation.rs persisted cockpit conversations + data-dir resolution
   harness/

@@ -22,7 +22,7 @@ mod cluster;
 mod evolve;
 mod example;
 mod hypothesize;
-mod llm;
+pub(crate) mod llm;
 mod production;
 mod queueing;
 mod rank;

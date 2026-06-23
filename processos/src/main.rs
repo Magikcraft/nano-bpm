@@ -9,12 +9,15 @@
 //! links or knows about ProcessOS. Run a Nano cluster without this binary and
 //! production is unaffected.
 
+mod agent;
+mod analysis;
 mod contracts;
 mod cockpit;
 mod conversation;
 mod corpus;
 mod dataset;
 mod harness;
+mod investigate;
 mod pilot;
 mod report;
 mod supervisor;
@@ -252,6 +255,10 @@ async fn main() {
         .route(
             "/api/workspace/customers/{customer}/processes/{process}/insights",
             get(ws_process_insights),
+        )
+        .route(
+            "/api/workspace/customers/{customer}/processes/{process}/investigate",
+            post(ws_process_investigate),
         )
         .with_state(state);
 
@@ -757,6 +764,66 @@ async fn ws_process_insights(
     match report::build_over(&src, limit, sample).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => bad_gateway(e),
+    }
+}
+
+
+/// Request body for an investigation: optional LLM override + bounds.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InvestigateRequest {
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    /// Max instances to load into the analytic view (default 100k).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Max model↔tool rounds before giving up (default 12).
+    #[serde(default)]
+    max_rounds: Option<usize>,
+}
+
+/// `POST /api/workspace/customers/{customer}/processes/{process}/investigate` — point
+/// the configured LLM at this process's bound trace source and let it form and test its
+/// own hypotheses over the data via the read-only `query_traces` SQL tool. Returns the
+/// agent's conclusion plus the full query/result "lab notebook".
+async fn ws_process_investigate(
+    State(state): State<AppState>,
+    Path((customer, process)): Path<(String, String)>,
+    Json(req): Json<InvestigateRequest>,
+) -> impl IntoResponse {
+    let mut cfg = LlmConfig::from_env();
+    if let Some(o) = &req.llm {
+        cfg = cfg.with_override(o);
+    }
+    if !cfg.is_ready() {
+        return unprocessable(
+            "no LLM model configured; set PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL \
+             / PROCESSOS_LLM_PROVIDER as needed) or pass an `llm` object with at least \
+             `model` in the request body"
+                .to_string(),
+        );
+    }
+    let src = match state.workspace.resolve_source(&customer, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let limit = req.limit.unwrap_or(100_000).clamp(1, 1_000_000);
+    let max_rounds = req.max_rounds.unwrap_or(12).clamp(1, 40);
+    // The DuckDB connection inside the analysis is !Send, so the investigation cannot
+    // cross the multi-threaded handler's await boundary. Run the whole loop on a
+    // dedicated current-thread runtime where the connection never leaves its thread.
+    let task = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        rt.block_on(investigate::run_investigation(&src, cfg, limit, max_rounds))
+    })
+    .await;
+    match task {
+        Ok(Ok(report)) => Json(report).into_response(),
+        Ok(Err(e)) => bad_gateway(e),
+        Err(e) => bad_gateway(format!("investigation task failed: {e}")),
     }
 }
 

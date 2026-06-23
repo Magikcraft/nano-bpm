@@ -888,7 +888,7 @@ pub fn score(inference: &Inference, expected_path: &Path) -> Result<Score, Strin
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const LOAN_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -926,7 +926,7 @@ mod tests {
   </bpmn:process>
 </bpmn:definitions>"#;
 
-    fn loan_def() -> ProcessDefinition {
+    pub(crate) fn loan_def() -> ProcessDefinition {
         parse_bpmn(LOAN_BPMN)
             .expect("loan bpmn parses")
             .into_iter()
@@ -934,7 +934,7 @@ mod tests {
             .expect("loan process present")
     }
 
-    fn loan_pack() -> Pack {
+    pub(crate) fn loan_pack() -> Pack {
         Pack {
             process_id: "loan-approval".into(),
             bpmn: "loan.bpmn".into(),
