@@ -817,10 +817,17 @@ async function loadDebug(ws, proc){
   const host = $('#chatDebug'); if(!host) return;
   const sid = STATE.sessionId;
   if(!sid){ host.innerHTML = '<div class="empty">Start a conversation to capture a request.</div>'; return; }
+  // Show in-flight payloads for this session immediately (the endpoint only fills in once the
+  // turn finishes), so switching to Debug while the droid is thinking isn't a blank panel.
+  const live = (STATE.liveDebugSid === sid && Array.isArray(STATE.liveDebug)) ? STATE.liveDebug : [];
+  if(live.length) host.innerHTML = renderDebug({ requests: live });
   try {
     const data = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions/'+encodeURIComponent(sid)+'/debug');
-    host.innerHTML = renderDebug(data);
-  } catch(e){ host.innerHTML = '<div class="empty">'+esc(e.message||e)+'</div>'; }
+    if(STATE.sessionId !== sid) return; // session switched while fetching
+    const reqs = (data && data.requests) || [];
+    // Prefer the persisted payloads, but don't clobber a live view with an empty endpoint.
+    if(reqs.length || !live.length) host.innerHTML = renderDebug(data);
+  } catch(e){ if(!live.length) host.innerHTML = '<div class="empty">'+esc(e.message||e)+'</div>'; }
 }
 
 // Render the captured request payloads (one <details> per round) showing the full message
@@ -1195,7 +1202,11 @@ async function sendChat(ws, proc){
   const liveThinkWrap = $('#liveThinkWrap'), liveTimeline = $('#liveTimeline');
   const liveAnswer = $('#liveAnswer'), liveStatus = $('#liveStatus');
   let answerBuf = '';
-  const liveDebug = []; // request payloads captured this turn for live Debug-tab updates
+  // Request payloads captured this turn. Stored on STATE (scoped to the session) so switching
+  // to the Debug tab mid-flight can show them — the persisted endpoint only fills in once the
+  // turn completes.
+  const liveDebug = [];
+  STATE.liveDebug = liveDebug; STATE.liveDebugSid = STATE.sessionId;
   let curReason = null, curReasonBuf = ''; // the reasoning block currently streaming
   const pendingSteps = []; // FIFO of {tool, el} awaiting their result
   const nearBottom = () => (log.scrollHeight - log.scrollTop - log.clientHeight) < 80;
