@@ -40,6 +40,53 @@ impl Default for PyConfig {
     }
 }
 
+/// Result of probing the configured interpreter for the optional data-science stack.
+#[derive(Debug, Clone, Default)]
+pub struct DataScienceProbe {
+    /// The interpreter actually ran (resolvable on PATH / at the configured path).
+    pub runs: bool,
+    /// `pandas` and `duckdb` (the libraries the preamble uses) are both importable.
+    pub data_science: bool,
+    /// Of the probed libraries (`pandas`, `numpy`, `duckdb`, `scipy`), those NOT importable.
+    pub missing: Vec<String>,
+}
+
+/// Probe the configured interpreter: does it run, and is the data-science stack importable?
+/// Used by the console to label the Python escape-hatch control. Runs a tiny one-shot script;
+/// blocking, so call it off the async runtime.
+pub fn probe_data_science(cfg: &PyConfig) -> DataScienceProbe {
+    let script = "import json,importlib.util as u\n\
+                  libs=['pandas','numpy','duckdb','scipy']\n\
+                  print(json.dumps({'missing':[l for l in libs if u.find_spec(l) is None]}))";
+    let out = Command::new(&cfg.python_bin)
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let missing: Vec<String> = serde_json::from_slice::<serde_json::Value>(&o.stdout)
+                .ok()
+                .and_then(|v| {
+                    v.get("missing")
+                        .and_then(|m| m.as_array())
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                })
+                .unwrap_or_default();
+            let data_science =
+                !missing.iter().any(|m| m == "pandas") && !missing.iter().any(|m| m == "duckdb");
+            DataScienceProbe {
+                runs: true,
+                data_science,
+                missing,
+            }
+        }
+        _ => DataScienceProbe::default(),
+    }
+}
+
 impl PyConfig {
     pub fn from_env() -> Self {
         let d = Self::default();

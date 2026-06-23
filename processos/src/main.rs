@@ -83,6 +83,9 @@ struct AppState {
     /// The operator's chat prompt library (reusable compose-box message templates),
     /// persisted to the user's config dir alongside `settings.json`.
     chat_prompts: Arc<chat_prompts::ChatPromptStore>,
+    /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
+    /// control sets the flag; the agent loop checks it between rounds and reports early.
+    chat_cancels: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 /// Server configuration, all overridable by environment.
@@ -224,6 +227,7 @@ async fn main() {
         chat_prompts: Arc::new(chat_prompts::ChatPromptStore::open(
             settings::config_dir().join("chat-prompts.json"),
         )),
+        chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
@@ -292,6 +296,11 @@ async fn main() {
             "/api/workspaces/{workspace}/processes/{process}/chat/reset",
             post(cockpit_chat_reset),
         )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/wrapup",
+            post(cockpit_chat_wrapup),
+        )
+        .route("/api/python/status", get(python_status))
         .route(
             "/api/chat-prompts",
             get(chat_prompts_list).post(chat_prompts_upsert),
@@ -1184,24 +1193,37 @@ async fn cockpit_chat_send(
     // connection inside the analysis is !Send, so the loop runs on a current-thread runtime.
     let prior = state.chat.load(&key);
     let message = req.message;
-    let task = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("runtime: {e}"))?;
-        rt.block_on(investigate::run_chat_turn(
-            &src,
-            cfg,
-            py,
-            limit,
-            max_rounds,
-            allow_python,
-            objective.as_deref(),
-            prior,
-            &message,
-        ))
-    })
-    .await;
+    // Register a wrap-up flag for this in-flight turn so `POST .../chat/wrapup` can ask the
+    // agent to report early. Cleared in all exit paths below.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut m) = state.chat_cancels.lock() {
+        m.insert(key.clone(), cancel.clone());
+    }
+    let task = {
+        let cancel = cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("runtime: {e}"))?;
+            rt.block_on(investigate::run_chat_turn(
+                &src,
+                cfg,
+                py,
+                limit,
+                max_rounds,
+                allow_python,
+                objective.as_deref(),
+                Some(&cancel),
+                prior,
+                &message,
+            ))
+        })
+        .await
+    };
+    if let Ok(mut m) = state.chat_cancels.lock() {
+        m.remove(&key);
+    }
     match task {
         Ok(Ok(result)) => {
             state.chat.save(&key, result.messages.clone());
@@ -1226,6 +1248,58 @@ async fn cockpit_chat_reset(
     let key = chat::session_key(&workspace, &process);
     state.chat.clear(&key);
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// `POST .../chat/wrapup` — ask an in-flight chat turn to stop investigating and report its
+/// findings so far. No-op (404) when no turn is running for this session.
+async fn cockpit_chat_wrapup(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let flagged = state
+        .chat_cancels
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&key).cloned());
+    match flagged {
+        Some(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            StatusCode::ACCEPTED.into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no investigation is running for this dataset" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/python/status` — whether a Python interpreter is configured and whether the
+/// optional data-science stack (pandas / numpy / duckdb / scipy) is importable in it, so the
+/// console can label the Python escape-hatch control appropriately.
+async fn python_status(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.settings.snapshot();
+    // "Configured" = the operator set an interpreter explicitly (settings or env), as opposed
+    // to falling back to the bare `python3` default.
+    let configured = snap
+        .python_bin
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+        || std::env::var_os("PROCESSOS_PYTHON").is_some();
+    let py = snap.py_config();
+    let interpreter = py.python_bin.clone();
+    let probe = tokio::task::spawn_blocking(move || pyrunner::probe_data_science(&py))
+        .await
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "configured": configured,
+        "interpreter": interpreter,
+        "interpreterRuns": probe.runs,
+        "dataScience": probe.data_science,
+        "missing": probe.missing,
+    }))
+    .into_response()
 }
 
 /// `GET /api/chat-prompts` — list reusable compose-box message templates.

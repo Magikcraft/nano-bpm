@@ -242,7 +242,10 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   transcript into operator-facing `user`/`droid` turns (each droid turn carries the SQL/
   Python tool steps it ran as a collapsible **lab notebook**).
 - `agent::run_agent_resumable` drives the loop over a `&mut Vec<Msg>`, appending the
-  assistant/tool turns **and** the final answer so the next turn keeps full context.
+  assistant/tool turns **and** the final answer so the next turn keeps full context. A turn
+  can also be **wrapped up early** (`POST .../chat/wrapup`): the loop checks a per-session
+  cancel flag between rounds and, when set (or when the round budget is exhausted), tells the
+  model to stop investigating and report its findings so far instead of erroring.
 - `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
   persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
   Ships four built-ins led by an **open investigation** (the default, pre-loaded into a
@@ -265,7 +268,20 @@ curl       .../api/workspaces/{workspace}/processes/{process}/chat        # load
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/reset # forget it
 curl       .../api/chat-prompts                                           # list templates
 curl -XPOST .../api/chat-prompts -d '{"id":"my-probe","name":"My probe","text":"…"}'
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/wrapup # stop & report now
+curl       .../api/python/status   # { configured, interpreter, interpreterRuns, dataScience, missing }
 ```
+
+The chat surface adds a few operator conveniences: the **Send** button is labelled with the
+active LLM profile (*"Investigate with &lt;profile&gt; →"*) and relabels live when the active
+profile is switched in Settings; droid bubbles are titled with the **model name** and render
+any `<think>…</think>` reasoning as a **collapsed** "Thinking" disclosure with the cleaned
+answer as the paragraph; **A−/A+** controls size the chat font (persisted in `localStorage`); a
+**Wrap it up →** button appears while a turn is in flight (`POST .../chat/wrapup`); and the
+Python toggle self-describes from `GET /api/python/status` — *"Enable Python Data Science
+tools"* when the interpreter has pandas/duckdb, *"Enable Python (Optional: Install Data Science
+tools)"* with an install popup when it runs but lacks them, or *"Configure Python"* with a
+setup popup when no interpreter is usable.
 
 
 ## The cockpit & pilot loop (§10)

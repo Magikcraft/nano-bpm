@@ -142,6 +142,9 @@
     fillFields();
     $('s-python').value = v.pythonBin || '';
     $('s-path').textContent = v.path ? ('Persisted to ' + v.path) : '';
+    // Let host surfaces (e.g. the cockpit's Send button + Python label) react to a change.
+    try { window.dispatchEvent(new CustomEvent('processos:settings-changed', { detail: v })); }
+    catch (e) { /* CustomEvent unsupported — non-fatal */ }
   }
 
   async function api(method, url, body) {

@@ -113,10 +113,29 @@ pub async fn run_agent_resumable<M: AgentStep, T: ToolBox + ?Sized>(
     msgs: &mut Vec<Msg>,
     max_rounds: usize,
 ) -> Result<AgentRun, String> {
+    run_agent_resumable_cancellable(model, tools, msgs, max_rounds, None).await
+}
+
+/// As [`run_agent_resumable`], but a shared `cancel` flag lets the caller ask the agent to
+/// **wrap up early**: when it is set, the loop stops issuing tool calls, instructs the model
+/// to report its findings so far (with tools withheld so it must answer in prose), and
+/// returns that. Used by the cockpit's "wrap it up" control for long investigations.
+pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
+    model: &M,
+    tools: &T,
+    msgs: &mut Vec<Msg>,
+    max_rounds: usize,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<AgentRun, String> {
+    use std::sync::atomic::Ordering;
     let specs = tools.specs();
     let mut steps: Vec<AgentStepRecord> = Vec::new();
 
     for round in 1..=max_rounds {
+        // Operator asked to wrap up: stop investigating and force a prose summary now.
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return wrap_up(model, msgs, steps, round).await;
+        }
         match model.step(msgs, &specs).await? {
             Turn::Final(answer) => {
                 // Record the answer in the transcript so a resumed conversation
@@ -161,7 +180,38 @@ pub async fn run_agent_resumable<M: AgentStep, T: ToolBox + ?Sized>(
             }
         }
     }
-    Err(format!("agent exceeded the {max_rounds}-round budget"))
+    // Budget exhausted: rather than erroring, ask the model to summarise what it has so the
+    // operator still gets findings from a long run.
+    wrap_up(model, msgs, steps, max_rounds).await
+}
+
+/// Force a final prose answer from the model with no tools available, recording it in the
+/// transcript. Used both when the operator wraps up early and when the round budget is hit.
+async fn wrap_up<M: AgentStep>(
+    model: &M,
+    msgs: &mut Vec<Msg>,
+    steps: Vec<AgentStepRecord>,
+    round: usize,
+) -> Result<AgentRun, String> {
+    msgs.push(Msg::System(
+        "Stop investigating now and report your findings so far, based only on what you \
+         have already gathered. Do not call any more tools — answer in clear prose, stating \
+         what you found, your confidence, and what you'd recommend or check next."
+            .to_string(),
+    ));
+    let answer = match model.step(msgs, &[]).await? {
+        Turn::Final(a) => a,
+        Turn::ToolCalls(_) => String::new(),
+    };
+    msgs.push(Msg::Assistant {
+        text: Some(answer.clone()),
+        tool_calls: Vec::new(),
+    });
+    Ok(AgentRun {
+        answer,
+        steps,
+        rounds: round,
+    })
 }
 
 // ─── OpenAI chat-completions tool-calling transport ──────────────────────────
@@ -354,19 +404,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loop_enforces_round_budget() {
-        // A model that always asks for a tool never terminates → budget error.
+    async fn budget_exhaustion_wraps_up_instead_of_erroring() {
+        // A model that keeps asking for tools hits the round budget; rather than erroring,
+        // the loop withholds tools and forces a prose wrap-up so the operator still gets
+        // findings. The scripted model returns its final answer once tools are withheld.
         let model = ScriptedModel {
             turns: vec![
                 vec![ToolCall { id: "c".into(), name: "echo".into(), arguments: json!({"x":"a"}) }],
                 vec![ToolCall { id: "c".into(), name: "echo".into(), arguments: json!({"x":"b"}) }],
-                vec![ToolCall { id: "c".into(), name: "echo".into(), arguments: json!({"x":"c"}) }],
             ],
             idx: Cell::new(0),
-            final_answer: "never".into(),
+            final_answer: "wrapped up".into(),
         };
-        let err = run_agent(&model, &EchoTools, "sys", "go", 2).await.unwrap_err();
-        assert!(err.contains("budget"), "{err}");
+        let run = run_agent(&model, &EchoTools, "sys", "go", 2).await.unwrap();
+        assert_eq!(run.answer, "wrapped up");
+        assert_eq!(run.rounds, 2);
+        // Both tool calls were executed before the budget hit.
+        assert_eq!(run.steps.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_flag_forces_an_early_wrap_up() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // The cancel flag is already set before the loop starts, so round 1 short-circuits
+        // straight to the wrap-up (no tools), returning the model's prose answer.
+        let model = ScriptedModel {
+            turns: vec![],
+            idx: Cell::new(0),
+            final_answer: "early findings".into(),
+        };
+        let cancel = AtomicBool::new(true);
+        let mut msgs = vec![Msg::System("sys".into()), Msg::User("go".into())];
+        let run = run_agent_resumable_cancellable(&model, &EchoTools, &mut msgs, 5, Some(&cancel))
+            .await
+            .unwrap();
+        assert_eq!(run.answer, "early findings");
+        // No tools were dispatched — the very first scripted tool turn was never reached.
+        assert!(run.steps.is_empty());
+        // The wrap-up was triggered on round 1.
+        assert_eq!(run.rounds, 1);
+        // Flag untouched by the loop.
+        assert!(cancel.load(Ordering::Relaxed));
     }
 
     #[test]

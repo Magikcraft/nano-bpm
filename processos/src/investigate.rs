@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::agent::{
-    run_agent, run_agent_resumable, AgentRun, Msg, OpenAiAgent, ToolBox, ToolSpec,
+    run_agent, run_agent_resumable_cancellable, AgentRun, Msg, OpenAiAgent, ToolBox, ToolSpec,
 };
 use crate::analysis::Analysis;
 use crate::dataset::TraceSource;
@@ -254,6 +254,7 @@ pub async fn run_chat_turn(
     max_rounds: usize,
     allow_python: bool,
     objective: Option<&str>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     mut messages: Vec<Msg>,
     user_message: &str,
 ) -> Result<ChatTurnResult, String> {
@@ -291,7 +292,8 @@ pub async fn run_chat_turn(
     }
     messages.push(Msg::User(user_message.to_string()));
 
-    let run = run_agent_resumable(&model, &tools, &mut messages, max_rounds).await?;
+    let run =
+        run_agent_resumable_cancellable(&model, &tools, &mut messages, max_rounds, cancel).await?;
     Ok(ChatTurnResult {
         answer: run.answer,
         rounds: run.rounds,

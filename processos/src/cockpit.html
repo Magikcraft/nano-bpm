@@ -118,15 +118,18 @@
   .conclusion { border: 1px solid #3730a3; background: #14142b; border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
   /* interactive cockpit chat */
   .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; max-height: 64vh; }
-  .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; }
+  .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; --chat-font: 15px; }
   .chatlog .empty { color: #71717a; font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
-  .bub { padding: 10px 13px; border-radius: 12px; font-size: 13px; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
+  .bub { padding: 10px 13px; border-radius: 12px; font-size: var(--chat-font, 15px); line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
   .bub .who { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
   .bub.user { align-self: flex-end; background: #1b2540; border: 1px solid #2c3c66; }
   .bub.user .who { color: #93c5fd; }
   .bub.droid { align-self: flex-start; background: #11142a; border: 1px solid #28306a; }
   .bub.droid .who { color: #a5b4fc; }
   .bub.pending { align-self: flex-start; background: #131316; border: 1px solid #26262b; color: #a1a1aa; }
+  .bub .think { margin-bottom: 8px; border: 1px solid #26262b; border-radius: 8px; background: #0b0b14; }
+  .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: #8b8b93; text-transform: uppercase; letter-spacing: .04em; }
+  .bub .think .think-body { padding: 0 10px 9px; font-size: calc(var(--chat-font, 15px) - 2px); line-height: 1.5; color: #9ca3af; white-space: pre-wrap; }
   .bub .steps { margin-top: 8px; }
   .bub .steps details { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
   .bub .steps summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
@@ -138,6 +141,17 @@
   .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 9px 11px; font: 13px/1.5 inherit; resize: vertical; min-height: 64px; }
   .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
   .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .fontctl { display: inline-flex; align-items: center; gap: 4px; margin-left: 4px; }
+  .fontctl button { background: #16161a; border: 1px solid #34343c; color: #c7d2fe; border-radius: 6px; width: 24px; height: 24px; line-height: 1; cursor: pointer; font-size: 13px; }
+  .fontctl button:hover { background: #1f1f27; }
+  .pylink { color: #a5b4fc; cursor: pointer; text-decoration: underline; }
+  .btn.warn { background: #3a1d1d; border: 1px solid #7f1d1d; color: #fca5a5; }
+  .btn.warn:hover { background: #4a2424; }
+  .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: #111118; border: 1px solid #34343c; border-radius: 12px; padding: 20px 22px; max-width: 560px; width: 90%; max-height: 80vh; overflow: auto; }
+  .modal h3 { margin: 0 0 10px; }
+  .modal pre { background: #0c0c0e; border: 1px solid #26262b; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, monospace; color: #c7d2fe; }
+  .modal .close { margin-top: 14px; }
 </style>
 </head>
 <body>
@@ -541,26 +555,36 @@ async function renderWorkspace(ws, proc){
         <div class="compose-row">
           <select id="chatPrompt"><option value="">Load a prompt…</option></select>
           <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
+          <span class="fontctl" title="Chat text size">
+            <button id="chatFontDown" title="Smaller text">A−</button>
+            <button id="chatFontUp" title="Larger text">A+</button>
+          </span>
           <button class="btn ghost" id="chatReset" title="Forget this conversation" style="margin-left:auto">Reset</button>
         </div>
         <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…"></textarea>
         <div class="compose-actions">
           <button class="btn primary" id="chatSend">Investigate with the droid →</button>
-          <label class="muted"><input type="checkbox" id="chatPy" /> allow Python escape hatch</label>
+          <button class="btn warn" id="chatWrapup" style="display:none" title="Tell the droid to stop and report its findings so far">Wrap it up →</button>
+          <label class="muted" id="chatPyLabel"><input type="checkbox" id="chatPy" /> <span id="chatPyText">allow Python escape hatch</span></label>
           <span class="muted" id="chatHint" style="margin-left:auto"></span>
         </div>
       </div>
     </div>`;
   if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
   STATE.ws = ws; STATE.wsProc = proc; STATE.prompts = [];
+  applyChatFont();
   labelSendButton();
+  refreshPythonLabel();
   await loadChatPrompts();
   await loadChat(ws, proc);
   $('#chatSend').onclick = () => sendChat(ws, proc);
+  $('#chatWrapup').onclick = () => wrapUpChat(ws, proc);
   $('#wsObjSave').onclick = () => saveObjective(ws, proc, p);
   $('#chatBox').addEventListener('keydown', e => {
     if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); sendChat(ws, proc); }
   });
+  $('#chatFontDown').onclick = () => bumpChatFont(-1);
+  $('#chatFontUp').onclick = () => bumpChatFont(1);
   $('#chatPrompt').onchange = e => {
     const pr = (STATE.prompts||[]).find(x => x.id===e.target.value);
     if(pr){ $('#chatBox').value = pr.text; $('#chatBox').focus(); }
@@ -570,7 +594,63 @@ async function renderWorkspace(ws, proc){
   $('#chatReset').onclick = () => resetChat(ws, proc);
 }
 
-// Label the Send button with the active LLM profile so the operator knows who answers.
+// ── chat text size (user-adjustable, persisted) ──────────────────────────────
+function applyChatFont(){
+  const px = Math.min(24, Math.max(11, parseInt(localStorage.getItem('processos.chatFont')||'15', 10)||15));
+  const log = $('#chatLog'); if(log) log.style.setProperty('--chat-font', px+'px');
+  return px;
+}
+function bumpChatFont(dir){
+  const px = Math.min(24, Math.max(11, applyChatFont() + dir*1));
+  localStorage.setItem('processos.chatFont', String(px));
+  applyChatFont();
+}
+
+// ── smart Python escape-hatch label ──────────────────────────────────────────
+async function refreshPythonLabel(){
+  const text = $('#chatPyText'); const cb = $('#chatPy'); if(!text) return;
+  let s;
+  try { s = await api('/api/python/status'); }
+  catch(e){ return; }
+  if(!s.configured || !s.interpreterRuns){
+    // No usable interpreter — disable the toggle, link to configure instructions.
+    if(cb){ cb.checked = false; cb.disabled = true; }
+    text.innerHTML = '<span class="pylink" id="pyConfigure">Configure Python</span>';
+    const l = $('#pyConfigure'); if(l) l.onclick = pyConfigurePopup;
+  } else if(s.dataScience){
+    if(cb) cb.disabled = false;
+    text.textContent = 'Enable Python Data Science tools';
+  } else {
+    if(cb) cb.disabled = false;
+    const missing = (s.missing||[]).join(', ');
+    text.innerHTML = 'Enable Python (Optional: <span class="pylink" id="pyInstall">Install Data Science tools</span>)';
+    const l = $('#pyInstall'); if(l) l.onclick = () => pyInstallPopup(missing);
+  }
+}
+function showModal(title, bodyHtml){
+  const back = document.createElement('div');
+  back.className = 'modal-back';
+  back.innerHTML = '<div class="modal"><h3>'+esc(title)+'</h3>'+bodyHtml+
+    '<div class="close"><button class="btn ghost" id="modalClose">Close</button></div></div>';
+  back.onclick = e => { if(e.target===back) back.remove(); };
+  document.body.appendChild(back);
+  $('#modalClose').onclick = () => back.remove();
+}
+function pyInstallPopup(missing){
+  showModal('Install the Python data-science tools',
+    '<p class="muted" style="font-size:13px">Your configured interpreter runs, but these libraries are missing: <b>'+esc(missing||'pandas, duckdb')+'</b>. Install them into a virtual environment and point ProcessOS at it.</p>'+
+    '<pre>python3 -m venv .venv\n.venv/bin/pip install duckdb pandas numpy scipy</pre>'+
+    '<p class="muted" style="font-size:13px">Then set the interpreter to <code>.venv/bin/python</code> in the Settings cog (Python interpreter), or export <code>PROCESSOS_PYTHON=/path/to/.venv/bin/python</code> before starting ProcessOS.</p>');
+}
+function pyConfigurePopup(){
+  showModal('Configure a Python interpreter',
+    '<p class="muted" style="font-size:13px">The Python escape hatch lets the droid run analysis code the SQL tool can\u2019t express. It needs a Python 3 interpreter (ideally one with the data-science stack).</p>'+
+    '<pre>python3 -m venv .venv\n.venv/bin/pip install duckdb pandas numpy scipy</pre>'+
+    '<p class="muted" style="font-size:13px">Open the Settings cog (lower-left), set <b>Python interpreter</b> to <code>.venv/bin/python</code>, and Save \u2014 or export <code>PROCESSOS_PYTHON=/path/to/.venv/bin/python</code> before starting ProcessOS. A bare <code>python3</code> works too (stdlib-only).</p>');
+}
+
+// Label the Send button with the active LLM profile so the operator knows who answers, and
+// remember the active model name for the droid's chat bubbles.
 async function labelSendButton(){
   const btn = $('#chatSend'); if(!btn) return;
   try {
@@ -579,8 +659,12 @@ async function labelSendButton(){
     const name = active && active.name ? active.name : 'the droid';
     btn.textContent = 'Investigate with '+name+' →';
     btn.dataset.profile = name;
+    STATE.modelName = (active && active.model) ? active.model : 'Droid';
   } catch(e){ /* leave default label */ }
 }
+
+// Live-update the Send button + droid label + Python label when settings change.
+window.addEventListener('processos:settings-changed', () => { labelSendButton(); refreshPythonLabel(); });
 
 // Persist an edited objective on the process config (round-trips the full config).
 async function saveObjective(ws, proc, p){
@@ -602,15 +686,32 @@ async function saveObjective(ws, proc, p){
   finally { btn.disabled = false; }
 }
 
+// Pull <think>/<thinking> reasoning out of the answer text so it can be shown collapsed,
+// returning { think, answer } where answer is the cleaned prose.
+function splitThinking(text){
+  let t = text || '';
+  let think = '';
+  // Greedy across the whole string; tolerate an unterminated trailing <think> (streaming).
+  t = t.replace(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi, (_, body) => { think += (think?'\n\n':'')+body.trim(); return ''; });
+  const open = t.match(/<think(?:ing)?>([\s\S]*)$/i);
+  if(open){ think += (think?'\n\n':'')+open[1].trim(); t = t.slice(0, open.index); }
+  return { think: think.trim(), answer: t.trim() };
+}
+
+function droidName(){ return STATE.modelName || 'Droid'; }
+
 function chatBub(t){
   if(t.role==='user') return '<div class="bub user"><div class="who">You</div>'+esc(t.text)+'</div>';
+  const { think, answer } = splitThinking(t.text);
+  const thinkHtml = think ? '<details class="think"><summary>Thinking</summary><div class="think-body">'+esc(think)+'</div></details>' : '';
   const steps = (t.steps||[]).map((s,i) => `
     <details>
       <summary>${esc(s.tool)} · ${i+1}</summary>
       <div class="args">${esc(JSON.stringify(s.arguments))}</div>
       <pre>${esc(s.result)}</pre>
     </details>`).join('');
-  return '<div class="bub droid"><div class="who">Droid</div>'+esc(t.text||'(no answer)')+
+  return '<div class="bub droid"><div class="who">'+esc(droidName())+'</div>'+thinkHtml+
+    '<div class="answer">'+esc(answer || (think ? '' : '(no answer)'))+'</div>'+
     (steps ? '<div class="steps">'+steps+'</div>' : '')+'</div>';
 }
 
@@ -649,12 +750,14 @@ async function sendChat(ws, proc){
   const box = $('#chatBox'); const msg = box.value.trim();
   if(!msg) return;
   const send = $('#chatSend'); const log = $('#chatLog'); const hint = $('#chatHint');
-  const allowPython = $('#chatPy').checked;
+  const wrap = $('#chatWrapup');
+  const allowPython = $('#chatPy').checked && !$('#chatPy').disabled;
   send.disabled = true; box.disabled = true;
+  if(wrap){ wrap.style.display = ''; wrap.disabled = false; }
   // optimistic: drop the placeholder, append the user turn + a pending droid bubble.
   if(log.querySelector('.empty')) log.innerHTML = '';
   log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
-  log.insertAdjacentHTML('beforeend', '<div class="bub pending" id="chatPending"><div class="who">Droid</div>reasoning over the dataset…</div>');
+  log.insertAdjacentHTML('beforeend', '<div class="bub pending" id="chatPending"><div class="who">'+esc(droidName())+'</div>reasoning over the dataset…</div>');
   log.scrollTop = log.scrollHeight;
   box.value = '';
   try {
@@ -668,11 +771,22 @@ async function sendChat(ws, proc){
       (ds.instances!=null?(ds.instances+' instances · '+ds.jobs+' jobs · '+ds.incidents+' incidents'):'');
   } catch(e){
     const pend = $('#chatPending'); if(pend) pend.remove();
-    log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">Droid</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
+    log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+esc(droidName())+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
     box.value = msg; // restore so the operator can retry
   } finally {
     send.disabled = false; box.disabled = false; box.focus();
+    if(wrap) wrap.style.display = 'none';
   }
+}
+
+// Ask an in-flight investigation to stop and report its findings so far.
+async function wrapUpChat(ws, proc){
+  const wrap = $('#chatWrapup'); if(wrap) wrap.disabled = true;
+  const pend = $('#chatPending'); if(pend) pend.innerHTML = '<div class="who">'+esc(droidName())+'</div>wrapping up — reporting findings so far…';
+  try {
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/wrapup', { method:'POST' });
+    $('#chatHint').textContent = 'asked the droid to wrap up…';
+  } catch(e){ $('#chatHint').textContent = 'wrap-up request failed: '+(e.message||e); }
 }
 
 async function saveChatPrompt(){
