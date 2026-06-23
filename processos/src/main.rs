@@ -1733,6 +1733,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <span class="sub">Insights (T1) · <span id="nano"></span></span>
   <nav style="margin-left:auto;display:flex;align-items:center;gap:14px">
     <a href="/" style="color:#a1a1aa;text-decoration:none;font-size:13px">Home</a>
+    <a href="/cockpit" style="color:#a1a1aa;text-decoration:none;font-size:13px">Cockpit</a>
     <a href="/features" style="color:#a1a1aa;text-decoration:none;font-size:13px">Features</a>
     <a href="/harness" style="color:#a1a1aa;text-decoration:none;font-size:13px">Harness</a>
     <button onclick="load()">Refresh</button>
