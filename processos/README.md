@@ -99,13 +99,16 @@ precedence **inline `prompt` > `promptId` > built-in default**.
 | `PROCESSOS_LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 
 These are *defaults*; the console **Settings** panel (the gear in the lower-left of the
-console and cockpit) persists operator overrides to
+console and cockpit) manages one or more named **LLM profiles** — switch the *active*
+profile, add/delete profiles, and **Fetch** an endpoint's model list to pick a model id.
+It ships with a `Local (llama.cpp)` profile pointing at `http://localhost:8888/v1`.
+Profiles + the active selection + the global Python interpreter persist to
 `${XDG_CONFIG_HOME:-~/.config}/processos/settings.json` (overridable with
 `PROCESSOS_CONFIG_DIR`; written `0600` as it may hold an API key). The effective config
-layers **built-in default → `PROCESSOS_LLM_*` env → persisted settings → per-request
+layers **built-in default → `PROCESSOS_LLM_*` env → active profile → per-request
 `llm` override**, each winning when present — so the console is authoritative over the
-environment without a relaunch. The settings panel also configures `PROCESSOS_PYTHON`
-(the `run_python` interpreter). See [`GET`/`PUT /api/settings`](#endpoints).
+environment without a relaunch. The panel also configures `PROCESSOS_PYTHON`
+(the `run_python` interpreter). See the [settings endpoints](#endpoints).
 
 ## Workspaces — bounded contexts & processes (multi-tenant + datasets)
 
@@ -340,7 +343,10 @@ for it automatically.
 | `GET` | `/api/workspaces/{workspace}/processes/{process}/insights` | Insights folded over the process's bound source |
 | `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
 | `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |
-| `GET`/`PUT` | `/api/settings` | Read / update the operator's persisted LLM + Python settings (the console gear). `GET` redacts the API key (`llmApiKeySet`); `PUT` is a partial update — absent fields are unchanged, an empty string clears a field back to the env default |
+| `GET`/`PUT` | `/api/settings` | Read settings / update the **globals** (`activeProfile`, `pythonBin`). `GET` lists LLM profiles (each redacting its key as `apiKeySet`) + the active profile + the Python interpreter |
+| `POST` | `/api/settings/profiles` | Create a new LLM profile (optional `name`); returns the new `id` + the updated settings |
+| `PUT`/`DELETE` | `/api/settings/profiles/{id}` | Partial-update / delete one profile. On `PUT`, absent fields are unchanged, an empty string (or `0`/negative number) clears a field back to the env default; the API key is set only when a non-empty `apiKey` is sent |
+| `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id |
 
 ## Layout
 

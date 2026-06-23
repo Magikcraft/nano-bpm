@@ -40,7 +40,7 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, build_evolve_prompt,
-    calibrate_from_measured, example_scenario, llm_complete, parse_structural_candidates,
+    calibrate_from_measured, example_scenario, list_models, llm_complete, parse_structural_candidates,
     rank_candidates_by_replay, replay_dataset, replay_instance, run_hypothesis, run_scenario,
     staff_for_summary, summarize_dataset, CandidateModel, LlmConfig, LlmOverride, MeasuredJobType,
     Prompt, PromptLibrary, RecordedInstance, Scenario, DEFAULT_EVOLVE_SYSTEM_PROMPT,
@@ -272,7 +272,14 @@ async fn main() {
             post(ws_process_investigate),
         )
         .route("/assets/bpmn/{file}", get(bpmn_asset))
+        .route("/assets/settings.js", get(settings_js))
         .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/settings/profiles", post(post_profile))
+        .route(
+            "/api/settings/profiles/{id}",
+            axum::routing::put(put_profile).delete(delete_profile),
+        )
+        .route("/api/settings/models", post(post_models))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -648,6 +655,7 @@ const WORKSPACE_HTML: &str = include_str!("workspace.html");
 const BPMN_VIEWER_JS: &str = include_str!("../assets/bpmn/bpmn-navigated-viewer.js");
 const BPMN_DIAGRAM_CSS: &str = include_str!("../assets/bpmn/diagram-js.css");
 const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css");
+const SETTINGS_JS: &str = include_str!("../assets/settings.js");
 
 /// The bundled loan-approval demo pack + model, embedded so `seed-demo` works from
 /// any working directory.
@@ -780,6 +788,18 @@ async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     ([(axum::http::header::CONTENT_TYPE, ctype)], body).into_response()
+}
+
+/// Serves the shared settings panel module (`/assets/settings.js`), included by both the
+/// console and the cockpit.
+async fn settings_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        SETTINGS_JS,
+    )
 }
 
 /// `GET /api/workspaces/{workspace}/processes/{process}/model` — the process's BPMN
@@ -921,26 +941,79 @@ async fn ws_process_insights(
 }
 
 
-/// `GET /api/settings` — the operator's persisted settings (LLM connection + Python
-/// interpreter), redacted so the API key is never echoed back.
+/// `GET /api/settings` — the operator's persisted settings (LLM profiles + active
+/// profile + Python interpreter), redacted so API keys are never echoed back.
 async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.settings.view())
 }
 
-/// `PUT /api/settings` — partial update of the persisted settings. Absent fields are
-/// left unchanged; an empty string clears a field back to the environment default.
+/// `PUT /api/settings` — update the globals: the active profile and/or the Python
+/// interpreter. Absent fields are left unchanged.
 async fn put_settings(
     State(state): State<AppState>,
-    Json(patch): Json<settings::SettingsPatch>,
+    Json(patch): Json<settings::GlobalsPatch>,
 ) -> impl IntoResponse {
-    match state.settings.update(patch) {
+    match state.settings.update_globals(patch) {
         Ok(view) => Json(view).into_response(),
-        Err(e) => bad_gateway(format!("could not persist settings: {e}")),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/settings/profiles` — create a new LLM profile (optionally seeded from the
+/// body). Returns `{ id, settings }`.
+async fn post_profile(
+    State(state): State<AppState>,
+    Json(patch): Json<settings::ProfilePatch>,
+) -> impl IntoResponse {
+    match state.settings.add_profile(patch) {
+        Ok((id, view)) => Json(serde_json::json!({ "id": id, "settings": view })).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `PUT /api/settings/profiles/{id}` — partial update of one profile. Absent fields are
+/// left unchanged; an empty string clears a field back to the environment default.
+async fn put_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(patch): Json<settings::ProfilePatch>,
+) -> impl IntoResponse {
+    match state.settings.update_profile(&id, patch) {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `DELETE /api/settings/profiles/{id}` — remove a profile.
+async fn delete_profile(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.settings.delete_profile(&id) {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/settings/models` — query an endpoint's model list so the console can pick a
+/// model. Body: `{ profileId?, provider?, baseUrl?, apiKey? }` (a saved profile supplies a
+/// stored key; inline fields let the console probe an endpoint it is still editing).
+async fn post_models(
+    State(state): State<AppState>,
+    Json(req): Json<settings::ProbeRequest>,
+) -> impl IntoResponse {
+    let cfg = match state.settings.probe_config(&req) {
+        Ok(c) => c,
+        Err(e) => return unprocessable(e),
+    };
+    match list_models(&cfg).await {
+        Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
+        Err(e) => bad_gateway(e),
     }
 }
 
 /// Resolve the effective LLM config for a request: built-in defaults → `PROCESSOS_LLM_*`
-/// env → persisted operator settings → per-request override. Each later layer wins when
+/// env → the active operator profile → per-request override. Each later layer wins when
 /// present, so the console is authoritative over the environment while a one-off request
 /// body can still override everything.
 fn resolve_llm(state: &AppState, req: Option<&LlmOverride>) -> LlmConfig {
@@ -1912,20 +1985,6 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   .bottleneck { color: #fca5a5; }
   .err { color: #fca5a5; background: #2a0a0a; padding: 12px 16px; border-radius: 8px; }
   button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
-  #cog { position: fixed; left: 14px; bottom: 14px; width: 38px; height: 38px; border-radius: 50%; font-size: 18px; line-height: 1; display: flex; align-items: center; justify-content: center; background: #18181b; border: 1px solid #3f3f46; color: #a1a1aa; cursor: pointer; z-index: 50; padding: 0; }
-  #cog:hover { color: #e4e4e7; border-color: #6366f1; }
-  #settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 60; display: flex; }
-  #settings-overlay[hidden] { display: none; }
-  #settings-panel { margin: 0 auto 0 0; width: 360px; max-width: 92vw; height: 100%; background: #0f0f11; border-right: 1px solid #27272a; box-shadow: 0 0 40px rgba(0,0,0,.6); display: flex; flex-direction: column; }
-  #settings-panel .ph { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #27272a; }
-  #settings-panel .ph button { background: none; border: none; color: #a1a1aa; font-size: 16px; }
-  .settings-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow: auto; }
-  .settings-body label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #a1a1aa; }
-  .settings-body input, .settings-body select { background: #18181b; border: 1px solid #3f3f46; border-radius: 6px; color: #e4e4e7; padding: 6px 8px; font: inherit; }
-  .settings-body .row { display: flex; gap: 10px; }
-  .settings-body .row label { flex: 1; }
-  .settings-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
-  .settings-actions .ghost { background: none; }
 </style>
 </head>
 <body>
@@ -2001,85 +2060,7 @@ async function load(){
 function card(n,l){ return '<div class="card"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'; }
 load();
 </script>
-<button id="cog" title="Settings" aria-label="Settings">&#9881;</button>
-<div id="settings-overlay" hidden>
-  <div id="settings-panel" role="dialog" aria-label="Settings">
-    <div class="ph"><strong>Settings</strong><button id="s-close" aria-label="Close">&#10005;</button></div>
-    <div class="settings-body">
-      <label>LLM provider
-        <select id="s-provider">
-          <option value="">(env default)</option>
-          <option value="openai">openai / local</option>
-          <option value="anthropic">anthropic</option>
-        </select>
-      </label>
-      <label>Base URL <input id="s-baseUrl" placeholder="e.g. http://localhost:8888/v1"></label>
-      <label>Model <input id="s-model" placeholder="model id (required to run)"></label>
-      <label>API key <input id="s-apiKey" type="password" placeholder="(unset)"></label>
-      <div class="row">
-        <label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048"></label>
-        <label>Temperature <input id="s-temp" type="number" step="0.05" min="0" placeholder="0.2"></label>
-      </div>
-      <label>Python interpreter <input id="s-python" placeholder="python3 or /path/to/venv/bin/python"></label>
-      <div class="settings-actions">
-        <button id="s-save">Save</button>
-        <button id="s-clearkey" class="ghost">Clear API key</button>
-        <span id="s-status" class="sub"></span>
-      </div>
-      <div class="sub" id="s-path"></div>
-    </div>
-  </div>
-</div>
-<script>
-(function(){
-  var $ = function(id){ return document.getElementById(id); };
-  var overlay = $('settings-overlay');
-  function keyPh(set){ return set ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '(unset)'; }
-  function fill(d){
-    $('s-provider').value = d.llmProvider || '';
-    $('s-baseUrl').value = d.llmBaseUrl || '';
-    $('s-model').value = d.llmModel || '';
-    $('s-apiKey').value = ''; $('s-apiKey').placeholder = keyPh(d.llmApiKeySet);
-    $('s-maxTokens').value = d.llmMaxTokens != null ? d.llmMaxTokens : '';
-    $('s-temp').value = d.llmTemperature != null ? d.llmTemperature : '';
-    $('s-python').value = d.pythonBin || '';
-    $('s-path').textContent = d.path ? ('Persisted to ' + d.path) : '';
-  }
-  async function loadSettings(){
-    $('s-status').textContent = '';
-    try { var r = await fetch('/api/settings'); fill(await r.json()); }
-    catch(e){ $('s-status').textContent = 'load failed: ' + e; }
-  }
-  async function save(patch, msg){
-    $('s-status').textContent = 'Saving\u2026';
-    try {
-      var r = await fetch('/api/settings', {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(patch)});
-      var d = await r.json();
-      if(!r.ok){ $('s-status').textContent = 'error: ' + (d.error || r.status); return; }
-      fill(d); $('s-status').textContent = msg || 'Saved';
-    } catch(e){ $('s-status').textContent = 'error: ' + e; }
-  }
-  function open(){ overlay.hidden = false; loadSettings(); }
-  function close(){ overlay.hidden = true; }
-  $('cog').addEventListener('click', open);
-  $('s-close').addEventListener('click', close);
-  overlay.addEventListener('click', function(e){ if(e.target === overlay) close(); });
-  $('s-save').addEventListener('click', function(){
-    var patch = {
-      llmProvider: $('s-provider').value,
-      llmBaseUrl: $('s-baseUrl').value,
-      llmModel: $('s-model').value,
-      llmMaxTokens: $('s-maxTokens').value ? Number($('s-maxTokens').value) : 0,
-      llmTemperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1,
-      pythonBin: $('s-python').value
-    };
-    var key = $('s-apiKey').value;
-    if(key) patch.llmApiKey = key;
-    save(patch, 'Saved \u2713');
-  });
-  $('s-clearkey').addEventListener('click', function(){ save({llmApiKey: ''}, 'API key cleared'); });
-})();
-</script>
+<script src="/assets/settings.js"></script>
 </body>
 </html>
 "#;

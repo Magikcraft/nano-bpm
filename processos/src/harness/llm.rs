@@ -262,6 +262,83 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// List the model ids the configured endpoint advertises (the OpenAI-compatible
+/// `/models` route, or Anthropic's `/v1/models`). Used by the console to populate the
+/// model picker by querying the live endpoint. A `model` need not be set on `cfg`.
+pub async fn list_models(cfg: &LlmConfig) -> Result<Vec<String>, String> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let base = cfg.base_url.trim_end_matches('/');
+    let (url, req) = match cfg.provider {
+        Provider::Openai => {
+            let url = format!("{base}/models");
+            let mut r = client.get(&url);
+            if let Some(key) = &cfg.api_key {
+                r = r.bearer_auth(key);
+            }
+            (url, r)
+        }
+        Provider::Anthropic => {
+            let url = format!("{base}/v1/models");
+            let key = cfg
+                .api_key
+                .as_deref()
+                .ok_or("Anthropic requires an API key to list models")?;
+            let r = client
+                .get(&url)
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01");
+            (url, r)
+        }
+    };
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("model list request to {url} failed: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("reading model list: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("endpoint returned {status}: {}", truncate(&text, 300)));
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("model list not JSON: {e}"))?;
+    // OpenAI / Anthropic / llama.cpp all expose `data: [{ id }]`; fall back to a bare
+    // top-level `models: [{ id | name }]` (some llama.cpp builds).
+    let mut ids = Vec::new();
+    let arrays = [v.get("data"), v.get("models")];
+    for arr in arrays.into_iter().flatten() {
+        if let Some(items) = arr.as_array() {
+            for it in items {
+                let id = it
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .or_else(|| it.get("name").and_then(|x| x.as_str()))
+                    .or_else(|| it.as_str());
+                if let Some(id) = id {
+                    if !id.is_empty() && !ids.iter().any(|e| e == id) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+        if !ids.is_empty() {
+            break;
+        }
+    }
+    if ids.is_empty() {
+        return Err(format!(
+            "no models found in response: {}",
+            truncate(&text, 300)
+        ));
+    }
+    ids.sort();
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
