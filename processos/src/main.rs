@@ -1881,10 +1881,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ProcessOS — Insights</title>
+<title>Nano ProcessOS — Live instance</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  a { color: inherit; text-decoration: none; }
+  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
+  .rail .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
+  .rail .brand .dot { color: #a5b4fc; }
+  .rail .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
+  .rail nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; }
+  .rail nav a:hover { background: #18181b; color: #e4e4e7; }
+  .rail nav a.active { background: #1d1d22; color: #c7d2fe; }
+  .content { min-width: 0; }
   header { padding: 16px 24px; border-bottom: 1px solid #27272a; display: flex; align-items: baseline; gap: 12px; }
   h1 { font-size: 18px; margin: 0; }
   .sub { color: #71717a; font-size: 12px; }
@@ -1919,19 +1929,27 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 </style>
 </head>
 <body>
-<header>
-  <h1>ProcessOS</h1>
-  <span class="sub">Live instance · <span id="nano"></span></span>
-  <nav style="margin-left:auto;display:flex;align-items:center;gap:14px">
-    <a href="/" style="color:#a1a1aa;text-decoration:none;font-size:13px">Home</a>
-    <a href="/workspace" style="color:#a1a1aa;text-decoration:none;font-size:13px">Workspaces</a>
-    <a href="/cockpit" style="color:#a1a1aa;text-decoration:none;font-size:13px">Cockpit</a>
-    <a href="/features" style="color:#a1a1aa;text-decoration:none;font-size:13px">Features</a>
-    <a href="/harness" style="color:#a1a1aa;text-decoration:none;font-size:13px">Harness</a>
-    <button onclick="load()">Refresh</button>
-  </nav>
-</header>
-<main id="out">Loading…</main>
+<div class="app">
+  <aside class="rail">
+    <a class="brand" href="/">Nano Process<span class="dot">OS</span></a>
+    <div class="tag">live instance</div>
+    <nav>
+      <a href="/console" class="active">Console</a>
+      <a href="/workspace">Workspaces</a>
+      <a href="/cockpit">Cockpit</a>
+      <a href="/harness">Harness</a>
+      <a href="/features">Features</a>
+    </nav>
+  </aside>
+  <div class="content">
+    <header>
+      <h1>Live instance</h1>
+      <span class="sub">&middot; <span id="nano"></span></span>
+      <button onclick="load()" style="margin-left:auto">Refresh</button>
+    </header>
+    <main id="out">Loading…</main>
+  </div>
+</div>
 <script>
 function ms(v){ return v==null ? '—' : (v>=1000 ? (v/1000).toFixed(2)+'s' : v+'ms'); }
 function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
@@ -2073,7 +2091,7 @@ const HARNESS_HTML: &str = r##"<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ProcessOS — Optimization Harness</title>
+<title>Nano ProcessOS — Optimization Harness</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0a0a0b; color: #e4e4e7; }
@@ -2098,9 +2116,9 @@ const HARNESS_HTML: &str = r##"<!doctype html>
 </head>
 <body>
 <header>
-  <h1>ProcessOS — Optimization Harness</h1>
+  <h1><a href="/" style="color:inherit;text-decoration:none">Nano ProcessOS</a> — Optimization Harness</h1>
   <div class="sub">SimRunner over the bundled example scenario (worker-swap transform space). The same loop runs in production against live Nano traces.</div>
-  <div class="sub" style="margin-top:8px"><a href="/" style="color:#a5b4fc;text-decoration:none">Home</a> · <a href="/features" style="color:#a5b4fc;text-decoration:none">Features</a> · <a href="/console" style="color:#a5b4fc;text-decoration:none">Console</a></div>
+  <div class="sub" style="margin-top:8px"><a href="/" style="color:#a5b4fc;text-decoration:none">Home</a> · <a href="/workspace" style="color:#a5b4fc;text-decoration:none">Workspaces</a> · <a href="/features" style="color:#a5b4fc;text-decoration:none">Features</a> · <a href="/console" style="color:#a5b4fc;text-decoration:none">Console</a></div>
 </header>
 <main id="root">Running the example scenario…</main>
 <script>

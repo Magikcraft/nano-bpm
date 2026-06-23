@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ProcessOS — Cockpit</title>
+<title>Nano ProcessOS — Cockpit</title>
 <link rel="stylesheet" href="/assets/bpmn/diagram-js.css" />
 <link rel="stylesheet" href="/assets/bpmn/bpmn-embedded.css" />
 <style>
@@ -14,7 +14,7 @@
   .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
   /* left rail */
   .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
-  .brand { font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
+  .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
   .brand .dot { color: #a5b4fc; }
   .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
   .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; cursor: pointer; }
@@ -134,9 +134,10 @@
 <body>
 <div class="app">
   <aside class="rail">
-    <div class="brand">Process<span class="dot">OS</span></div>
+    <a class="brand" href="/">Nano Process<span class="dot">OS</span></a>
     <div class="tag">the cockpit</div>
     <nav class="nav">
+      <a href="/workspace">Workspaces</a>
       <a data-view="console">Console</a>
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
@@ -518,7 +519,7 @@ async function runInvestigation(ws, proc){
   finally { btn.disabled = false; btn.textContent = 'Investigate with the droid →'; }
 }
 
-document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
+document.querySelectorAll('.nav a[data-view]').forEach(a => a.onclick = () => {
   const v = a.dataset.view;
   if(v==='console') renderConsole();
   else if(v==='processes') renderProcesses();
