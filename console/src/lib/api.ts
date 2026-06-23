@@ -95,6 +95,15 @@ export interface Incident {
   created_at_ms: number;
 }
 
+/// One page of the process-instance list plus the total count, matching the
+/// server's `GET /console/api/instances?page=&pageSize=` response.
+export interface InstancePage {
+  items: Instance[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
 export interface InstanceDetail {
   instance: Instance;
   variables: Variable[];
@@ -341,7 +350,8 @@ export const api = {
   clusterHealth: () => getJson<ClusterHealth>("/cluster/health"),
   metrics: () => getJson<MetricsSnapshot>("/metrics"),
   clusterMetrics: () => getJson<ClusterMetrics>("/cluster/metrics"),
-  instances: () => getJson<Instance[]>("/instances"),
+  instances: (page = 0, pageSize = 50) =>
+    getJson<InstancePage>(`/instances?page=${page}&pageSize=${pageSize}`),
   instanceDetail: (key: string) =>
     getJson<InstanceDetail>(`/instances/${key}`),
   traces: (limit = 100) => getJson<TraceSummary[]>(`/traces?limit=${limit}`),

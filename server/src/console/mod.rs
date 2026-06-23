@@ -730,6 +730,26 @@ impl From<&crate::readstore::ProcessInstanceRow> for InstanceDto {
     }
 }
 
+/// Query string for the paginated instance list (`?page=&pageSize=`). Both are
+/// optional; defaults are applied (and `pageSize` clamped) in the handler.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstanceListQuery {
+    page: Option<i64>,
+    page_size: Option<i64>,
+}
+
+/// One page of process instances plus the total row count, so the console can
+/// render a pager without a second request.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstancePage {
+    items: Vec<InstanceDto>,
+    total: i64,
+    page: i64,
+    page_size: i64,
+}
+
 #[derive(Serialize)]
 struct VariableDto {
     name: String,
@@ -767,12 +787,27 @@ struct InstanceDetailDto {
     incidents: Vec<IncidentDto>,
 }
 
-/// `GET /console/api/instances` — process-instance list, newest first.
-async fn instances(State(server): State<ServerImpl>) -> Json<Vec<InstanceDto>> {
-    let mut rows = server.store.process_instances();
-    // Newest first: most useful default ordering for an ops view.
-    rows.sort_by(|a, b| b.start_date_ms.cmp(&a.start_date_ms));
-    Json(rows.iter().map(InstanceDto::from).collect())
+/// `GET /console/api/instances?page=N&pageSize=M` — one page of process
+/// instances, newest first, plus the total count for the pager. Pagination is
+/// pushed into SQLite (`process_instances_page`) so a node with a large read
+/// model returns a bounded page instead of materializing and sorting every row
+/// (which made the Process Explorer hang).
+async fn instances(
+    State(server): State<ServerImpl>,
+    Query(q): Query<InstanceListQuery>,
+) -> Json<InstancePage> {
+    let page = q.page.unwrap_or(0).max(0);
+    let page_size = q.page_size.unwrap_or(50).clamp(1, 500);
+    let total = server.store.process_instance_count();
+    let rows = server
+        .store
+        .process_instances_page(page_size, page.saturating_mul(page_size));
+    Json(InstancePage {
+        items: rows.iter().map(InstanceDto::from).collect(),
+        total,
+        page,
+        page_size,
+    })
 }
 
 /// `GET /console/api/instances/{key}` — one instance with its variables, jobs,

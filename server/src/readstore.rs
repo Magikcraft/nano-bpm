@@ -491,6 +491,34 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// Total number of process instances in the read model — the page count for
+    /// the console's paginated instance list. Cheap `COUNT(*)` on the table.
+    pub fn process_instance_count(&self) -> i64 {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    /// One page of process instances, newest first. Orders by `key DESC` — keys
+    /// are monotonic so this is newest-first (the same ordering the retention
+    /// prune uses) and rides the integer PRIMARY KEY index, so it is
+    /// `O(limit + offset)` in SQLite rather than loading and sorting every row
+    /// in memory (which is what made the console hang on large datasets).
+    pub fn process_instances_page(&self, limit: i64, offset: i64) -> Vec<ProcessInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, process_id, process_definition_id, process_definition_key, \
+                 version, state, start_date_ms, has_incident, tags, business_id \
+                 FROM process_instances ORDER BY key DESC LIMIT ?1 OFFSET ?2",
+            )
+            .expect("prepare process_instances_page");
+        let rows = stmt
+            .query_map(params![limit, offset], map_instance)
+            .expect("query process_instances_page");
+        rows.filter_map(Result::ok).collect()
+    }
+
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         conn.query_row(
@@ -1331,5 +1359,31 @@ mod definition_xml_tests {
 
         // Re-pruning at the same cap is a no-op (nothing beyond the cap).
         assert_eq!(store.prune_terminal_instances(2).unwrap(), 0);
+    }
+
+    #[test]
+    fn process_instances_page_returns_newest_first_bounded_pages() {
+        let store = ReadStore::open(None).unwrap();
+        // Keys 1..=5, created oldest→newest; keys are monotonic so newest = key 5.
+        for k in 1..=5u64 {
+            store.export(&[&created_event(k)]).unwrap();
+        }
+
+        assert_eq!(store.process_instance_count(), 5);
+
+        // First page: the 2 newest, descending by key.
+        let page0 = store.process_instances_page(2, 0);
+        assert_eq!(page0.iter().map(|r| r.key).collect::<Vec<_>>(), vec![5, 4]);
+
+        // Second page picks up where the first left off.
+        let page1 = store.process_instances_page(2, 2);
+        assert_eq!(page1.iter().map(|r| r.key).collect::<Vec<_>>(), vec![3, 2]);
+
+        // Final partial page.
+        let page2 = store.process_instances_page(2, 4);
+        assert_eq!(page2.iter().map(|r| r.key).collect::<Vec<_>>(), vec![1]);
+
+        // Offset past the end yields nothing.
+        assert!(store.process_instances_page(2, 6).is_empty());
     }
 }
