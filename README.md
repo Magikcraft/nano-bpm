@@ -451,6 +451,9 @@ instance finishes).
 | `NANOBPMN_NODE_ID=<i>` | This node's id (index into `NANOBPMN_NODES`). Default `0`. |
 | `NANOBPMN_RAFT=on` | Enable per-partition Raft replication. Off ⇒ the single-homed, byte-identical path. |
 | `NANOBPMN_RF=<k>` | Replication factor: nodes per partition. Default `1`. Clamped to `[1, num_nodes]`. Use an odd node count with `RF=num_nodes` for fault tolerance. |
+| `NANOBPMN_REPLICATE_ACTIVATION=<mode>` | How the job-activation lock is handled under Raft (RF>1). Default/absent ⇒ **replicated**: `ActivateJobs` + lock-expiry go through the log, so every replica holds the lease (3 quorum commits/job; the lease survives failover exactly). `0`/`false`/`off` ⇒ **leader-local**: the lock lives only in the leader's RAM (2 commits/job, ~3× throughput, no collapse under worker over-provisioning), but a new leader redelivers in-flight jobs *immediately* on failover. `digest` ⇒ leader-local **plus** a best-effort soft lease digest: the leader fire-and-forget broadcasts its held leases to followers each tick, and a freshly-promoted leader honours each reported deadline before redelivering — narrowing the failover redelivery window with no per-job quorum cost. All three modes are at-least-once. No effect on a single node / RF=1. See [`docs/adr/0002-leader-local-activation-and-lease-digest.md`](docs/adr/0002-leader-local-activation-and-lease-digest.md). |
+| `NANOBPMN_REPLICATION=<tier>` | Replication durability tier for the partition log under Raft (RF>1) — the sibling of `NANOBPMN_DURABILITY` but on the *replication* axis (Kafka `acks=all` vs `acks=1`). Default/absent ⇒ **quorum**: a write acks only after a majority of voters commits + applies it, so it survives node loss with zero data loss. `leader-durable` (also `acks=1`) ⇒ each led group is formed with the **leader as the sole voter** and the other replicas as **learners**: the leader acks after its own local durable append+apply (no follower round-trip — the biggest latency win at low concurrency) and ships the log to learners asynchronously. Trade-off: a tail acked but not yet shipped is lost if that leader is lost. A sole-voter group cannot self-elect, so automatic failover is supplied by an **app-driven promotion supervisor**: the deterministic surviving successor rebuilds the group as a fresh sole-voter group seeded from its replica engine, fenced by a monotonic promotion epoch with a deterministic lowest-node-id tiebreak (a strictly-higher epoch wins; a symmetric split that produces equal-epoch promotions reconverges to the lowest-id leader ⇒ bounded loss, never permanent divergence or a stuck double-leader). At-least-once either way. No effect on a single node / RF=1. See [`docs/adr/0003-write-path-durability-tiers.md`](docs/adr/0003-write-path-durability-tiers.md). |
+| `NANOBPMN_LEADER_DURABLE_GRACE_TICKS=<n>` | Leader-durable auto-recovery sensitivity: number of consecutive 500 ms supervisor passes a partition must be observed leaderless before the deterministic successor self-promotes. Default `3` (floor `1`). Only consulted in `leader-durable` mode. |
 | `NANOBPMN_RAFT_HEARTBEAT_MS=<ms>` | Leader heartbeat interval. Default `250`. |
 | `NANOBPMN_RAFT_ELECTION_MIN_MS` / `_MAX_MS` | Randomized election timeout window. Defaults `500` / `1000`. |
 | `NANOBPMN_RAFT_SNAPSHOT_LOGS=<n>` | Snapshot every `n` applied entries (log compaction; also the catch-up→snapshot threshold). Default `5000`. |
@@ -983,3 +986,60 @@ path inside it, then either deep-`merge`s a mapping or `append`s items to a list
 This is how nanobpmn adds the `processCompleted` flag to
 `CreateProcessInstanceResult` (it reports whether the returned variables are the
 authoritative final result) without forking the upstream spec.
+
+## Cluster tuning
+
+Single-node defaults are tuned for correctness and need no thought: one partition,
+`sync` durability, backpressure on. The knobs below only matter once you cluster
+(`NANOBPMN_RAFT=on`, `NANOBPMN_NODES=…`) or push a node toward saturation. They are
+deliberately orthogonal — pick each axis independently for your workload.
+
+### Topology: nodes, partitions, replication factor
+
+- **Partitions ≥ nodes, always.** Each partition is owned by exactly one node
+  (`owner = partition % num_nodes`), and a clustered node that owns *zero*
+  partitions aborts on startup. The clean, balanced choice is **one partition led
+  per node**: `NANOBPMN_PARTITIONS = NANOBPMN_NODES` count (e.g. 6 nodes → 6
+  partitions). Use a higher multiple (`2×`, `3×` nodes) only if you want finer
+  rebalancing granularity or headroom to add nodes without a data-dir reset —
+  `NANOBPMN_PARTITIONS` cannot be changed in place (the journal layout differs).
+- **`NANOBPMN_RF=3` for fault tolerance.** RF is the number of copies per
+  partition; `RF=1` (default) is no replication. `RF=3` survives one node loss with
+  a majority still live. Keep `RF` ≤ node count. With `quorum` replication you want
+  an **odd** voter count per group so a majority always exists; `RF=3` over any node
+  count ≥ 3 gives each partition a 3-replica group.
+- **Throughput scales with partitions, not nodes alone.** Each partition is a single
+  writer (one fsync + apply loop), so aggregate write throughput tracks the number
+  of *led* partitions. More nodes with the same partition count mostly buys
+  durability and read/activation fan-out, not raw create throughput.
+
+### What to tune, by situation
+
+| If you want… | Tune | To |
+| --- | --- | --- |
+| **Lowest write latency** (small/medium concurrency) | `NANOBPMN_DURABILITY=async` + `NANOBPMN_REPLICATION=leader-durable` | Ack on the leader's local durable append+apply — no fsync-before-ack wait and no follower round-trip. Cost: a just-acked tail can be lost on an ungraceful leader loss (bounded, never divergent). |
+| **Zero-data-loss durability** (the default) | leave `NANOBPMN_DURABILITY=sync`, `NANOBPMN_REPLICATION=quorum` | `200`/`204` means fsync'd locally **and** majority-committed. Strongest guarantee; highest per-write latency. |
+| **High throughput under worker over-provisioning** | `NANOBPMN_REPLICATE_ACTIVATION=0` (leader-local) or `=digest` | Keep the activation lease off the Raft log (~3× activation throughput, no collapse when far more workers than jobs poll). `digest` adds a best-effort lease broadcast so failover redelivery is narrowed. All modes stay at-least-once. |
+| **Even job drain / e2e-latency across nodes** | `NANOBPMN_ACTIVATION_FAIRNESS=1` or `=2` | The default (Off) drains a worker's *local* partition first, then pulls from peers in fixed node-id order — which skews the per-node latency distribution and can cap aggregate throughput. `1` rotates+quota-splits the lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog so the deepest node drains fastest. |
+| **A producer that outpaces the workers** | leave backpressure on (default **Adaptive**), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | Adaptive (AIMD) sizes the in-flight-instance watermark from measured latency and sheds excess creates with `503 RESOURCE_EXHAUSTED`, so the producer converges to the drain rate instead of growing an unbounded backlog. Set `0`/`off` only to measure raw ingest with no shedding. A fixed `<n>` gives a deterministic, host-independent watermark for A/B runs. |
+| **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS` (default `5000`), `NANOBPMN_HISTORY_MAX_INSTANCES`, `NANOBPMN_VAR_SPILL*` | Idle-purge compacts hot state and returns freed arenas to the OS after the quiescence window (`0` disables). Cap retained completed instances to bound read-model growth. Variable spill pages cold parked-instance variables to disk (on by default when a data dir is set). |
+| **Faster failover detection** (leader-durable) | `NANOBPMN_LEADER_DURABLE_GRACE_TICKS` (default `3` × 500 ms) | Lower it (floor `1`) to promote a successor sooner after a leader is observed gone; raise it to avoid promoting during transient blips. |
+
+### Recommended profiles
+
+- **Strong durability (default, money-movement workloads):** `RF=3`,
+  `NANOBPMN_RAFT=on`, leave durability/replication/activation unset. Every ack is
+  fsync'd and quorum-committed. Pair with a persistent `NANOBPMN_DATA_DIR` per node.
+- **Low latency (interactive workflows, modest concurrency):** `RF=3`,
+  `NANOBPMN_DURABILITY=async`, `NANOBPMN_REPLICATION=leader-durable`,
+  `NANOBPMN_REPLICATE_ACTIVATION=digest`. Bounded-loss, self-healing failover via
+  the promotion supervisor; narrowest practical latency.
+- **Max throughput / benchmarking:** one partition led per node,
+  `NANOBPMN_REPLICATE_ACTIVATION=0`, `NANOBPMN_ACTIVATION_FAIRNESS=2`, and decide
+  backpressure explicitly (`Adaptive` for a realistic ceiling, `off` to measure
+  raw ingest). Always benchmark the **release** binary
+  (`server/target/release/nanobpm-gateway-rest-server`).
+
+> Durability/replication tiers are chosen at startup from the on-disk log; switching
+> tiers on an existing data directory is unsupported. Start each reconfigured cluster
+> from a fresh `NANOBPMN_DATA_DIR`.
