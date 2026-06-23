@@ -12,6 +12,7 @@
 mod contracts;
 mod cockpit;
 mod conversation;
+mod corpus;
 mod dataset;
 mod harness;
 mod pilot;
@@ -126,6 +127,28 @@ fn resolve_nano_urls(
 
 #[tokio::main]
 async fn main() {
+    // CLI subcommands run a one-shot task and exit before the server boots. This keeps
+    // the default (no-args) behaviour — start the optimization-plane server — intact.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "gen" | "generate" => {
+                run_cli_generate(&args[2..]);
+                return;
+            }
+            "infer" => {
+                run_cli_infer(&args[2..]);
+                return;
+            }
+            other => {
+                eprintln!("unknown subcommand '{other}'. usage:");
+                eprintln!("  processos gen <pack.json> <out-dir>");
+                eprintln!("  processos infer <dataset-dir> [target-p99-wait-ms]");
+                std::process::exit(2);
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -254,6 +277,55 @@ async fn main() {
     // Tear down the spawned engine (if any) so it doesn't outlive ProcessOS.
     if let Some(engine) = own_engine {
         engine.shutdown().await;
+    }
+}
+
+/// `processos gen <pack.json> <out-dir>` — generate a synthetic trace corpus.
+fn run_cli_generate(args: &[String]) {
+    if args.len() < 2 {
+        eprintln!("usage: processos gen <pack.json> <out-dir>");
+        std::process::exit(2);
+    }
+    let pack_path = std::path::Path::new(&args[0]);
+    let out_dir = std::path::Path::new(&args[1]);
+    let (pack, def) = corpus::load_pack(pack_path).unwrap_or_else(|e| {
+        eprintln!("load pack failed: {e}");
+        std::process::exit(1);
+    });
+    let summary = corpus::generate(&pack, &def, out_dir).unwrap_or_else(|e| {
+        eprintln!("generate failed: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).unwrap_or_default()
+    );
+}
+
+/// `processos infer <dataset-dir> [target-p99-wait-ms]` — run the inference + score.
+fn run_cli_infer(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("usage: processos infer <dataset-dir> [target-p99-wait-ms]");
+        std::process::exit(2);
+    }
+    let dataset_dir = std::path::Path::new(&args[0]);
+    let target = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
+    let inference = corpus::infer(dataset_dir, target).unwrap_or_else(|e| {
+        eprintln!("infer failed: {e}");
+        std::process::exit(1);
+    });
+    println!("{}", serde_json::to_string_pretty(&inference).unwrap_or_default());
+
+    // Score against expected.json if it sits beside the dataset.
+    let expected = dataset_dir.join("expected.json");
+    if expected.is_file() {
+        match corpus::score(&inference, &expected) {
+            Ok(s) => println!(
+                "SCORE {}",
+                serde_json::to_string(&s).unwrap_or_default()
+            ),
+            Err(e) => eprintln!("score failed: {e}"),
+        }
     }
 }
 

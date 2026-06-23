@@ -125,6 +125,38 @@ A dataset folder holds per-instance `*.json` files (each a
 `GET /console/api/traces/{key}` shape) at top level or under `instances/`/`traces/`,
 and/or a single `traces.json` array, plus an optional `metrics.json`.
 
+## Synthetic trace corpus — labelled benchmark for domain inference (`src/corpus.rs`)
+
+To exercise the distributed-sensing goal *without a running server*, ProcessOS can
+**synthesise a labelled trace corpus** from a "before" archetype process plus a thin
+infra sidecar. It runs the **real** `engine-core` per instance for the logical path
+(branching, errors) and overlays timing analytically: lognormal service times + an
+M/M/c queue-wait sampled against a **time-varying arrival schedule**. The result is a
+`traces.json` array — byte-compatible with a real Nano capture, so it loads straight
+into a workspace `DatasetSource` — carrying a **planted pathology** (e.g. an
+under-provisioned job whose queue tail spikes weekday 09–12) and a ground-truth label.
+
+A `pack.json` describes the scenario; the bundled
+`corpus-packs/loan-approval/` plants a 2-worker `credit-check` bureau pool overloaded
+by an 8× weekday-morning arrival spike:
+
+```bash
+# generate ~10k instances of traffic over a 14-day horizon
+processos gen corpus-packs/loan-approval/pack.json /tmp/loan-corpus
+#  -> traces.json (load via a workspace dataset) + metrics.json + expected.json
+
+# run the inference + score it against the planted label
+processos infer /tmp/loan-corpus 500   # 500ms p99-wait staffing target
+#  -> bottleneckJob credit-check, window weekday-morning, recommendedWorkers 44
+#  -> SCORE {"domainOk":true,"jobOk":true,"windowOk":true,"points":3,"maxPoints":3}
+```
+
+The inference time-buckets per-`(job, window)` queue means, localises the tail to the
+job + temporal window with the largest peak-vs-off-peak inflation, fits the peak arrival
+rate to an Erlang-C staffing recommendation, and classifies the domain — then `score`
+grades that against `expected.json` (domain + job + window = 3 points). The generator is
+the symmetric write-side of `replay.rs`, so a corpus also feeds `replay-rank`/`evolve`.
+
 ## The cockpit & pilot loop (§10)
 
 The optimization loop is itself authored as **editable BPMN** (the *pilot process*,
@@ -226,6 +258,7 @@ src/
   pilot.rs        the forkable pilot process — plastic surface (a) of §10
   workspace.rs    customers/processes tree + persistence + CRUD + source binding
   dataset.rs      DatasetSource (loaded trace folder) + TraceSource enum (live | dataset)
+  corpus.rs       synthetic labelled trace corpus: generator + inference + scorer
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
   conversation.rs persisted cockpit conversations + data-dir resolution
   harness/

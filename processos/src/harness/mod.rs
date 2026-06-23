@@ -55,6 +55,8 @@ pub use queueing::staff_for_summary;
 #[allow(unused_imports)]
 pub use queueing::WorkerStaffing;
 #[allow(unused_imports)]
+pub(crate) use queueing::{erlang_c, min_workers_for_p99, StaffingPlan};
+#[allow(unused_imports)]
 pub use rank::{run_scenario, HarnessReport, VariantResult};
 #[allow(unused_imports)]
 pub use replay::{

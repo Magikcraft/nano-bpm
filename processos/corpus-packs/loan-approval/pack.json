@@ -1,0 +1,50 @@
+{
+  "processId": "loan-approval",
+  "bpmn": "loan-approval.bpmn",
+  "domain": "loan-origination",
+  "seed": 7,
+  "horizonDays": 14,
+
+  "baseArrivalsPerHour": 18.0,
+  "peak": {
+    "pattern": "weekday-morning",
+    "multiplier": 8.0,
+    "startHour": 9,
+    "endHour": 12
+  },
+
+  "jobs": {
+    "credit-check": {
+      "serviceMsMean": 120000,
+      "serviceMsSigma": 0.35,
+      "cost": 0.45,
+      "failureRate": 0.02,
+      "poolCapacity": 2
+    },
+    "approve-loan": {
+      "serviceMsMean": 30000,
+      "serviceMsSigma": 0.25,
+      "cost": 0.1,
+      "failureRate": 0.0,
+      "poolCapacity": 30
+    },
+    "reject-application": {
+      "serviceMsMean": 20000,
+      "serviceMsSigma": 0.25,
+      "cost": 0.05,
+      "failureRate": 0.0,
+      "poolCapacity": 30
+    }
+  },
+
+  "inputs": [
+    { "weight": 0.62, "vars": { "creditScore": 750 }, "expectedOutcome": "completed" },
+    { "weight": 0.38, "vars": { "creditScore": 650 }, "expectedOutcome": "completed" }
+  ],
+
+  "plantedFault": {
+    "jobType": "credit-check",
+    "kind": "under-provisioned",
+    "window": "weekday-morning"
+  }
+}
