@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ProcessOS — Workspaces</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  a { color: inherit; text-decoration: none; }
+  header { border-bottom: 1px solid #1f1f23; padding: 14px 26px; background: #0c0c0e; display: flex; align-items: baseline; gap: 16px; }
+  .brand { font-weight: 700; font-size: 16px; }
+  .brand .dot { color: #a5b4fc; }
+  .tag { color: #71717a; font-size: 12px; }
+  header nav { margin-left: auto; display: flex; gap: 14px; }
+  header nav a { color: #a1a1aa; font-size: 13px; }
+  header nav a:hover { color: #c7d2fe; }
+  main { padding: 24px 30px; max-width: 1100px; }
+  .crumbs { color: #71717a; font-size: 12px; margin-bottom: 14px; }
+  .crumbs a { color: #a5b4fc; cursor: pointer; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .lede { color: #a1a1aa; font-size: 13px; margin: 0 0 18px; max-width: 760px; }
+  h2 { font-size: 12px; color: #a1a1aa; text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 12px; }
+  .tile { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
+  .tile:hover { border-color: #3f3f6a; transform: translateY(-1px); }
+  .tile h3 { margin: 0 0 4px; font-size: 15px; color: #c7d2fe; }
+  .tile .meta { color: #8b8b93; font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+  .pill.live { background: #0c2a4a; color: #93c5fd; }
+  .pill.dataset { background: #06301c; color: #6ee7b7; }
+  .pill.unbound { background: #3a1c1c; color: #fca5a5; }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid #3f3f46; background: #1d1d22; color: #e4e4e7; padding: 7px 13px; }
+  button.primary { background: #4f46e5; border-color: #4f46e5; color: #fff; }
+  button:hover { filter: brightness(1.1); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input, textarea, select { font: inherit; background: #141417; border: 1px solid #2a2a30; color: #e4e4e7; border-radius: 8px; padding: 7px 10px; }
+  input, select { min-width: 220px; }
+  .dialog { background: #141417; border: 1px solid #2a2a30; border-radius: 10px; padding: 16px; margin: 14px 0; max-width: 560px; }
+  .dialog label { display: block; font-size: 12px; color: #a1a1aa; margin: 10px 0 3px; }
+  .dialog input, .dialog textarea, .dialog select { width: 100%; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .card { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 12px 16px; min-width: 110px; }
+  .card .n { font-size: 22px; font-weight: 650; }
+  .card .l { color: #8b8b93; font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 6px; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #1f1f23; }
+  th { color: #8b8b93; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .err { color: #fca5a5; font-size: 13px; margin: 10px 0; }
+  .muted { color: #71717a; }
+  code { font-family: ui-monospace, monospace; color: #c7d2fe; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">Process<span class="dot">OS</span></span>
+  <span class="tag">Workspaces</span>
+  <nav>
+    <a href="/console">Insights</a>
+    <a href="/cockpit">Cockpit</a>
+    <a href="/">Home</a>
+  </nav>
+</header>
+<main id="app">Loading…</main>
+
+<script>
+const $ = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstChild; };
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const app = document.getElementById('app');
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || (r.status + ' ' + r.statusText));
+  return body;
+}
+
+function bindingPill(b) { return `<span class="pill ${b}">${b}</span>`; }
+
+// --- customers list -----------------------------------------------------
+async function viewCustomers() {
+  app.innerHTML = 'Loading…';
+  let data;
+  try { data = await api('/api/workspace/customers'); }
+  catch (e) { app.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+  const tiles = data.customers.map(c => `
+    <div class="tile" data-c="${esc(c.slug)}">
+      <h3>${esc(c.displayName || c.slug)}</h3>
+      <div class="meta">${c.processCount} process${c.processCount === 1 ? '' : 'es'} · <code>${esc(c.slug)}</code></div>
+    </div>`).join('');
+
+  app.innerHTML = `
+    <h1>Customers</h1>
+    <p class="lede">Each customer is a folder under <code>${esc(data.root)}</code>. A consultant curates customers and their processes here; a process binds to a live customer Nano instance or a loaded trace dataset.</p>
+    <div class="row"><button class="primary" id="newC">+ New customer</button></div>
+    <div id="dlg"></div>
+    <h2>Customers</h2>
+    <div class="grid">${tiles || '<p class="muted">No customers yet — create one to begin.</p>'}</div>`;
+
+  app.querySelectorAll('.tile[data-c]').forEach(t =>
+    t.onclick = () => location.hash = '#/c/' + t.dataset.c);
+  document.getElementById('newC').onclick = () => showNewCustomer();
+}
+
+function showNewCustomer() {
+  const dlg = document.getElementById('dlg');
+  dlg.innerHTML = '';
+  const el = $(`<div class="dialog">
+    <label>Display name</label><input id="cn" placeholder="Acme Corp" />
+    <label>Notes (optional)</label><input id="cnotes" placeholder="priority account" />
+    <div class="row" style="margin-top:12px"><button class="primary" id="save">Create</button><button id="cancel">Cancel</button></div>
+    <div class="err" id="e"></div></div>`);
+  dlg.appendChild(el);
+  el.querySelector('#cancel').onclick = () => dlg.innerHTML = '';
+  el.querySelector('#save').onclick = async () => {
+    try {
+      const c = await api('/api/workspace/customers', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ displayName: el.querySelector('#cn').value, notes: el.querySelector('#cnotes').value || null })
+      });
+      location.hash = '#/c/' + c.slug;
+    } catch (e) { el.querySelector('#e').textContent = e.message; }
+  };
+}
+
+// --- one customer: its processes ----------------------------------------
+async function viewCustomer(slug) {
+  app.innerHTML = 'Loading…';
+  let data;
+  try { data = await api('/api/workspace/customers/' + encodeURIComponent(slug)); }
+  catch (e) { app.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+  const tiles = data.processes.map(p => `
+    <div class="tile" data-p="${esc(p.slug)}">
+      <h3>${esc(p.displayName || p.slug)} ${bindingPill(p.binding)}</h3>
+      <div class="meta">${p.objective ? esc(p.objective) + ' · ' : ''}<code>${esc(p.slug)}</code></div>
+    </div>`).join('');
+
+  app.innerHTML = `
+    <div class="crumbs"><a id="up">Customers</a> / ${esc(data.customer.displayName || slug)}</div>
+    <h1>${esc(data.customer.displayName || slug)}</h1>
+    ${data.customer.notes ? `<p class="lede">${esc(data.customer.notes)}</p>` : ''}
+    <div class="row"><button class="primary" id="newP">+ New process</button></div>
+    <div id="dlg"></div>
+    <h2>Processes</h2>
+    <div class="grid">${tiles || '<p class="muted">No processes yet — add one and bind it to a live engine or a trace dataset.</p>'}</div>`;
+
+  document.getElementById('up').onclick = () => location.hash = '#/';
+  app.querySelectorAll('.tile[data-p]').forEach(t =>
+    t.onclick = () => location.hash = '#/c/' + slug + '/p/' + t.dataset.p);
+  document.getElementById('newP').onclick = () => showNewProcess(slug);
+}
+
+function showNewProcess(customer) {
+  const dlg = document.getElementById('dlg');
+  dlg.innerHTML = '';
+  const el = $(`<div class="dialog">
+    <label>Display name</label><input id="pn" placeholder="Order Fulfilment" />
+    <label>Live target URL (optional — a customer/deployment Nano)</label><input id="pt" placeholder="http://customer-host:8080" />
+    <label>Trace dataset folder (optional — used when no target URL)</label><input id="pd" placeholder="leave blank to use a traces/ folder beside the process" />
+    <label>Objective (optional)</label><input id="po" placeholder="cut p99 latency" />
+    <div class="row" style="margin-top:12px"><button class="primary" id="save">Create</button><button id="cancel">Cancel</button></div>
+    <div class="muted" style="margin-top:8px;font-size:12px">Bind to a live engine <em>or</em> a dataset. Leave both blank to create the folder now and drop a <code>traces/</code> dataset in later.</div>
+    <div class="err" id="e"></div></div>`);
+  dlg.appendChild(el);
+  el.querySelector('#cancel').onclick = () => dlg.innerHTML = '';
+  el.querySelector('#save').onclick = async () => {
+    try {
+      const p = await api('/api/workspace/customers/' + encodeURIComponent(customer) + '/processes', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          displayName: el.querySelector('#pn').value,
+          targetUrl: el.querySelector('#pt').value || null,
+          dataset: el.querySelector('#pd').value || null,
+          objective: el.querySelector('#po').value || null
+        })
+      });
+      location.hash = '#/c/' + customer + '/p/' + p.slug;
+    } catch (e) { el.querySelector('#e').textContent = e.message; }
+  };
+}
+
+// --- one process: config + insights -------------------------------------
+async function viewProcess(customer, process) {
+  app.innerHTML = 'Loading…';
+  let p;
+  try { p = await api(`/api/workspace/customers/${encodeURIComponent(customer)}/processes/${encodeURIComponent(process)}`); }
+  catch (e) { app.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+  app.innerHTML = `
+    <div class="crumbs"><a id="up0">Customers</a> / <a id="up1">${esc(customer)}</a> / ${esc(p.displayName || process)}</div>
+    <h1>${esc(p.displayName || process)} ${bindingPill(p.binding)}</h1>
+    <p class="lede">
+      Source: ${p.binding === 'live' ? `live <code>${esc(p.targetUrl)}</code>` : p.binding === 'dataset' ? `dataset <code>${esc(p.datasetPath)}</code>` : '<span class="muted">unbound — set a target URL or drop a traces/ dataset folder</span>'}
+      ${p.objective ? ' · objective: ' + esc(p.objective) : ''}
+    </p>
+    <div class="row"><button class="primary" id="load" ${p.binding === 'unbound' ? 'disabled' : ''}>Load Insights</button></div>
+    <div id="ins"></div>`;
+
+  document.getElementById('up0').onclick = () => location.hash = '#/';
+  document.getElementById('up1').onclick = () => location.hash = '#/c/' + customer;
+  const load = document.getElementById('load');
+  if (load && !load.disabled) load.onclick = () => loadInsights(customer, process);
+}
+
+async function loadInsights(customer, process) {
+  const ins = document.getElementById('ins');
+  ins.innerHTML = '<p class="muted">Reading traces…</p>';
+  let r;
+  try { r = await api(`/api/workspace/customers/${encodeURIComponent(customer)}/processes/${encodeURIComponent(process)}/insights`); }
+  catch (e) { ins.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+  const t = r.totals;
+  const cards = `<div class="cards">
+    <div class="card"><div class="n">${t.instances}</div><div class="l">instances</div></div>
+    <div class="card"><div class="n">${t.completed}</div><div class="l">completed</div></div>
+    <div class="card"><div class="n">${t.active}</div><div class="l">active</div></div>
+    <div class="card"><div class="n">${t.terminated}</div><div class="l">terminated</div></div>
+    <div class="card"><div class="n">${t.incidents}</div><div class="l">incidents</div></div>
+  </div>`;
+
+  const procRows = (r.processes || []).map(pr => `
+    <tr><td><code>${esc(pr.processId)}</code></td>
+        <td class="num">${pr.instances}</td>
+        <td class="num">${pr.avgDurationMs ?? '—'}</td>
+        <td class="num">${pr.p95DurationMs ?? '—'}</td>
+        <td>${pr.bottleneck ? esc(pr.bottleneck.elementId) : '<span class="muted">—</span>'}</td></tr>`).join('');
+
+  ins.innerHTML = `
+    <h2>Source: <code>${esc(r.nanoBaseUrl)}</code> · sampled ${r.sampledInstances} instances</h2>
+    ${cards}
+    <h2>Processes</h2>
+    <table><thead><tr><th>process</th><th>instances</th><th>avg ms</th><th>p95 ms</th><th>bottleneck</th></tr></thead>
+    <tbody>${procRows || '<tr><td colspan="5" class="muted">no detail sampled</td></tr>'}</tbody></table>`;
+}
+
+// --- router --------------------------------------------------------------
+function route() {
+  const h = location.hash.replace(/^#/, '');
+  const m = h.match(/^\/c\/([^/]+)\/p\/([^/]+)/);
+  if (m) return viewProcess(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+  const c = h.match(/^\/c\/([^/]+)/);
+  if (c) return viewCustomer(decodeURIComponent(c[1]));
+  return viewCustomers();
+}
+window.addEventListener('hashchange', route);
+route();
+</script>
+</body>
+</html>

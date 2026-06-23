@@ -98,6 +98,33 @@ precedence **inline `prompt` > `promptId` > built-in default**.
 | `PROCESSOS_LLM_MAX_TOKENS` | `2048` | Completion budget |
 | `PROCESSOS_LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 
+## Workspaces — customers & processes (multi-tenant + datasets)
+
+A consultant manages many engagements, so ProcessOS roots a **workspace tree** of
+`customers / processes` on disk (`src/workspace.rs`). Each process **binds** to a
+trace source — either a **live** Nano instance (`targetUrl`) or a **loaded dataset**
+(a folder of instance-trace JSON, or a sibling `traces/` folder) — and the Insights
+report is folded over whichever source is bound (`src/dataset.rs`,
+`report::build_over`). Folders are scanned from disk, so a consultant can curate a
+customer folder structure by hand and it shows up; the CRUD API also creates them.
+
+```
+<PROCESSOS_WORKSPACES_DIR>/
+  <customer-slug>/
+    customer.json
+    <process-slug>/
+      process.json          # { displayName, targetUrl? | dataset?, objective?, notes? }
+      traces/               # optional dataset folder (else `dataset` points elsewhere)
+```
+
+A process is `live` when `targetUrl` is set, `dataset` when a `dataset` path or a
+`traces/` folder resolves, else `unbound`. Slugs are single, lowercased
+`[a-z0-9-_]` path segments (no traversal). Browse it at `/workspace`.
+
+A dataset folder holds per-instance `*.json` files (each a
+`GET /console/api/traces/{key}` shape) at top level or under `instances/`/`traces/`,
+and/or a single `traces.json` array, plus an optional `metrics.json`.
+
 ## The cockpit & pilot loop (§10)
 
 The optimization loop is itself authored as **editable BPMN** (the *pilot process*,
@@ -129,6 +156,7 @@ PROCESSOS_SPAWN_NANO=1 cargo run
 | `NANO_TARGET_URL` | _(= `NANO_BASE_URL`)_ | The **read-only production** engine to analyse |
 | `PROCESSOS_NANO_URL` | _(= `NANO_BASE_URL`)_ | The **own** engine the pilot loop runs on |
 | `PROCESSOS_DATA_DIR` | `./.processos-data` | Persisted forks, conversations, prefs |
+| `PROCESSOS_WORKSPACES_DIR` | _(`<data_dir>/workspaces`)_ | Root of the customers/processes workspace tree |
 | `PROCESSOS_PROMPTS_DIR` | _(none)_ | Directory of prompt files imported into the library on boot |
 | `PROCESSOS_SPAWN_NANO` | `false` | Spawn + supervise an own Nano engine as a child process |
 | `PROCESSOS_NANO_BIN` | _(built gateway)_ | Path to the own-engine gateway binary |
@@ -158,6 +186,7 @@ for it automatically.
 | `GET` | `/console` | Insights dashboard (fetches `/api/insights`) |
 | `GET` | `/cockpit` | The cockpit — Console → Process → Experiment, with the droid conversation |
 | `GET` | `/harness` | Optimization-harness dashboard (runs the example scenario) |
+| `GET` | `/workspace` | Workspace browser — customers → processes → per-process Insights |
 | `GET` | `/health` | Liveness (`ok`) |
 | `GET` | `/api/insights?limit=&sample=` | Folded performance report from the **target** traces/metrics |
 | `GET` | `/api/cockpit/overview` | Cockpit state: process(es), pilot, recent experiments |
@@ -180,6 +209,11 @@ for it automatically.
 | `GET`/`DELETE` | `/api/prompts/{id}` | Get / delete a prompt (refuses built-ins) |
 | `GET`/`PUT` | `/api/pilot` | Read / fork the pilot process BPMN |
 | `POST` | `/api/pilot/reset` | Restore the built-in default pilot |
+| `GET`/`POST` | `/api/workspace/customers` | List / create customers |
+| `GET` | `/api/workspace/customers/{c}` | A customer + its processes |
+| `POST` | `/api/workspace/customers/{c}/processes` | Create a process (bind `targetUrl` or `dataset`) |
+| `GET`/`PUT` | `/api/workspace/customers/{c}/processes/{p}` | Read / update a process config |
+| `GET` | `/api/workspace/customers/{c}/processes/{p}/insights` | Insights folded over the process's bound source |
 
 ## Layout
 
@@ -190,6 +224,8 @@ src/
   report.rs       pure aggregation: traces -> Insights (with unit tests)
   supervisor.rs   spawn + supervise the own Nano engine (learn port, deploy pilot, reap)
   pilot.rs        the forkable pilot process — plastic surface (a) of §10
+  workspace.rs    customers/processes tree + persistence + CRUD + source binding
+  dataset.rs      DatasetSource (loaded trace folder) + TraceSource enum (live | dataset)
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
   conversation.rs persisted cockpit conversations + data-dir resolution
   harness/

@@ -12,10 +12,12 @@
 mod contracts;
 mod cockpit;
 mod conversation;
+mod dataset;
 mod harness;
 mod pilot;
 mod report;
 mod supervisor;
+mod workspace;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -60,6 +62,9 @@ struct AppState {
     /// that drives the optimization loop. File-backed; the supervisor deploys it on
     /// boot, and `PUT /api/pilot` re-forks it and hot-redeploys to the own engine.
     pilot: Arc<pilot::PilotStore>,
+    /// The consultant's workspace tree — customers > processes, each bound to a live
+    /// customer Nano or a loaded trace dataset. Discovered by scanning the root.
+    workspace: workspace::Workspace,
 }
 
 /// Server configuration, all overridable by environment.
@@ -173,6 +178,7 @@ async fn main() {
         prompts: Arc::new(RwLock::new(library)),
         conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
         pilot,
+        workspace: workspace::Workspace::open(workspace::root_from_env(&cfg.data_dir)),
     };
 
     let app = Router::new()
@@ -206,6 +212,24 @@ async fn main() {
         .route("/api/prompts/{id}", get(prompts_get).delete(prompts_delete))
         .route("/api/pilot", get(pilot_get).put(pilot_put))
         .route("/api/pilot/reset", post(pilot_reset))
+        .route("/workspace", get(workspace_page))
+        .route(
+            "/api/workspace/customers",
+            get(ws_customers).post(ws_create_customer),
+        )
+        .route("/api/workspace/customers/{customer}", get(ws_customer))
+        .route(
+            "/api/workspace/customers/{customer}/processes",
+            post(ws_create_process),
+        )
+        .route(
+            "/api/workspace/customers/{customer}/processes/{process}",
+            get(ws_process).put(ws_update_process),
+        )
+        .route(
+            "/api/workspace/customers/{customer}/processes/{process}/insights",
+            get(ws_process_insights),
+        )
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -512,6 +536,156 @@ fn bad_gateway(e: String) -> axum::response::Response {
         Json(serde_json::json!({ "error": e })),
     )
         .into_response()
+}
+
+fn unprocessable(e: String) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "error": e })),
+    )
+        .into_response()
+}
+
+// --- Workspaces — customers > processes (the consultant's folder tree) -----------
+
+/// The single-file workspace browser. Served at `/workspace`.
+const WORKSPACE_HTML: &str = include_str!("workspace.html");
+
+/// `GET /workspace` — browse customers, drill into a process, view its Insights.
+async fn workspace_page() -> Html<&'static str> {
+    Html(WORKSPACE_HTML)
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateCustomerBody {
+    #[serde(default, alias = "displayName", alias = "name")]
+    display_name: String,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateProcessBody {
+    #[serde(default, alias = "displayName", alias = "name")]
+    display_name: String,
+    #[serde(default, alias = "targetUrl")]
+    target_url: Option<String>,
+    #[serde(default)]
+    dataset: Option<String>,
+    #[serde(default)]
+    objective: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// `GET /api/workspace/customers` — every customer (scanned from disk).
+async fn ws_customers(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "root": state.workspace.root().to_string_lossy(),
+        "customers": state.workspace.list_customers(),
+    }))
+}
+
+/// `POST /api/workspace/customers` — create a customer from a display name.
+async fn ws_create_customer(
+    State(state): State<AppState>,
+    Json(body): Json<CreateCustomerBody>,
+) -> impl IntoResponse {
+    match state
+        .workspace
+        .create_customer(&body.display_name, body.notes)
+    {
+        Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `GET /api/workspace/customers/{customer}` — a customer + its processes.
+async fn ws_customer(
+    State(state): State<AppState>,
+    Path(customer): Path<String>,
+) -> impl IntoResponse {
+    match state.workspace.get_customer(&customer) {
+        Some(c) => Json(serde_json::json!({
+            "customer": c,
+            "processes": state.workspace.list_processes(&customer),
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no such customer: {customer}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/workspace/customers/{customer}/processes` — create a process.
+async fn ws_create_process(
+    State(state): State<AppState>,
+    Path(customer): Path<String>,
+    Json(body): Json<CreateProcessBody>,
+) -> impl IntoResponse {
+    let config = workspace::ProcessConfig {
+        display_name: body.display_name.clone(),
+        target_url: body.target_url.filter(|s| !s.trim().is_empty()),
+        dataset: body.dataset.filter(|s| !s.trim().is_empty()),
+        objective: body.objective.filter(|s| !s.trim().is_empty()),
+        notes: body.notes.filter(|s| !s.trim().is_empty()),
+    };
+    match state
+        .workspace
+        .create_process(&customer, &body.display_name, config)
+    {
+        Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `GET /api/workspace/customers/{customer}/processes/{process}` — one process.
+async fn ws_process(
+    State(state): State<AppState>,
+    Path((customer, process)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.workspace.get_process(&customer, &process) {
+        Some(p) => Json(p).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no such process: {customer}/{process}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/workspace/customers/{customer}/processes/{process}` — update config.
+async fn ws_update_process(
+    State(state): State<AppState>,
+    Path((customer, process)): Path<(String, String)>,
+    Json(config): Json<workspace::ProcessConfig>,
+) -> impl IntoResponse {
+    match state.workspace.update_process(&customer, &process, config) {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `GET /api/workspace/customers/{customer}/processes/{process}/insights` — the
+/// folded Insights report for this process, read from whatever source it is bound
+/// to (live customer Nano or a loaded trace dataset).
+async fn ws_process_insights(
+    State(state): State<AppState>,
+    Path((customer, process)): Path<(String, String)>,
+    Query(q): Query<InsightsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let sample = q.sample.unwrap_or(50).clamp(1, 500);
+    let src = match state.workspace.resolve_source(&customer, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    match report::build_over(&src, limit, sample).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => bad_gateway(e),
+    }
 }
 
 

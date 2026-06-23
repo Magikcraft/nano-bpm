@@ -101,6 +101,38 @@ This is the physical substrate for "the first target is always itself" (§10): t
 self-optimizing loop runs on an engine ProcessOS owns, while the client's engine stays
 a pure read-only target.
 
+### 1.5 Workspaces — many engagements over many sources
+
+A single ProcessOS analyses **many** processes across **many** customers, against a mix
+of **live** targets and **loaded historical datasets** (a consultant reasoning over a
+captured trace export offline). So the single-tenant `target` of §1.4 generalises into a
+filesystem-rooted **workspace tree** (`PROCESSOS_WORKSPACES_DIR`, default
+`<data_dir>/workspaces`):
+
+```
+<root>/<customer-slug>/customer.json
+<root>/<customer-slug>/<process-slug>/process.json   # binds a source
+<root>/<customer-slug>/<process-slug>/traces/        # optional loaded dataset
+```
+
+Each process binds to a **`TraceSource`** — a small enum the read path is generalised
+over (`report::build_over(&TraceSource, …)`), so Insights folds identically whether the
+source is:
+
+- **live** — a `NanoClient` against `targetUrl` (the §1.1 read contract), or
+- **dataset** — a `DatasetSource` that loads a folder of instance-trace JSON (the exact
+  `GET /console/api/traces/{key}` shape, eagerly into memory so request-time reads do no
+  blocking IO) and derives the trace summaries the report needs.
+
+The tree is **disk-curatable** (list operations scan the directory, so hand-made
+customer folders appear without going through the API) and **traversal-safe** (slugs are
+single lowercased `[a-z0-9-_]` path segments). This keeps the §1.4 target/own split
+intact — a live binding is just a target URL per process — while adding the offline
+dataset source the consultant workflow needs. The mutation surface (create customer /
+process, bind a source) and reads (`…/insights`) are a thin CRUD layer; `cockpit` /
+`prompts` / `pilot` remain global for now, and re-scoping them per selected process is
+the natural follow-up.
+
 ## 2. Internal architecture (inside the ProcessOS crate)
 
 A pipeline of independently-testable stages, mirroring the optimization design's

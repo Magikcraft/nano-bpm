@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::contracts::{InstanceTrace, Metrics, NanoClient, TraceSummary};
+use crate::dataset::TraceSource;
 
 /// The full Insights document served at `GET /api/insights`.
 #[derive(Debug, Serialize)]
@@ -79,8 +80,18 @@ pub struct IncidentCluster {
 /// bounds how many trace *details* we pull for per-element aggregation (the list
 /// gives totals cheaply; details cost one request each).
 pub async fn build(nano: &NanoClient, limit: usize, sample: usize) -> Result<Insights, String> {
-    let summaries = nano.list_traces(limit).await?;
-    let live = nano.metrics().await.ok();
+    build_over(&TraceSource::Live(nano.clone()), limit, sample).await
+}
+
+/// Build Insights over **any** trace source — a live gateway or a loaded dataset.
+/// This is the source-agnostic core; [`build`] is the live-gateway convenience.
+pub async fn build_over(
+    src: &TraceSource,
+    limit: usize,
+    sample: usize,
+) -> Result<Insights, String> {
+    let summaries = src.list_traces(limit).await?;
+    let live = src.metrics().await;
 
     let totals = totals_of(&summaries);
 
@@ -88,7 +99,7 @@ pub async fn build(nano: &NanoClient, limit: usize, sample: usize) -> Result<Ins
     let take = sample.min(summaries.len());
     let mut details: Vec<InstanceTrace> = Vec::with_capacity(take);
     for s in summaries.iter().take(take) {
-        if let Ok(t) = nano.trace(&s.instance_key).await {
+        if let Ok(t) = src.trace(&s.instance_key).await {
             details.push(t);
         }
     }
@@ -98,7 +109,7 @@ pub async fn build(nano: &NanoClient, limit: usize, sample: usize) -> Result<Ins
 
     Ok(Insights {
         generated_at_ms: now_ms(),
-        nano_base_url: nano.base_url().to_string(),
+        nano_base_url: src.label(),
         sampled_instances: details.len(),
         totals,
         live,
