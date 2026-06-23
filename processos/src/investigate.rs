@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::agent::{run_agent, AgentRun, OpenAiAgent, ToolBox, ToolSpec};
+use crate::agent::{
+    run_agent, run_agent_resumable, AgentRun, Msg, OpenAiAgent, ToolBox, ToolSpec,
+};
 use crate::analysis::Analysis;
 use crate::dataset::TraceSource;
 use crate::harness::llm::LlmConfig;
@@ -202,6 +204,88 @@ pub async fn run_investigation(
     Ok(InvestigationReport { dataset, run })
 }
 
+/// The system prompt for the **interactive** cockpit chat. Same analytical discipline
+/// and tool usage as the one-shot investigator, but the droid answers the operator's
+/// questions conversationally (prose citing the numbers it measured) across a
+/// multi-turn dialogue, rather than emitting a single fixed JSON verdict.
+pub const CHAT_SYSTEM: &str = "\
+You are a performance/process analyst paired with an operator, investigating a captured \
+BPMN trace dataset. Your job is to answer the operator's questions by actually querying \
+the data — never guess or invent numbers. Your primary tool is query_traces, which runs \
+read-only DuckDB SQL over the dataset. If a run_python tool is offered, use it only AFTER \
+SQL has localised a candidate, for analysis SQL cannot express (distribution fitting, \
+changepoint/seasonal decomposition).\n\
+\n\
+Discipline: before you query, state the hypothesis you are testing. Prefer queries that \
+report an EFFECT SIZE and a SAMPLE SIZE (count), not just existence. When you assert a \
+pattern (e.g. a queue tail localised to a time window), replicate it on a held-out slice \
+first. For queue tails, compare quantile_cont(queue_ms, 0.99) across hour / day-of-week \
+buckets per job_type.\n\
+\n\
+Style: reply in clear prose, citing the concrete figures you measured. Stay focused on \
+what the operator asked; when useful, suggest a sharp next question. Do NOT force your \
+answer into JSON — write for a human reading a chat.";
+
+/// The outcome of one interactive chat turn: the droid's reply, the tool calls it ran
+/// this turn (the lab notebook), and the **full updated transcript** the caller must
+/// persist so the next turn resumes with memory.
+pub struct ChatTurnResult {
+    pub answer: String,
+    pub rounds: usize,
+    pub messages: Vec<Msg>,
+    pub dataset: DatasetShape,
+}
+
+/// Run one interactive chat turn over a trace source, resuming from `messages` (the
+/// persisted transcript, empty on the first turn). The dataset's analytic view is built
+/// fresh for the turn; the operator's `user_message` is appended and the tool-calling
+/// loop runs until the droid replies. The returned `messages` is the transcript to
+/// persist (it now ends with the droid's answer).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_chat_turn(
+    src: &TraceSource,
+    cfg: LlmConfig,
+    py: PyConfig,
+    limit: usize,
+    max_rounds: usize,
+    allow_python: bool,
+    mut messages: Vec<Msg>,
+    user_message: &str,
+) -> Result<ChatTurnResult, String> {
+    let analysis = Analysis::from_source(src, limit).await?;
+    let dataset = DatasetShape {
+        instances: analysis.instance_count(),
+        jobs: analysis.job_count(),
+        incidents: analysis.incident_count(),
+    };
+    let tools = if allow_python {
+        AnalysisTools::with_python(analysis, py)
+    } else {
+        AnalysisTools::new(analysis)
+    };
+    let model = OpenAiAgent { cfg };
+
+    // Seed the system message (with one-time dataset framing) only at the start of a
+    // conversation; subsequent turns already carry it in the persisted transcript.
+    if messages.is_empty() {
+        let sys = format!(
+            "{CHAT_SYSTEM}\n\nDataset bound for this conversation: {} instances, {} job \
+             executions, {} incidents.",
+            dataset.instances, dataset.jobs, dataset.incidents
+        );
+        messages.push(Msg::System(sys));
+    }
+    messages.push(Msg::User(user_message.to_string()));
+
+    let run = run_agent_resumable(&model, &tools, &mut messages, max_rounds).await?;
+    Ok(ChatTurnResult {
+        answer: run.answer,
+        rounds: run.rounds,
+        messages,
+        dataset,
+    })
+}
+
 /// Coarse shape of the dataset that was investigated.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -210,7 +294,6 @@ pub struct DatasetShape {
     pub jobs: usize,
     pub incidents: usize,
 }
-
 /// The full investigation result: the dataset shape + the agent's lab notebook.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -11,6 +11,8 @@
 
 mod agent;
 mod analysis;
+mod chat;
+mod chat_prompts;
 mod contracts;
 mod cockpit;
 mod conversation;
@@ -74,6 +76,13 @@ struct AppState {
     /// Operator-editable settings (LLM connection + Python interpreter), persisted to the
     /// user's config dir and layered over the environment at request time.
     settings: settings::SettingsStore,
+    /// Persisted interactive cockpit chat sessions — the full droid transcript per
+    /// `(workspace, process)`, so a conversation resumes with memory across turns and
+    /// restarts.
+    chat: Arc<chat::ChatStore>,
+    /// The operator's chat prompt library (reusable compose-box message templates),
+    /// persisted to the user's config dir alongside `settings.json`.
+    chat_prompts: Arc<chat_prompts::ChatPromptStore>,
 }
 
 /// Server configuration, all overridable by environment.
@@ -211,6 +220,10 @@ async fn main() {
         pilot,
         workspaces: workspace::WorkspaceCatalog::open(workspace::root_from_env(&cfg.data_dir)),
         settings: settings::SettingsStore::open(),
+        chat: Arc::new(chat::ChatStore::open(cfg.data_dir.join("chat"))),
+        chat_prompts: Arc::new(chat_prompts::ChatPromptStore::open(
+            settings::config_dir().join("chat-prompts.json"),
+        )),
     };
 
     let app = Router::new()
@@ -271,6 +284,19 @@ async fn main() {
             "/api/workspaces/{workspace}/processes/{process}/investigate",
             post(ws_process_investigate),
         )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat",
+            get(cockpit_chat_load).post(cockpit_chat_send),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/reset",
+            post(cockpit_chat_reset),
+        )
+        .route(
+            "/api/chat-prompts",
+            get(chat_prompts_list).post(chat_prompts_upsert),
+        )
+        .route("/api/chat-prompts/{id}", axum::routing::delete(chat_prompts_delete))
         .route("/assets/bpmn/{file}", get(bpmn_asset))
         .route("/assets/settings.js", get(settings_js))
         .route("/api/settings", get(get_settings).put(put_settings))
@@ -1086,6 +1112,133 @@ async fn ws_process_investigate(
         Ok(Ok(report)) => Json(report).into_response(),
         Ok(Err(e)) => bad_gateway(e),
         Err(e) => bad_gateway(format!("investigation task failed: {e}")),
+    }
+}
+
+
+// --- Interactive cockpit chat ----------------------------------------------------
+
+/// `GET /api/workspaces/{workspace}/processes/{process}/chat` — load the persisted
+/// chat transcript for this dataset as operator-facing turns.
+async fn cockpit_chat_load(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let messages = state.chat.load(&key);
+    Json(serde_json::json!({ "turns": chat::render_view(&messages) })).into_response()
+}
+
+/// Request body for an interactive chat turn.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatSendRequest {
+    /// The operator's message to the droid.
+    message: String,
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    max_rounds: Option<usize>,
+    /// Offer the trusted Python escape hatch in addition to the SQL tool (off by default).
+    #[serde(default)]
+    allow_python: bool,
+}
+
+/// `POST .../chat` — send one operator message; the droid replies (running SQL/Python
+/// tool calls as needed), resuming from the persisted transcript. The updated transcript
+/// is saved so the next turn keeps full context.
+async fn cockpit_chat_send(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    Json(req): Json<ChatSendRequest>,
+) -> impl IntoResponse {
+    if req.message.trim().is_empty() {
+        return unprocessable("message must not be empty".to_string());
+    }
+    let cfg = resolve_llm(&state, req.llm.as_ref());
+    if !cfg.is_ready() {
+        return unprocessable(
+            "no LLM model configured; set it in the console settings (cog, lower-left) or \
+             via PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER \
+             as needed), or pass an `llm` object with at least `model` in the request body"
+                .to_string(),
+        );
+    }
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let limit = req.limit.unwrap_or(100_000).clamp(1, 1_000_000);
+    let max_rounds = req.max_rounds.unwrap_or(12).clamp(1, 40);
+    let allow_python = req.allow_python;
+    let py = state.settings.snapshot().py_config();
+    let key = chat::session_key(&workspace, &process);
+    // Load the prior transcript BEFORE the spawn_blocking (Vec<Msg> is Send); the DuckDB
+    // connection inside the analysis is !Send, so the loop runs on a current-thread runtime.
+    let prior = state.chat.load(&key);
+    let message = req.message;
+    let task = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        rt.block_on(investigate::run_chat_turn(
+            &src, cfg, py, limit, max_rounds, allow_python, prior, &message,
+        ))
+    })
+    .await;
+    match task {
+        Ok(Ok(result)) => {
+            state.chat.save(&key, result.messages.clone());
+            Json(serde_json::json!({
+                "answer": result.answer,
+                "rounds": result.rounds,
+                "dataset": result.dataset,
+                "turns": chat::render_view(&result.messages),
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => bad_gateway(e),
+        Err(e) => bad_gateway(format!("chat task failed: {e}")),
+    }
+}
+
+/// `POST .../chat/reset` — forget this dataset's conversation.
+async fn cockpit_chat_reset(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    state.chat.clear(&key);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `GET /api/chat-prompts` — list reusable compose-box message templates.
+async fn chat_prompts_list(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.chat_prompts.list()).into_response()
+}
+
+/// `POST /api/chat-prompts` — author or update a chat prompt (persisted to the config dir).
+async fn chat_prompts_upsert(
+    State(state): State<AppState>,
+    Json(prompt): Json<chat_prompts::ChatPrompt>,
+) -> impl IntoResponse {
+    match state.chat_prompts.upsert(prompt) {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `DELETE /api/chat-prompts/{id}` — delete a non-built-in chat prompt.
+async fn chat_prompts_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.chat_prompts.delete(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => unprocessable(e),
     }
 }
 

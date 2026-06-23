@@ -11,7 +11,7 @@
 //! wire shape (what a local `llama.cpp`/vLLM/Ollama server and OpenAI itself all
 //! accept); Anthropic tool-use can slot in as a second `AgentStep` impl later.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::harness::llm::LlmConfig;
@@ -26,7 +26,7 @@ pub struct ToolSpec {
 }
 
 /// One tool invocation the model requested.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -42,7 +42,11 @@ pub enum Turn {
 }
 
 /// A neutral conversation message the transport serialises per provider.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` let a multi-turn chat persist the *full* transcript
+/// (including tool calls and their results) so the model keeps its working memory
+/// across operator messages and server restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Msg {
     System(String),
     User(String),
@@ -94,18 +98,38 @@ pub async fn run_agent<M: AgentStep, T: ToolBox + ?Sized>(
     user: &str,
     max_rounds: usize,
 ) -> Result<AgentRun, String> {
-    let specs = tools.specs();
     let mut msgs = vec![Msg::System(system.to_string()), Msg::User(user.to_string())];
+    run_agent_resumable(model, tools, &mut msgs, max_rounds).await
+}
+
+/// Drive the loop over an **existing transcript**, appending the assistant/tool turns
+/// (and finally the assistant's answer) to `msgs` in place. This is the multi-turn
+/// substrate: the caller seeds `msgs` with the persisted history plus the new user
+/// message, runs a turn, and persists the mutated `msgs` so the next turn resumes
+/// with full context. `run_agent` is the single-shot special case.
+pub async fn run_agent_resumable<M: AgentStep, T: ToolBox + ?Sized>(
+    model: &M,
+    tools: &T,
+    msgs: &mut Vec<Msg>,
+    max_rounds: usize,
+) -> Result<AgentRun, String> {
+    let specs = tools.specs();
     let mut steps: Vec<AgentStepRecord> = Vec::new();
 
     for round in 1..=max_rounds {
-        match model.step(&msgs, &specs).await? {
+        match model.step(msgs, &specs).await? {
             Turn::Final(answer) => {
+                // Record the answer in the transcript so a resumed conversation
+                // remembers what the droid concluded last turn.
+                msgs.push(Msg::Assistant {
+                    text: Some(answer.clone()),
+                    tool_calls: Vec::new(),
+                });
                 return Ok(AgentRun {
                     answer,
                     steps,
                     rounds: round,
-                })
+                });
             }
             Turn::ToolCalls(calls) if calls.is_empty() => {
                 // Defensive: a tool-call turn with nothing to call — treat as done.

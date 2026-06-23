@@ -228,6 +228,36 @@ current-thread runtime via `spawn_blocking`. The labelled corpus is the **eval s
 planted `credit-check` / `weekday-morning` fault through the full model→tool→DuckDB→model
 path (and via `run_python` over the exported CSV with stdlib-only Python).
 
+### Interactive cockpit chat (`src/chat.rs`, `chat_prompts.rs`)
+
+The one-shot `investigate` call is also available as a **multi-turn, scrollable chat** at
+`/cockpit?workspace=&process=`. The operator converses with the droid over the bound
+dataset; each turn resumes from the persisted transcript, so the model remembers its own
+earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happen?"*).
+
+- `chat.rs` — a file-backed `ChatStore` under `PROCESSOS_DATA_DIR` (one JSON transcript per
+  `(workspace, process)` session) plus `render_view`, which projects the raw model
+  transcript into operator-facing `user`/`droid` turns (each droid turn carries the SQL/
+  Python tool steps it ran as a collapsible **lab notebook**).
+- `agent::run_agent_resumable` drives the loop over a `&mut Vec<Msg>`, appending the
+  assistant/tool turns **and** the final answer so the next turn keeps full context.
+- `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
+  persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
+  Ships three built-ins (bottleneck / temporal / failures); operators author new ones from
+  the compose box ("Save prompt") and load any of them into the box from a dropdown.
+
+```bash
+# Send one turn (resumes the persisted transcript); GET to reload it, /reset to forget.
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat \
+  -d '{"message":"Which job type has the worst queue tail?","allowPython":false}'
+# -> { answer, rounds, dataset:{instances,jobs,incidents}, turns:[{role,text,steps}] }
+curl       .../api/workspaces/{workspace}/processes/{process}/chat        # load transcript
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/reset # forget it
+curl       .../api/chat-prompts                                           # list templates
+curl -XPOST .../api/chat-prompts -d '{"id":"my-probe","name":"My probe","text":"…"}'
+```
+
+
 ## The cockpit & pilot loop (§10)
 
 The optimization loop is itself authored as **editable BPMN** (the *pilot process*,
@@ -341,7 +371,11 @@ for it automatically.
 | `GET`/`PUT` | `/api/workspaces/{workspace}/processes/{process}` | Read / update a process config |
 | `GET`/`PUT` | `/api/workspaces/{workspace}/processes/{process}/model` | Read / set the process's BPMN model |
 | `GET` | `/api/workspaces/{workspace}/processes/{process}/insights` | Insights folded over the process's bound source |
-| `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | One-shot LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
+| `GET`/`POST` | `/api/workspaces/{workspace}/processes/{process}/chat` | Multi-turn cockpit chat: `GET` loads the persisted transcript; `POST {message,allowPython}` sends one turn and resumes from it |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/reset` | Forget this dataset's conversation |
+| `GET`/`POST` | `/api/chat-prompts` | List / author reusable compose-box prompt templates (persisted to the config dir) |
+| `DELETE` | `/api/chat-prompts/{id}` | Delete a non-built-in chat prompt |
 | `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |
 | `GET`/`PUT` | `/api/settings` | Read settings / update the **globals** (`activeProfile`, `pythonBin`). `GET` lists LLM profiles (each redacting its key as `apiKeySet`) + the active profile + the Python interpreter |
 | `POST` | `/api/settings/profiles` | Create a new LLM profile (optional `name`); returns the new `id` + the updated settings |
@@ -366,6 +400,8 @@ src/
   pyrunner.rs     optional run_python escape hatch: CSV export + timeout subprocess runner
   settings.rs     operator-editable LLM + Python settings, persisted to ~/.config/processos
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
+  chat.rs         interactive cockpit chat: file-backed transcript store + view projection
+  chat_prompts.rs reusable compose-box prompt library, persisted to the config dir
   conversation.rs persisted cockpit conversations + data-dir resolution
   harness/
     mod.rs         scenario / worker / variant types + seeded PRNG

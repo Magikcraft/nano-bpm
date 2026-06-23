@@ -114,6 +114,28 @@
   .step pre { margin: 0; padding: 0 12px 12px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 320px; overflow: auto; }
   .step .args { color: #71717a; padding: 0 12px 6px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
   .conclusion { border: 1px solid #3730a3; background: #14142b; border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
+  /* interactive cockpit chat */
+  .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; max-height: 64vh; }
+  .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; }
+  .chatlog .empty { color: #71717a; font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
+  .bub { padding: 10px 13px; border-radius: 12px; font-size: 13px; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
+  .bub .who { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+  .bub.user { align-self: flex-end; background: #1b2540; border: 1px solid #2c3c66; }
+  .bub.user .who { color: #93c5fd; }
+  .bub.droid { align-self: flex-start; background: #11142a; border: 1px solid #28306a; }
+  .bub.droid .who { color: #a5b4fc; }
+  .bub.pending { align-self: flex-start; background: #131316; border: 1px solid #26262b; color: #a1a1aa; }
+  .bub .steps { margin-top: 8px; }
+  .bub .steps details { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
+  .bub .steps summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
+  .bub .steps .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .bub .steps pre { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 280px; overflow: auto; }
+  .compose { border-top: 1px solid #26262b; padding: 12px 14px; }
+  .compose-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .compose select { background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 6px 10px; font: inherit; }
+  .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 9px 11px; font: 13px/1.5 inherit; resize: vertical; min-height: 64px; }
+  .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+  .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
 </style>
 </head>
 <body>
@@ -449,16 +471,128 @@ async function renderWorkspace(ws, proc){
       ${p.objective ? '<b>objective</b><span>'+esc(p.objective)+'</span>' : ''}
     </div>
     ${p.hasModel ? '<div id="wsModel" class="ws-model"></div>' : ''}
-    <div style="display:flex;align-items:center;gap:14px;margin:12px 0">
-      <button class="btn primary" id="invGo">Investigate with the droid →</button>
-      <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="invPy" /> allow Python escape hatch
-      </label>
-    </div>
-    <p class="muted" style="font-size:12px;max-width:680px">The droid queries the bound trace dataset directly (read-only SQL over a DuckDB view, plus an optional trusted Python tier) to form and test its own hypotheses. Its conclusion and full query/result lab notebook appear below.</p>
-    <div id="invOut"></div>`;
+    <p class="muted" style="font-size:12px;max-width:720px;margin:12px 0 0">Chat with the droid about this dataset. It queries the bound traces directly (read-only SQL over a DuckDB view, plus an optional trusted Python tier) to form and test its own hypotheses. The conversation is multi-turn — it remembers earlier answers in this session.</p>
+    <div class="chat">
+      <div id="chatLog" class="chatlog"><div class="empty">Loading conversation…</div></div>
+      <div class="compose">
+        <div class="compose-row">
+          <select id="chatPrompt"><option value="">Load a prompt…</option></select>
+          <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
+          <button class="btn ghost" id="chatReset" title="Forget this conversation" style="margin-left:auto">Reset</button>
+        </div>
+        <textarea id="chatBox" placeholder="Ask the droid… (e.g. where is the bottleneck, and when does it happen?)"></textarea>
+        <div class="compose-actions">
+          <button class="btn primary" id="chatSend">Send →</button>
+          <label class="muted"><input type="checkbox" id="chatPy" /> allow Python escape hatch</label>
+          <span class="muted" id="chatHint" style="margin-left:auto"></span>
+        </div>
+      </div>
+    </div>`;
   if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
-  $('#invGo').onclick = () => runInvestigation(ws, proc);
+  STATE.ws = ws; STATE.wsProc = proc; STATE.prompts = [];
+  loadChatPrompts();
+  loadChat(ws, proc);
+  $('#chatSend').onclick = () => sendChat(ws, proc);
+  $('#chatBox').addEventListener('keydown', e => {
+    if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); sendChat(ws, proc); }
+  });
+  $('#chatPrompt').onchange = e => {
+    const pr = (STATE.prompts||[]).find(x => x.id===e.target.value);
+    if(pr){ $('#chatBox').value = pr.text; $('#chatBox').focus(); }
+    e.target.value = '';
+  };
+  $('#chatSave').onclick = saveChatPrompt;
+  $('#chatReset').onclick = () => resetChat(ws, proc);
+}
+
+function chatBub(t){
+  if(t.role==='user') return '<div class="bub user"><div class="who">You</div>'+esc(t.text)+'</div>';
+  const steps = (t.steps||[]).map((s,i) => `
+    <details>
+      <summary>${esc(s.tool)} · ${i+1}</summary>
+      <div class="args">${esc(JSON.stringify(s.arguments))}</div>
+      <pre>${esc(s.result)}</pre>
+    </details>`).join('');
+  return '<div class="bub droid"><div class="who">Droid</div>'+esc(t.text||'(no answer)')+
+    (steps ? '<div class="steps">'+steps+'</div>' : '')+'</div>';
+}
+
+function drawChat(turns){
+  const log = $('#chatLog');
+  if(!log) return;
+  if(!turns || !turns.length){ log.innerHTML = '<div class="empty">No messages yet. Ask the droid a question to begin investigating this dataset.</div>'; return; }
+  log.innerHTML = turns.map(chatBub).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+async function loadChat(ws, proc){
+  try {
+    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat');
+    drawChat(r.turns);
+  } catch(e){ const log=$('#chatLog'); if(log) log.innerHTML='<div class="empty">'+esc(e.message||e)+'</div>'; }
+}
+
+async function loadChatPrompts(){
+  const sel = $('#chatPrompt');
+  try {
+    STATE.prompts = await api('/api/chat-prompts');
+    if(sel) sel.innerHTML = '<option value="">Load a prompt…</option>' +
+      (STATE.prompts||[]).map(p => '<option value="'+esc(p.id)+'">'+esc(p.name||p.id)+(p.builtin?'':' ✎')+'</option>').join('');
+  } catch(e){ /* prompts are optional */ }
+}
+
+async function sendChat(ws, proc){
+  const box = $('#chatBox'); const msg = box.value.trim();
+  if(!msg) return;
+  const send = $('#chatSend'); const log = $('#chatLog'); const hint = $('#chatHint');
+  const allowPython = $('#chatPy').checked;
+  send.disabled = true; box.disabled = true;
+  // optimistic: drop the placeholder, append the user turn + a pending droid bubble.
+  if(log.querySelector('.empty')) log.innerHTML = '';
+  log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
+  log.insertAdjacentHTML('beforeend', '<div class="bub pending" id="chatPending"><div class="who">Droid</div>reasoning over the dataset…</div>');
+  log.scrollTop = log.scrollHeight;
+  box.value = '';
+  try {
+    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ message: msg, allowPython })
+    });
+    drawChat(r.turns);
+    const ds = r.dataset || {};
+    hint.textContent = (r.rounds!=null?('round '+r.rounds+' · '):'') +
+      (ds.instances!=null?(ds.instances+' instances · '+ds.jobs+' jobs · '+ds.incidents+' incidents'):'');
+  } catch(e){
+    const pend = $('#chatPending'); if(pend) pend.remove();
+    log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">Droid</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
+    box.value = msg; // restore so the operator can retry
+  } finally {
+    send.disabled = false; box.disabled = false; box.focus();
+  }
+}
+
+async function saveChatPrompt(){
+  const text = $('#chatBox').value.trim();
+  if(!text){ $('#chatHint').textContent = 'nothing in the compose box to save'; return; }
+  const name = window.prompt('Name this prompt:');
+  if(name==null) return;
+  const id = (name.trim()||'prompt').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || ('prompt-'+Date.now());
+  try {
+    await api('/api/chat-prompts', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ id, name: name.trim()||id, text })
+    });
+    await loadChatPrompts();
+    $('#chatHint').textContent = 'saved prompt “'+(name.trim()||id)+'”';
+  } catch(e){ $('#chatHint').textContent = e.message||e; }
+}
+
+async function resetChat(ws, proc){
+  if(!window.confirm('Forget this conversation?')) return;
+  try {
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/reset', { method:'POST' });
+    drawChat([]); $('#chatHint').textContent = '';
+  } catch(e){ $('#chatHint').textContent = e.message||e; }
 }
 
 async function renderWsModel(url){
@@ -470,38 +604,6 @@ async function renderWsModel(url){
     await viewer.importXML(xml);
     viewer.get('canvas').zoom('fit-viewport', 'auto');
   } catch(e){ el.innerHTML = '<p class="err" style="padding:12px">could not render model: '+esc(e.message||e)+'</p>'; }
-}
-
-async function runInvestigation(ws, proc){
-  const btn = $('#invGo'); const out = $('#invOut');
-  const allowPython = $('#invPy').checked;
-  btn.disabled = true; btn.textContent = 'Investigating…';
-  out.innerHTML = '<p class="muted">The droid is reasoning over the dataset — this can take a moment.</p>';
-  try {
-    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/investigate', {
-      method: 'POST', headers: {'content-type':'application/json'},
-      body: JSON.stringify({ allowPython })
-    });
-    const ds = r.dataset || {};
-    const run = r.run || {};
-    const steps = (run.steps||[]).map(s => `
-      <details class="step">
-        <summary>${esc(s.tool)} · ${(run.steps||[]).indexOf(s)+1}</summary>
-        <div class="args">${esc(JSON.stringify(s.arguments))}</div>
-        <pre>${esc(s.result)}</pre>
-      </details>`).join('');
-    out.innerHTML = `
-      <div class="ws-grid">
-        <b>dataset</b><span>${ds.instances??'—'} instances · ${ds.jobs??'—'} jobs · ${ds.incidents??'—'} incidents</span>
-        <b>rounds</b><span>${run.rounds??'—'}</span>
-      </div>
-      <div class="conclusion">${esc(run.answer||'(no conclusion)')}</div>
-      <div class="notebook">
-        <h2 style="font-size:14px;margin:16px 0 8px">Lab notebook (${(run.steps||[]).length} queries)</h2>
-        ${steps || '<p class="muted">No tool calls recorded.</p>'}
-      </div>`;
-  } catch(e){ out.innerHTML = '<div class="err">'+esc(e.message||e)+'</div>'; }
-  finally { btn.disabled = false; btn.textContent = 'Investigate with the droid →'; }
 }
 
 document.querySelectorAll('.nav a[data-view]').forEach(a => a.onclick = () => {

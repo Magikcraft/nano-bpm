@@ -469,18 +469,24 @@ fn migrate(s: &str) -> Option<Settings> {
     Some(settings)
 }
 
-/// Resolve the settings file path. Honours `PROCESSOS_CONFIG_DIR` (mainly for tests),
-/// then `XDG_CONFIG_HOME`, then `$HOME/.config`, falling back to the current directory.
-pub fn settings_path() -> PathBuf {
+/// Resolve the ProcessOS config directory. Honours `PROCESSOS_CONFIG_DIR` (mainly for
+/// tests), then `XDG_CONFIG_HOME`/processos, then `$HOME/.config`/processos, falling back
+/// to `./processos`.
+pub fn config_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("PROCESSOS_CONFIG_DIR").filter(|s| !s.is_empty()) {
-        return PathBuf::from(dir).join("settings.json");
+        return PathBuf::from(dir);
     }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("processos").join("settings.json")
+    base.join("processos")
+}
+
+/// Resolve the settings file path (the `settings.json` inside [`config_dir`]).
+pub fn settings_path() -> PathBuf {
+    config_dir().join("settings.json")
 }
 
 #[cfg(unix)]
