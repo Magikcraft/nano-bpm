@@ -18,7 +18,7 @@
 //! frames). Job-push subscription aggregation (`Subscribe`/`Job`) and async
 //! `InstanceCompleted` await routing build on the same link later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -256,6 +256,56 @@ impl PeerLink {
         }
     }
 
+    /// Sends a fire-and-forget frame on the app lane without registering a pending
+    /// correlation or awaiting a reply. Used by the best-effort lease digest
+    /// broadcast: a partition leader pushes its current leases to a follower and
+    /// never waits for an answer (loss/staleness is safe by construction). Returns
+    /// `Err(Closed)` only if the link is down or the writer queue is full/closed.
+    pub async fn send_oneway(&self, frame: ClientFrame) -> Result<(), PeerError> {
+        if !self.is_connected() {
+            return Err(PeerError::Closed);
+        }
+        let txt = serde_json::to_string(&frame).expect("ClientFrame serializes");
+        self.out_app
+            .send(Message::Text(txt.into()))
+            .await
+            .map_err(|_| PeerError::Closed)
+    }
+
+    /// Broadcasts a best-effort lease digest for `partition` to this follower.
+    pub async fn send_lease_digest(
+        &self,
+        partition: u64,
+        leases: Vec<(u64, u64)>,
+        sent_at: u64,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::LeaseDigest {
+            partition,
+            leases,
+            sent_at,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a leader-durable promotion announcement to this peer (ADR
+    /// 0003): this node has app-promoted itself leader of `partition` at `epoch`
+    /// after the previous sole-voter leader was lost. See [`ClientFrame::Promote`].
+    pub async fn send_promote(
+        &self,
+        partition: u64,
+        epoch: u64,
+        leader_node: u64,
+        leader_addr: String,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::Promote {
+            partition,
+            epoch,
+            leader_node,
+            leader_addr,
+        })
+        .await
+    }
+
     /// Forwards a `createProcessInstance` to this peer (it creates on one of its
     /// own partitions). `await_completion` is intentionally unsupported here —
     /// it resolves over an async `InstanceCompleted` frame, wired in a later
@@ -331,12 +381,18 @@ impl PeerLink {
     /// of that partition. Answered by a `CommandResult` whose body is the
     /// serialized `RaftRpcResponse`. This is the command-stream binding of the
     /// per-partition Raft network (stage 3 leader routing).
-    pub async fn raft_rpc(&self, partition: u64, rpc: Value) -> Result<PeerResult, PeerError> {
+    pub async fn raft_rpc(
+        &self,
+        partition: u64,
+        rpc: String,
+        zip: bool,
+    ) -> Result<PeerResult, PeerError> {
         self.request_on(&self.out_raft, &self.pending_raft, request_timeout(), |corr| {
             ClientFrame::Raft {
                 corr,
                 partition,
                 rpc,
+                zip,
             }
         })
         .await
@@ -606,6 +662,12 @@ pub struct PeerSet {
     /// One slot per node id; `Some` once a link has been established. Guarded by
     /// an async mutex so concurrent forwards to the same peer share one dial.
     links: Arc<Mutex<HashMap<u32, PeerLink>>>,
+    /// Fault-injection set: node ids treated as unreachable. Empty in production
+    /// (never populated outside tests); lets a failover test faithfully simulate
+    /// a peer's death from a survivor's point of view without having to tear down
+    /// the dead node's already-accepted connections (which `axum::serve` drives on
+    /// detached per-connection tasks that outlive an aborted serve task).
+    unreachable: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl PeerSet {
@@ -615,6 +677,7 @@ impl PeerSet {
         Self {
             topology,
             links: Arc::new(Mutex::new(HashMap::new())),
+            unreachable: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -623,10 +686,23 @@ impl PeerSet {
         !self.topology.is_single_node()
     }
 
+    /// Fault injection (tests only): mark `node_id` unreachable, dropping any
+    /// cached link so subsequent `link`/reachability probes fail as if the peer
+    /// had died. Production code never calls this.
+    pub async fn fail_node(&self, node_id: u32) {
+        self.unreachable.lock().await.insert(node_id);
+        self.links.lock().await.remove(&node_id);
+    }
+
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
     /// link or the cached one has dropped. Concurrent callers for the same peer
     /// share the single in-flight dial (serialized by the map lock).
     pub async fn link(&self, node_id: u32) -> Result<PeerLink, PeerError> {
+        if self.unreachable.lock().await.contains(&node_id) {
+            return Err(PeerError::Connect(format!(
+                "node {node_id} marked unreachable (fault injection)"
+            )));
+        }
         let mut links = self.links.lock().await;
         if let Some(existing) = links.get(&node_id) {
             if existing.is_connected() {

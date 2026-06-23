@@ -93,6 +93,11 @@ type DispatchTarget = (Arc<Connection>, Arc<Subscription>);
 // Frame protocol (tagged union; wire form is camelCase JSON over text frames).
 // ----------------------------------------------------------------------------
 
+/// `serde` `skip_serializing_if` predicate: omit a `bool` field when it is `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Client → server frames.
 ///
 /// `Serialize` is derived so a node can act as a command-stream *client* to its
@@ -331,7 +336,47 @@ pub enum ClientFrame {
     Raft {
         corr: u64,
         partition: u64,
-        rpc: Value,
+        /// The `RaftRpcRequest` serialized to a JSON string and carried verbatim,
+        /// so the heavy AppendEntries / InstallSnapshot payloads (journal events +
+        /// variables) are encoded once on the sender and parsed once on the
+        /// receiver — never materialized into an intermediate `serde_json::Value`
+        /// DOM (which, for a large variables map, would allocate a node per field).
+        /// When `zip` is set the string is raw-deflate + base64 (large payloads
+        /// only — see [`crate::raft_net::encode_rpc_payload`]).
+        rpc: String,
+        /// Whether `rpc` is deflate+base64 compressed. Absent ⇒ `false` (raw JSON),
+        /// so small control RPCs add no field and older raw frames still parse.
+        #[serde(default, skip_serializing_if = "is_false")]
+        zip: bool,
+    },
+    /// **Intra-cluster only.** A best-effort soft lease digest broadcast by a
+    /// partition leader to its followers (leader-local activation, `digest` mode).
+    /// Fire-and-forget: it carries the leader's currently-held activation leases
+    /// `(jobKey, deadline)` for `partition` so that a follower, on being promoted
+    /// to leader, can recover them ([`Engine::recover_lease`]) and honour each
+    /// deadline before redelivering — narrowing the failover redelivery window
+    /// that leader-local activation otherwise opens. It is **not** answered (no
+    /// `corr`); a dropped or stale digest only costs a slightly wider window, so
+    /// loss is safe by construction.
+    #[serde(rename_all = "camelCase")]
+    LeaseDigest {
+        partition: u64,
+        leases: Vec<(u64, u64)>,
+        sent_at: u64,
+    },
+    /// Leader-durable auto-recovery announcement (ADR 0003): the sender has
+    /// app-promoted itself leader of `partition` at `epoch` after detecting the
+    /// previous (sole-voter) leader was lost. Recipients adopt the higher epoch,
+    /// rejoin the partition as a learner of the new leader (so new writes ship to
+    /// them again), and a stale leader at a lower epoch steps down (fencing).
+    /// Fire-and-forget (no `corr`): the promoting leader retries `add_learner`, so a
+    /// dropped announcement only delays a survivor's rejoin, never correctness.
+    #[serde(rename_all = "camelCase")]
+    Promote {
+        partition: u64,
+        epoch: u64,
+        leader_node: u64,
+        leader_addr: String,
     },
 }
 
@@ -784,6 +829,8 @@ async fn handle_client_frame(
         ClientFrame::ForwardUserTask { .. } => "forward_user_task",
         ClientFrame::ForwardCreate { .. } => "forward_create",
         ClientFrame::Raft { .. } => "raft",
+        ClientFrame::LeaseDigest { .. } => "lease_digest",
+        ClientFrame::Promote { .. } => "promote",
     };
     crate::metrics::record_stream_frame(frame_type);
     
@@ -1370,14 +1417,36 @@ async fn handle_client_frame(
             corr,
             partition,
             rpc,
+            zip,
         } => {
             // Peer-side of the Raft network: feed the inbound RPC into the local
             // replica of `partition` and answer with the serialized response.
-            let (status, body) = match server.dispatch_raft_rpc(partition, rpc).await {
+            let (status, body) = match server.dispatch_raft_rpc(partition, &rpc, zip).await {
                 Ok(resp) => (200u16, Some(resp)),
                 Err((status, message)) => (status, Some(Value::String(message))),
             };
             conn.send(ServerFrame::CommandResult { corr, status, body });
+        }
+        ClientFrame::LeaseDigest {
+            partition,
+            leases,
+            sent_at,
+        } => {
+            // Best-effort soft lease digest from this partition's current leader.
+            // Store it; on promotion this node recovers the leases (see the tick
+            // driver). Fire-and-forget: no reply.
+            server.record_lease_digest(partition, leases, sent_at);
+        }
+        ClientFrame::Promote {
+            partition,
+            epoch,
+            leader_node,
+            leader_addr: _,
+        } => {
+            // Leader-durable auto-recovery announcement: a peer promoted itself
+            // leader of `partition`. Adopt the epoch and rejoin as a learner (or
+            // step down if we were a stale leader). Fire-and-forget: no reply.
+            server.handle_promotion(partition, epoch, leader_node).await;
         }
     }
     

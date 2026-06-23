@@ -198,6 +198,40 @@ pub struct ServerImpl {
     /// replicated deadline). Both modes are at-least-once; this one widens the
     /// failover redelivery window. See [`replicate_activation_from_env`].
     replicate_activation: bool,
+    /// Best-effort soft lease digest mode (`NANOBPMN_REPLICATE_ACTIVATION=digest`).
+    /// Layered on top of leader-local activation (so `replicate_activation` is
+    /// also `false`): a partition leader periodically broadcasts its currently-held
+    /// activation leases to its followers (fire-and-forget), and a follower
+    /// recovers them on promotion so the new leader honours each lease deadline
+    /// before redelivering — narrowing (not closing) the failover redelivery
+    /// window that plain leader-local activation opens, with no per-job quorum cost
+    /// and no external infrastructure. `false` everywhere else (single node / RF=1
+    /// / default), so zero overhead. See [`lease_digest_from_env`].
+    lease_digest: bool,
+    /// Soft lease table: the latest lease digest received from each partition's
+    /// leader, keyed by partition id. Consulted on leadership takeover to recover
+    /// in-flight leases (see the tick driver). Soft state, never journaled; bounded
+    /// by the number of partitions this node replicates. Empty unless `lease_digest`
+    /// is on.
+    lease_digests: Arc<std::sync::Mutex<std::collections::HashMap<u64, ReceivedDigest>>>,
+    /// Replication durability tier for the partition Raft log (`NANOBPMN_REPLICATION`,
+    /// ADR 0003). [`ReplicationMode::Quorum`] (default) acks after majority commit;
+    /// [`ReplicationMode::LeaderDurable`] forms each led group with the leader as the
+    /// sole voter and the rest as learners, so the ack does not wait for follower
+    /// quorum (async log shipping). Consumed in [`Self::raft_bootstrap`] when forming
+    /// groups; no effect without Raft (single node / RF=1).
+    replication_mode: ReplicationMode,
+    /// Per-partition promotion fence for leader-durable auto-recovery (ADR 0003),
+    /// stored as `(epoch, leader_node)`. The epoch is monotonic, bumped each time
+    /// this node app-promotes a leaderless partition or adopts a peer's winning
+    /// promotion; `leader_node` records who holds the partition at that epoch. Used
+    /// to (a) dedupe / avoid re-promoting, (b) fence a stale leader (a node leading
+    /// at a LOWER epoch steps down on learning of a higher one), and (c) break a
+    /// SAME-epoch collision deterministically by lowest node id, so a symmetric
+    /// multi-way split that produces two equal-epoch promotions still reconverges to
+    /// a single leader. Empty (epoch 0 implied) unless leader-durable recovery has
+    /// fired. Soft state, never journaled.
+    promotion_epoch: Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>,
     /// Tier-A execution-trace projection, folded off the engine event stream by
     /// the exporter thread (process-optimization design doc §3). In-memory and
     /// bounded; served under `/console/api/traces`. Console builds only.
@@ -238,6 +272,8 @@ impl ServerImpl {
         // correlation key (`hash(correlation_key)`). With a single partition this
         // is `1`, so placement stays local and behaviour is unchanged.
         let replicate_activation = replicate_activation_from_env();
+        let lease_digest = lease_digest_from_env();
+        let replication_mode = replication_mode_from_env();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
             // Leader-local activation mode: replicas must accept a replicated
@@ -416,6 +452,10 @@ impl ServerImpl {
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             replicate_activation,
+            lease_digest,
+            lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            replication_mode,
+            promotion_epoch: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "console")]
             trace_store: Arc::new(console::trace::TraceStore::from_env()),
         }
@@ -499,10 +539,15 @@ impl ServerImpl {
     pub async fn dispatch_raft_rpc(
         &self,
         partition: u64,
-        rpc: serde_json::Value,
+        rpc: &str,
+        zip: bool,
     ) -> Result<serde_json::Value, (u16, String)> {
-        let req: crate::raft_net::RaftRpcRequest =
-            serde_json::from_value(rpc).map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
+        // Decompress (large payloads ride deflate+base64) before parsing the RPC
+        // straight from JSON — no intermediate `serde_json::Value` DOM.
+        let rpc = crate::raft_net::decode_rpc_payload(rpc, zip)
+            .map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
+        let req: crate::raft_net::RaftRpcRequest = serde_json::from_str(&rpc)
+            .map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
         let part = self.raft.get(partition).ok_or_else(|| {
             (
                 404u16,
@@ -729,10 +774,105 @@ fn replicate_activation_from_env() -> bool {
     match std::env::var("NANOBPMN_REPLICATE_ACTIVATION").ok().as_deref() {
         Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
+            "0" | "false" | "off" | "no" | "digest"
         ),
         None => true,
     }
+}
+
+/// Whether the best-effort soft lease digest is enabled
+/// (`NANOBPMN_REPLICATE_ACTIVATION=digest`). `digest` is leader-local activation
+/// (so [`replicate_activation_from_env`] also returns `false`) PLUS a periodic,
+/// fire-and-forget broadcast of the leader's currently-held leases to its
+/// followers. On promotion a follower recovers those leases so the new leader
+/// honours their deadlines before redelivering — narrowing the failover
+/// redelivery window that plain leader-local activation opens, at no per-job
+/// quorum cost and with no external infrastructure. The digest is lossy/soft by
+/// design (a dropped or stale digest only widens the window slightly), so it never
+/// affects correctness — only the failover redelivery timing.
+fn lease_digest_from_env() -> bool {
+    matches!(
+        std::env::var("NANOBPMN_REPLICATE_ACTIVATION")
+            .ok()
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase()),
+        Some(ref v) if v == "digest"
+    )
+}
+
+/// The replication durability tier for the partition Raft log (ADR 0003), the
+/// sibling of the local `NANOBPMN_DURABILITY=sync|async` knob but on the
+/// *replication* axis. Read once at startup from `NANOBPMN_REPLICATION`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplicationMode {
+    /// `quorum` (the default, and the original behaviour): every durable command
+    /// is acked only after a majority of voters has committed AND applied it.
+    /// Survives node loss (a minority can fail with no data loss); RF=1 / single
+    /// node is unaffected (the leader is the only voter, so quorum is itself).
+    Quorum,
+    /// `leader-durable`: form each partition group with the **leader as the sole
+    /// voter** and the other replicas as **learners**. The leader acks after its
+    /// own local durable append + apply (quorum = 1), and ships the log to the
+    /// learners asynchronously in the background — the Kafka `acks=1` model
+    /// applied to the workflow command log. This takes the cross-node quorum
+    /// round-trip off the client critical path (the biggest win at low
+    /// concurrency, where group commit cannot amortize it).
+    ///
+    /// TRADE-OFF (ADR 0003): a command acked by the leader but not yet shipped to
+    /// a learner is lost if that leader is lost before catch-up — a bounded tail,
+    /// the same shape as the local `DURABILITY=async` fsync window but on the
+    /// replication axis. Consistent with the system's at-least-once contract: a
+    /// lost completion tail redelivers (idempotent workers tolerate it); a lost
+    /// create tail was never durably admitted (the at-least-once producer
+    /// retries). Single voter means openraft cannot auto-elect a new leader on
+    /// leader loss — learner promotion / longest-log election is the option-2
+    /// follow-on; this tier is the cheap, measurable option-1 spike. No effect
+    /// without Raft (single node / RF=1).
+    LeaderDurable,
+}
+
+/// Resolves the replication durability tier from `NANOBPMN_REPLICATION`. Default
+/// (absent or unrecognised) is [`ReplicationMode::Quorum`] — the strong,
+/// node-loss-durable behaviour every existing benchmark and CI run is validated
+/// against. `leader-durable` (also accepted: `leader_durable`, `acks=1`, `acks1`)
+/// selects the leader-only-voter tier. See [`ReplicationMode`].
+fn replication_mode_from_env() -> ReplicationMode {
+    match std::env::var("NANOBPMN_REPLICATION")
+        .ok()
+        .as_deref()
+        .map(|v| v.trim().to_ascii_lowercase())
+    {
+        Some(ref v)
+            if v == "leader-durable"
+                || v == "leader_durable"
+                || v == "leaderdurable"
+                || v == "acks=1"
+                || v == "acks1" =>
+        {
+            ReplicationMode::LeaderDurable
+        }
+        _ => ReplicationMode::Quorum,
+    }
+}
+
+/// Consecutive leaderless supervisor passes (≈500 ms each) before leader-durable
+/// auto-recovery promotes a partition. Default 3 (~1.5 s) so a brief
+/// heartbeat/election flutter never triggers a needless promotion; env-tunable via
+/// `NANOBPMN_LEADER_DURABLE_GRACE_TICKS`. Floored at 1.
+fn leader_durable_recovery_grace_ticks() -> u32 {
+    std::env::var("NANOBPMN_LEADER_DURABLE_GRACE_TICKS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+        .max(1)
+}
+
+/// The latest lease digest received from a partition's leader: the leases it held
+/// `(job_key, deadline)`. Held in the soft lease table and consumed by a
+/// newly-promoted leader to recover in-flight leases.
+#[derive(Clone, Debug)]
+struct ReceivedDigest {
+    leases: Vec<(u64, u64)>,
 }
 
 /// Resolves the active-instance-backlog admission limit, or `0` (off) by default.
@@ -5050,6 +5190,13 @@ impl ServerImpl {
             // Form each group this node leads from its replica set. `initialize`
             // is idempotent and does not require peers to be up (they catch up via
             // replication), but we retry to ride out a transient failure.
+            //
+            // ADR 0003 replication tier: in `quorum` mode every replica is a voter,
+            // so a write commits on a majority. In `leader-durable` mode the leader
+            // forms the group as the SOLE voter and adds the other replicas as
+            // learners (below), so a write acks on the leader alone and ships to the
+            // learners asynchronously — `acks=1` for the workflow log.
+            let leader_durable = server.replication_mode == ReplicationMode::LeaderDurable;
             for p in topology.replica_partitions() {
                 if topology.leader_of(p) != topology.node_id {
                     continue;
@@ -5057,9 +5204,13 @@ impl ServerImpl {
                 let Some(part) = server.raft_registry().get(p) else {
                     continue;
                 };
-                let members: std::collections::BTreeMap<u64, openraft::BasicNode> = topology
-                    .replicas_of(p)
-                    .into_iter()
+                let all_replicas = topology.replicas_of(p);
+                // Voter set: every replica in `quorum`, leader-only in
+                // `leader-durable`.
+                let members: std::collections::BTreeMap<u64, openraft::BasicNode> = all_replicas
+                    .iter()
+                    .copied()
+                    .filter(|&n| !leader_durable || n == topology.node_id)
                     .map(|n| {
                         let addr = topology.peer_addr(n).unwrap_or("").to_string();
                         (n as u64, openraft::BasicNode::new(addr))
@@ -5069,9 +5220,10 @@ impl ServerImpl {
                     match part.initialize(members.clone()).await {
                         Ok(()) => {
                             tracing::info!(
-                                "raft: node {} formed the group for partition {p} (members {:?})",
+                                "raft: node {} formed the group for partition {p} (mode {:?}, voters {:?})",
                                 topology.node_id,
-                                topology.replicas_of(p)
+                                server.replication_mode,
+                                members.keys().collect::<Vec<_>>(),
                             );
                             break;
                         }
@@ -5083,7 +5235,313 @@ impl ServerImpl {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }
+                // Leader-durable: register the remaining replicas as non-voting
+                // learners so they tail the log without gating the write quorum.
+                if leader_durable {
+                    for n in all_replicas.iter().copied() {
+                        if n == topology.node_id {
+                            continue;
+                        }
+                        let addr = topology.peer_addr(n).unwrap_or("").to_string();
+                        match part.add_learner(n as u64, openraft::BasicNode::new(addr)).await {
+                            Ok(()) => tracing::info!(
+                                "raft: node {} added node {n} as a learner for partition {p}",
+                                topology.node_id,
+                            ),
+                            Err(e) => tracing::warn!(
+                                "raft: add_learner node {n} for partition {p} failed: {e}"
+                            ),
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    /// Spawns the leader-durable auto-recovery supervisor (ADR 0003, option-2
+    /// follow-on). A no-op unless Raft is enabled AND the replication tier is
+    /// [`ReplicationMode::LeaderDurable`] with real peers: in every other
+    /// configuration failover is either irrelevant (single node / RF=1) or already
+    /// handled natively by openraft's voter-majority election (`quorum` mode).
+    ///
+    /// In leader-durable mode each group has a SINGLE voter (the leader), so when
+    /// that leader is lost openraft cannot elect a successor — the learners have no
+    /// vote and no node can change membership without a leader. This supervisor
+    /// fills that gap: it watches each partition this node replicates and, when the
+    /// partition is leaderless and this node is the deterministic surviving
+    /// successor, app-promotes it (see [`Self::promote_partition`]).
+    fn spawn_leader_durable_recovery(&self) {
+        if !raft_enabled()
+            || self.replication_mode != ReplicationMode::LeaderDurable
+            || !self.peers.has_peers()
+        {
+            return;
+        }
+        let server = self.clone();
+        tokio::spawn(async move {
+            // A few consecutive leaderless observations before acting, so a brief
+            // election/heartbeat flutter never triggers a needless promotion.
+            let grace_ticks = leader_durable_recovery_grace_ticks();
+            let mut leaderless: std::collections::HashMap<u64, u32> =
+                std::collections::HashMap::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                server.leader_durable_recovery_tick(grace_ticks, &mut leaderless).await;
+            }
+        });
+    }
+
+    /// One pass of the leader-durable recovery supervisor. For every partition this
+    /// node replicates: if the group is leaderless (no current leader, and the
+    /// original leader's peer link is down) for `grace_ticks` consecutive passes
+    /// and this node is the deterministic surviving successor, promote it. `misses`
+    /// carries the per-partition consecutive-leaderless counter across passes.
+    ///
+    /// Factored out (and not gated on the env) so a test can drive recovery
+    /// deterministically without spawning the loop.
+    async fn leader_durable_recovery_tick(
+        &self,
+        grace_ticks: u32,
+        misses: &mut std::collections::HashMap<u64, u32>,
+    ) {
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id as u64;
+        for p in topology.replica_partitions() {
+            let leader = self
+                .raft
+                .get(p)
+                .and_then(|part| part.raft.metrics().borrow().current_leader);
+            // A live leader resets the counter. "Live" means present AND, if it is
+            // a peer, reachable — a metric still naming a dead leader does not count.
+            let leader_live = match leader {
+                Some(l) if l == me => true,
+                Some(l) => self.peer_reachable(l as u32).await,
+                None => false,
+            };
+            if leader_live {
+                misses.remove(&p);
+                continue;
+            }
+            let n = misses.entry(p).or_insert(0);
+            *n += 1;
+            if *n < grace_ticks {
+                continue;
+            }
+            // Leaderless past the grace window. Promote iff this node is the
+            // deterministic surviving successor for `p`.
+            if self.designated_successor(p).await == Some(me as u32) {
+                let next_epoch = self.next_promotion_epoch(p);
+                tracing::warn!(
+                    "leader-durable: partition {p} leaderless; node {me} self-promoting (epoch {next_epoch})"
+                );
+                self.promote_partition(p, next_epoch).await;
+                misses.remove(&p);
+            }
+        }
+    }
+
+    /// Whether peer `node` is currently reachable (a live command-stream uplink can
+    /// be established). Used as the failure detector for leader-durable recovery: a
+    /// node whose link cannot be dialed is treated as down. `true` for this node
+    /// itself.
+    async fn peer_reachable(&self, node: u32) -> bool {
+        if node == self.engine.topology().node_id {
+            return true;
+        }
+        matches!(self.peers.link(node).await, Ok(link) if link.is_connected())
+    }
+
+    /// The deterministic surviving successor for partition `p`: the first node in
+    /// `replicas_of(p)` order (leader first) that is currently reachable. Because
+    /// the replica order is identical on every node, all survivors independently
+    /// agree on the same successor with no coordination — so at most one node
+    /// promotes. Returns `None` if no replica is reachable (this node included,
+    /// which cannot happen since `self` is always reachable to itself).
+    async fn designated_successor(&self, p: u64) -> Option<u32> {
+        for n in self.engine.topology().replicas_of(p) {
+            if self.peer_reachable(n).await {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    /// Reserves the next promotion epoch for partition `p` (current max + 1) and
+    /// records this node as the leader at that epoch. Monotonic per partition.
+    fn next_promotion_epoch(&self, p: u64) -> u64 {
+        let me = self.engine.topology().node_id as u64;
+        let mut map = self.promotion_epoch.lock().unwrap();
+        let next = map.get(&p).map(|(e, _)| *e).unwrap_or(0) + 1;
+        map.insert(p, (next, me));
+        next
+    }
+
+    /// App-promotes leaderless partition `p` on this node (leader-durable
+    /// auto-recovery, ADR 0003). Rebuilds the partition's Raft group as a fresh
+    /// single-voter group led by this node, seeded from the engine actor that
+    /// already holds the replicated state (its replica engine, or the owned actor),
+    /// so all committed-and-shipped progress carries over and the partition resumes
+    /// serving writes immediately. Then announces the promotion to peers so the
+    /// other survivors rejoin as learners (durability for new writes) and any stale
+    /// leader at a lower epoch steps down (fencing).
+    ///
+    /// LOSS WINDOW (the leader-durable trade): any tail the dead leader acked but
+    /// had not yet shipped to this node's replica engine is gone — bounded,
+    /// at-least-once (a lost completion redelivers; a lost create was never durably
+    /// admitted, so the producer retries). SPLIT-BRAIN under a pure network
+    /// partition is the inherent acks=1 limit: a partitioned-but-alive old leader
+    /// may keep acking writes that are later discarded when it sees the higher
+    /// epoch — bounded loss, never permanent divergence (higher epoch always wins).
+    async fn promote_partition(&self, p: u64, epoch: u64) {
+        use crate::raft::RaftPartition;
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id as u64;
+
+        // The engine actor holding the replicated state for `p` on this node.
+        let engine = match self.engine_handle_for(p) {
+            Some(h) => h,
+            None => self.replica_engine_for(p).await,
+        };
+
+        // Tear down the stale group (a learner of the dead leader) before replacing
+        // it, so its openraft task and sockets are released.
+        if let Some(old) = self.raft.get(p) {
+            old.raft.shutdown().await.ok();
+        }
+
+        // Form a fresh single-voter group on a clean in-memory log (the engine's
+        // own journal remains the local durability source). Initialize with this
+        // node as the sole voter so it elects itself immediately, then add the
+        // reachable survivors as learners so new writes ship to them.
+        let transport = self.raft_transport();
+        let part = match RaftPartition::bootstrap_member(me, p, engine, transport, None).await {
+            Ok(part) => Arc::new(part),
+            Err(e) => {
+                tracing::error!("leader-durable: promote partition {p} failed to build group: {e}");
+                return;
+            }
+        };
+        let mut members = std::collections::BTreeMap::new();
+        members.insert(me, openraft::BasicNode::new(topology.peer_addr(me as u32).unwrap_or("").to_string()));
+        if let Err(e) = part.initialize(members).await {
+            tracing::error!("leader-durable: promote partition {p} failed to initialize: {e}");
+            return;
+        }
+        self.raft.insert(part.clone());
+        tracing::info!("leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})");
+
+        // Announce so peers rejoin as learners and any stale leader steps down,
+        // then (best-effort) add the reachable survivors as learners.
+        self.broadcast_promotion(p, epoch).await;
+        for n in topology.replicas_of(p) {
+            if n as u64 == me {
+                continue;
+            }
+            if self.peer_reachable(n).await {
+                let addr = topology.peer_addr(n).unwrap_or("").to_string();
+                part.add_learner(n as u64, openraft::BasicNode::new(addr)).await.ok();
+            }
+        }
+    }
+
+    /// Fire-and-forget a [`ClientFrame::Promote`] to every reachable peer, telling
+    /// them this node is now the leader of partition `p` at `epoch`.
+    async fn broadcast_promotion(&self, p: u64, epoch: u64) {
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id;
+        let addr = topology.peer_addr(me).unwrap_or("").to_string();
+        for n in 0..topology.num_nodes() {
+            if n == me {
+                continue;
+            }
+            if let Ok(link) = self.peers.link(n).await {
+                link.send_promote(p, epoch, me as u64, addr.clone()).await.ok();
+            }
+        }
+    }
+
+    /// Handles an inbound [`ClientFrame::Promote`]: a peer (`leader_node`) has
+    /// app-promoted itself leader of partition `p` at `epoch` (leader-durable
+    /// recovery). We adopt the announcement when it *wins the fence*: a strictly
+    /// higher epoch, or the SAME epoch from a lower node id (the deterministic
+    /// tiebreak that collapses a symmetric multi-way split — two survivors that each
+    /// promote at the same epoch — back to one leader; lowest node id wins). On
+    /// adopting, if we host a now-stale group for `p` that we do not lead at this
+    /// epoch, we rebuild it as a fresh receiver member so the new leader's
+    /// replication (its `add_learner`) lands, and so a stale leader at a lower (or
+    /// tie-losing) epoch steps down (fencing).
+    ///
+    /// If instead WE are the current leader for `p` at this epoch and the inbound
+    /// announcement is a tie-loser (or a stale duplicate from a survivor that
+    /// promoted concurrently), we keep leadership but `add_learner` the sender so it
+    /// rejoins our group for durability — closing the survivor-rejoin gap for the
+    /// collision case. Idempotent otherwise.
+    pub(crate) async fn handle_promotion(&self, p: u64, epoch: u64, leader_node: u64) {
+        let me = self.engine.topology().node_id as u64;
+        // Fence decision under the lock: wins(epoch, leader) iff strictly newer, or
+        // same epoch with a lower node id. `cur_leader` defaults to u64::MAX so any
+        // real promotion at epoch >= 1 beats the implicit (0, _) incumbent state.
+        let (adopt, i_lead_here) = {
+            let mut map = self.promotion_epoch.lock().unwrap();
+            let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, u64::MAX));
+            let wins = epoch > cur_epoch || (epoch == cur_epoch && leader_node < cur_leader);
+            if wins {
+                map.insert(p, (epoch, leader_node));
+                (true, false)
+            } else {
+                (false, cur_epoch == epoch && cur_leader == me)
+            }
+        };
+
+        if !adopt {
+            // We did not adopt. If we are the standing leader for `p` at this epoch
+            // and the sender is a tie-loser/concurrent promoter, pull it back in as a
+            // learner so it stops diverging and resumes receiving our log.
+            if i_lead_here && leader_node != me {
+                if let Some(addr) = self
+                    .engine
+                    .topology()
+                    .peer_addr(leader_node as u32)
+                    .map(str::to_string)
+                {
+                    if let Some(part) = self.raft.get(p) {
+                        part.add_learner(
+                            leader_node,
+                            openraft::BasicNode::new(addr),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+            }
+            return; // stale / duplicate / tie-loser
+        }
+
+        if leader_node == me {
+            return;
+        }
+        // Rebuild our member for `p` as a fresh receiver so the new leader can
+        // replicate to us (a learner of the OLD group would reject the new leader's
+        // lower-term, fresh log). No initialize: we only receive.
+        use crate::raft::RaftPartition;
+        let engine = match self.engine_handle_for(p) {
+            Some(h) => h,
+            None => self.replica_engine_for(p).await,
+        };
+        if let Some(old) = self.raft.get(p) {
+            old.raft.shutdown().await.ok();
+        }
+        let transport = self.raft_transport();
+        match RaftPartition::bootstrap_member(me, p, engine, transport, None).await {
+            Ok(part) => {
+                self.raft.insert(Arc::new(part));
+                tracing::info!(
+                    "leader-durable: node {me} rejoined partition {p} as a learner of node {leader_node} (epoch {epoch})"
+                );
+            }
+            Err(e) => tracing::error!(
+                "leader-durable: node {me} failed to rejoin partition {p} after promotion: {e}"
+            ),
         }
     }
 
@@ -5174,6 +5632,81 @@ impl ServerImpl {
             return Some(h.clone());
         }
         self.raft_replicas.lock().unwrap().get(&p).cloned()
+    }
+
+    /// Stores the latest best-effort lease digest received from `partition`'s
+    /// leader (soft state; never journaled). Consulted on leadership takeover by
+    /// [`Self::run_lease_digest`]. A no-op-cost overwrite: only the most recent
+    /// digest per partition is retained.
+    pub fn record_lease_digest(&self, partition: u64, leases: Vec<(u64, u64)>, _sent_at: u64) {
+        if !self.lease_digest {
+            return;
+        }
+        self.lease_digests.lock().unwrap().insert(
+            partition,
+            ReceivedDigest { leases },
+        );
+    }
+
+    /// One pass of the soft lease-digest protocol, driven by the 500ms tick when
+    /// `NANOBPMN_REPLICATE_ACTIVATION=digest`. For every partition this node leads:
+    ///
+    /// 1. **Recover** any digest received from the previous leader — for each
+    ///    in-flight lease still `Created` here (this node followed the partition
+    ///    and never saw the leader-local activation), mark it `Activated` until the
+    ///    original deadline ([`Journal::recover_lease`]). A long-stable leader holds
+    ///    no received digest for its own led partitions, so this fires only just
+    ///    after a promotion. Idempotent across ticks (already-activated jobs are
+    ///    skipped); the stored digest is evicted once all its deadlines have passed.
+    /// 2. **Broadcast** this node's current leases to the partition's followers
+    ///    (fire-and-forget) so a future leader can in turn recover them.
+    ///
+    /// Soft/lossy by design: a dropped or stale digest only widens the failover
+    /// redelivery window slightly; it never affects correctness (at-least-once is
+    /// preserved by the leases themselves and lenient completion).
+    async fn run_lease_digest(&self, now: u64) {
+        let led = self.led_partitions();
+        let node_id = self.engine.topology().node_id;
+        for p in led {
+            let handle = match self.engine_handle_for(p) {
+                Some(h) => h,
+                None => continue,
+            };
+            // 1. Recover a received digest (only present just after a promotion).
+            let stored = self.lease_digests.lock().unwrap().get(&p).cloned();
+            if let Some(digest) = stored {
+                let leases = digest.leases.clone();
+                let recover_handle = handle.clone();
+                recover_handle
+                    .with(move |journal| {
+                        for (job_key, deadline) in &leases {
+                            journal.recover_lease(*job_key, *deadline, now);
+                        }
+                    })
+                    .await;
+                // Drop the digest once every lease in it has expired: there is
+                // nothing left to recover and we must not pin stale state.
+                let max_deadline = digest.leases.iter().map(|(_, d)| *d).max().unwrap_or(0);
+                if max_deadline <= now {
+                    self.lease_digests.lock().unwrap().remove(&p);
+                }
+            }
+            // 2. Broadcast our current leases to this partition's followers.
+            let leases = handle.with(|journal| journal.activated_leases()).await;
+            let followers: Vec<u32> = self
+                .engine
+                .topology()
+                .replicas_of(p)
+                .into_iter()
+                .filter(|n| *n != node_id)
+                .collect();
+            for follower in followers {
+                if let Ok(link) = self.peers.link(follower).await {
+                    // Fire-and-forget: a failed send just skips this round.
+                    let _ = link.send_lease_digest(p, leases.clone(), now).await;
+                }
+            }
+        }
     }
 
     /// Fans a deployment into every replica engine actor (followers under RF>1) so
@@ -7431,6 +7964,12 @@ async fn main() {
     // over the command stream and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
 
+    // Leader-durable auto-recovery (ADR 0003): when the replication tier is
+    // leader-durable, each group has a single voter, so openraft cannot elect on
+    // leader loss — this supervisor app-promotes a deterministic survivor. No-op
+    // in every other configuration (single node / RF=1 / quorum mode).
+    server.spawn_leader_durable_recovery();
+
     // Self-contained single-node distribution: build the embedded web console
     // router (SPA + /console/api/*) before `server` is moved into the generated
     // router. Feature-gated; the default gateway build never includes it and the
@@ -7533,6 +8072,12 @@ async fn main() {
                 if produced {
                     jobs_available.notify_waiters();
                     dispatch_wake.notify_one();
+                }
+                // Best-effort lease-digest pass (digest mode only): recover leases
+                // on a freshly-promoted leader and broadcast current leases to
+                // followers. Empty / single-node / non-digest => zero work.
+                if tick_server.lease_digest && !tick_server.raft.is_empty() {
+                    tick_server.run_lease_digest(now).await;
                 }
             }
         });
@@ -9545,6 +10090,47 @@ mod clustered_startup_tests {
     /// until node 0 leads partition 0. Returns the three nodes. Used by the
     /// broadened failover tests below.
     async fn boot_rf3_intake_cluster() -> (ServerImpl, ServerImpl, ServerImpl) {
+        let (n0, n1, n2, _h) = boot_rf3_intake_cluster_cfg2(false, false).await;
+        (n0, n1, n2)
+    }
+
+    /// As [`boot_rf3_intake_cluster`], but the cluster runs in leader-durable
+    /// replication mode (`NANOBPMN_REPLICATION=leader-durable`, ADR 0003): each led
+    /// group is formed with the leader as the sole voter and the other replicas as
+    /// learners, so writes ack on the leader without follower quorum.
+    async fn boot_rf3_leader_durable_cluster() -> (ServerImpl, ServerImpl, ServerImpl) {
+        let (n0, n1, n2, _h) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        (n0, n1, n2)
+    }
+
+    /// As [`boot_rf3_intake_cluster`], but when `digest` is set the cluster runs in
+    /// best-effort lease-digest mode (`NANOBPMN_REPLICATE_ACTIVATION=digest`):
+    /// leader-local activation plus a soft lease broadcast. Tests can't set the env
+    /// var (it would race other parallel tests), so the relevant per-node state is
+    /// configured directly before the nodes are served and bootstrapped.
+    async fn boot_rf3_intake_cluster_cfg(
+        digest: bool,
+    ) -> (ServerImpl, ServerImpl, ServerImpl) {
+        let (n0, n1, n2, _h) = boot_rf3_intake_cluster_cfg2(digest, false).await;
+        (n0, n1, n2)
+    }
+
+    /// Backing helper for the RF=3 cluster boots: `digest` enables lease-digest
+    /// mode (ADR 0002 B) and `leader_durable` enables leader-durable replication
+    /// (ADR 0003). Both default off (plain `quorum` + fully-replicated activation).
+    /// Per-node state is set directly because the env readers can't be used safely
+    /// under parallel tests. Also returns the three serve-task handles (node order)
+    /// so a test can `abort()` a node's command-stream server to make it genuinely
+    /// unreachable (the leader-durable failure detector keys on peer reachability).
+    async fn boot_rf3_intake_cluster_cfg2(
+        digest: bool,
+        leader_durable: bool,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        ServerImpl,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
         use crate::raft::RaftPartition;
 
         let mut listeners = Vec::new();
@@ -9573,9 +10159,39 @@ mod clustered_startup_tests {
             let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
             build_server(journals, store, topology)
         };
-        let node0 = build_node(0);
-        let node1 = build_node(1);
-        let node2 = build_node(2);
+        let mut node0 = build_node(0);
+        let mut node1 = build_node(1);
+        let mut node2 = build_node(2);
+
+        // Digest mode = leader-local activation (replicate_activation = false) PLUS
+        // the soft lease broadcast (lease_digest = true). Configure both directly
+        // (the env reader can't be used safely under parallel tests) and relax the
+        // completion check on every owned engine actor, exactly as
+        // `ServerImpl::new` would have for `replicate_activation = false`. The
+        // follower replica engines built during `raft_bootstrap` then pick up
+        // lenient completion automatically (they read the now-false field).
+        if digest {
+            for node in [&mut node0, &mut node1, &mut node2] {
+                node.replicate_activation = false;
+                node.lease_digest = true;
+                for handle in node.engine.all() {
+                    handle
+                        .with(|journal| journal.set_lenient_completion(true))
+                        .await;
+                }
+            }
+        }
+
+        // Leader-durable replication (ADR 0003): set the tier directly before
+        // bootstrap so each leader forms its group as the sole voter + learners.
+        // `replication_mode` is a plain `Copy` field read in `raft_bootstrap`, so it
+        // must be set before that runs (and before the `clone()` that serves each
+        // node).
+        if leader_durable {
+            for node in [&mut node0, &mut node1, &mut node2] {
+                node.replication_mode = ReplicationMode::LeaderDurable;
+            }
+        }
 
         let proc = ProcessBuilder::new("intake")
             .start_event("start")
@@ -9608,13 +10224,14 @@ mod clustered_startup_tests {
             (node1.clone(), listeners.remove(0)),
             (node2.clone(), listeners.remove(0)),
         ];
+        let mut serve_handles = Vec::new();
         for (server, listener) in served {
             let registry = command_stream::Registry::new();
             command_stream::spawn_dispatcher(server.clone(), registry.clone());
             let app = command_stream::router(server.clone(), registry);
-            tokio::spawn(async move {
+            serve_handles.push(tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
-            });
+            }));
         }
         tokio::join!(
             node0.raft_bootstrap(),
@@ -9636,7 +10253,7 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(ok, "node 0 must lead partition 0");
-        (node0, node1, node2)
+        (node0, node1, node2, serve_handles)
     }
 
     /// Re-election helper: polls survivors {n1, n2} until partition `p` has a leader
@@ -10254,6 +10871,473 @@ mod clustered_startup_tests {
                     part.raft.shutdown().await.ok();
                 }
             }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lease_digest_holds_failover_redelivery_until_the_deadline() {
+        // ADR 0002 Part B: with `NANOBPMN_REPLICATE_ACTIVATION=digest`, the
+        // activation lock is leader-local (NOT replicated), so a follower's replica
+        // engine holds an in-flight job as `Created`. The leader periodically
+        // broadcasts its held leases; a follower recovers them on promotion so the
+        // NEW leader honours the original deadline before redelivering — narrowing
+        // the immediate-redelivery window plain leader-local activation opens.
+        let (node0, node1, node2) = boot_rf3_intake_cluster_cfg(true).await;
+
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits via quorum");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        // Lease the job on the leader with a LONG deadline (leader-local; not
+        // replicated). The lease lives only in node 0's engine RAM.
+        let mut leased = false;
+        for _ in 0..200 {
+            let jobs = node0
+                .activate_for_stream("do-work", "w", 10, 600_000, None)
+                .await;
+            if !jobs.is_empty() {
+                leased = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leased, "the job leases on the original leader");
+        assert_eq!(
+            node0.led_partitions(),
+            vec![0],
+            "node 0 leads only partition 0"
+        );
+
+        // Broadcast the held lease to the followers (fire-and-forget over the
+        // command stream), then give it a moment to be recorded on the peers.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        node0.run_lease_digest(now).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Kill the leader while the job is still leased (and not completed).
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+
+        // Wait until the committed create has replicated to the new leader's
+        // replica engine (so there is a `Created` job for the digest to recover).
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        let mut present = false;
+        for _ in 0..400 {
+            if handle
+                .with(move |journal| journal.engine().state().instances.contains_key(&instance_key))
+                .await
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(present, "the create replicates to the new leader");
+
+        // Recover the digest on the new leader. The in-flight job transitions
+        // Created -> Activated until the ORIGINAL deadline, so it is NOT
+        // immediately redeliverable.
+        let recover_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        new_leader.run_lease_digest(recover_now).await;
+
+        let jobs = new_leader
+            .activate_for_stream("do-work", "w", 10, 60_000, None)
+            .await;
+        assert!(
+            jobs.is_empty(),
+            "the recovered lease holds redelivery until the deadline (digest narrowed the window)"
+        );
+
+        // Past the deadline, the normal expiry tick reclaims the recovered lease
+        // and the job is re-offered (at-least-once still holds).
+        let multi_partition = new_leader.engine.topology().num_partitions > 1;
+        let far_future = recover_now + 1_200_000;
+        for _ in 0..50 {
+            new_leader
+                .tick_partition_via_raft(0, far_future, multi_partition)
+                .await;
+            let jobs = new_leader
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
+            if !jobs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let reoffered = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0")
+            .with(move |journal| {
+                journal
+                    .engine()
+                    .state()
+                    .instances
+                    .contains_key(&instance_key)
+            })
+            .await;
+        assert!(
+            reoffered,
+            "after the deadline the job is reclaimed and remains available (at-least-once)"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_durable_acks_on_the_sole_voter_and_ships_to_learners() {
+        // ADR 0003: with `NANOBPMN_REPLICATION=leader-durable`, the partition leader
+        // forms its group as the SOLE voter and the other replicas as learners. A
+        // write therefore acks on the leader's own durable append+apply (quorum = 1,
+        // no follower round-trip) yet still ships to the learners asynchronously, so
+        // their replica engines catch up in the background.
+        let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
+
+        // Membership for partition 0 (led by node 0): exactly one voter (node 0) and
+        // two learners (nodes 1 and 2). This is what takes follower quorum off the
+        // critical path.
+        let part0 = node0
+            .raft_registry()
+            .get(0)
+            .expect("node 0 hosts partition 0");
+        let metrics = part0.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership().clone();
+        let voters: Vec<u64> = membership.voter_ids().collect();
+        let learners: Vec<u64> = membership.learner_ids().collect();
+        assert_eq!(voters, vec![0], "only the leader is a voter in leader-durable");
+        assert_eq!(
+            {
+                let mut l = learners.clone();
+                l.sort_unstable();
+                l
+            },
+            vec![1, 2],
+            "the other two replicas are learners"
+        );
+
+        // A create acks on the leader alone (no follower quorum gates it).
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        // Despite acking without quorum, the entry is shipped to the learners in the
+        // background: a learner's replica engine eventually materializes the
+        // instance, proving async log shipping (durability/catch-up) still happens.
+        let learner_handle = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut replicated = false;
+        for _ in 0..400 {
+            if learner_handle
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            replicated,
+            "the acked entry ships to the learner asynchronously (leader-durable still replicates)"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_durable_auto_recovers_a_leaderless_partition_without_manual_intervention() {
+        // ADR 0003 (option-2 follow-on): in leader-durable mode a partition group
+        // has a single voter, so openraft cannot elect when that leader is lost.
+        // The leader-durable recovery supervisor fills the gap: it detects the
+        // leaderless partition and the deterministic surviving successor app-promotes
+        // itself, seeded from the replica engine that already holds the shipped
+        // state — restoring write availability with NO manual intervention.
+        let (node0, node1, node2, mut handles) =
+            boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Create an instance on partition 0 (led by node 0, the sole voter). It acks
+        // on node 0 and ships to the learners; wait until node 1's replica engine has
+        // it, so the post-promotion state carry-over is observable.
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        let node1_p0 = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut shipped = false;
+        for _ in 0..400 {
+            if node1_p0
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                shipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(shipped, "the create ships to node 1 (learner) before the leader dies");
+
+        // Kill node 0 entirely: stop its Raft groups AND mark it unreachable from
+        // the survivors. Aborting node 0's serve task is not enough on its own —
+        // `axum::serve` drives each accepted connection on a detached task that
+        // outlives the aborted listener, so a survivor's already-established uplink
+        // to node 0 keeps reporting `is_connected`. The fault-injection seam makes
+        // node 0 unreachable from each survivor's `PeerSet`, faithfully simulating
+        // the post-mortem state (links dropped, redials refused) the recovery
+        // failure detector keys on.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        handles[0].abort();
+        node1.peers.fail_node(0).await;
+        node2.peers.fail_node(0).await;
+
+        // Drive the recovery supervisor on the survivors (the spawned loop is not
+        // started in-test). node 1 is the deterministic successor for partition 0
+        // (replicas_of(0) = [0,1,2]; node 0 is down), so it self-promotes; node 2
+        // sees node 1 alive and stands down. Use grace_ticks = 1 for a prompt test.
+        let mut misses1 = std::collections::HashMap::new();
+        let mut misses2 = std::collections::HashMap::new();
+        let mut promoted = false;
+        for _ in 0..200 {
+            node1.leader_durable_recovery_tick(1, &mut misses1).await;
+            node2.leader_durable_recovery_tick(1, &mut misses2).await;
+            if node1
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(1)
+            {
+                promoted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            promoted,
+            "node 1 auto-promotes itself leader of the leaderless partition 0"
+        );
+        assert!(
+            node1.led_partitions().contains(&0),
+            "serving follows the auto-promoted leadership"
+        );
+        // node 2 must NOT also promote (single promoter — deterministic successor).
+        assert_ne!(
+            node2
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader),
+            Some(2),
+            "only the deterministic successor promotes; node 2 stands down"
+        );
+
+        // Write availability is restored: the new leader serves writes for partition
+        // 0. Activate and complete the in-flight job (carried over from the dead
+        // leader's shipped state) and confirm the instance completes on node 1.
+        let mut job_key = None;
+        for _ in 0..200 {
+            let jobs = node1.activate_for_stream("do-work", "w", 10, 60_000, None).await;
+            if let Some(j) = jobs.into_iter().next() {
+                job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let job_key = job_key.expect("the auto-promoted leader serves activateJobs for partition 0");
+        node1
+            .complete_job_for_stream(job_key, Default::default())
+            .await
+            .expect("the auto-promoted leader commits the completion")
+            .wait()
+            .await;
+
+        let mut completed = false;
+        for _ in 0..400 {
+            if node1_p0
+                .with(move |journal| journal.engine().is_completed(instance_key))
+                .await
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            completed,
+            "the instance completes on the auto-promoted leader (write availability recovered)"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_durable_split_brain_reconverges_to_one_leader_via_epoch_tiebreak() {
+        // A symmetric multi-way split can make TWO survivors each self-promote the
+        // same leaderless partition at the SAME epoch (each isolated from the other,
+        // so each is its own deterministic successor). The epoch fence must still
+        // collapse this back to a single leader: same-epoch ties break by lowest
+        // node id, and the tie-loser steps down to a learner of the winner. Without
+        // the tiebreak both would keep leading at equal epochs forever (permanent
+        // split-brain). This proves reconvergence.
+        let (node0, node1, node2, mut handles) =
+            boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Seed partition-0 state and let it ship to BOTH survivors' replica engines
+        // so each has something to promote from.
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        for node in [&node1, &node2] {
+            let h = node
+                .engine_handle_for(0)
+                .expect("survivor materializes a replica engine for partition 0");
+            let mut shipped = false;
+            for _ in 0..400 {
+                if h.with(move |journal| {
+                    journal.engine().state().instances.contains_key(&instance_key)
+                })
+                .await
+                {
+                    shipped = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(shipped, "the create ships to both survivors before the split");
+        }
+
+        // Symmetric split: node 0 is gone, AND node 1 / node 2 cannot see each other.
+        // Each survivor is therefore its own deterministic successor for partition 0.
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        handles[0].abort();
+        node1.peers.fail_node(0).await;
+        node1.peers.fail_node(2).await;
+        node2.peers.fail_node(0).await;
+        node2.peers.fail_node(1).await;
+
+        // Drive recovery on both: each promotes partition 0 at epoch 1. (Broadcasts
+        // can't cross the split — the peers are fault-injected down — so no
+        // cross-delivery happens yet; both end up leaders. That is the split-brain.)
+        let mut m1 = std::collections::HashMap::new();
+        let mut m2 = std::collections::HashMap::new();
+        let leads = |node: &ServerImpl, who: u64| -> bool {
+            node.raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(who)
+        };
+        let mut both = false;
+        for _ in 0..200 {
+            node1.leader_durable_recovery_tick(1, &mut m1).await;
+            node2.leader_durable_recovery_tick(1, &mut m2).await;
+            if leads(&node1, 1) && leads(&node2, 2) {
+                both = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            both,
+            "the symmetric split produces two equal-epoch leaders (split-brain to be resolved)"
+        );
+        // Both promoted at epoch 1, each naming itself.
+        assert_eq!(node1.promotion_epoch.lock().unwrap().get(&0).copied(), Some((1, 1)));
+        assert_eq!(node2.promotion_epoch.lock().unwrap().get(&0).copied(), Some((1, 2)));
+
+        // Heal: each side now learns of the other's promotion (same epoch). Deliver
+        // both announcements. The lowest-id winner (node 1) keeps leadership; node 2
+        // adopts (1, 1) and steps down to a learner.
+        node1.handle_promotion(0, 1, 2).await; // tie-loser announcement: node 1 keeps lead
+        node2.handle_promotion(0, 1, 1).await; // winning announcement: node 2 yields
+
+        // Convergence: both agree the leader is node 1 at epoch 1; node 2 no longer
+        // leads partition 0 (it rebuilt as a receiver/learner). One history, one
+        // leader — split-brain resolved.
+        assert_eq!(
+            node1.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1)),
+            "the lowest-id node keeps leadership"
+        );
+        assert_eq!(
+            node2.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1)),
+            "the tie-loser adopts the winner's fence (deterministic node-id tiebreak)"
+        );
+        assert!(leads(&node1, 1), "node 1 remains leader of partition 0");
+        assert!(
+            !leads(&node2, 2),
+            "node 2 stands down — no longer a competing leader"
+        );
+
+        for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
         }
     }
 }

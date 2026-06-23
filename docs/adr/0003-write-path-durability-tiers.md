@@ -1,6 +1,6 @@
 # ADR 0003 — Write-path durability tiers (leader-durable replication)
 
-Status: **Proposed (spike pending).**
+Status: **Accepted — option-1 spike + app-driven auto-recovery implemented (opt-in, default-off).**
 Date: 2026-06-23.
 Relates to: ADR 0002 (leader-local activation & lease digest), `docs/distributed-scaling-design.md`, `server/src/journal.rs`, `server/src/raft.rs`.
 
@@ -84,6 +84,111 @@ after quorum commit. Options, cheapest → deepest:
 
 The spike should prototype option 1 first (measure the delta cheaply), and scope
 option 2 as the follow-on if the ceiling justifies it.
+
+### As built (option-1 spike)
+
+Implemented behind `NANOBPMN_REPLICATION=quorum|leader-durable` (default
+`quorum`; also accepts `leader_durable` / `acks=1`). The resolved choices:
+
+- **Mechanism = openraft learners (option 1).** In `leader-durable` mode each
+  partition leader forms its group with **itself as the sole voter** and adds the
+  other replicas as **learners** (`Raft::add_learner(.., blocking = false)`),
+  instead of initializing every replica as a voter. The write quorum is therefore
+  1 (the leader), so `client_write` acks after the leader's own local durable
+  append + apply, with **no follower round-trip on the client critical path**.
+  Learners still receive the log via openraft's normal replication, asynchronously
+  and off the ack path — this is the `acks=1` shape using openraft primitives, no
+  second replication engine.
+- **Wiring.** `ReplicationMode` + `replication_mode_from_env()`
+  (`server/src/main.rs`), a `replication_mode` field on `ServerImpl`, and a branch
+  in `raft_bootstrap` that selects the voter set (`{leader}` vs all replicas) and
+  registers the rest as learners. `RaftPartition::add_learner` wraps openraft and
+  swallows the idempotent "already a member" error (`server/src/raft.rs`). The
+  `Batcher` / `propose` path is unchanged — it simply commits faster because the
+  quorum is smaller.
+- **Failover caveat (addressed by app-driven auto-recovery, below).** A single
+  voter means openraft cannot auto-elect a new leader if that leader is lost: there
+  is no voting majority among learners. The option-1 spike on its own is the
+  **cheap, measurable throughput/latency vehicle**; automatic failover is supplied
+  by the app-driven promotion supervisor described in the next section (option 2's
+  spirit, layered on top of the spike rather than replacing it). `quorum` (the
+  default) retains openraft-native auto-failover. Switching tiers across restarts on
+  the same log dir is unsupported (the committed membership differs) — use a fresh
+  cluster.
+- **Verification.** Server test
+  `leader_durable_acks_on_the_sole_voter_and_ships_to_learners` (3-node RF=3):
+  asserts partition 0's membership is exactly one voter (the leader) + two
+  learners, that a create acks on the leader alone, and that the acked entry still
+  ships to a learner's replica engine asynchronously. Full suite green; default
+  (`quorum`) path byte-identical.
+
+### As built (option-2 follow-on: app-driven auto-recovery)
+
+Because a sole-voter openraft group cannot self-elect — and no node can change
+membership without a live leader — automatic failover for `leader-durable` is
+**app-driven**, not delegated to openraft. A promotion supervisor on every node
+detects a leaderless partition and has the deterministic surviving successor
+rebuild the group as a fresh sole-voter group seeded from its replica engine.
+
+- **Detection.** `spawn_leader_durable_recovery()` runs a 500 ms tick
+  (`leader_durable_recovery_tick(grace_ticks, &mut misses)`); it is wired in
+  `main()` after `spawn_raft_bootstrap()` and only does work in `leader-durable`
+  mode. A partition is "leaderless" when its group's `current_leader` is `None` or
+  names a peer that is not `peer_reachable`. After `grace_ticks` consecutive
+  leaderless passes (`NANOBPMN_LEADER_DURABLE_GRACE_TICKS`, default 3) the node
+  acts. The failure detector is `peer_reachable(node)` (a dialable command-stream
+  uplink; `true` for self).
+- **Single-promoter safety.** `designated_successor(p)` is the first node in
+  `replicas_of(p)` order (leader-first, deterministic) that is reachable. Every
+  survivor computes the same successor from the same replica order with no
+  coordination, so **at most one node promotes**.
+- **Promotion.** `promote_partition(p, epoch)` takes the engine actor that already
+  holds the replicated state (its replica engine, or the owned actor), shuts down
+  the stale group, and rebuilds a fresh single-voter group via
+  `RaftPartition::bootstrap_member(.., log_dir = None)` — a clean in-memory
+  `MemLogStore`, since the engine's own journal is the local durability source. It
+  `initialize({me})` (self-elects immediately), replaces the registry entry, then
+  `add_learner`s the reachable survivors so new writes ship to them. Routing
+  (`route_by_leader` / `led_partitions`) follows automatically once the promoted
+  node reports itself leader.
+- **Fencing (epoch + node-id tiebreak).** A monotonic per-partition fence stored as
+  `(epoch, leader_node)`. The promoter broadcasts a
+  `ClientFrame::Promote { partition, epoch, leader_node, leader_addr }` frame;
+  `handle_promotion` adopts a peer's announcement iff it **wins the fence** — a
+  strictly-higher epoch, *or the same epoch from a lower node id* — and rebuilds the
+  receiver as a fresh learner of the winner. A stale or tie-losing leader therefore
+  steps down and rejoins, while the standing winner instead `add_learner`s a
+  tie-losing sender so it rejoins for durability. **Higher epoch wins; equal epochs
+  break by lowest node id** ⇒ a single leader always emerges.
+- **Loss window / split-brain (the inherent acks=1 trade, documented in code).**
+  Any tail the dead leader acked but had not yet shipped to the successor's replica
+  engine is gone — bounded and at-least-once (a lost completion redelivers; a lost
+  create was never durably admitted, so the producer retries). Under a *true network
+  partition* two survivors can each believe the other is dead and both promote. This
+  is the fundamental acks=1 limitation, not a bug — but the fence **always
+  reconverges to one leader**: a strictly-higher epoch wins, and a *symmetric* split
+  that yields two **equal-epoch** promotions is resolved deterministically by lowest
+  node id (the tie-loser adopts the winner and steps down to a learner). The price is
+  bounded loss of the losing side's un-shipped acked tail — never permanent
+  divergence, and never a stuck double-leader.
+- **Verification.** Two server tests (3-node RF=3):
+  - `leader_durable_auto_recovers_a_leaderless_partition_without_manual_intervention`:
+    a create acks on the sole voter and ships to node 1's replica engine; node 0 is
+    then killed (Raft groups shut down + a `PeerSet` fault-injection seam,
+    `fail_node`, marks it unreachable from the survivors — faithfully simulating the
+    post-mortem state, since `axum::serve` drives accepted connections on detached
+    tasks that outlive an aborted listener). Driving the supervisor on the survivors,
+    node 1 (the deterministic successor) self-promotes, node 2 stands down, and the
+    carried-over in-flight job is activated and completed on the new leader — proving
+    write availability is restored with no manual intervention.
+  - `leader_durable_split_brain_reconverges_to_one_leader_via_epoch_tiebreak`: a
+    *symmetric* split (node 0 down AND node 1 / node 2 mutually unreachable) makes
+    both survivors self-promote partition 0 at the **same epoch** — a genuine
+    split-brain. On heal, exchanging the two `Promote` frames collapses it: node 1
+    (lower id) keeps leadership, node 2 adopts the winner's fence and steps down. One
+    leader, one history.
+
+  Full suite green; default (`quorum`) path byte-identical.
 
 ## Are the digest and leader-durable replication complementary? — Yes.
 

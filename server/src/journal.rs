@@ -1099,6 +1099,20 @@ impl Journal {
         self.engine.set_lenient_completion(lenient);
     }
 
+    /// The currently-held activation leases `(job_key, deadline)` on the
+    /// underlying engine — the body of a best-effort lease digest broadcast (see
+    /// [`Engine::activated_leases`]). Pure read.
+    pub fn activated_leases(&self) -> Vec<(u64, u64)> {
+        self.engine.activated_leases()
+    }
+
+    /// Recovers a soft activation lease from a digest on the underlying engine
+    /// (Created → Activated until `deadline`). Soft state only — journals nothing.
+    /// See [`Engine::recover_lease`].
+    pub fn recover_lease(&mut self, job_key: u64, deadline: u64, now: u64) -> bool {
+        self.engine.recover_lease(job_key, deadline, now)
+    }
+
     // --- Read delegations mirroring the engine API the server uses. ---
 
     pub fn state(&self) -> &State {

@@ -48,6 +48,8 @@ mime_guess = { version = "2", optional = true }
 hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
+flate2 = "1.1.9"
+base64 = "0.22.1"
 
 # jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
 # Linux glibc), it returns freed memory to the OS on a decay schedule and exposes

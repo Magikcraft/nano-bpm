@@ -33,6 +33,12 @@ pub struct EngineSnapshot {
     pub start_dispatch_rr: u64,
 }
 
+/// Synthetic worker name stamped on a job whose activation lease was recovered
+/// from a soft lease digest by a newly-promoted leader (see
+/// [`Engine::recover_lease`]). It marks the lease as "restored from a digest, not
+/// held by a live worker connection".
+pub const LEASE_DIGEST_WORKER: &str = "__lease_digest__";
+
 /// An embeddable BPMN engine instance.
 ///
 /// Holds all state in memory. It is `Send` and contains no threads, locks or I/O,
@@ -741,6 +747,48 @@ impl Engine {
             .values()
             .filter(|j| j.state == state::JobState::Created)
             .collect()
+    }
+
+    /// The currently-held activation leases as `(job_key, deadline)` pairs — every
+    /// job in [`state::JobState::Activated`] with a deadline. Used by the
+    /// best-effort **lease digest** (leader-local activation, `digest` mode): a
+    /// partition leader periodically broadcasts these so a future leader can
+    /// recover them on takeover ([`Engine::recover_lease`]) and honour the
+    /// deadline before redelivering, instead of redelivering immediately. Pure
+    /// read; the digest is soft state and is never journaled or replicated.
+    pub fn activated_leases(&self) -> Vec<(Key, u64)> {
+        self.state
+            .jobs
+            .values()
+            .filter(|j| j.state == state::JobState::Activated)
+            .filter_map(|j| j.deadline.map(|d| (j.key, d)))
+            .collect()
+    }
+
+    /// Recovers a soft activation lease from a digest: if `job_key` is currently
+    /// [`state::JobState::Created`] and `deadline` is still in the future, marks
+    /// it [`state::JobState::Activated`] until `deadline` under a synthetic worker.
+    /// Returns `true` if a lease was set.
+    ///
+    /// This is a pure leader-local soft-state mutation — it emits and journals
+    /// **nothing**, because the lease it restores was never replicated (that is
+    /// the whole point of leader-local activation). A newly-promoted leader calls
+    /// this for each lease in the last digest it received from the previous
+    /// leader, so it holds redelivery of in-flight jobs until their original
+    /// deadline (the normal leader-local `expire_jobs` tick then reclaims them)
+    /// rather than redelivering the instant it takes over. Idempotent: a job that
+    /// is already activated (e.g. re-leased by this leader) is left untouched.
+    pub fn recover_lease(&mut self, job_key: Key, deadline: u64, now: u64) -> bool {
+        if let Some(job) = self.state.jobs.get_mut(&job_key) {
+            if job.state == state::JobState::Created && deadline > now {
+                job.state = state::JobState::Activated;
+                job.worker = Some(LEASE_DIGEST_WORKER.to_string());
+                job.deadline = Some(deadline);
+                job.activated = true;
+                return true;
+            }
+        }
+        false
     }
 
     /// Activates up to `max_jobs` activatable jobs of `job_type` for `worker`,
@@ -6596,6 +6644,64 @@ mod tests {
 
         // then the job is gone and the instance advanced past the service task
         assert!(engine.pending_jobs().is_empty());
+    }
+
+    #[test]
+    fn recover_lease_restores_a_soft_lease_and_holds_redelivery_until_the_deadline() {
+        // given a newly-promoted leader that has the job in Created state (it
+        // replicated the create but, under leader-local activation, never saw the
+        // previous leader's activation) and a digested lease (key, deadline=1000)
+        let mut engine = Engine::new();
+        engine.set_lenient_completion(true);
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        // when it recovers the lease from the digest at t=0
+        assert!(engine.recover_lease(job_key, 1_000, 0));
+
+        // then the job is no longer activatable (held until the deadline), so a
+        // worker activation before the deadline gets nothing
+        assert!(engine.pending_jobs().is_empty());
+        assert!(engine.activate_jobs("payment", "W", 10, 1_000, 500).is_empty());
+
+        // and once the original deadline passes, the leader-local expiry tick
+        // reclaims it and it is redelivered (at-least-once, honouring the deadline)
+        engine.expire_jobs(1_500);
+        let reactivated = engine.activate_jobs("payment", "W", 10, 1_000, 1_500);
+        assert_eq!(reactivated.len(), 1);
+        assert_eq!(reactivated[0].key, job_key);
+    }
+
+    #[test]
+    fn recover_lease_is_idempotent_and_respects_an_expired_deadline() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("order"))
+            .unwrap();
+        let job_key = engine.pending_jobs()[0].key;
+
+        // a lease whose deadline has already passed is not recovered
+        assert!(!engine.recover_lease(job_key, 1_000, 1_000));
+        assert_eq!(engine.pending_jobs().len(), 1);
+
+        // a live lease is recovered and surfaces in activated_leases
+        assert!(engine.recover_lease(job_key, 2_000, 1_000));
+        assert_eq!(engine.activated_leases(), vec![(job_key, 2_000)]);
+
+        // recovering again on an already-activated job is a no-op
+        assert!(!engine.recover_lease(job_key, 3_000, 1_000));
+        assert_eq!(engine.activated_leases(), vec![(job_key, 2_000)]);
+
+        // an unknown key is a no-op
+        assert!(!engine.recover_lease(999_999, 5_000, 1_000));
     }
 
     #[test]

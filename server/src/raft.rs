@@ -768,6 +768,22 @@ impl RaftPartition {
         Ok(())
     }
 
+    /// Adds `node` as a **learner** (non-voting replica) of this group — the
+    /// leader-durable path (ADR 0003). A learner receives the replicated log in the
+    /// background but does NOT count toward the write quorum, so the leader (sole
+    /// voter) acks without waiting for it. Idempotent in effect: re-adding an
+    /// existing learner is a cheap no-op error we swallow. `blocking = false` so the
+    /// call returns immediately rather than waiting for the learner to catch up —
+    /// catch-up proceeds asynchronously, which is the whole point of the tier.
+    pub async fn add_learner(&self, node_id: NodeId, node: BasicNode) -> anyhow::Result<()> {
+        match self.raft.add_learner(node_id, node, false).await {
+            Ok(_) => Ok(()),
+            // Already a member (learner or voter): nothing to do.
+            Err(e) if e.to_string().contains("already") => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("add_learner({node_id}): {e}")),
+        }
+    }
+
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
     /// it once committed, returning the events it produced. At RF=1 this commits
     /// as soon as the local log write lands. Routed through the per-partition

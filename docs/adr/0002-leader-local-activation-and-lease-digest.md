@@ -1,6 +1,6 @@
 # ADR 0002 — Leader-local job activation & best-effort lease digest
 
-Status: **Leader-local activation Accepted (shipped, opt-in). Lease digest Proposed (spike pending).**
+Status: **Leader-local activation Accepted (shipped, opt-in). Lease digest Accepted (implemented, opt-in; live failover A/B pending).**
 Date: 2026-06-23.
 Relates to: ADR 0001 (cluster job-activation fairness), `docs/distributed-scaling-design.md`.
 
@@ -74,22 +74,58 @@ leader there is no behavioural change — the single-writer engine still enforce
 exclusive leases, so no double-activation. Documented at
 `replicate_activation_from_env` and the `ServerImpl.replicate_activation` field.
 
-### Part B — Best-effort lease digest (proposed; spike pending)
+### Part B — Best-effort lease digest (implemented; opt-in)
 
-Part A trades the failover redelivery window for ~3× throughput. **Part B aims to
-buy most of that window back without re-incurring the Raft cost and without an
-external dependency**, as a *third* setting, e.g.
-`NANOBPMN_REPLICATE_ACTIVATION=digest`.
+Part A trades the failover redelivery window for ~3× throughput. **Part B buys most
+of that window back without re-incurring the Raft cost and without an external
+dependency**, as a *third* setting: `NANOBPMN_REPLICATE_ACTIVATION=digest`.
 
-Idea: the leader periodically broadcasts a **compact lease digest** to its
-followers as a **fire-and-forget async peer push** (no Raft consensus, no
-per-job round-trip), reusing the existing Stage-2 backlog piggyback channel
-(`activate_from_peer` already carries a per-node backlog `i64` on every
-activation response — see ADR 0001). Followers keep a **soft lease table**. On
-becoming leader, a node holds redelivery of any job it has heard a lease for
-until that lease's (digest-reported) deadline, then re-dispatches as normal.
+Idea: the leader periodically broadcasts a **lease digest** to its followers as a
+**fire-and-forget async peer push** (no Raft consensus, no per-job round-trip) over
+the existing app-lane peer command stream. Followers keep a **soft lease table**. On
+becoming leader, a node recovers any job it has heard a lease for — transitioning it
+`Created → Activated` until that lease's (digest-reported) deadline — so the normal
+leader-local expiry tick re-dispatches it only *after* the deadline rather than
+immediately.
 
-Design questions for the spike (explicitly open):
+**As built (the spike's resolved choices):**
+
+- **Digest shape: full `Vec<(job_key, deadline)>` per partition.** The richest of the
+  options below was chosen for the first cut — it is exact, self-trimming (bounded by
+  concurrent in-flight activated jobs), and needs no key reconstruction (full keys
+  embed their partition). A roaring-bitmap encoding remains a future optimisation if
+  payload size ever matters; pairs are fine at realistic in-flight counts.
+- **Recovery is applied on every tick for every led partition, not on an explicit
+  leadership-transition event.** This is idempotent and self-targeting: a long-stable
+  leader holds *no* received digest for a partition it leads (it only stores digests it
+  *receives*, and receives none for partitions it sends for), so recovery is a no-op
+  except just after a promotion. `recover_lease` is also a no-op on an already-Activated
+  job and on an expired deadline. The stored digest is evicted once its max deadline has
+  passed.
+- **Transport: the app-lane peer WebSocket** (`PeerLink::send_oneway` →
+  `ClientFrame::LeaseDigest`, no `corr`, no reply), *not* the dedicated Raft lane and
+  *not* (yet) the ADR-0001 backlog-piggyback channel. A standalone fire-and-forget frame
+  keeps the digest fully decoupled from both consensus and the fairness signal; folding
+  it into the piggyback envelope remains a possible future consolidation.
+- **Cadence: the existing 500 ms server tick** drives both the broadcast and the
+  recovery pass (`run_lease_digest`), gated on `lease_digest && !raft.is_empty()`.
+- **Soft state only.** `recover_lease`/`activated_leases` (engine-core) mutate engine
+  state without emitting or journaling any event — the lease was never replicated, so
+  there is nothing durable to write. Default and leader-local code paths are
+  byte-identical; the digest is purely additive.
+
+**Verification:** engine-core unit tests cover `recover_lease` (soft Created→Activated,
+idempotent, expired-deadline no-op) and `activated_leases`. A 3-node RF=3 server test
+(`the_lease_digest_holds_failover_redelivery_until_the_deadline`) proves the end-to-end
+behaviour: a job leased on the leader is broadcast, the leader is killed, the new leader
+recovers the digest and an immediate `activateJobs` returns **nothing** (redelivery is
+held), and after the deadline the expiry tick reclaims the lease so the job remains
+available (at-least-once preserved). Still pending: a **live failover A/B** measuring the
+duplicate-execution / redelivery-window reduction vs. plain leader-local (`=0`) under
+load, and a throughput parity check (the digest adds only a periodic fire-and-forget
+broadcast, so throughput should match leader-local).
+
+Open design questions considered during the spike (choices resolved above):
 
 - **Digest shape.** Options, cheapest → richest:
   - a per-partition **max-deadline / grace timestamp** (one `u64` per led
@@ -99,13 +135,12 @@ Design questions for the spike (explicitly open):
   - a **roaring bitmap of leased job-locals** (+ a single grace deadline): the
     new leader holds only the specific jobs it heard were leased. O(in-flight)
     bits, still compact (~in-flight/8 bytes), self-trimming as leases clear.
-  - a full `{job_local → deadline}` map: exact, but O(in-flight) entries and the
-    largest payload. Probably unnecessary.
-- **Cadence vs staleness.** Push every N ms and/or on a batch threshold. A
-  digest is a *hint*, never authoritative: a missed/stale digest degrades to the
-  Part-A behaviour (immediate redelivery) — never to incorrectness, since leases
-  stay exclusive on the live leader's single-writer actor and completion is
-  key-alone.
+  - a full `{job_key → deadline}` map: exact, but O(in-flight) entries and the
+    largest payload. **Chosen** for the first cut (see above).
+- **Cadence vs staleness.** Push every tick. A digest is a *hint*, never
+  authoritative: a missed/stale digest degrades to the Part-A behaviour (immediate
+  redelivery) — never to incorrectness, since leases stay exclusive on the live
+  leader's single-writer actor and completion is key-alone.
 - **Consistency class.** This is intentionally **best-effort / lossy async**,
   i.e. the *same* consistency class as an external Redis/ElastiCache lease
   (async-replicated, can drop the last writes on its own failover), but **with
@@ -118,8 +153,9 @@ Design questions for the spike (explicitly open):
   to ~hundreds of bytes/lease (map). Backlog itself is already gated by
   admission/backpressure, so the digest reflects bound load, it does not create
   it.
-- **Interaction with fairness (ADR 0001).** The digest rides the same peer
-  channel; ensure the two piggybacked payloads compose without extra round-trips.
+- **Interaction with fairness (ADR 0001).** The digest currently rides its own
+  fire-and-forget frame; folding it into the ADR-0001 peer piggyback envelope (so the
+  two payloads compose without extra round-trips) remains a future consolidation.
 
 ## Alternatives considered
 
