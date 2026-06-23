@@ -98,6 +98,15 @@ precedence **inline `prompt` > `promptId` > built-in default**.
 | `PROCESSOS_LLM_MAX_TOKENS` | `2048` | Completion budget |
 | `PROCESSOS_LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 
+These are *defaults*; the console **Settings** panel (the gear in the lower-left of the
+console and cockpit) persists operator overrides to
+`${XDG_CONFIG_HOME:-~/.config}/processos/settings.json` (overridable with
+`PROCESSOS_CONFIG_DIR`; written `0600` as it may hold an API key). The effective config
+layers **built-in default → `PROCESSOS_LLM_*` env → persisted settings → per-request
+`llm` override**, each winning when present — so the console is authoritative over the
+environment without a relaunch. The settings panel also configures `PROCESSOS_PYTHON`
+(the `run_python` interpreter). See [`GET`/`PUT /api/settings`](#endpoints).
+
 ## Workspaces — bounded contexts & processes (multi-tenant + datasets)
 
 A consultant manages many engagements, so ProcessOS roots a **workspace tree** of
@@ -331,6 +340,7 @@ for it automatically.
 | `GET` | `/api/workspaces/{workspace}/processes/{process}/insights` | Insights folded over the process's bound source |
 | `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
 | `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |
+| `GET`/`PUT` | `/api/settings` | Read / update the operator's persisted LLM + Python settings (the console gear). `GET` redacts the API key (`llmApiKeySet`); `PUT` is a partial update — absent fields are unchanged, an empty string clears a field back to the env default |
 
 ## Layout
 
@@ -348,6 +358,7 @@ src/
   agent.rs        provider-agnostic tool-calling loop (OpenAI transport) + lab notebook
   investigate.rs  LLM-driven investigation: analysis ToolBox + disciplined system prompt
   pyrunner.rs     optional run_python escape hatch: CSV export + timeout subprocess runner
+  settings.rs     operator-editable LLM + Python settings, persisted to ~/.config/processos
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
   conversation.rs persisted cockpit conversations + data-dir resolution
   harness/

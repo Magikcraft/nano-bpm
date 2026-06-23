@@ -176,6 +176,7 @@ citing numbers you measured>]}.";
 pub async fn run_investigation(
     src: &TraceSource,
     cfg: LlmConfig,
+    py: PyConfig,
     limit: usize,
     max_rounds: usize,
     allow_python: bool,
@@ -187,7 +188,7 @@ pub async fn run_investigation(
         incidents: analysis.incident_count(),
     };
     let tools = if allow_python {
-        AnalysisTools::with_python(analysis, PyConfig::from_env())
+        AnalysisTools::with_python(analysis, py)
     } else {
         AnalysisTools::new(analysis)
     };

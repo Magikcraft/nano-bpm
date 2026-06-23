@@ -114,6 +114,21 @@
   .step pre { margin: 0; padding: 0 12px 12px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 320px; overflow: auto; }
   .step .args { color: #71717a; padding: 0 12px 6px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
   .conclusion { border: 1px solid #3730a3; background: #14142b; border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
+  #cog { position: fixed; left: 14px; bottom: 14px; width: 38px; height: 38px; border-radius: 50%; font-size: 18px; line-height: 1; display: flex; align-items: center; justify-content: center; background: #18181b; border: 1px solid #3f3f46; color: #a1a1aa; cursor: pointer; z-index: 50; padding: 0; }
+  #cog:hover { color: #e4e4e7; border-color: #6366f1; }
+  #settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 60; display: flex; }
+  #settings-overlay[hidden] { display: none; }
+  #settings-panel { margin: 0 auto 0 0; width: 360px; max-width: 92vw; height: 100%; background: #0f0f11; border-right: 1px solid #27272a; box-shadow: 0 0 40px rgba(0,0,0,.6); display: flex; flex-direction: column; }
+  #settings-panel .ph { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #27272a; }
+  #settings-panel .ph button { background: none; border: none; color: #a1a1aa; font-size: 16px; cursor: pointer; }
+  .settings-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow: auto; }
+  .settings-body label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #a1a1aa; }
+  .settings-body input, .settings-body select { background: #18181b; border: 1px solid #3f3f46; border-radius: 6px; color: #e4e4e7; padding: 6px 8px; font: inherit; }
+  .settings-body .row { display: flex; gap: 10px; }
+  .settings-body .row label { flex: 1; }
+  .settings-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+  .settings-actions .ghost { background: none; }
+  #s-path, #s-status { color: #71717a; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -518,6 +533,85 @@ document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
   const ws = q.get('workspace'), proc = q.get('process');
   if(ws && proc) renderWorkspace(ws, proc);
   else renderConsole();
+})();
+</script>
+<button id="cog" title="Settings" aria-label="Settings">&#9881;</button>
+<div id="settings-overlay" hidden>
+  <div id="settings-panel" role="dialog" aria-label="Settings">
+    <div class="ph"><strong>Settings</strong><button id="s-close" aria-label="Close">&#10005;</button></div>
+    <div class="settings-body">
+      <label>LLM provider
+        <select id="s-provider">
+          <option value="">(env default)</option>
+          <option value="openai">openai / local</option>
+          <option value="anthropic">anthropic</option>
+        </select>
+      </label>
+      <label>Base URL <input id="s-baseUrl" placeholder="e.g. http://localhost:8888/v1"></label>
+      <label>Model <input id="s-model" placeholder="model id (required to run)"></label>
+      <label>API key <input id="s-apiKey" type="password" placeholder="(unset)"></label>
+      <div class="row">
+        <label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048"></label>
+        <label>Temperature <input id="s-temp" type="number" step="0.05" min="0" placeholder="0.2"></label>
+      </div>
+      <label>Python interpreter <input id="s-python" placeholder="python3 or /path/to/venv/bin/python"></label>
+      <div class="settings-actions">
+        <button id="s-save">Save</button>
+        <button id="s-clearkey" class="ghost">Clear API key</button>
+        <span id="s-status"></span>
+      </div>
+      <div id="s-path"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var overlay = $('settings-overlay');
+  function keyPh(set){ return set ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '(unset)'; }
+  function fill(d){
+    $('s-provider').value = d.llmProvider || '';
+    $('s-baseUrl').value = d.llmBaseUrl || '';
+    $('s-model').value = d.llmModel || '';
+    $('s-apiKey').value = ''; $('s-apiKey').placeholder = keyPh(d.llmApiKeySet);
+    $('s-maxTokens').value = d.llmMaxTokens != null ? d.llmMaxTokens : '';
+    $('s-temp').value = d.llmTemperature != null ? d.llmTemperature : '';
+    $('s-python').value = d.pythonBin || '';
+    $('s-path').textContent = d.path ? ('Persisted to ' + d.path) : '';
+  }
+  async function loadSettings(){
+    $('s-status').textContent = '';
+    try { var r = await fetch('/api/settings'); fill(await r.json()); }
+    catch(e){ $('s-status').textContent = 'load failed: ' + e; }
+  }
+  async function save(patch, msg){
+    $('s-status').textContent = 'Saving\u2026';
+    try {
+      var r = await fetch('/api/settings', {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(patch)});
+      var d = await r.json();
+      if(!r.ok){ $('s-status').textContent = 'error: ' + (d.error || r.status); return; }
+      fill(d); $('s-status').textContent = msg || 'Saved';
+    } catch(e){ $('s-status').textContent = 'error: ' + e; }
+  }
+  function open(){ overlay.hidden = false; loadSettings(); }
+  function close(){ overlay.hidden = true; }
+  $('cog').addEventListener('click', open);
+  $('s-close').addEventListener('click', close);
+  overlay.addEventListener('click', function(e){ if(e.target === overlay) close(); });
+  $('s-save').addEventListener('click', function(){
+    var patch = {
+      llmProvider: $('s-provider').value,
+      llmBaseUrl: $('s-baseUrl').value,
+      llmModel: $('s-model').value,
+      llmMaxTokens: $('s-maxTokens').value ? Number($('s-maxTokens').value) : 0,
+      llmTemperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1,
+      pythonBin: $('s-python').value
+    };
+    var key = $('s-apiKey').value;
+    if(key) patch.llmApiKey = key;
+    save(patch, 'Saved \u2713');
+  });
+  $('s-clearkey').addEventListener('click', function(){ save({llmApiKey: ''}, 'API key cleared'); });
 })();
 </script>
 </body>

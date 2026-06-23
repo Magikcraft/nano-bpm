@@ -21,6 +21,7 @@ mod investigate;
 mod pilot;
 mod pyrunner;
 mod report;
+mod settings;
 mod supervisor;
 mod workspace;
 
@@ -70,6 +71,9 @@ struct AppState {
     /// The consultant's workspace tree — workspaces > processes, each bound to a live
     /// customer Nano or a loaded trace dataset. Discovered by scanning the root.
     workspaces: workspace::WorkspaceCatalog,
+    /// Operator-editable settings (LLM connection + Python interpreter), persisted to the
+    /// user's config dir and layered over the environment at request time.
+    settings: settings::SettingsStore,
 }
 
 /// Server configuration, all overridable by environment.
@@ -206,6 +210,7 @@ async fn main() {
         conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
         pilot,
         workspaces: workspace::WorkspaceCatalog::open(workspace::root_from_env(&cfg.data_dir)),
+        settings: settings::SettingsStore::open(),
     };
 
     let app = Router::new()
@@ -267,6 +272,7 @@ async fn main() {
             post(ws_process_investigate),
         )
         .route("/assets/bpmn/{file}", get(bpmn_asset))
+        .route("/api/settings", get(get_settings).put(put_settings))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -915,6 +921,36 @@ async fn ws_process_insights(
 }
 
 
+/// `GET /api/settings` — the operator's persisted settings (LLM connection + Python
+/// interpreter), redacted so the API key is never echoed back.
+async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.settings.view())
+}
+
+/// `PUT /api/settings` — partial update of the persisted settings. Absent fields are
+/// left unchanged; an empty string clears a field back to the environment default.
+async fn put_settings(
+    State(state): State<AppState>,
+    Json(patch): Json<settings::SettingsPatch>,
+) -> impl IntoResponse {
+    match state.settings.update(patch) {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => bad_gateway(format!("could not persist settings: {e}")),
+    }
+}
+
+/// Resolve the effective LLM config for a request: built-in defaults → `PROCESSOS_LLM_*`
+/// env → persisted operator settings → per-request override. Each later layer wins when
+/// present, so the console is authoritative over the environment while a one-off request
+/// body can still override everything.
+fn resolve_llm(state: &AppState, req: Option<&LlmOverride>) -> LlmConfig {
+    let mut cfg = LlmConfig::from_env().with_override(&state.settings.snapshot().as_llm_override());
+    if let Some(o) = req {
+        cfg = cfg.with_override(o);
+    }
+    cfg
+}
+
 /// Request body for an investigation: optional LLM override + bounds.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -943,15 +979,12 @@ async fn ws_process_investigate(
     Path((workspace, process)): Path<(String, String)>,
     Json(req): Json<InvestigateRequest>,
 ) -> impl IntoResponse {
-    let mut cfg = LlmConfig::from_env();
-    if let Some(o) = &req.llm {
-        cfg = cfg.with_override(o);
-    }
+    let cfg = resolve_llm(&state, req.llm.as_ref());
     if !cfg.is_ready() {
         return unprocessable(
-            "no LLM model configured; set PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL \
-             / PROCESSOS_LLM_PROVIDER as needed) or pass an `llm` object with at least \
-             `model` in the request body"
+            "no LLM model configured; set it in the console settings (cog, lower-left) or \
+             via PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER \
+             as needed), or pass an `llm` object with at least `model` in the request body"
                 .to_string(),
         );
     }
@@ -962,6 +995,7 @@ async fn ws_process_investigate(
     let limit = req.limit.unwrap_or(100_000).clamp(1, 1_000_000);
     let max_rounds = req.max_rounds.unwrap_or(12).clamp(1, 40);
     let allow_python = req.allow_python;
+    let py = state.settings.snapshot().py_config();
     // The DuckDB connection inside the analysis is !Send, so the investigation cannot
     // cross the multi-threaded handler's await boundary. Run the whole loop on a
     // dedicated current-thread runtime where the connection never leaves its thread.
@@ -971,7 +1005,7 @@ async fn ws_process_investigate(
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
         rt.block_on(investigate::run_investigation(
-            &src, cfg, limit, max_rounds, allow_python,
+            &src, cfg, py, limit, max_rounds, allow_python,
         ))
     })
     .await;
@@ -1077,17 +1111,15 @@ async fn harness_hypothesize(
     State(state): State<AppState>,
     Json(req): Json<HypothesizeRequest>,
 ) -> impl IntoResponse {
-    let mut cfg = LlmConfig::from_env();
-    if let Some(o) = &req.llm {
-        cfg = cfg.with_override(o);
-    }
+    let cfg = resolve_llm(&state, req.llm.as_ref());
     if !cfg.is_ready() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "no LLM model configured; set PROCESSOS_LLM_MODEL (and \
-                          PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER as needed) \
-                          or pass an `llm` object with at least `model` in the request body"
+                "error": "no LLM model configured; set it in the console settings (cog, \
+                          lower-left) or via PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL \
+                          / PROCESSOS_LLM_PROVIDER as needed), or pass an `llm` object with \
+                          at least `model` in the request body"
             })),
         )
             .into_response();
@@ -1484,18 +1516,17 @@ async fn harness_evolve(
     State(state): State<AppState>,
     Json(req): Json<EvolveRequest>,
 ) -> impl IntoResponse {
-    // Resolve LLM config (env + per-request override); a model name is required.
-    let mut cfg = LlmConfig::from_env();
-    if let Some(o) = &req.llm {
-        cfg = cfg.with_override(o);
-    }
+    // Resolve LLM config (env + persisted settings + per-request override); a model
+    // name is required.
+    let cfg = resolve_llm(&state, req.llm.as_ref());
     if !cfg.is_ready() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "no LLM model configured; set PROCESSOS_LLM_MODEL (and \
-                          PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER as needed) \
-                          or pass an `llm` object with at least `model`"
+                "error": "no LLM model configured; set it in the console settings (cog, \
+                          lower-left) or via PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL \
+                          / PROCESSOS_LLM_PROVIDER as needed), or pass an `llm` object with \
+                          at least `model`"
             })),
         )
             .into_response();
@@ -1871,6 +1902,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   .bottleneck { color: #fca5a5; }
   .err { color: #fca5a5; background: #2a0a0a; padding: 12px 16px; border-radius: 8px; }
   button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  #cog { position: fixed; left: 14px; bottom: 14px; width: 38px; height: 38px; border-radius: 50%; font-size: 18px; line-height: 1; display: flex; align-items: center; justify-content: center; background: #18181b; border: 1px solid #3f3f46; color: #a1a1aa; cursor: pointer; z-index: 50; padding: 0; }
+  #cog:hover { color: #e4e4e7; border-color: #6366f1; }
+  #settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 60; display: flex; }
+  #settings-overlay[hidden] { display: none; }
+  #settings-panel { margin: 0 auto 0 0; width: 360px; max-width: 92vw; height: 100%; background: #0f0f11; border-right: 1px solid #27272a; box-shadow: 0 0 40px rgba(0,0,0,.6); display: flex; flex-direction: column; }
+  #settings-panel .ph { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid #27272a; }
+  #settings-panel .ph button { background: none; border: none; color: #a1a1aa; font-size: 16px; }
+  .settings-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow: auto; }
+  .settings-body label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #a1a1aa; }
+  .settings-body input, .settings-body select { background: #18181b; border: 1px solid #3f3f46; border-radius: 6px; color: #e4e4e7; padding: 6px 8px; font: inherit; }
+  .settings-body .row { display: flex; gap: 10px; }
+  .settings-body .row label { flex: 1; }
+  .settings-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+  .settings-actions .ghost { background: none; }
 </style>
 </head>
 <body>
@@ -1937,6 +1982,85 @@ async function load(){
 }
 function card(n,l){ return '<div class="card"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'; }
 load();
+</script>
+<button id="cog" title="Settings" aria-label="Settings">&#9881;</button>
+<div id="settings-overlay" hidden>
+  <div id="settings-panel" role="dialog" aria-label="Settings">
+    <div class="ph"><strong>Settings</strong><button id="s-close" aria-label="Close">&#10005;</button></div>
+    <div class="settings-body">
+      <label>LLM provider
+        <select id="s-provider">
+          <option value="">(env default)</option>
+          <option value="openai">openai / local</option>
+          <option value="anthropic">anthropic</option>
+        </select>
+      </label>
+      <label>Base URL <input id="s-baseUrl" placeholder="e.g. http://localhost:8888/v1"></label>
+      <label>Model <input id="s-model" placeholder="model id (required to run)"></label>
+      <label>API key <input id="s-apiKey" type="password" placeholder="(unset)"></label>
+      <div class="row">
+        <label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048"></label>
+        <label>Temperature <input id="s-temp" type="number" step="0.05" min="0" placeholder="0.2"></label>
+      </div>
+      <label>Python interpreter <input id="s-python" placeholder="python3 or /path/to/venv/bin/python"></label>
+      <div class="settings-actions">
+        <button id="s-save">Save</button>
+        <button id="s-clearkey" class="ghost">Clear API key</button>
+        <span id="s-status" class="sub"></span>
+      </div>
+      <div class="sub" id="s-path"></div>
+    </div>
+  </div>
+</div>
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var overlay = $('settings-overlay');
+  function keyPh(set){ return set ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '(unset)'; }
+  function fill(d){
+    $('s-provider').value = d.llmProvider || '';
+    $('s-baseUrl').value = d.llmBaseUrl || '';
+    $('s-model').value = d.llmModel || '';
+    $('s-apiKey').value = ''; $('s-apiKey').placeholder = keyPh(d.llmApiKeySet);
+    $('s-maxTokens').value = d.llmMaxTokens != null ? d.llmMaxTokens : '';
+    $('s-temp').value = d.llmTemperature != null ? d.llmTemperature : '';
+    $('s-python').value = d.pythonBin || '';
+    $('s-path').textContent = d.path ? ('Persisted to ' + d.path) : '';
+  }
+  async function loadSettings(){
+    $('s-status').textContent = '';
+    try { var r = await fetch('/api/settings'); fill(await r.json()); }
+    catch(e){ $('s-status').textContent = 'load failed: ' + e; }
+  }
+  async function save(patch, msg){
+    $('s-status').textContent = 'Saving\u2026';
+    try {
+      var r = await fetch('/api/settings', {method:'PUT', headers:{'content-type':'application/json'}, body:JSON.stringify(patch)});
+      var d = await r.json();
+      if(!r.ok){ $('s-status').textContent = 'error: ' + (d.error || r.status); return; }
+      fill(d); $('s-status').textContent = msg || 'Saved';
+    } catch(e){ $('s-status').textContent = 'error: ' + e; }
+  }
+  function open(){ overlay.hidden = false; loadSettings(); }
+  function close(){ overlay.hidden = true; }
+  $('cog').addEventListener('click', open);
+  $('s-close').addEventListener('click', close);
+  overlay.addEventListener('click', function(e){ if(e.target === overlay) close(); });
+  $('s-save').addEventListener('click', function(){
+    var patch = {
+      llmProvider: $('s-provider').value,
+      llmBaseUrl: $('s-baseUrl').value,
+      llmModel: $('s-model').value,
+      llmMaxTokens: $('s-maxTokens').value ? Number($('s-maxTokens').value) : 0,
+      llmTemperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1,
+      pythonBin: $('s-python').value
+    };
+    var key = $('s-apiKey').value;
+    if(key) patch.llmApiKey = key;
+    save(patch, 'Saved \u2713');
+  });
+  $('s-clearkey').addEventListener('click', function(){ save({llmApiKey: ''}, 'API key cleared'); });
+})();
 </script>
 </body>
 </html>
