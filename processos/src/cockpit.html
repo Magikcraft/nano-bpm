@@ -4,6 +4,8 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ProcessOS — Cockpit</title>
+<link rel="stylesheet" href="/assets/bpmn/diagram-js.css" />
+<link rel="stylesheet" href="/assets/bpmn/bpmn-embedded.css" />
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -102,6 +104,16 @@
   #promptEditor input:disabled, #promptEditor textarea:disabled { opacity: .6; }
   #pilotNote { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; }
   .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid #26262b; }
+  /* workspace investigation surface */
+  .ws-model { background: #fafafa; border: 1px solid #26262b; border-radius: 12px; height: 460px; margin: 14px 0; }
+  .ws-grid { display: grid; grid-template-columns: 110px 1fr; gap: 6px 14px; font-size: 13px; margin: 10px 0; }
+  .ws-grid b { color: #a1a1aa; font-weight: 500; }
+  .notebook { margin-top: 14px; }
+  .step { border: 1px solid #26262b; border-radius: 9px; margin-bottom: 8px; background: #0c0c0e; }
+  .step summary { cursor: pointer; padding: 9px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: #c7d2fe; }
+  .step pre { margin: 0; padding: 0 12px 12px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 320px; overflow: auto; }
+  .step .args { color: #71717a; padding: 0 12px 6px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .conclusion { border: 1px solid #3730a3; background: #14142b; border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -134,6 +146,7 @@
   </div>
 </dialog>
 
+<script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const main = $('#main');
@@ -415,6 +428,81 @@ $('#dlgGo').onclick = async () => {
 
 function fail(e){ main.innerHTML = '<div class="err">'+esc(e.message||e)+'</div>'; }
 
+// ---- Workspace process investigation (?workspace=&process=) ----
+// Reason with the droid over a workspace process and its bound trace dataset.
+async function renderWorkspace(ws, proc){
+  STATE.view='workspace'; setActive();
+  main.innerHTML = 'Loading…';
+  let p;
+  try { p = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)); }
+  catch(e){ return fail(e); }
+  const binding = p.binding==='dataset' ? '<span class="pill accept">dataset</span>' : '<span class="pill run">'+esc(p.binding||'unbound')+'</span>';
+  main.innerHTML = `
+    <div class="muted" style="font-size:12px">
+      <a href="/workspace#/c/${encodeURIComponent(ws)}/p/${encodeURIComponent(proc)}" style="color:#a5b4fc">← back to workspace</a>
+      · ${esc(ws)} / ${esc(proc)}
+    </div>
+    <h1 style="margin:6px 0">${esc(p.displayName||proc)} ${binding}</h1>
+    <div class="ws-grid">
+      <b>source</b><span style="font-family:ui-monospace,monospace;font-size:12px">${esc(p.datasetPath||'—')}</span>
+      ${p.objective ? '<b>objective</b><span>'+esc(p.objective)+'</span>' : ''}
+    </div>
+    ${p.hasModel ? '<div id="wsModel" class="ws-model"></div>' : ''}
+    <div style="display:flex;align-items:center;gap:14px;margin:12px 0">
+      <button class="btn primary" id="invGo">Investigate with the droid →</button>
+      <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:6px">
+        <input type="checkbox" id="invPy" /> allow Python escape hatch
+      </label>
+    </div>
+    <p class="muted" style="font-size:12px;max-width:680px">The droid queries the bound trace dataset directly (read-only SQL over a DuckDB view, plus an optional trusted Python tier) to form and test its own hypotheses. Its conclusion and full query/result lab notebook appear below.</p>
+    <div id="invOut"></div>`;
+  if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
+  $('#invGo').onclick = () => runInvestigation(ws, proc);
+}
+
+async function renderWsModel(url){
+  const el = document.getElementById('wsModel');
+  if(!el || typeof BpmnJS === 'undefined'){ if(el) el.innerHTML='<p class="muted" style="padding:12px">viewer unavailable</p>'; return; }
+  try {
+    const xml = await (await fetch(url)).text();
+    const viewer = new BpmnJS({ container: el });
+    await viewer.importXML(xml);
+    viewer.get('canvas').zoom('fit-viewport', 'auto');
+  } catch(e){ el.innerHTML = '<p class="err" style="padding:12px">could not render model: '+esc(e.message||e)+'</p>'; }
+}
+
+async function runInvestigation(ws, proc){
+  const btn = $('#invGo'); const out = $('#invOut');
+  const allowPython = $('#invPy').checked;
+  btn.disabled = true; btn.textContent = 'Investigating…';
+  out.innerHTML = '<p class="muted">The droid is reasoning over the dataset — this can take a moment.</p>';
+  try {
+    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/investigate', {
+      method: 'POST', headers: {'content-type':'application/json'},
+      body: JSON.stringify({ allowPython })
+    });
+    const ds = r.dataset || {};
+    const run = r.run || {};
+    const steps = (run.steps||[]).map(s => `
+      <details class="step">
+        <summary>${esc(s.tool)} · ${(run.steps||[]).indexOf(s)+1}</summary>
+        <div class="args">${esc(JSON.stringify(s.arguments))}</div>
+        <pre>${esc(s.result)}</pre>
+      </details>`).join('');
+    out.innerHTML = `
+      <div class="ws-grid">
+        <b>dataset</b><span>${ds.instances??'—'} instances · ${ds.jobs??'—'} jobs · ${ds.incidents??'—'} incidents</span>
+        <b>rounds</b><span>${run.rounds??'—'}</span>
+      </div>
+      <div class="conclusion">${esc(run.answer||'(no conclusion)')}</div>
+      <div class="notebook">
+        <h2 style="font-size:14px;margin:16px 0 8px">Lab notebook (${(run.steps||[]).length} queries)</h2>
+        ${steps || '<p class="muted">No tool calls recorded.</p>'}
+      </div>`;
+  } catch(e){ out.innerHTML = '<div class="err">'+esc(e.message||e)+'</div>'; }
+  finally { btn.disabled = false; btn.textContent = 'Investigate with the droid →'; }
+}
+
 document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
   const v = a.dataset.view;
   if(v==='console') renderConsole();
@@ -423,7 +511,14 @@ document.querySelectorAll('.nav a').forEach(a => a.onclick = () => {
   else if(v==='experiments') renderExperiments();
 });
 
-renderConsole();
+// Boot: a workspace-process deep-link (?workspace=&process=) opens the
+// investigation surface; otherwise the default console.
+(function(){
+  const q = new URLSearchParams(location.search);
+  const ws = q.get('workspace'), proc = q.get('process');
+  if(ws && proc) renderWorkspace(ws, proc);
+  else renderConsole();
+})();
 </script>
 </body>
 </html>

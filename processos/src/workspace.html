@@ -4,6 +4,8 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ProcessOS — Workspaces</title>
+<link rel="stylesheet" href="/assets/bpmn/diagram-js.css" />
+<link rel="stylesheet" href="/assets/bpmn/bpmn-embedded.css" />
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -51,6 +53,11 @@
   .err { color: #fca5a5; font-size: 13px; margin: 10px 0; }
   .muted { color: #71717a; }
   code { font-family: ui-monospace, monospace; color: #c7d2fe; }
+  .model { height: 420px; background: #fbfbfd; border: 1px solid #26262b; border-radius: 10px; margin: 8px 0 4px; overflow: hidden; }
+  .model .djs-container { background: #fbfbfd; }
+  .panel { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+  .panel h2 { margin-top: 0; }
+  .btnrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0 0; }
 </style>
 </head>
 <body>
@@ -58,13 +65,14 @@
   <span class="brand">Process<span class="dot">OS</span></span>
   <span class="tag">Workspaces</span>
   <nav>
-    <a href="/console">Insights</a>
     <a href="/cockpit">Cockpit</a>
+    <a href="/console">Live insights</a>
     <a href="/">Home</a>
   </nav>
 </header>
 <main id="app">Loading…</main>
 
+<script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
 <script>
 const $ = (h) => { const t = document.createElement('template'); t.innerHTML = h.trim(); return t.content.firstChild; };
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -79,37 +87,55 @@ async function api(path, opts) {
 
 function bindingPill(b) { return `<span class="pill ${b}">${b}</span>`; }
 
-// --- customers list -----------------------------------------------------
-async function viewCustomers() {
+// --- workspaces list ----------------------------------------------------
+async function viewWorkspaces() {
   app.innerHTML = 'Loading…';
   let data;
-  try { data = await api('/api/workspace/customers'); }
+  try { data = await api('/api/workspaces'); }
   catch (e) { app.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
 
-  const tiles = data.customers.map(c => `
+  const tiles = data.workspaces.map(c => `
     <div class="tile" data-c="${esc(c.slug)}">
       <h3>${esc(c.displayName || c.slug)}</h3>
       <div class="meta">${c.processCount} process${c.processCount === 1 ? '' : 'es'} · <code>${esc(c.slug)}</code></div>
     </div>`).join('');
 
   app.innerHTML = `
-    <h1>Customers</h1>
-    <p class="lede">Each customer is a folder under <code>${esc(data.root)}</code>. A consultant curates customers and their processes here; a process binds to a live customer Nano instance or a loaded trace dataset.</p>
-    <div class="row"><button class="primary" id="newC">+ New customer</button></div>
+    <h1>Workspaces</h1>
+    <p class="lede">A workspace is a bounded context for one customer/deployment — a folder under <code>${esc(data.root)}</code>. Inside it you connect to a live Nano instance or load captured processes and traces, then drill into a process to study its model, its insights, and reason over it with the droid in the cockpit.</p>
+    <div class="btnrow">
+      <button class="primary" id="newC">+ New workspace</button>
+      <button id="seed">Load demo dataset</button>
+    </div>
     <div id="dlg"></div>
-    <h2>Customers</h2>
-    <div class="grid">${tiles || '<p class="muted">No customers yet — create one to begin.</p>'}</div>`;
+    <h2>Workspaces</h2>
+    <div class="grid">${tiles || '<p class="muted">No workspaces yet — create one, or load the demo dataset to begin.</p>'}</div>`;
 
   app.querySelectorAll('.tile[data-c]').forEach(t =>
     t.onclick = () => location.hash = '#/c/' + t.dataset.c);
-  document.getElementById('newC').onclick = () => showNewCustomer();
+  document.getElementById('newC').onclick = () => showNewWorkspace();
+  document.getElementById('seed').onclick = (e) => seedDemo(e.target);
 }
 
-function showNewCustomer() {
+async function seedDemo(btn) {
+  btn.disabled = true; const label = btn.textContent; btn.textContent = 'Generating demo corpus…';
+  try {
+    const r = await api('/api/workspaces/seed-demo', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+    });
+    location.hash = '#/c/' + r.workspace + '/p/' + r.process;
+  } catch (e) {
+    btn.disabled = false; btn.textContent = label;
+    const dlg = document.getElementById('dlg');
+    if (dlg) dlg.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+  }
+}
+
+function showNewWorkspace() {
   const dlg = document.getElementById('dlg');
   dlg.innerHTML = '';
   const el = $(`<div class="dialog">
-    <label>Display name</label><input id="cn" placeholder="Acme Corp" />
+    <label>Display name</label><input id="cn" placeholder="Northwind Bank" />
     <label>Notes (optional)</label><input id="cnotes" placeholder="priority account" />
     <div class="row" style="margin-top:12px"><button class="primary" id="save">Create</button><button id="cancel">Cancel</button></div>
     <div class="err" id="e"></div></div>`);
@@ -117,7 +143,7 @@ function showNewCustomer() {
   el.querySelector('#cancel').onclick = () => dlg.innerHTML = '';
   el.querySelector('#save').onclick = async () => {
     try {
-      const c = await api('/api/workspace/customers', {
+      const c = await api('/api/workspaces', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ displayName: el.querySelector('#cn').value, notes: el.querySelector('#cnotes').value || null })
       });
@@ -126,24 +152,24 @@ function showNewCustomer() {
   };
 }
 
-// --- one customer: its processes ----------------------------------------
-async function viewCustomer(slug) {
+// --- one workspace: its processes ---------------------------------------
+async function viewWorkspace(slug) {
   app.innerHTML = 'Loading…';
   let data;
-  try { data = await api('/api/workspace/customers/' + encodeURIComponent(slug)); }
+  try { data = await api('/api/workspaces/' + encodeURIComponent(slug)); }
   catch (e) { app.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
 
   const tiles = data.processes.map(p => `
     <div class="tile" data-p="${esc(p.slug)}">
       <h3>${esc(p.displayName || p.slug)} ${bindingPill(p.binding)}</h3>
-      <div class="meta">${p.objective ? esc(p.objective) + ' · ' : ''}<code>${esc(p.slug)}</code></div>
+      <div class="meta">${p.hasModel ? '◇ model · ' : ''}${p.objective ? esc(p.objective) + ' · ' : ''}<code>${esc(p.slug)}</code></div>
     </div>`).join('');
 
   app.innerHTML = `
-    <div class="crumbs"><a id="up">Customers</a> / ${esc(data.customer.displayName || slug)}</div>
-    <h1>${esc(data.customer.displayName || slug)}</h1>
-    ${data.customer.notes ? `<p class="lede">${esc(data.customer.notes)}</p>` : ''}
-    <div class="row"><button class="primary" id="newP">+ New process</button></div>
+    <div class="crumbs"><a id="up">Workspaces</a> / ${esc(data.workspace.displayName || slug)}</div>
+    <h1>${esc(data.workspace.displayName || slug)}</h1>
+    ${data.workspace.notes ? `<p class="lede">${esc(data.workspace.notes)}</p>` : ''}
+    <div class="btnrow"><button class="primary" id="newP">+ New process</button></div>
     <div id="dlg"></div>
     <h2>Processes</h2>
     <div class="grid">${tiles || '<p class="muted">No processes yet — add one and bind it to a live engine or a trace dataset.</p>'}</div>`;
@@ -154,7 +180,7 @@ async function viewCustomer(slug) {
   document.getElementById('newP').onclick = () => showNewProcess(slug);
 }
 
-function showNewProcess(customer) {
+function showNewProcess(workspace) {
   const dlg = document.getElementById('dlg');
   dlg.innerHTML = '';
   const el = $(`<div class="dialog">
@@ -163,13 +189,13 @@ function showNewProcess(customer) {
     <label>Trace dataset folder (optional — used when no target URL)</label><input id="pd" placeholder="leave blank to use a traces/ folder beside the process" />
     <label>Objective (optional)</label><input id="po" placeholder="cut p99 latency" />
     <div class="row" style="margin-top:12px"><button class="primary" id="save">Create</button><button id="cancel">Cancel</button></div>
-    <div class="muted" style="margin-top:8px;font-size:12px">Bind to a live engine <em>or</em> a dataset. Leave both blank to create the folder now and drop a <code>traces/</code> dataset in later.</div>
+    <div class="muted" style="margin-top:8px;font-size:12px">Bind to a live engine <em>or</em> a dataset. Leave both blank to create the folder now and drop a <code>traces/</code> dataset and a <code>model.bpmn</code> in later.</div>
     <div class="err" id="e"></div></div>`);
   dlg.appendChild(el);
   el.querySelector('#cancel').onclick = () => dlg.innerHTML = '';
   el.querySelector('#save').onclick = async () => {
     try {
-      const p = await api('/api/workspace/customers/' + encodeURIComponent(customer) + '/processes', {
+      const p = await api('/api/workspaces/' + encodeURIComponent(workspace) + '/processes', {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           displayName: el.querySelector('#pn').value,
@@ -178,40 +204,60 @@ function showNewProcess(customer) {
           objective: el.querySelector('#po').value || null
         })
       });
-      location.hash = '#/c/' + customer + '/p/' + p.slug;
+      location.hash = '#/c/' + workspace + '/p/' + p.slug;
     } catch (e) { el.querySelector('#e').textContent = e.message; }
   };
 }
 
-// --- one process: config + insights -------------------------------------
-async function viewProcess(customer, process) {
+// --- one process: model + config + insights -----------------------------
+async function viewProcess(workspace, process) {
   app.innerHTML = 'Loading…';
   let p;
-  try { p = await api(`/api/workspace/customers/${encodeURIComponent(customer)}/processes/${encodeURIComponent(process)}`); }
+  const base = `/api/workspaces/${encodeURIComponent(workspace)}/processes/${encodeURIComponent(process)}`;
+  try { p = await api(base); }
   catch (e) { app.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
 
+  const cockpitUrl = `/cockpit?workspace=${encodeURIComponent(workspace)}&process=${encodeURIComponent(process)}`;
   app.innerHTML = `
-    <div class="crumbs"><a id="up0">Customers</a> / <a id="up1">${esc(customer)}</a> / ${esc(p.displayName || process)}</div>
+    <div class="crumbs"><a id="up0">Workspaces</a> / <a id="up1">${esc(workspace)}</a> / ${esc(p.displayName || process)}</div>
     <h1>${esc(p.displayName || process)} ${bindingPill(p.binding)}</h1>
     <p class="lede">
       Source: ${p.binding === 'live' ? `live <code>${esc(p.targetUrl)}</code>` : p.binding === 'dataset' ? `dataset <code>${esc(p.datasetPath)}</code>` : '<span class="muted">unbound — set a target URL or drop a traces/ dataset folder</span>'}
       ${p.objective ? ' · objective: ' + esc(p.objective) : ''}
     </p>
-    <div class="row"><button class="primary" id="load" ${p.binding === 'unbound' ? 'disabled' : ''}>Load Insights</button></div>
+    <div class="btnrow">
+      <a href="${cockpitUrl}"><button class="primary">Reason in cockpit →</button></a>
+      <button id="load" ${p.binding === 'unbound' ? 'disabled' : ''}>Load insights</button>
+    </div>
+    ${p.hasModel ? `<h2>Process model</h2><div class="model" id="model"></div>` : '<p class="muted" style="margin-top:14px">No <code>model.bpmn</code> for this process yet.</p>'}
     <div id="ins"></div>`;
 
   document.getElementById('up0').onclick = () => location.hash = '#/';
-  document.getElementById('up1').onclick = () => location.hash = '#/c/' + customer;
+  document.getElementById('up1').onclick = () => location.hash = '#/c/' + workspace;
   const load = document.getElementById('load');
-  if (load && !load.disabled) load.onclick = () => loadInsights(customer, process);
+  if (load && !load.disabled) load.onclick = () => loadInsights(base);
+  if (p.hasModel) renderModel(base + '/model');
 }
 
-async function loadInsights(customer, process) {
+async function renderModel(modelUrl) {
+  const el = document.getElementById('model');
+  if (!el || typeof BpmnJS === 'undefined') { if (el) el.innerHTML = '<p class="muted" style="padding:12px">viewer unavailable</p>'; return; }
+  try {
+    const xml = await (await fetch(modelUrl)).text();
+    const viewer = new BpmnJS({ container: el });
+    await viewer.importXML(xml);
+    viewer.get('canvas').zoom('fit-viewport', 'auto');
+  } catch (e) {
+    el.innerHTML = `<p class="err" style="padding:12px">could not render model: ${esc(e.message || e)}</p>`;
+  }
+}
+
+async function loadInsights(base) {
   const ins = document.getElementById('ins');
-  ins.innerHTML = '<p class="muted">Reading traces…</p>';
+  ins.innerHTML = '<h2>Insights</h2><p class="muted">Reading traces…</p>';
   let r;
-  try { r = await api(`/api/workspace/customers/${encodeURIComponent(customer)}/processes/${encodeURIComponent(process)}/insights`); }
-  catch (e) { ins.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  try { r = await api(base + '/insights'); }
+  catch (e) { ins.innerHTML = `<h2>Insights</h2><div class="err">${esc(e.message)}</div>`; return; }
 
   const t = r.totals;
   const cards = `<div class="cards">
@@ -230,9 +276,8 @@ async function loadInsights(customer, process) {
         <td>${pr.bottleneck ? esc(pr.bottleneck.elementId) : '<span class="muted">—</span>'}</td></tr>`).join('');
 
   ins.innerHTML = `
-    <h2>Source: <code>${esc(r.nanoBaseUrl)}</code> · sampled ${r.sampledInstances} instances</h2>
+    <h2>Insights — <code>${esc(r.nanoBaseUrl)}</code> · sampled ${r.sampledInstances} instances</h2>
     ${cards}
-    <h2>Processes</h2>
     <table><thead><tr><th>process</th><th>instances</th><th>avg ms</th><th>p95 ms</th><th>bottleneck</th></tr></thead>
     <tbody>${procRows || '<tr><td colspan="5" class="muted">no detail sampled</td></tr>'}</tbody></table>`;
 }
@@ -243,8 +288,8 @@ function route() {
   const m = h.match(/^\/c\/([^/]+)\/p\/([^/]+)/);
   if (m) return viewProcess(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
   const c = h.match(/^\/c\/([^/]+)/);
-  if (c) return viewCustomer(decodeURIComponent(c[1]));
-  return viewCustomers();
+  if (c) return viewWorkspace(decodeURIComponent(c[1]));
+  return viewWorkspaces();
 }
 window.addEventListener('hashchange', route);
 route();

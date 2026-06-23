@@ -98,28 +98,38 @@ precedence **inline `prompt` > `promptId` > built-in default**.
 | `PROCESSOS_LLM_MAX_TOKENS` | `2048` | Completion budget |
 | `PROCESSOS_LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 
-## Workspaces — customers & processes (multi-tenant + datasets)
+## Workspaces — bounded contexts & processes (multi-tenant + datasets)
 
 A consultant manages many engagements, so ProcessOS roots a **workspace tree** of
-`customers / processes` on disk (`src/workspace.rs`). Each process **binds** to a
-trace source — either a **live** Nano instance (`targetUrl`) or a **loaded dataset**
-(a folder of instance-trace JSON, or a sibling `traces/` folder) — and the Insights
-report is folded over whichever source is bound (`src/dataset.rs`,
-`report::build_over`). Folders are scanned from disk, so a consultant can curate a
-customer folder structure by hand and it shows up; the CRUD API also creates them.
+`workspaces / processes` on disk (`src/workspace.rs`). A **workspace** is a bounded
+context for one customer/deployment. Each process **binds** to a trace source —
+either a **live** Nano instance (`targetUrl`) or a **loaded dataset** (a folder of
+instance-trace JSON, or a sibling `traces/` folder) — and the Insights report is
+folded over whichever source is bound (`src/dataset.rs`, `report::build_over`).
+Folders are scanned from disk, so a consultant can curate a workspace folder
+structure by hand and it shows up; the CRUD API also creates them. The front door
+is `/workspace`: browse workspaces → open one → open a process to see its **rendered
+BPMN model** (vendored bpmn-js viewer, served from `/assets/bpmn/`) and Insights,
+then **Reason in cockpit →** to investigate the bound trace with the droid.
 
 ```
 <PROCESSOS_WORKSPACES_DIR>/
-  <customer-slug>/
-    customer.json
+  <workspace-slug>/
+    workspace.json
     <process-slug>/
       process.json          # { displayName, targetUrl? | dataset?, objective?, notes? }
+      model.bpmn            # optional process model (rendered in the browser)
       traces/               # optional dataset folder (else `dataset` points elsewhere)
 ```
 
 A process is `live` when `targetUrl` is set, `dataset` when a `dataset` path or a
 `traces/` folder resolves, else `unbound`. Slugs are single, lowercased
 `[a-z0-9-_]` path segments (no traversal). Browse it at `/workspace`.
+
+**Load the demo dataset in one click:** `POST /api/workspaces/seed-demo` (or the
+"Load demo dataset" button) creates the **Northwind Bank** workspace + **Loan
+Approval** process, generates a labelled trace corpus into its `traces/` folder, and
+writes `model.bpmn` — ready to view and investigate.
 
 A dataset folder holds per-instance `*.json` files (each a
 `GET /console/api/traces/{key}` shape) at top level or under `instances/`/`traces/`,
@@ -193,7 +203,7 @@ instead of picking from a fixed menu.
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:
-curl -XPOST .../customers/{c}/processes/{p}/investigate \
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/investigate \
   -d '{"llm":{"model":"local-model"},"maxRounds":12,"allowPython":false}'
 # -> { dataset:{instances,jobs,incidents},
 #      run:{ answer:"{\"bottleneckJob\":\"credit-check\",\"window\":\"weekday-morning\",…}",
@@ -256,7 +266,7 @@ PROCESSOS_SPAWN_NANO=1 cargo run
 | `NANO_TARGET_URL` | _(= `NANO_BASE_URL`)_ | The **read-only production** engine to analyse |
 | `PROCESSOS_NANO_URL` | _(= `NANO_BASE_URL`)_ | The **own** engine the pilot loop runs on |
 | `PROCESSOS_DATA_DIR` | `./.processos-data` | Persisted forks, conversations, prefs |
-| `PROCESSOS_WORKSPACES_DIR` | _(`<data_dir>/workspaces`)_ | Root of the customers/processes workspace tree |
+| `PROCESSOS_WORKSPACES_DIR` | _(`<data_dir>/workspaces`)_ | Root of the workspaces/processes tree |
 | `PROCESSOS_PROMPTS_DIR` | _(none)_ | Directory of prompt files imported into the library on boot |
 | `PROCESSOS_SPAWN_NANO` | `false` | Spawn + supervise an own Nano engine as a child process |
 | `PROCESSOS_NANO_BIN` | _(built gateway)_ | Path to the own-engine gateway binary |
@@ -287,9 +297,9 @@ for it automatically.
 | `GET` | `/` | Landing page |
 | `GET` | `/features` | Features page |
 | `GET` | `/console` | Insights dashboard (fetches `/api/insights`) |
-| `GET` | `/cockpit` | The cockpit — Console → Process → Experiment, with the droid conversation |
+| `GET` | `/cockpit` | The cockpit — Console → Process → Experiment, with the droid conversation; `?workspace=&process=` opens the workspace-dataset investigation surface |
 | `GET` | `/harness` | Optimization-harness dashboard (runs the example scenario) |
-| `GET` | `/workspace` | Workspace browser — customers → processes → per-process Insights |
+| `GET` | `/workspace` | Workspace browser — workspaces → processes → BPMN model + Insights + "Reason in cockpit" |
 | `GET` | `/health` | Liveness (`ok`) |
 | `GET` | `/api/insights?limit=&sample=` | Folded performance report from the **target** traces/metrics |
 | `GET` | `/api/cockpit/overview` | Cockpit state: process(es), pilot, recent experiments |
@@ -312,12 +322,15 @@ for it automatically.
 | `GET`/`DELETE` | `/api/prompts/{id}` | Get / delete a prompt (refuses built-ins) |
 | `GET`/`PUT` | `/api/pilot` | Read / fork the pilot process BPMN |
 | `POST` | `/api/pilot/reset` | Restore the built-in default pilot |
-| `GET`/`POST` | `/api/workspace/customers` | List / create customers |
-| `GET` | `/api/workspace/customers/{c}` | A customer + its processes |
-| `POST` | `/api/workspace/customers/{c}/processes` | Create a process (bind `targetUrl` or `dataset`) |
-| `GET`/`PUT` | `/api/workspace/customers/{c}/processes/{p}` | Read / update a process config |
-| `GET` | `/api/workspace/customers/{c}/processes/{p}/insights` | Insights folded over the process's bound source |
-| `POST` | `/api/workspace/customers/{c}/processes/{p}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
+| `GET`/`POST` | `/api/workspaces` | List / create workspaces |
+| `POST` | `/api/workspaces/seed-demo` | One-click demo: Northwind Bank + Loan Approval + generated traces + model |
+| `GET` | `/api/workspaces/{workspace}` | A workspace + its processes |
+| `POST` | `/api/workspaces/{workspace}/processes` | Create a process (bind `targetUrl` or `dataset`) |
+| `GET`/`PUT` | `/api/workspaces/{workspace}/processes/{process}` | Read / update a process config |
+| `GET`/`PUT` | `/api/workspaces/{workspace}/processes/{process}/model` | Read / set the process's BPMN model |
+| `GET` | `/api/workspaces/{workspace}/processes/{process}/insights` | Insights folded over the process's bound source |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
+| `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |
 
 ## Layout
 
@@ -328,7 +341,7 @@ src/
   report.rs       pure aggregation: traces -> Insights (with unit tests)
   supervisor.rs   spawn + supervise the own Nano engine (learn port, deploy pilot, reap)
   pilot.rs        the forkable pilot process — plastic surface (a) of §10
-  workspace.rs    customers/processes tree + persistence + CRUD + source binding
+  workspace.rs    workspaces/processes tree + persistence + CRUD + source binding
   dataset.rs      DatasetSource (loaded trace folder) + TraceSource enum (live | dataset)
   corpus.rs       synthetic labelled trace corpus: generator + inference + scorer
   analysis.rs     flatten traces into in-memory DuckDB; read-only query_traces surface

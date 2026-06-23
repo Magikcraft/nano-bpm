@@ -1,17 +1,18 @@
-//! **Workspaces** — the consultant's folder structure of customer engagements.
+//! **Workspaces** — the consultant's folder structure of customer/deployment engagements.
 //!
 //! ProcessOS started single-tenant: one production `target` engine, one `own`
 //! engine, one flat pile of experiments. A consultant, though, works *many*
-//! customers, each with *many* processes to optimize — and not always against a
-//! live engine: often the material is a captured dataset of traces handed over for
-//! analysis. This module gives ProcessOS that shape:
+//! workspaces (one per customer/deployment), each with *many* processes to optimize
+//! — and not always against a live engine: often the material is a captured dataset
+//! of traces handed over for analysis. This module gives ProcessOS that shape:
 //!
 //! ```text
 //! <root>/                          PROCESSOS_WORKSPACES_DIR
-//!   <customer-slug>/
-//!     customer.json                { displayName, notes? }
+//!   <workspace-slug>/
+//!     workspace.json               { displayName, notes? }
 //!     <process-slug>/
 //!       process.json               { displayName, targetUrl?, dataset?, objective?, notes? }
+//!       model.bpmn                  optional process model (BPMN XML), rendered in the console
 //!       traces/                     optional captured trace dataset (instance JSON)
 //! ```
 //!
@@ -21,7 +22,7 @@
 //! cockpit/prompts/pilot per-process later — operates *within a selected process*.
 //!
 //! The tree is **discovered by scanning** (so a consultant can curate folders by
-//! hand and have them appear) **and** mutable via the API (create customers /
+//! hand and have them appear) **and** mutable via the API (create workspaces /
 //! processes). Persistence mirrors the dependency-light, path-traversal-safe pattern
 //! used by [`crate::conversation`].
 
@@ -33,10 +34,10 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::NanoClient;
 use crate::dataset::{DatasetSource, TraceSource};
 
-/// On-disk customer metadata (`customer.json`).
+/// On-disk workspace metadata (`workspace.json`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CustomerConfig {
+pub struct WorkspaceConfig {
     #[serde(default)]
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -49,7 +50,7 @@ pub struct CustomerConfig {
 pub struct ProcessConfig {
     #[serde(default)]
     pub display_name: String,
-    /// A live customer/deployment Nano base URL (the analysis target). When set, the
+    /// A live workspace/deployment Nano base URL (the analysis target). When set, the
     /// process reads live; when unset, it falls back to a dataset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_url: Option<String>,
@@ -64,13 +65,13 @@ pub struct ProcessConfig {
     pub notes: Option<String>,
 }
 
-/// A customer plus its slug (the directory name).
+/// A workspace plus its slug (the directory name).
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Customer {
+pub struct Workspace {
     pub slug: String,
     #[serde(flatten)]
-    pub config: CustomerConfig,
+    pub config: WorkspaceConfig,
     pub process_count: usize,
 }
 
@@ -86,16 +87,18 @@ pub struct Process {
     /// For a dataset binding, the resolved dataset directory; otherwise `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_path: Option<String>,
+    /// Whether a `model.bpmn` sits beside `process.json` (rendered in the console).
+    pub has_model: bool,
 }
 
 /// The workspace root. Cheap to clone (just a `PathBuf`); all reads scan the disk so
 /// hand-curated folders show up without a restart.
 #[derive(Clone)]
-pub struct Workspace {
+pub struct WorkspaceCatalog {
     root: PathBuf,
 }
 
-impl Workspace {
+impl WorkspaceCatalog {
     /// Open (creating if needed) a workspace rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
@@ -109,11 +112,11 @@ impl Workspace {
         &self.root
     }
 
-    // --- customers ---------------------------------------------------------
+    // --- workspaces --------------------------------------------------------
 
-    /// List all customers (directories under the root holding a `customer.json`,
+    /// List all customers (directories under the root holding a `workspace.json`,
     /// or any directory — a hand-made folder without metadata still appears).
-    pub fn list_customers(&self) -> Vec<Customer> {
+    pub fn list_workspaces(&self) -> Vec<Workspace> {
         let mut out = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return out;
@@ -128,7 +131,7 @@ impl Workspace {
             if !is_safe_slug(&slug) {
                 continue;
             }
-            if let Some(c) = self.get_customer(&slug) {
+            if let Some(c) = self.get_workspace(&slug) {
                 out.push(c);
             }
         }
@@ -136,45 +139,45 @@ impl Workspace {
         out
     }
 
-    pub fn get_customer(&self, slug: &str) -> Option<Customer> {
-        let dir = self.customer_dir(slug)?;
+    pub fn get_workspace(&self, slug: &str) -> Option<Workspace> {
+        let dir = self.workspace_dir(slug)?;
         if !dir.is_dir() {
             return None;
         }
-        let config = read_json(&dir.join("customer.json")).unwrap_or_else(|| CustomerConfig {
+        let config = read_json(&dir.join("workspace.json")).unwrap_or_else(|| WorkspaceConfig {
             display_name: slug.to_string(),
             notes: None,
         });
-        Some(Customer {
+        Some(Workspace {
             slug: slug.to_string(),
             process_count: self.list_processes(slug).len(),
             config,
         })
     }
 
-    /// Create a customer from a display name (slug derived from it). Idempotent: an
+    /// Create a workspace from a display name (slug derived from it). Idempotent: an
     /// existing slug has its metadata refreshed rather than erroring.
-    pub fn create_customer(&self, display_name: &str, notes: Option<String>) -> Result<Customer, String> {
+    pub fn create_workspace(&self, display_name: &str, notes: Option<String>) -> Result<Workspace, String> {
         let slug = slugify(display_name);
         if slug.is_empty() {
-            return Err("customer name produced an empty slug".into());
+            return Err("workspace name produced an empty slug".into());
         }
         let dir = self.root.join(&slug);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create customer dir: {e}"))?;
-        let config = CustomerConfig {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create workspace dir: {e}"))?;
+        let config = WorkspaceConfig {
             display_name: display_name.trim().to_string(),
             notes,
         };
-        write_json(&dir.join("customer.json"), &config)?;
-        self.get_customer(&slug)
-            .ok_or_else(|| "customer vanished after create".into())
+        write_json(&dir.join("workspace.json"), &config)?;
+        self.get_workspace(&slug)
+            .ok_or_else(|| "workspace vanished after create".into())
     }
 
     // --- processes ---------------------------------------------------------
 
-    pub fn list_processes(&self, customer: &str) -> Vec<Process> {
+    pub fn list_processes(&self, workspace: &str) -> Vec<Process> {
         let mut out = Vec::new();
-        let Some(cdir) = self.customer_dir(customer) else {
+        let Some(cdir) = self.workspace_dir(workspace) else {
             return out;
         };
         let Ok(entries) = std::fs::read_dir(&cdir) else {
@@ -190,7 +193,7 @@ impl Workspace {
             if !is_safe_slug(&slug) {
                 continue;
             }
-            if let Some(p) = self.get_process(customer, &slug) {
+            if let Some(p) = self.get_process(workspace, &slug) {
                 out.push(p);
             }
         }
@@ -198,8 +201,8 @@ impl Workspace {
         out
     }
 
-    pub fn get_process(&self, customer: &str, process: &str) -> Option<Process> {
-        let dir = self.process_dir(customer, process)?;
+    pub fn get_process(&self, workspace: &str, process: &str) -> Option<Process> {
+        let dir = self.process_dir(workspace, process)?;
         if !dir.is_dir() {
             return None;
         }
@@ -215,21 +218,22 @@ impl Workspace {
             config,
             binding,
             dataset_path,
+            has_model: dir.join("model.bpmn").is_file(),
         })
     }
 
-    /// Create (or refresh) a process under a customer.
+    /// Create (or refresh) a process under a workspace.
     pub fn create_process(
         &self,
-        customer: &str,
+        workspace: &str,
         display_name: &str,
         config: ProcessConfig,
     ) -> Result<Process, String> {
         let cdir = self
-            .customer_dir(customer)
-            .ok_or_else(|| "invalid customer slug".to_string())?;
+            .workspace_dir(workspace)
+            .ok_or_else(|| "invalid workspace slug".to_string())?;
         if !cdir.is_dir() {
-            return Err(format!("no such customer: {customer}"));
+            return Err(format!("no such workspace: {workspace}"));
         }
         let slug = slugify(display_name);
         if slug.is_empty() {
@@ -242,34 +246,34 @@ impl Workspace {
             config.display_name = display_name.trim().to_string();
         }
         write_json(&dir.join("process.json"), &config)?;
-        self.get_process(customer, &slug)
+        self.get_process(workspace, &slug)
             .ok_or_else(|| "process vanished after create".into())
     }
 
     /// Replace a process's configuration (binding, objective, notes).
     pub fn update_process(
         &self,
-        customer: &str,
+        workspace: &str,
         process: &str,
         config: ProcessConfig,
     ) -> Result<Process, String> {
         let dir = self
-            .process_dir(customer, process)
+            .process_dir(workspace, process)
             .ok_or_else(|| "invalid slug".to_string())?;
         if !dir.is_dir() {
-            return Err(format!("no such process: {customer}/{process}"));
+            return Err(format!("no such process: {workspace}/{process}"));
         }
         write_json(&dir.join("process.json"), &config)?;
-        self.get_process(customer, process)
+        self.get_process(workspace, process)
             .ok_or_else(|| "process vanished after update".into())
     }
 
     /// Resolve the [`TraceSource`] a process reads from: a live gateway when
     /// `targetUrl` is set, otherwise a dataset loaded from disk.
-    pub fn resolve_source(&self, customer: &str, process: &str) -> Result<TraceSource, String> {
+    pub fn resolve_source(&self, workspace: &str, process: &str) -> Result<TraceSource, String> {
         let p = self
-            .get_process(customer, process)
-            .ok_or_else(|| format!("no such process: {customer}/{process}"))?;
+            .get_process(workspace, process)
+            .ok_or_else(|| format!("no such process: {workspace}/{process}"))?;
         if let Some(url) = p.config.target_url.as_deref().filter(|s| !s.is_empty()) {
             return Ok(TraceSource::Live(NanoClient::new(url)));
         }
@@ -278,11 +282,43 @@ impl Workspace {
             return Ok(TraceSource::Dataset(Arc::new(ds)));
         }
         Err(format!(
-            "process {customer}/{process} is unbound (no targetUrl and no trace dataset)"
+            "process {workspace}/{process} is unbound (no targetUrl and no trace dataset)"
         ))
     }
 
-    // --- internals ---------------------------------------------------------
+    // --- process model (BPMN) ----------------------------------------------
+
+    /// Read the process's `model.bpmn` (BPMN XML), if present.
+    pub fn read_model(&self, workspace: &str, process: &str) -> Option<String> {
+        let dir = self.process_dir(workspace, process)?;
+        std::fs::read_to_string(dir.join("model.bpmn")).ok()
+    }
+
+    /// Write (or replace) the process's `model.bpmn`.
+    pub fn write_model(&self, workspace: &str, process: &str, xml: &str) -> Result<(), String> {
+        let dir = self
+            .process_dir(workspace, process)
+            .ok_or_else(|| "invalid slug".to_string())?;
+        if !dir.is_dir() {
+            return Err(format!("no such process: {workspace}/{process}"));
+        }
+        std::fs::write(dir.join("model.bpmn"), xml).map_err(|e| format!("write model.bpmn: {e}"))
+    }
+
+    /// The `traces/` dataset directory beside a process's `process.json` (created on
+    /// demand), used when loading captured traces into a process.
+    pub fn process_traces_dir(&self, workspace: &str, process: &str) -> Result<PathBuf, String> {
+        let dir = self
+            .process_dir(workspace, process)
+            .ok_or_else(|| "invalid slug".to_string())?;
+        if !dir.is_dir() {
+            return Err(format!("no such process: {workspace}/{process}"));
+        }
+        let traces = dir.join("traces");
+        std::fs::create_dir_all(&traces).map_err(|e| format!("create traces dir: {e}"))?;
+        Ok(traces)
+    }
+
 
     /// Classify how a process is bound and resolve its dataset directory.
     fn binding_of(&self, dir: &Path, config: &ProcessConfig) -> (String, Option<String>) {
@@ -312,15 +348,15 @@ impl Workspace {
         }
     }
 
-    fn customer_dir(&self, slug: &str) -> Option<PathBuf> {
+    fn workspace_dir(&self, slug: &str) -> Option<PathBuf> {
         is_safe_slug(slug).then(|| self.root.join(slug))
     }
 
-    fn process_dir(&self, customer: &str, process: &str) -> Option<PathBuf> {
-        if !is_safe_slug(customer) || !is_safe_slug(process) {
+    fn process_dir(&self, workspace: &str, process: &str) -> Option<PathBuf> {
+        if !is_safe_slug(workspace) || !is_safe_slug(process) {
             return None;
         }
-        Some(self.root.join(customer).join(process))
+        Some(self.root.join(workspace).join(process))
     }
 }
 
@@ -408,10 +444,10 @@ mod tests {
     #[test]
     fn create_list_and_get_round_trip() {
         let root = tmp();
-        let ws = Workspace::open(&root);
+        let ws = WorkspaceCatalog::open(&root);
 
         let c = ws
-            .create_customer("Acme Corp", Some("priority account".into()))
+            .create_workspace("Acme Corp", Some("priority account".into()))
             .unwrap();
         assert_eq!(c.slug, "acme-corp");
         assert_eq!(c.config.display_name, "Acme Corp");
@@ -431,7 +467,7 @@ mod tests {
         assert_eq!(p.binding, "unbound");
 
         // appears in listings, count reflects the new process
-        let customers = ws.list_customers();
+        let customers = ws.list_workspaces();
         assert_eq!(customers.len(), 1);
         assert_eq!(customers[0].process_count, 1);
         assert_eq!(ws.list_processes("acme-corp").len(), 1);
@@ -442,8 +478,8 @@ mod tests {
     #[test]
     fn live_binding_resolves_to_a_nano_client() {
         let root = tmp();
-        let ws = Workspace::open(&root);
-        ws.create_customer("C", None).unwrap();
+        let ws = WorkspaceCatalog::open(&root);
+        ws.create_workspace("C", None).unwrap();
         ws.create_process(
             "c",
             "P",
@@ -464,8 +500,8 @@ mod tests {
     #[test]
     fn dataset_binding_resolves_from_a_traces_folder() {
         let root = tmp();
-        let ws = Workspace::open(&root);
-        ws.create_customer("C", None).unwrap();
+        let ws = WorkspaceCatalog::open(&root);
+        ws.create_workspace("C", None).unwrap();
         let p = ws.create_process("c", "P", ProcessConfig::default()).unwrap();
         assert_eq!(p.binding, "unbound");
 
@@ -490,10 +526,10 @@ mod tests {
     #[test]
     fn unsafe_slugs_never_escape_the_root() {
         let root = tmp();
-        let ws = Workspace::open(&root);
-        assert!(ws.customer_dir("../escape").is_none());
+        let ws = WorkspaceCatalog::open(&root);
+        assert!(ws.workspace_dir("../escape").is_none());
         assert!(ws.process_dir("ok", "../escape").is_none());
-        assert!(ws.get_customer("../escape").is_none());
+        assert!(ws.get_workspace("../escape").is_none());
         assert!(ws.resolve_source("../x", "../y").is_err());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -501,14 +537,14 @@ mod tests {
     #[test]
     fn hand_made_folder_without_metadata_still_appears() {
         let root = tmp();
-        std::fs::create_dir_all(root.join("manual-customer").join("manual-process")).unwrap();
-        let ws = Workspace::open(&root);
-        let customers = ws.list_customers();
+        std::fs::create_dir_all(root.join("manual-workspace").join("manual-process")).unwrap();
+        let ws = WorkspaceCatalog::open(&root);
+        let customers = ws.list_workspaces();
         assert_eq!(customers.len(), 1);
-        assert_eq!(customers[0].slug, "manual-customer");
+        assert_eq!(customers[0].slug, "manual-workspace");
         // display name falls back to the slug
-        assert_eq!(customers[0].config.display_name, "manual-customer");
-        assert_eq!(ws.list_processes("manual-customer").len(), 1);
+        assert_eq!(customers[0].config.display_name, "manual-workspace");
+        assert_eq!(ws.list_processes("manual-workspace").len(), 1);
         std::fs::remove_dir_all(&root).ok();
     }
 }

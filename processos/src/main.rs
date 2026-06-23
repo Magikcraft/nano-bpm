@@ -67,9 +67,9 @@ struct AppState {
     /// that drives the optimization loop. File-backed; the supervisor deploys it on
     /// boot, and `PUT /api/pilot` re-forks it and hot-redeploys to the own engine.
     pilot: Arc<pilot::PilotStore>,
-    /// The consultant's workspace tree — customers > processes, each bound to a live
+    /// The consultant's workspace tree — workspaces > processes, each bound to a live
     /// customer Nano or a loaded trace dataset. Discovered by scanning the root.
-    workspace: workspace::Workspace,
+    workspaces: workspace::WorkspaceCatalog,
 }
 
 /// Server configuration, all overridable by environment.
@@ -205,7 +205,7 @@ async fn main() {
         prompts: Arc::new(RwLock::new(library)),
         conversations: Arc::new(conversation::ConversationStore::open(&cfg.data_dir)),
         pilot,
-        workspace: workspace::Workspace::open(workspace::root_from_env(&cfg.data_dir)),
+        workspaces: workspace::WorkspaceCatalog::open(workspace::root_from_env(&cfg.data_dir)),
     };
 
     let app = Router::new()
@@ -241,26 +241,32 @@ async fn main() {
         .route("/api/pilot/reset", post(pilot_reset))
         .route("/workspace", get(workspace_page))
         .route(
-            "/api/workspace/customers",
-            get(ws_customers).post(ws_create_customer),
+            "/api/workspaces",
+            get(ws_workspaces).post(ws_create_workspace),
         )
-        .route("/api/workspace/customers/{customer}", get(ws_customer))
+        .route("/api/workspaces/{workspace}", get(ws_workspace))
+        .route("/api/workspaces/seed-demo", post(ws_seed_demo))
         .route(
-            "/api/workspace/customers/{customer}/processes",
+            "/api/workspaces/{workspace}/processes",
             post(ws_create_process),
         )
         .route(
-            "/api/workspace/customers/{customer}/processes/{process}",
+            "/api/workspaces/{workspace}/processes/{process}",
             get(ws_process).put(ws_update_process),
         )
         .route(
-            "/api/workspace/customers/{customer}/processes/{process}/insights",
+            "/api/workspaces/{workspace}/processes/{process}/model",
+            get(ws_process_model).put(ws_set_process_model),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/insights",
             get(ws_process_insights),
         )
         .route(
-            "/api/workspace/customers/{customer}/processes/{process}/investigate",
+            "/api/workspaces/{workspace}/processes/{process}/investigate",
             post(ws_process_investigate),
         )
+        .route("/assets/bpmn/{file}", get(bpmn_asset))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -626,18 +632,29 @@ fn unprocessable(e: String) -> axum::response::Response {
         .into_response()
 }
 
-// --- Workspaces — customers > processes (the consultant's folder tree) -----------
+// --- Workspaces (customer/deployment bounded contexts) > processes (the consultant's folder tree) -----------
 
 /// The single-file workspace browser. Served at `/workspace`.
 const WORKSPACE_HTML: &str = include_str!("workspace.html");
 
-/// `GET /workspace` — browse customers, drill into a process, view its Insights.
+/// Vendored bpmn-js viewer assets (self-contained, served at `/assets/bpmn/*`), so
+/// the workspace console can render a real BPMN diagram with no CDN/build step.
+const BPMN_VIEWER_JS: &str = include_str!("../assets/bpmn/bpmn-navigated-viewer.js");
+const BPMN_DIAGRAM_CSS: &str = include_str!("../assets/bpmn/diagram-js.css");
+const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css");
+
+/// The bundled loan-approval demo pack + model, embedded so `seed-demo` works from
+/// any working directory.
+const LOAN_PACK_JSON: &str = include_str!("../corpus-packs/loan-approval/pack.json");
+const LOAN_MODEL_BPMN: &str = include_str!("../corpus-packs/loan-approval/loan-approval.bpmn");
+
+/// `GET /workspace` — browse workspaces, drill into a process, view its Insights.
 async fn workspace_page() -> Html<&'static str> {
     Html(WORKSPACE_HTML)
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateCustomerBody {
+struct CreateWorkspaceBody {
     #[serde(default, alias = "displayName", alias = "name")]
     display_name: String,
     #[serde(default)]
@@ -658,51 +675,51 @@ struct CreateProcessBody {
     notes: Option<String>,
 }
 
-/// `GET /api/workspace/customers` — every customer (scanned from disk).
-async fn ws_customers(State(state): State<AppState>) -> impl IntoResponse {
+/// `GET /api/workspaces` — every workspace (scanned from disk).
+async fn ws_workspaces(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "root": state.workspace.root().to_string_lossy(),
-        "customers": state.workspace.list_customers(),
+        "root": state.workspaces.root().to_string_lossy(),
+        "workspaces": state.workspaces.list_workspaces(),
     }))
 }
 
-/// `POST /api/workspace/customers` — create a customer from a display name.
-async fn ws_create_customer(
+/// `POST /api/workspaces` — create a workspace from a display name.
+async fn ws_create_workspace(
     State(state): State<AppState>,
-    Json(body): Json<CreateCustomerBody>,
+    Json(body): Json<CreateWorkspaceBody>,
 ) -> impl IntoResponse {
     match state
-        .workspace
-        .create_customer(&body.display_name, body.notes)
+        .workspaces
+        .create_workspace(&body.display_name, body.notes)
     {
         Ok(c) => (StatusCode::CREATED, Json(c)).into_response(),
         Err(e) => unprocessable(e),
     }
 }
 
-/// `GET /api/workspace/customers/{customer}` — a customer + its processes.
-async fn ws_customer(
+/// `GET /api/workspaces/{workspace}` — a workspace + its processes.
+async fn ws_workspace(
     State(state): State<AppState>,
-    Path(customer): Path<String>,
+    Path(workspace): Path<String>,
 ) -> impl IntoResponse {
-    match state.workspace.get_customer(&customer) {
+    match state.workspaces.get_workspace(&workspace) {
         Some(c) => Json(serde_json::json!({
-            "customer": c,
-            "processes": state.workspace.list_processes(&customer),
+            "workspace": c,
+            "processes": state.workspaces.list_processes(&workspace),
         }))
         .into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("no such customer: {customer}") })),
+            Json(serde_json::json!({ "error": format!("no such workspace: {workspace}") })),
         )
             .into_response(),
     }
 }
 
-/// `POST /api/workspace/customers/{customer}/processes` — create a process.
+/// `POST /api/workspaces/{workspace}/processes` — create a process.
 async fn ws_create_process(
     State(state): State<AppState>,
-    Path(customer): Path<String>,
+    Path(workspace): Path<String>,
     Json(body): Json<CreateProcessBody>,
 ) -> impl IntoResponse {
     let config = workspace::ProcessConfig {
@@ -713,52 +730,181 @@ async fn ws_create_process(
         notes: body.notes.filter(|s| !s.trim().is_empty()),
     };
     match state
-        .workspace
-        .create_process(&customer, &body.display_name, config)
+        .workspaces
+        .create_process(&workspace, &body.display_name, config)
     {
         Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
         Err(e) => unprocessable(e),
     }
 }
 
-/// `GET /api/workspace/customers/{customer}/processes/{process}` — one process.
+/// `GET /api/workspaces/{workspace}/processes/{process}` — one process.
 async fn ws_process(
     State(state): State<AppState>,
-    Path((customer, process)): Path<(String, String)>,
+    Path((workspace, process)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    match state.workspace.get_process(&customer, &process) {
+    match state.workspaces.get_process(&workspace, &process) {
         Some(p) => Json(p).into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("no such process: {customer}/{process}") })),
+            Json(serde_json::json!({ "error": format!("no such process: {workspace}/{process}") })),
         )
             .into_response(),
     }
 }
 
-/// `PUT /api/workspace/customers/{customer}/processes/{process}` — update config.
+/// `PUT /api/workspaces/{workspace}/processes/{process}` — update config.
 async fn ws_update_process(
     State(state): State<AppState>,
-    Path((customer, process)): Path<(String, String)>,
+    Path((workspace, process)): Path<(String, String)>,
     Json(config): Json<workspace::ProcessConfig>,
 ) -> impl IntoResponse {
-    match state.workspace.update_process(&customer, &process, config) {
+    match state.workspaces.update_process(&workspace, &process, config) {
         Ok(p) => Json(p).into_response(),
         Err(e) => unprocessable(e),
     }
 }
 
-/// `GET /api/workspace/customers/{customer}/processes/{process}/insights` — the
+/// `GET /assets/bpmn/{file}` — serve a vendored bpmn-js viewer asset.
+async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
+    let (body, ctype): (&'static str, &'static str) = match file.as_str() {
+        "bpmn-navigated-viewer.js" => (BPMN_VIEWER_JS, "application/javascript; charset=utf-8"),
+        "diagram-js.css" => (BPMN_DIAGRAM_CSS, "text/css; charset=utf-8"),
+        "bpmn-embedded.css" => (BPMN_EMBEDDED_CSS, "text/css; charset=utf-8"),
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    ([(axum::http::header::CONTENT_TYPE, ctype)], body).into_response()
+}
+
+/// `GET /api/workspaces/{workspace}/processes/{process}/model` — the process's BPMN
+/// XML, for the viewer. 404 when the process has no `model.bpmn`.
+async fn ws_process_model(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.workspaces.read_model(&workspace, &process) {
+        Some(xml) => (
+            [(axum::http::header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+            xml,
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no model.bpmn for this process" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /api/workspaces/{workspace}/processes/{process}/model` — set the BPMN model
+/// (raw XML request body).
+async fn ws_set_process_model(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    body: String,
+) -> impl IntoResponse {
+    if body.trim().is_empty() {
+        return unprocessable("empty model body".into());
+    }
+    match state.workspaces.write_model(&workspace, &process, &body) {
+        Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SeedDemoBody {
+    /// Workspace display name (default "Northwind Bank").
+    #[serde(default)]
+    workspace: Option<String>,
+    /// Process display name (default "Loan Approval").
+    #[serde(default)]
+    process: Option<String>,
+}
+
+/// `POST /api/workspaces/seed-demo` — materialise the bundled loan-approval demo: a
+/// workspace + a process bound to a freshly generated trace dataset + its BPMN model.
+/// Idempotent on the derived slugs. Returns the created `{workspace, process}` slugs.
+async fn ws_seed_demo(
+    State(state): State<AppState>,
+    Json(body): Json<SeedDemoBody>,
+) -> impl IntoResponse {
+    let ws_name = body
+        .workspace
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Northwind Bank".to_string());
+    let proc_name = body
+        .process
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Loan Approval".to_string());
+
+    // Run the (blocking) corpus generation off the async runtime.
+    let workspaces = state.workspaces.clone();
+    let result = tokio::task::spawn_blocking(move || seed_demo(&workspaces, &ws_name, &proc_name))
+        .await
+        .map_err(|e| format!("seed task failed: {e}"));
+
+    match result {
+        Ok(Ok(slugs)) => (StatusCode::CREATED, Json(slugs)).into_response(),
+        Ok(Err(e)) => unprocessable(e),
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// Create the workspace + process, generate the corpus into its `traces/` folder, and
+/// drop the BPMN model beside it. Returns the slugs.
+fn seed_demo(
+    workspaces: &workspace::WorkspaceCatalog,
+    ws_name: &str,
+    proc_name: &str,
+) -> Result<serde_json::Value, String> {
+    let ws = workspaces.create_workspace(ws_name, Some("Demo engagement (bundled loan-approval corpus)".into()))?;
+    let proc_cfg = workspace::ProcessConfig {
+        display_name: proc_name.to_string(),
+        objective: Some("cut credit-check queue tail under the weekday-morning spike".into()),
+        ..Default::default()
+    };
+    let proc = workspaces.create_process(&ws.slug, proc_name, proc_cfg)?;
+
+    // Write the embedded pack + bpmn to a temp dir, then load + generate.
+    let tmp = std::env::temp_dir().join(format!(
+        "processos-seed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("seed tmp: {e}"))?;
+    std::fs::write(tmp.join("pack.json"), LOAN_PACK_JSON).map_err(|e| format!("write pack: {e}"))?;
+    std::fs::write(tmp.join("loan-approval.bpmn"), LOAN_MODEL_BPMN)
+        .map_err(|e| format!("write bpmn: {e}"))?;
+
+    let (pack, def) = corpus::load_pack(&tmp.join("pack.json"))?;
+    let traces_dir = workspaces.process_traces_dir(&ws.slug, &proc.slug)?;
+    let summary = corpus::generate(&pack, &def, &traces_dir)?;
+    workspaces.write_model(&ws.slug, &proc.slug, LOAN_MODEL_BPMN)?;
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    Ok(serde_json::json!({
+        "workspace": ws.slug,
+        "process": proc.slug,
+        "instances": summary.instances,
+    }))
+}
+
+
 /// folded Insights report for this process, read from whatever source it is bound
 /// to (live customer Nano or a loaded trace dataset).
 async fn ws_process_insights(
     State(state): State<AppState>,
-    Path((customer, process)): Path<(String, String)>,
+    Path((workspace, process)): Path<(String, String)>,
     Query(q): Query<InsightsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    let src = match state.workspace.resolve_source(&customer, &process) {
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
         Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
@@ -788,13 +934,13 @@ struct InvestigateRequest {
     allow_python: bool,
 }
 
-/// `POST /api/workspace/customers/{customer}/processes/{process}/investigate` — point
+/// `POST /api/workspaces/{workspace}/processes/{process}/investigate` — point
 /// the configured LLM at this process's bound trace source and let it form and test its
 /// own hypotheses over the data via the read-only `query_traces` SQL tool. Returns the
 /// agent's conclusion plus the full query/result "lab notebook".
 async fn ws_process_investigate(
     State(state): State<AppState>,
-    Path((customer, process)): Path<(String, String)>,
+    Path((workspace, process)): Path<(String, String)>,
     Json(req): Json<InvestigateRequest>,
 ) -> impl IntoResponse {
     let mut cfg = LlmConfig::from_env();
@@ -809,7 +955,7 @@ async fn ws_process_investigate(
                 .to_string(),
         );
     }
-    let src = match state.workspace.resolve_source(&customer, &process) {
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
         Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
@@ -1730,9 +1876,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 <body>
 <header>
   <h1>ProcessOS</h1>
-  <span class="sub">Insights (T1) · <span id="nano"></span></span>
+  <span class="sub">Live instance · <span id="nano"></span></span>
   <nav style="margin-left:auto;display:flex;align-items:center;gap:14px">
     <a href="/" style="color:#a1a1aa;text-decoration:none;font-size:13px">Home</a>
+    <a href="/workspace" style="color:#a1a1aa;text-decoration:none;font-size:13px">Workspaces</a>
     <a href="/cockpit" style="color:#a1a1aa;text-decoration:none;font-size:13px">Cockpit</a>
     <a href="/features" style="color:#a1a1aa;text-decoration:none;font-size:13px">Features</a>
     <a href="/harness" style="color:#a1a1aa;text-decoration:none;font-size:13px">Harness</a>
