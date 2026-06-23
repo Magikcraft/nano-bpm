@@ -96,6 +96,10 @@ engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (need
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
 	cd processos && cargo build
 
+.PHONY: processos-build-release
+processos-build-release: ## Build ProcessOS in release (opt-level=s, lto) -> processos/target/release/processos
+	cd processos && cargo build --release
+
 .PHONY: processos-test
 processos-test: ## Test the ProcessOS crate
 	cd processos && cargo test
