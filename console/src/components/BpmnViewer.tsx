@@ -70,13 +70,19 @@ export default function BpmnViewer({
     };
   }, [xml, activeElementIds, incidentElementIds]);
 
-  if (!xml) {
-    return (
-      <div className="flex h-full items-center justify-center text-sm text-zinc-500">
-        No diagram available for this definition.
-      </div>
-    );
-  }
-
-  return <div ref={containerRef} className="h-full w-full" />;
+  // Render a single, stable structure so the container ref points at the same
+  // DOM node for the component's whole life (the viewer is created against it
+  // on mount, before the async XML query resolves). The empty-state message is
+  // an overlay shown until the XML arrives — never an alternate tree that would
+  // leave the ref unmounted and prevent the viewer from being created.
+  return (
+    <div className="relative h-full w-full">
+      <div ref={containerRef} className="h-full w-full" />
+      {!xml && (
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-zinc-500">
+          No diagram available for this definition.
+        </div>
+      )}
+    </div>
+  );
 }
