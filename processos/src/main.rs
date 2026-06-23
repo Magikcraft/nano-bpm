@@ -89,6 +89,10 @@ struct AppState {
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
     chat_cancels: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// The exact model request bodies sent during each session's most recent turn, keyed by
+    /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
+    /// (not persisted) — it shows what was last sent and is cleared on restart.
+    chat_debug: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
 }
 
 /// Server configuration, all overridable by environment.
@@ -231,6 +235,7 @@ async fn main() {
             settings::config_dir().join("chat-prompts.json"),
         )),
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
@@ -294,6 +299,22 @@ async fn main() {
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat",
             get(cockpit_chat_load).post(cockpit_chat_send),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions",
+            get(cockpit_chat_sessions_list).post(cockpit_chat_sessions_create),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}",
+            get(cockpit_chat_session_load).delete(cockpit_chat_session_delete),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/rename",
+            post(cockpit_chat_session_rename),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/debug",
+            get(cockpit_chat_session_debug),
         )
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/stream",
@@ -1134,15 +1155,181 @@ async fn ws_process_investigate(
 
 // --- Interactive cockpit chat ----------------------------------------------------
 
-/// `GET /api/workspaces/{workspace}/processes/{process}/chat` — load the persisted
-/// chat transcript for this dataset as operator-facing turns.
-async fn cockpit_chat_load(
+/// Query string carrying the target chat session id (shared by load/stream/wrapup).
+#[derive(Debug, Default, Deserialize)]
+struct SessionQuery {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Per-session wrap-up flag key, so an in-flight turn in one session can be wrapped up
+/// without touching another session of the same dataset.
+fn chat_cancel_key(key: &str, session_id: &str) -> String {
+    format!("{key}::{session_id}")
+}
+
+/// Resolve the session to act on: the explicit `?session=` id if it exists, else the most
+/// recently active session, creating a first one if the dataset has none yet.
+fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::SessionMeta {
+    if let Some(id) = wanted {
+        if let Some(s) = state.chat.get(key, id) {
+            return chat::SessionMeta {
+                id: s.id,
+                name: s.name,
+                created: s.created,
+                updated: s.updated,
+                turns: 0,
+            };
+        }
+    }
+    let mut list = state.chat.list(key);
+    if let Some(first) = list.drain(..).next() {
+        return first;
+    }
+    let s = state.chat.create(key, None);
+    chat::SessionMeta {
+        id: s.id,
+        name: s.name,
+        created: s.created,
+        updated: s.updated,
+        turns: 0,
+    }
+}
+
+/// `GET .../chat/sessions` — list this dataset's chat sessions (newest activity first),
+/// creating an initial one so the cockpit always has a session to open.
+async fn cockpit_chat_sessions_list(
     State(state): State<AppState>,
     Path((workspace, process)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let key = chat::session_key(&workspace, &process);
-    let messages = state.chat.load(&key);
-    Json(serde_json::json!({ "turns": chat::render_view(&messages) })).into_response()
+    let mut sessions = state.chat.list(&key);
+    if sessions.is_empty() {
+        state.chat.create(&key, None);
+        sessions = state.chat.list(&key);
+    }
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// Body for creating / renaming a chat session.
+#[derive(Debug, Default, Deserialize)]
+struct ChatSessionNameRequest {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST .../chat/sessions` — start a new (empty) chat session.
+async fn cockpit_chat_sessions_create(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    body: Option<Json<ChatSessionNameRequest>>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let name = body.and_then(|Json(b)| b.name);
+    let s = state.chat.create(&key, name);
+    Json(serde_json::json!({
+        "id": s.id, "name": s.name, "created": s.created, "updated": s.updated, "turns": 0,
+    }))
+    .into_response()
+}
+
+/// `GET .../chat/sessions/{id}` — load one session's transcript as timestamped turns.
+async fn cockpit_chat_session_load(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    match state.chat.get(&key, &id) {
+        Some(s) => Json(serde_json::json!({
+            "id": s.id,
+            "name": s.name,
+            "turns": chat::render_view_stamped(&s.messages, &s.stamps),
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such chat session" })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST .../chat/sessions/{id}/rename` — rename a chat session.
+async fn cockpit_chat_session_rename(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+    Json(req): Json<ChatSessionNameRequest>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let name = req.name.unwrap_or_default();
+    if name.trim().is_empty() {
+        return unprocessable("name must not be empty".to_string());
+    }
+    if state.chat.rename(&key, &id, &name) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such chat session" })),
+        )
+            .into_response()
+    }
+}
+
+/// `GET .../chat/sessions/{id}/debug` — the exact model request payloads sent during this
+/// session's most recent turn (one per round): system prompt, tool specs, and the full
+/// transcript. Powers the cockpit's per-chat "Debug" tab so the operator can see everything
+/// the model receives, not just their latest message. Empty until a turn has run this session.
+async fn cockpit_chat_session_debug(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let cancel_key = chat_cancel_key(&key, &id);
+    let requests = state
+        .chat_debug
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&cancel_key).cloned())
+        .unwrap_or_default();
+    Json(serde_json::json!({ "sessionId": id, "requests": requests }))
+}
+
+/// `DELETE .../chat/sessions/{id}` — delete a chat session.
+async fn cockpit_chat_session_delete(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    if state.chat.delete(&key, &id) {
+        if let Ok(mut m) = state.chat_debug.lock() {
+            m.remove(&chat_cancel_key(&key, &id));
+        }
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such chat session" })),
+        )
+            .into_response()
+    }
+}
+
+/// `GET /api/workspaces/{workspace}/processes/{process}/chat` — load a chat session's
+/// transcript as operator-facing turns (the `?session=` one, or the most recent).
+async fn cockpit_chat_load(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let meta = resolve_session(&state, &key, q.session.as_deref());
+    let session = state.chat.get(&key, &meta.id).unwrap_or_default();
+    Json(serde_json::json!({
+        "sessionId": meta.id,
+        "turns": chat::render_view_stamped(&session.messages, &session.stamps),
+    }))
+    .into_response()
 }
 
 /// Request body for an interactive chat turn.
@@ -1168,6 +1355,7 @@ struct ChatSendRequest {
 async fn cockpit_chat_send(
     State(state): State<AppState>,
     Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
     Json(req): Json<ChatSendRequest>,
 ) -> impl IntoResponse {
     if req.message.trim().is_empty() {
@@ -1196,24 +1384,37 @@ async fn cockpit_chat_send(
         .get_process(&workspace, &process)
         .and_then(|p| p.config.objective);
     let key = chat::session_key(&workspace, &process);
+    let sid = resolve_session(&state, &key, q.session.as_deref()).id;
+    let cancel_key = chat_cancel_key(&key, &sid);
     // Load the prior transcript BEFORE the spawn_blocking (Vec<Msg> is Send); the DuckDB
     // connection inside the analysis is !Send, so the loop runs on a current-thread runtime.
-    let prior = state.chat.load(&key);
+    let session = state.chat.get(&key, &sid).unwrap_or_default();
+    let prior = session.messages;
+    let prior_stamps = session.stamps;
+    let user_ts = chat_now_ms();
     let message = req.message;
     // Register a wrap-up flag for this in-flight turn so `POST .../chat/wrapup` can ask the
     // agent to report early. Cleared in all exit paths below.
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Ok(mut m) = state.chat_cancels.lock() {
-        m.insert(key.clone(), cancel.clone());
+        m.insert(cancel_key.clone(), cancel.clone());
     }
     let task = {
         let cancel = cancel.clone();
-        tokio::task::spawn_blocking(move || {
+        let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let dbg_capture = dbg.clone();
+        let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("runtime: {e}"))?;
-            let mut sink = |_ev: agent::AgentEvent| {};
+            let mut sink = move |ev: agent::AgentEvent| {
+                if let agent::AgentEvent::Request { round, body } = ev {
+                    if let Ok(mut d) = dbg_capture.lock() {
+                        d.push(serde_json::json!({ "round": round, "body": body }));
+                    }
+                }
+            };
             rt.block_on(investigate::run_chat_turn(
                 &src,
                 cfg,
@@ -1228,19 +1429,30 @@ async fn cockpit_chat_send(
                 &message,
             ))
         })
-        .await
+        .await;
+        // Stash this turn's exact request payloads for the session's Debug tab.
+        let bodies = dbg.lock().map(|d| d.clone()).unwrap_or_default();
+        if let Ok(mut m) = state.chat_debug.lock() {
+            m.insert(cancel_key.clone(), bodies);
+        }
+        handle
     };
     if let Ok(mut m) = state.chat_cancels.lock() {
-        m.remove(&key);
+        m.remove(&cancel_key);
     }
     match task {
         Ok(Ok(result)) => {
-            state.chat.save(&key, result.messages.clone());
+            let stamps =
+                chat::extend_stamps(&result.messages, prior_stamps, user_ts, chat_now_ms());
+            state
+                .chat
+                .save(&key, &sid, result.messages.clone(), stamps.clone());
             Json(serde_json::json!({
+                "sessionId": sid,
                 "answer": result.answer,
                 "rounds": result.rounds,
                 "dataset": result.dataset,
-                "turns": chat::render_view(&result.messages),
+                "turns": chat::render_view_stamped(&result.messages, &stamps),
             }))
             .into_response()
         }
@@ -1257,6 +1469,7 @@ async fn cockpit_chat_send(
 async fn cockpit_chat_stream(
     State(state): State<AppState>,
     Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
     Json(req): Json<ChatSendRequest>,
 ) -> impl IntoResponse {
     if req.message.trim().is_empty() {
@@ -1284,12 +1497,17 @@ async fn cockpit_chat_stream(
         .get_process(&workspace, &process)
         .and_then(|p| p.config.objective);
     let key = chat::session_key(&workspace, &process);
-    let prior = state.chat.load(&key);
+    let sid = resolve_session(&state, &key, q.session.as_deref()).id;
+    let cancel_key = chat_cancel_key(&key, &sid);
+    let session = state.chat.get(&key, &sid).unwrap_or_default();
+    let prior = session.messages;
+    let prior_stamps = session.stamps;
+    let user_ts = chat_now_ms();
     let message = req.message;
     // Register a wrap-up flag so `POST .../chat/wrapup` can ask this in-flight turn to report early.
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Ok(mut m) = state.chat_cancels.lock() {
-        m.insert(key.clone(), cancel.clone());
+        m.insert(cancel_key.clone(), cancel.clone());
     }
 
     // The agent loop runs on a blocking thread (DuckDB is !Send) and pushes events into an
@@ -1298,6 +1516,8 @@ async fn cockpit_chat_stream(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let task_state = state.clone();
     let task_key = key.clone();
+    let task_sid = sid.clone();
+    let task_cancel_key = cancel_key.clone();
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1310,9 +1530,19 @@ async fn cockpit_chat_stream(
             }
         };
         let tx_ev = tx.clone();
+        // Accumulate this turn's exact request payloads for the session's Debug tab while also
+        // forwarding each over the wire so the tab can update live.
+        let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let dbg_for_sink = dbg.clone();
         let mut sink = move |ev: agent::AgentEvent| {
             let v = match ev {
                 agent::AgentEvent::Round(n) => serde_json::json!({ "type": "round", "n": n }),
+                agent::AgentEvent::Request { round, body } => {
+                    if let Ok(mut d) = dbg_for_sink.lock() {
+                        d.push(serde_json::json!({ "round": round, "body": body.clone() }));
+                    }
+                    serde_json::json!({ "type": "request", "round": round, "body": body })
+                }
                 agent::AgentEvent::Reasoning(t) => serde_json::json!({ "type": "reasoning", "text": t }),
                 agent::AgentEvent::Answer(t) => serde_json::json!({ "type": "answer", "text": t }),
                 agent::AgentEvent::ToolCall { tool, arguments } => {
@@ -1337,15 +1567,25 @@ async fn cockpit_chat_stream(
             prior,
             &message,
         ));
+        // Persist the captured payloads regardless of outcome (a failed turn still sent a request).
+        let bodies = dbg.lock().map(|d| d.clone()).unwrap_or_default();
+        if let Ok(mut m) = task_state.chat_debug.lock() {
+            m.insert(task_cancel_key.clone(), bodies);
+        }
         match result {
             Ok(r) => {
-                task_state.chat.save(&task_key, r.messages.clone());
+                let stamps =
+                    chat::extend_stamps(&r.messages, prior_stamps, user_ts, chat_now_ms());
+                task_state
+                    .chat
+                    .save(&task_key, &task_sid, r.messages.clone(), stamps.clone());
                 let _ = tx.send(serde_json::json!({
                     "type": "done",
+                    "sessionId": task_sid,
                     "answer": r.answer,
                     "rounds": r.rounds,
                     "dataset": r.dataset,
-                    "turns": chat::render_view(&r.messages),
+                    "turns": chat::render_view_stamped(&r.messages, &stamps),
                 }));
             }
             Err(e) => {
@@ -1353,7 +1593,7 @@ async fn cockpit_chat_stream(
             }
         }
         if let Ok(mut m) = task_state.chat_cancels.lock() {
-            m.remove(&task_key);
+            m.remove(&task_cancel_key);
         }
     });
 
@@ -1370,13 +1610,20 @@ async fn cockpit_chat_stream(
         .into_response()
 }
 
-/// `POST .../chat/reset` — forget this dataset's conversation.
+/// `POST .../chat/reset` — forget a conversation. With `?session=`, clears just that
+/// session's transcript (keeping its name); without, forgets every session for the dataset.
 async fn cockpit_chat_reset(
     State(state): State<AppState>,
     Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
 ) -> impl IntoResponse {
     let key = chat::session_key(&workspace, &process);
-    state.chat.clear(&key);
+    match q.session {
+        Some(sid) if state.chat.get(&key, &sid).is_some() => {
+            state.chat.save(&key, &sid, Vec::new(), Vec::new());
+        }
+        _ => state.chat.clear(&key),
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1385,13 +1632,16 @@ async fn cockpit_chat_reset(
 async fn cockpit_chat_wrapup(
     State(state): State<AppState>,
     Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
 ) -> impl IntoResponse {
     let key = chat::session_key(&workspace, &process);
+    let sid = resolve_session(&state, &key, q.session.as_deref()).id;
+    let cancel_key = chat_cancel_key(&key, &sid);
     let flagged = state
         .chat_cancels
         .lock()
         .ok()
-        .and_then(|m| m.get(&key).cloned());
+        .and_then(|m| m.get(&cancel_key).cloned());
     match flagged {
         Some(flag) => {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1403,6 +1653,14 @@ async fn cockpit_chat_wrapup(
         )
             .into_response(),
     }
+}
+
+/// Epoch-ms now, for chat timestamps.
+fn chat_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// `GET /api/python/status` — whether a Python interpreter is configured and whether the

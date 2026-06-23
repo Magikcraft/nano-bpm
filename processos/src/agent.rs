@@ -78,6 +78,8 @@ pub enum Delta {
 pub enum AgentEvent {
     /// A new round of the tool-calling loop began.
     Round(usize),
+    /// The exact request body about to be sent to the model this round (for the debug view).
+    Request { round: usize, body: Value },
     /// A chunk of the droid's thinking.
     Reasoning(String),
     /// A chunk of the droid's answer prose.
@@ -92,6 +94,14 @@ pub enum AgentEvent {
 #[allow(async_fn_in_trait)]
 pub trait AgentStep {
     async fn step(&self, msgs: &[Msg], tools: &[ToolSpec]) -> Result<Turn, String>;
+
+    /// The exact request body this transport would send for `msgs`/`tools`, surfaced to the
+    /// cockpit's per-session debug view so the operator can see *everything* the model receives
+    /// (system prompt, tool specs, full transcript) — not just their latest message. The default
+    /// is `None` (mock transports make no HTTP request and have nothing to show).
+    fn debug_body(&self, _msgs: &[Msg], _tools: &[ToolSpec]) -> Option<Value> {
+        None
+    }
 
     /// Streaming variant: same contract as [`AgentStep::step`], but `on_delta` is invoked with
     /// each token fragment as it arrives so the caller can surface live progress. The default
@@ -187,10 +197,24 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
             return wrap_up(model, msgs, steps, round, sink).await;
         }
         sink(AgentEvent::Round(round));
+        // Surface the exact payload this round sends to the model, so the debug view can show
+        // everything it receives (system prompt + tool specs + full transcript), not just the
+        // operator's latest message.
+        if let Some(body) = model.debug_body(msgs, &specs) {
+            sink(AgentEvent::Request { round, body });
+        }
+        // Capture this round's chain-of-thought so a tool-calling turn can persist it (the
+        // model often does its real thinking in the round where it decides to call a tool;
+        // without this it would vanish from the saved transcript, leaving the droid bubble
+        // with no "Thinking" disclosure after the live stream ends).
+        let mut round_reasoning = String::new();
         let turn = {
             // Forward token fragments live; scoped so `sink` is free again after the call.
             let mut on_delta = |d: Delta| match d {
-                Delta::Reasoning(t) => sink(AgentEvent::Reasoning(t)),
+                Delta::Reasoning(t) => {
+                    round_reasoning.push_str(&t);
+                    sink(AgentEvent::Reasoning(t));
+                }
                 Delta::Answer(t) => sink(AgentEvent::Answer(t)),
             };
             model.step_streaming(msgs, &specs, &mut on_delta).await?
@@ -218,8 +242,15 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                 });
             }
             Turn::ToolCalls(calls) => {
+                // Persist this round's thinking (as a `<think>` block) on the tool-calling
+                // turn so it survives into the rendered transcript even though the visible
+                // answer comes from a later round.
+                let text = {
+                    let r = round_reasoning.trim();
+                    (!r.is_empty()).then(|| format!("<think>{r}</think>"))
+                };
                 msgs.push(Msg::Assistant {
-                    text: None,
+                    text,
                     tool_calls: calls.clone(),
                 });
                 for call in calls {
@@ -335,6 +366,10 @@ struct ToolCallAccum {
 }
 
 impl AgentStep for OpenAiAgent {
+    fn debug_body(&self, msgs: &[Msg], tools: &[ToolSpec]) -> Option<Value> {
+        Some(self.request_body(msgs, tools, true))
+    }
+
     async fn step(&self, msgs: &[Msg], tools: &[ToolSpec]) -> Result<Turn, String> {
         if !self.cfg.is_ready() {
             return Err("no LLM model configured (set PROCESSOS_LLM_MODEL)".into());

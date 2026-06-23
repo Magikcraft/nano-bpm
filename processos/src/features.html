@@ -226,6 +226,60 @@
         background: var(--border);
         margin: 2.4rem 0;
       }
+      /* ---- Nano Alternate Reality Engine callout ---- */
+      .multiverse {
+        position: relative;
+        margin: 1.4rem 0 0.4rem;
+        padding: 1.2rem 1.35rem 1.1rem;
+        border-radius: 0.9rem;
+        background:
+          radial-gradient(130% 150% at 0% 0%, rgba(167, 139, 250, 0.15), transparent 60%),
+          radial-gradient(130% 150% at 100% 100%, rgba(56, 189, 248, 0.12), transparent 62%),
+          var(--card);
+        border: 1px solid rgba(167, 139, 250, 0.33);
+        overflow: hidden;
+      }
+      .multiverse::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 3px;
+        background: linear-gradient(180deg, var(--violet), var(--sky));
+      }
+      .mv-title {
+        font-weight: 700;
+        font-size: 1.1rem;
+        letter-spacing: -0.01em;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        margin-bottom: 0.45rem;
+        background: linear-gradient(90deg, var(--violet), var(--sky));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .mv-spark {
+        -webkit-text-fill-color: var(--violet);
+        color: var(--violet);
+        font-size: 1rem;
+      }
+      .multiverse .mv-lede {
+        color: var(--ink);
+        margin: 0.3rem 0 0.6rem;
+        font-size: 1.02rem;
+      }
+      .multiverse p {
+        margin: 0.5rem 0;
+      }
+      .mv-foot {
+        color: var(--muted);
+        font-style: italic;
+        font-size: 0.92rem;
+        margin-top: 0.75rem !important;
+      }
       .principle {
         text-align: center;
         color: var(--muted);
@@ -376,6 +430,28 @@
           caught by the numbers and ranked below the baseline; structurally invalid
           proposals are rejected with a reason.
         </p>
+        <div class="multiverse">
+          <div class="mv-title">
+            <span class="mv-spark">&#9671;</span> The Nano Alternate Reality Engine
+          </div>
+          <p class="mv-lede">
+            Every hypothesis gets its own universe. Process OS forks a
+            <strong>multiverse of &ldquo;what-ifs?&rdquo;</strong> &mdash; each candidate
+            variant runs in a fully isolated alternate reality, replaying the same
+            production inputs through its own fresh <code>engine-core</code> on a private
+            virtual clock.
+          </p>
+          <p>
+            Just like speculative execution in a CPU, Nano explores many branches of how the
+            process <em>could</em> run at once &mdash; different worker assignments,
+            restructured models, alternate routings &mdash; and lets reality, not rhetoric,
+            decide which branch to keep. Realities that measure worse than today collapse;
+            the one that genuinely moves the objective is promoted. Because every engine is
+            cheap, deterministic, and WASM-portable, the multiverse is effectively free to
+            spin up and explore at scale.
+          </p>
+          <p class="mv-foot">Many realities run. One survives contact with the numbers.</p>
+        </div>
         <ul>
           <li>
             Model-agnostic and OpenAI-compatible &mdash; points at a local

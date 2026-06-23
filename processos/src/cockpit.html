@@ -117,7 +117,48 @@
   .step .args { color: #71717a; padding: 0 12px 6px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
   .conclusion { border: 1px solid #3730a3; background: #14142b; border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
   /* interactive cockpit chat */
+  .chat-wrap { display: flex; gap: 12px; margin-top: 14px; align-items: stretch; }
+  .chat-wrap .chat { margin-top: 0; flex: 1; min-width: 0; }
+  .chat-sessions { width: 214px; flex: none; border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; display: flex; flex-direction: column; max-height: 64vh; }
+  .cs-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid #1f1f25; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #8b8b93; font-weight: 700; }
+  .cs-head .btn { font-size: 12px; padding: 3px 8px; }
+  .cs-list { overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .cs-empty { color: #71717a; font-size: 12px; padding: 10px; text-align: center; }
+  .cs-tab { display: flex; align-items: center; gap: 4px; border: 1px solid transparent; border-radius: 8px; padding: 7px 8px; cursor: pointer; }
+  .cs-tab:hover { background: #131318; }
+  .cs-tab.on { background: #11142a; border-color: #28306a; }
+  .cs-main { flex: 1; min-width: 0; }
+  .cs-name { font-size: 13px; color: #e4e4e7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cs-tab.on .cs-name { color: #c7d2fe; }
+  .cs-meta { font-size: 10.5px; color: #6b7280; margin-top: 1px; }
+  .cs-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .1s; }
+  .cs-tab:hover .cs-actions, .cs-tab.on .cs-actions { opacity: 1; }
+  .cs-btn { background: none; border: 0; color: #71717a; cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 11px; line-height: 1; }
+  .cs-btn:hover { background: #1f1f27; color: #e5e7eb; }
   .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; max-height: 64vh; }
+  .chat-tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid #1c1c22; }
+  .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: #8b8b93; cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
+  .chat-tabs .ctab:hover { color: #c7d2fe; }
+  .chat-tabs .ctab.active { color: #e4e4e7; background: #11142a; border-color: #28306a; }
+  .chatdebug { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 160px; }
+  .chatdebug .empty { color: #71717a; font-size: 13px; margin: 30px auto; text-align: center; max-width: 460px; }
+  .dbg-round { border: 1px solid #26262b; border-radius: 10px; background: #0b0b14; margin-bottom: 10px; }
+  .dbg-round > summary { cursor: pointer; padding: 8px 12px; font: 600 12px/1.4 inherit; color: #c7d2fe; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .dbg-round > summary .dim { color: #6b7280; font-weight: 400; font-family: ui-monospace, monospace; font-size: 11px; }
+  .dbg-round .dbg-actions { padding: 0 12px 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .dbg-round .dbg-actions .copybtn { float: none; margin: 0; border: 1px solid #34343c; border-radius: 6px; padding: 3px 9px; font-size: 11px; color: #a1a1aa; }
+  .dbg-round .dbg-actions .copybtn:hover { color: #c7d2fe; border-color: #4b5563; }
+  .dbg-msg { border-top: 1px solid #1c1c22; padding: 8px 12px; }
+  .dbg-msg .role { font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 999px; display: inline-block; margin-bottom: 5px; }
+  .dbg-msg .role.system { color: #fcd34d; background: rgba(252,211,77,.1); }
+  .dbg-msg .role.user { color: #93c5fd; background: rgba(147,197,253,.1); }
+  .dbg-msg .role.assistant { color: #a5b4fc; background: rgba(165,180,252,.1); }
+  .dbg-msg .role.tool { color: #86efac; background: rgba(134,239,172,.1); }
+  .dbg-msg pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 11.5px/1.5 ui-monospace, monospace; color: #cbd5e1; max-height: 320px; overflow: auto; }
+  .dbg-msg .meta { color: #6b7280; font: 11px/1.4 ui-monospace, monospace; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .dbg-tools { border-top: 1px solid #1c1c22; padding: 8px 12px; }
+  .dbg-tools summary { cursor: pointer; color: #8b8b93; font: 600 11px/1.4 inherit; }
+  .dbg-tools .meta { color: #71717a; font: 11px/1.5 ui-monospace, monospace; padding-top: 5px; white-space: pre-wrap; }
   .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; --chat-font: 15px; }
   .chatlog .empty { color: #71717a; font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
   .bub { padding: 10px 13px; border-radius: 12px; font-size: var(--chat-font, 15px); line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
@@ -131,7 +172,34 @@
   .bub .think { margin-bottom: 8px; border: 1px solid #26262b; border-radius: 8px; background: #0b0b14; }
   .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: #8b8b93; text-transform: uppercase; letter-spacing: .04em; }
   .bub .think .think-body { padding: 0 10px 9px; font-size: calc(var(--chat-font, 15px) - 2px); line-height: 1.5; color: #9ca3af; white-space: pre-wrap; }
+  .bub .think .think-body.md { white-space: normal; }
+  .bub .think .think-body.md p { margin: 0 0 6px; white-space: pre-wrap; }
+  .bub .think .think-body.md p:last-child { margin-bottom: 0; }
+  .bub .think .think-body.md ul, .bub .think .think-body.md ol { margin: 4px 0 6px; padding-left: 20px; }
+  .bub .think .think-body.md li { margin: 2px 0; }
+  .bub .think .think-body.md h1, .bub .think .think-body.md h2, .bub .think .think-body.md h3,
+  .bub .think .think-body.md h4, .bub .think .think-body.md h5, .bub .think .think-body.md h6 { margin: 8px 0 4px; font-size: 1em; font-weight: 700; color: #b6bdc9; }
+  .bub .think .think-body.md code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 4px; padding: 1px 4px; font: 0.86em ui-monospace, monospace; color: #d4a0a0; }
+  .bub .think .think-body.md pre.md-code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 6px; padding: 8px 10px; margin: 5px 0; overflow: auto; max-height: 240px; white-space: pre; font: 11px/1.5 ui-monospace, monospace; color: #9ca3af; }
+  .bub .think .think-body.md strong { color: #cbd5e1; }
+  .bub .who .ts { float: right; font-weight: 500; text-transform: none; letter-spacing: 0; color: #6b7280; font-size: 10px; }
   .bub .steps { margin-top: 8px; }
+  /* interleaved chain-of-thought timeline inside the Thinking disclosure */
+  .bub .think .think-tl { padding: 4px 10px 9px; }
+  .bub .think .think-tl .think-body { padding: 0; }
+  .bub .think .think-tl .toolcall { border: 1px solid #26262b; border-radius: 8px; margin: 6px 0; background: #0c0c0e; }
+  .bub .think .think-tl .toolcall summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
+  .bub .think .think-tl .toolcall .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+  .bub .think .think-tl .toolcall pre, .bub .think .think-tl .toolcall .result { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 280px; overflow: auto; }
+  /* copy-to-clipboard button on a droid bubble */
+  .bub .who .copybtn { float: right; margin-left: 8px; background: none; border: none; cursor: pointer; color: #6b7280; font-size: 13px; padding: 0 2px; line-height: 1; }
+  .bub .who .copybtn:hover { color: #c7d2fe; }
+  .bub .who .copybtn.done { color: #86efac; }
+  /* GitHub-style markdown tables (answers + thinking) */
+  .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
+  .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
+  .bub table.md-table th { background: #161a35; color: #c7d2fe; font-weight: 700; }
+  .bub table.md-table tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
   /* live streaming bubble: tool steps + a transient status line */
   .bub .live-status { margin-top: 6px; font-size: 12px; color: #8b8b93; font-style: italic; }
   .bub .steps .livestep { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
@@ -254,6 +322,25 @@ function mdToHtml(src){
     if(bm){ flush(); html += blocks[+bm[1]]; i++; continue; }
     const h = ln.match(/^(#{1,6})\s+(.*)$/);
     if(h){ flush(); html += '<h'+h[1].length+'>'+inline(h[2])+'</h'+h[1].length+'>'; i++; continue; }
+    // GitHub-style table: a header row followed by a |:---|---:| separator row.
+    if(ln.indexOf('|')!==-1 && i+1<lines.length && /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)*\|?\s*$/.test(lines[i+1])){
+      flush();
+      const cellsOf = r => { let s = r.trim(); if(s.startsWith('|')) s = s.slice(1); if(s.endsWith('|')) s = s.slice(0,-1); return s.split('|').map(c=>c.trim()); };
+      const header = cellsOf(lines[i]);
+      const aligns = cellsOf(lines[i+1]).map(c => { const l = c.startsWith(':'), r = c.endsWith(':'); return (l&&r)?'center':(r?'right':(l?'left':'')); });
+      i += 2;
+      let tb = '<table class="md-table"><thead><tr>';
+      header.forEach((c,ci)=>{ tb += '<th'+(aligns[ci]?' style="text-align:'+aligns[ci]+'"':'')+'>'+inline(c)+'</th>'; });
+      tb += '</tr></thead><tbody>';
+      while(i<lines.length && lines[i].indexOf('|')!==-1 && !/^\s*$/.test(lines[i])){
+        const cells = cellsOf(lines[i]);
+        tb += '<tr>';
+        for(let ci=0; ci<header.length; ci++){ const a = aligns[ci]; tb += '<td'+(a?' style="text-align:'+a+'"':'')+'>'+inline(cells[ci]||'')+'</td>'; }
+        tb += '</tr>'; i++;
+      }
+      tb += '</tbody></table>';
+      html += tb; continue;
+    }
     if(/^\s*([-*+])\s+/.test(ln)){
       flush(); html += '<ul>';
       while(i<lines.length && /^\s*([-*+])\s+/.test(lines[i])){ html += '<li>'+inline(lines[i].replace(/^\s*([-*+])\s+/,''))+'</li>'; i++; }
@@ -281,6 +368,14 @@ function tierBadge(t){
   return '<span class="tier '+m[0]+'">'+m[1]+'</span>';
 }
 function ago(t){ if(!t) return ''; const s=(Date.now()-t)/1000; if(s<60) return Math.round(s)+'s ago'; if(s<3600) return Math.round(s/60)+'m ago'; return Math.round(s/3600)+'h ago'; }
+// Clock time for a chat message stamp; includes the date when it isn't today.
+function fmtTime(t){
+  if(!t) return '';
+  const d = new Date(t), now = new Date();
+  const hm = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  const sameDay = d.toDateString() === now.toDateString();
+  return sameDay ? hm : (d.toLocaleDateString([], {month:'short', day:'numeric'})+' '+hm);
+}
 
 async function api(path, opts){
   const r = await fetch(path, opts);
@@ -627,38 +722,53 @@ async function renderWorkspace(ws, proc){
     </div>
     ${p.hasModel ? '<div id="wsModel" class="ws-model"></div>' : ''}
     <p class="muted" style="font-size:12px;max-width:720px;margin:12px 0 0">Chat with the droid about this dataset. It queries the bound traces directly (read-only SQL over a DuckDB view, plus an optional trusted Python tier) to form and test its own hypotheses. The conversation is multi-turn — it remembers earlier answers in this session.</p>
-    <div class="chat">
-      <div id="chatLog" class="chatlog"><div class="empty">Loading conversation…</div></div>
-      <div class="compose">
-        <div class="compose-row">
-          <select id="chatPrompt"><option value="">Load a prompt…</option></select>
-          <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
-          <span class="fontctl" title="Chat text size">
-            <button id="chatFontDown" title="Smaller text">A−</button>
-            <button id="chatFontUp" title="Larger text">A+</button>
-          </span>
-          <button class="btn ghost" id="chatReset" title="Forget this conversation" style="margin-left:auto">Reset</button>
+    <div class="chat-wrap">
+      <div class="chat-sessions">
+        <div class="cs-head"><span>Chats</span><button class="btn ghost" id="chatNew" title="Start a new chat session">+ New</button></div>
+        <div id="chatTabs" class="cs-list"><div class="cs-empty">Loading…</div></div>
+      </div>
+      <div class="chat">
+        <div class="chat-tabs">
+          <button class="ctab active" id="tabChat" data-tab="chat">Chat</button>
+          <button class="ctab" id="tabDebug" data-tab="debug" title="See exactly what was sent to the model this session">Debug</button>
         </div>
-        <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…"></textarea>
-        <div class="compose-actions">
-          <span class="split">
-            <button class="btn primary" id="chatSend">Investigate with the droid →</button>
-            <button class="btn primary split-caret" id="chatSendMenu" title="Send with a different LLM profile" aria-haspopup="true" aria-expanded="false">▾</button>
-            <div class="menu" id="chatProfileMenu" hidden></div>
-          </span>
-          <button class="btn warn" id="chatWrapup" style="display:none" title="Tell the droid to stop and report its findings so far">Wrap it up →</button>
-          <label class="muted" id="chatPyLabel"><input type="checkbox" id="chatPy" /> <span id="chatPyText">allow Python escape hatch</span></label>
-          <span class="muted" id="chatHint" style="margin-left:auto"></span>
+        <div id="chatLog" class="chatlog"><div class="empty">Loading conversation…</div></div>
+        <div id="chatDebug" class="chatdebug" style="display:none"><div class="empty">No request captured yet. Send a message; the exact payload sent to the model will appear here.</div></div>
+        <div class="compose" id="chatCompose">
+          <div class="compose-row">
+            <select id="chatPrompt"><option value="">Load a prompt…</option></select>
+            <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
+            <span class="fontctl" title="Chat text size">
+              <button id="chatFontDown" title="Smaller text">A−</button>
+              <button id="chatFontUp" title="Larger text">A+</button>
+            </span>
+            <button class="btn ghost" id="chatReset" title="Forget this conversation" style="margin-left:auto">Reset</button>
+          </div>
+          <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…"></textarea>
+          <div class="compose-actions">
+            <span class="split">
+              <button class="btn primary" id="chatSend">Investigate with the droid →</button>
+              <button class="btn primary split-caret" id="chatSendMenu" title="Send with a different LLM profile" aria-haspopup="true" aria-expanded="false">▾</button>
+              <div class="menu" id="chatProfileMenu" hidden></div>
+            </span>
+            <button class="btn warn" id="chatWrapup" style="display:none" title="Tell the droid to stop and report its findings so far">Wrap it up →</button>
+            <label class="muted" id="chatPyLabel"><input type="checkbox" id="chatPy" /> <span id="chatPyText">allow Python escape hatch</span></label>
+            <span class="muted" id="chatHint" style="margin-left:auto"></span>
+          </div>
         </div>
       </div>
     </div>`;
   if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
-  STATE.ws = ws; STATE.wsProc = proc; STATE.prompts = [];
+  STATE.ws = ws; STATE.wsProc = proc; STATE.prompts = []; STATE.sessionId = null;
+  STATE.chatTab = 'chat';
   applyChatFont();
   labelSendButton();
   refreshPythonLabel();
   await loadChatPrompts();
-  await loadChat(ws, proc);
+  await loadSessions(ws, proc);
+  $('#chatNew').onclick = () => newSession(ws, proc);
+  $('#tabChat').onclick = () => switchChatTab('chat', ws, proc);
+  $('#tabDebug').onclick = () => switchChatTab('debug', ws, proc);
   $('#chatSend').onclick = () => sendChat(ws, proc);
   $('#chatSendMenu').onclick = (e) => { e.stopPropagation(); toggleProfileMenu(); };
   $('#chatWrapup').onclick = () => wrapUpChat(ws, proc);
@@ -689,6 +799,64 @@ function bumpChatFont(dir){
   applyChatFont();
 }
 
+// ── Chat / Debug tab switcher (Debug shows exactly what was sent to the model) ─
+function switchChatTab(tab, ws, proc){
+  STATE.chatTab = tab;
+  const onChat = tab === 'chat';
+  const log = $('#chatLog'), dbg = $('#chatDebug'), compose = $('#chatCompose');
+  if(log) log.style.display = onChat ? '' : 'none';
+  if(compose) compose.style.display = onChat ? '' : 'none';
+  if(dbg) dbg.style.display = onChat ? 'none' : '';
+  const tc = $('#tabChat'), td = $('#tabDebug');
+  if(tc) tc.classList.toggle('active', onChat);
+  if(td) td.classList.toggle('active', !onChat);
+  if(!onChat) loadDebug(ws, proc);
+}
+
+async function loadDebug(ws, proc){
+  const host = $('#chatDebug'); if(!host) return;
+  const sid = STATE.sessionId;
+  if(!sid){ host.innerHTML = '<div class="empty">Start a conversation to capture a request.</div>'; return; }
+  try {
+    const data = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions/'+encodeURIComponent(sid)+'/debug');
+    host.innerHTML = renderDebug(data);
+  } catch(e){ host.innerHTML = '<div class="empty">'+esc(e.message||e)+'</div>'; }
+}
+
+// Render the captured request payloads (one <details> per round) showing the full message
+// array the model received: system prompt, prior transcript, tool specs and the latest message.
+function renderDebug(data){
+  const reqs = (data && data.requests) || [];
+  if(!reqs.length) return '<div class="empty">No request captured for this chat yet. Send a message and it will appear here.</div>';
+  const roleClass = r => ({system:'system', user:'user', assistant:'assistant', tool:'tool'}[r] || 'assistant');
+  return reqs.map((entry, idx) => {
+    const b = entry.body || {};
+    const msgs = b.messages || [];
+    const tools = b.tools || [];
+    const head = 'Round '+(entry.round!=null?entry.round:(idx+1))+
+      ' <span class="dim">'+esc(b.model||'')+(b.temperature!=null?(' · temp '+esc(b.temperature)):'')+(b.max_tokens!=null?(' · max_tokens '+esc(b.max_tokens)):'')+' · '+msgs.length+' messages</span>';
+    const copyJson = esc(JSON.stringify(b, null, 2));
+    const msgHtml = msgs.map(m => {
+      const rc = roleClass(m.role);
+      let body = '';
+      if(m.content) body += '<pre>'+esc(typeof m.content==='string'?m.content:JSON.stringify(m.content,null,2))+'</pre>';
+      if(m.tool_calls && m.tool_calls.length){
+        body += '<div class="meta">tool_calls: '+esc(m.tool_calls.map(c => (c.function&&c.function.name)+'('+((c.function&&c.function.arguments)||'')+')').join(', '))+'</div>';
+      }
+      if(m.tool_call_id) body += '<div class="meta">tool_call_id: '+esc(m.tool_call_id)+'</div>';
+      if(!body) body = '<pre>(empty)</pre>';
+      return '<div class="dbg-msg"><span class="role '+rc+'">'+esc(m.role||'?')+'</span>'+body+'</div>';
+    }).join('');
+    const toolHtml = tools.length ? '<details class="dbg-tools"><summary>'+tools.length+' tool'+(tools.length===1?'':'s')+' offered</summary><div class="meta">'+
+      esc(tools.map(t => (t.function&&t.function.name)+' — '+((t.function&&t.function.description)||'').split('\n')[0]).join('\n'))+'</div></details>' : '';
+    return '<details class="dbg-round"'+(idx===reqs.length-1?' open':'')+'>'+
+      '<summary>'+head+'</summary>'+
+      '<div class="dbg-actions"><button class="copybtn" title="Copy the full JSON payload" data-copy="'+copyJson+'">Copy JSON payload</button></div>'+
+      msgHtml + toolHtml +
+      '</details>';
+  }).join('');
+}
+
 // ── smart Python escape-hatch label ──────────────────────────────────────────
 async function refreshPythonLabel(){
   const text = $('#chatPyText'); const cb = $('#chatPy'); if(!text) return;
@@ -701,14 +869,15 @@ async function refreshPythonLabel(){
     text.innerHTML = '<span class="pylink" id="pyConfigure">Configure Python</span>';
     const l = $('#pyConfigure'); if(l) l.onclick = pyConfigurePopup;
   } else if(s.dataScience){
-    if(cb) cb.disabled = false;
+    if(cb){ cb.disabled = false; cb.checked = (localStorage.getItem('processos.allowPython')==='1'); }
     text.textContent = 'Enable Python Data Science tools';
   } else {
-    if(cb) cb.disabled = false;
+    if(cb){ cb.disabled = false; cb.checked = (localStorage.getItem('processos.allowPython')==='1'); }
     const missing = (s.missing||[]).join(', ');
     text.innerHTML = 'Enable Python (Optional: <span class="pylink" id="pyInstall">Install Data Science tools</span>)';
     const l = $('#pyInstall'); if(l) l.onclick = () => pyInstallPopup(missing);
   }
+  if(cb) cb.onchange = () => { if(!cb.disabled) localStorage.setItem('processos.allowPython', cb.checked ? '1' : '0'); };
 }
 function showModal(title, bodyHtml){
   const back = document.createElement('div');
@@ -833,18 +1002,49 @@ function droidWhoHtml(){
 }
 
 function chatBub(t){
-  if(t.role==='user') return '<div class="bub user"><div class="who">You</div>'+esc(t.text)+'</div>';
-  const { think, answer } = splitThinking(t.text);
-  const thinkHtml = think ? '<details class="think"><summary>Thinking</summary><div class="think-body">'+esc(think)+'</div></details>' : '';
-  const steps = (t.steps||[]).map((s,i) => `
-    <details>
-      <summary>${esc(s.tool)} · ${i+1}</summary>
-      <div class="args">${esc(JSON.stringify(s.arguments))}</div>
-      <pre>${esc(s.result)}</pre>
-    </details>`).join('');
-  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div>'+thinkHtml+
-    '<div class="answer md">'+(answer ? mdToHtml(answer) : (think ? '' : '(no answer)'))+'</div>'+
-    (steps ? '<div class="steps">'+steps+'</div>' : '')+'</div>';
+  const time = t.ts ? '<span class="ts" title="'+esc(new Date(t.ts).toLocaleString())+'">'+esc(fmtTime(t.ts))+'</span>' : '';
+  if(t.role==='user') return '<div class="bub user"><div class="who">You'+time+'</div>'+esc(t.text)+'</div>';
+  let answer = t.text || '';
+  // Prefer the backend's interleaved reasoning/tool timeline; fall back to splitting <think>
+  // out of the answer + appending flat steps for any legacy turn without a `thought` array.
+  let items = t.thought || [];
+  if(!items.length){
+    const sp = splitThinking(answer); answer = sp.answer;
+    items = [];
+    if(sp.think) items.push({ kind:'reasoning', text: sp.think });
+    (t.steps||[]).forEach(s => items.push({ kind:'tool', tool:s.tool, arguments:s.arguments, result:s.result }));
+  }
+  let ti = 0; let toolCount = 0;
+  const inner = items.map(it => {
+    if(it.kind === 'tool'){
+      ti++; toolCount++;
+      return '<details class="toolcall"><summary>'+esc(it.tool)+' · '+ti+'</summary>'+
+        '<div class="args">'+esc(JSON.stringify(it.arguments))+'</div>'+
+        '<pre>'+esc(it.result)+'</pre></details>';
+    }
+    return '<div class="think-body md">'+mdToHtml(it.text)+'</div>';
+  }).join('');
+  const summary = 'Thinking' + (toolCount ? ' · '+toolCount+' tool call'+(toolCount===1?'':'s') : '');
+  const thinkHtml = inner ? '<details class="think"><summary>'+esc(summary)+'</summary><div class="think-tl">'+inner+'</div></details>' : '';
+  const copyBtn = answer ? '<button class="copybtn" title="Copy response" data-copy="'+esc(answer)+'">\u29C9</button>' : '';
+  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+copyBtn+time+'</div>'+thinkHtml+
+    '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div></div>';
+}
+
+// Copy-to-clipboard for droid bubbles (delegated once; survives chat re-renders).
+if(!window.__copyWired){
+  window.__copyWired = true;
+  document.addEventListener('click', async (e) => {
+    const btn = e.target.closest && e.target.closest('.copybtn');
+    if(!btn) return;
+    const txt = btn.getAttribute('data-copy') || '';
+    let ok = false;
+    try { if(navigator.clipboard && navigator.clipboard.writeText){ await navigator.clipboard.writeText(txt); ok = true; } } catch(_){}
+    if(!ok){ try { const ta = document.createElement('textarea'); ta.value = txt; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); ok = document.execCommand('copy'); document.body.removeChild(ta); } catch(_){} }
+    const prev = btn.textContent;
+    btn.textContent = ok ? '\u2713' : '\u2717'; btn.classList.add('done');
+    setTimeout(()=>{ btn.textContent = prev; btn.classList.remove('done'); }, 1200);
+  });
 }
 
 function drawChat(turns){
@@ -856,8 +1056,11 @@ function drawChat(turns){
 }
 
 async function loadChat(ws, proc){
+  const sid = STATE.sessionId;
   try {
-    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat');
+    const url = '/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat'+(sid?('?session='+encodeURIComponent(sid)):'');
+    const r = await api(url);
+    if(r.sessionId) STATE.sessionId = r.sessionId;
     drawChat(r.turns);
     // Fresh conversation: pre-load the open-investigation prompt so the default action is
     // an unbiased investigation the operator can send or edit.
@@ -867,6 +1070,90 @@ async function loadChat(ws, proc){
       if(box && !box.value && open) box.value = open.text;
     }
   } catch(e){ const log=$('#chatLog'); if(log) log.innerHTML='<div class="empty">'+esc(e.message||e)+'</div>'; }
+}
+
+// ── chat sessions (tabs) ─────────────────────────────────────────────────────
+async function loadSessions(ws, proc, preferId){
+  try {
+    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions');
+    STATE.sessions = r.sessions || [];
+  } catch(e){ STATE.sessions = []; }
+  // Choose the active session: explicit preference, else the current one if still present,
+  // else the most recent (the list is newest-first).
+  const want = preferId || STATE.sessionId;
+  let active = STATE.sessions.find(s => s.id===want) || STATE.sessions[0];
+  STATE.sessionId = active ? active.id : null;
+  drawSessions(ws, proc);
+  await loadChat(ws, proc);
+}
+
+function drawSessions(ws, proc){
+  const list = $('#chatTabs'); if(!list) return;
+  const ss = STATE.sessions || [];
+  if(!ss.length){ list.innerHTML = '<div class="cs-empty">No chats yet.</div>'; return; }
+  list.innerHTML = ss.map(s => {
+    const on = s.id===STATE.sessionId ? ' on' : '';
+    const when = s.updated ? fmtTime(s.updated) : '';
+    return '<div class="cs-tab'+on+'" data-id="'+esc(s.id)+'">'+
+      '<div class="cs-main">'+
+        '<div class="cs-name" title="'+esc(s.name)+'">'+esc(s.name)+'</div>'+
+        '<div class="cs-meta">'+esc(when)+(s.turns?(' · '+s.turns+' msg'+(s.turns===1?'':'s')):'')+'</div>'+
+      '</div>'+
+      '<div class="cs-actions">'+
+        '<button class="cs-btn cs-ren" title="Rename">✎</button>'+
+        '<button class="cs-btn cs-del" title="Delete">✕</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+  list.querySelectorAll('.cs-tab').forEach(el => {
+    const id = el.dataset.id;
+    el.querySelector('.cs-main').onclick = () => selectSession(ws, proc, id);
+    el.querySelector('.cs-ren').onclick = (e) => { e.stopPropagation(); renameSession(ws, proc, id); };
+    el.querySelector('.cs-del').onclick = (e) => { e.stopPropagation(); deleteSession(ws, proc, id); };
+  });
+}
+
+async function selectSession(ws, proc, id){
+  if(id===STATE.sessionId) return;
+  STATE.sessionId = id;
+  $('#chatHint').textContent = '';
+  drawSessions(ws, proc);
+  await loadChat(ws, proc);
+  if(STATE.chatTab === 'debug') loadDebug(ws, proc);
+}
+
+async function newSession(ws, proc){
+  try {
+    const s = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions', {
+      method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({})
+    });
+    await loadSessions(ws, proc, s.id);
+    const box = $('#chatBox'); if(box) box.focus();
+  } catch(e){ $('#chatHint').textContent = e.message||e; }
+}
+
+async function renameSession(ws, proc, id){
+  const cur = (STATE.sessions||[]).find(s => s.id===id);
+  const name = window.prompt('Rename chat:', cur ? cur.name : '');
+  if(name==null || !name.trim()) return;
+  try {
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions/'+encodeURIComponent(id)+'/rename', {
+      method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ name: name.trim() })
+    });
+    await loadSessions(ws, proc, STATE.sessionId);
+  } catch(e){ $('#chatHint').textContent = e.message||e; }
+}
+
+async function deleteSession(ws, proc, id){
+  const cur = (STATE.sessions||[]).find(s => s.id===id);
+  if(!window.confirm('Delete chat “'+(cur?cur.name:'this chat')+'”? This cannot be undone.')) return;
+  try {
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions/'+encodeURIComponent(id), { method:'DELETE' });
+    // If we deleted the active one, fall back to the most recent remaining session.
+    const next = (id===STATE.sessionId) ? null : STATE.sessionId;
+    STATE.sessionId = next;
+    await loadSessions(ws, proc, next);
+  } catch(e){ $('#chatHint').textContent = e.message||e; }
 }
 
 async function loadChatPrompts(){
@@ -882,9 +1169,10 @@ async function loadChatPrompts(){
 function livePendingHtml(){
   return '<div class="bub droid pending" id="chatPending">'+
     '<div class="who">'+droidWhoHtml()+'</div>'+
-    '<details class="think live" open id="liveThinkWrap" style="display:none"><summary>Thinking…</summary><div class="think-body" id="liveThink"></div></details>'+
+    '<details class="think live" open id="liveThinkWrap" style="display:none"><summary>Thinking…</summary>'+
+      '<div class="think-tl" id="liveTimeline"></div>'+
+    '</details>'+
     '<div class="answer md" id="liveAnswer"></div>'+
-    '<div class="steps" id="liveSteps"></div>'+
     '<div class="muted live-status" id="liveStatus">reasoning over the dataset…</div>'+
     '</div>';
 }
@@ -904,29 +1192,39 @@ async function sendChat(ws, proc){
   box.value = '';
 
   const pend = $('#chatPending');
-  const liveThink = $('#liveThink'), liveThinkWrap = $('#liveThinkWrap');
-  const liveAnswer = $('#liveAnswer'), liveSteps = $('#liveSteps'), liveStatus = $('#liveStatus');
-  let answerBuf = '', thinkBuf = '';
+  const liveThinkWrap = $('#liveThinkWrap'), liveTimeline = $('#liveTimeline');
+  const liveAnswer = $('#liveAnswer'), liveStatus = $('#liveStatus');
+  let answerBuf = '';
+  const liveDebug = []; // request payloads captured this turn for live Debug-tab updates
+  let curReason = null, curReasonBuf = ''; // the reasoning block currently streaming
   const pendingSteps = []; // FIFO of {tool, el} awaiting their result
   const nearBottom = () => (log.scrollHeight - log.scrollTop - log.clientHeight) < 80;
   const autoscroll = () => { if(nearBottom()) log.scrollTop = log.scrollHeight; };
 
   function handleEvent(ev){
     if(ev.type==='round'){ if(liveStatus) liveStatus.textContent = 'round '+ev.n+' — investigating…'; }
+    else if(ev.type==='request'){
+      liveDebug.push({ round: ev.round, body: ev.body });
+      if(STATE.chatTab==='debug'){ const host=$('#chatDebug'); if(host) host.innerHTML = renderDebug({ requests: liveDebug }); }
+    }
     else if(ev.type==='reasoning'){
-      thinkBuf += ev.text; if(liveThinkWrap) liveThinkWrap.style.display='';
-      if(liveThink) liveThink.textContent = thinkBuf; autoscroll();
+      if(liveThinkWrap) liveThinkWrap.style.display='';
+      // Append to the open reasoning block, or start a new one (e.g. after a tool call).
+      if(!curReason && liveTimeline){ curReason = document.createElement('div'); curReason.className = 'think-body md'; curReasonBuf = ''; liveTimeline.appendChild(curReason); }
+      curReasonBuf += ev.text; if(curReason) curReason.innerHTML = mdToHtml(curReasonBuf); autoscroll();
     }
     else if(ev.type==='answer'){
       answerBuf += ev.text; if(liveAnswer) liveAnswer.innerHTML = mdToHtml(answerBuf); autoscroll();
     }
     else if(ev.type==='tool'){
+      if(liveThinkWrap) liveThinkWrap.style.display='';
+      curReason = null; // close the current reasoning block so later thinking lands after this tool
       const el = document.createElement('details');
-      el.className = 'livestep'; el.open = true;
+      el.className = 'toolcall'; el.open = true;
       el.innerHTML = '<summary>▶ '+esc(ev.tool)+' …</summary>'+
         '<div class="args">'+esc(JSON.stringify(ev.arguments))+'</div>'+
         '<pre class="result">running…</pre>';
-      liveSteps.appendChild(el); pendingSteps.push({ tool: ev.tool, el });
+      if(liveTimeline) liveTimeline.appendChild(el); pendingSteps.push({ tool: ev.tool, el });
       if(liveStatus) liveStatus.textContent = 'running '+ev.tool+'…';
       autoscroll();
     }
@@ -941,6 +1239,9 @@ async function sendChat(ws, proc){
       const ds = ev.dataset || {};
       hint.textContent = (ev.rounds!=null?('round '+ev.rounds+' · '):'') +
         (ds.instances!=null?(ds.instances+' instances · '+ds.jobs+' jobs · '+ds.incidents+' incidents'):'');
+      // Refresh the tab list so the active chat's last-message time + count update.
+      loadSessionsQuiet(ws, proc, STATE.sessionId);
+      if(STATE.chatTab==='debug') loadDebug(ws, proc);
     }
     else if(ev.type==='error'){
       if(pend) pend.remove();
@@ -949,7 +1250,8 @@ async function sendChat(ws, proc){
   }
 
   try {
-    const resp = await fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream', {
+    const qs = STATE.sessionId ? ('?session='+encodeURIComponent(STATE.sessionId)) : '';
+    const resp = await fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ message: msg, allowPython })
     });
@@ -979,7 +1281,7 @@ async function sendChat(ws, proc){
     }
     if(!finished){
       // Stream closed without a terminal event — fall back to the persisted transcript.
-      try { const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat'); drawChat(r.turns); }
+      try { const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat'+(STATE.sessionId?('?session='+encodeURIComponent(STATE.sessionId)):'')); drawChat(r.turns); }
       catch(e){ if(pend) pend.remove(); }
     }
   } catch(e){
@@ -992,13 +1294,24 @@ async function sendChat(ws, proc){
   }
 }
 
+// Refresh the tab list (metadata only) without reloading the chat log — used after a turn
+// completes so the active chat's timestamp and message count update in place.
+async function loadSessionsQuiet(ws, proc, keepId){
+  try {
+    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/sessions');
+    STATE.sessions = r.sessions || [];
+    if(keepId) STATE.sessionId = keepId;
+    drawSessions(ws, proc);
+  } catch(e){ /* tab refresh is best-effort */ }
+}
+
 // Ask an in-flight investigation to stop and report its findings so far. The live bubble keeps
 // streaming — the wrap-up answer arrives as further `answer` events.
 async function wrapUpChat(ws, proc){
   const wrap = $('#chatWrapup'); if(wrap) wrap.disabled = true;
   const st = $('#liveStatus'); if(st) st.textContent = 'wrapping up — reporting findings so far…';
   try {
-    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/wrapup', { method:'POST' });
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/wrapup'+(STATE.sessionId?('?session='+encodeURIComponent(STATE.sessionId)):''), { method:'POST' });
     $('#chatHint').textContent = 'asked the droid to wrap up…';
   } catch(e){ $('#chatHint').textContent = 'wrap-up request failed: '+(e.message||e); }
 }
@@ -1022,8 +1335,9 @@ async function saveChatPrompt(){
 async function resetChat(ws, proc){
   if(!window.confirm('Forget this conversation?')) return;
   try {
-    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/reset', { method:'POST' });
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/reset'+(STATE.sessionId?('?session='+encodeURIComponent(STATE.sessionId)):''), { method:'POST' });
     drawChat([]); $('#chatHint').textContent = '';
+    loadSessionsQuiet(ws, proc, STATE.sessionId);
   } catch(e){ $('#chatHint').textContent = e.message||e; }
 }
 

@@ -237,16 +237,36 @@ The one-shot `investigate` call is also available as a **multi-turn, scrollable 
 dataset; each turn resumes from the persisted transcript, so the model remembers its own
 earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happen?"*).
 
-- `chat.rs` — a file-backed `ChatStore` under `PROCESSOS_DATA_DIR` (one JSON transcript per
-  `(workspace, process)` session) plus `render_view`, which projects the raw model
+- `chat.rs` — a file-backed `ChatStore` under `PROCESSOS_DATA_DIR` (one JSON file per
+  `(workspace, process)`, holding **several named sessions** so the operator can keep
+  multiple parallel investigations) plus `render_view`, which projects the raw model
   transcript into operator-facing `user`/`droid` turns (each droid turn carries the SQL/
-  Python tool steps it ran as a collapsible **lab notebook**).
+  Python tool steps it ran as a collapsible **lab notebook**). Each session has an editable
+  `name`, `created`/`updated` stamps, and a per-turn timestamp vector (`stamps`) aligned to
+  the rendered turns by `render_view_stamped`. The pre-multisession single-conversation file
+  shape is migrated on load into one named session.
+- **Sessions / tabs** — the cockpit shows a left-hand tab list (newest activity first) with
+  each chat's name and last-message time; operators **create**, **rename**, and **delete**
+  sessions, and every chat call carries the active `?session=` id. Endpoints live under
+  `.../chat/sessions`.
 - `agent::run_agent_resumable` drives the loop over a `&mut Vec<Msg>`, appending the
   assistant/tool turns **and** the final answer so the next turn keeps full context. A turn
   can also be **wrapped up early** (`POST .../chat/wrapup`): the loop checks a per-session
   cancel flag between rounds and, when set (or when the round budget is exhausted), tells the
   model to stop investigating and report its findings so far instead of erroring.
+- **Chain-of-thought is preserved across rounds**: the reasoning a model emits in a round
+  where it decides to call a tool is folded into a `<think>` block on that tool-calling turn
+  and carried forward by `render_view` onto the droid bubble it precedes — so the collapsible
+  "Thinking" disclosure survives even when the visible answer came from a later round (the
+  cockpit renders it as **collapsed, expandable Markdown**, since models think in Markdown too).
 - **Live token streaming** (`POST .../chat/stream`, SSE): the canonical agent loop
+  (`run_agent_streaming`) threads a sink that emits `round` / `reasoning` / `answer` / `tool` /
+  `toolResult` events as the model produces them, terminated by `done` (or `error`). The
+  `OpenAiAgent` requests `stream: true` and parses the SSE deltas — accumulating
+  `reasoning_content` and `content` tokens and assembling streamed `tool_calls` fragments by
+  index — so the cockpit shows the droid's thinking, tool calls, and answer **as they happen**
+  (live "Thinking" disclosure shown open, then collapsed once the turn completes). The
+  non-streaming `POST .../chat` endpoint still exists (same loop, no-op sink) for curl/API use.
   (`run_agent_streaming`) threads a sink that emits `round` / `reasoning` / `answer` / `tool` /
   `toolResult` events as the model produces them, terminated by `done` (or `error`). The
   `OpenAiAgent` requests `stream: true` and parses the SSE deltas — accumulating
@@ -269,37 +289,54 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
 
 ```bash
 # Send one turn (resumes the persisted transcript); GET to reload it, /reset to forget.
+# All chat calls accept ?session={id} (defaults to the most recent / a fresh session).
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat \
   -d '{"message":"Which job type has the worst queue tail?","allowPython":false}'
-# -> { answer, rounds, dataset:{instances,jobs,incidents}, turns:[{role,text,steps}] }
+# -> { sessionId, answer, rounds, dataset:{instances,jobs,incidents}, turns:[{role,text,steps,ts}] }
 # Same turn, streamed live as Server-Sent Events (round/reasoning/answer/tool/toolResult/done):
-curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream \
+curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream?session={id} \
   -d '{"message":"Which job type has the worst queue tail?","allowPython":false}'
 curl       .../api/workspaces/{workspace}/processes/{process}/chat        # load transcript
-curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/reset # forget it
+curl       .../api/workspaces/{workspace}/processes/{process}/chat/sessions          # list tabs
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/sessions -d '{"name":"Probe"}' # new
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/rename -d '{"name":"…"}'
+curl -XDELETE .../api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}   # delete a tab
+curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/reset?session={id} # forget it
 curl       .../api/chat-prompts                                           # list templates
 curl -XPOST .../api/chat-prompts -d '{"id":"my-probe","name":"My probe","text":"…"}'
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/wrapup # stop & report now
+curl       .../api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/debug # exact payloads sent
 curl       .../api/python/status   # { configured, interpreter, interpreterRuns, dataScience, missing }
 ```
 
-The chat surface adds a few operator conveniences: the **Send** button is a split control
-labelled with the active LLM profile (*"Investigate with &lt;profile&gt; →"*) whose **caret
-opens a profile picker** so the operator can switch the model that answers the next message
-without opening Settings; the button relabels live when the active profile changes. Droid
-bubbles are titled with the **profile name** and the model id in a smaller, dimmer
-parenthetical (*"Remote Qwen 3.6 (unsloth/qwen3.6-…)"*); they render the answer as
-**Markdown** (headings, lists, bold/italic, inline + fenced code, links — escaped first, only
-http(s) links emitted) and any reasoning as a **collapsed** "Thinking" disclosure. The droid's
-chain-of-thought is captured whether the backend emits inline `<think>…</think>` tags or a
-separate `reasoning_content` field (as llama.cpp does for Gemma/Qwen — `parse_openai_turn`
-folds it into a `<think>` block).
+The chat surface adds a few operator conveniences: a left-hand **tab list** of named chat
+sessions (each showing its last-message time and turn count) with **+ New**, inline
+**rename** (✎), and **delete** (✕); every message and the tab itself is **timestamped**. Each
+chat window also has a **Chat / Debug** tab pair — the **Debug** tab shows *exactly what was
+sent to the model* on the session's most recent turn (`GET .../chat/sessions/{id}/debug`): one
+collapsible section per round with the model, temperature, `max_tokens`, the **full message
+array** (system prompt + prior transcript + the latest message, each role-badged), the tool
+specs offered, and a **Copy JSON payload** button — so it's clear the model receives far more
+than just the operator's prompt. (The same payloads stream live as `request` SSE events.) The
+**Send** button is a split control labelled with the active LLM profile (*"Investigate with
+&lt;profile&gt; →"*) whose **caret opens a profile picker** so the operator can switch the model
+that answers the next message without opening Settings; the button relabels live when the
+active profile changes. Droid bubbles are titled with the **profile name** and the model id in
+a smaller, dimmer parenthetical (*"Remote Qwen 3.6 (unsloth/qwen3.6-…)"*); they carry a
+**copy-to-clipboard** button and render the answer as **Markdown** (headings, lists,
+bold/italic, inline + fenced code, **GitHub-style tables**, links — escaped first, only http(s)
+links emitted). Any reasoning is shown as a **collapsed, expandable, Markdown** "Thinking"
+disclosure whose **tool calls appear inline, exactly where they happened** in the chain of
+thought (each its own nested collapsible section). The droid's chain-of-thought is captured
+whether the backend emits inline `<think>…</think>` tags or a separate `reasoning_content`
+field (as llama.cpp does for Gemma/Qwen), and is preserved even when it happened in an earlier
+tool-calling round.
 **A−/A+** controls size the chat font (persisted in `localStorage`); a **Wrap it up →** button
 appears while a turn is in flight (`POST .../chat/wrapup`); and the Python toggle
 self-describes from `GET /api/python/status` — *"Enable Python Data Science tools"* when the
 interpreter has pandas/duckdb, *"Enable Python (Optional: Install Data Science tools)"* with an
 install popup when it runs but lacks them, or *"Configure Python"* with a setup popup when no
-interpreter is usable.
+interpreter is usable — and its on/off state is **persisted** in `localStorage`.
 
 
 ## The cockpit & pilot loop (§10)
@@ -417,8 +454,13 @@ for it automatically.
 | `GET` | `/api/workspaces/{workspace}/processes/{process}/insights` | Insights folded over the process's bound source |
 | `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | One-shot LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
 | `GET`/`POST` | `/api/workspaces/{workspace}/processes/{process}/chat` | Multi-turn cockpit chat: `GET` loads the persisted transcript; `POST {message,allowPython}` sends one turn and resumes from it |
-| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/stream` | Same as `chat`, streamed live as SSE (`round`/`reasoning`/`answer`/`tool`/`toolResult`/`done`) |
-| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/reset` | Forget this dataset's conversation |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/stream` | Same as `chat`, streamed live as SSE (`round`/`request`/`reasoning`/`answer`/`tool`/`toolResult`/`done`) |
+| `GET`/`POST` | `/api/workspaces/{workspace}/processes/{process}/chat/sessions` | List chat sessions (tabs) / create one (`POST {name?}`) |
+| `GET`/`DELETE` | `/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}` | Load one session's transcript / delete it |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/rename` | Rename a session (`POST {name}`) |
+| `GET` | `/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/debug` | The exact model request payloads sent during this session's most recent turn (one per round) — the Debug tab |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/wrapup` | Ask the in-flight turn to stop and report its findings so far |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/reset` | Forget this dataset's conversation (`?session={id}` clears just that one) |
 | `GET`/`POST` | `/api/chat-prompts` | List / author reusable compose-box prompt templates (persisted to the config dir) |
 | `DELETE` | `/api/chat-prompts/{id}` | Delete a non-built-in chat prompt |
 | `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |

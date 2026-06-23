@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,19 +26,59 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Msg, ToolCall};
 
-/// A persisted chat session: the full model transcript plus a last-updated stamp.
+/// Monotonic suffix so two sessions created in the same millisecond get distinct ids.
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A persisted chat session: a named, timestamped droid conversation. A `(workspace,
+/// process)` dataset can carry several, so the operator can run parallel investigations.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ChatSession {
+    pub id: String,
     #[serde(default)]
-    pub messages: Vec<Msg>,
+    pub name: String,
+    #[serde(default)]
+    pub created: u64,
     #[serde(default)]
     pub updated: u64,
+    #[serde(default)]
+    pub messages: Vec<Msg>,
+    /// Epoch-ms timestamp per rendered turn (aligned by index to [`render_view`]).
+    #[serde(default)]
+    pub stamps: Vec<u64>,
 }
 
-/// A file-backed chat-session store keyed by a sanitised `(workspace, process)` key.
+/// Lightweight session descriptor for the tab list (no transcript).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMeta {
+    pub id: String,
+    pub name: String,
+    pub created: u64,
+    pub updated: u64,
+    pub turns: usize,
+}
+
+/// On-disk shape: all sessions for one `(workspace, process)` key in a single file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ChatFile {
+    #[serde(default)]
+    sessions: Vec<ChatSession>,
+}
+
+/// The pre-multisession on-disk shape (one conversation per key). Read for migration.
+#[derive(Deserialize)]
+struct LegacyChatFile {
+    #[serde(default)]
+    messages: Vec<Msg>,
+    #[serde(default)]
+    updated: u64,
+}
+
+/// A file-backed multi-session chat store keyed by a sanitised `(workspace, process)` key.
+/// Each key owns a list of [`ChatSession`]s persisted together (overwrite-on-save).
 pub struct ChatStore {
     dir: PathBuf,
-    mem: RwLock<HashMap<String, ChatSession>>,
+    mem: RwLock<HashMap<String, Vec<ChatSession>>>,
 }
 
 impl ChatStore {
@@ -54,34 +95,133 @@ impl ChatStore {
         }
     }
 
-    /// Load a session's transcript (empty when none exists yet).
-    pub fn load(&self, key: &str) -> Vec<Msg> {
+    /// List a key's sessions (metadata only), newest activity first.
+    pub fn list(&self, key: &str) -> Vec<SessionMeta> {
+        self.ensure_loaded(key);
+        let mut metas: Vec<SessionMeta> = self
+            .mem
+            .read()
+            .ok()
+            .and_then(|m| {
+                m.get(key).map(|sessions| {
+                    sessions
+                        .iter()
+                        .map(|s| SessionMeta {
+                            id: s.id.clone(),
+                            name: s.name.clone(),
+                            created: s.created,
+                            updated: s.updated,
+                            turns: render_view(&s.messages).len(),
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        metas.sort_by(|a, b| b.updated.cmp(&a.updated));
+        metas
+    }
+
+    /// Create a new (empty) session for `key`, returning it.
+    pub fn create(&self, key: &str, name: Option<String>) -> ChatSession {
+        self.ensure_loaded(key);
+        let now = now_ms();
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let sessions = guard.entry(key.to_string()).or_default();
+        let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        let session = ChatSession {
+            id: new_session_id(),
+            name: name.unwrap_or_else(|| default_name(sessions.len() + 1)),
+            created: now,
+            updated: now,
+            messages: Vec::new(),
+            stamps: Vec::new(),
+        };
+        sessions.push(session.clone());
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+        session
+    }
+
+    /// Load a session by id (its full transcript + stamps).
+    pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {
         self.ensure_loaded(key);
         self.mem
             .read()
             .ok()
-            .and_then(|m| m.get(key).map(|s| s.messages.clone()))
-            .unwrap_or_default()
+            .and_then(|m| m.get(key).and_then(|s| s.iter().find(|s| s.id == session_id).cloned()))
     }
 
-    /// Replace a session's transcript with `messages` and persist it.
-    pub fn save(&self, key: &str, messages: Vec<Msg>) {
-        let session = ChatSession {
-            messages,
-            updated: now_ms(),
+    /// Replace a session's transcript + stamps, bumping `updated`. Creates the session if
+    /// the id is unknown (e.g. a race) so a turn is never lost.
+    pub fn save(&self, key: &str, session_id: &str, messages: Vec<Msg>, stamps: Vec<u64>) {
+        self.ensure_loaded(key);
+        let now = now_ms();
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let sessions = guard.entry(key.to_string()).or_default();
+        if let Some(s) = sessions.iter_mut().find(|s| s.id == session_id) {
+            s.messages = messages;
+            s.stamps = stamps;
+            s.updated = now;
+        } else {
+            let n = sessions.len() + 1;
+            sessions.push(ChatSession {
+                id: session_id.to_string(),
+                name: default_name(n),
+                created: now,
+                updated: now,
+                messages,
+                stamps,
+            });
+        }
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+    }
+
+    /// Rename a session. Returns false when the id is unknown.
+    pub fn rename(&self, key: &str, session_id: &str, name: &str) -> bool {
+        self.ensure_loaded(key);
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let Some(sessions) = guard.get_mut(key) else {
+            return false;
         };
-        if let Ok(mut mem) = self.mem.write() {
-            mem.insert(key.to_string(), session.clone());
-        }
-        if let Err(e) = self.persist(key, &session) {
-            tracing::warn!(key = %key, error = %e, "chat store: persist failed");
-        }
+        let Some(s) = sessions.iter_mut().find(|s| s.id == session_id) else {
+            return false;
+        };
+        s.name = name.to_string();
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+        true
     }
 
-    /// Clear a session (forget the conversation).
+    /// Delete one session. Returns false when the id is unknown.
+    pub fn delete(&self, key: &str, session_id: &str) -> bool {
+        self.ensure_loaded(key);
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let Some(sessions) = guard.get_mut(key) else {
+            return false;
+        };
+        let before = sessions.len();
+        sessions.retain(|s| s.id != session_id);
+        if sessions.len() == before {
+            return false;
+        }
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+        true
+    }
+
+    /// Clear every session under a key (used by the legacy "reset" path).
     pub fn clear(&self, key: &str) {
         if let Ok(mut mem) = self.mem.write() {
-            mem.remove(key);
+            mem.insert(key.to_string(), Vec::new());
         }
         let _ = fs::remove_file(self.path_for(key));
     }
@@ -96,15 +236,42 @@ impl ChatStore {
         }
     }
 
-    fn load_from_disk(&self, key: &str) -> Option<ChatSession> {
+    /// Load a key's sessions from disk, migrating the legacy single-conversation shape.
+    fn load_from_disk(&self, key: &str) -> Option<Vec<ChatSession>> {
         let body = fs::read_to_string(self.path_for(key)).ok()?;
-        serde_json::from_str(&body).ok()
+        if let Ok(file) = serde_json::from_str::<ChatFile>(&body) {
+            if !file.sessions.is_empty() {
+                return Some(file.sessions);
+            }
+        }
+        // Migrate the legacy `{messages, updated}` file into a single named session.
+        let legacy: LegacyChatFile = serde_json::from_str(&body).ok()?;
+        if legacy.messages.is_empty() {
+            return Some(Vec::new());
+        }
+        let updated = if legacy.updated > 0 { legacy.updated } else { now_ms() };
+        Some(vec![ChatSession {
+            id: new_session_id(),
+            name: default_name(1),
+            created: updated,
+            updated,
+            messages: legacy.messages,
+            stamps: Vec::new(),
+        }])
     }
 
-    fn persist(&self, key: &str, session: &ChatSession) -> std::io::Result<()> {
-        let body = serde_json::to_string(session)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        fs::write(self.path_for(key), body)
+    fn persist(&self, key: &str, sessions: &[ChatSession]) {
+        let file = ChatFile {
+            sessions: sessions.to_vec(),
+        };
+        match serde_json::to_string(&file) {
+            Ok(body) => {
+                if let Err(e) = fs::write(self.path_for(key), body) {
+                    tracing::warn!(key = %key, error = %e, "chat store: persist failed");
+                }
+            }
+            Err(e) => tracing::warn!(key = %key, error = %e, "chat store: serialise failed"),
+        }
     }
 
     /// One file per `(workspace, process)`; the key is sanitised so it can never escape
@@ -122,6 +289,17 @@ impl ChatStore {
             .collect();
         self.dir.join(format!("chat-{safe}.json"))
     }
+}
+
+/// A fresh, collision-resistant session id (`s{epoch_ms}-{seq}`).
+fn new_session_id() -> String {
+    let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("s{}-{}", now_ms(), seq)
+}
+
+/// Default name for the Nth session under a key.
+fn default_name(n: usize) -> String {
+    format!("Investigation {n}")
 }
 
 /// Build the store's per-`(workspace, process)` key.
@@ -158,6 +336,22 @@ pub struct ChatStepView {
     pub result: String,
 }
 
+/// One entry in a droid turn's chain-of-thought timeline: either a block of reasoning prose
+/// or a tool call, kept in the order they actually happened so the cockpit can show each tool
+/// call *where it occurred* in the thinking rather than lumped at the end.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ThoughtItem {
+    Reasoning {
+        text: String,
+    },
+    Tool {
+        tool: String,
+        arguments: serde_json::Value,
+        result: String,
+    },
+}
+
 /// One operator-facing turn in the chat.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -165,20 +359,95 @@ pub struct ChatTurnView {
     /// `user` (the operator) or `droid` (the model).
     pub role: String,
     pub text: String,
-    /// For droid turns, the tool calls it ran before replying.
+    /// For droid turns, the tool calls it ran before replying (flat, legacy view).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<ChatStepView>,
+    /// For droid turns, the interleaved reasoning + tool-call timeline in chronological order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thought: Vec<ThoughtItem>,
+    /// Epoch-ms timestamp of this turn, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
+}
+
+/// Find `needle` (ASCII) in `hay` case-insensitively from byte offset `from`, returning a byte
+/// offset into the original string. Operates on bytes; safe for UTF-8 because the ASCII tag
+/// bytes never occur inside a multi-byte sequence.
+fn find_ci(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= hay.len() || needle.len() > hay.len() {
+        return None;
+    }
+    let end = hay.len() - needle.len();
+    (from..=end).find(|&i| hay[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Pull `<think>`/`<thinking>` reasoning out of `text`, mirroring the cockpit's client-side
+/// `splitThinking`. Returns `(thinking, answer)` where `answer` is the cleaned prose. Handles
+/// multiple blocks and tolerates an unterminated trailing `<think>` (as seen mid-stream).
+fn split_thinking(text: &str) -> (String, String) {
+    let bytes = text.as_bytes();
+    let mut think = String::new();
+    let mut answer = String::new();
+    let mut pos = 0usize;
+    let push_think = |think: &mut String, body: &str| {
+        let body = body.trim();
+        if !body.is_empty() {
+            if !think.is_empty() {
+                think.push_str("\n\n");
+            }
+            think.push_str(body);
+        }
+    };
+    while pos < bytes.len() {
+        let open_a = find_ci(bytes, b"<think>", pos).map(|i| (i, 7usize));
+        let open_b = find_ci(bytes, b"<thinking>", pos).map(|i| (i, 10usize));
+        let next = match (open_a, open_b) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some((start, open_len)) = next else {
+            answer.push_str(&text[pos..]);
+            break;
+        };
+        answer.push_str(&text[pos..start]);
+        let body_start = start + open_len;
+        let close_a = find_ci(bytes, b"</think>", body_start).map(|i| (i, 8usize));
+        let close_b = find_ci(bytes, b"</thinking>", body_start).map(|i| (i, 11usize));
+        let close = match (close_a, close_b) {
+            (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        match close {
+            Some((cstart, clen)) => {
+                push_think(&mut think, &text[body_start..cstart]);
+                pos = cstart + clen;
+            }
+            None => {
+                push_think(&mut think, &text[body_start..]);
+                pos = bytes.len();
+            }
+        }
+    }
+    (think.trim().to_string(), answer.trim().to_string())
 }
 
 /// Project a model transcript into operator-facing turns: each `User` message becomes a
 /// user turn; the model's tool calls are paired with their `Tool` results into steps and
-/// attached to the next droid turn (an `Assistant` message carrying final text). The
-/// system message is intentionally omitted.
+/// attached to the next droid turn (an `Assistant` message carrying final text). The droid
+/// turn also carries a `thought` timeline interleaving every reasoning block (extracted from
+/// each round's `<think>` block) with the tool calls in chronological order, so the cockpit
+/// can render each tool call exactly where it happened in the thinking. The visible `text` is
+/// the final answer with its `<think>` stripped; the system message is omitted.
 pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
     let mut turns: Vec<ChatTurnView> = Vec::new();
     // Tool calls awaiting their results / a final answer, by call_id.
     let mut pending: Vec<ToolCall> = Vec::new();
     let mut steps: Vec<ChatStepView> = Vec::new();
+    let mut thought: Vec<ThoughtItem> = Vec::new();
 
     for msg in messages {
         match msg {
@@ -188,42 +457,95 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                     role: "user".into(),
                     text: text.clone(),
                     steps: Vec::new(),
+                    thought: Vec::new(),
+                    ts: None,
                 });
             }
             Msg::Assistant { text, tool_calls } => {
                 if !tool_calls.is_empty() {
                     // A tool-requesting turn: remember the calls so the following Tool
-                    // messages can be matched to them.
+                    // messages can be matched, and record this round's reasoning.
                     pending.extend(tool_calls.iter().cloned());
+                    if let Some(t) = text {
+                        let (think, rest) = split_thinking(t);
+                        let reason = if !think.is_empty() { think } else { rest };
+                        if !reason.trim().is_empty() {
+                            thought.push(ThoughtItem::Reasoning {
+                                text: reason.trim().to_string(),
+                            });
+                        }
+                    }
                 } else {
-                    // A final answer: drain accumulated steps onto this droid turn.
+                    // A final answer: split off its reasoning, then drain the timeline.
+                    let (think, answer) = split_thinking(text.as_deref().unwrap_or(""));
+                    if !think.trim().is_empty() {
+                        thought.push(ThoughtItem::Reasoning {
+                            text: think.trim().to_string(),
+                        });
+                    }
                     turns.push(ChatTurnView {
                         role: "droid".into(),
-                        text: text.clone().unwrap_or_default(),
+                        text: answer,
                         steps: std::mem::take(&mut steps),
+                        thought: std::mem::take(&mut thought),
+                        ts: None,
                     });
                     pending.clear();
                 }
             }
             Msg::Tool { call_id, content } => {
-                if let Some(pos) = pending.iter().position(|c| c.id == *call_id) {
+                let step = if let Some(pos) = pending.iter().position(|c| c.id == *call_id) {
                     let call = pending.remove(pos);
-                    steps.push(ChatStepView {
+                    ChatStepView {
                         tool: call.name,
                         arguments: call.arguments,
                         result: content.clone(),
-                    });
+                    }
                 } else {
-                    steps.push(ChatStepView {
+                    ChatStepView {
                         tool: "tool".into(),
                         arguments: serde_json::Value::Null,
                         result: content.clone(),
-                    });
-                }
+                    }
+                };
+                thought.push(ThoughtItem::Tool {
+                    tool: step.tool.clone(),
+                    arguments: step.arguments.clone(),
+                    result: step.result.clone(),
+                });
+                steps.push(step);
             }
         }
     }
     turns
+}
+
+/// Project a transcript into turns and attach per-turn timestamps from `stamps` (aligned by
+/// index to the rendered turns; missing/extra entries are tolerated).
+pub fn render_view_stamped(messages: &[Msg], stamps: &[u64]) -> Vec<ChatTurnView> {
+    let mut turns = render_view(messages);
+    for (i, t) in turns.iter_mut().enumerate() {
+        if let Some(&ts) = stamps.get(i) {
+            if ts > 0 {
+                t.ts = Some(ts);
+            }
+        }
+    }
+    turns
+}
+
+/// Extend `stamps` so it aligns with the rendered turns of `messages`: a newly-appeared user
+/// turn is stamped `user_ts` and newly-appeared droid turns `droid_ts`. Existing stamps are
+/// preserved; the result is truncated to the turn count.
+pub fn extend_stamps(messages: &[Msg], mut stamps: Vec<u64>, user_ts: u64, droid_ts: u64) -> Vec<u64> {
+    let view = render_view(messages);
+    while stamps.len() < view.len() {
+        let i = stamps.len();
+        let ts = if view[i].role == "user" { user_ts } else { droid_ts };
+        stamps.push(ts);
+    }
+    stamps.truncate(view.len());
+    stamps
 }
 
 #[cfg(test)]
@@ -241,21 +563,67 @@ mod tests {
     }
 
     #[test]
-    fn save_load_round_trips_and_survives_reopen() {
+    fn create_save_load_round_trips_and_survives_reopen() {
         let dir = tmp();
         let key = session_key("acme", "loan");
+        let id;
         {
             let store = ChatStore::open(&dir);
+            let s = store.create(&key, Some("My probe".into()));
+            id = s.id.clone();
+            assert_eq!(s.name, "My probe");
             store.save(
                 &key,
+                &id,
                 vec![Msg::System("s".into()), Msg::User("hi".into())],
+                vec![0, 123],
             );
         }
         let store = ChatStore::open(&dir);
-        let loaded = store.load(&key);
-        assert_eq!(loaded.len(), 2);
-        store.clear(&key);
-        assert!(store.load(&key).is_empty());
+        let loaded = store.get(&key, &id).expect("session present after reopen");
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.stamps, vec![0, 123]);
+        assert_eq!(store.list(&key).len(), 1);
+        assert!(store.delete(&key, &id));
+        assert!(store.get(&key, &id).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_and_multiple_sessions() {
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        let store = ChatStore::open(&dir);
+        let a = store.create(&key, None);
+        let b = store.create(&key, None);
+        assert_eq!(a.name, "Investigation 1");
+        assert_eq!(b.name, "Investigation 2");
+        assert!(store.rename(&key, &a.id, "Renamed"));
+        assert_eq!(store.get(&key, &a.id).unwrap().name, "Renamed");
+        assert_eq!(store.list(&key).len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_legacy_single_session_file() {
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write the pre-multisession shape directly.
+        let store = ChatStore::open(&dir);
+        let legacy = serde_json::json!({
+            "messages": [{"User": "old question"}],
+            "updated": 42,
+        });
+        std::fs::write(store.path_for(&key), legacy.to_string()).unwrap();
+        // A fresh store should migrate it into one named session on load.
+        let store = ChatStore::open(&dir);
+        let metas = store.list(&key);
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].name, "Investigation 1");
+        assert_eq!(metas[0].updated, 42);
+        let s = store.get(&key, &metas[0].id).unwrap();
+        assert_eq!(s.messages.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -263,7 +631,7 @@ mod tests {
     fn keys_cannot_escape_the_data_dir() {
         let dir = tmp();
         let store = ChatStore::open(&dir);
-        store.save("../../etc/passwd", vec![Msg::User("x".into())]);
+        store.save("../../etc/passwd", "sid", vec![Msg::User("x".into())], vec![0]);
         let entries: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -272,6 +640,20 @@ mod tests {
         assert!(entries.iter().all(|n| !n.contains('/')));
         assert!(entries.iter().any(|n| n.ends_with(".json")));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extend_stamps_aligns_user_then_droid() {
+        let transcript = vec![
+            Msg::System("s".into()),
+            Msg::User("q".into()),
+            Msg::Assistant { text: Some("a".into()), tool_calls: vec![] },
+        ];
+        let stamps = extend_stamps(&transcript, vec![], 100, 200);
+        assert_eq!(stamps, vec![100, 200]); // user turn, droid turn
+        let view = render_view_stamped(&transcript, &stamps);
+        assert_eq!(view[0].ts, Some(100));
+        assert_eq!(view[1].ts, Some(200));
     }
 
     #[test]
@@ -305,5 +687,43 @@ mod tests {
         assert_eq!(view[1].steps.len(), 1);
         assert_eq!(view[1].steps[0].tool, "query_traces");
         assert_eq!(view[1].steps[0].result, "1");
+    }
+
+    #[test]
+    fn render_view_carries_tool_round_thinking_into_droid_turn() {
+        // The model thinks, calls a tool (thinking persisted as <think> on that turn), then
+        // answers in a later round with no further thinking. The droid turn must still show it.
+        let transcript = vec![
+            Msg::System("sys".into()),
+            Msg::User("why slow?".into()),
+            Msg::Assistant {
+                text: Some("<think>let me check durations</think>".into()),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "query_traces".into(),
+                    arguments: json!({"sql": "SELECT 1"}),
+                }],
+            },
+            Msg::Tool { call_id: "c1".into(), content: "1".into() },
+            Msg::Assistant { text: Some("credit-check.".into()), tool_calls: vec![] },
+        ];
+        let view = render_view(&transcript);
+        assert_eq!(view.len(), 2);
+        // The visible answer is the cleaned final text (no <think>).
+        assert_eq!(view[1].text, "credit-check.");
+        // The reasoning from the tool round survives in the interleaved thought timeline,
+        // ordered before the tool call it preceded.
+        assert!(matches!(&view[1].thought[0], ThoughtItem::Reasoning { text } if text.contains("let me check durations")));
+        assert!(matches!(&view[1].thought[1], ThoughtItem::Tool { tool, .. } if tool == "query_traces"));
+    }
+
+    #[test]
+    fn split_thinking_handles_blocks_and_unterminated() {
+        let (think, answer) = split_thinking("<think>a</think>hello<thinking>b</thinking> world");
+        assert_eq!(think, "a\n\nb");
+        assert_eq!(answer, "hello world");
+        let (think, answer) = split_thinking("still thinking <think>not closed");
+        assert_eq!(think, "not closed");
+        assert_eq!(answer, "still thinking");
     }
 }
