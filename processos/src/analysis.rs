@@ -186,6 +186,24 @@ impl Analysis {
         SCHEMA_DOC
     }
 
+    /// Export the three flat tables as `<dir>/{instances,jobs,incidents}.csv` (with
+    /// headers). CSV is chosen over Parquet so a bare Python interpreter (stdlib `csv`)
+    /// can read them with no `pyarrow`/`pandas` dependency, while a rich interpreter can
+    /// still `read_csv`/`read_csv_auto` them.
+    pub fn export_csv(&self, dir: &std::path::Path) -> Result<(), String> {
+        for table in ["instances", "jobs", "incidents"] {
+            let path = dir.join(format!("{table}.csv"));
+            let sql = format!(
+                "COPY (SELECT * FROM {table}) TO '{}' (HEADER, FORMAT CSV)",
+                path.display()
+            );
+            self.conn
+                .execute_batch(&sql)
+                .map_err(|e| format!("export {table}.csv: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Run one read-only `SELECT`/`WITH` query, capped to [`MAX_ROWS`].
     pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
         let stmt_sql = guard_read_only(sql)?;

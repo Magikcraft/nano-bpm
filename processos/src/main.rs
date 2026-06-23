@@ -19,6 +19,7 @@ mod dataset;
 mod harness;
 mod investigate;
 mod pilot;
+mod pyrunner;
 mod report;
 mod supervisor;
 mod workspace;
@@ -780,6 +781,11 @@ struct InvestigateRequest {
     /// Max model↔tool rounds before giving up (default 12).
     #[serde(default)]
     max_rounds: Option<usize>,
+    /// Offer the trusted Python escape hatch (`run_python`) in addition to the SQL tool.
+    /// Off by default; gated behind the SQL tool by prompt discipline. The tool runs
+    /// ARBITRARY operator-trusted code (timeout + private workdir, not a sandbox).
+    #[serde(default)]
+    allow_python: bool,
 }
 
 /// `POST /api/workspace/customers/{customer}/processes/{process}/investigate` — point
@@ -809,6 +815,7 @@ async fn ws_process_investigate(
     };
     let limit = req.limit.unwrap_or(100_000).clamp(1, 1_000_000);
     let max_rounds = req.max_rounds.unwrap_or(12).clamp(1, 40);
+    let allow_python = req.allow_python;
     // The DuckDB connection inside the analysis is !Send, so the investigation cannot
     // cross the multi-threaded handler's await boundary. Run the whole loop on a
     // dedicated current-thread runtime where the connection never leaves its thread.
@@ -817,7 +824,9 @@ async fn ws_process_investigate(
             .enable_all()
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
-        rt.block_on(investigate::run_investigation(&src, cfg, limit, max_rounds))
+        rt.block_on(investigate::run_investigation(
+            &src, cfg, limit, max_rounds, allow_python,
+        ))
     })
     .await;
     match task {

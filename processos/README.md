@@ -177,11 +177,24 @@ instead of picking from a fixed menu.
 - `investigate.rs` — wires the two: a system prompt that imposes analytical discipline
   (state a hypothesis before querying, report effect size + sample size, replicate on a
   held-out slice before concluding) and emits a gradeable JSON conclusion.
+- `pyrunner.rs` — the optional **Python escape hatch** (`run_python`): for hypotheses SQL
+  can't express (distribution fitting, changepoint/seasonal decomposition, clustering).
+  Off by default; pass `"allowPython": true`. The tables are exported as CSV to a private
+  temp workdir and a **dependency-tolerant preamble** loads them as `pandas` DataFrames +
+  a `duckdb` connection when those libs are present (`HAVE_PANDAS` / `HAVE_DUCKDB` flags),
+  degrading to stdlib `csv` row-dicts otherwise — so it works on a bare interpreter too.
+  It runs **arbitrary operator-trusted code** (a trusted-operator hatch, *not* a security
+  sandbox) with pragmatic rails: a private workdir, a wall-clock timeout (child killed on
+  overrun), and an output cap. Env: `PROCESSOS_PYTHON` (default `python3`),
+  `PROCESSOS_PYTHON_TIMEOUT_SECS` (default 20), `PROCESSOS_PYTHON_MAX_OUTPUT` (default
+  8000). For the rich path, point `PROCESSOS_PYTHON` at a venv:
+  `python3 -m venv .venv && .venv/bin/pip install duckdb pandas numpy scipy` then
+  `PROCESSOS_PYTHON=$PWD/.venv/bin/python`.
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:
 curl -XPOST .../customers/{c}/processes/{p}/investigate \
-  -d '{"llm":{"model":"local-model"},"maxRounds":12}'
+  -d '{"llm":{"model":"local-model"},"maxRounds":12,"allowPython":false}'
 # -> { dataset:{instances,jobs,incidents},
 #      run:{ answer:"{\"bottleneckJob\":\"credit-check\",\"window\":\"weekday-morning\",…}",
 #            steps:[{tool:"query_traces", arguments:{sql}, result}], rounds } }
@@ -191,7 +204,7 @@ The DuckDB connection is `!Send`, so the endpoint runs the whole loop on a dedic
 current-thread runtime via `spawn_blocking`. The labelled corpus is the **eval substrate**:
 `investigate.rs` tests drive the loop over a generated corpus and assert it recovers the
 planted `credit-check` / `weekday-morning` fault through the full model→tool→DuckDB→model
-path. A Python escape hatch (`run_python`) for novel methods is the deferred next tier.
+path (and via `run_python` over the exported CSV with stdlib-only Python).
 
 ## The cockpit & pilot loop (§10)
 
@@ -282,7 +295,7 @@ for it automatically.
 | `POST` | `/api/workspace/customers/{c}/processes` | Create a process (bind `targetUrl` or `dataset`) |
 | `GET`/`PUT` | `/api/workspace/customers/{c}/processes/{p}` | Read / update a process config |
 | `GET` | `/api/workspace/customers/{c}/processes/{p}/insights` | Insights folded over the process's bound source |
-| `POST` | `/api/workspace/customers/{c}/processes/{p}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool |
+| `POST` | `/api/workspace/customers/{c}/processes/{p}/investigate` | LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
 
 ## Layout
 
@@ -299,6 +312,7 @@ src/
   analysis.rs     flatten traces into in-memory DuckDB; read-only query_traces surface
   agent.rs        provider-agnostic tool-calling loop (OpenAI transport) + lab notebook
   investigate.rs  LLM-driven investigation: analysis ToolBox + disciplined system prompt
+  pyrunner.rs     optional run_python escape hatch: CSV export + timeout subprocess runner
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
   conversation.rs persisted cockpit conversations + data-dir resolution
   harness/
