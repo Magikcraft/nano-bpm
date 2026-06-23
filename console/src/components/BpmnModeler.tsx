@@ -52,6 +52,14 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     const containerRef = useRef<HTMLDivElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
+    // Set once the modeler has been destroyed, so async work that was already
+    // in flight (an import, the initial createDiagram) doesn't touch a dead
+    // instance — diagram-js throws "reading 'root-0'" when operated on after
+    // destroy or while a load is mid-flight.
+    const disposedRef = useRef(false);
+    // Serializes document loads. importXML/createDiagram must never overlap;
+    // every load is chained after the previous one so they run one at a time.
+    const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
     // Suppress the change callback for programmatic loads (import/createDiagram),
     // so opening a model doesn't immediately look dirty.
     const suppressChange = useRef(false);
@@ -60,8 +68,39 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     const onReadyRef = useRef(onReady);
     onReadyRef.current = onReady;
 
+    // Queues a load on a single chain so imports can't race each other or the
+    // initial blank diagram. Each op captures the modeler instance it was
+    // enqueued for and bails if that instance was destroyed or swapped out
+    // (e.g. StrictMode's mount→unmount→mount) before it ran. Returns a promise
+    // that rejects on a genuine load failure (e.g. invalid XML) so callers can
+    // surface it, while the internal chain keeps going regardless.
+    const runLoad = (
+      loader: (m: Modeler) => Promise<unknown>,
+      after?: () => void,
+    ): Promise<void> => {
+      const modeler = modelerRef.current;
+      if (!modeler) return Promise.resolve();
+      const run = opChainRef.current.then(async () => {
+        if (disposedRef.current || modelerRef.current !== modeler) return;
+        suppressChange.current = true;
+        try {
+          await loader(modeler);
+          if (disposedRef.current || modelerRef.current !== modeler) return;
+          modeler.get<Canvas>("canvas").zoom("fit-viewport");
+          after?.();
+        } finally {
+          suppressChange.current = false;
+        }
+      });
+      // Keep the chain alive even when this op fails, so one bad import doesn't
+      // wedge every later load.
+      opChainRef.current = run.catch(() => {});
+      return run;
+    };
+
     useEffect(() => {
       if (!containerRef.current || !panelRef.current) return;
+      disposedRef.current = false;
       const modeler = new Modeler({
         container: containerRef.current,
         propertiesPanel: { parent: panelRef.current },
@@ -78,45 +117,32 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         onChangeRef.current?.();
       };
       modeler.on("commandStack.changed", handleChanged);
-      // Start on a blank diagram so the canvas is never empty.
-      suppressChange.current = true;
-      modeler
-        .createDiagram()
-        .then(() => onReadyRef.current?.())
-        .finally(() => {
-          suppressChange.current = false;
-        });
+      // Start on a blank diagram so the canvas is never empty. Queued like any
+      // other load so a quick open() serializes after it instead of racing it.
+      void runLoad(
+        (m) => m.createDiagram(),
+        () => onReadyRef.current?.(),
+      );
       return () => {
+        disposedRef.current = true;
         modeler.off("commandStack.changed", handleChanged);
         modeler.destroy();
         modelerRef.current = null;
       };
     }, []);
 
-    const load = async (loader: (m: Modeler) => Promise<unknown>) => {
-      const modeler = modelerRef.current;
-      if (!modeler) return;
-      suppressChange.current = true;
-      try {
-        await loader(modeler);
-        modeler.get<Canvas>("canvas").zoom("fit-viewport");
-      } finally {
-        suppressChange.current = false;
-      }
-    };
-
     useImperativeHandle(ref, () => ({
       async getXml() {
         const modeler = modelerRef.current;
-        if (!modeler) return "";
+        if (!modeler || disposedRef.current) return "";
         const { xml } = await modeler.saveXML({ format: true });
         return xml;
       },
-      importXml: (xml: string) => load((m) => m.importXML(xml)),
-      createBlank: () => load((m) => m.createDiagram()),
+      importXml: (xml: string) => runLoad((m) => m.importXML(xml)),
+      createBlank: () => runLoad((m) => m.createDiagram()),
       getProcessId() {
         const modeler = modelerRef.current;
-        if (!modeler) return null;
+        if (!modeler || disposedRef.current) return null;
         try {
           return modeler.get<Canvas>("canvas").getRootElement().businessObject.id;
         } catch {
@@ -125,10 +151,14 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       },
       setProcessId(id: string) {
         const modeler = modelerRef.current;
-        if (!modeler) return;
-        const canvas = modeler.get<Canvas>("canvas");
-        const modeling = modeler.get<Modeling>("modeling");
-        modeling.updateProperties(canvas.getRootElement(), { id });
+        if (!modeler || disposedRef.current) return;
+        try {
+          const canvas = modeler.get<Canvas>("canvas");
+          const modeling = modeler.get<Modeling>("modeling");
+          modeling.updateProperties(canvas.getRootElement(), { id });
+        } catch {
+          // Root not ready (e.g. a load is still settling) — ignore.
+        }
       },
     }));
 
