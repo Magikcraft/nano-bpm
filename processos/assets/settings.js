@@ -59,7 +59,7 @@
       '</label>' +
       '<label>API key <input id="s-apiKey" type="password" placeholder="(unset)"></label>' +
       '<div class="row">' +
-        '<label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048"></label>' +
+        '<label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048" title="Token budget; Fetch fills this from the model\u2019s context window"></label>' +
         '<label>Temperature <input id="s-temp" type="number" step="0.05" min="0" placeholder="0.2"></label>' +
       '</div>' +
       '<div class="bar"><button id="s-save" class="primary">Save profile</button><button id="s-clearkey" class="ghost">Clear API key</button></div>' +
@@ -84,6 +84,15 @@
 
   function keyPh(set) { return set ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '(unset)'; }
   function status(msg) { $('s-status').textContent = msg || ''; }
+
+  // Context windows learned from the last endpoint fetch, keyed by model id.
+  var MODEL_CTX = {};
+  // Fill the Max tokens field from a model's fetched context window when we know it, so
+  // picking a model sizes the token budget to the endpoint's reported window.
+  function applyModelContext(modelId) {
+    var ctx = modelId && MODEL_CTX[modelId];
+    if (ctx) { $('s-maxTokens').value = ctx; }
+  }
 
   function currentProfile() {
     if (!STATE.view) return null;
@@ -213,12 +222,30 @@
     try {
       var d = await api('POST', '/api/settings/models', body);
       var dl = $('s-modellist'); dl.innerHTML = '';
-      d.models.forEach(function (m) { var o = document.createElement('option'); o.value = m; dl.appendChild(o); });
-      if (!$('s-model').value && d.models.length === 1) $('s-model').value = d.models[0];
-      status('Found ' + d.models.length + ' model(s) \u2014 pick one from the field');
+      MODEL_CTX = {};
+      d.models.forEach(function (m) {
+        var id = typeof m === 'string' ? m : m.id;
+        var ctx = (m && typeof m === 'object') ? m.contextWindow : null;
+        if (ctx) MODEL_CTX[id] = ctx;
+        var o = document.createElement('option');
+        o.value = id;
+        if (ctx) o.label = id + ' (' + ctx.toLocaleString() + ' ctx)';
+        dl.appendChild(o);
+      });
+      if (!$('s-model').value && d.models.length === 1) {
+        $('s-model').value = typeof d.models[0] === 'string' ? d.models[0] : d.models[0].id;
+      }
+      applyModelContext($('s-model').value);
+      var ctxNote = '';
+      var sel = $('s-model').value;
+      if (sel && MODEL_CTX[sel]) ctxNote = ' \u2014 context window ' + MODEL_CTX[sel].toLocaleString() + ' tokens';
+      status('Found ' + d.models.length + ' model(s) \u2014 pick one from the field' + ctxNote);
       $('s-model').focus();
     } catch (e) { status('fetch failed: ' + e.message); }
   });
+
+  // When the operator picks/edits a model, fill Max tokens from its fetched context window.
+  $('s-model').addEventListener('change', function () { applyModelContext($('s-model').value); });
 
   $('s-savepy').addEventListener('click', async function () {
     status('Saving\u2026');

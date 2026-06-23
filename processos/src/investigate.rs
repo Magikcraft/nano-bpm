@@ -216,11 +216,15 @@ read-only DuckDB SQL over the dataset. If a run_python tool is offered, use it o
 SQL has localised a candidate, for analysis SQL cannot express (distribution fitting, \
 changepoint/seasonal decomposition).\n\
 \n\
+Investigate openly. Don't assume where the problem is or that there is one: profile \
+broadly first (volumes, where time is spent across job types, failures, and how these \
+move over time) and let the evidence point you to what matters. Form your own hypotheses \
+from what you see rather than confirming a preconceived answer.\n\
+\n\
 Discipline: before you query, state the hypothesis you are testing. Prefer queries that \
 report an EFFECT SIZE and a SAMPLE SIZE (count), not just existence. When you assert a \
-pattern (e.g. a queue tail localised to a time window), replicate it on a held-out slice \
-first. For queue tails, compare quantile_cont(queue_ms, 0.99) across hour / day-of-week \
-buckets per job_type.\n\
+pattern (for example a delay localised to a recurring time window), replicate it on a \
+held-out slice before trusting it.\n\
 \n\
 Style: reply in clear prose, citing the concrete figures you measured. Stay focused on \
 what the operator asked; when useful, suggest a sharp next question. Do NOT force your \
@@ -249,6 +253,7 @@ pub async fn run_chat_turn(
     limit: usize,
     max_rounds: usize,
     allow_python: bool,
+    objective: Option<&str>,
     mut messages: Vec<Msg>,
     user_message: &str,
 ) -> Result<ChatTurnResult, String> {
@@ -268,11 +273,20 @@ pub async fn run_chat_turn(
     // Seed the system message (with one-time dataset framing) only at the start of a
     // conversation; subsequent turns already carry it in the persisted transcript.
     if messages.is_empty() {
-        let sys = format!(
+        let mut sys = format!(
             "{CHAT_SYSTEM}\n\nDataset bound for this conversation: {} instances, {} job \
              executions, {} incidents.",
             dataset.instances, dataset.jobs, dataset.incidents
         );
+        // The operator's stated objective is context, not a conclusion — surface it but
+        // keep the analyst investigating openly and verifying against the data.
+        if let Some(obj) = objective.map(str::trim).filter(|o| !o.is_empty()) {
+            sys.push_str(&format!(
+                "\n\nThe operator's stated objective for this process: \"{obj}\". Treat it \
+                 as background context, not a foregone conclusion — investigate openly and \
+                 let the data confirm or challenge it."
+            ));
+        }
         messages.push(Msg::System(sys));
     }
     messages.push(Msg::User(user_message.to_string()));

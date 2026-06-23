@@ -100,7 +100,9 @@ precedence **inline `prompt` > `promptId` > built-in default**.
 
 These are *defaults*; the console **Settings** panel (the gear in the lower-left of the
 console and cockpit) manages one or more named **LLM profiles** — switch the *active*
-profile, add/delete profiles, and **Fetch** an endpoint's model list to pick a model id.
+profile, add/delete profiles, and **Fetch** an endpoint's model list to pick a model id
+(the fetch also reads each model's **context window** — llama.cpp's `meta.n_ctx`,
+`n_ctx_train`, or a `context_length`-style field — and fills the Max-tokens budget from it).
 It ships with a `Local (llama.cpp)` profile pointing at `http://localhost:8888/v1`.
 Profiles + the active selection + the global Python interpreter persist to
 `${XDG_CONFIG_HOME:-~/.config}/processos/settings.json` (overridable with
@@ -243,8 +245,16 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   assistant/tool turns **and** the final answer so the next turn keeps full context.
 - `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
   persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
-  Ships three built-ins (bottleneck / temporal / failures); operators author new ones from
-  the compose box ("Save prompt") and load any of them into the box from a dropdown.
+  Ships four built-ins led by an **open investigation** (the default, pre-loaded into a
+  fresh compose box so the unbiased default action is to let the droid profile the data and
+  find the problem itself) plus a specific *worker-swap hypothesis*, a temporal angle, and a
+  failures angle. Operators author new ones from the compose box ("Save prompt") or the
+  console **Prompts** view (which lists both libraries), and load any into the box from a
+  dropdown. The CHAT_SYSTEM framing is deliberately open — it asks the analyst to profile
+  broadly and form its own hypotheses rather than confirm a preconceived answer — and the
+  process's operator-set **objective** (editable on the cockpit surface) is woven in as
+  *background context, not a conclusion*, so the operator can optionally steer without
+  pre-revealing the planted issue.
 
 ```bash
 # Send one turn (resumes the persisted transcript); GET to reload it, /reset to forget.
@@ -380,7 +390,7 @@ for it automatically.
 | `GET`/`PUT` | `/api/settings` | Read settings / update the **globals** (`activeProfile`, `pythonBin`). `GET` lists LLM profiles (each redacting its key as `apiKeySet`) + the active profile + the Python interpreter |
 | `POST` | `/api/settings/profiles` | Create a new LLM profile (optional `name`); returns the new `id` + the updated settings |
 | `PUT`/`DELETE` | `/api/settings/profiles/{id}` | Partial-update / delete one profile. On `PUT`, absent fields are unchanged, an empty string (or `0`/negative number) clears a field back to the env default; the API key is set only when a non-empty `apiKey` is sent |
-| `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id |
+| `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id; each entry includes its `contextWindow` when the endpoint reports one |
 
 ## Layout
 

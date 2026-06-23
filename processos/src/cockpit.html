@@ -108,6 +108,8 @@
   .ws-model { background: #fafafa; border: 1px solid #26262b; border-radius: 12px; height: 460px; margin: 14px 0; }
   .ws-grid { display: grid; grid-template-columns: 110px 1fr; gap: 6px 14px; font-size: 13px; margin: 10px 0; }
   .ws-grid b { color: #a1a1aa; font-weight: 500; }
+  .obj-row { display: flex; gap: 8px; align-items: center; }
+  .obj-row input { flex: 1; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 13px; }
   .notebook { margin-top: 14px; }
   .step { border: 1px solid #26262b; border-radius: 9px; margin-bottom: 8px; background: #0c0c0e; }
   .step summary { cursor: pointer; padding: 9px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: #c7d2fe; }
@@ -361,15 +363,72 @@ async function decide(key, decision){
 
 // ---- Prompts (authoring) ----
 let PROMPTS = [];
+let CHAT_PROMPTS = [];
 async function renderPrompts(){
   STATE.view='prompts'; setActive(); main.innerHTML='Loading…';
-  try { const xs = await api('/api/prompts'); PROMPTS = Array.isArray(xs)?xs:(xs.prompts||[]); }
-  catch(e){ return fail(e); }
+  let xs;
+  try { xs = await api('/api/prompts'); } catch(e){ return fail(e); }
+  PROMPTS = Array.isArray(xs)?xs:(xs.prompts||[]);
+  try { const cps = await api('/api/chat-prompts'); CHAT_PROMPTS = Array.isArray(cps)?cps:[]; }
+  catch(e){ CHAT_PROMPTS = []; }
+  main.innerHTML =
+    '<h1>Prompts</h1>'
+    + '<p class="lede">Two libraries the droid draws on. <b>Investigation chat prompts</b> are the message templates you load in the cockpit to interrogate a dataset. <b>Hypothesis system prompts</b> are the skills that drive experiment generation.</p>'
+    + '<h2>Investigation chat prompts</h2><div id="chatPromptsWrap"></div>'
+    + '<h2 style="margin-top:28px">Hypothesis system prompts</h2><div id="sysPromptsWrap"></div>';
+  drawChatPrompts(CHAT_PROMPTS.length ? CHAT_PROMPTS[0].id : null);
   drawPrompts(PROMPTS.length ? PROMPTS[0].id : null);
 }
+
+// --- chat-prompt library (cockpit message templates) inside the Prompts view ---
+function drawChatPrompts(selId){
+  const wrap = document.getElementById('chatPromptsWrap'); if(!wrap) return;
+  let h = '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
+  h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editCPrompt(null)">+ New chat prompt</button>';
+  for(const p of CHAT_PROMPTS){
+    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    h += '<div class="tile"'+active+' onclick="editCPrompt(\''+esc(p.id)+'\')">'
+      + '<h3 style="font-size:14px">'+esc(p.name||p.id)+(p.builtin?' <span class="muted" style="font-size:11px">built-in</span>':'')+'</h3>'
+      + '<div class="meta">'+esc((p.text||'').slice(0,90))+'</div></div>';
+  }
+  h += '</div><div id="cpromptEditor" class="pane"></div></div>';
+  wrap.innerHTML = h;
+  editCPrompt(selId);
+}
+function editCPrompt(id){
+  const ed = $('#cpromptEditor'); if(!ed) return;
+  const p = id===null ? {id:'',name:'',text:'',builtin:false} : (CHAT_PROMPTS.find(x=>x.id===id)||{id:'',name:'',text:'',builtin:false});
+  const isNew = id===null;
+  let h = '<h2 style="margin-top:0">'+(isNew?'New chat prompt':'Edit chat prompt')+'</h2>';
+  h += '<label class="lbl">Id</label><input id="cpId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. cost-probe" />';
+  h += '<label class="lbl">Name</label><input id="cpName" value="'+esc(p.name)+'" '+(p.builtin?'disabled':'')+' />';
+  h += '<label class="lbl">Prompt text (loaded into the cockpit compose box)</label><textarea id="cpText" rows="8" '+(p.builtin?'disabled':'')+'>'+esc(p.text)+'</textarea>';
+  h += '<div class="actions">';
+  if(p.builtin){
+    h += '<span class="muted" style="font-size:12px">Built-in prompts are read-only. Create a new one to author your own.</span>';
+  } else {
+    h += '<button class="btn primary" onclick="saveCPrompt()">Save</button>';
+    if(!isNew) h += '<button class="btn ghost" onclick="deleteCPrompt(\''+esc(p.id)+'\')">Delete</button>';
+  }
+  h += '</div>';
+  ed.innerHTML = h;
+}
+async function saveCPrompt(){
+  const body = { id: $('#cpId').value.trim(), name: $('#cpName').value.trim(), text: $('#cpText').value };
+  if(!body.id || !body.text.trim()){ alert('Id and prompt text are required.'); return; }
+  try { await api('/api/chat-prompts', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+  catch(e){ alert('Save failed: '+e.message); return; }
+  const cps = await api('/api/chat-prompts'); CHAT_PROMPTS = Array.isArray(cps)?cps:[]; drawChatPrompts(body.id);
+}
+async function deleteCPrompt(id){
+  if(!confirm('Delete chat prompt “'+id+'”?')) return;
+  try { await api('/api/chat-prompts/'+encodeURIComponent(id), {method:'DELETE'}); }
+  catch(e){ alert('Delete failed: '+e.message); return; }
+  const cps = await api('/api/chat-prompts'); CHAT_PROMPTS = Array.isArray(cps)?cps:[]; drawChatPrompts(CHAT_PROMPTS.length?CHAT_PROMPTS[0].id:null);
+}
 function drawPrompts(selId){
-  let h = '<h1>Prompts</h1><p class="lede">The droid’s skills — the system prompts that drive hypothesis generation. The experimental-variable library, reused across processes. Author one, then select it when you start an experiment.</p>';
-  h += '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
+  const wrap = document.getElementById('sysPromptsWrap'); if(!wrap) return;
+  let h = '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
   // list
   h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editPrompt(null)">+ New prompt</button>';
   for(const p of PROMPTS){
@@ -381,7 +440,7 @@ function drawPrompts(selId){
   h += '</div>';
   // editor
   h += '<div id="promptEditor" class="pane"></div></div>';
-  main.innerHTML = h;
+  wrap.innerHTML = h;
   editPrompt(selId);
 }
 function editPrompt(id){
@@ -468,7 +527,11 @@ async function renderWorkspace(ws, proc){
     <h1 style="margin:6px 0">${esc(p.displayName||proc)} ${binding}</h1>
     <div class="ws-grid">
       <b>source</b><span style="font-family:ui-monospace,monospace;font-size:12px">${esc(p.datasetPath||'—')}</span>
-      ${p.objective ? '<b>objective</b><span>'+esc(p.objective)+'</span>' : ''}
+      <b>objective</b>
+      <span class="obj-row">
+        <input id="wsObjective" value="${esc(p.objective||'')}" placeholder="what should the droid optimise for? (optional)" />
+        <button class="btn ghost" id="wsObjSave" title="Save objective">Save</button>
+      </span>
     </div>
     ${p.hasModel ? '<div id="wsModel" class="ws-model"></div>' : ''}
     <p class="muted" style="font-size:12px;max-width:720px;margin:12px 0 0">Chat with the droid about this dataset. It queries the bound traces directly (read-only SQL over a DuckDB view, plus an optional trusted Python tier) to form and test its own hypotheses. The conversation is multi-turn — it remembers earlier answers in this session.</p>
@@ -480,9 +543,9 @@ async function renderWorkspace(ws, proc){
           <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
           <button class="btn ghost" id="chatReset" title="Forget this conversation" style="margin-left:auto">Reset</button>
         </div>
-        <textarea id="chatBox" placeholder="Ask the droid… (e.g. where is the bottleneck, and when does it happen?)"></textarea>
+        <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…"></textarea>
         <div class="compose-actions">
-          <button class="btn primary" id="chatSend">Send →</button>
+          <button class="btn primary" id="chatSend">Investigate with the droid →</button>
           <label class="muted"><input type="checkbox" id="chatPy" /> allow Python escape hatch</label>
           <span class="muted" id="chatHint" style="margin-left:auto"></span>
         </div>
@@ -490,9 +553,11 @@ async function renderWorkspace(ws, proc){
     </div>`;
   if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
   STATE.ws = ws; STATE.wsProc = proc; STATE.prompts = [];
-  loadChatPrompts();
-  loadChat(ws, proc);
+  labelSendButton();
+  await loadChatPrompts();
+  await loadChat(ws, proc);
   $('#chatSend').onclick = () => sendChat(ws, proc);
+  $('#wsObjSave').onclick = () => saveObjective(ws, proc, p);
   $('#chatBox').addEventListener('keydown', e => {
     if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); sendChat(ws, proc); }
   });
@@ -503,6 +568,38 @@ async function renderWorkspace(ws, proc){
   };
   $('#chatSave').onclick = saveChatPrompt;
   $('#chatReset').onclick = () => resetChat(ws, proc);
+}
+
+// Label the Send button with the active LLM profile so the operator knows who answers.
+async function labelSendButton(){
+  const btn = $('#chatSend'); if(!btn) return;
+  try {
+    const s = await api('/api/settings');
+    const active = (s.profiles||[]).find(p => p.id===s.activeProfile) || (s.profiles||[])[0];
+    const name = active && active.name ? active.name : 'the droid';
+    btn.textContent = 'Investigate with '+name+' →';
+    btn.dataset.profile = name;
+  } catch(e){ /* leave default label */ }
+}
+
+// Persist an edited objective on the process config (round-trips the full config).
+async function saveObjective(ws, proc, p){
+  const v = $('#wsObjective').value.trim();
+  const btn = $('#wsObjSave'); btn.disabled = true;
+  try {
+    const cfg = {
+      displayName: p.displayName||proc,
+      objective: v || null
+    };
+    if(p.binding==='dataset' && p.datasetPath) cfg.dataset = p.datasetPath;
+    if(p.binding && p.binding!=='dataset' && p.binding!=='unbound') cfg.targetUrl = p.targetUrl;
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc), {
+      method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify(cfg)
+    });
+    p.objective = v;
+    $('#chatHint').textContent = 'objective saved — it now frames new conversations';
+  } catch(e){ $('#chatHint').textContent = 'objective save failed: '+(e.message||e); }
+  finally { btn.disabled = false; }
 }
 
 function chatBub(t){
@@ -529,6 +626,13 @@ async function loadChat(ws, proc){
   try {
     const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat');
     drawChat(r.turns);
+    // Fresh conversation: pre-load the open-investigation prompt so the default action is
+    // an unbiased investigation the operator can send or edit.
+    if((!r.turns || !r.turns.length)){
+      const box = $('#chatBox');
+      const open = (STATE.prompts||[]).find(x => x.id==='open') || (STATE.prompts||[])[0];
+      if(box && !box.value && open) box.value = open.text;
+    }
   } catch(e){ const log=$('#chatLog'); if(log) log.innerHTML='<div class="empty">'+esc(e.message||e)+'</div>'; }
 }
 

@@ -914,7 +914,7 @@ fn seed_demo(
     let ws = workspaces.create_workspace(ws_name, Some("Demo engagement (bundled loan-approval corpus)".into()))?;
     let proc_cfg = workspace::ProcessConfig {
         display_name: proc_name.to_string(),
-        objective: Some("cut credit-check queue tail under the weekday-morning spike".into()),
+        objective: Some("keep loan approvals fast and reliable as volume grows".into()),
         ..Default::default()
     };
     let proc = workspaces.create_process(&ws.slug, proc_name, proc_cfg)?;
@@ -1174,6 +1174,11 @@ async fn cockpit_chat_send(
     let max_rounds = req.max_rounds.unwrap_or(12).clamp(1, 40);
     let allow_python = req.allow_python;
     let py = state.settings.snapshot().py_config();
+    // The operator's stated objective for this process (if any) frames the conversation.
+    let objective = state
+        .workspaces
+        .get_process(&workspace, &process)
+        .and_then(|p| p.config.objective);
     let key = chat::session_key(&workspace, &process);
     // Load the prior transcript BEFORE the spawn_blocking (Vec<Msg> is Send); the DuckDB
     // connection inside the analysis is !Send, so the loop runs on a current-thread runtime.
@@ -1185,7 +1190,15 @@ async fn cockpit_chat_send(
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
         rt.block_on(investigate::run_chat_turn(
-            &src, cfg, py, limit, max_rounds, allow_python, prior, &message,
+            &src,
+            cfg,
+            py,
+            limit,
+            max_rounds,
+            allow_python,
+            objective.as_deref(),
+            prior,
+            &message,
         ))
     })
     .await;

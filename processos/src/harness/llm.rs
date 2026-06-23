@@ -262,10 +262,49 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// List the model ids the configured endpoint advertises (the OpenAI-compatible
-/// `/models` route, or Anthropic's `/v1/models`). Used by the console to populate the
-/// model picker by querying the live endpoint. A `model` need not be set on `cfg`.
-pub async fn list_models(cfg: &LlmConfig) -> Result<Vec<String>, String> {
+/// A model advertised by an endpoint, with its context window when the endpoint reports
+/// one (llama.cpp exposes `meta.n_ctx` / `n_ctx_train`; some servers use `context_length`).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+}
+
+/// Pull a context-window size out of a model entry, tolerating the several shapes endpoints
+/// use: llama.cpp nests it under `meta` (`n_ctx`, the server's configured window, else
+/// `n_ctx_train`); others expose a top-level `context_length` / `max_context_length` /
+/// `max_model_len` / `context_window`.
+fn extract_context_window(item: &serde_json::Value) -> Option<u64> {
+    let as_u64 = |v: &serde_json::Value| v.as_u64().filter(|n| *n > 0);
+    if let Some(meta) = item.get("meta") {
+        if let Some(n) = meta.get("n_ctx").and_then(as_u64) {
+            return Some(n);
+        }
+        if let Some(n) = meta.get("n_ctx_train").and_then(as_u64) {
+            return Some(n);
+        }
+    }
+    for key in [
+        "context_length",
+        "max_context_length",
+        "max_model_len",
+        "context_window",
+        "n_ctx",
+    ] {
+        if let Some(n) = item.get(key).and_then(as_u64) {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// List the models the configured endpoint advertises (the OpenAI-compatible `/models`
+/// route, or Anthropic's `/v1/models`), each with its context window when reported. Used
+/// by the console to populate the model picker and the max-tokens field by querying the
+/// live endpoint. A `model` need not be set on `cfg`.
+pub async fn list_models(cfg: &LlmConfig) -> Result<Vec<ModelInfo>, String> {
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| format!("http client: {e}"))?;
@@ -307,8 +346,9 @@ pub async fn list_models(cfg: &LlmConfig) -> Result<Vec<String>, String> {
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("model list not JSON: {e}"))?;
     // OpenAI / Anthropic / llama.cpp all expose `data: [{ id }]`; fall back to a bare
-    // top-level `models: [{ id | name }]` (some llama.cpp builds).
-    let mut ids = Vec::new();
+    // top-level `models: [{ id | name }]` (some llama.cpp builds). Capture a context
+    // window per entry when the endpoint reports one.
+    let mut models: Vec<ModelInfo> = Vec::new();
     let arrays = [v.get("data"), v.get("models")];
     for arr in arrays.into_iter().flatten() {
         if let Some(items) = arr.as_array() {
@@ -319,24 +359,27 @@ pub async fn list_models(cfg: &LlmConfig) -> Result<Vec<String>, String> {
                     .or_else(|| it.get("name").and_then(|x| x.as_str()))
                     .or_else(|| it.as_str());
                 if let Some(id) = id {
-                    if !id.is_empty() && !ids.iter().any(|e| e == id) {
-                        ids.push(id.to_string());
+                    if !id.is_empty() && !models.iter().any(|m| m.id == id) {
+                        models.push(ModelInfo {
+                            id: id.to_string(),
+                            context_window: extract_context_window(it),
+                        });
                     }
                 }
             }
         }
-        if !ids.is_empty() {
+        if !models.is_empty() {
             break;
         }
     }
-    if ids.is_empty() {
+    if models.is_empty() {
         return Err(format!(
             "no models found in response: {}",
             truncate(&text, 300)
         ));
     }
-    ids.sort();
-    Ok(ids)
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
 }
 
 #[cfg(test)]

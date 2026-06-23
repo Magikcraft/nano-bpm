@@ -132,20 +132,36 @@ impl ChatPromptStore {
 fn builtins() -> BTreeMap<String, ChatPrompt> {
     let seed = [
         ChatPrompt {
-            id: "bottleneck".into(),
-            name: "Find the bottleneck".into(),
-            text: "Which job type dominates end-to-end latency in this dataset? Localise \
-                   it: report its share of total wait, its queue vs service split, and a \
-                   sample size."
+            id: "open".into(),
+            name: "Open investigation".into(),
+            text: "Investigate this dataset with fresh eyes. Profile the process end to \
+                   end — volumes, latency, where time is spent, failures, and how any of \
+                   these move over time — and surface the single most important problem \
+                   you can find, with evidence. Don't assume where it is; let the data \
+                   tell you. Then say what you'd recommend and why."
+                .into(),
+            builtin: true,
+        },
+        ChatPrompt {
+            id: "worker-swap".into(),
+            name: "Worker swap hypothesis".into(),
+            text: "Test one specific hypothesis: the dominant latency comes from a single \
+                   job type saturating during a recurring peak, and adding workers to that \
+                   job type during that window would cut the tail. Identify the job type \
+                   and the window from the data, quantify the tail (e.g. p99 queue) against \
+                   its off-peak baseline with sample sizes, and estimate what headroom a \
+                   larger worker pool would buy. If the data doesn't support the \
+                   hypothesis, say so."
                 .into(),
             builtin: true,
         },
         ChatPrompt {
             id: "temporal".into(),
-            name: "Localise the queue tail in time".into(),
-            text: "Is there a time window (hour of day / day of week) where a queue tail \
-                   appears? Compare quantile_cont(queue_ms, 0.99) across buckets per job \
-                   type, and replicate the pattern on a held-out slice."
+            name: "Look for a pattern over time".into(),
+            text: "Does anything about this process change with time of day or day of \
+                   week? Compare the relevant metric across hour and day-of-week buckets, \
+                   report effect sizes and sample sizes, and replicate any pattern you \
+                   find on a held-out slice before trusting it."
                 .into(),
             builtin: true,
         },
@@ -182,7 +198,7 @@ mod tests {
         let path = tmp();
         let store = ChatPromptStore::open(&path);
         assert!(store.list().len() >= 3);
-        assert!(store.delete("bottleneck").is_err());
+        assert!(store.delete("open").is_err());
         assert!(store.delete("missing").is_err());
         let _ = std::fs::remove_file(&path);
     }
