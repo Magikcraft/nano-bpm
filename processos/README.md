@@ -218,6 +218,25 @@ stepper in a persisted droid-conversation surface.
 
 ## Run
 
+### Prerequisites (machine setup)
+
+- **Rust** (stable) — `cargo` builds/tests; the `duckdb` crate vendors its engine (bundled),
+  so no system DuckDB is needed. First build compiles the bundled amalgamation (~95s, one-time).
+- **Python 3** — only required for the optional `run_python` investigation tool. A bare
+  `python3` works (stdlib fallback). For the **rich** analysis path (pandas/numpy/scipy/duckdb)
+  create a venv once and point `PROCESSOS_PYTHON` at it:
+
+  ```sh
+  # from the processos/ directory
+  python3 -m venv .venv
+  .venv/bin/pip install --upgrade pip
+  .venv/bin/pip install duckdb pandas numpy scipy
+  export PROCESSOS_PYTHON="$PWD/.venv/bin/python"   # else run_python uses stdlib-only python3
+  ```
+
+  The `.venv/` is git-ignored and machine-local. Without it, `run_python` still runs but the
+  preamble degrades to stdlib `csv` row-dicts (`HAVE_PANDAS`/`HAVE_DUCKDB` are `False`).
+
 ```sh
 # Build + test
 make processos-build
@@ -244,6 +263,9 @@ PROCESSOS_SPAWN_NANO=1 cargo run
 | `PROCESSOS_NANO_PORT` | `0` (auto) | Port for the spawned own engine |
 | `PROCESSOS_NANO_DATA_DIR` | `.processos-nano-data` | Data dir for the spawned own engine |
 | `PROCESSOS_NANO_CAPTURE` | `true` | Enable trace/stimulus capture on the own engine |
+| `PROCESSOS_PYTHON` | `python3` | Interpreter for the `run_python` tool — point at a venv for the rich (pandas/duckdb) path |
+| `PROCESSOS_PYTHON_TIMEOUT_SECS` | `20` | Wall-clock budget for a `run_python` call (child killed past it) |
+| `PROCESSOS_PYTHON_MAX_OUTPUT` | `8000` | Max chars of combined stdout+stderr returned to the model |
 
 ### Capturing replay inputs on Nano (opt-in, on the engine being read)
 
