@@ -272,16 +272,19 @@ curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/wrapup # sto
 curl       .../api/python/status   # { configured, interpreter, interpreterRuns, dataScience, missing }
 ```
 
-The chat surface adds a few operator conveniences: the **Send** button is labelled with the
-active LLM profile (*"Investigate with &lt;profile&gt; →"*) and relabels live when the active
-profile is switched in Settings; droid bubbles are titled with the **model name** and render
-any `<think>…</think>` reasoning as a **collapsed** "Thinking" disclosure with the cleaned
-answer as the paragraph; **A−/A+** controls size the chat font (persisted in `localStorage`); a
-**Wrap it up →** button appears while a turn is in flight (`POST .../chat/wrapup`); and the
-Python toggle self-describes from `GET /api/python/status` — *"Enable Python Data Science
-tools"* when the interpreter has pandas/duckdb, *"Enable Python (Optional: Install Data Science
-tools)"* with an install popup when it runs but lacks them, or *"Configure Python"* with a
-setup popup when no interpreter is usable.
+The chat surface adds a few operator conveniences: the **Send** button is a split control
+labelled with the active LLM profile (*"Investigate with &lt;profile&gt; →"*) whose **caret
+opens a profile picker** so the operator can switch the model that answers the next message
+without opening Settings; the button relabels live when the active profile changes. Droid
+bubbles are titled with the **profile name** and the model id in a smaller, dimmer
+parenthetical (*"Remote Qwen 3.6 (unsloth/qwen3.6-…)"*); they render any `<think>…</think>`
+reasoning as a **collapsed** "Thinking" disclosure with the cleaned answer as the paragraph.
+**A−/A+** controls size the chat font (persisted in `localStorage`); a **Wrap it up →** button
+appears while a turn is in flight (`POST .../chat/wrapup`); and the Python toggle
+self-describes from `GET /api/python/status` — *"Enable Python Data Science tools"* when the
+interpreter has pandas/duckdb, *"Enable Python (Optional: Install Data Science tools)"* with an
+install popup when it runs but lacks them, or *"Configure Python"* with a setup popup when no
+interpreter is usable.
 
 
 ## The cockpit & pilot loop (§10)

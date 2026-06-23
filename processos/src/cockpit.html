@@ -126,6 +126,7 @@
   .bub.user .who { color: #93c5fd; }
   .bub.droid { align-self: flex-start; background: #11142a; border: 1px solid #28306a; }
   .bub.droid .who { color: #a5b4fc; }
+  .bub.droid .who .who-model { font-size: 10px; font-weight: 500; text-transform: none; letter-spacing: 0; color: #6b7280; }
   .bub.pending { align-self: flex-start; background: #131316; border: 1px solid #26262b; color: #a1a1aa; }
   .bub .think { margin-bottom: 8px; border: 1px solid #26262b; border-radius: 8px; background: #0b0b14; }
   .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: #8b8b93; text-transform: uppercase; letter-spacing: .04em; }
@@ -147,6 +148,17 @@
   .pylink { color: #a5b4fc; cursor: pointer; text-decoration: underline; }
   .btn.warn { background: #3a1d1d; border: 1px solid #7f1d1d; color: #fca5a5; }
   .btn.warn:hover { background: #4a2424; }
+  /* split Send button: primary action + a caret that opens the profile picker */
+  .split { position: relative; display: inline-flex; }
+  .split #chatSend { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .split .split-caret { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left-color: rgba(255,255,255,.25); padding: 0 9px; font-size: 11px; }
+  .split .menu { position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 240px; max-width: 360px; background: #16161a; border: 1px solid #34343c; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.5); padding: 4px; z-index: 40; }
+  .split .menu button { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left; background: none; border: 0; color: #e5e7eb; padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .split .menu button:hover { background: #1f1f27; }
+  .split .menu button.on { color: #c7d2fe; }
+  .split .menu .mi-model { font-size: 11px; color: #6b7280; word-break: break-all; }
+  .split .menu .mi-on { margin-left: auto; color: #818cf8; }
+  .split .menu .mi-empty { padding: 8px 9px; color: #8b8b93; font-size: 12px; }
   .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
   .modal { background: #111118; border: 1px solid #34343c; border-radius: 12px; padding: 20px 22px; max-width: 560px; width: 90%; max-height: 80vh; overflow: auto; }
   .modal h3 { margin: 0 0 10px; }
@@ -563,7 +575,11 @@ async function renderWorkspace(ws, proc){
         </div>
         <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…"></textarea>
         <div class="compose-actions">
-          <button class="btn primary" id="chatSend">Investigate with the droid →</button>
+          <span class="split">
+            <button class="btn primary" id="chatSend">Investigate with the droid →</button>
+            <button class="btn primary split-caret" id="chatSendMenu" title="Send with a different LLM profile" aria-haspopup="true" aria-expanded="false">▾</button>
+            <div class="menu" id="chatProfileMenu" hidden></div>
+          </span>
           <button class="btn warn" id="chatWrapup" style="display:none" title="Tell the droid to stop and report its findings so far">Wrap it up →</button>
           <label class="muted" id="chatPyLabel"><input type="checkbox" id="chatPy" /> <span id="chatPyText">allow Python escape hatch</span></label>
           <span class="muted" id="chatHint" style="margin-left:auto"></span>
@@ -578,6 +594,7 @@ async function renderWorkspace(ws, proc){
   await loadChatPrompts();
   await loadChat(ws, proc);
   $('#chatSend').onclick = () => sendChat(ws, proc);
+  $('#chatSendMenu').onclick = (e) => { e.stopPropagation(); toggleProfileMenu(); };
   $('#chatWrapup').onclick = () => wrapUpChat(ws, proc);
   $('#wsObjSave').onclick = () => saveObjective(ws, proc, p);
   $('#chatBox').addEventListener('keydown', e => {
@@ -659,12 +676,54 @@ async function labelSendButton(){
     const name = active && active.name ? active.name : 'the droid';
     btn.textContent = 'Investigate with '+name+' →';
     btn.dataset.profile = name;
-    STATE.modelName = (active && active.model) ? active.model : 'Droid';
+    STATE.profileName = (active && active.name) ? active.name : 'Droid';
+    STATE.modelName = (active && active.model) ? active.model : '';
   } catch(e){ /* leave default label */ }
 }
 
 // Live-update the Send button + droid label + Python label when settings change.
 window.addEventListener('processos:settings-changed', () => { labelSendButton(); refreshPythonLabel(); });
+
+// ── profile picker on the split Send button ──────────────────────────────────
+// The caret beside "Investigate with …" drops a menu of every configured LLM profile so the
+// operator can switch the model that answers the next message without opening Settings.
+async function toggleProfileMenu(){
+  const menu = $('#chatProfileMenu'); const caret = $('#chatSendMenu');
+  if(!menu) return;
+  if(!menu.hidden){ closeProfileMenu(); return; }
+  let s;
+  try { s = await api('/api/settings'); }
+  catch(e){ $('#chatHint').textContent = 'could not load profiles: '+(e.message||e); return; }
+  const profiles = s.profiles||[];
+  menu.innerHTML = profiles.length ? profiles.map(p => {
+    const active = p.id===s.activeProfile;
+    return '<button data-id="'+esc(p.id)+'"'+(active?' class="on"':'')+'>'+
+      '<span class="mi-name">'+esc(p.name||p.id)+'</span>'+
+      (p.model?' <span class="mi-model">'+esc(p.model)+'</span>':'')+
+      (active?' <span class="mi-on">✓</span>':'')+'</button>';
+  }).join('') : '<div class="mi-empty">No profiles configured</div>';
+  menu.querySelectorAll('button[data-id]').forEach(b => {
+    b.onclick = () => selectProfile(b.getAttribute('data-id'), b.getAttribute('data-id')===s.activeProfile);
+  });
+  menu.hidden = false; caret.setAttribute('aria-expanded','true');
+  setTimeout(() => document.addEventListener('click', closeProfileMenu, { once:true }), 0);
+}
+function closeProfileMenu(){
+  const menu = $('#chatProfileMenu'); const caret = $('#chatSendMenu');
+  if(menu) menu.hidden = true;
+  if(caret) caret.setAttribute('aria-expanded','false');
+}
+// Make the chosen profile active so the next send (and the button label) use its model.
+async function selectProfile(id, alreadyActive){
+  closeProfileMenu();
+  if(alreadyActive) return;
+  try {
+    await api('/api/settings', { method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify({ activeProfile: id }) });
+    await labelSendButton();
+    $('#chatHint').textContent = 'next message goes to '+(STATE.profileName||'the selected profile');
+    try { window.dispatchEvent(new CustomEvent('processos:settings-changed')); } catch(e){}
+  } catch(e){ $('#chatHint').textContent = 'could not switch profile: '+(e.message||e); }
+}
 
 // Persist an edited objective on the process config (round-trips the full config).
 async function saveObjective(ws, proc, p){
@@ -698,7 +757,14 @@ function splitThinking(text){
   return { think: think.trim(), answer: t.trim() };
 }
 
-function droidName(){ return STATE.modelName || 'Droid'; }
+function droidName(){ return STATE.profileName || 'Droid'; }
+// The droid's bubble title: the active profile name, with the model id in a smaller, dimmer
+// parenthetical — e.g. "Remote Qwen 3.6 (UNSLOTH/QWEN3.6-35B-A3B-GGUF:UD-Q6_K)".
+function droidWhoHtml(){
+  const name = STATE.profileName || 'Droid';
+  const model = STATE.modelName || '';
+  return esc(name) + (model ? ' <span class="who-model">('+esc(model)+')</span>' : '');
+}
 
 function chatBub(t){
   if(t.role==='user') return '<div class="bub user"><div class="who">You</div>'+esc(t.text)+'</div>';
@@ -710,7 +776,7 @@ function chatBub(t){
       <div class="args">${esc(JSON.stringify(s.arguments))}</div>
       <pre>${esc(s.result)}</pre>
     </details>`).join('');
-  return '<div class="bub droid"><div class="who">'+esc(droidName())+'</div>'+thinkHtml+
+  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div>'+thinkHtml+
     '<div class="answer">'+esc(answer || (think ? '' : '(no answer)'))+'</div>'+
     (steps ? '<div class="steps">'+steps+'</div>' : '')+'</div>';
 }
@@ -757,7 +823,7 @@ async function sendChat(ws, proc){
   // optimistic: drop the placeholder, append the user turn + a pending droid bubble.
   if(log.querySelector('.empty')) log.innerHTML = '';
   log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
-  log.insertAdjacentHTML('beforeend', '<div class="bub pending" id="chatPending"><div class="who">'+esc(droidName())+'</div>reasoning over the dataset…</div>');
+  log.insertAdjacentHTML('beforeend', '<div class="bub pending" id="chatPending"><div class="who">'+droidWhoHtml()+'</div>reasoning over the dataset…</div>');
   log.scrollTop = log.scrollHeight;
   box.value = '';
   try {
@@ -771,7 +837,7 @@ async function sendChat(ws, proc){
       (ds.instances!=null?(ds.instances+' instances · '+ds.jobs+' jobs · '+ds.incidents+' incidents'):'');
   } catch(e){
     const pend = $('#chatPending'); if(pend) pend.remove();
-    log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+esc(droidName())+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
+    log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
     box.value = msg; // restore so the operator can retry
   } finally {
     send.disabled = false; box.disabled = false; box.focus();
@@ -782,7 +848,7 @@ async function sendChat(ws, proc){
 // Ask an in-flight investigation to stop and report its findings so far.
 async function wrapUpChat(ws, proc){
   const wrap = $('#chatWrapup'); if(wrap) wrap.disabled = true;
-  const pend = $('#chatPending'); if(pend) pend.innerHTML = '<div class="who">'+esc(droidName())+'</div>wrapping up — reporting findings so far…';
+  const pend = $('#chatPending'); if(pend) pend.innerHTML = '<div class="who">'+droidWhoHtml()+'</div>wrapping up — reporting findings so far…';
   try {
     await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/wrapup', { method:'POST' });
     $('#chatHint').textContent = 'asked the droid to wrap up…';
