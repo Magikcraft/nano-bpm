@@ -132,6 +132,21 @@
   .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: #8b8b93; text-transform: uppercase; letter-spacing: .04em; }
   .bub .think .think-body { padding: 0 10px 9px; font-size: calc(var(--chat-font, 15px) - 2px); line-height: 1.5; color: #9ca3af; white-space: pre-wrap; }
   .bub .steps { margin-top: 8px; }
+  /* rendered markdown in a droid answer: reset the bubble's pre-wrap and space block elements */
+  .bub .answer.md { white-space: normal; }
+  .bub .answer.md p { margin: 0 0 8px; white-space: pre-wrap; }
+  .bub .answer.md p:last-child { margin-bottom: 0; }
+  .bub .answer.md h1, .bub .answer.md h2, .bub .answer.md h3,
+  .bub .answer.md h4, .bub .answer.md h5, .bub .answer.md h6 { margin: 12px 0 6px; line-height: 1.3; font-weight: 700; }
+  .bub .answer.md h1 { font-size: 1.3em; } .bub .answer.md h2 { font-size: 1.2em; } .bub .answer.md h3 { font-size: 1.1em; }
+  .bub .answer.md h4, .bub .answer.md h5, .bub .answer.md h6 { font-size: 1em; color: #c7d2fe; }
+  .bub .answer.md ul, .bub .answer.md ol { margin: 4px 0 8px; padding-left: 22px; }
+  .bub .answer.md li { margin: 2px 0; }
+  .bub .answer.md code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 4px; padding: 1px 4px; font: 0.88em ui-monospace, monospace; color: #fca5a5; }
+  .bub .answer.md pre.md-code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 8px; padding: 10px 12px; margin: 6px 0 8px; overflow: auto; max-height: 320px; }
+  .bub .answer.md pre.md-code { white-space: pre; font: 12px/1.5 ui-monospace, monospace; color: #a1a1aa; }
+  .bub .answer.md a { color: #93c5fd; }
+  .bub .answer.md strong { color: #f1f5f9; }
   .bub .steps details { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
   .bub .steps summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
   .bub .steps .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
@@ -204,6 +219,51 @@ const main = $('#main');
 let STATE = { view: 'console', proc: null, exp: null };
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// Minimal, XSS-safe Markdown → HTML for droid answers (headings, bold/italic, inline + fenced
+// code, ordered/unordered lists, http(s) links, paragraphs). Escapes all input first; only
+// http(s) links are emitted, so model output can never inject markup.
+function mdToHtml(src){
+  const e = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const blocks = [];
+  src = String(src||'').replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    blocks.push('<pre class="md-code">'+e(code.replace(/\n$/,''))+'</pre>');
+    return '\u0000B'+(blocks.length-1)+'\u0000';
+  });
+  const inline = t => {
+    t = e(t);
+    t = t.replace(/`([^`]+)`/g, (_,c)=>'<code>'+c+'</code>');
+    t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    t = t.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    t = t.replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    return t;
+  };
+  const lines = src.split(/\r?\n/);
+  let html = '', i = 0, para = [];
+  const flush = () => { if(para.length){ html += '<p>'+para.map(inline).join('<br>')+'</p>'; para = []; } };
+  while(i < lines.length){
+    const ln = lines[i];
+    const bm = ln.match(/^\u0000B(\d+)\u0000$/);
+    if(bm){ flush(); html += blocks[+bm[1]]; i++; continue; }
+    const h = ln.match(/^(#{1,6})\s+(.*)$/);
+    if(h){ flush(); html += '<h'+h[1].length+'>'+inline(h[2])+'</h'+h[1].length+'>'; i++; continue; }
+    if(/^\s*([-*+])\s+/.test(ln)){
+      flush(); html += '<ul>';
+      while(i<lines.length && /^\s*([-*+])\s+/.test(lines[i])){ html += '<li>'+inline(lines[i].replace(/^\s*([-*+])\s+/,''))+'</li>'; i++; }
+      html += '</ul>'; continue;
+    }
+    if(/^\s*\d+[.)]\s+/.test(ln)){
+      flush(); html += '<ol>';
+      while(i<lines.length && /^\s*\d+[.)]\s+/.test(lines[i])){ html += '<li>'+inline(lines[i].replace(/^\s*\d+[.)]\s+/,''))+'</li>'; i++; }
+      html += '</ol>'; continue;
+    }
+    if(/^\s*$/.test(ln)){ flush(); i++; continue; }
+    para.push(ln); i++;
+  }
+  flush();
+  return html;
+}
 function ms(v){ return v==null ? '—' : (v>=1000 ? (v/1000).toFixed(2)+'s' : Math.round(v)+'ms'); }
 function pct(v){ return v==null ? '—' : (v*100).toFixed(1)+'%'; }
 function tierBadge(t){
@@ -777,7 +837,7 @@ function chatBub(t){
       <pre>${esc(s.result)}</pre>
     </details>`).join('');
   return '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div>'+thinkHtml+
-    '<div class="answer">'+esc(answer || (think ? '' : '(no answer)'))+'</div>'+
+    '<div class="answer md">'+(answer ? mdToHtml(answer) : (think ? '' : '(no answer)'))+'</div>'+
     (steps ? '<div class="steps">'+steps+'</div>' : '')+'</div>';
 }
 

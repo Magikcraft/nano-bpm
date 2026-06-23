@@ -277,8 +277,12 @@ labelled with the active LLM profile (*"Investigate with &lt;profile&gt; →"*) 
 opens a profile picker** so the operator can switch the model that answers the next message
 without opening Settings; the button relabels live when the active profile changes. Droid
 bubbles are titled with the **profile name** and the model id in a smaller, dimmer
-parenthetical (*"Remote Qwen 3.6 (unsloth/qwen3.6-…)"*); they render any `<think>…</think>`
-reasoning as a **collapsed** "Thinking" disclosure with the cleaned answer as the paragraph.
+parenthetical (*"Remote Qwen 3.6 (unsloth/qwen3.6-…)"*); they render the answer as
+**Markdown** (headings, lists, bold/italic, inline + fenced code, links — escaped first, only
+http(s) links emitted) and any reasoning as a **collapsed** "Thinking" disclosure. The droid's
+chain-of-thought is captured whether the backend emits inline `<think>…</think>` tags or a
+separate `reasoning_content` field (as llama.cpp does for Gemma/Qwen — `parse_openai_turn`
+folds it into a `<think>` block).
 **A−/A+** controls size the chat font (persisted in `localStorage`); a **Wrap it up →** button
 appears while a turn is in flight (`POST .../chat/wrapup`); and the Python toggle
 self-describes from `GET /api/python/status` — *"Enable Python Data Science tools"* when the

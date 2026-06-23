@@ -333,7 +333,20 @@ fn parse_openai_turn(message: &Value) -> Result<Turn, String> {
         }
     }
     let content = message["content"].as_str().unwrap_or_default().to_string();
-    Ok(Turn::Final(content))
+    // Some backends (e.g. llama.cpp serving Gemma/Qwen) return the model's chain-of-thought in a
+    // separate `reasoning_content` field rather than inline `<think>` tags. Fold it back in as a
+    // `<think>` block so the cockpit can show it as a collapsed "Thinking" disclosure.
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .trim();
+    let final_text = if reasoning.is_empty() {
+        content
+    } else {
+        format!("<think>{reasoning}</think>\n{content}")
+    };
+    Ok(Turn::Final(final_text))
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -471,6 +484,15 @@ mod tests {
         let msg = json!({ "content": "the answer" });
         match parse_openai_turn(&msg).unwrap() {
             Turn::Final(s) => assert_eq!(s, "the answer"),
+            Turn::ToolCalls(_) => panic!("expected final"),
+        }
+    }
+
+    #[test]
+    fn folds_reasoning_content_into_a_think_block() {
+        let msg = json!({ "content": "the answer", "reasoning_content": "  step one\nstep two  " });
+        match parse_openai_turn(&msg).unwrap() {
+            Turn::Final(s) => assert_eq!(s, "<think>step one\nstep two</think>\nthe answer"),
             Turn::ToolCalls(_) => panic!("expected final"),
         }
     }
