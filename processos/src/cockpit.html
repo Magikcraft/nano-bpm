@@ -132,6 +132,12 @@
   .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: #8b8b93; text-transform: uppercase; letter-spacing: .04em; }
   .bub .think .think-body { padding: 0 10px 9px; font-size: calc(var(--chat-font, 15px) - 2px); line-height: 1.5; color: #9ca3af; white-space: pre-wrap; }
   .bub .steps { margin-top: 8px; }
+  /* live streaming bubble: tool steps + a transient status line */
+  .bub .live-status { margin-top: 6px; font-size: 12px; color: #8b8b93; font-style: italic; }
+  .bub .steps .livestep { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
+  .bub .steps .livestep summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
+  .bub .steps .livestep .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .bub .steps .livestep .result { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 280px; overflow: auto; }
   /* rendered markdown in a droid answer: reset the bubble's pre-wrap and space block elements */
   .bub .answer.md { white-space: normal; }
   .bub .answer.md p { margin: 0 0 8px; white-space: pre-wrap; }
@@ -872,6 +878,17 @@ async function loadChatPrompts(){
   } catch(e){ /* prompts are optional */ }
 }
 
+// Build the live "pending" droid bubble whose regions fill in as SSE events stream.
+function livePendingHtml(){
+  return '<div class="bub droid pending" id="chatPending">'+
+    '<div class="who">'+droidWhoHtml()+'</div>'+
+    '<details class="think live" open id="liveThinkWrap" style="display:none"><summary>Thinking…</summary><div class="think-body" id="liveThink"></div></details>'+
+    '<div class="answer md" id="liveAnswer"></div>'+
+    '<div class="steps" id="liveSteps"></div>'+
+    '<div class="muted live-status" id="liveStatus">reasoning over the dataset…</div>'+
+    '</div>';
+}
+
 async function sendChat(ws, proc){
   const box = $('#chatBox'); const msg = box.value.trim();
   if(!msg) return;
@@ -880,23 +897,93 @@ async function sendChat(ws, proc){
   const allowPython = $('#chatPy').checked && !$('#chatPy').disabled;
   send.disabled = true; box.disabled = true;
   if(wrap){ wrap.style.display = ''; wrap.disabled = false; }
-  // optimistic: drop the placeholder, append the user turn + a pending droid bubble.
   if(log.querySelector('.empty')) log.innerHTML = '';
   log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
-  log.insertAdjacentHTML('beforeend', '<div class="bub pending" id="chatPending"><div class="who">'+droidWhoHtml()+'</div>reasoning over the dataset…</div>');
+  log.insertAdjacentHTML('beforeend', livePendingHtml());
   log.scrollTop = log.scrollHeight;
   box.value = '';
+
+  const pend = $('#chatPending');
+  const liveThink = $('#liveThink'), liveThinkWrap = $('#liveThinkWrap');
+  const liveAnswer = $('#liveAnswer'), liveSteps = $('#liveSteps'), liveStatus = $('#liveStatus');
+  let answerBuf = '', thinkBuf = '';
+  const pendingSteps = []; // FIFO of {tool, el} awaiting their result
+  const nearBottom = () => (log.scrollHeight - log.scrollTop - log.clientHeight) < 80;
+  const autoscroll = () => { if(nearBottom()) log.scrollTop = log.scrollHeight; };
+
+  function handleEvent(ev){
+    if(ev.type==='round'){ if(liveStatus) liveStatus.textContent = 'round '+ev.n+' — investigating…'; }
+    else if(ev.type==='reasoning'){
+      thinkBuf += ev.text; if(liveThinkWrap) liveThinkWrap.style.display='';
+      if(liveThink) liveThink.textContent = thinkBuf; autoscroll();
+    }
+    else if(ev.type==='answer'){
+      answerBuf += ev.text; if(liveAnswer) liveAnswer.innerHTML = mdToHtml(answerBuf); autoscroll();
+    }
+    else if(ev.type==='tool'){
+      const el = document.createElement('details');
+      el.className = 'livestep'; el.open = true;
+      el.innerHTML = '<summary>▶ '+esc(ev.tool)+' …</summary>'+
+        '<div class="args">'+esc(JSON.stringify(ev.arguments))+'</div>'+
+        '<pre class="result">running…</pre>';
+      liveSteps.appendChild(el); pendingSteps.push({ tool: ev.tool, el });
+      if(liveStatus) liveStatus.textContent = 'running '+ev.tool+'…';
+      autoscroll();
+    }
+    else if(ev.type==='toolResult'){
+      const i = pendingSteps.findIndex(s => s.tool===ev.tool);
+      const s = i>=0 ? pendingSteps.splice(i,1)[0] : null;
+      if(s){ s.el.querySelector('summary').textContent = ev.tool+' ✓'; s.el.querySelector('.result').textContent = ev.result; s.el.open = false; }
+      autoscroll();
+    }
+    else if(ev.type==='done'){
+      drawChat(ev.turns);
+      const ds = ev.dataset || {};
+      hint.textContent = (ev.rounds!=null?('round '+ev.rounds+' · '):'') +
+        (ds.instances!=null?(ds.instances+' instances · '+ds.jobs+' jobs · '+ds.incidents+' incidents'):'');
+    }
+    else if(ev.type==='error'){
+      if(pend) pend.remove();
+      log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(ev.message)+'</span></div>');
+    }
+  }
+
   try {
-    const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat', {
+    const resp = await fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream', {
       method:'POST', headers:{'content-type':'application/json'},
       body: JSON.stringify({ message: msg, allowPython })
     });
-    drawChat(r.turns);
-    const ds = r.dataset || {};
-    hint.textContent = (r.rounds!=null?('round '+r.rounds+' · '):'') +
-      (ds.instances!=null?(ds.instances+' instances · '+ds.jobs+' jobs · '+ds.incidents+' incidents'):'');
+    if(!resp.ok || !resp.body){
+      let m = 'stream failed ('+resp.status+')';
+      try { const j = await resp.json(); m = j.error || m; } catch(e){}
+      throw new Error(m);
+    }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', finished = false;
+    while(true){
+      const { value, done } = await reader.read();
+      if(done) break;
+      buf += dec.decode(value, { stream:true });
+      let idx;
+      while((idx = buf.indexOf('\n\n')) >= 0){
+        const frame = buf.slice(0, idx); buf = buf.slice(idx+2);
+        const dataLine = frame.split('\n').find(l => l.startsWith('data:'));
+        if(!dataLine) continue;
+        const payload = dataLine.slice(5).trim();
+        if(!payload) continue;
+        let ev; try { ev = JSON.parse(payload); } catch(e){ continue; }
+        handleEvent(ev);
+        if(ev.type==='done' || ev.type==='error') finished = true;
+      }
+    }
+    if(!finished){
+      // Stream closed without a terminal event — fall back to the persisted transcript.
+      try { const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat'); drawChat(r.turns); }
+      catch(e){ if(pend) pend.remove(); }
+    }
   } catch(e){
-    const pend = $('#chatPending'); if(pend) pend.remove();
+    if(pend) pend.remove();
     log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
     box.value = msg; // restore so the operator can retry
   } finally {
@@ -905,10 +992,11 @@ async function sendChat(ws, proc){
   }
 }
 
-// Ask an in-flight investigation to stop and report its findings so far.
+// Ask an in-flight investigation to stop and report its findings so far. The live bubble keeps
+// streaming — the wrap-up answer arrives as further `answer` events.
 async function wrapUpChat(ws, proc){
   const wrap = $('#chatWrapup'); if(wrap) wrap.disabled = true;
-  const pend = $('#chatPending'); if(pend) pend.innerHTML = '<div class="who">'+droidWhoHtml()+'</div>wrapping up — reporting findings so far…';
+  const st = $('#liveStatus'); if(st) st.textContent = 'wrapping up — reporting findings so far…';
   try {
     await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/wrapup', { method:'POST' });
     $('#chatHint').textContent = 'asked the droid to wrap up…';

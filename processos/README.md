@@ -246,6 +246,14 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   can also be **wrapped up early** (`POST .../chat/wrapup`): the loop checks a per-session
   cancel flag between rounds and, when set (or when the round budget is exhausted), tells the
   model to stop investigating and report its findings so far instead of erroring.
+- **Live token streaming** (`POST .../chat/stream`, SSE): the canonical agent loop
+  (`run_agent_streaming`) threads a sink that emits `round` / `reasoning` / `answer` / `tool` /
+  `toolResult` events as the model produces them, terminated by `done` (or `error`). The
+  `OpenAiAgent` requests `stream: true` and parses the SSE deltas — accumulating
+  `reasoning_content` and `content` tokens and assembling streamed `tool_calls` fragments by
+  index — so the cockpit shows the droid's thinking, tool calls, and answer **as they happen**
+  (live "Thinking" disclosure shown open, then collapsed once the turn completes). The
+  non-streaming `POST .../chat` endpoint still exists (same loop, no-op sink) for curl/API use.
 - `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
   persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
   Ships four built-ins led by an **open investigation** (the default, pre-loaded into a
@@ -264,6 +272,9 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat \
   -d '{"message":"Which job type has the worst queue tail?","allowPython":false}'
 # -> { answer, rounds, dataset:{instances,jobs,incidents}, turns:[{role,text,steps}] }
+# Same turn, streamed live as Server-Sent Events (round/reasoning/answer/tool/toolResult/done):
+curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream \
+  -d '{"message":"Which job type has the worst queue tail?","allowPython":false}'
 curl       .../api/workspaces/{workspace}/processes/{process}/chat        # load transcript
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/reset # forget it
 curl       .../api/chat-prompts                                           # list templates
@@ -406,6 +417,7 @@ for it automatically.
 | `GET` | `/api/workspaces/{workspace}/processes/{process}/insights` | Insights folded over the process's bound source |
 | `POST` | `/api/workspaces/{workspace}/processes/{process}/investigate` | One-shot LLM-driven investigation over the bound source via the `query_traces` SQL tool (+ optional `run_python` when `allowPython:true`) |
 | `GET`/`POST` | `/api/workspaces/{workspace}/processes/{process}/chat` | Multi-turn cockpit chat: `GET` loads the persisted transcript; `POST {message,allowPython}` sends one turn and resumes from it |
+| `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/stream` | Same as `chat`, streamed live as SSE (`round`/`reasoning`/`answer`/`tool`/`toolResult`/`done`) |
 | `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/reset` | Forget this dataset's conversation |
 | `GET`/`POST` | `/api/chat-prompts` | List / author reusable compose-box prompt templates (persisted to the config dir) |
 | `DELETE` | `/api/chat-prompts/{id}` | Delete a non-built-in chat prompt |

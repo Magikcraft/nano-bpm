@@ -66,10 +66,44 @@ pub trait ToolBox {
     fn call(&self, name: &str, args: &Value) -> Result<String, String>;
 }
 
+/// A streamed fragment of one model step, surfaced live to the operator.
+pub enum Delta {
+    /// A chunk of the model's chain-of-thought (`reasoning_content`).
+    Reasoning(String),
+    /// A chunk of the model's user-facing answer (`content`).
+    Answer(String),
+}
+
+/// An event emitted by the streaming agent loop, for live cockpit feedback.
+pub enum AgentEvent {
+    /// A new round of the tool-calling loop began.
+    Round(usize),
+    /// A chunk of the droid's thinking.
+    Reasoning(String),
+    /// A chunk of the droid's answer prose.
+    Answer(String),
+    /// The droid asked to run a tool (emitted before execution).
+    ToolCall { tool: String, arguments: Value },
+    /// A tool finished; `result` is the raw string fed back to the model.
+    ToolResult { tool: String, result: String },
+}
+
 /// The model transport: one request/response step given the running messages.
 #[allow(async_fn_in_trait)]
 pub trait AgentStep {
     async fn step(&self, msgs: &[Msg], tools: &[ToolSpec]) -> Result<Turn, String>;
+
+    /// Streaming variant: same contract as [`AgentStep::step`], but `on_delta` is invoked with
+    /// each token fragment as it arrives so the caller can surface live progress. The default
+    /// implementation is non-streaming (emits no deltas) so mock transports need not implement it.
+    async fn step_streaming(
+        &self,
+        msgs: &[Msg],
+        tools: &[ToolSpec],
+        _on_delta: &mut dyn FnMut(Delta),
+    ) -> Result<Turn, String> {
+        self.step(msgs, tools).await
+    }
 }
 
 /// One recorded tool call + its result (the "lab notebook" of an investigation).
@@ -127,6 +161,22 @@ pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
     max_rounds: usize,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<AgentRun, String> {
+    let mut sink = |_ev: AgentEvent| {};
+    run_agent_streaming(model, tools, msgs, max_rounds, cancel, &mut sink).await
+}
+
+/// As [`run_agent_resumable_cancellable`], but emits [`AgentEvent`]s through `sink` as the run
+/// progresses — token fragments of the droid's thinking and answer, plus tool-call boundaries —
+/// so the cockpit can render the investigation live instead of waiting for the whole turn. This
+/// is the canonical loop; the non-streaming entry points delegate here with a no-op sink.
+pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
+    model: &M,
+    tools: &T,
+    msgs: &mut Vec<Msg>,
+    max_rounds: usize,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    sink: &mut dyn FnMut(AgentEvent),
+) -> Result<AgentRun, String> {
     use std::sync::atomic::Ordering;
     let specs = tools.specs();
     let mut steps: Vec<AgentStepRecord> = Vec::new();
@@ -134,9 +184,18 @@ pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
     for round in 1..=max_rounds {
         // Operator asked to wrap up: stop investigating and force a prose summary now.
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
-            return wrap_up(model, msgs, steps, round).await;
+            return wrap_up(model, msgs, steps, round, sink).await;
         }
-        match model.step(msgs, &specs).await? {
+        sink(AgentEvent::Round(round));
+        let turn = {
+            // Forward token fragments live; scoped so `sink` is free again after the call.
+            let mut on_delta = |d: Delta| match d {
+                Delta::Reasoning(t) => sink(AgentEvent::Reasoning(t)),
+                Delta::Answer(t) => sink(AgentEvent::Answer(t)),
+            };
+            model.step_streaming(msgs, &specs, &mut on_delta).await?
+        };
+        match turn {
             Turn::Final(answer) => {
                 // Record the answer in the transcript so a resumed conversation
                 // remembers what the droid concluded last turn.
@@ -164,9 +223,17 @@ pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
                     tool_calls: calls.clone(),
                 });
                 for call in calls {
+                    sink(AgentEvent::ToolCall {
+                        tool: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    });
                     let result = tools
                         .call(&call.name, &call.arguments)
                         .unwrap_or_else(|e| json!({ "error": e }).to_string());
+                    sink(AgentEvent::ToolResult {
+                        tool: call.name.clone(),
+                        result: result.clone(),
+                    });
                     steps.push(AgentStepRecord {
                         tool: call.name.clone(),
                         arguments: call.arguments.clone(),
@@ -182,7 +249,7 @@ pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
     }
     // Budget exhausted: rather than erroring, ask the model to summarise what it has so the
     // operator still gets findings from a long run.
-    wrap_up(model, msgs, steps, max_rounds).await
+    wrap_up(model, msgs, steps, max_rounds, sink).await
 }
 
 /// Force a final prose answer from the model with no tools available, recording it in the
@@ -192,6 +259,7 @@ async fn wrap_up<M: AgentStep>(
     msgs: &mut Vec<Msg>,
     steps: Vec<AgentStepRecord>,
     round: usize,
+    sink: &mut dyn FnMut(AgentEvent),
 ) -> Result<AgentRun, String> {
     msgs.push(Msg::System(
         "Stop investigating now and report your findings so far, based only on what you \
@@ -199,9 +267,15 @@ async fn wrap_up<M: AgentStep>(
          what you found, your confidence, and what you'd recommend or check next."
             .to_string(),
     ));
-    let answer = match model.step(msgs, &[]).await? {
-        Turn::Final(a) => a,
-        Turn::ToolCalls(_) => String::new(),
+    let answer = {
+        let mut on_delta = |d: Delta| match d {
+            Delta::Reasoning(t) => sink(AgentEvent::Reasoning(t)),
+            Delta::Answer(t) => sink(AgentEvent::Answer(t)),
+        };
+        match model.step_streaming(msgs, &[], &mut on_delta).await? {
+            Turn::Final(a) => a,
+            Turn::ToolCalls(_) => String::new(),
+        }
     };
     msgs.push(Msg::Assistant {
         text: Some(answer.clone()),
@@ -221,16 +295,9 @@ pub struct OpenAiAgent {
     pub cfg: LlmConfig,
 }
 
-impl AgentStep for OpenAiAgent {
-    async fn step(&self, msgs: &[Msg], tools: &[ToolSpec]) -> Result<Turn, String> {
-        if !self.cfg.is_ready() {
-            return Err("no LLM model configured (set PROCESSOS_LLM_MODEL)".into());
-        }
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
-        let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
-
+impl OpenAiAgent {
+    /// Build the `chat/completions` request body shared by streaming and non-streaming calls.
+    fn request_body(&self, msgs: &[Msg], tools: &[ToolSpec], stream: bool) -> Value {
         let tool_defs: Vec<Value> = tools
             .iter()
             .map(|t| {
@@ -244,14 +311,39 @@ impl AgentStep for OpenAiAgent {
                 })
             })
             .collect();
-
-        let body = json!({
+        json!({
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
             "max_tokens": self.cfg.max_tokens,
             "tools": tool_defs,
+            "stream": stream,
             "messages": msgs.iter().map(openai_message).collect::<Vec<_>>(),
-        });
+        })
+    }
+
+    fn endpoint(&self) -> String {
+        format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'))
+    }
+}
+
+/// Accumulates one streamed tool call whose `arguments` (and sometimes name) arrive in fragments.
+#[derive(Default)]
+struct ToolCallAccum {
+    id: String,
+    name: String,
+    args: String,
+}
+
+impl AgentStep for OpenAiAgent {
+    async fn step(&self, msgs: &[Msg], tools: &[ToolSpec]) -> Result<Turn, String> {
+        if !self.cfg.is_ready() {
+            return Err("no LLM model configured (set PROCESSOS_LLM_MODEL)".into());
+        }
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        let url = self.endpoint();
+        let body = self.request_body(msgs, tools, false);
 
         let mut req = client.post(&url).json(&body);
         if let Some(key) = &self.cfg.api_key {
@@ -272,6 +364,124 @@ impl AgentStep for OpenAiAgent {
         let v: Value =
             serde_json::from_str(&text).map_err(|e| format!("LLM response not JSON: {e}"))?;
         parse_openai_turn(&v["choices"][0]["message"])
+    }
+
+    async fn step_streaming(
+        &self,
+        msgs: &[Msg],
+        tools: &[ToolSpec],
+        on_delta: &mut dyn FnMut(Delta),
+    ) -> Result<Turn, String> {
+        use futures_util::StreamExt;
+        if !self.cfg.is_ready() {
+            return Err("no LLM model configured (set PROCESSOS_LLM_MODEL)".into());
+        }
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        let url = self.endpoint();
+        let body = self.request_body(msgs, tools, true);
+
+        let mut req = client.post(&url).json(&body);
+        if let Some(key) = &self.cfg.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("LLM request to {url} failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("LLM returned {status}: {}", truncate(&text, 500)));
+        }
+
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tool_accum: Vec<ToolCallAccum> = Vec::new();
+        let mut buf = String::new();
+        let mut stream = resp.bytes_stream();
+        'outer: while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|e| format!("LLM stream error: {e}"))?;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            // Process complete SSE lines; keep the trailing partial line in `buf`.
+            while let Some(pos) = buf.find('\n') {
+                let line = buf[..pos].trim().to_string();
+                buf.drain(..=pos);
+                let data = match line.strip_prefix("data:") {
+                    Some(d) => d.trim(),
+                    None => continue, // comments / blank lines
+                };
+                if data == "[DONE]" {
+                    break 'outer;
+                }
+                let v: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let delta = &v["choices"][0]["delta"];
+                if let Some(r) = delta["reasoning_content"].as_str() {
+                    if !r.is_empty() {
+                        reasoning.push_str(r);
+                        on_delta(Delta::Reasoning(r.to_string()));
+                    }
+                }
+                if let Some(c) = delta["content"].as_str() {
+                    if !c.is_empty() {
+                        content.push_str(c);
+                        on_delta(Delta::Answer(c.to_string()));
+                    }
+                }
+                if let Some(tcs) = delta["tool_calls"].as_array() {
+                    for tc in tcs {
+                        let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                        while tool_accum.len() <= idx {
+                            tool_accum.push(ToolCallAccum::default());
+                        }
+                        let acc = &mut tool_accum[idx];
+                        if let Some(id) = tc["id"].as_str() {
+                            if !id.is_empty() {
+                                acc.id = id.to_string();
+                            }
+                        }
+                        if let Some(n) = tc["function"]["name"].as_str() {
+                            if !n.is_empty() {
+                                acc.name.push_str(n);
+                            }
+                        }
+                        if let Some(a) = tc["function"]["arguments"].as_str() {
+                            acc.args.push_str(a);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !tool_accum.is_empty() {
+            let calls = tool_accum
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| ToolCall {
+                    id: if a.id.is_empty() {
+                        format!("call_{i}")
+                    } else {
+                        a.id
+                    },
+                    name: a.name,
+                    arguments: serde_json::from_str(&a.args).unwrap_or(json!({})),
+                })
+                .collect();
+            return Ok(Turn::ToolCalls(calls));
+        }
+        // Fold any separate reasoning stream back into a `<think>` block so the persisted
+        // transcript (and non-streaming render) keeps the droid's chain-of-thought.
+        let reasoning = reasoning.trim();
+        let final_text = if reasoning.is_empty() {
+            content
+        } else {
+            format!("<think>{reasoning}</think>\n{content}")
+        };
+        Ok(Turn::Final(final_text))
     }
 }
 

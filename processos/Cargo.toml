@@ -20,7 +20,10 @@ serde_json = "1"
 # Localhost gateway + local llama.cpp are plain HTTP, but Anthropic (and most
 # hosted model APIs) require HTTPS — so we enable the pure-Rust rustls backend
 # (no system OpenSSL; still builds offline from the crate cache).
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
+# Stream combinators for consuming the LLM's token stream (reqwest bytes_stream) and
+# bridging the agent's event channel into an axum SSE response.
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 # The MVP optimization harness (SimRunner) embeds the REAL engine for

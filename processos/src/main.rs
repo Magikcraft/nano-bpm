@@ -33,7 +33,10 @@ use std::sync::{Arc, RwLock};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -291,6 +294,10 @@ async fn main() {
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat",
             get(cockpit_chat_load).post(cockpit_chat_send),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/stream",
+            post(cockpit_chat_stream),
         )
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/reset",
@@ -1206,6 +1213,7 @@ async fn cockpit_chat_send(
                 .enable_all()
                 .build()
                 .map_err(|e| format!("runtime: {e}"))?;
+            let mut sink = |_ev: agent::AgentEvent| {};
             rt.block_on(investigate::run_chat_turn(
                 &src,
                 cfg,
@@ -1215,6 +1223,7 @@ async fn cockpit_chat_send(
                 allow_python,
                 objective.as_deref(),
                 Some(&cancel),
+                &mut sink,
                 prior,
                 &message,
             ))
@@ -1238,6 +1247,127 @@ async fn cockpit_chat_send(
         Ok(Err(e)) => bad_gateway(e),
         Err(e) => bad_gateway(format!("chat task failed: {e}")),
     }
+}
+
+/// `POST .../chat/stream` — like [`cockpit_chat_send`], but streams the turn as Server-Sent
+/// Events so the cockpit can show the droid's thinking, tool calls, and answer live as they are
+/// produced. Event payloads are JSON: `{type:"round",n}`, `{type:"reasoning",text}`,
+/// `{type:"answer",text}`, `{type:"tool",tool,arguments}`, `{type:"toolResult",tool,result}`,
+/// and a terminal `{type:"done",answer,rounds,dataset,turns}` or `{type:"error",message}`.
+async fn cockpit_chat_stream(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    Json(req): Json<ChatSendRequest>,
+) -> impl IntoResponse {
+    if req.message.trim().is_empty() {
+        return unprocessable("message must not be empty".to_string());
+    }
+    let cfg = resolve_llm(&state, req.llm.as_ref());
+    if !cfg.is_ready() {
+        return unprocessable(
+            "no LLM model configured; set it in the console settings (cog, lower-left) or \
+             via PROCESSOS_LLM_MODEL (and PROCESSOS_LLM_BASE_URL / PROCESSOS_LLM_PROVIDER \
+             as needed), or pass an `llm` object with at least `model` in the request body"
+                .to_string(),
+        );
+    }
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let limit = req.limit.unwrap_or(100_000).clamp(1, 1_000_000);
+    let max_rounds = req.max_rounds.unwrap_or(12).clamp(1, 40);
+    let allow_python = req.allow_python;
+    let py = state.settings.snapshot().py_config();
+    let objective = state
+        .workspaces
+        .get_process(&workspace, &process)
+        .and_then(|p| p.config.objective);
+    let key = chat::session_key(&workspace, &process);
+    let prior = state.chat.load(&key);
+    let message = req.message;
+    // Register a wrap-up flag so `POST .../chat/wrapup` can ask this in-flight turn to report early.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Ok(mut m) = state.chat_cancels.lock() {
+        m.insert(key.clone(), cancel.clone());
+    }
+
+    // The agent loop runs on a blocking thread (DuckDB is !Send) and pushes events into an
+    // unbounded channel; the SSE response drains that channel on the main runtime. Unbounded +
+    // non-blocking `send` avoids panicking inside the blocking thread's current-thread runtime.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let task_state = state.clone();
+    let task_key = key.clone();
+    tokio::task::spawn_blocking(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(serde_json::json!({ "type": "error", "message": format!("runtime: {e}") }));
+                return;
+            }
+        };
+        let tx_ev = tx.clone();
+        let mut sink = move |ev: agent::AgentEvent| {
+            let v = match ev {
+                agent::AgentEvent::Round(n) => serde_json::json!({ "type": "round", "n": n }),
+                agent::AgentEvent::Reasoning(t) => serde_json::json!({ "type": "reasoning", "text": t }),
+                agent::AgentEvent::Answer(t) => serde_json::json!({ "type": "answer", "text": t }),
+                agent::AgentEvent::ToolCall { tool, arguments } => {
+                    serde_json::json!({ "type": "tool", "tool": tool, "arguments": arguments })
+                }
+                agent::AgentEvent::ToolResult { tool, result } => {
+                    serde_json::json!({ "type": "toolResult", "tool": tool, "result": result })
+                }
+            };
+            let _ = tx_ev.send(v);
+        };
+        let result = rt.block_on(investigate::run_chat_turn(
+            &src,
+            cfg,
+            py,
+            limit,
+            max_rounds,
+            allow_python,
+            objective.as_deref(),
+            Some(&cancel),
+            &mut sink,
+            prior,
+            &message,
+        ));
+        match result {
+            Ok(r) => {
+                task_state.chat.save(&task_key, r.messages.clone());
+                let _ = tx.send(serde_json::json!({
+                    "type": "done",
+                    "answer": r.answer,
+                    "rounds": r.rounds,
+                    "dataset": r.dataset,
+                    "turns": chat::render_view(&r.messages),
+                }));
+            }
+            Err(e) => {
+                let _ = tx.send(serde_json::json!({ "type": "error", "message": e }));
+            }
+        }
+        if let Ok(mut m) = task_state.chat_cancels.lock() {
+            m.remove(&task_key);
+        }
+    });
+
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|v| {
+            (
+                Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string())),
+                rx,
+            )
+        })
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// `POST .../chat/reset` — forget this dataset's conversation.
