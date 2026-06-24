@@ -243,7 +243,8 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                 // steering pattern as wrap_up.
                 let wrapping_up = cancel.is_some_and(|c| c.load(Ordering::Relaxed));
                 let thinking_only = is_thinking_only(&answer);
-                let needs_nudge = thinking_only || signals_deferred_action(&answer);
+                let runaway = is_runaway_repetition(&answer);
+                let needs_nudge = thinking_only || runaway || signals_deferred_action(&answer);
                 if !wrapping_up
                     && auto_continues < MAX_AUTO_CONTINUES
                     && round < max_rounds
@@ -253,7 +254,13 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                         text: Some(answer.clone()),
                         tool_calls: Vec::new(),
                     });
-                    let nudge = if thinking_only {
+                    let nudge = if runaway {
+                        "Your previous turn ran on, repeating the same text many times without \
+                         finishing. Writing SQL in your answer (e.g. in backticks) does NOTHING \
+                         — the ONLY way to run a query is to emit a query_traces tool call. Stop \
+                         repeating yourself. Now do exactly one thing: emit a single query_traces \
+                         tool call, or give a concise final answer."
+                    } else if thinking_only {
                         "Your previous turn was all reasoning and produced no answer or \
                          tool call — you likely ran out of room mid-thought. Do NOT author \
                          long content (such as full BPMN XML) inside your reasoning; keep \
@@ -866,8 +873,33 @@ fn strip_think_blocks(s: &str) -> String {
     out
 }
 
-/// A stable signature for a round's tool calls, used to detect a model that spins by
-/// re-issuing the SAME call(s) it already ran (e.g. running an identical `query_traces`
+/// Detect a *runaway* final turn: the model rambles, repeating the same line many times
+/// (often writing SQL as backtick prose instead of calling `query_traces`), filling the
+/// output budget without ever finishing or calling a tool. Conservative: only fires on a
+/// long answer where some non-trivial line recurs many times, so ordinary prose — which
+/// does not repeat a 12+-char line six times — is never misclassified.
+fn is_runaway_repetition(answer: &str) -> bool {
+    const MIN_LEN: usize = 3000;
+    const MIN_LINE: usize = 12;
+    const MAX_REPEATS: usize = 6;
+    if answer.len() < MIN_LEN {
+        return false;
+    }
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for line in answer.lines() {
+        let l = line.trim();
+        if l.len() >= MIN_LINE {
+            let c = counts.entry(l).or_insert(0);
+            *c += 1;
+            if *c >= MAX_REPEATS {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+
 /// SQL over and over instead of acting on the result). Tool name plus normalised
 /// arguments: JSON object keys are sorted and string values whitespace-collapsed and
 /// lower-cased, so trivially-reformatted repeats (re-indented SQL, case changes) still
@@ -1287,5 +1319,37 @@ mod tests {
         let run = run_agent(&model, &EchoTools, "sys", "go", 20).await.unwrap();
         assert_eq!(run.answer, "found it");
         assert_eq!(run.steps.len(), 2);
+    }
+
+    #[test]
+    fn runaway_repetition_detector_fires_only_on_a_long_repetitive_ramble() {
+        // The Investigation 7 failure: a long answer that repeats the same SQL line.
+        let line = "`SELECT job_type, SUM(failures) FROM jobs GROUP BY job_type`\n";
+        let runaway = format!("Let me think about the bottleneck.\n{}", line.repeat(80));
+        assert!(is_runaway_repetition(&runaway));
+        // A normal (even fairly long) answer with varied content must not trip.
+        let normal = "The credit-check task is the bottleneck: P99 queue 91m, 189 incidents. \
+                      Recommend a retry boundary plus +4 workers. I verified this against the \
+                      trace data and the simulate scorecard."
+            .repeat(20); // long but every line is distinct after repeat (single line)
+        assert!(!is_runaway_repetition(&normal));
+        // Short answers are never runaway, however repetitive.
+        assert!(!is_runaway_repetition(&line.repeat(3)));
+    }
+
+    #[tokio::test]
+    async fn runaway_final_turn_is_nudged_to_call_the_tool_instead_of_writing_sql() {
+        // Round 1: the model rambles, repeating SQL as prose with no tool call. The loop
+        // must nudge rather than accept the runaway; round 2 it recovers with a real answer.
+        let line = "Actually, I'll just do: `SELECT * FROM jobs`\n";
+        let model = SequencedModel {
+            script: vec![
+                Scripted::Defer(format!("Thinking...\n{}", line.repeat(100))),
+                Scripted::Done("Bottleneck is credit-check; recommend retry + workers.".into()),
+            ],
+            idx: Cell::new(0),
+        };
+        let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
+        assert_eq!(run.answer, "Bottleneck is credit-check; recommend retry + workers.");
     }
 }

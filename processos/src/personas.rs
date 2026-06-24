@@ -317,7 +317,9 @@ the numbers.\n\
 \n\
 Ground yourself first. Use read_model to understand the current structure and job types, and \
 query_traces (read-only DuckDB SQL) to see where the real cost is — what to improve and why. Never \
-invent numbers; every claim comes from a tool result.\n\
+invent numbers; every claim comes from a tool result. To run SQL you MUST emit a query_traces tool \
+call — writing SQL in your reply text (even in backticks) does nothing and runs nothing. Issue ONE \
+query per turn, read the result, then decide; never restate or repeat a query you have not run.\n\
 \n\
 Then speculate, but PROVE it. Author a full variant of the BPMN model (a structural change: \
 parallelise independent tasks, drop or reorder a step, swap a task's job type, add a boundary/retry) \
