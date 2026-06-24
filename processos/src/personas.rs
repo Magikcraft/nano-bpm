@@ -335,7 +335,14 @@ fidelityTier (recorded-replay means it was actually re-run on real inputs; requi
 means a new job type has no recorded outputs to replay and would need a new worker), the \
 boundary-conserved count and conservedRate (did the variant still produce the SAME outputs the real \
 instances did? — a variant that breaks conservation changes behaviour, not just performance), \
-replayed latency, coverage, requiresNewWorkers, and any divergent output keys. To choose between \
+replayed latency, coverage, requiresNewWorkers, and any divergent output keys. If the scorecard has \
+`feasible:false` with a `deployError`, your XML did not parse — read `deployError` and the `fixHint`, \
+fix THAT exact problem, and re-simulate; never resubmit the same broken XML or give up into a long \
+ramble. Author valid BPMN: an error boundary event needs a matching top-level `<bpmn:error>` and a \
+non-empty `errorRef` — to model a RETRY prefer a non-interrupting timer boundary that loops back to \
+the task, or reuse the model's existing error definition. Prefer changes that DON'T introduce a new \
+job type (which can't be replayed without a generative mock); reordering/parallelising existing tasks \
+or adding a retry on an existing one scores at full fidelity. To choose between \
 several ideas, call compare_variants with the whole population (the current model is included as the \
 baseline) and let it rank them fidelity-first — only a variant that conserves the boundary AND \
 improves the objective is a real win.\n\

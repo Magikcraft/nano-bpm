@@ -100,6 +100,42 @@ fn trim_report(report: &mut Value) {
     }
 }
 
+/// When a candidate fails to deploy, the BPMN parser's reason is buried in
+/// `scorecard.report.error` under a prominent `feasible:false` / "did not deploy". Lift it
+/// to a top-level `deployError` on the scorecard and, for the recurring authoring mistakes
+/// a model makes, attach an actionable `fixHint` — so the agent gets a crisp signal it can
+/// act on instead of re-submitting the same broken XML.
+fn surface_deploy_error(scorecard: &mut Value) {
+    let err = scorecard
+        .get("report")
+        .and_then(|r| r.get("error"))
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string());
+    let Some(err) = err else { return };
+    if let Some(obj) = scorecard.as_object_mut() {
+        if let Some(hint) = deploy_fix_hint(&err) {
+            obj.insert("fixHint".into(), Value::String(hint));
+        }
+        obj.insert("deployError".into(), Value::String(err));
+    }
+}
+
+/// Map a known BPMN deploy/parse error to a concrete fix, so the model stops repeating it.
+fn deploy_fix_hint(err: &str) -> Option<String> {
+    if err.contains("InvalidBoundaryEvent") && err.contains("unknown error") {
+        return Some(
+            "The error boundary event has an empty or unknown errorRef. A BPMN error \
+             boundary needs BOTH a top-level `<bpmn:error id=\"E_X\" errorCode=\"...\"/>` \
+             definition AND `<bpmn:errorEventDefinition errorRef=\"E_X\"/>` on the boundary \
+             event referencing that id. To model a RETRY, prefer a timer boundary event \
+             (interrupting=false) that loops back to the task, or reuse the model's existing \
+             error definition — do not leave errorRef empty."
+                .into(),
+        );
+    }
+    None
+}
+
 /// `simulate` — replay one candidate model against the recorded dataset.
 pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Value) -> Result<Value, String> {
     let model = args["model"]
@@ -120,6 +156,7 @@ pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Val
     let mut v = serde_json::to_value(&ranking).map_err(|e| format!("serialise ranking: {e}"))?;
     if let Some(c) = v["candidates"].as_array_mut().and_then(|a| a.first_mut()) {
         trim_report(&mut c["report"]);
+        surface_deploy_error(c);
         return Ok(json!({
             "replayable": true,
             "datasetSize": ranking.dataset_size,
@@ -170,6 +207,7 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
     if let Some(arr) = v["candidates"].as_array_mut() {
         for c in arr.iter_mut() {
             trim_report(&mut c["report"]);
+            surface_deploy_error(c);
         }
     }
     Ok(v)
@@ -294,5 +332,29 @@ mod tests {
         assert_eq!(baseline["report"]["conserved"], 3);
         let fork = cands.iter().find(|c| c["name"] == "drop-summarize").unwrap();
         assert_eq!(fork["report"]["conserved"], 0);
+    }
+
+    #[test]
+    fn surface_deploy_error_lifts_the_parse_error_with_a_fix_hint() {
+        // The Investigation 12 symptom: the deploy reason is buried in report.error.
+        let mut sc = json!({
+            "feasible": false,
+            "confidence": "n/a — candidate did not deploy",
+            "report": {
+                "valid": 0,
+                "error": "failed to parse: InvalidBoundaryEvent { process_id: \"loan-approval\", reason: \"boundary event BoundaryEvent_CreditError references unknown error ''\" }"
+            }
+        });
+        surface_deploy_error(&mut sc);
+        assert!(sc["deployError"].as_str().unwrap().contains("InvalidBoundaryEvent"));
+        assert!(sc["fixHint"].as_str().unwrap().contains("errorRef"));
+    }
+
+    #[test]
+    fn surface_deploy_error_is_a_noop_for_a_clean_scorecard() {
+        let mut sc = json!({ "feasible": true, "report": { "conserved": 3 } });
+        surface_deploy_error(&mut sc);
+        assert!(sc.get("deployError").is_none());
+        assert!(sc.get("fixHint").is_none());
     }
 }
