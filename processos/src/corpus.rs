@@ -194,6 +194,39 @@ struct TraceOut {
     duration_ms: u64,
     elements: Vec<ElementOut>,
     incidents: Vec<IncidentOut>,
+    /// Tier-1 capture: the instance creation inputs. Emitted so the corpus is
+    /// **recorded-input replayable** (drives the Alternate Reality Engine).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    creation_variables: Option<VariablesOut>,
+    /// Tier-2 capture: the ordered `jobCompleted` stimulus log (one per completed
+    /// job, in execution order) that replay feeds back into a candidate model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stimuli: Option<Vec<StimulusOut>>,
+    /// The synthetic corpus never truncates the stimulus log.
+    stimuli_truncated: bool,
+}
+
+/// A captured variable map (mirrors `contracts::Variables`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VariablesOut {
+    truncated: bool,
+    bytes: usize,
+    values: Json,
+}
+
+/// One recorded external input (mirrors `contracts::Stimulus`). The corpus only
+/// emits `jobCompleted` stimuli, keyed by job *type* (replay matches by type).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StimulusOut {
+    seq: u32,
+    at: u64,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variables: Option<VariablesOut>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +339,7 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
 
         let mut elements: Vec<ElementOut> = Vec::new();
         let mut incidents: Vec<IncidentOut> = Vec::new();
+        let mut stimuli: Vec<StimulusOut> = Vec::new();
         let mut cursor = arrival;
 
         for (step, jstep) in path.steps.iter().enumerate() {
@@ -342,6 +376,18 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
                 }),
             });
             cursor += queue_ms + service_ms;
+            // A completed job is one recorded-input stimulus (jobCompleted), keyed by
+            // type and timestamped at its completion. A failed job that exhausts
+            // retries terminates the instance and produces no completion input.
+            if !jstep.failed {
+                stimuli.push(StimulusOut {
+                    seq: (stimuli.len() + 1) as u32,
+                    at: cursor,
+                    kind: "jobCompleted".into(),
+                    reference: Some(jstep.job_type.clone()),
+                    variables: None,
+                });
+            }
         }
 
         let outcome = if path.completed { "completed" } else { "terminated" };
@@ -350,6 +396,9 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
         } else {
             terminated += 1;
         }
+
+        let creation_values = serde_json::to_value(&input.vars).unwrap_or(Json::Null);
+        let creation_bytes = serde_json::to_vec(&input.vars).map(|v| v.len()).unwrap_or(0);
 
         traces.push(TraceOut {
             instance_key: format!("{}", 100_000 + idx),
@@ -360,6 +409,13 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
             duration_ms: cursor - arrival,
             elements,
             incidents,
+            creation_variables: Some(VariablesOut {
+                truncated: false,
+                bytes: creation_bytes,
+                values: creation_values,
+            }),
+            stimuli: Some(stimuli),
+            stimuli_truncated: false,
         });
     }
 
