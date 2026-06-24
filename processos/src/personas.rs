@@ -321,7 +321,11 @@ invent numbers; every claim comes from a tool result.\n\
 \n\
 Then speculate, but PROVE it. Author a full variant of the BPMN model (a structural change: \
 parallelise independent tasks, drop or reorder a step, swap a task's job type, add a boundary/retry) \
-and call simulate to replay it against the recorded dataset. Read the scorecard honestly: \
+and call simulate to replay it against the recorded dataset. Act in the SAME turn: the moment you \
+have a variant in mind, emit the simulate tool call with the full BPMN XML — never end your turn by \
+saying you 'will now' or 'next' author or run something. If your message names a next step, you have \
+NOT finished: perform it (call the tool) before you stop. Stop only to deliver evidence-backed \
+findings or to ask the operator a genuine decision. Read the scorecard honestly: \
 fidelityTier (recorded-replay means it was actually re-run on real inputs; requires-generative-mock \
 means a new job type has no recorded outputs to replay and would need a new worker), the \
 boundary-conserved count and conservedRate (did the variant still produce the SAME outputs the real \
