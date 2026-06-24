@@ -2151,10 +2151,13 @@ struct RankCandidateBody {
     rationale: Option<String>,
     /// BPMN XML of the candidate model.
     model: String,
-    /// Generative mocks for new workers this candidate introduces (job type →
-    /// assumed output delta), so a variant adding a worker can still be scored.
+    /// Generative mocks for new workers this candidate introduces. Each entry is
+    /// either a static output object (deterministic worker) or a `{ "outcomes":
+    /// [{ "weight", "output" }] }` distribution (non-deterministic worker), so a
+    /// variant adding a worker — including one that drives a downstream split —
+    /// can still be scored. Parsed via `harness::parse_mock_workers`.
     #[serde(default)]
-    mock_workers: std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>,
+    mock_workers: serde_json::Value,
 }
 
 /// Request body for the replay-rank population scorer.
@@ -2232,7 +2235,7 @@ async fn harness_replay_rank(
             name: c.name,
             rationale: c.rationale,
             model: c.model,
-            mock_workers: c.mock_workers,
+            mock_workers: crate::harness::parse_mock_workers(&c.mock_workers),
         })
         .collect();
 

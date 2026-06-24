@@ -17,12 +17,14 @@
 //! replayable, and the tools say so plainly (with skip accounting) rather than
 //! fabricating a result.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
 use crate::dataset::TraceSource;
-use crate::harness::{rank_candidates_by_replay, CandidateModel, MockWorkers, RecordedInstance};
+use crate::harness::{
+    parse_mock_workers, rank_candidates_by_replay, CandidateModel, RecordedInstance,
+};
 
 /// How many recent instances to draw into the replay dataset (bounds the per-turn I/O
 /// and keeps replay fast); mirrors the replay-rank HTTP endpoint's default.
@@ -134,24 +136,6 @@ fn deploy_fix_hint(err: &str) -> Option<String> {
         );
     }
     None
-}
-
-/// Parse a `mockWorkers` argument into [`MockWorkers`]. Accepts an object mapping a
-/// new job type to the deterministic output delta its mock worker produces, e.g.
-/// `{ "fraud-check": { "fraudScore": 0.1, "isFraud": false } }`. A non-object (or
-/// absent) value yields no mocks. Non-object per-type values are skipped.
-fn parse_mock_workers(v: &Value) -> MockWorkers {
-    let mut mocks = MockWorkers::new();
-    if let Some(obj) = v.as_object() {
-        for (job_type, out) in obj {
-            if let Some(out_obj) = out.as_object() {
-                let delta: HashMap<String, Value> =
-                    out_obj.iter().map(|(k, val)| (k.clone(), val.clone())).collect();
-                mocks.insert(job_type.clone(), delta);
-            }
-        }
-    }
-    mocks
 }
 
 /// `simulate` — replay one candidate model against the recorded dataset.

@@ -506,7 +506,9 @@ mod tests {
         };
         with_mock.mock_workers.insert(
             "translate".to_string(),
-            [("translated".to_string(), json!(true))].into_iter().collect(),
+            crate::harness::MockWorker::deterministic(
+                [("translated".to_string(), json!(true))].into_iter().collect(),
+            ),
         );
         let without_mock = CandidateModel {
             name: "translate-no-mock".into(),

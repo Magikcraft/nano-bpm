@@ -345,7 +345,13 @@ non-empty `errorRef` — to model a RETRY prefer a non-interrupting timer bounda
 the task, or reuse the model's existing error definition. You CAN introduce a NEW worker (a job type \
 the recorded history never ran — e.g. a fraud-check or background-check): add the service task with \
 its `zeebe:taskDefinition type`, and pass a `mockWorkers` map giving that job type the output \
-variables its worker would produce (e.g. {\"fraud-check\": {\"isFraud\": false}}). The variant then \
+variables its worker would produce (e.g. {\"fraud-check\": {\"isFraud\": false}}). When a new \
+worker's output DRIVES A SPLIT and you want to see how the population flows down each branch, make it \
+NON-DETERMINISTIC with a weighted distribution instead of a single value, e.g. \
+{\"credit-check\": {\"outcomes\": [{\"weight\": 0.7, \"output\": {\"preApproved\": true}}, \
+{\"weight\": 0.3, \"output\": {\"preApproved\": false}}]}} — the harness spreads the outcomes across \
+the replayed instances reproducibly, so ~70% take the approve branch and ~30% the reject branch. The \
+variant then \
 scores at mocked-replay (Level 3) instead of being unscorable — just be explicit that the result \
 rests on your mock assumption. When a measured (Level-2) change is available, prefer it: reordering or \
 parallelising EXISTING tasks, or adding a retry on an existing one, scores at full fidelity with no \

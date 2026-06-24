@@ -37,16 +37,142 @@ use serde_json::Value as Json;
 use crate::contracts::{InstanceTrace, Variables};
 
 /// Operator/LLM-supplied **generative mock workers** for the Alternate Reality
-/// engine, keyed by job type. Each entry is the deterministic output delta the new
-/// worker is assumed to produce. When a candidate issues a job type history never
-/// recorded (a *new worker*), replay serves the mock's output instead of completing
-/// empty — so a structural change that adds a worker can actually be scored
-/// (Level-3, assumption-based) rather than hitting an unreplayable dead end.
-pub type MockWorkers = HashMap<String, HashMap<String, Json>>;
+/// engine, keyed by job type. A mock worker is a (possibly non-deterministic)
+/// [`MockWorker`]: a weighted distribution over output deltas. When a candidate
+/// issues a job type history never recorded (a *new worker*), replay serves an
+/// outcome drawn from the mock instead of completing empty — so a structural
+/// change that adds a worker can actually be scored (Level-3, assumption-based)
+/// rather than hitting an unreplayable dead end.
+///
+/// Non-determinism is what lets the harness exercise downstream **splits**: a
+/// worker declared as `preApproved: true @0.7 / false @0.3` makes ~70% of the
+/// replayed population take the approve branch of an exclusive gateway and ~30%
+/// the reject branch — reproducibly, because the outcome is chosen by a stable
+/// seed (instance key + job type + invocation index), not a live RNG.
+pub type MockWorkers = HashMap<String, MockWorker>;
 
-/// A recorded instance distilled from a [`InstanceTrace`] into exactly what replay
-/// needs: the creation inputs and the ordered stimulus log with its values
-/// resolved to natural JSON.
+/// One possible output of a mock worker, with a relative `weight` within its
+/// worker's distribution.
+#[derive(Clone, Debug)]
+pub struct MockOutcome {
+    pub weight: f64,
+    pub output: HashMap<String, Json>,
+}
+
+/// A mock worker for one new job type: a weighted distribution over output
+/// deltas. A deterministic worker is the single-outcome case; two or more
+/// outcomes model a non-deterministic worker (e.g. an approve/reject decision).
+#[derive(Clone, Debug, Default)]
+pub struct MockWorker {
+    pub outcomes: Vec<MockOutcome>,
+}
+
+impl MockWorker {
+    /// A deterministic mock that always emits `output`.
+    pub fn deterministic(output: HashMap<String, Json>) -> Self {
+        Self { outcomes: vec![MockOutcome { weight: 1.0, output }] }
+    }
+
+    /// True when this worker can emit more than one distinct output.
+    #[allow(dead_code)] // used in tests and a useful predicate for callers
+    pub fn is_random(&self) -> bool {
+        self.outcomes.len() > 1
+    }
+
+    /// Choose an outcome's output for a job invocation, given a stable `seed` in
+    /// `[0, u64::MAX]`. Weights are relative; a non-positive total collapses to
+    /// the first outcome. Returns `None` only when there are no outcomes.
+    fn pick(&self, seed: u64) -> Option<&HashMap<String, Json>> {
+        match self.outcomes.as_slice() {
+            [] => None,
+            [only] => Some(&only.output),
+            many => {
+                let total: f64 = many.iter().map(|o| o.weight.max(0.0)).sum();
+                if total <= 0.0 {
+                    return Some(&many[0].output);
+                }
+                let target = (seed as f64 / u64::MAX as f64) * total;
+                let mut acc = 0.0;
+                for o in many {
+                    acc += o.weight.max(0.0);
+                    if target < acc {
+                        return Some(&o.output);
+                    }
+                }
+                many.last().map(|o| &o.output)
+            }
+        }
+    }
+}
+
+/// Stable FNV-1a 64-bit hash of a string, used to seed mock-outcome selection so
+/// replays are reproducible across processes and rebuilds (unlike `DefaultHasher`).
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Parse a `mockWorkers` JSON argument into [`MockWorkers`]. The value maps each
+/// new job type to a worker spec that is **either**:
+///
+/// * a static output object — `{ "fraud-check": { "fraudScore": 0.1 } }` — a
+///   deterministic worker, or
+/// * a distribution — `{ "credit-check": { "outcomes": [
+///     { "weight": 0.7, "output": { "preApproved": true } },
+///     { "weight": 0.3, "output": { "preApproved": false } } ] } }` — a
+///   non-deterministic worker whose outcomes are spread across the replayed
+///   population (so a downstream split is exercised both ways).
+///
+/// The distribution form is recognised by an `outcomes` array; any other object is
+/// taken verbatim as a single deterministic output. A non-object (or absent) value,
+/// and per-type values that are not objects, yield no mock for that type.
+pub fn parse_mock_workers(v: &Json) -> MockWorkers {
+    let mut mocks = MockWorkers::new();
+    if let Some(obj) = v.as_object() {
+        for (job_type, spec) in obj {
+            if let Some(worker) = parse_mock_worker(spec) {
+                mocks.insert(job_type.clone(), worker);
+            }
+        }
+    }
+    mocks
+}
+
+fn parse_mock_worker(spec: &Json) -> Option<MockWorker> {
+    let obj = spec.as_object()?;
+    match obj.get("outcomes") {
+        Some(Json::Array(items)) => {
+            let mut outcomes = Vec::new();
+            for it in items {
+                let io = match it.as_object() {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let output: HashMap<String, Json> = io
+                    .get("output")
+                    .and_then(|o| o.as_object())
+                    .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                let weight = io.get("weight").and_then(|w| w.as_f64()).unwrap_or(1.0);
+                outcomes.push(MockOutcome { weight, output });
+            }
+            if outcomes.is_empty() {
+                None
+            } else {
+                Some(MockWorker { outcomes })
+            }
+        }
+        _ => {
+            let output: HashMap<String, Json> =
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            Some(MockWorker::deterministic(output))
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct RecordedInstance {
     pub instance_key: String,
@@ -363,10 +489,13 @@ pub fn replay_instance_with_mocks(
                 }
                 None => {
                     // No recorded output of this type remains. If the operator/LLM
-                    // supplied a generative mock for this new worker, serve its
-                    // assumed output (Level-3 fidelity); otherwise complete empty and
-                    // flag the type as requiring a new worker (the historic dead end).
-                    match mocks.get(&job_type) {
+                    // supplied a generative mock for this new worker, serve an
+                    // outcome drawn from its distribution (Level-3 fidelity);
+                    // otherwise complete empty and flag the type as requiring a new
+                    // worker (the historic dead end).
+                    let inv = issued.get(&job_type).copied().unwrap_or(1);
+                    let seed = fnv1a64(&format!("{}|{}|{}", rec.instance_key, job_type, inv));
+                    match mocks.get(&job_type).and_then(|m| m.pick(seed)) {
                         Some(mock_out) => {
                             if !mocked.contains(&job_type) {
                                 mocked.push(job_type.clone());
@@ -841,7 +970,7 @@ mod tests {
         let mut mocks = MockWorkers::new();
         mocks.insert(
             "summarize".to_string(),
-            [("summary".to_string(), json!("S"))].into_iter().collect(),
+            MockWorker::deterministic([("summary".to_string(), json!("S"))].into_iter().collect()),
         );
 
         let res = replay_instance_with_mocks(&defs, "P", &r, &mocks);
@@ -849,6 +978,51 @@ mod tests {
         assert!(res.uncovered_job_types.is_empty(), "mocked type must not be uncovered");
         assert_eq!(res.mocked_job_types, vec!["summarize".to_string()]);
         assert!(res.conserved, "divergences: {:?}", res.divergences);
+    }
+
+    #[test]
+    fn a_nondeterministic_mock_spreads_outcomes_across_the_population() {
+        // A single 70/30 worker, when replayed over many instances, must split the
+        // population across its two outcomes (deterministically per instance key).
+        let worker = MockWorker {
+            outcomes: vec![
+                MockOutcome { weight: 0.7, output: map(&[("preApproved", json!(true))]) },
+                MockOutcome { weight: 0.3, output: map(&[("preApproved", json!(false))]) },
+            ],
+        };
+        assert!(worker.is_random());
+
+        let mut trues = 0u32;
+        let total = 400u32;
+        for i in 0..total {
+            let key = format!("inst-{i}");
+            let seed = fnv1a64(&format!("{key}|credit-check|1"));
+            let out = worker.pick(seed).unwrap();
+            // Selection is stable for a given key.
+            assert_eq!(out, worker.pick(seed).unwrap());
+            if out.get("preApproved") == Some(&json!(true)) {
+                trues += 1;
+            }
+        }
+        // Expect roughly 70% true; allow a generous band so the test isn't flaky.
+        let frac = trues as f64 / total as f64;
+        assert!((0.6..0.8).contains(&frac), "split was {frac} ({trues}/{total})");
+    }
+
+    #[test]
+    fn parse_mock_workers_accepts_static_and_distribution_forms() {
+        let v = json!({
+            "fraud-check": { "isFraud": false },
+            "credit-check": { "outcomes": [
+                { "weight": 0.7, "output": { "preApproved": true } },
+                { "weight": 0.3, "output": { "preApproved": false } }
+            ] }
+        });
+        let mocks = parse_mock_workers(&v);
+        assert!(!mocks["fraud-check"].is_random(), "static form is deterministic");
+        assert_eq!(mocks["fraud-check"].outcomes.len(), 1);
+        assert!(mocks["credit-check"].is_random(), "outcomes form is non-deterministic");
+        assert_eq!(mocks["credit-check"].outcomes.len(), 2);
     }
 
     #[test]

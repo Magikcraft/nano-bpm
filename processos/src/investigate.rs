@@ -217,11 +217,17 @@ impl ToolBox for AnalysisTools {
                         "rationale": { "type": "string", "description": "Why this variant was proposed." },
                         "mockWorkers": {
                             "type": "object",
-                            "description": "Generative mocks for NEW workers the variant introduces: \
-                                map each new job type to the deterministic output variables its \
-                                worker would produce, e.g. {\"fraud-check\": {\"fraudScore\": 0.1, \
-                                \"isFraud\": false}}. Supply one per new job type so the variant is \
-                                scorable; existing (recorded) job types do not need a mock.",
+                            "description": "Generative mocks for NEW workers the variant introduces. \
+                                Map each new job type to EITHER a static output object (a \
+                                deterministic worker), e.g. {\"fraud-check\": {\"fraudScore\": 0.1, \
+                                \"isFraud\": false}}, OR a NON-DETERMINISTIC worker as a weighted \
+                                distribution: {\"credit-check\": {\"outcomes\": [{\"weight\": 0.7, \
+                                \"output\": {\"preApproved\": true}}, {\"weight\": 0.3, \"output\": \
+                                {\"preApproved\": false}}]}}. Use the distribution form when the \
+                                worker's output drives a downstream split/gateway and you want to \
+                                see how the population flows down each branch (outcomes are spread \
+                                across instances reproducibly, ~70/30 here). Supply one entry per \
+                                new job type; existing (recorded) job types do not need a mock.",
                             "additionalProperties": { "type": "object" }
                         }
                     },
@@ -257,7 +263,10 @@ impl ToolBox for AnalysisTools {
                                     "mockWorkers": {
                                         "type": "object",
                                         "description": "Generative mocks for NEW workers THIS variant \
-                                            adds (job type → assumed output variables).",
+                                            adds. Each job type maps to a static output object \
+                                            (deterministic) or a {\"outcomes\":[{\"weight\",\"output\"}]} \
+                                            distribution for a non-deterministic worker that drives a \
+                                            downstream split.",
                                         "additionalProperties": { "type": "object" }
                                     }
                                 },
@@ -270,9 +279,11 @@ impl ToolBox for AnalysisTools {
                         },
                         "mockWorkers": {
                             "type": "object",
-                            "description": "Generative mocks for new workers shared by ALL candidates \
-                                (job type → assumed output variables), e.g. {\"fraud-check\": \
-                                {\"isFraud\": false}}.",
+                            "description": "Generative mocks for new workers shared by ALL candidates. \
+                                Each job type maps to a static output object (deterministic), e.g. \
+                                {\"fraud-check\": {\"isFraud\": false}}, or a {\"outcomes\": [{\"weight\", \
+                                \"output\"}]} distribution for a non-deterministic worker (e.g. a \
+                                preApproved true/false split spread across the population).",
                             "additionalProperties": { "type": "object" }
                         }
                     },
