@@ -89,6 +89,7 @@ impl Analysis {
                 .map_err(|e| format!("appender jobs: {e}"))?;
             for t in traces {
                 let started = t.started_at;
+                let mut seq = 0i32;
                 for el in &t.elements {
                     let Some(job) = &el.job else { continue };
                     job_count += 1;
@@ -105,8 +106,10 @@ impl Analysis {
                         dow_of(started) as i32,
                         is_weekend(started),
                         t.outcome,
+                        seq,
                     ])
                     .map_err(|e| format!("append job: {e}"))?;
+                    seq += 1;
                 }
             }
             jobs.flush().map_err(|e| format!("flush jobs: {e}"))?;
@@ -272,7 +275,8 @@ CREATE TABLE jobs (\
   hour             INTEGER,\
   dow              INTEGER,\
   is_weekend       BOOLEAN,\
-  instance_outcome VARCHAR\
+  instance_outcome VARCHAR,\
+  seq              INTEGER\
 );\
 CREATE TABLE incidents (\
   instance_key VARCHAR,\
@@ -294,7 +298,7 @@ instances(instance_key, process_id, version, outcome, started_at /*epoch ms*/,\n
           incident_count, started_ts /*TIMESTAMP*/)\n\
 jobs(instance_key, process_id, element_id, job_type, queue_ms /*wait before service*/,\n\
      service_ms /*busy time*/, failures, started_at, hour, dow, is_weekend,\n\
-     instance_outcome, started_ts)\n\
+     instance_outcome, started_ts, seq /*0-based execution order within the instance*/)\n\
 incidents(instance_key, element_id, kind, reason, started_at, hour, dow,\n\
           is_weekend, started_ts)\n\
 \n\

@@ -74,6 +74,16 @@ fn is_gateway(kind: &ElementKind) -> bool {
     )
 }
 
+/// A node that produces a `jobs` row at runtime (one row per executed service/user task).
+/// These are the only model nodes observable in the trace tables, so conformance checking
+/// works at the granularity of task-to-task transitions.
+fn is_task(kind: &ElementKind) -> bool {
+    matches!(
+        kind,
+        ElementKind::ServiceTask { .. } | ElementKind::UserTask(_)
+    )
+}
+
 /// Kind-specific extra attributes for the structural view (job type, attachment, etc.).
 fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
@@ -293,6 +303,90 @@ fn loop_components(def: &ProcessDefinition, adj: &HashMap<String, Vec<String>>) 
         }
     }
     loops
+}
+
+/// The model projected onto its *observable* nodes (service/user tasks). This is the
+/// reference against which mined trace behaviour is checked for conformance: the trace only
+/// records task executions, so the model's allowed behaviour is expressed as task-to-task
+/// transitions, collapsing the gateways and events that sit between tasks.
+pub(crate) struct ModelTaskGraph {
+    pub process_id: String,
+    /// Every service/user task id in the model.
+    pub tasks: HashSet<String>,
+    /// For each task, the set of tasks reachable next via paths of only non-task nodes
+    /// (gateways, events, subprocess/boundary edges) — i.e. the transitions the model permits.
+    pub allowed: HashMap<String, HashSet<String>>,
+    /// Tasks the model can reach first from the start event (legal opening tasks).
+    pub start_tasks: HashSet<String>,
+    /// Tasks from which an end event is reachable without an intervening task (legal closing tasks).
+    pub end_tasks: HashSet<String>,
+}
+
+/// Build the [`ModelTaskGraph`] by collapsing the structural graph onto its task nodes.
+pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
+    let (def, _) = first_def(xml)?;
+    let adj = adjacency(&def);
+    let is_task_id = |id: &str| def.element(id).map(|e| is_task(&e.kind)).unwrap_or(false);
+    let is_end_id = |id: &str| {
+        matches!(
+            def.element(id).map(|e| &e.kind),
+            Some(ElementKind::EndEvent)
+        )
+    };
+    let tasks: HashSet<String> = def
+        .elements
+        .iter()
+        .filter(|(_, e)| is_task(&e.kind))
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    // From a starting frontier, walk forward through only non-task nodes, recording the
+    // first task reached on each path (and whether any path reaches an end event).
+    let next_tasks = |frontier: Vec<String>| -> (HashSet<String>, bool) {
+        let mut found = HashSet::new();
+        let mut reached_end = false;
+        let mut visited = HashSet::new();
+        let mut stack = frontier;
+        while let Some(n) = stack.pop() {
+            if !visited.insert(n.clone()) {
+                continue;
+            }
+            if is_end_id(&n) {
+                reached_end = true;
+                continue;
+            }
+            if is_task_id(&n) {
+                found.insert(n.clone()); // stop: don't expand past a task
+                continue;
+            }
+            if let Some(nexts) = adj.get(&n) {
+                for s in nexts {
+                    stack.push(s.clone());
+                }
+            }
+        }
+        (found, reached_end)
+    };
+
+    let mut allowed = HashMap::new();
+    let mut end_tasks = HashSet::new();
+    for t in &tasks {
+        let frontier = adj.get(t).cloned().unwrap_or_default();
+        let (succ, reached_end) = next_tasks(frontier);
+        if reached_end {
+            end_tasks.insert(t.clone());
+        }
+        allowed.insert(t.clone(), succ);
+    }
+    let (start_tasks, _) = next_tasks(vec![def.start_event.clone()]);
+
+    Ok(ModelTaskGraph {
+        process_id: def.id.clone(),
+        tasks,
+        allowed,
+        start_tasks,
+        end_tasks,
+    })
 }
 
 /// `read_model` — a compact, deterministic structural view of the process: the start
@@ -698,5 +792,24 @@ mod tests {
     fn rejects_unparseable_xml() {
         assert!(read_model("not bpmn").is_err());
         assert!(analyze_model("<bpmn/>").is_err());
+    }
+
+    #[test]
+    fn model_task_graph_collapses_gateways_onto_task_transitions() {
+        let g = model_task_graph(LOAN_BPMN).expect("graph");
+        assert_eq!(g.process_id, "loan-approval");
+        // Only the three service tasks are observable (start/end/gateway collapse away).
+        assert_eq!(g.tasks.len(), 3);
+        assert!(g.tasks.contains("CreditCheck"));
+        // CreditCheck -> Decision(XOR) -> {Approve, Reject}: both are permitted next tasks.
+        let from_cc = &g.allowed["CreditCheck"];
+        assert!(from_cc.contains("Approve"));
+        assert!(from_cc.contains("Reject"));
+        // Approve / Reject lead only to end events — no further task.
+        assert!(g.allowed["Approve"].is_empty());
+        // The model opens on CreditCheck and closes on Approve or Reject.
+        assert!(g.start_tasks.contains("CreditCheck"));
+        assert!(g.end_tasks.contains("Approve") && g.end_tasks.contains("Reject"));
+        assert!(!g.end_tasks.contains("CreditCheck"));
     }
 }

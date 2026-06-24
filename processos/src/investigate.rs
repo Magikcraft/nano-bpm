@@ -116,6 +116,18 @@ impl ToolBox for AnalysisTools {
                 "required": ["sql"]
             }),
         }];
+        specs.push(ToolSpec {
+            name: "discover_flow".into(),
+            description: "Mine the directly-follows graph the TRACE implies — independent of \
+                any model. Returns the observed task nodes (with execution/instance counts), the \
+                task-to-task transitions A->B (B's job ran immediately after A's within an \
+                instance, ordered by capture seq) with counts and share, and the observed first/ \
+                last tasks. Node ids are jobs.element_id, so this joins to the model's node ids. \
+                Caveat: parallel branches are linearised in capture, so cross-branch edges are \
+                artefacts. Takes no arguments."
+                .into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        });
         if self.python.is_some() {
             specs.push(ToolSpec {
                 name: "run_python".into(),
@@ -158,6 +170,19 @@ impl ToolBox for AnalysisTools {
                     .into(),
                 parameters: json!({ "type": "object", "properties": {} }),
             });
+            specs.push(ToolSpec {
+                name: "conformance_check".into(),
+                description: "Replay the mined trace behaviour against the BPMN MODEL and report \
+                    where reality diverges from design: a transition-fitness score, nonconformant \
+                    task-to-task transitions (the model permits no path between them), tasks \
+                    executed but absent from the model (undocumented), designed transitions the \
+                    trace never took (unused model paths), and start/end deviations. Tasks are \
+                    service/user tasks (the only nodes traced); gateways/events are collapsed. \
+                    Use this to confirm whether the structure people designed is the process they \
+                    actually run. Takes no arguments."
+                    .into(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            });
         }
         specs
     }
@@ -170,6 +195,10 @@ impl ToolBox for AnalysisTools {
                     .ok_or("query_traces requires a string 'sql' argument")?;
                 let result = self.analysis.query(sql)?;
                 serde_json::to_string(&result).map_err(|e| format!("serialise result: {e}"))
+            }
+            "discover_flow" => {
+                let v = crate::conformance::discover_flow(&self.analysis)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise flow: {e}"))
             }
             "run_python" => {
                 let py = self
@@ -196,6 +225,14 @@ impl ToolBox for AnalysisTools {
                     .ok_or("analyze_model is not available: this process has no BPMN model")?;
                 let v = crate::bpmn_model::analyze_model(xml)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise findings: {e}"))
+            }
+            "conformance_check" => {
+                let xml = self
+                    .model
+                    .as_ref()
+                    .ok_or("conformance_check is not available: this process has no BPMN model")?;
+                let v = crate::conformance::conformance_check(&self.analysis, xml)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise conformance: {e}"))
             }
             other => Err(format!("unknown tool '{other}'")),
         }

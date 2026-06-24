@@ -14,6 +14,7 @@ mod analysis;
 mod bpmn_model;
 mod chat;
 mod chat_prompts;
+mod conformance;
 mod contracts;
 mod cockpit;
 mod conversation;

@@ -224,6 +224,18 @@ instead of picking from a fixed menu.
   and a service task's `job_type` are the same join keys as the trace tables (`jobs.element_id`,
   `jobs.job_type`, `incidents.element_id`), so structural risk can be confirmed against runtime via
   `query_traces`. The **Process Architect** persona is prompted to drive these tools.
+- `conformance.rs` — **process-mining tools** that intersect the *designed* model with the
+  *actual* trace. `discover_flow` mines the directly-follows graph straight from the `jobs`
+  table (task nodes + the A→B transitions between consecutive task executions, ordered by a new
+  per-instance `seq` column), with no reference to the BPMN. `conformance_check` replays that
+  mined behaviour against the model's permitted task-to-task transitions
+  (`bpmn_model::model_task_graph`, which collapses gateways/events so a transition is "permitted"
+  when the target task is reachable through only non-task nodes) and reports a transition-fitness
+  score plus the concrete divergences: nonconformant transitions, undocumented tasks (executed but
+  not modelled), unused model transitions (designed but never taken), and start/end deviations.
+  Caveat: parallel branches are linearised in capture, so cross-branch directly-follows edges are
+  artefacts. The **Conformance Miner** persona drives both, then characterises the divergences
+  with `query_traces`.
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:
@@ -262,7 +274,8 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
 - **Personas** — each chat session runs under a selectable **persona**: a standing *system*
   prompt that sets the droid's lens and discipline. Built-ins ship with **Performance Analyst**
   (the default — the canonical `investigate::CHAT_SYSTEM`), **SRE / Incident Responder**,
-  **Capacity Planner**, and **Process Architect**; operators author their own in the Prompts view. The persona is chosen in
+  **Capacity Planner**, **Process Architect**, and **Conformance Miner**; operators author their
+  own in the Prompts view. The persona is chosen in
   the cockpit's compose row, sent as `personaId`, and **baked into the session's system message
   on its first turn** — so a session's persona is fixed once the conversation starts (the picker
   locks and the bound id is surfaced on the session/`SessionMeta`). Personas persist to
