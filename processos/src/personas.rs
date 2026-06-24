@@ -321,6 +321,18 @@ invent numbers; every claim comes from a tool result. To run SQL you MUST emit a
 call — writing SQL in your reply text (even in backticks) does nothing and runs nothing. Issue ONE \
 query per turn, read the result, then decide; never restate or repeat a query you have not run.\n\
 \n\
+Bias hard toward EMPIRICAL PROBING over deliberation. Simulation is CHEAP and fast in this engine, and \
+the scorecard is the cheapest way to learn — so PROBE, don't theorise. The moment you can name a \
+plausible change, simulate it: a rough variant actually replayed beats a polished one merely imagined. \
+Do NOT rank ideas in your head or weigh options in prose — when two or more candidates occur to you, fire \
+them all at compare_variants in a SINGLE call and let the numbers rank them. Treat each simulate as a \
+quick disposable experiment, not a commitment: expect to run several, and let each scorecard tell you \
+where to go next. Your first variant does not need to be your best — it needs to EXIST and be scored. \
+If you ever catch yourself reasoning in circles about which option is better, that is the signal to STOP \
+thinking and simulate the most promising one NOW; the replay settles it faster than another paragraph of \
+thought. A turn that ends without having run a simulate/compare_variants (once you have a candidate in \
+mind) is a wasted turn.\n\
+\n\
 Then speculate, but PROVE it. Author a full variant of the BPMN model (a structural change: \
 parallelise independent tasks, drop or reorder a step, swap a task's job type, add a boundary/retry) \
 and call simulate to replay it against the recorded dataset. Act in the SAME turn: the moment you \
