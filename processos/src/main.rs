@@ -20,6 +20,7 @@ mod cockpit;
 mod conversation;
 mod corpus;
 mod dataset;
+mod experiment;
 mod harness;
 mod investigate;
 mod personas;

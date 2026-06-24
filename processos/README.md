@@ -236,6 +236,18 @@ instead of picking from a fixed menu.
   Caveat: parallel branches are linearised in capture, so cross-branch directly-follows edges are
   artefacts. The **Conformance Miner** persona drives both, then characterises the divergences
   with `query_traces`.
+- `experiment.rs` — **the Nano Alternate Reality Engine**: speculative execution of variant
+  hypotheses. `simulate` forks the current model into a candidate (what-if) BPMN and replays the
+  REAL recorded production instances through it on an in-process engine, returning a fidelity
+  scorecard (fidelity tier, boundary-conserved count and conserved-rate, replayed latency,
+  per-job-type coverage, the job types it would need new workers for, and any output keys it
+  failed to reproduce). `compare_variants` scores a whole *multiverse* of candidates against the
+  same recorded dataset — the current model included as the `baseline` — and ranks them
+  fidelity-first. Both are built on the deterministic replay harness and need **Tier-2
+  recorded-input capture** (`c8 nano --capture` / `NANOBPMN_TRACE_STIMULI`); without it they
+  return `replayable:false` with skip accounting rather than fabricating a result. The recorded
+  dataset is distilled once per chat turn (bounded to the most recent instances) whenever the
+  process has a `model.bpmn`. The **Experiment Designer** persona drives these tools.
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:
@@ -274,8 +286,8 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
 - **Personas** — each chat session runs under a selectable **persona**: a standing *system*
   prompt that sets the droid's lens and discipline. Built-ins ship with **Performance Analyst**
   (the default — the canonical `investigate::CHAT_SYSTEM`), **SRE / Incident Responder**,
-  **Capacity Planner**, **Process Architect**, and **Conformance Miner**; operators author their
-  own in the Prompts view. The persona is chosen in
+  **Capacity Planner**, **Process Architect**, **Conformance Miner**, and **Experiment Designer**;
+  operators author their own in the Prompts view. The persona is chosen in
   the cockpit's compose row, sent as `personaId`, and **baked into the session's system message
   on its first turn** — so a session's persona is fixed once the conversation starts (the picker
   locks and the bound id is surfaced on the session/`SessionMeta`). Personas persist to

@@ -36,6 +36,9 @@ pub struct AnalysisTools {
     /// Raw `model.bpmn` XML for the bound process, when one is present. Enables the
     /// structural `read_model` / `analyze_model` tools (parsed lazily on call).
     model: Option<String>,
+    /// Recorded-input instances for replay, distilled once per turn. Enables the
+    /// `simulate` / `compare_variants` Alternate Reality Engine tools.
+    recorded: Option<crate::experiment::RecordedDataset>,
 }
 
 impl Drop for AnalysisTools {
@@ -53,6 +56,7 @@ impl AnalysisTools {
             analysis,
             python: None,
             model: None,
+            recorded: None,
         }
     }
 
@@ -79,6 +83,7 @@ impl AnalysisTools {
             analysis,
             python,
             model: None,
+            recorded: None,
         }
     }
 
@@ -86,6 +91,12 @@ impl AnalysisTools {
     /// available. A `None` (or absent `model.bpmn`) leaves them off.
     pub fn set_model(&mut self, xml: Option<String>) {
         self.model = xml.filter(|x| !x.trim().is_empty());
+    }
+
+    /// Attach the recorded-input replay dataset so the Alternate Reality Engine tools
+    /// (`simulate` / `compare_variants`) become available.
+    pub fn set_recorded(&mut self, ds: Option<crate::experiment::RecordedDataset>) {
+        self.recorded = ds;
     }
 }
 
@@ -183,6 +194,63 @@ impl ToolBox for AnalysisTools {
                     .into(),
                 parameters: json!({ "type": "object", "properties": {} }),
             });
+            specs.push(ToolSpec {
+                name: "simulate".into(),
+                description: "ALTERNATE REALITY ENGINE — replay a candidate (what-if) BPMN model \
+                    against the REAL recorded production instances on an in-process engine, and \
+                    return its fidelity scorecard: fidelityTier, boundary-conserved count and \
+                    conservedRate, replayed avg/p99 end-to-end latency, per-job-type coverage, the \
+                    job types it would need NEW WORKERS for (requiresNewWorkers), and which recorded \
+                    output keys it failed to reproduce. Author a full variant of the current model \
+                    (use read_model first) and pass its XML. Needs recorded-input capture; if none \
+                    is available it returns replayable=false with the reason. Args: model (BPMN \
+                    XML, required), name, rationale."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "model": { "type": "string", "description": "Candidate BPMN XML to replay." },
+                        "name": { "type": "string", "description": "Short label for the variant." },
+                        "rationale": { "type": "string", "description": "Why this variant was proposed." }
+                    },
+                    "required": ["model"]
+                }),
+            });
+            specs.push(ToolSpec {
+                name: "compare_variants".into(),
+                description: "ALTERNATE REALITY ENGINE — score a MULTIVERSE of candidate models \
+                    against the same recorded production dataset and rank them fidelity-first \
+                    (conservedRate, then latency, then fewer required new workers). The current \
+                    model is included as the 'baseline' by default (set includeBaseline=false to \
+                    omit). Use this to decide whether a redesign actually beats today's process on \
+                    real history. Returns datasetSize, the ranked candidates with their scorecards, \
+                    and the best one. Needs recorded-input capture. Args: candidates (array of \
+                    {name, model (BPMN XML), rationale?}), includeBaseline (bool)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "candidates": {
+                            "type": "array",
+                            "description": "Variant models to score.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "model": { "type": "string", "description": "Candidate BPMN XML." },
+                                    "rationale": { "type": "string" }
+                                },
+                                "required": ["model"]
+                            }
+                        },
+                        "includeBaseline": {
+                            "type": "boolean",
+                            "description": "Include the current model as 'baseline' (default true)."
+                        }
+                    },
+                    "required": ["candidates"]
+                }),
+            });
         }
         specs
     }
@@ -233,6 +301,22 @@ impl ToolBox for AnalysisTools {
                     .ok_or("conformance_check is not available: this process has no BPMN model")?;
                 let v = crate::conformance::conformance_check(&self.analysis, xml)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise conformance: {e}"))
+            }
+            "simulate" => {
+                let ds = self
+                    .recorded
+                    .as_ref()
+                    .ok_or("simulate is not available: no recorded dataset for this process")?;
+                let v = crate::experiment::simulate(self.model.as_deref(), ds, args)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise simulation: {e}"))
+            }
+            "compare_variants" => {
+                let ds = self
+                    .recorded
+                    .as_ref()
+                    .ok_or("compare_variants is not available: no recorded dataset for this process")?;
+                let v = crate::experiment::compare_variants(self.model.as_deref(), ds, args)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise comparison: {e}"))
             }
             other => Err(format!("unknown tool '{other}'")),
         }
@@ -366,7 +450,15 @@ pub async fn run_chat_turn(
     } else {
         AnalysisTools::new(analysis)
     };
+    // A model unlocks structural reasoning AND the Alternate Reality Engine: when one is
+    // present, distil a (bounded) recorded-input dataset so simulate/compare_variants can
+    // replay real instances against forked variants.
+    let has_model = model_xml.as_ref().map(|x| !x.trim().is_empty()).unwrap_or(false);
     tools.set_model(model_xml);
+    if has_model {
+        let recorded = crate::experiment::build_recorded_dataset(src, crate::experiment::RECORDED_CAP).await;
+        tools.set_recorded(Some(recorded));
+    }
     let model = OpenAiAgent { cfg };
 
     // Seed the system message (with one-time dataset framing) only at the start of a
