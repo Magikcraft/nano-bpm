@@ -54,6 +54,11 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// OpenAI-style frequency penalty, forwarded to the model. Small quantised local
+    /// models readily fall into a repetition attractor (emitting the same line forever
+    /// until they hit the token budget); a modest penalty (>0) discourages that at the
+    /// sampler. Default 0.3; set `PROCESSOS_LLM_FREQUENCY_PENALTY` to tune (0 disables).
+    pub frequency_penalty: f32,
 }
 
 /// Per-request overrides (any subset) accepted on the hypothesize endpoint.
@@ -100,6 +105,10 @@ impl LlmConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.2);
+        let frequency_penalty = std::env::var("PROCESSOS_LLM_FREQUENCY_PENALTY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.3);
         Self {
             provider,
             base_url,
@@ -107,6 +116,7 @@ impl LlmConfig {
             api_key,
             max_tokens,
             temperature,
+            frequency_penalty,
         }
     }
 
@@ -182,6 +192,7 @@ async fn complete_openai(
         "model": cfg.model,
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
+        "frequency_penalty": cfg.frequency_penalty,
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user },
@@ -405,6 +416,7 @@ mod tests {
             api_key: None,
             max_tokens: 1024,
             temperature: 0.2,
+            frequency_penalty: 0.0,
         };
         let o = LlmOverride {
             provider: Some("anthropic".into()),
@@ -426,6 +438,7 @@ mod tests {
             api_key: None,
             max_tokens: 1024,
             temperature: 0.2,
+            frequency_penalty: 0.0,
         };
         let o = LlmOverride {
             base_url: Some("http://gpu-box.lan:8000/v1".into()),

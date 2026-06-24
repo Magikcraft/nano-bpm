@@ -429,6 +429,7 @@ impl OpenAiAgent {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
             "max_tokens": self.cfg.max_tokens,
+            "frequency_penalty": self.cfg.frequency_penalty,
             "tools": tool_defs,
             "stream": stream,
             "messages": msgs.iter().map(openai_message).collect::<Vec<_>>(),
@@ -518,6 +519,14 @@ impl AgentStep for OpenAiAgent {
         let mut reasoning = String::new();
         let mut tool_accum: Vec<ToolCallAccum> = Vec::new();
         let mut buf = String::new();
+        // Mid-stream circuit-breaker: a small local model can fall into a repetition
+        // attractor and emit the same line forever until it exhausts the (now larger)
+        // token budget — the operator watches a wall of identical text. Once a channel's
+        // tail shows that runaway, stop reading the stream (which cancels generation) so
+        // the harness can nudge the model on the next round instead of waiting it out.
+        // The first check only fires past RUNAWAY_TAIL_MIN so the accumulated text is also
+        // long enough for the harness-level `is_runaway_repetition` to catch and nudge it.
+        let mut next_check = RUNAWAY_TAIL_MIN;
         let mut stream = resp.bytes_stream();
         'outer: while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(|e| format!("LLM stream error: {e}"))?;
@@ -570,6 +579,17 @@ impl AgentStep for OpenAiAgent {
                         if let Some(a) = tc["function"]["arguments"].as_str() {
                             acc.args.push_str(a);
                         }
+                    }
+                }
+            }
+            // Only watch free-form generation (a tool call streaming its arguments is not a
+            // runaway). Check the tail periodically to keep this cheap.
+            if tool_accum.is_empty() {
+                let total = content.len() + reasoning.len();
+                if total >= next_check {
+                    next_check = total + RUNAWAY_TAIL_STEP;
+                    if runaway_tail(&content) || runaway_tail(&reasoning) {
+                        break 'outer;
                     }
                 }
             }
@@ -880,23 +900,44 @@ fn strip_think_blocks(s: &str) -> String {
 /// does not repeat a 12+-char line six times — is never misclassified.
 fn is_runaway_repetition(answer: &str) -> bool {
     const MIN_LEN: usize = 3000;
-    const MIN_LINE: usize = 12;
-    const MAX_REPEATS: usize = 6;
-    if answer.len() < MIN_LEN {
-        return false;
-    }
+    answer.len() >= MIN_LEN && has_repeated_line(answer, RUNAWAY_MIN_LINE, RUNAWAY_MAX_REPEATS)
+}
+
+/// First accumulated length at which `step_streaming` starts watching for a runaway, and
+/// the gap between subsequent checks. The minimum is kept above `is_runaway_repetition`'s
+/// own length floor so that when we break early the partial text still trips the
+/// harness-level nudge.
+const RUNAWAY_TAIL_MIN: usize = 3500;
+const RUNAWAY_TAIL_STEP: usize = 1000;
+const RUNAWAY_MIN_LINE: usize = 12;
+const RUNAWAY_MAX_REPEATS: usize = 6;
+
+/// True if any single trimmed line of at least `min_line` chars occurs `max_repeats`+ times.
+fn has_repeated_line(s: &str, min_line: usize, max_repeats: usize) -> bool {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for line in answer.lines() {
+    for line in s.lines() {
         let l = line.trim();
-        if l.len() >= MIN_LINE {
+        if l.len() >= min_line {
             let c = counts.entry(l).or_insert(0);
             *c += 1;
-            if *c >= MAX_REPEATS {
+            if *c >= max_repeats {
                 return true;
             }
         }
     }
     false
+}
+
+/// Streaming guard: does the *tail* of an in-flight generation already show a runaway
+/// (the same line repeating)? Only the last window is scanned so the per-chunk cost stays
+/// bounded regardless of how much has streamed.
+fn runaway_tail(s: &str) -> bool {
+    const TAIL: usize = 2500;
+    let mut start = s.len().saturating_sub(TAIL);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    has_repeated_line(&s[start..], RUNAWAY_MIN_LINE, RUNAWAY_MAX_REPEATS)
 }
 
 
@@ -1295,6 +1336,25 @@ mod tests {
         // Terminated well before the 20-round budget (1 first call + 3 repeats).
         assert_eq!(run.rounds, 4);
         assert_eq!(run.steps.len(), 4);
+    }
+
+    #[test]
+    fn runaway_tail_detects_a_loop_only_at_the_end_of_a_stream() {
+        // A clean prefix followed by a repeating tail (the Investigation 8 symptom).
+        let cycle = "Actually, I'll just do the Retry.\nWait, I'll parallelize credit-check.\n";
+        let mut s = "Reasoning about the bottleneck in detail.\n".repeat(40);
+        s.push_str(&cycle.repeat(50));
+        assert!(runaway_tail(&s));
+        // A long but non-repeating tail must not trip it.
+        let varied: String = (0..200).map(|i| format!("Distinct analysis line number {i}.\n")).collect();
+        assert!(!runaway_tail(&varied));
+    }
+
+    #[test]
+    fn runaway_tail_is_utf8_boundary_safe() {
+        // Multibyte chars near the tail window must not panic the slice.
+        let s = "✓ data looks consistent ✓\n".repeat(300);
+        let _ = runaway_tail(&s); // must not panic
     }
 
     #[tokio::test]
