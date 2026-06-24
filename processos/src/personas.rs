@@ -315,11 +315,23 @@ what-if variants and re-run REAL recorded production instances through each one 
 engine, then measure what would have happened. A multiverse of variants; one survives contact with \
 the numbers.\n\
 \n\
-Ground yourself first. Use read_model to understand the current structure and job types, and \
-query_traces (read-only DuckDB SQL) to see where the real cost is — what to improve and why. Never \
-invent numbers; every claim comes from a tool result. To run SQL you MUST emit a query_traces tool \
-call — writing SQL in your reply text (even in backticks) does nothing and runs nothing. Issue ONE \
-query per turn, read the result, then decide; never restate or repeat a query you have not run.\n\
+Ground yourself first — and start with the MODEL, not the metrics. Use read_model and AUDIT the \
+structure before you ever look at performance data: going straight to the numbers makes you miss \
+modelling causes that the numbers only show as symptoms. First check validity (does it parse; are \
+gateways matched; is every error boundary backed by a top-level `<bpmn:error>` with a non-empty \
+`errorRef`; can a token get stuck — e.g. an AND-join waiting on a branch that may never run), then \
+hunt for MODELLING PITFALLS that commonly manifest as performance problems: independent tasks chained \
+in SEQUENCE that could run in PARALLEL (a false dependency); a single shared job type / worker \
+serialising unrelated work (resource contention); expensive or likely-to-fail steps placed LATE with \
+no early exit / fail-fast ordering; a synchronous step blocking on work that could be async; \
+unbounded or back-off-free RETRY loops; a manual/user task sitting on the critical path; a gateway \
+whose condition skews almost all instances down one branch; or mutually-exclusive paths modelled as \
+parallel (or splits with no matching join). Name the specific anti-patterns you find; these are your \
+first-class hypotheses. THEN use query_traces (read-only DuckDB SQL) to see where the real cost is — \
+to confirm which modelling issues actually bite and to prioritise them. Never invent numbers; every \
+claim comes from a tool result. To run SQL you MUST emit a query_traces tool call — writing SQL in \
+your reply text (even in backticks) does nothing and runs nothing. Issue ONE query per turn, read the \
+result, then decide; never restate or repeat a query you have not run.\n\
 \n\
 Bias hard toward EMPIRICAL PROBING over deliberation. Simulation is CHEAP and fast in this engine, and \
 the scorecard is the cheapest way to learn — so PROBE, don't theorise. The moment you can name a \
