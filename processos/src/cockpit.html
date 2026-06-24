@@ -1302,6 +1302,10 @@ async function sendChat(ws, proc){
   const liveThinkWrap = $('#liveThinkWrap'), liveTimeline = $('#liveTimeline');
   const liveAnswer = $('#liveAnswer'), liveStatus = $('#liveStatus');
   let answerBuf = '';
+  // Set when the turn ends in an error (a transport failure, or an SSE `error` event such
+  // as the LLM backend returning 404/503). On any error we restore the prompt into the
+  // compose box (see `finally`) so the operator can resend it without retyping.
+  let errored = false;
   // Request payloads captured this turn. Stored on STATE (scoped to the session) so switching
   // to the Debug tab mid-flight can show them — the persisted endpoint only fills in once the
   // turn completes.
@@ -1355,6 +1359,7 @@ async function sendChat(ws, proc){
       if(STATE.chatTab==='debug') loadDebug(ws, proc);
     }
     else if(ev.type==='error'){
+      errored = true;
       if(pend) pend.remove();
       log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(ev.message)+'</span></div>');
     }
@@ -1396,11 +1401,13 @@ async function sendChat(ws, proc){
       catch(e){ if(pend) pend.remove(); }
     }
   } catch(e){
+    errored = true;
     if(pend) pend.remove();
     log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
-    box.value = msg; // restore so the operator can retry
   } finally {
-    send.disabled = false; box.disabled = false; box.focus();
+    send.disabled = false; box.disabled = false;
+    if(errored) box.value = msg; // restore the prompt so the operator can resend it
+    box.focus();
     if(wrap) wrap.style.display = 'none';
   }
 }
