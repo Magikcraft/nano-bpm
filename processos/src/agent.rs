@@ -190,6 +190,10 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
     use std::sync::atomic::Ordering;
     let specs = tools.specs();
     let mut steps: Vec<AgentStepRecord> = Vec::new();
+    // Bounded safety net: how many times the loop may nudge a model that ended a
+    // turn by *naming* a next action without performing it (see Turn::Final below).
+    const MAX_AUTO_CONTINUES: usize = 2;
+    let mut auto_continues = 0usize;
 
     for round in 1..=max_rounds {
         // Operator asked to wrap up: stop investigating and force a prose summary now.
@@ -221,6 +225,33 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
         };
         match turn {
             Turn::Final(answer) => {
+                // A model (especially a local one) sometimes ends a turn by NAMING a
+                // next action ("I will now author the variant") without performing it —
+                // a genuine final turn with no tool call that would silently end the
+                // investigation. Nudge it to actually act, bounded, and never when the
+                // operator asked to wrap up. Uses the same mid-conversation System
+                // steering pattern as wrap_up.
+                let wrapping_up = cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+                if !wrapping_up
+                    && auto_continues < MAX_AUTO_CONTINUES
+                    && round < max_rounds
+                    && signals_deferred_action(&answer)
+                {
+                    msgs.push(Msg::Assistant {
+                        text: Some(answer.clone()),
+                        tool_calls: Vec::new(),
+                    });
+                    msgs.push(Msg::System(
+                        "You ended your turn by naming a next step but did not carry it \
+                         out. Do not stop here: perform that step NOW by calling the \
+                         appropriate tool (e.g. simulate with the full BPMN XML of your \
+                         variant). Only stop to report evidence-backed findings or to ask \
+                         the operator a genuine decision."
+                            .to_string(),
+                    ));
+                    auto_continues += 1;
+                    continue;
+                }
                 // Record the answer in the transcript so a resumed conversation
                 // remembers what the droid concluded last turn.
                 msgs.push(Msg::Assistant {
@@ -714,6 +745,52 @@ fn parse_leaked_args(body: &str, quote: &str) -> Value {
     Value::Object(map)
 }
 
+/// Heuristic: did the model end a turn by *promising* a concrete next action
+/// (author/run a variant, call a tool) without actually performing it? Such an
+/// "I will now ..." turn is a genuine final answer with no tool call, so it would
+/// silently end the agent loop mid-investigation. Conservative by design — it only
+/// fires on an explicit self-commitment adjacent to an action verb, so ordinary
+/// recommendation prose ("I would not change the logic") never trips it.
+fn signals_deferred_action(answer: &str) -> bool {
+    let t = answer.to_lowercase();
+    // Direct commitments to author/simulate a variant — unambiguous on their own.
+    const DIRECT: [&str; 8] = [
+        "i will author",
+        "i'll author",
+        "let me author",
+        "i will simulate",
+        "i'll simulate",
+        "let me simulate",
+        "i will now author",
+        "i will now simulate",
+    ];
+    if DIRECT.iter().any(|p| t.contains(p)) {
+        return true;
+    }
+    // Generic commitment markers must sit next to an action verb to count.
+    const COMMIT: [&str; 6] = [
+        "i will now",
+        "i'll now",
+        "let me now",
+        "next step: i will",
+        "next step: i'll",
+        "i am going to",
+    ];
+    const ACTION: [&str; 8] = [
+        "author", "simulate", "fork", "variant", "model", "build", "create", "run ",
+    ];
+    for c in COMMIT {
+        if let Some(pos) = t.find(c) {
+            let end = (pos + 120).min(t.len());
+            let window = &t[pos..end];
+            if ACTION.iter().any(|a| window.contains(a)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
@@ -919,5 +996,84 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "simulate");
         assert_eq!(calls[0].arguments["limit"], 500);
+    }
+
+    #[test]
+    fn deferred_action_detector_fires_on_commitment_not_on_recommendation() {
+        // Verbatim tail from Investigation 5 message [18] — the droid promised to act.
+        assert!(signals_deferred_action(
+            "Next Step: I will now author the Retry Logic variant to see if we can recover those instances."
+        ));
+        assert!(signals_deferred_action("Let me author a variant that parallelises the two tasks."));
+        // Plain recommendation / refusal prose must NOT trip the detector.
+        assert!(!signals_deferred_action(
+            "I would not change the logic; this is a provisioning problem, not a design one."
+        ));
+        assert!(!signals_deferred_action(
+            "The bottleneck is credit-check. My recommendation is to scale the worker pool."
+        ));
+    }
+
+    /// A mock that replays a scripted sequence of turns (deferral text, tool call, or done).
+    enum Scripted {
+        Defer(String),
+        Call(ToolCall),
+        Done(String),
+    }
+    struct SequencedModel {
+        script: Vec<Scripted>,
+        idx: Cell<usize>,
+    }
+    impl AgentStep for SequencedModel {
+        async fn step(&self, _msgs: &[Msg], _tools: &[ToolSpec]) -> Result<Turn, String> {
+            let i = self.idx.get();
+            self.idx.set(i + 1);
+            match self.script.get(i) {
+                Some(Scripted::Call(c)) => Ok(Turn::ToolCalls(vec![c.clone()])),
+                Some(Scripted::Defer(s)) | Some(Scripted::Done(s)) => Ok(Turn::Final(s.clone())),
+                None => Ok(Turn::Final("(exhausted)".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_final_is_nudged_to_actually_call_the_tool() {
+        // Round 1: the model defers ("I will now author..."). The loop must NOT end —
+        // it nudges, and round 2 the model issues the tool call, then round 3 finishes.
+        let model = SequencedModel {
+            script: vec![
+                Scripted::Defer("Next step: I will now author and simulate the variant.".into()),
+                Scripted::Call(ToolCall {
+                    id: "c1".into(),
+                    name: "echo".into(),
+                    arguments: json!({"x": "variant"}),
+                }),
+                Scripted::Done("Here is the evidence-backed result.".into()),
+            ],
+            idx: Cell::new(0),
+        };
+        let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
+        assert_eq!(run.answer, "Here is the evidence-backed result.");
+        // The tool actually ran (the deferral did not end the investigation).
+        assert_eq!(run.steps.len(), 1);
+        assert_eq!(run.steps[0].tool, "echo");
+    }
+
+    #[tokio::test]
+    async fn persistent_deferral_is_bounded_and_still_terminates() {
+        // A model that ALWAYS defers must not loop forever: after MAX_AUTO_CONTINUES
+        // nudges the loop accepts the final answer and returns.
+        let model = SequencedModel {
+            script: vec![
+                Scripted::Defer("I will now author the variant.".into()),
+                Scripted::Defer("I will now author the variant.".into()),
+                Scripted::Defer("I will now author the variant.".into()),
+                Scripted::Defer("I will now author the variant.".into()),
+            ],
+            idx: Cell::new(0),
+        };
+        let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
+        assert_eq!(run.answer, "I will now author the variant.");
+        assert!(run.steps.is_empty());
     }
 }
