@@ -194,6 +194,14 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
     // turn by *naming* a next action without performing it (see Turn::Final below).
     const MAX_AUTO_CONTINUES: usize = 2;
     let mut auto_continues = 0usize;
+    // Bounded safety net for a *different* spin: a model that keeps re-issuing the SAME
+    // tool call(s) it already ran (e.g. running an identical query_traces SQL every round
+    // instead of acting on the result). We remember the last few call signatures; on a
+    // repeat we steer once, and after MAX_REPEAT_NUDGES repeats we force a wrap-up so the
+    // run always terminates with whatever findings it has instead of grinding to max_rounds.
+    const MAX_REPEAT_NUDGES: usize = 2;
+    let mut repeat_nudges = 0usize;
+    let mut recent_sigs: std::collections::VecDeque<String> = std::collections::VecDeque::new();
 
     for round in 1..=max_rounds {
         // Operator asked to wrap up: stop investigating and force a prose summary now.
@@ -284,6 +292,16 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                 });
             }
             Turn::ToolCalls(calls) => {
+                // Detect a model spinning on identical tool call(s) it already ran this
+                // session. We still execute and return the (cheap, read-only) result so the
+                // model has the data, but steer it to act on what it has; if it keeps
+                // repeating past the bound, force a wrap-up so the loop terminates.
+                let sig = tool_call_signature(&calls);
+                let is_repeat = recent_sigs.contains(&sig);
+                recent_sigs.push_back(sig);
+                while recent_sigs.len() > 3 {
+                    recent_sigs.pop_front();
+                }
                 // Persist this round's thinking (as a `<think>` block) on the tool-calling
                 // turn so it survives into the rendered transcript even though the visible
                 // answer comes from a later round.
@@ -316,6 +334,22 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                         call_id: call.id,
                         content: result,
                     });
+                }
+                if is_repeat {
+                    repeat_nudges += 1;
+                    if repeat_nudges > MAX_REPEAT_NUDGES {
+                        // The model is stuck re-running the same call; stop the spin and
+                        // summarise from the evidence gathered so far.
+                        return wrap_up(model, msgs, steps, round, sink).await;
+                    }
+                    msgs.push(Msg::System(
+                        "You just re-issued a tool call you already ran this session and got \
+                         the same result — you are repeating yourself, not making progress. Do \
+                         NOT run that query again. You already have this data: act on it. Call a \
+                         DIFFERENT tool that moves the investigation forward (e.g. simulate a \
+                         variant), or, if you have enough evidence, give your final answer now."
+                            .to_string(),
+                    ));
                 }
             }
         }
@@ -832,6 +866,35 @@ fn strip_think_blocks(s: &str) -> String {
     out
 }
 
+/// A stable signature for a round's tool calls, used to detect a model that spins by
+/// re-issuing the SAME call(s) it already ran (e.g. running an identical `query_traces`
+/// SQL over and over instead of acting on the result). Tool name plus normalised
+/// arguments: JSON object keys are sorted and string values whitespace-collapsed and
+/// lower-cased, so trivially-reformatted repeats (re-indented SQL, case changes) still
+/// collide. Multiple calls in one round are joined in order.
+fn tool_call_signature(calls: &[ToolCall]) -> String {
+    fn norm(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(),
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                keys.into_iter()
+                    .map(|k| format!("{k}={}", norm(&map[k])))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+            Value::Array(items) => items.iter().map(norm).collect::<Vec<_>>().join(";"),
+            other => other.to_string(),
+        }
+    }
+    calls
+        .iter()
+        .map(|c| format!("{}({})", c.name, norm(&c.arguments)))
+        .collect::<Vec<_>>()
+        .join("\u{1}")
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
@@ -1144,5 +1207,85 @@ mod tests {
         };
         let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
         assert_eq!(run.answer, "Variant simulated: conservedRate 1.0, P99 down 38x.");
+    }
+
+    #[test]
+    fn tool_call_signature_collides_on_trivial_reformatting_only() {
+        let a = vec![ToolCall {
+            id: "1".into(),
+            name: "query_traces".into(),
+            arguments: json!({"sql": "SELECT * FROM jobs WHERE x = 1"}),
+        }];
+        let b = vec![ToolCall {
+            id: "2".into(), // different id, reindented + recased SQL
+            name: "query_traces".into(),
+            arguments: json!({"sql": "  select   *\n  from JOBS\n  where x = 1  "}),
+        }];
+        let c = vec![ToolCall {
+            id: "3".into(),
+            name: "query_traces".into(),
+            arguments: json!({"sql": "SELECT * FROM incidents"}),
+        }];
+        assert_eq!(tool_call_signature(&a), tool_call_signature(&b));
+        assert_ne!(tool_call_signature(&a), tool_call_signature(&c));
+    }
+
+    /// Mock that always asks for the SAME tool call, but answers in prose once the
+    /// harness strips tools (the wrap-up summarisation step passes empty specs).
+    struct AlwaysSameCall {
+        call: ToolCall,
+        summary: String,
+    }
+    impl AgentStep for AlwaysSameCall {
+        async fn step(&self, _msgs: &[Msg], tools: &[ToolSpec]) -> Result<Turn, String> {
+            if tools.is_empty() {
+                Ok(Turn::Final(self.summary.clone()))
+            } else {
+                Ok(Turn::ToolCalls(vec![self.call.clone()]))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_tool_call_is_broken_before_max_rounds() {
+        // A model stuck re-running the same query_traces must not grind to max_rounds:
+        // after MAX_REPEAT_NUDGES repeats the loop forces a wrap-up summary.
+        let model = AlwaysSameCall {
+            call: ToolCall {
+                id: "q".into(),
+                name: "echo".into(),
+                arguments: json!({"x": "same"}),
+            },
+            summary: "Stuck — summarising what I have.".into(),
+        };
+        let run = run_agent(&model, &EchoTools, "sys", "go", 20).await.unwrap();
+        assert_eq!(run.answer, "Stuck — summarising what I have.");
+        // Terminated well before the 20-round budget (1 first call + 3 repeats).
+        assert_eq!(run.rounds, 4);
+        assert_eq!(run.steps.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn distinct_tool_calls_are_not_treated_as_a_spin() {
+        // Genuine progress (different args each round) must never trip the repeat breaker.
+        let model = ScriptedModel {
+            turns: vec![
+                vec![ToolCall {
+                    id: "a".into(),
+                    name: "echo".into(),
+                    arguments: json!({"x": "one"}),
+                }],
+                vec![ToolCall {
+                    id: "b".into(),
+                    name: "echo".into(),
+                    arguments: json!({"x": "two"}),
+                }],
+            ],
+            idx: Cell::new(0),
+            final_answer: "found it".into(),
+        };
+        let run = run_agent(&model, &EchoTools, "sys", "go", 20).await.unwrap();
+        assert_eq!(run.answer, "found it");
+        assert_eq!(run.steps.len(), 2);
     }
 }
