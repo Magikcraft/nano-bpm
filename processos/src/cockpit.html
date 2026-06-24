@@ -99,9 +99,9 @@
   .dlg-body label { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
   .dlg-body input, .dlg-body select { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
   .lbl { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
-  #promptEditor input, #promptEditor textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
-  #promptEditor textarea { font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
-  #promptEditor input:disabled, #promptEditor textarea:disabled { opacity: .6; }
+  #promptEditor input, #promptEditor textarea, #cpromptEditor input, #cpromptEditor textarea, #personaEditor input, #personaEditor textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; box-sizing: border-box; }
+  #promptEditor textarea, #cpromptEditor textarea, #personaEditor textarea { font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
+  #promptEditor input:disabled, #promptEditor textarea:disabled, #cpromptEditor input:disabled, #cpromptEditor textarea:disabled, #personaEditor input:disabled, #personaEditor textarea:disabled { opacity: .6; }
   #pilotNote { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; }
   .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid #26262b; }
   /* workspace investigation surface */
@@ -228,6 +228,9 @@
   .compose { border-top: 1px solid #26262b; padding: 12px 14px; }
   .compose-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
   .compose select { background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 6px 10px; font: inherit; }
+  .persona-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a1a1aa; }
+  .persona-pick > span { white-space: nowrap; }
+  .persona-pick select:disabled { opacity: .7; cursor: not-allowed; }
   .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 9px 11px; font: 13px/1.5 inherit; resize: vertical; min-height: 64px; }
   .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
   .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
@@ -551,6 +554,7 @@ async function decide(key, decision){
 // ---- Prompts (authoring) ----
 let PROMPTS = [];
 let CHAT_PROMPTS = [];
+let PERSONAS = [];
 async function renderPrompts(){
   STATE.view='prompts'; setActive(); main.innerHTML='Loading…';
   let xs;
@@ -558,13 +562,67 @@ async function renderPrompts(){
   PROMPTS = Array.isArray(xs)?xs:(xs.prompts||[]);
   try { const cps = await api('/api/chat-prompts'); CHAT_PROMPTS = Array.isArray(cps)?cps:[]; }
   catch(e){ CHAT_PROMPTS = []; }
+  try { const ps = await api('/api/personas'); PERSONAS = Array.isArray(ps)?ps:[]; }
+  catch(e){ PERSONAS = []; }
   main.innerHTML =
     '<h1>Prompts</h1>'
-    + '<p class="lede">Two libraries the droid draws on. <b>Investigation chat prompts</b> are the message templates you load in the cockpit to interrogate a dataset. <b>Hypothesis system prompts</b> are the skills that drive experiment generation.</p>'
-    + '<h2>Investigation chat prompts</h2><div id="chatPromptsWrap"></div>'
+    + '<p class="lede">Three libraries the droid draws on. <b>Personas</b> are the standing system prompts that set the droid\u2019s lens for a cockpit chat (pick one per chat). <b>Investigation chat prompts</b> are the message templates you load into the compose box to interrogate a dataset. <b>Hypothesis system prompts</b> are the skills that drive experiment generation.</p>'
+    + '<h2>Personas</h2><div id="personasWrap"></div>'
+    + '<h2 style="margin-top:28px">Investigation chat prompts</h2><div id="chatPromptsWrap"></div>'
     + '<h2 style="margin-top:28px">Hypothesis system prompts</h2><div id="sysPromptsWrap"></div>';
+  drawPersonas(PERSONAS.length ? PERSONAS[0].id : null);
   drawChatPrompts(CHAT_PROMPTS.length ? CHAT_PROMPTS[0].id : null);
   drawPrompts(PROMPTS.length ? PROMPTS[0].id : null);
+}
+
+// --- persona library (selectable chat system prompts) inside the Prompts view ---
+function drawPersonas(selId){
+  const wrap = document.getElementById('personasWrap'); if(!wrap) return;
+  let h = '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
+  h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editPersona(null)">+ New persona</button>';
+  for(const p of PERSONAS){
+    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    const tags = (p.default?' <span class="muted" style="font-size:11px">default</span>':'') + (p.builtin?' <span class="muted" style="font-size:11px">built-in</span>':'');
+    h += '<div class="tile"'+active+' onclick="editPersona(\''+esc(p.id)+'\')">'
+      + '<h3 style="font-size:14px">'+esc(p.name||p.id)+tags+'</h3>'
+      + '<div class="meta">'+esc((p.summary||p.system||'').slice(0,90))+'</div></div>';
+  }
+  h += '</div><div id="personaEditor" class="pane"></div></div>';
+  wrap.innerHTML = h;
+  editPersona(selId);
+}
+function editPersona(id){
+  const ed = $('#personaEditor'); if(!ed) return;
+  const blank = {id:'',name:'',summary:'',system:'',builtin:false,default:false};
+  const p = id===null ? blank : (PERSONAS.find(x=>x.id===id)||blank);
+  const isNew = id===null;
+  let h = '<h2 style="margin-top:0">'+(isNew?'New persona':'Edit persona')+'</h2>';
+  h += '<label class="lbl">Id</label><input id="paId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. cost-hawk" />';
+  h += '<label class="lbl">Name</label><input id="paName" value="'+esc(p.name)+'" '+(p.builtin?'disabled':'')+' />';
+  h += '<label class="lbl">Summary (one line, shown in the picker)</label><input id="paSummary" value="'+esc(p.summary||'')+'" '+(p.builtin?'disabled':'')+' />';
+  h += '<label class="lbl">System prompt (the droid\u2019s standing instructions for the chat)</label><textarea id="paSystem" rows="14" '+(p.builtin?'disabled':'')+'>'+esc(p.system)+'</textarea>';
+  h += '<div class="actions">';
+  if(p.builtin){
+    h += '<span class="muted" style="font-size:12px">Built-in personas are read-only. Create a new one to author your own.</span>';
+  } else {
+    h += '<button class="btn primary" onclick="savePersona()">Save</button>';
+    if(!isNew) h += '<button class="btn ghost" onclick="deletePersona(\''+esc(p.id)+'\')">Delete</button>';
+  }
+  h += '</div>';
+  ed.innerHTML = h;
+}
+async function savePersona(){
+  const body = { id: $('#paId').value.trim(), name: $('#paName').value.trim(), summary: $('#paSummary').value.trim(), system: $('#paSystem').value };
+  if(!body.id || !body.system.trim()){ alert('Id and system prompt are required.'); return; }
+  try { await api('/api/personas', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+  catch(e){ alert('Save failed: '+e.message); return; }
+  const ps = await api('/api/personas'); PERSONAS = Array.isArray(ps)?ps:[]; drawPersonas(body.id);
+}
+async function deletePersona(id){
+  if(!confirm('Delete persona “'+id+'”?')) return;
+  try { await api('/api/personas/'+encodeURIComponent(id), {method:'DELETE'}); }
+  catch(e){ alert('Delete failed: '+e.message); return; }
+  const ps = await api('/api/personas'); PERSONAS = Array.isArray(ps)?ps:[]; drawPersonas(PERSONAS.length?PERSONAS[0].id:null);
 }
 
 // --- chat-prompt library (cockpit message templates) inside the Prompts view ---
@@ -589,7 +647,7 @@ function editCPrompt(id){
   let h = '<h2 style="margin-top:0">'+(isNew?'New chat prompt':'Edit chat prompt')+'</h2>';
   h += '<label class="lbl">Id</label><input id="cpId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. cost-probe" />';
   h += '<label class="lbl">Name</label><input id="cpName" value="'+esc(p.name)+'" '+(p.builtin?'disabled':'')+' />';
-  h += '<label class="lbl">Prompt text (loaded into the cockpit compose box)</label><textarea id="cpText" rows="8" '+(p.builtin?'disabled':'')+'>'+esc(p.text)+'</textarea>';
+  h += '<label class="lbl">Prompt text (loaded into the cockpit compose box)</label><textarea id="cpText" rows="14" '+(p.builtin?'disabled':'')+'>'+esc(p.text)+'</textarea>';
   h += '<div class="actions">';
   if(p.builtin){
     h += '<span class="muted" style="font-size:12px">Built-in prompts are read-only. Create a new one to author your own.</span>';
@@ -736,6 +794,10 @@ async function renderWorkspace(ws, proc){
         <div id="chatDebug" class="chatdebug" style="display:none"><div class="empty">No request captured yet. Send a message; the exact payload sent to the model will appear here.</div></div>
         <div class="compose" id="chatCompose">
           <div class="compose-row">
+            <label class="persona-pick" title="The persona sets the droid's standing instructions (system prompt) for this chat. It's fixed once the conversation starts.">
+              <span>Persona</span>
+              <select id="chatPersona"></select>
+            </label>
             <select id="chatPrompt"><option value="">Load a prompt…</option></select>
             <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
             <span class="fontctl" title="Chat text size">
@@ -765,6 +827,7 @@ async function renderWorkspace(ws, proc){
   labelSendButton();
   refreshPythonLabel();
   await loadChatPrompts();
+  await loadPersonas();
   await loadSessions(ws, proc);
   $('#chatNew').onclick = () => newSession(ws, proc);
   $('#tabChat').onclick = () => switchChatTab('chat', ws, proc);
@@ -1069,6 +1132,7 @@ async function loadChat(ws, proc){
     const r = await api(url);
     if(r.sessionId) STATE.sessionId = r.sessionId;
     drawChat(r.turns);
+    applyPersonaState();
     // Fresh conversation: pre-load the open-investigation prompt so the default action is
     // an unbiased investigation the operator can send or edit.
     if((!r.turns || !r.turns.length)){
@@ -1172,6 +1236,42 @@ async function loadChatPrompts(){
   } catch(e){ /* prompts are optional */ }
 }
 
+// Load the selectable personas (standing system prompts) into the chat picker. The default
+// persona is preselected; the picker is later locked to a session's bound persona once it has
+// started (see applyPersonaState).
+async function loadPersonas(){
+  const sel = $('#chatPersona');
+  try {
+    STATE.personas = await api('/api/personas') || [];
+  } catch(e){ STATE.personas = []; }
+  if(sel){
+    const def = (STATE.personas.find(p => p.default) || STATE.personas[0] || {}).id || '';
+    sel.innerHTML = (STATE.personas||[]).map(p =>
+      '<option value="'+esc(p.id)+'"'+(p.id===def?' selected':'')+'>'+esc(p.name||p.id)+(p.default?' (default)':'')+(p.builtin?'':' ✎')+'</option>').join('');
+    sel.title = personaSummary(def);
+    sel.onchange = () => { sel.title = personaSummary(sel.value); };
+  }
+}
+function personaSummary(id){
+  const p = (STATE.personas||[]).find(x => x.id===id);
+  return p ? (p.summary || p.name || id) : 'Pick the droid\u2019s persona for this chat';
+}
+// Reflect a session's persona binding: if the session has started, show and lock its persona;
+// otherwise leave the picker enabled at the default (or the operator's current choice).
+function applyPersonaState(){
+  const sel = $('#chatPersona'); if(!sel) return;
+  const meta = (STATE.sessions||[]).find(s => s.id===STATE.sessionId);
+  const bound = meta && meta.persona;
+  if(bound){
+    if([...sel.options].some(o => o.value===bound)) sel.value = bound;
+    sel.disabled = true;
+    sel.title = 'Persona is fixed once a chat has started — start a new chat to use a different one. ('+personaSummary(bound)+')';
+  } else {
+    sel.disabled = false;
+    sel.title = personaSummary(sel.value);
+  }
+}
+
 // Build the live "pending" droid bubble whose regions fill in as SSE events stream.
 function livePendingHtml(){
   return '<div class="bub droid pending" id="chatPending">'+
@@ -1264,7 +1364,7 @@ async function sendChat(ws, proc){
     const qs = STATE.sessionId ? ('?session='+encodeURIComponent(STATE.sessionId)) : '';
     const resp = await fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython })
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined })
     });
     if(!resp.ok || !resp.body){
       let m = 'stream failed ('+resp.status+')';
@@ -1313,6 +1413,7 @@ async function loadSessionsQuiet(ws, proc, keepId){
     STATE.sessions = r.sessions || [];
     if(keepId) STATE.sessionId = keepId;
     drawSessions(ws, proc);
+    applyPersonaState();
   } catch(e){ /* tab refresh is best-effort */ }
 }
 

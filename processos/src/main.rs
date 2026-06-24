@@ -20,6 +20,7 @@ mod corpus;
 mod dataset;
 mod harness;
 mod investigate;
+mod personas;
 mod pilot;
 mod pyrunner;
 mod report;
@@ -86,6 +87,9 @@ struct AppState {
     /// The operator's chat prompt library (reusable compose-box message templates),
     /// persisted to the user's config dir alongside `settings.json`.
     chat_prompts: Arc<chat_prompts::ChatPromptStore>,
+    /// The operator's persona library (selectable standing system prompts for chat),
+    /// persisted to the user's config dir alongside `settings.json`.
+    personas: Arc<personas::PersonaStore>,
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
     chat_cancels: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
@@ -234,6 +238,9 @@ async fn main() {
         chat_prompts: Arc::new(chat_prompts::ChatPromptStore::open(
             settings::config_dir().join("chat-prompts.json"),
         )),
+        personas: Arc::new(personas::PersonaStore::open(
+            settings::config_dir().join("personas.json"),
+        )),
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
@@ -334,6 +341,8 @@ async fn main() {
             get(chat_prompts_list).post(chat_prompts_upsert),
         )
         .route("/api/chat-prompts/{id}", axum::routing::delete(chat_prompts_delete))
+        .route("/api/personas", get(personas_list).post(personas_upsert))
+        .route("/api/personas/{id}", axum::routing::delete(personas_delete))
         .route("/assets/bpmn/{file}", get(bpmn_asset))
         .route("/assets/settings.js", get(settings_js))
         .route("/api/settings", get(get_settings).put(put_settings))
@@ -1179,6 +1188,7 @@ fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::S
                 created: s.created,
                 updated: s.updated,
                 turns: 0,
+                persona: s.persona,
             };
         }
     }
@@ -1193,6 +1203,7 @@ fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::S
         created: s.created,
         updated: s.updated,
         turns: 0,
+        persona: s.persona,
     }
 }
 
@@ -1347,6 +1358,10 @@ struct ChatSendRequest {
     /// Offer the trusted Python escape hatch in addition to the SQL tool (off by default).
     #[serde(default)]
     allow_python: bool,
+    /// The persona (standing system prompt) for this conversation. Only takes effect on the
+    /// first turn of a session — afterwards the persona is baked into the persisted transcript.
+    #[serde(default)]
+    persona_id: Option<String>,
 }
 
 /// `POST .../chat` — send one operator message; the droid replies (running SQL/Python
@@ -1391,6 +1406,12 @@ async fn cockpit_chat_send(
     let session = state.chat.get(&key, &sid).unwrap_or_default();
     let prior = session.messages;
     let prior_stamps = session.stamps;
+    // Resolve the persona (standing system prompt). It only takes effect on the first turn;
+    // record the resolved id on the session so the cockpit can show/lock it thereafter.
+    let (persona_id, persona_system) = state.personas.resolve(req.persona_id.as_deref());
+    if prior.is_empty() {
+        state.chat.set_persona(&key, &sid, &persona_id);
+    }
     let user_ts = chat_now_ms();
     let message = req.message;
     // Register a wrap-up flag for this in-flight turn so `POST .../chat/wrapup` can ask the
@@ -1423,6 +1444,7 @@ async fn cockpit_chat_send(
                 max_rounds,
                 allow_python,
                 objective.as_deref(),
+                Some(&persona_system),
                 Some(&cancel),
                 &mut sink,
                 prior,
@@ -1502,6 +1524,11 @@ async fn cockpit_chat_stream(
     let session = state.chat.get(&key, &sid).unwrap_or_default();
     let prior = session.messages;
     let prior_stamps = session.stamps;
+    // Resolve the persona; it only takes effect on the first turn. Record it on the session.
+    let (persona_id, persona_system) = state.personas.resolve(req.persona_id.as_deref());
+    if prior.is_empty() {
+        state.chat.set_persona(&key, &sid, &persona_id);
+    }
     let user_ts = chat_now_ms();
     let message = req.message;
     // Register a wrap-up flag so `POST .../chat/wrapup` can ask this in-flight turn to report early.
@@ -1562,6 +1589,7 @@ async fn cockpit_chat_stream(
             max_rounds,
             allow_python,
             objective.as_deref(),
+            Some(&persona_system),
             Some(&cancel),
             &mut sink,
             prior,
@@ -1712,6 +1740,33 @@ async fn chat_prompts_delete(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.chat_prompts.delete(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `GET /api/personas` — list the selectable chat personas (standing system prompts).
+async fn personas_list(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.personas.list()).into_response()
+}
+
+/// `POST /api/personas` — author or update a persona (persisted to the config dir).
+async fn personas_upsert(
+    State(state): State<AppState>,
+    Json(persona): Json<personas::Persona>,
+) -> impl IntoResponse {
+    match state.personas.upsert(persona) {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `DELETE /api/personas/{id}` — delete a non-built-in persona.
+async fn personas_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.personas.delete(&id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => unprocessable(e),
     }

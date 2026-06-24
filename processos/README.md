@@ -249,6 +249,17 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   each chat's name and last-message time; operators **create**, **rename**, and **delete**
   sessions, and every chat call carries the active `?session=` id. Endpoints live under
   `.../chat/sessions`.
+- **Personas** — each chat session runs under a selectable **persona**: a standing *system*
+  prompt that sets the droid's lens and discipline. Built-ins ship with **Performance Analyst**
+  (the default — the canonical `investigate::CHAT_SYSTEM`), **SRE / Incident Responder**, and
+  **Capacity Planner**; operators author their own in the Prompts view. The persona is chosen in
+  the cockpit's compose row, sent as `personaId`, and **baked into the session's system message
+  on its first turn** — so a session's persona is fixed once the conversation starts (the picker
+  locks and the bound id is surfaced on the session/`SessionMeta`). Personas persist to
+  `<config_dir>/personas.json` and are served by `GET/POST /api/personas` + `DELETE
+  /api/personas/{id}` (built-ins are read-only). This is distinct from the per-message
+  *chat-prompt* templates (`/api/chat-prompts`) and the *hypothesis* system prompts
+  (`/api/prompts`).
 - `agent::run_agent_resumable` drives the loop over a `&mut Vec<Msg>`, appending the
   assistant/tool turns **and** the final answer so the next turn keeps full context. A turn
   can also be **wrapped up early** (`POST .../chat/wrapup`): the loop checks a per-session
@@ -304,6 +315,8 @@ curl -XDELETE .../api/workspaces/{workspace}/processes/{process}/chat/sessions/{
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/reset?session={id} # forget it
 curl       .../api/chat-prompts                                           # list templates
 curl -XPOST .../api/chat-prompts -d '{"id":"my-probe","name":"My probe","text":"…"}'
+curl       .../api/personas                                              # list chat personas
+curl -XPOST .../api/personas -d '{"id":"cost-hawk","name":"Cost Hawk","summary":"…","system":"You are…"}'
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/wrapup # stop & report now
 curl       .../api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/debug # exact payloads sent
 curl       .../api/python/status   # { configured, interpreter, interpreterRuns, dataScience, missing }
@@ -463,6 +476,8 @@ for it automatically.
 | `POST` | `/api/workspaces/{workspace}/processes/{process}/chat/reset` | Forget this dataset's conversation (`?session={id}` clears just that one) |
 | `GET`/`POST` | `/api/chat-prompts` | List / author reusable compose-box prompt templates (persisted to the config dir) |
 | `DELETE` | `/api/chat-prompts/{id}` | Delete a non-built-in chat prompt |
+| `GET`/`POST` | `/api/personas` | List / author chat **personas** (standing system prompts; persisted to the config dir). Built-ins are read-only |
+| `DELETE` | `/api/personas/{id}` | Delete a non-built-in persona |
 | `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |
 | `GET`/`PUT` | `/api/settings` | Read settings / update the **globals** (`activeProfile`, `pythonBin`). `GET` lists LLM profiles (each redacting its key as `apiKeySet`) + the active profile + the Python interpreter |
 | `POST` | `/api/settings/profiles` | Create a new LLM profile (optional `name`); returns the new `id` + the updated settings |

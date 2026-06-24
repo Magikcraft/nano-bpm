@@ -45,6 +45,10 @@ pub struct ChatSession {
     /// Epoch-ms timestamp per rendered turn (aligned by index to [`render_view`]).
     #[serde(default)]
     pub stamps: Vec<u64>,
+    /// The persona (standing system prompt) this session uses, set on its first turn and
+    /// fixed thereafter (the system prompt is baked into the transcript). Empty until then.
+    #[serde(default)]
+    pub persona: String,
 }
 
 /// Lightweight session descriptor for the tab list (no transcript).
@@ -56,6 +60,9 @@ pub struct SessionMeta {
     pub created: u64,
     pub updated: u64,
     pub turns: usize,
+    /// The persona (standing system prompt) bound to this session, if its first turn has run.
+    #[serde(default)]
+    pub persona: String,
 }
 
 /// On-disk shape: all sessions for one `(workspace, process)` key in a single file.
@@ -112,6 +119,7 @@ impl ChatStore {
                             created: s.created,
                             updated: s.updated,
                             turns: render_view(&s.messages).len(),
+                            persona: s.persona.clone(),
                         })
                         .collect()
                 })
@@ -135,6 +143,7 @@ impl ChatStore {
             updated: now,
             messages: Vec::new(),
             stamps: Vec::new(),
+            persona: String::new(),
         };
         sessions.push(session.clone());
         let snapshot = sessions.clone();
@@ -172,6 +181,7 @@ impl ChatStore {
                 updated: now,
                 messages,
                 stamps,
+                persona: String::new(),
             });
         }
         let snapshot = sessions.clone();
@@ -198,6 +208,40 @@ impl ChatStore {
         drop(guard);
         self.persist(key, &snapshot);
         true
+    }
+
+    /// Bind a session to a persona (its standing system prompt) on its first turn. No-op if the
+    /// session already has a persona recorded (it is fixed once the conversation has started) or
+    /// the id is unknown. Creates the session if missing so the first turn never loses it.
+    pub fn set_persona(&self, key: &str, session_id: &str, persona: &str) {
+        self.ensure_loaded(key);
+        let persona = persona.trim();
+        if persona.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let sessions = guard.entry(key.to_string()).or_default();
+        match sessions.iter_mut().find(|s| s.id == session_id) {
+            Some(s) => {
+                if !s.persona.is_empty() {
+                    return; // already bound — persona is fixed for the session
+                }
+                s.persona = persona.to_string();
+            }
+            None => sessions.push(ChatSession {
+                id: session_id.to_string(),
+                name: default_name(sessions.len() + 1),
+                created: now,
+                updated: now,
+                messages: Vec::new(),
+                stamps: Vec::new(),
+                persona: persona.to_string(),
+            }),
+        }
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
     }
 
     /// Delete one session. Returns false when the id is unknown.
@@ -257,6 +301,7 @@ impl ChatStore {
             updated,
             messages: legacy.messages,
             stamps: Vec::new(),
+            persona: String::new(),
         }])
     }
 

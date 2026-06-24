@@ -254,6 +254,7 @@ pub async fn run_chat_turn(
     max_rounds: usize,
     allow_python: bool,
     objective: Option<&str>,
+    persona_system: Option<&str>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     sink: &mut dyn FnMut(AgentEvent),
     mut messages: Vec<Msg>,
@@ -273,10 +274,12 @@ pub async fn run_chat_turn(
     let model = OpenAiAgent { cfg };
 
     // Seed the system message (with one-time dataset framing) only at the start of a
-    // conversation; subsequent turns already carry it in the persisted transcript.
+    // conversation; subsequent turns already carry it in the persisted transcript. The
+    // standing instruction is the selected persona (defaulting to the Performance Analyst).
     if messages.is_empty() {
+        let base = persona_system.unwrap_or(CHAT_SYSTEM);
         let mut sys = format!(
-            "{CHAT_SYSTEM}\n\nDataset bound for this conversation: {} instances, {} job \
+            "{base}\n\nDataset bound for this conversation: {} instances, {} job \
              executions, {} incidents.",
             dataset.instances, dataset.jobs, dataset.incidents
         );
