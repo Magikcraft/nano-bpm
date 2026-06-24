@@ -869,12 +869,21 @@ async function renderWorkspace(ws, proc){
   $('#chatNew').onclick = () => newSession(ws, proc);
   $('#tabChat').onclick = () => switchChatTab('chat', ws, proc);
   $('#tabDebug').onclick = () => switchChatTab('debug', ws, proc);
-  $('#chatSend').onclick = () => sendChat(ws, proc);
+  $('#chatSend').onclick = () => submitCompose(ws, proc);
   $('#chatSendMenu').onclick = (e) => { e.stopPropagation(); toggleProfileMenu(); };
   $('#chatWrapup').onclick = () => wrapUpChat(ws, proc);
   $('#wsObjSave').onclick = () => saveObjective(ws, proc, p);
   $('#chatBox').addEventListener('keydown', e => {
-    if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); sendChat(ws, proc); }
+    if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); submitCompose(ws, proc); return; }
+    const box = e.target;
+    // Shell-style history: Up recalls earlier prompts only when the caret is on the
+    // first line; Down moves forward only when it's on the last line. A plain caret
+    // (no selection, no modifier) so normal multi-line editing is untouched.
+    if(e.key==='ArrowUp' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey && box.selectionStart===box.selectionEnd){
+      if(box.value.slice(0, box.selectionStart).indexOf('\n') === -1){ if(historyPrev(box)) e.preventDefault(); }
+    } else if(e.key==='ArrowDown' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey && box.selectionStart===box.selectionEnd && STATE.promptHistIdx!==null){
+      if(box.value.slice(box.selectionEnd).indexOf('\n') === -1){ if(historyNext(box)) e.preventDefault(); }
+    }
   });
   $('#chatFontDown').onclick = () => bumpChatFont(-1);
   $('#chatFontUp').onclick = () => bumpChatFont(1);
@@ -1026,6 +1035,77 @@ async function labelSendButton(){
 
 // Live-update the Send button + droid label + Python label when settings change.
 window.addEventListener('processos:settings-changed', () => { labelSendButton(); refreshPythonLabel(); });
+
+// ── busy state + steering ────────────────────────────────────────────────────
+// While the droid is working we DON'T lock the compose box. The Send button stays
+// live and becomes "Steer <profile>" so the operator can redirect the in-flight
+// investigation (a queued user turn injected at the next round boundary); it
+// reverts to "Investigate with <profile> →" when the turn finishes.
+function setChatBusy(busy){
+  STATE.chatBusy = busy;
+  const btn = $('#chatSend');
+  if(btn){
+    if(busy){ btn.textContent = 'Steer ' + (STATE.profileName || 'the droid'); }
+    else { labelSendButton(); }
+  }
+}
+
+// The Send button and Cmd/Ctrl+Enter route to steering while a turn is in flight,
+// and to a fresh investigation otherwise.
+function submitCompose(ws, proc){
+  if(STATE.chatBusy) steerChat(ws, proc);
+  else sendChat(ws, proc);
+}
+
+// Queue a steering instruction for the running turn. Optimistically shows it as a
+// user bubble (the persisted transcript redraws on `done`), clears the box, and
+// does NOT open a new stream — the live stream picks the instruction up.
+async function steerChat(ws, proc){
+  const box = $('#chatBox'); const msg = box.value.trim();
+  if(!msg) return;
+  const log = $('#chatLog'); const hint = $('#chatHint');
+  pushPromptHistory(msg);
+  const pend = $('#chatPending');
+  if(pend) pend.insertAdjacentHTML('beforebegin', chatBub({ role:'user', text:msg, ts: Date.now() }));
+  else if(log) log.insertAdjacentHTML('beforeend', chatBub({ role:'user', text:msg, ts: Date.now() }));
+  if(log) log.scrollTop = log.scrollHeight;
+  box.value = '';
+  try {
+    await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/steer'+(STATE.sessionId?('?session='+encodeURIComponent(STATE.sessionId)):''), {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ message: msg })
+    });
+    if(hint) hint.textContent = 'steering the droid…';
+  } catch(e){
+    box.value = msg; // restore so the operator can retry
+    if(hint) hint.textContent = 'steer failed: '+(e.message||e);
+  }
+}
+
+// ── compose prompt history (shell-style up/down recall) ──────────────────────
+function pushPromptHistory(msg){
+  STATE.promptHistory = STATE.promptHistory || [];
+  if(STATE.promptHistory[STATE.promptHistory.length-1] !== msg) STATE.promptHistory.push(msg);
+  STATE.promptHistIdx = null; STATE.promptDraft = '';
+}
+function placeCursorEnd(box){ const n = box.value.length; box.selectionStart = box.selectionEnd = n; }
+// Up on the first line steps back through earlier prompts (saving the current draft);
+// Down on the last line steps forward, restoring the draft past the newest entry.
+function historyPrev(box){
+  const h = STATE.promptHistory || [];
+  if(!h.length) return false;
+  if(STATE.promptHistIdx === null){ STATE.promptDraft = box.value; STATE.promptHistIdx = h.length; }
+  if(STATE.promptHistIdx > 0){ STATE.promptHistIdx--; box.value = h[STATE.promptHistIdx]; placeCursorEnd(box); }
+  return true;
+}
+function historyNext(box){
+  const h = STATE.promptHistory || [];
+  if(STATE.promptHistIdx === null) return false;
+  if(STATE.promptHistIdx < h.length - 1){ STATE.promptHistIdx++; box.value = h[STATE.promptHistIdx]; }
+  else { STATE.promptHistIdx = null; box.value = STATE.promptDraft || ''; }
+  placeCursorEnd(box);
+  return true;
+}
 
 // ── profile picker on the split Send button ──────────────────────────────────
 // The caret beside "Investigate with …" drops a menu of every configured LLM profile so the
@@ -1483,7 +1563,8 @@ async function sendChat(ws, proc){
   const send = $('#chatSend'); const log = $('#chatLog'); const hint = $('#chatHint');
   const wrap = $('#chatWrapup');
   const allowPython = $('#chatPy').checked && !$('#chatPy').disabled;
-  send.disabled = true; box.disabled = true;
+  pushPromptHistory(msg);
+  setChatBusy(true);
   if(wrap){ wrap.style.display = ''; wrap.disabled = false; }
   if(log.querySelector('.empty')) log.innerHTML = '';
   log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
@@ -1598,7 +1679,7 @@ async function sendChat(ws, proc){
     if(pend) pend.remove();
     log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
   } finally {
-    send.disabled = false; box.disabled = false;
+    setChatBusy(false);
     if(errored) box.value = msg; // restore the prompt so the operator can resend it
     box.focus();
     if(wrap) wrap.style.display = 'none';

@@ -474,6 +474,7 @@ pub async fn run_chat_turn(
     persona_system: Option<&str>,
     model_xml: Option<String>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    steer: Option<&std::sync::Mutex<Vec<String>>>,
     sink: &mut dyn FnMut(AgentEvent),
     mut messages: Vec<Msg>,
     user_message: &str,
@@ -524,7 +525,7 @@ pub async fn run_chat_turn(
     messages.push(Msg::User(user_message.to_string()));
 
     let run =
-        run_agent_streaming(&model, &tools, &mut messages, max_rounds, cancel, sink).await?;
+        run_agent_streaming(&model, &tools, &mut messages, max_rounds, cancel, steer, sink).await?;
     Ok(ChatTurnResult {
         answer: run.answer,
         rounds: run.rounds,

@@ -96,6 +96,10 @@ struct AppState {
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
     chat_cancels: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Steering queues for in-flight chat turns, keyed by session. The cockpit's "Steer …"
+    /// control appends an operator instruction; the agent loop drains it at the next round
+    /// boundary and injects it as a user turn, redirecting an investigation without restarting it.
+    chat_steers: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>>,
     /// The exact model request bodies sent during each session's most recent turn, keyed by
     /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
     /// (not persisted) — it shows what was last sent and is cleared on restart.
@@ -245,6 +249,7 @@ async fn main() {
             settings::config_dir().join("personas.json"),
         )),
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
@@ -337,6 +342,10 @@ async fn main() {
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/wrapup",
             post(cockpit_chat_wrapup),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/steer",
+            post(cockpit_chat_steer),
         )
         .route("/api/python/status", get(python_status))
         .route(
@@ -1453,6 +1462,7 @@ async fn cockpit_chat_send(
                 Some(&persona_system),
                 model,
                 Some(&cancel),
+                None,
                 &mut sink,
                 prior,
                 &message,
@@ -1544,6 +1554,11 @@ async fn cockpit_chat_stream(
     if let Ok(mut m) = state.chat_cancels.lock() {
         m.insert(cancel_key.clone(), cancel.clone());
     }
+    // Register a steering queue so `POST .../chat/steer` can redirect this in-flight turn.
+    let steer = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    if let Ok(mut m) = state.chat_steers.lock() {
+        m.insert(cancel_key.clone(), steer.clone());
+    }
 
     // The agent loop runs on a blocking thread (DuckDB is !Send) and pushes events into an
     // unbounded channel; the SSE response drains that channel on the main runtime. Unbounded +
@@ -1601,6 +1616,7 @@ async fn cockpit_chat_stream(
             Some(&persona_system),
             model,
             Some(&cancel),
+            Some(&steer),
             &mut sink,
             prior,
             &message,
@@ -1631,6 +1647,9 @@ async fn cockpit_chat_stream(
             }
         }
         if let Ok(mut m) = task_state.chat_cancels.lock() {
+            m.remove(&task_cancel_key);
+        }
+        if let Ok(mut m) = task_state.chat_steers.lock() {
             m.remove(&task_cancel_key);
         }
     });
@@ -1693,7 +1712,46 @@ async fn cockpit_chat_wrapup(
     }
 }
 
-/// Epoch-ms now, for chat timestamps.
+/// Body for `POST .../chat/steer` — the operator's mid-investigation steering instruction.
+#[derive(Debug, Deserialize)]
+struct SteerRequest {
+    message: String,
+}
+
+/// `POST .../chat/steer` — send a steering instruction to an in-flight chat turn. The message
+/// is queued and injected as a user turn at the agent loop's next round boundary, redirecting
+/// the investigation without restarting it. No-op (404) when no turn is running for this session.
+async fn cockpit_chat_steer(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
+    Json(req): Json<SteerRequest>,
+) -> impl IntoResponse {
+    if req.message.trim().is_empty() {
+        return unprocessable("message must not be empty".to_string());
+    }
+    let key = chat::session_key(&workspace, &process);
+    let sid = resolve_session(&state, &key, q.session.as_deref()).id;
+    let cancel_key = chat_cancel_key(&key, &sid);
+    let queue = state
+        .chat_steers
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&cancel_key).cloned());
+    match queue {
+        Some(q) => {
+            if let Ok(mut v) = q.lock() {
+                v.push(req.message);
+            }
+            StatusCode::ACCEPTED.into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no investigation is running for this dataset" })),
+        )
+            .into_response(),
+    }
+}
 fn chat_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

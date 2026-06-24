@@ -172,7 +172,7 @@ pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<AgentRun, String> {
     let mut sink = |_ev: AgentEvent| {};
-    run_agent_streaming(model, tools, msgs, max_rounds, cancel, &mut sink).await
+    run_agent_streaming(model, tools, msgs, max_rounds, cancel, None, &mut sink).await
 }
 
 /// As [`run_agent_resumable_cancellable`], but emits [`AgentEvent`]s through `sink` as the run
@@ -185,6 +185,7 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
     msgs: &mut Vec<Msg>,
     max_rounds: usize,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    steer: Option<&std::sync::Mutex<Vec<String>>>,
     sink: &mut dyn FnMut(AgentEvent),
 ) -> Result<AgentRun, String> {
     use std::sync::atomic::Ordering;
@@ -207,6 +208,23 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
         // Operator asked to wrap up: stop investigating and force a prose summary now.
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return wrap_up(model, msgs, steps, round, sink).await;
+        }
+        // Operator sent steering instruction(s) mid-investigation: inject them as user
+        // turns so the next round reasons with the new direction in context. Drained at
+        // the round boundary — the model finishes its current generation, then the steer
+        // lands before it decides the next action. Each becomes part of the persisted
+        // transcript (the cockpit redraws it on `done`).
+        if let Some(q) = steer {
+            let pending: Vec<String> = q
+                .lock()
+                .map(|mut v| std::mem::take(&mut *v))
+                .unwrap_or_default();
+            for s in pending {
+                let s = s.trim();
+                if !s.is_empty() {
+                    msgs.push(Msg::User(s.to_string()));
+                }
+            }
         }
         sink(AgentEvent::Round(round));
         // Surface the exact payload this round sends to the model, so the debug view can show
@@ -1077,6 +1095,37 @@ mod tests {
         assert_eq!(run.rounds, 1);
         // Flag untouched by the loop.
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_queued_steer_is_injected_as_a_user_turn_mid_loop() {
+        use std::sync::Mutex;
+        // Round 1 calls a tool, round 2 gives the final answer. A steer queued before the
+        // run is drained at the round-1 boundary and appended as a user turn, so it lands in
+        // the transcript and is in context for the model's subsequent rounds.
+        let model = ScriptedModel {
+            turns: vec![vec![ToolCall {
+                id: "c".into(),
+                name: "echo".into(),
+                arguments: json!({"x":"a"}),
+            }]],
+            idx: Cell::new(0),
+            final_answer: "done".into(),
+        };
+        let steer = Mutex::new(vec!["focus on credit-check".to_string()]);
+        let mut msgs = vec![Msg::System("sys".into()), Msg::User("go".into())];
+        let mut sink = |_ev: AgentEvent| {};
+        let run = run_agent_streaming(&model, &EchoTools, &mut msgs, 5, None, Some(&steer), &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(run.answer, "done");
+        // The steer was consumed from the queue …
+        assert!(steer.lock().unwrap().is_empty());
+        // … and appears as a user message in the transcript.
+        assert!(
+            msgs.iter().any(|m| matches!(m, Msg::User(t) if t == "focus on credit-check")),
+            "steer must be injected as a user turn: {msgs:?}"
+        );
     }
 
     #[test]
