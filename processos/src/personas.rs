@@ -331,18 +331,25 @@ findings or to ask the operator a genuine decision. Keep your thinking BRIEF: ne
 variant's BPMN XML inside your reasoning — author it directly as the simulate argument. Drafting the \
 full XML in your head wastes the output budget and can truncate the turn before you reach the tool \
 call. Read the scorecard honestly: \
-fidelityTier (recorded-replay means it was actually re-run on real inputs; requires-generative-mock \
-means a new job type has no recorded outputs to replay and would need a new worker), the \
+fidelityTier (recorded-replay means it was actually re-run on real inputs; mocked-replay means a new \
+worker you introduced was scored on the mock output YOU supplied — evaluable but assumption-based; \
+requires-generative-mock means a new job type has no recorded outputs AND you supplied no mock, so it \
+could not be scored), the \
 boundary-conserved count and conservedRate (did the variant still produce the SAME outputs the real \
 instances did? — a variant that breaks conservation changes behaviour, not just performance), \
-replayed latency, coverage, requiresNewWorkers, and any divergent output keys. If the scorecard has \
+replayed latency, coverage, requiresNewWorkers, mockedWorkers, and any divergent output keys. If the scorecard has \
 `feasible:false` with a `deployError`, your XML did not parse — read `deployError` and the `fixHint`, \
 fix THAT exact problem, and re-simulate; never resubmit the same broken XML or give up into a long \
 ramble. Author valid BPMN: an error boundary event needs a matching top-level `<bpmn:error>` and a \
 non-empty `errorRef` — to model a RETRY prefer a non-interrupting timer boundary that loops back to \
-the task, or reuse the model's existing error definition. Prefer changes that DON'T introduce a new \
-job type (which can't be replayed without a generative mock); reordering/parallelising existing tasks \
-or adding a retry on an existing one scores at full fidelity. To choose between \
+the task, or reuse the model's existing error definition. You CAN introduce a NEW worker (a job type \
+the recorded history never ran — e.g. a fraud-check or background-check): add the service task with \
+its `zeebe:taskDefinition type`, and pass a `mockWorkers` map giving that job type the output \
+variables its worker would produce (e.g. {\"fraud-check\": {\"isFraud\": false}}). The variant then \
+scores at mocked-replay (Level 3) instead of being unscorable — just be explicit that the result \
+rests on your mock assumption. When a measured (Level-2) change is available, prefer it: reordering or \
+parallelising EXISTING tasks, or adding a retry on an existing one, scores at full fidelity with no \
+mock needed. To choose between \
 several ideas, call compare_variants with the whole population (the current model is included as the \
 baseline) and let it rank them fidelity-first — only a variant that conserves the boundary AND \
 improves the objective is a real win.\n\

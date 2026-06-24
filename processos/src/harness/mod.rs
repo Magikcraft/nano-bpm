@@ -60,8 +60,9 @@ pub(crate) use queueing::{erlang_c, min_workers_for_p99, StaffingPlan};
 pub use rank::{run_scenario, HarnessReport, VariantResult};
 #[allow(unused_imports)]
 pub use replay::{
-    replay_dataset, replay_instance, JobCoverage, KeyCount, RecordedInstance, RecordedStimulus,
-    ReplayReport, ReplayResult, ReplayUnavailable, VarDivergence,
+    replay_dataset, replay_dataset_with_mocks, replay_instance, replay_instance_with_mocks,
+    JobCoverage, KeyCount, MockWorkers, RecordedInstance, RecordedStimulus, ReplayReport,
+    ReplayResult, ReplayUnavailable, VarDivergence,
 };
 #[allow(unused_imports)]
 pub use replay_rank::{

@@ -1437,7 +1437,8 @@ async fn cockpit_chat_send(
             let mut sink = move |ev: agent::AgentEvent| {
                 if let agent::AgentEvent::Request { round, body } = ev {
                     if let Ok(mut d) = dbg_capture.lock() {
-                        d.push(serde_json::json!({ "round": round, "body": body }));
+                        let ts = chat_now_ms();
+                        d.push(serde_json::json!({ "round": round, "ts": ts, "body": body }));
                     }
                 }
             };
@@ -1572,10 +1573,11 @@ async fn cockpit_chat_stream(
             let v = match ev {
                 agent::AgentEvent::Round(n) => serde_json::json!({ "type": "round", "n": n }),
                 agent::AgentEvent::Request { round, body } => {
+                    let ts = chat_now_ms();
                     if let Ok(mut d) = dbg_for_sink.lock() {
-                        d.push(serde_json::json!({ "round": round, "body": body.clone() }));
+                        d.push(serde_json::json!({ "round": round, "ts": ts, "body": body.clone() }));
                     }
-                    serde_json::json!({ "type": "request", "round": round, "body": body })
+                    serde_json::json!({ "type": "request", "round": round, "ts": ts, "body": body })
                 }
                 agent::AgentEvent::Reasoning(t) => serde_json::json!({ "type": "reasoning", "text": t }),
                 agent::AgentEvent::Answer(t) => serde_json::json!({ "type": "answer", "text": t }),
@@ -2149,6 +2151,10 @@ struct RankCandidateBody {
     rationale: Option<String>,
     /// BPMN XML of the candidate model.
     model: String,
+    /// Generative mocks for new workers this candidate introduces (job type →
+    /// assumed output delta), so a variant adding a worker can still be scored.
+    #[serde(default)]
+    mock_workers: std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>>,
 }
 
 /// Request body for the replay-rank population scorer.
@@ -2226,6 +2232,7 @@ async fn harness_replay_rank(
             name: c.name,
             rationale: c.rationale,
             model: c.model,
+            mock_workers: c.mock_workers,
         })
         .collect();
 

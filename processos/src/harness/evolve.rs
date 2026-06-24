@@ -192,6 +192,7 @@ pub fn parse_structural_candidates(text: &str) -> Result<Vec<CandidateModel>, St
                 .unwrap_or_else(|| format!("llm-candidate-{}", i + 1)),
             rationale: c.rationale.filter(|s| !s.trim().is_empty()),
             model: c.model,
+            ..Default::default()
         })
         .collect();
 

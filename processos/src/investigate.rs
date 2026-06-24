@@ -202,16 +202,28 @@ impl ToolBox for AnalysisTools {
                     conservedRate, replayed avg/p99 end-to-end latency, per-job-type coverage, the \
                     job types it would need NEW WORKERS for (requiresNewWorkers), and which recorded \
                     output keys it failed to reproduce. Author a full variant of the current model \
-                    (use read_model first) and pass its XML. Needs recorded-input capture; if none \
-                    is available it returns replayable=false with the reason. Args: model (BPMN \
-                    XML, required), name, rationale."
+                    (use read_model first) and pass its XML. If your variant adds a NEW worker (a \
+                    job type history never recorded), supply a generative mock for it in \
+                    `mockWorkers` so it can still be scored (fidelityTier becomes 'mocked-replay', \
+                    a Level-3 assumption-based result) instead of being unscorable. Needs \
+                    recorded-input capture; if none is available it returns replayable=false with \
+                    the reason. Args: model (BPMN XML, required), name, rationale, mockWorkers."
                     .into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "model": { "type": "string", "description": "Candidate BPMN XML to replay." },
                         "name": { "type": "string", "description": "Short label for the variant." },
-                        "rationale": { "type": "string", "description": "Why this variant was proposed." }
+                        "rationale": { "type": "string", "description": "Why this variant was proposed." },
+                        "mockWorkers": {
+                            "type": "object",
+                            "description": "Generative mocks for NEW workers the variant introduces: \
+                                map each new job type to the deterministic output variables its \
+                                worker would produce, e.g. {\"fraud-check\": {\"fraudScore\": 0.1, \
+                                \"isFraud\": false}}. Supply one per new job type so the variant is \
+                                scorable; existing (recorded) job types do not need a mock.",
+                            "additionalProperties": { "type": "object" }
+                        }
                     },
                     "required": ["model"]
                 }),
@@ -224,8 +236,11 @@ impl ToolBox for AnalysisTools {
                     model is included as the 'baseline' by default (set includeBaseline=false to \
                     omit). Use this to decide whether a redesign actually beats today's process on \
                     real history. Returns datasetSize, the ranked candidates with their scorecards, \
-                    and the best one. Needs recorded-input capture. Args: candidates (array of \
-                    {name, model (BPMN XML), rationale?}), includeBaseline (bool)."
+                    and the best one. Needs recorded-input capture. A variant that adds a NEW \
+                    worker can be scored by supplying a generative mock for it — either per \
+                    candidate (mockWorkers on that item) or a top-level mockWorkers shared by all. \
+                    Args: candidates (array of {name, model (BPMN XML), rationale?, mockWorkers?}), \
+                    includeBaseline (bool), mockWorkers (shared map)."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -238,7 +253,13 @@ impl ToolBox for AnalysisTools {
                                 "properties": {
                                     "name": { "type": "string" },
                                     "model": { "type": "string", "description": "Candidate BPMN XML." },
-                                    "rationale": { "type": "string" }
+                                    "rationale": { "type": "string" },
+                                    "mockWorkers": {
+                                        "type": "object",
+                                        "description": "Generative mocks for NEW workers THIS variant \
+                                            adds (job type → assumed output variables).",
+                                        "additionalProperties": { "type": "object" }
+                                    }
                                 },
                                 "required": ["model"]
                             }
@@ -246,6 +267,13 @@ impl ToolBox for AnalysisTools {
                         "includeBaseline": {
                             "type": "boolean",
                             "description": "Include the current model as 'baseline' (default true)."
+                        },
+                        "mockWorkers": {
+                            "type": "object",
+                            "description": "Generative mocks for new workers shared by ALL candidates \
+                                (job type → assumed output variables), e.g. {\"fraud-check\": \
+                                {\"isFraud\": false}}.",
+                            "additionalProperties": { "type": "object" }
                         }
                     },
                     "required": ["candidates"]

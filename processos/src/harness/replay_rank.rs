@@ -22,10 +22,12 @@ use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::ProcessDefinition;
 use serde::Serialize;
 
-use super::replay::{replay_dataset, RecordedInstance, ReplayReport};
+use super::replay::{
+    replay_dataset, replay_dataset_with_mocks, MockWorkers, RecordedInstance, ReplayReport,
+};
 
 /// A candidate model to score, as supplied by the operator or the LLM.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CandidateModel {
     /// Display name for the candidate (e.g. an LLM rationale label).
     pub name: String,
@@ -33,6 +35,10 @@ pub struct CandidateModel {
     pub rationale: Option<String>,
     /// BPMN XML of the candidate model.
     pub model: String,
+    /// Operator/LLM-supplied generative mocks for any **new workers** this
+    /// candidate introduces (job type → assumed output delta). Empty for a
+    /// candidate that only reuses existing, recorded job types.
+    pub mock_workers: MockWorkers,
 }
 
 /// The evaluation fidelity tier a candidate was scored at (§7.7 fidelity ladder).
@@ -50,22 +56,28 @@ pub enum FidelityTier {
     /// recorded output *of that job type*, so routing and the boundary used real
     /// production values. The result is measured (±replay residual), high trust.
     RecordedReplay,
+    /// **Level 3 — generative mock applied.** The candidate introduces new job
+    /// types, but the operator/LLM supplied a mock worker for every one, so it was
+    /// scored end-to-end on those *assumed* outputs. Evaluable, but only as trust-
+    /// worthy as the mock — distinct from a measured Level-2 result.
+    MockedReplay,
     /// **Level 3 — generative mock required (not yet evaluable).** The candidate
-    /// issues job types history never exercised, so faithful replay is impossible and
-    /// a generated mock worker is needed to score it. Surfaced, not hidden: these
+    /// issues job types history never exercised *and no mock was supplied* for
+    /// them, so faithful replay is impossible. Surfaced, not hidden: these
     /// candidates also require new workers to *deploy*.
     RequiresGenerativeMock,
 }
 
 impl FidelityTier {
-    /// Sort precedence: replay-evaluable (most trustworthy) first, then mock-required,
-    /// then infeasible. Keeps a high-fidelity result ahead of a speculative one even
-    /// when a flukey conserved rate would otherwise reorder them.
+    /// Sort precedence: replay-evaluable (most trustworthy) first, then mock-applied,
+    /// then mock-required, then infeasible. Keeps a high-fidelity result ahead of a
+    /// speculative one even when a flukey conserved rate would otherwise reorder them.
     fn rank(self) -> u8 {
         match self {
             FidelityTier::RecordedReplay => 0,
-            FidelityTier::RequiresGenerativeMock => 1,
-            FidelityTier::Infeasible => 2,
+            FidelityTier::MockedReplay => 1,
+            FidelityTier::RequiresGenerativeMock => 2,
+            FidelityTier::Infeasible => 3,
         }
     }
 }
@@ -74,10 +86,12 @@ impl FidelityTier {
 fn classify_tier(feasible: bool, report: &ReplayReport) -> FidelityTier {
     if !feasible || report.error.is_some() {
         FidelityTier::Infeasible
-    } else if report.uncovered_job_types.is_empty() {
-        FidelityTier::RecordedReplay
-    } else {
+    } else if !report.uncovered_job_types.is_empty() {
         FidelityTier::RequiresGenerativeMock
+    } else if !report.mocked_job_types.is_empty() {
+        FidelityTier::MockedReplay
+    } else {
+        FidelityTier::RecordedReplay
     }
 }
 
@@ -89,9 +103,17 @@ fn confidence_band(tier: FidelityTier, report: &ReplayReport) -> String {
             "Level 2 · measured on {} recorded instance(s), {} boundary-conserved",
             report.instances_total, report.conserved
         ),
+        FidelityTier::MockedReplay => format!(
+            "Level 3 · scored with operator-supplied mock(s) for {} new worker(s) ({}) — \
+             assumption-based, not measured",
+            report.mocked_job_types.len(),
+            report.mocked_job_types.join(", ")
+        ),
         FidelityTier::RequiresGenerativeMock => format!(
-            "Level 3 required · {} new job type(s) need a generative mock to score",
-            report.uncovered_job_types.len()
+            "Level 3 required · {} new job type(s) need a generative mock to score ({}) — \
+             supply mockWorkers to evaluate",
+            report.uncovered_job_types.len(),
+            report.uncovered_job_types.join(", ")
         ),
     }
 }
@@ -116,6 +138,9 @@ pub struct RankedCandidate {
     /// needs a new worker per type to *deploy*, and a generative mock to *evaluate*.
     /// Empty ⇔ replay-evaluable (Level 2). First-class, not buried in the scorecard.
     pub requires_new_workers: Vec<String>,
+    /// New job types that WERE scored, served from an operator/LLM-supplied mock
+    /// (the new workers this candidate introduced and provided a mock for).
+    pub mocked_workers: Vec<String>,
     /// A short confidence band qualifying the metrics by their fidelity tier.
     pub confidence: String,
     /// The full Level-2 scorecard for this candidate.
@@ -176,7 +201,7 @@ fn score_candidate(
             let process_id = default_process_id
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| defs[0].id.clone());
-            let report = replay_dataset(&defs, &process_id, dataset);
+            let report = replay_dataset_with_mocks(&defs, &process_id, dataset, &c.mock_workers);
             let tier = classify_tier(true, &report);
             RankedCandidate {
                 name: c.name.clone(),
@@ -185,6 +210,7 @@ fn score_candidate(
                 feasible: true,
                 fidelity_tier: tier,
                 requires_new_workers: report.uncovered_job_types.clone(),
+                mocked_workers: report.mocked_job_types.clone(),
                 confidence: confidence_band(tier, &report),
                 report,
             }
@@ -210,6 +236,7 @@ fn infeasible(c: &CandidateModel, default_process_id: Option<&str>, reason: &str
         feasible: false,
         fidelity_tier: tier,
         requires_new_workers: report.uncovered_job_types.clone(),
+        mocked_workers: report.mocked_job_types.clone(),
         confidence: confidence_band(tier, &report),
         report,
     }
@@ -347,11 +374,13 @@ mod tests {
                 name: "drop-summarize".into(),
                 rationale: Some("fewer steps".into()),
                 model: ONE_TASK.into(),
+                ..Default::default()
             },
             CandidateModel {
                 name: "keep-both".into(),
                 rationale: None,
                 model: TWO_TASK.into(),
+                ..Default::default()
             },
         ];
         let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
@@ -372,11 +401,13 @@ mod tests {
                 name: "broken".into(),
                 rationale: None,
                 model: "<not-bpmn/>".into(),
+                ..Default::default()
             },
             CandidateModel {
                 name: "good".into(),
                 rationale: None,
                 model: TWO_TASK.into(),
+                ..Default::default()
             },
         ];
         let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
@@ -404,16 +435,19 @@ mod tests {
                 name: "needs-translate-worker".into(),
                 rationale: Some("add translation".into()),
                 model: NEW_JOB.into(),
+                ..Default::default()
             },
             CandidateModel {
                 name: "keep-both".into(),
                 rationale: None,
                 model: TWO_TASK.into(),
+                ..Default::default()
             },
             CandidateModel {
                 name: "broken".into(),
                 rationale: None,
                 model: "<not-bpmn/>".into(),
+                ..Default::default()
             },
         ];
         let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
@@ -449,6 +483,7 @@ mod tests {
             name: "keep-both".into(),
             rationale: None,
             model: TWO_TASK.into(),
+            ..Default::default()
         }];
         let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
         let json = serde_json::to_value(&ranking).unwrap();
@@ -458,5 +493,48 @@ mod tests {
         );
         assert!(json["candidates"][0]["requiresNewWorkers"].is_array());
         assert!(json["candidates"][0]["confidence"].is_string());
+    }
+
+    #[test]
+    fn supplying_a_mock_for_a_new_worker_upgrades_it_to_mocked_replay() {
+        let ds = dataset();
+        let mut with_mock = CandidateModel {
+            name: "translate-with-mock".into(),
+            rationale: Some("add translation, mocked".into()),
+            model: NEW_JOB.into(),
+            ..Default::default()
+        };
+        with_mock.mock_workers.insert(
+            "translate".to_string(),
+            [("translated".to_string(), json!(true))].into_iter().collect(),
+        );
+        let without_mock = CandidateModel {
+            name: "translate-no-mock".into(),
+            model: NEW_JOB.into(),
+            ..Default::default()
+        };
+        let ranking = rank_candidates_by_replay(&[with_mock, without_mock], &ds, Some("P"));
+
+        let mocked = ranking
+            .candidates
+            .iter()
+            .find(|c| c.name == "translate-with-mock")
+            .unwrap();
+        assert_eq!(mocked.fidelity_tier, FidelityTier::MockedReplay);
+        assert_eq!(mocked.mocked_workers, vec!["translate".to_string()]);
+        assert!(mocked.requires_new_workers.is_empty());
+        assert!(mocked.confidence.starts_with("Level 3"));
+
+        let unmocked = ranking
+            .candidates
+            .iter()
+            .find(|c| c.name == "translate-no-mock")
+            .unwrap();
+        assert_eq!(unmocked.fidelity_tier, FidelityTier::RequiresGenerativeMock);
+
+        // A mock-applied (evaluable) candidate ranks above one that still needs a mock.
+        let mocked_idx = ranking.candidates.iter().position(|c| c.name == "translate-with-mock").unwrap();
+        let unmocked_idx = ranking.candidates.iter().position(|c| c.name == "translate-no-mock").unwrap();
+        assert!(mocked_idx < unmocked_idx);
     }
 }

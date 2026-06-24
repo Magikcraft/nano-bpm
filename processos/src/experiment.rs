@@ -17,12 +17,12 @@
 //! replayable, and the tools say so plainly (with skip accounting) rather than
 //! fabricating a result.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Value};
 
 use crate::dataset::TraceSource;
-use crate::harness::{rank_candidates_by_replay, CandidateModel, RecordedInstance};
+use crate::harness::{rank_candidates_by_replay, CandidateModel, MockWorkers, RecordedInstance};
 
 /// How many recent instances to draw into the replay dataset (bounds the per-turn I/O
 /// and keeps replay fast); mirrors the replay-rank HTTP endpoint's default.
@@ -136,6 +136,24 @@ fn deploy_fix_hint(err: &str) -> Option<String> {
     None
 }
 
+/// Parse a `mockWorkers` argument into [`MockWorkers`]. Accepts an object mapping a
+/// new job type to the deterministic output delta its mock worker produces, e.g.
+/// `{ "fraud-check": { "fraudScore": 0.1, "isFraud": false } }`. A non-object (or
+/// absent) value yields no mocks. Non-object per-type values are skipped.
+fn parse_mock_workers(v: &Value) -> MockWorkers {
+    let mut mocks = MockWorkers::new();
+    if let Some(obj) = v.as_object() {
+        for (job_type, out) in obj {
+            if let Some(out_obj) = out.as_object() {
+                let delta: HashMap<String, Value> =
+                    out_obj.iter().map(|(k, val)| (k.clone(), val.clone())).collect();
+                mocks.insert(job_type.clone(), delta);
+            }
+        }
+    }
+    mocks
+}
+
 /// `simulate` — replay one candidate model against the recorded dataset.
 pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Value) -> Result<Value, String> {
     let model = args["model"]
@@ -146,8 +164,9 @@ pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Val
     }
     let name = args["name"].as_str().unwrap_or("variant").to_string();
     let rationale = args["rationale"].as_str().map(|s| s.to_string());
+    let mock_workers = parse_mock_workers(&args["mockWorkers"]);
     let pid = default_process_id(dataset);
-    let candidate = CandidateModel { name, rationale, model: model.to_string() };
+    let candidate = CandidateModel { name, rationale, model: model.to_string(), mock_workers };
     let ranking = rank_candidates_by_replay(
         std::slice::from_ref(&candidate),
         &dataset.instances,
@@ -176,6 +195,10 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
         return Ok(unavailable(dataset));
     }
     let include_baseline = args["includeBaseline"].as_bool().unwrap_or(true);
+    // A top-level `mockWorkers` applies to every candidate (the new workers
+    // available in this alternate reality); a per-candidate `mockWorkers` merges
+    // over it for variants that define their own.
+    let shared_mocks = parse_mock_workers(&args["mockWorkers"]);
 
     let mut candidates: Vec<CandidateModel> = Vec::new();
     if include_baseline {
@@ -184,6 +207,7 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
                 name: "baseline (current model)".into(),
                 rationale: Some("the model currently deployed for this process".into()),
                 model: base.to_string(),
+                ..Default::default()
             });
         }
     }
@@ -191,10 +215,15 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
         let model = c["model"]
             .as_str()
             .ok_or_else(|| format!("candidate #{i} is missing a string 'model' (BPMN XML)"))?;
+        let mut mock_workers = shared_mocks.clone();
+        for (jt, out) in parse_mock_workers(&c["mockWorkers"]) {
+            mock_workers.insert(jt, out);
+        }
         candidates.push(CandidateModel {
             name: c["name"].as_str().unwrap_or(&format!("variant {}", i + 1)).to_string(),
             rationale: c["rationale"].as_str().map(|s| s.to_string()),
             model: model.to_string(),
+            mock_workers,
         });
     }
     if candidates.is_empty() {
@@ -332,6 +361,46 @@ mod tests {
         assert_eq!(baseline["report"]["conserved"], 3);
         let fork = cands.iter().find(|c| c["name"] == "drop-summarize").unwrap();
         assert_eq!(fork["report"]["conserved"], 0);
+    }
+
+    #[test]
+    fn simulate_scores_a_new_worker_when_a_mock_is_supplied() {
+        // TWO_TASK issues classify+summarize, but our dataset only recorded classify —
+        // so summarize is a new worker. Supplying a mock for it makes the variant
+        // scorable at the mocked-replay tier instead of requiring a generative mock.
+        let ds = RecordedDataset {
+            instances: vec![RecordedInstance {
+                instance_key: "k0".into(),
+                process_id: "P".into(),
+                started_at: 1000,
+                creation_variables: [("input".to_string(), json!("x"))].into_iter().collect(),
+                stimuli: vec![RecordedStimulus {
+                    seq: 1,
+                    at: 1100,
+                    kind: "jobCompleted".into(),
+                    reference: Some("classify".into()),
+                    variables: Some([("label".to_string(), json!("A"))].into_iter().collect::<HashMap<_, _>>()),
+                }],
+            }],
+            matched: 1,
+            skipped: 0,
+            skip_reasons: BTreeMap::new(),
+        };
+        let v = simulate(
+            None,
+            &ds,
+            &json!({
+                "model": TWO_TASK,
+                "name": "mocked",
+                "mockWorkers": { "summarize": { "summary": "M" } }
+            }),
+        )
+        .unwrap();
+        assert_eq!(v["replayable"], true);
+        let sc = &v["scorecard"];
+        assert_eq!(sc["fidelityTier"], "mocked-replay");
+        assert_eq!(sc["mockedWorkers"], json!(["summarize"]));
+        assert!(sc["requiresNewWorkers"].as_array().unwrap().is_empty());
     }
 
     #[test]

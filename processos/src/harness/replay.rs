@@ -36,6 +36,14 @@ use serde_json::Value as Json;
 
 use crate::contracts::{InstanceTrace, Variables};
 
+/// Operator/LLM-supplied **generative mock workers** for the Alternate Reality
+/// engine, keyed by job type. Each entry is the deterministic output delta the new
+/// worker is assumed to produce. When a candidate issues a job type history never
+/// recorded (a *new worker*), replay serves the mock's output instead of completing
+/// empty — so a structural change that adds a worker can actually be scored
+/// (Level-3, assumption-based) rather than hitting an unreplayable dead end.
+pub type MockWorkers = HashMap<String, HashMap<String, Json>>;
+
 /// A recorded instance distilled from a [`InstanceTrace`] into exactly what replay
 /// needs: the creation inputs and the ordered stimulus log with its values
 /// resolved to natural JSON.
@@ -190,6 +198,10 @@ pub struct ReplayResult {
     /// Job types the candidate issued more often than history recorded — these
     /// have no historical output to replay ⇒ *requires a new worker* to deploy.
     pub uncovered_job_types: Vec<String>,
+    /// Job types served from an operator/LLM-supplied **generative mock** (a new
+    /// worker the candidate introduced, scored on the mock's assumed output rather
+    /// than recorded history) — Level-3 fidelity, surfaced not hidden.
+    pub mocked_job_types: Vec<String>,
     /// Keys of the recorded terminal output the replay failed to reproduce.
     pub divergences: Vec<VarDivergence>,
     /// Boundary conservation held: completed, fully covered, no divergence.
@@ -203,6 +215,20 @@ pub fn replay_instance(
     defs: &[ProcessDefinition],
     process_id: &str,
     rec: &RecordedInstance,
+) -> ReplayResult {
+    replay_instance_with_mocks(defs, process_id, rec, &MockWorkers::new())
+}
+
+/// Like [`replay_instance`], but with operator/LLM-supplied [`MockWorkers`]: when
+/// the candidate issues a job type history never recorded, its completion is served
+/// from the matching mock's output (and reported in `mocked_job_types`) instead of
+/// completing empty + flagged uncovered. This is what lets the Alternate Reality
+/// engine score a variant that introduces a **new worker**.
+pub fn replay_instance_with_mocks(
+    defs: &[ProcessDefinition],
+    process_id: &str,
+    rec: &RecordedInstance,
+    mocks: &MockWorkers,
 ) -> ReplayResult {
     // The recorded terminal output: creation inputs folded with every stimulus
     // delta in order (last-writer-wins) — what the original run left behind, and
@@ -251,6 +277,7 @@ pub fn replay_instance(
 
     let mut issued: HashMap<String, u32> = HashMap::new();
     let mut uncovered: Vec<String> = Vec::new();
+    let mut mocked: Vec<String> = Vec::new();
 
     // Walk the recorded stimulus timeline only for its timestamps: each job we
     // complete advances the clock to the next recorded input's `at`, so the
@@ -335,19 +362,40 @@ pub fn replay_instance(
                     );
                 }
                 None => {
-                    // No recorded output of this type remains: the candidate issues
-                    // a job history never produced ⇒ requires a new worker. Complete
-                    // empty to keep the token moving and surface it in coverage.
-                    if !uncovered.contains(&job_type) {
-                        uncovered.push(job_type.clone());
+                    // No recorded output of this type remains. If the operator/LLM
+                    // supplied a generative mock for this new worker, serve its
+                    // assumed output (Level-3 fidelity); otherwise complete empty and
+                    // flag the type as requiring a new worker (the historic dead end).
+                    match mocks.get(&job_type) {
+                        Some(mock_out) => {
+                            if !mocked.contains(&job_type) {
+                                mocked.push(job_type.clone());
+                            }
+                            let out: HashMap<String, Value> = mock_out
+                                .iter()
+                                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                                .collect();
+                            let _ = engine.apply_command_at(
+                                Command::CompleteJob {
+                                    job_key,
+                                    variables: out,
+                                },
+                                clock,
+                            );
+                        }
+                        None => {
+                            if !uncovered.contains(&job_type) {
+                                uncovered.push(job_type.clone());
+                            }
+                            let _ = engine.apply_command_at(
+                                Command::CompleteJob {
+                                    job_key,
+                                    variables: HashMap::new(),
+                                },
+                                clock,
+                            );
+                        }
                     }
-                    let _ = engine.apply_command_at(
-                        Command::CompleteJob {
-                            job_key,
-                            variables: HashMap::new(),
-                        },
-                        clock,
-                    );
                 }
             }
         }
@@ -392,6 +440,7 @@ pub fn replay_instance(
         .collect();
     coverage.sort_by(|a, b| a.job_type.cmp(&b.job_type));
     uncovered.sort();
+    mocked.sort();
 
     let e2e_latency_ms = last_consumed_at.saturating_sub(rec.started_at);
     let conserved = completed && uncovered.is_empty() && divergences.is_empty();
@@ -405,6 +454,7 @@ pub fn replay_instance(
         steps,
         coverage,
         uncovered_job_types: uncovered,
+        mocked_job_types: mocked,
         divergences,
         conserved,
     }
@@ -434,6 +484,7 @@ fn invalid(rec: &RecordedInstance, error: String) -> ReplayResult {
         steps: 0,
         coverage: Vec::new(),
         uncovered_job_types: Vec::new(),
+        mocked_job_types: Vec::new(),
         divergences: Vec::new(),
         conserved: false,
     }
@@ -472,6 +523,9 @@ pub struct ReplayReport {
     /// Union of job types the candidate issued that history never produced an
     /// output for — i.e. the workers a deploy of this candidate would require.
     pub uncovered_job_types: Vec<String>,
+    /// Union of job types served from an operator/LLM-supplied generative mock
+    /// (the new workers the candidate introduced, scored on assumed output).
+    pub mocked_job_types: Vec<String>,
     /// Recorded-terminal keys the candidate most often failed to reproduce.
     pub divergent_keys: Vec<KeyCount>,
     /// Mean replayed end-to-end latency over completed instances (ms).
@@ -494,9 +548,21 @@ pub fn replay_dataset(
     process_id: &str,
     dataset: &[RecordedInstance],
 ) -> ReplayReport {
+    replay_dataset_with_mocks(defs, process_id, dataset, &MockWorkers::new())
+}
+
+/// Like [`replay_dataset`], but threads operator/LLM-supplied [`MockWorkers`] into
+/// every instance replay, so a candidate introducing new workers is scored on the
+/// mocks' assumed outputs (Level-3) rather than failing as unreplayable.
+pub fn replay_dataset_with_mocks(
+    defs: &[ProcessDefinition],
+    process_id: &str,
+    dataset: &[RecordedInstance],
+    mocks: &MockWorkers,
+) -> ReplayReport {
     let results: Vec<ReplayResult> = dataset
         .iter()
-        .map(|rec| replay_instance(defs, process_id, rec))
+        .map(|rec| replay_instance_with_mocks(defs, process_id, rec, mocks))
         .collect();
 
     let instances_total = results.len() as u32;
@@ -511,6 +577,14 @@ pub fn replay_dataset(
         .collect();
     uncovered.sort();
     uncovered.dedup();
+
+    // Union of mocked job types (new workers served from a supplied mock).
+    let mut mocked: Vec<String> = results
+        .iter()
+        .flat_map(|r| r.mocked_job_types.iter().cloned())
+        .collect();
+    mocked.sort();
+    mocked.dedup();
 
     // Which recorded-terminal keys diverge most across the dataset.
     let mut key_counts: HashMap<String, u32> = HashMap::new();
@@ -565,6 +639,7 @@ pub fn replay_dataset(
         conserved,
         conserved_rate,
         uncovered_job_types: uncovered,
+        mocked_job_types: mocked,
         divergent_keys,
         avg_e2e_latency_ms,
         p99_e2e_latency_ms,
@@ -743,6 +818,49 @@ mod tests {
         // Only classify was issued.
         assert_eq!(res.coverage.len(), 1);
         assert_eq!(res.coverage[0].job_type, "classify");
+    }
+
+    #[test]
+    fn a_supplied_mock_worker_serves_a_new_job_type_instead_of_flagging_it_uncovered() {
+        // History recorded only classify; the candidate (TWO_TASK) also issues
+        // summarize — a NEW worker. The recorded terminal still held summary=S (folded
+        // into the creation boundary here). With a mock for summarize that outputs
+        // summary=S, replay serves it: the type is reported mocked (not uncovered) and
+        // the mock's output reproduces the recorded boundary ⇒ conserved.
+        let mut creation = map(&[("input", json!("x"))]);
+        creation.insert("summary".into(), json!("S"));
+        let r = RecordedInstance {
+            instance_key: "1".into(),
+            process_id: "P".into(),
+            started_at: 1000,
+            creation_variables: creation,
+            stimuli: vec![job(1, 1100, "classify", Some(&[("label", json!("A"))]))],
+        };
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+
+        let mut mocks = MockWorkers::new();
+        mocks.insert(
+            "summarize".to_string(),
+            [("summary".to_string(), json!("S"))].into_iter().collect(),
+        );
+
+        let res = replay_instance_with_mocks(&defs, "P", &r, &mocks);
+        assert!(res.valid && res.completed);
+        assert!(res.uncovered_job_types.is_empty(), "mocked type must not be uncovered");
+        assert_eq!(res.mocked_job_types, vec!["summarize".to_string()]);
+        assert!(res.conserved, "divergences: {:?}", res.divergences);
+    }
+
+    #[test]
+    fn without_a_mock_the_same_new_worker_is_still_uncovered() {
+        let r = rec(
+            &[("input", json!("x"))],
+            vec![job(1, 1100, "classify", Some(&[("label", json!("A"))]))],
+        );
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+        let res = replay_instance_with_mocks(&defs, "P", &r, &MockWorkers::new());
+        assert_eq!(res.uncovered_job_types, vec!["summarize".to_string()]);
+        assert!(res.mocked_job_types.is_empty());
     }
 
     #[test]

@@ -145,6 +145,7 @@
   .dbg-round { border: 1px solid #26262b; border-radius: 10px; background: #0b0b14; margin-bottom: 10px; }
   .dbg-round > summary { cursor: pointer; padding: 8px 12px; font: 600 12px/1.4 inherit; color: #c7d2fe; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .dbg-round > summary .dim { color: #6b7280; font-weight: 400; font-family: ui-monospace, monospace; font-size: 11px; }
+  .dbg-round > summary .dbg-ts { margin-left: auto; color: #6b7280; font-weight: 500; font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }
   .dbg-round .dbg-actions { padding: 0 12px 8px; display: flex; gap: 8px; flex-wrap: wrap; }
   .dbg-round .dbg-actions .copybtn { float: none; margin: 0; border: 1px solid #34343c; border-radius: 6px; padding: 3px 9px; font-size: 11px; color: #a1a1aa; }
   .dbg-round .dbg-actions .copybtn:hover { color: #c7d2fe; border-color: #4b5563; }
@@ -231,7 +232,7 @@
   .persona-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a1a1aa; }
   .persona-pick > span { white-space: nowrap; }
   .persona-pick select:disabled { opacity: .7; cursor: not-allowed; }
-  .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 9px 11px; font: 13px/1.5 inherit; resize: vertical; min-height: 64px; }
+  .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 10px 12px; font: 15px/1.55 inherit; resize: vertical; min-height: 72px; }
   .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
   .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .fontctl { display: inline-flex; align-items: center; gap: 4px; margin-left: 4px; }
@@ -378,6 +379,15 @@ function fmtTime(t){
   const hm = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
   const sameDay = d.toDateString() === now.toDateString();
   return sameDay ? hm : (d.toLocaleDateString([], {month:'short', day:'numeric'})+' '+hm);
+}
+
+// Like fmtTime but with seconds — debug rounds often fire seconds apart.
+function fmtClock(t){
+  if(!t) return '';
+  const d = new Date(t), now = new Date();
+  const hms = d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+  const sameDay = d.toDateString() === now.toDateString();
+  return sameDay ? hms : (d.toLocaleDateString([], {month:'short', day:'numeric'})+' '+hms);
 }
 
 async function api(path, opts){
@@ -904,7 +914,8 @@ function renderDebug(data){
     const msgs = b.messages || [];
     const tools = b.tools || [];
     const head = 'Round '+(entry.round!=null?entry.round:(idx+1))+
-      ' <span class="dim">'+esc(b.model||'')+(b.temperature!=null?(' · temp '+esc(b.temperature)):'')+(b.max_tokens!=null?(' · max_tokens '+esc(b.max_tokens)):'')+' · '+msgs.length+' messages</span>';
+      ' <span class="dim">'+esc(b.model||'')+(b.temperature!=null?(' · temp '+esc(b.temperature)):'')+(b.max_tokens!=null?(' · max_tokens '+esc(b.max_tokens)):'')+' · '+msgs.length+' messages</span>'+
+      (entry.ts?'<span class="dbg-ts" title="'+esc(new Date(entry.ts).toLocaleString())+'">'+esc(fmtClock(entry.ts))+'</span>':'');
     const copyJson = esc(JSON.stringify(b, null, 2));
     const msgHtml = msgs.map(m => {
       const rc = roleClass(m.role);
@@ -1319,7 +1330,7 @@ async function sendChat(ws, proc){
   function handleEvent(ev){
     if(ev.type==='round'){ if(liveStatus) liveStatus.textContent = 'round '+ev.n+' — investigating…'; }
     else if(ev.type==='request'){
-      liveDebug.push({ round: ev.round, body: ev.body });
+      liveDebug.push({ round: ev.round, ts: ev.ts || Date.now(), body: ev.body });
       if(STATE.chatTab==='debug'){ const host=$('#chatDebug'); if(host) host.innerHTML = renderDebug({ requests: liveDebug }); }
     }
     else if(ev.type==='reasoning'){
