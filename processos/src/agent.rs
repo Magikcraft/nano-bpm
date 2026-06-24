@@ -516,6 +516,12 @@ impl AgentStep for OpenAiAgent {
         } else {
             format!("<think>{reasoning}</think>\n{content}")
         };
+        // Fallback: recover a tool call the model leaked into the streamed `content`
+        // as literal template tokens, so a leaked call doesn't end the loop early.
+        let leaked = parse_leaked_tool_calls(&final_text);
+        if !leaked.is_empty() {
+            return Ok(Turn::ToolCalls(leaked));
+        }
         Ok(Turn::Final(final_text))
     }
 }
@@ -591,7 +597,121 @@ fn parse_openai_turn(message: &Value) -> Result<Turn, String> {
     } else {
         format!("<think>{reasoning}</think>\n{content}")
     };
+    // Fallback: a model that leaked its tool call into `content` as literal template
+    // tokens (no structured `tool_calls`) would otherwise end the loop prematurely.
+    let leaked = parse_leaked_tool_calls(&final_text);
+    if !leaked.is_empty() {
+        return Ok(Turn::ToolCalls(leaked));
+    }
     Ok(Turn::Final(final_text))
+}
+
+/// Recover tool calls that a local model leaked into its `content` as literal
+/// template tokens instead of the structured `tool_calls` field.
+///
+/// Some llama.cpp-served models (observed: Gemma-4, Qwen3.x) intermittently emit
+/// their tool call as plain text — even with `--jinja` — when the server's chat
+/// template doesn't recognise the model's tool-call syntax. The OpenAI parse path
+/// then sees no tool call and the agent loop ends, so a multi-step investigation
+/// appears to "abort" mid-analysis. This is a defensive fallback: when no
+/// structured call is present we scan the text for the mangled shape and rebuild
+/// the call so the loop can continue.
+///
+/// Recognised (mangled) shape, e.g.:
+/// ```text
+/// <|tool_call>call:query_traces{sql:<|"|>SELECT 1<|"|>}<tool_call|>
+/// ```
+/// String argument values are delimited by the `<|"|>` quote marker; bare
+/// (unquoted) values are parsed as JSON scalars when possible, else as strings.
+fn parse_leaked_tool_calls(content: &str) -> Vec<ToolCall> {
+    const OPEN: &str = "<|tool_call>";
+    const CLOSE: &str = "<tool_call|>";
+    const QUOTE: &str = "<|\"|>";
+
+    let mut calls = Vec::new();
+    let mut rest = content;
+    let mut idx = 0usize;
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        // Body runs to the closing wrapper if present, else to the end of the text
+        // (some models drop the closing token).
+        let (segment, consumed) = match after_open.find(CLOSE) {
+            Some(end) => (&after_open[..end], start + OPEN.len() + end + CLOSE.len()),
+            None => (after_open, rest.len()),
+        };
+        if let Some(call) = parse_leaked_segment(segment, QUOTE, idx) {
+            calls.push(call);
+            idx += 1;
+        }
+        rest = &rest[consumed..];
+    }
+    calls
+}
+
+/// Parse one `call:NAME{ ... }` segment into a [`ToolCall`].
+fn parse_leaked_segment(segment: &str, quote: &str, idx: usize) -> Option<ToolCall> {
+    let seg = segment.trim();
+    let seg = seg.strip_prefix("call:").unwrap_or(seg).trim_start();
+    let brace = seg.find('{')?;
+    let name = seg[..brace].trim().trim_matches(|c| c == ':' || c == ' ');
+    if name.is_empty() {
+        return None;
+    }
+    let close = seg.rfind('}')?;
+    if close < brace {
+        return None;
+    }
+    let body = &seg[brace + 1..close];
+    let arguments = parse_leaked_args(body, quote);
+    Some(ToolCall {
+        id: format!("leaked_call_{idx}"),
+        name: name.to_string(),
+        arguments,
+    })
+}
+
+/// Parse a `key:<|"|>value<|"|>, key2:bare` argument body into a JSON object.
+fn parse_leaked_args(body: &str, quote: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    let mut rest = body;
+    while !rest.trim().is_empty() {
+        // Advance to the next key, skipping separators left by the previous value.
+        rest = rest.trim_start_matches([',', ' ', '\n', '\t', '\r']);
+        let colon = match rest.find(':') {
+            Some(c) => c,
+            None => break,
+        };
+        let key = rest[..colon].trim().trim_matches('"').to_string();
+        let mut after = rest[colon + 1..].trim_start();
+        if key.is_empty() {
+            break;
+        }
+        if let Some(stripped) = after.strip_prefix(quote) {
+            // Quoted string value: read until the closing quote marker.
+            match stripped.find(quote) {
+                Some(endq) => {
+                    let val = &stripped[..endq];
+                    map.insert(key, Value::String(val.to_string()));
+                    after = &stripped[endq + quote.len()..];
+                }
+                None => {
+                    // Unterminated quote: take the remainder as the value and stop.
+                    map.insert(key, Value::String(stripped.to_string()));
+                    break;
+                }
+            }
+        } else {
+            // Bare value up to the next comma; parse as a JSON scalar when possible.
+            let end = after.find(',').unwrap_or(after.len());
+            let raw = after[..end].trim();
+            let val = serde_json::from_str::<Value>(raw)
+                .unwrap_or_else(|_| Value::String(raw.to_string()));
+            map.insert(key, val);
+            after = &after[end..];
+        }
+        rest = after;
+    }
+    Value::Object(map)
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -740,5 +860,64 @@ mod tests {
             Turn::Final(s) => assert_eq!(s, "<think>step one\nstep two</think>\nthe answer"),
             Turn::ToolCalls(_) => panic!("expected final"),
         }
+    }
+
+    #[test]
+    fn recovers_a_tool_call_leaked_into_content() {
+        // Verbatim shape observed from Gemma-4 in Investigation 5: the model emitted
+        // its tool call as literal template tokens in `content` with empty tool_calls.
+        let leaked = "</think><|tool_call>call:query_traces{sql:<|\"|>SELECT element_id, count(*) as count FROM incidents GROUP BY element_id<|\"|>}<tool_call|></think>\n";
+        let msg = json!({ "content": leaked, "tool_calls": [] });
+        match parse_openai_turn(&msg).unwrap() {
+            Turn::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "query_traces");
+                assert_eq!(
+                    calls[0].arguments["sql"],
+                    "SELECT element_id, count(*) as count FROM incidents GROUP BY element_id"
+                );
+            }
+            Turn::Final(_) => panic!("expected the leaked tool call to be recovered"),
+        }
+    }
+
+    #[test]
+    fn structured_tool_calls_take_precedence_over_leak_scan() {
+        // A normal structured call must never be re-parsed by the fallback.
+        let msg = json!({
+            "content": "irrelevant prose with no markers",
+            "tool_calls": [{
+                "id": "abc",
+                "type": "function",
+                "function": { "name": "read_model", "arguments": "{}" }
+            }]
+        });
+        match parse_openai_turn(&msg).unwrap() {
+            Turn::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "abc");
+                assert_eq!(calls[0].name, "read_model");
+            }
+            Turn::Final(_) => panic!("expected structured tool call"),
+        }
+    }
+
+    #[test]
+    fn plain_prose_is_never_misread_as_a_tool_call() {
+        let msg = json!({ "content": "The bottleneck is credit-check; no action token here." });
+        match parse_openai_turn(&msg).unwrap() {
+            Turn::Final(s) => assert!(s.contains("bottleneck")),
+            Turn::ToolCalls(_) => panic!("plain prose must stay a final answer"),
+        }
+    }
+
+    #[test]
+    fn parses_leaked_call_with_missing_close_token_and_bare_arg() {
+        // Defensive: closing wrapper dropped, plus a bare (unquoted) scalar arg.
+        let leaked = "<|tool_call>call:simulate{limit:500}";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "simulate");
+        assert_eq!(calls[0].arguments["limit"], 500);
     }
 }
