@@ -29,10 +29,13 @@ struct PyEnv {
 }
 
 /// A [`ToolBox`] exposing the read-only trace-analysis surface to the model, and
-/// optionally a (trusted) Python escape hatch.
+/// optionally a (trusted) Python escape hatch and the BPMN model-analysis tools.
 pub struct AnalysisTools {
     analysis: Analysis,
     python: Option<PyEnv>,
+    /// Raw `model.bpmn` XML for the bound process, when one is present. Enables the
+    /// structural `read_model` / `analyze_model` tools (parsed lazily on call).
+    model: Option<String>,
 }
 
 impl Drop for AnalysisTools {
@@ -49,6 +52,7 @@ impl AnalysisTools {
         Self {
             analysis,
             python: None,
+            model: None,
         }
     }
 
@@ -71,7 +75,17 @@ impl AnalysisTools {
         if python.is_none() {
             let _ = std::fs::remove_dir_all(&workdir);
         }
-        Self { analysis, python }
+        Self {
+            analysis,
+            python,
+            model: None,
+        }
+    }
+
+    /// Attach the process's BPMN model so the structural model-analysis tools become
+    /// available. A `None` (or absent `model.bpmn`) leaves them off.
+    pub fn set_model(&mut self, xml: Option<String>) {
+        self.model = xml.filter(|x| !x.trim().is_empty());
     }
 }
 
@@ -118,6 +132,33 @@ impl ToolBox for AnalysisTools {
                 }),
             });
         }
+        if self.model.is_some() {
+            specs.push(ToolSpec {
+                name: "read_model".into(),
+                description: "Return the structural view of this process's BPMN MODEL \
+                    (independent of runtime): the start event, per-kind counts, and every \
+                    node with its kind, key attributes (serviceTask jobType, boundary \
+                    attachment, timer/message details), incoming count, outgoing targets \
+                    (conditional flagged), reachability and gateway split/join role. Node \
+                    ids and serviceTask jobTypes are the SAME keys the trace tables use \
+                    (jobs.element_id / jobs.job_type, incidents.element_id) — use this to \
+                    reason about structure and then join to runtime with query_traces. Takes \
+                    no arguments."
+                    .into(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            });
+            specs.push(ToolSpec {
+                name: "analyze_model".into(),
+                description: "Run deterministic static checks over the BPMN model structure \
+                    and return advisory findings: unreachable nodes, dead ends, missing end \
+                    events, exclusive splits with no default flow, unguarded service tasks \
+                    (no error/timer boundary), gateway split/join hazards, and rework loops. \
+                    Each finding references element ids that join to the trace tables, so you \
+                    can quantify the risk with query_traces. Takes no arguments."
+                    .into(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            });
+        }
         specs
     }
 
@@ -139,6 +180,22 @@ impl ToolBox for AnalysisTools {
                     .as_str()
                     .ok_or("run_python requires a string 'code' argument")?;
                 pyrunner::run_python(&py.cfg, &py.workdir, code)
+            }
+            "read_model" => {
+                let xml = self
+                    .model
+                    .as_ref()
+                    .ok_or("read_model is not available: this process has no BPMN model")?;
+                let v = crate::bpmn_model::read_model(xml)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise model: {e}"))
+            }
+            "analyze_model" => {
+                let xml = self
+                    .model
+                    .as_ref()
+                    .ok_or("analyze_model is not available: this process has no BPMN model")?;
+                let v = crate::bpmn_model::analyze_model(xml)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise findings: {e}"))
             }
             other => Err(format!("unknown tool '{other}'")),
         }
@@ -255,6 +312,7 @@ pub async fn run_chat_turn(
     allow_python: bool,
     objective: Option<&str>,
     persona_system: Option<&str>,
+    model_xml: Option<String>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     sink: &mut dyn FnMut(AgentEvent),
     mut messages: Vec<Msg>,
@@ -266,11 +324,12 @@ pub async fn run_chat_turn(
         jobs: analysis.job_count(),
         incidents: analysis.incident_count(),
     };
-    let tools = if allow_python {
+    let mut tools = if allow_python {
         AnalysisTools::with_python(analysis, py)
     } else {
         AnalysisTools::new(analysis)
     };
+    tools.set_model(model_xml);
     let model = OpenAiAgent { cfg };
 
     // Seed the system message (with one-time dataset framing) only at the start of a

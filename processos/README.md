@@ -214,6 +214,16 @@ instead of picking from a fixed menu.
   8000). For the rich path, point `PROCESSOS_PYTHON` at a venv:
   `python3 -m venv .venv && .venv/bin/pip install duckdb pandas numpy scipy` then
   `PROCESSOS_PYTHON=$PWD/.venv/bin/python`.
+- `bpmn_model.rs` — **structural BPMN tools** added to the toolbox whenever the process has a
+  `model.bpmn`: `read_model` distils the model into a structural graph (process id, start event,
+  per-kind counts, and per-node `{id, kind, incoming, outgoing, reachable, gatewayRole}` plus
+  kind extras like `jobType`/`attachedTo`/`messageName`), and `analyze_model` returns deterministic
+  static findings (missing end events, unreachable / dead-end nodes, exclusive gateways without a
+  default flow, unguarded service tasks, parallel-join deadlock hazards, exclusive joins of parallel
+  paths, rework loops). Both work with **zero trace data** (design-time review). A flow node's `id`
+  and a service task's `job_type` are the same join keys as the trace tables (`jobs.element_id`,
+  `jobs.job_type`, `incidents.element_id`), so structural risk can be confirmed against runtime via
+  `query_traces`. The **Process Architect** persona is prompted to drive these tools.
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:
@@ -251,8 +261,8 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   `.../chat/sessions`.
 - **Personas** — each chat session runs under a selectable **persona**: a standing *system*
   prompt that sets the droid's lens and discipline. Built-ins ship with **Performance Analyst**
-  (the default — the canonical `investigate::CHAT_SYSTEM`), **SRE / Incident Responder**, and
-  **Capacity Planner**; operators author their own in the Prompts view. The persona is chosen in
+  (the default — the canonical `investigate::CHAT_SYSTEM`), **SRE / Incident Responder**,
+  **Capacity Planner**, and **Process Architect**; operators author their own in the Prompts view. The persona is chosen in
   the cockpit's compose row, sent as `personaId`, and **baked into the session's system message
   on its first turn** — so a session's persona is fixed once the conversation starts (the picker
   locks and the bound id is surfaced on the session/`SessionMeta`). Personas persist to

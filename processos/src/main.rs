@@ -11,6 +11,7 @@
 
 mod agent;
 mod analysis;
+mod bpmn_model;
 mod chat;
 mod chat_prompts;
 mod contracts;
@@ -1398,6 +1399,8 @@ async fn cockpit_chat_send(
         .workspaces
         .get_process(&workspace, &process)
         .and_then(|p| p.config.objective);
+    // The process's BPMN model (if any) unlocks the structural read_model/analyze_model tools.
+    let model = state.workspaces.read_model(&workspace, &process);
     let key = chat::session_key(&workspace, &process);
     let sid = resolve_session(&state, &key, q.session.as_deref()).id;
     let cancel_key = chat_cancel_key(&key, &sid);
@@ -1445,6 +1448,7 @@ async fn cockpit_chat_send(
                 allow_python,
                 objective.as_deref(),
                 Some(&persona_system),
+                model,
                 Some(&cancel),
                 &mut sink,
                 prior,
@@ -1518,6 +1522,7 @@ async fn cockpit_chat_stream(
         .workspaces
         .get_process(&workspace, &process)
         .and_then(|p| p.config.objective);
+    let model = state.workspaces.read_model(&workspace, &process);
     let key = chat::session_key(&workspace, &process);
     let sid = resolve_session(&state, &key, q.session.as_deref()).id;
     let cancel_key = chat_cancel_key(&key, &sid);
@@ -1590,6 +1595,7 @@ async fn cockpit_chat_stream(
             allow_python,
             objective.as_deref(),
             Some(&persona_system),
+            model,
             Some(&cancel),
             &mut sink,
             prior,
