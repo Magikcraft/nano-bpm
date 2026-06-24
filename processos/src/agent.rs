@@ -225,30 +225,41 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
         };
         match turn {
             Turn::Final(answer) => {
-                // A model (especially a local one) sometimes ends a turn by NAMING a
-                // next action ("I will now author the variant") without performing it —
-                // a genuine final turn with no tool call that would silently end the
-                // investigation. Nudge it to actually act, bounded, and never when the
-                // operator asked to wrap up. Uses the same mid-conversation System
+                // Two failure modes end a turn without progress: (a) the model NAMES a
+                // next action ("I will now author the variant") but doesn't perform it,
+                // and (b) the model only *thinks* — a reasoning-only turn with no visible
+                // answer and no tool call, often because it exhausted its output budget
+                // mid-thought (renders as a blank "cut off while thinking" bubble). Both
+                // would silently end the investigation. Nudge once (bounded), never when
+                // the operator asked to wrap up, using the same mid-conversation System
                 // steering pattern as wrap_up.
                 let wrapping_up = cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+                let thinking_only = is_thinking_only(&answer);
+                let needs_nudge = thinking_only || signals_deferred_action(&answer);
                 if !wrapping_up
                     && auto_continues < MAX_AUTO_CONTINUES
                     && round < max_rounds
-                    && signals_deferred_action(&answer)
+                    && needs_nudge
                 {
                     msgs.push(Msg::Assistant {
                         text: Some(answer.clone()),
                         tool_calls: Vec::new(),
                     });
-                    msgs.push(Msg::System(
+                    let nudge = if thinking_only {
+                        "Your previous turn was all reasoning and produced no answer or \
+                         tool call — you likely ran out of room mid-thought. Do NOT author \
+                         long content (such as full BPMN XML) inside your reasoning; keep \
+                         thinking brief and put the XML directly in the tool-call argument. \
+                         Now, concisely: either call the appropriate tool, or give your \
+                         final answer."
+                    } else {
                         "You ended your turn by naming a next step but did not carry it \
                          out. Do not stop here: perform that step NOW by calling the \
                          appropriate tool (e.g. simulate with the full BPMN XML of your \
                          variant). Only stop to report evidence-backed findings or to ask \
                          the operator a genuine decision."
-                            .to_string(),
-                    ));
+                    };
+                    msgs.push(Msg::System(nudge.to_string()));
                     auto_continues += 1;
                     continue;
                 }
@@ -791,6 +802,36 @@ fn signals_deferred_action(answer: &str) -> bool {
     false
 }
 
+/// True when a "final" answer carries chain-of-thought but no actual user-facing
+/// content — the model only *thought* and produced neither an answer nor a tool
+/// call (commonly because it exhausted its output-token budget mid-reasoning).
+/// Such a turn renders as a blank droid bubble ("cut off while thinking").
+fn is_thinking_only(answer: &str) -> bool {
+    answer.contains("<think>") && strip_think_blocks(answer).trim().is_empty()
+}
+
+/// Remove `<think>…</think>` reasoning blocks, returning the user-facing remainder.
+/// An unterminated `<think>` (a turn truncated mid-thought) drops everything after
+/// the opening tag, since none of it is user-facing content.
+fn strip_think_blocks(s: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        match rest[start + OPEN.len()..].find(CLOSE) {
+            Some(end) => rest = &rest[start + OPEN.len() + end + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
@@ -1075,5 +1116,33 @@ mod tests {
         let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
         assert_eq!(run.answer, "I will now author the variant.");
         assert!(run.steps.is_empty());
+    }
+
+    #[test]
+    fn thinking_only_detector_distinguishes_blank_reasoning_from_real_answers() {
+        // Reasoning with no visible content (incl. a truncated, unterminated block).
+        assert!(is_thinking_only("<think>lots of reasoning here</think>\n"));
+        assert!(is_thinking_only("<think>authored XML then ran out of tokens"));
+        assert!(is_thinking_only("<think>a</think>   \n  "));
+        // A real answer (with or without a preceding think block) is not thinking-only.
+        assert!(!is_thinking_only("<think>reasoned</think>\nThe bottleneck is credit-check."));
+        assert!(!is_thinking_only("Plain final answer, no thinking."));
+        assert!(!is_thinking_only(""));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_turn_is_nudged_to_finish_instead_of_returning_blank() {
+        // Round 1: the model produces only a (truncated) think block — no answer, no
+        // tool call. The loop must nudge rather than return a blank answer; round 2 the
+        // model recovers with a real final answer.
+        let model = SequencedModel {
+            script: vec![
+                Scripted::Defer("<think>I authored a huge BPMN variant and ran out of room".into()),
+                Scripted::Done("Variant simulated: conservedRate 1.0, P99 down 38x.".into()),
+            ],
+            idx: Cell::new(0),
+        };
+        let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
+        assert_eq!(run.answer, "Variant simulated: conservedRate 1.0, P99 down 38x.");
     }
 }

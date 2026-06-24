@@ -325,7 +325,10 @@ and call simulate to replay it against the recorded dataset. Act in the SAME tur
 have a variant in mind, emit the simulate tool call with the full BPMN XML — never end your turn by \
 saying you 'will now' or 'next' author or run something. If your message names a next step, you have \
 NOT finished: perform it (call the tool) before you stop. Stop only to deliver evidence-backed \
-findings or to ask the operator a genuine decision. Read the scorecard honestly: \
+findings or to ask the operator a genuine decision. Keep your thinking BRIEF: never write the \
+variant's BPMN XML inside your reasoning — author it directly as the simulate argument. Drafting the \
+full XML in your head wastes the output budget and can truncate the turn before you reach the tool \
+call. Read the scorecard honestly: \
 fidelityTier (recorded-replay means it was actually re-run on real inputs; requires-generative-mock \
 means a new job type has no recorded outputs to replay and would need a new worker), the \
 boundary-conserved count and conservedRate (did the variant still produce the SAME outputs the real \
