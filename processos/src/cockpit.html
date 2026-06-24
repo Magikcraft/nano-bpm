@@ -1406,6 +1406,12 @@ async function loadChat(ws, proc){
     if(r.sessionId) STATE.sessionId = r.sessionId;
     drawChat(r.turns);
     applyPersonaState();
+    // If an investigation is still running for this session (e.g. the page was reloaded mid-flight),
+    // reattach to its live stream so the operator sees reasoning + console output as before.
+    if(r.inflight){
+      reattachLiveStream(ws, proc, r.inflight);
+      return;
+    }
     // Fresh conversation: pre-load the open-investigation prompt so the default action is
     // an unbiased investigation the operator can send or edit.
     if((!r.turns || !r.turns.length)){
@@ -1560,25 +1566,53 @@ function livePendingHtml(){
 async function sendChat(ws, proc){
   const box = $('#chatBox'); const msg = box.value.trim();
   if(!msg) return;
-  const send = $('#chatSend'); const log = $('#chatLog'); const hint = $('#chatHint');
-  const wrap = $('#chatWrapup');
   const allowPython = $('#chatPy').checked && !$('#chatPy').disabled;
   pushPromptHistory(msg);
+  box.value = '';
+  const qs = STATE.sessionId ? ('?session='+encodeURIComponent(STATE.sessionId)) : '';
+  await consumeLiveStream(ws, proc, {
+    userText: msg,
+    onErrorRestore: () => { box.value = msg; },
+    fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined })
+    }),
+  });
+}
+
+// Reattach to an in-flight investigation that is still running on the server (e.g. after a page
+// reload). Renders the in-flight user bubble + a live pending bubble and follows the replayed
+// event stream. Silently no-ops if the turn has already finished (404).
+async function reattachLiveStream(ws, proc, inflight){
+  const qs = STATE.sessionId ? ('?session='+encodeURIComponent(STATE.sessionId)) : '';
+  await consumeLiveStream(ws, proc, {
+    userText: (inflight && inflight.user) || '',
+    onErrorRestore: null,
+    quietMissing: true,
+    fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream/live'+qs, { method:'GET' }),
+  });
+}
+
+// Drive a live investigation SSE stream into the chat log. Shared by sendChat (POST) and
+// reattachLiveStream (GET reattach). `opts.fetchStream()` returns the fetch promise; `opts.userText`
+// (if given) is drawn as the operator's bubble; `opts.onErrorRestore` runs on error (e.g. to put
+// the prompt back); `opts.quietMissing` swallows a 404 (no live turn to reattach to).
+async function consumeLiveStream(ws, proc, opts){
+  const log = $('#chatLog'); const hint = $('#chatHint'); const wrap = $('#chatWrapup');
   setChatBusy(true);
   if(wrap){ wrap.style.display = ''; wrap.disabled = false; }
   if(log.querySelector('.empty')) log.innerHTML = '';
-  log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
+  if(opts.userText){ log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:opts.userText})); }
   log.insertAdjacentHTML('beforeend', livePendingHtml());
   log.scrollTop = log.scrollHeight;
-  box.value = '';
 
   const pend = $('#chatPending');
   const liveThinkWrap = $('#liveThinkWrap'), liveTimeline = $('#liveTimeline');
   const liveAnswer = $('#liveAnswer'), liveStatus = $('#liveStatus');
   let answerBuf = '';
   // Set when the turn ends in an error (a transport failure, or an SSE `error` event such
-  // as the LLM backend returning 404/503). On any error we restore the prompt into the
-  // compose box (see `finally`) so the operator can resend it without retyping.
+  // as the LLM backend returning 404/503). On any error we run onErrorRestore (see `finally`)
+  // so the operator can resend the prompt without retyping.
   let errored = false;
   // Request payloads captured this turn. Stored on STATE (scoped to the session) so switching
   // to the Debug tab mid-flight can show them — the persisted endpoint only fills in once the
@@ -1640,11 +1674,14 @@ async function sendChat(ws, proc){
   }
 
   try {
-    const qs = STATE.sessionId ? ('?session='+encodeURIComponent(STATE.sessionId)) : '';
-    const resp = await fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
-      method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined })
-    });
+    const resp = await opts.fetchStream();
+    if(resp.status===404 && opts.quietMissing){
+      // Nothing live to reattach to — the turn finished. Drop the optimistic bubbles and reload
+      // the persisted transcript so the completed answer shows.
+      if(pend) pend.remove();
+      try { const r = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat'+(STATE.sessionId?('?session='+encodeURIComponent(STATE.sessionId)):'')); drawChat(r.turns); } catch(e){}
+      return;
+    }
     if(!resp.ok || !resp.body){
       let m = 'stream failed ('+resp.status+')';
       try { const j = await resp.json(); m = j.error || m; } catch(e){}
@@ -1680,7 +1717,7 @@ async function sendChat(ws, proc){
     log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
   } finally {
     setChatBusy(false);
-    if(errored) box.value = msg; // restore the prompt so the operator can resend it
+    if(errored && opts.onErrorRestore) opts.onErrorRestore();
     box.focus();
     if(wrap) wrap.style.display = 'none';
   }

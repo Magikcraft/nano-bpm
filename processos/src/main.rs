@@ -104,6 +104,90 @@ struct AppState {
     /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
     /// (not persisted) — it shows what was last sent and is cleared on restart.
     chat_debug: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
+    /// Live event buffers for in-flight chat turns, keyed by session. The streaming turn appends
+    /// every SSE event here as it produces it; the original request *and* any later reattach
+    /// (`GET .../chat/stream/live`, used after a page reload) replay the buffer then follow along.
+    /// This decouples the running investigation from the fetch that started it, so reloading the
+    /// page no longer loses the live view. Removed once the turn ends.
+    chat_live: Arc<std::sync::Mutex<std::collections::HashMap<String, LiveTurn>>>,
+}
+
+/// An append-only buffer for one in-flight chat turn's SSE events, shared between the producing
+/// (blocking) agent task and any number of SSE consumers. Consumers each keep their own cursor,
+/// replay `events` from 0, then wait on `notify` for more until `done` is set.
+#[derive(Clone)]
+struct LiveTurn {
+    /// The operator message that started this turn — used to render the user bubble on reattach,
+    /// since the persisted transcript doesn't yet include this in-flight turn.
+    user: String,
+    /// Every SSE event emitted so far this turn (including the terminal `done`/`error`).
+    events: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    /// Woken whenever a new event is appended or the turn ends.
+    notify: Arc<tokio::sync::Notify>,
+    /// Set once a terminal (`done`/`error`) event has been appended.
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LiveTurn {
+    fn new(user: String) -> Self {
+        LiveTurn {
+            user,
+            events: Arc::new(std::sync::Mutex::new(Vec::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Append one event and wake all consumers. Terminal events also flip `done`.
+    fn emit(&self, v: serde_json::Value) {
+        let terminal = matches!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("done") | Some("error")
+        );
+        if let Ok(mut e) = self.events.lock() {
+            e.push(v);
+        }
+        if terminal {
+            self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+/// Build an SSE response that replays a `LiveTurn`'s buffered events from the beginning, then
+/// follows along live until the turn ends. Multiple consumers (the original request and any
+/// number of reattachers) can each call this independently; each keeps its own cursor.
+fn sse_from_live(
+    live: LiveTurn,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = futures_util::stream::unfold(0usize, move |cursor| {
+        let live = live.clone();
+        async move {
+            loop {
+                // Arm the wakeup *before* inspecting the buffer so an event appended between our
+                // read and our await can't be missed (lost-wakeup-safe).
+                let notified = live.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let item = live
+                    .events
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.get(cursor).cloned());
+                if let Some(v) = item {
+                    return Some((
+                        Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string())),
+                        cursor + 1,
+                    ));
+                }
+                if live.done.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
+                notified.await;
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 /// Server configuration, all overridable by environment.
@@ -251,6 +335,7 @@ async fn main() {
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
@@ -334,6 +419,10 @@ async fn main() {
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/stream",
             post(cockpit_chat_stream),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/stream/live",
+            get(cockpit_chat_stream_live),
         )
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/reset",
@@ -1348,11 +1437,47 @@ async fn cockpit_chat_load(
     let key = chat::session_key(&workspace, &process);
     let meta = resolve_session(&state, &key, q.session.as_deref());
     let session = state.chat.get(&key, &meta.id).unwrap_or_default();
+    // If a turn is mid-flight for this session (e.g. the page was reloaded), surface its user
+    // message so the cockpit can redraw the in-flight user bubble and reattach to the live stream.
+    let cancel_key = chat_cancel_key(&key, &meta.id);
+    let inflight = state
+        .chat_live
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&cancel_key).map(|lt| serde_json::json!({ "user": lt.user })));
     Json(serde_json::json!({
         "sessionId": meta.id,
         "turns": chat::render_view_stamped(&session.messages, &session.stamps),
+        "inflight": inflight,
     }))
     .into_response()
+}
+
+/// `GET .../chat/stream/live` — reattach to an in-flight chat turn's event stream (e.g. after a
+/// page reload). Replays the buffered events from the start, then follows along until the turn
+/// ends. Returns 404 when no turn is running for the session, so the cockpit can fall back to the
+/// persisted transcript.
+async fn cockpit_chat_stream_live(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    Query(q): Query<SessionQuery>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let meta = resolve_session(&state, &key, q.session.as_deref());
+    let cancel_key = chat_cancel_key(&key, &meta.id);
+    let live = state
+        .chat_live
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&cancel_key).cloned());
+    match live {
+        Some(live) => sse_from_live(live).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no investigation is running for this session" })),
+        )
+            .into_response(),
+    }
 }
 
 /// Request body for an interactive chat turn.
@@ -1560,14 +1685,21 @@ async fn cockpit_chat_stream(
         m.insert(cancel_key.clone(), steer.clone());
     }
 
-    // The agent loop runs on a blocking thread (DuckDB is !Send) and pushes events into an
-    // unbounded channel; the SSE response drains that channel on the main runtime. Unbounded +
-    // non-blocking `send` avoids panicking inside the blocking thread's current-thread runtime.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    // Register a live event buffer so the streaming response — and any later reattach after a
+    // page reload — can replay this turn's events. The agent task pushes here regardless of
+    // whether the original fetch is still connected.
+    let live = LiveTurn::new(message.clone());
+    if let Ok(mut m) = state.chat_live.lock() {
+        m.insert(cancel_key.clone(), live.clone());
+    }
+
+    // The agent loop runs on a blocking thread (DuckDB is !Send) and pushes events into the live
+    // buffer; the SSE response(s) follow that buffer on the main runtime.
     let task_state = state.clone();
     let task_key = key.clone();
     let task_sid = sid.clone();
     let task_cancel_key = cancel_key.clone();
+    let task_live = live.clone();
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1575,11 +1707,14 @@ async fn cockpit_chat_stream(
         {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = tx.send(serde_json::json!({ "type": "error", "message": format!("runtime: {e}") }));
+                task_live.emit(serde_json::json!({ "type": "error", "message": format!("runtime: {e}") }));
+                if let Ok(mut m) = task_state.chat_live.lock() {
+                    m.remove(&task_cancel_key);
+                }
                 return;
             }
         };
-        let tx_ev = tx.clone();
+        let live_for_sink = task_live.clone();
         // Accumulate this turn's exact request payloads for the session's Debug tab while also
         // forwarding each over the wire so the tab can update live.
         let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -1603,7 +1738,7 @@ async fn cockpit_chat_stream(
                     serde_json::json!({ "type": "toolResult", "tool": tool, "result": result })
                 }
             };
-            let _ = tx_ev.send(v);
+            live_for_sink.emit(v);
         };
         let result = rt.block_on(investigate::run_chat_turn(
             &src,
@@ -1633,7 +1768,7 @@ async fn cockpit_chat_stream(
                 task_state
                     .chat
                     .save(&task_key, &task_sid, r.messages.clone(), stamps.clone());
-                let _ = tx.send(serde_json::json!({
+                task_live.emit(serde_json::json!({
                     "type": "done",
                     "sessionId": task_sid,
                     "answer": r.answer,
@@ -1643,7 +1778,7 @@ async fn cockpit_chat_stream(
                 }));
             }
             Err(e) => {
-                let _ = tx.send(serde_json::json!({ "type": "error", "message": e }));
+                task_live.emit(serde_json::json!({ "type": "error", "message": e }));
             }
         }
         if let Ok(mut m) = task_state.chat_cancels.lock() {
@@ -1652,19 +1787,15 @@ async fn cockpit_chat_stream(
         if let Ok(mut m) = task_state.chat_steers.lock() {
             m.remove(&task_cancel_key);
         }
+        // Drop the live buffer last: any consumers still attached hold their own Arc clones and
+        // already saw the terminal event, so this only stops *new* reattachers (which then fall
+        // back to the now-complete persisted transcript).
+        if let Ok(mut m) = task_state.chat_live.lock() {
+            m.remove(&task_cancel_key);
+        }
     });
 
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|v| {
-            (
-                Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string())),
-                rx,
-            )
-        })
-    });
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    sse_from_live(live).into_response()
 }
 
 /// `POST .../chat/reset` — forget a conversation. With `?session=`, clears just that
