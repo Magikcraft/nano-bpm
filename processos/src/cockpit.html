@@ -257,6 +257,33 @@
   .modal h3 { margin: 0 0 10px; }
   .modal pre { background: #0c0c0e; border: 1px solid #26262b; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, monospace; color: #c7d2fe; }
   .modal .close { margin-top: 14px; }
+
+  /* Suggested-model cards: tabbed BPMN diagram / XML, with expand + download. */
+  .models { margin: 10px 0 2px; display: flex; flex-direction: column; gap: 10px; }
+  .models .models-lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #8b8b93; }
+  .modelcard { border: 1px solid #2a2a32; border-radius: 10px; background: #0c0c0e; overflow: hidden; }
+  .modelcard .mc-head { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-bottom: 1px solid #1f1f25; flex-wrap: wrap; }
+  .modelcard .mc-name { font: 600 12px/1.3 ui-monospace, monospace; color: #c7d2fe; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+  .modelcard .mc-tabs { display: inline-flex; gap: 2px; background: #15151b; border-radius: 7px; padding: 2px; }
+  .modelcard .mc-tab { background: none; border: 0; color: #8b8b93; cursor: pointer; padding: 3px 11px; border-radius: 5px; font: 600 11px/1.2 inherit; }
+  .modelcard .mc-tab.active { background: #26263a; color: #e4e4e7; }
+  .modelcard .mc-actions { margin-left: auto; display: inline-flex; gap: 4px; }
+  .modelcard .mc-btn { background: #16161a; border: 1px solid #34343c; color: #c7d2fe; border-radius: 6px; height: 24px; min-width: 24px; padding: 0 6px; line-height: 1; cursor: pointer; font-size: 13px; }
+  .modelcard .mc-btn:hover { background: #1f1f27; }
+  .modelcard .mc-body { position: relative; }
+  .modelcard .mc-diagram { background: #fafafa; height: 300px; }
+  .modelcard .mc-diagram .djs-container { height: 100%; }
+  .modelcard pre.mc-xml { margin: 0; padding: 10px 12px; height: 300px; overflow: auto; white-space: pre; word-break: normal; font: 11.5px/1.5 ui-monospace, monospace; color: #c7d2fe; }
+  .modelcard .mc-err { padding: 12px; color: #fca5a5; font-size: 12px; }
+  /* Big popover view of one model. */
+  .model-modal { position: fixed; inset: 0; background: rgba(0,0,0,.66); display: flex; align-items: center; justify-content: center; z-index: 60; }
+  .model-modal .mm-box { background: #111118; border: 1px solid #34343c; border-radius: 12px; width: 92vw; height: 88vh; max-width: 1200px; display: flex; flex-direction: column; overflow: hidden; }
+  .model-modal .mm-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #26262b; }
+  .model-modal .mm-title { font: 600 14px/1.3 ui-monospace, monospace; color: #c7d2fe; }
+  .model-modal .mm-actions { margin-left: auto; display: inline-flex; gap: 6px; }
+  .model-modal .mm-body { flex: 1; position: relative; min-height: 0; }
+  .model-modal .mm-diagram { position: absolute; inset: 0; background: #fafafa; }
+  .model-modal pre.mm-xml { position: absolute; inset: 0; margin: 0; padding: 14px 16px; overflow: auto; white-space: pre; background: #0c0c0e; color: #c7d2fe; font: 12.5px/1.6 ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -1108,8 +1135,162 @@ function chatBub(t){
   const summary = 'Thinking' + (toolCount ? ' · '+toolCount+' tool call'+(toolCount===1?'':'s') : '');
   const thinkHtml = inner ? '<details class="think"><summary>'+esc(summary)+'</summary><div class="think-tl">'+inner+'</div></details>' : '';
   const copyBtn = answer ? '<button class="copybtn" title="Copy response" data-copy="'+esc(answer)+'">\u29C9</button>' : '';
+  const modelsHtml = suggestedModelsHtml(items);
   return '<div class="bub droid"><div class="who">'+droidWhoHtml()+copyBtn+time+'</div>'+thinkHtml+
-    '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div></div>';
+    '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div>'+modelsHtml+'</div>';
+}
+
+// ── Suggested-model cards ───────────────────────────────────────────────────
+// The Experiment Designer proposes BPMN variants by passing them as the `model`
+// argument of simulate / compare_variants. Surface every distinct candidate as a
+// tabbed (diagram / XML) card the operator can expand and download.
+function extractSuggestedModels(items){
+  const out = [], seen = new Set();
+  const add = (name, xml) => {
+    if(typeof xml !== 'string') return;
+    const x = xml.trim();
+    if(!x || x.indexOf('<') === -1 || seen.has(x)) return;
+    seen.add(x);
+    out.push({ name: (name && String(name).trim()) || ('variant '+(out.length+1)), xml: x });
+  };
+  (items||[]).forEach(it => {
+    if(it.kind !== 'tool') return;
+    let a = it.arguments;
+    if(typeof a === 'string'){ try { a = JSON.parse(a); } catch(_){ return; } }
+    if(!a || typeof a !== 'object') return;
+    if(it.tool === 'simulate') add(a.name, a.model);
+    else if(it.tool === 'compare_variants' && Array.isArray(a.candidates)){
+      a.candidates.forEach(c => { if(c && typeof c === 'object') add(c.name, c.model); });
+    }
+  });
+  return out;
+}
+
+function suggestedModelsHtml(items){
+  const models = extractSuggestedModels(items);
+  if(!models.length) return '';
+  const cards = models.map(modelCardHtml).join('');
+  const lbl = models.length === 1 ? '1 suggested model' : (models.length+' suggested models');
+  return '<div class="models"><div class="models-lbl">'+esc(lbl)+'</div>'+cards+'</div>';
+}
+
+function modelCardHtml(m){
+  return '<div class="modelcard" data-rendered="0">'+
+    '<div class="mc-head">'+
+      '<span class="mc-name" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'+
+      '<div class="mc-tabs">'+
+        '<button class="mc-tab active" data-mc-tab="diagram">Diagram</button>'+
+        '<button class="mc-tab" data-mc-tab="xml">XML</button>'+
+      '</div>'+
+      '<div class="mc-actions">'+
+        '<button class="mc-btn mc-expand" title="Expand">\u2922</button>'+
+        '<button class="mc-btn mc-dl" title="Download .bpmn">\u2913</button>'+
+      '</div>'+
+    '</div>'+
+    '<div class="mc-body">'+
+      '<div class="mc-pane mc-diagram"></div>'+
+      '<pre class="mc-pane mc-xml" style="display:none">'+esc(m.xml)+'</pre>'+
+    '</div></div>';
+}
+
+// Render BPMN xml into a container with a fresh viewer; returns the viewer or null.
+async function renderBpmnInto(el, xml){
+  if(!el) return null;
+  if(typeof BpmnJS === 'undefined'){ el.innerHTML = '<div class="mc-err">diagram viewer unavailable</div>'; return null; }
+  try {
+    el.innerHTML = '';
+    const viewer = new BpmnJS({ container: el });
+    await viewer.importXML(xml);
+    try { viewer.get('canvas').zoom('fit-viewport', 'auto'); } catch(_){}
+    return viewer;
+  } catch(e){
+    el.innerHTML = '<div class="mc-err">could not render: '+esc((e&&e.message)||e)+'</div>';
+    return null;
+  }
+}
+
+function modelXmlOf(card){ const p = card.querySelector('.mc-xml'); return p ? p.textContent : ''; }
+function modelNameOf(card){ const n = card.querySelector('.mc-name'); return (n ? n.textContent : 'model') || 'model'; }
+function slugify(s){ return String(s||'model').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,60) || 'model'; }
+
+function downloadModel(card){
+  const xml = modelXmlOf(card);
+  const blob = new Blob([xml], { type: 'application/xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = slugify(modelNameOf(card))+'.bpmn';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+// Render a card's diagram on demand (once), when first shown.
+function ensureCardDiagram(card){
+  if(!card || card.dataset.rendered === '1') return;
+  card.dataset.rendered = '1';
+  renderBpmnInto(card.querySelector('.mc-diagram'), modelXmlOf(card));
+}
+
+function switchModelTab(card, tab){
+  card.querySelectorAll('.mc-tab').forEach(b => b.classList.toggle('active', b.dataset.mcTab === tab));
+  const dia = card.querySelector('.mc-diagram'), xml = card.querySelector('.mc-xml');
+  if(tab === 'xml'){ dia.style.display = 'none'; xml.style.display = ''; }
+  else { xml.style.display = 'none'; dia.style.display = ''; ensureCardDiagram(card); }
+}
+
+// Big popover: a large diagram with an XML toggle + download, over a dark backdrop.
+function openModelModal(card){
+  const xml = modelXmlOf(card), name = modelNameOf(card);
+  const back = document.createElement('div');
+  back.className = 'model-modal';
+  back.innerHTML = '<div class="mm-box">'+
+    '<div class="mm-head"><span class="mm-title">'+esc(name)+'</span>'+
+      '<div class="mm-actions">'+
+        '<button class="btn mm-tab-dia">Diagram</button>'+
+        '<button class="btn mm-tab-xml">XML</button>'+
+        '<button class="btn mm-dl">Download .bpmn</button>'+
+        '<button class="btn ghost mm-close">Close</button>'+
+      '</div></div>'+
+    '<div class="mm-body"><div class="mm-diagram"></div>'+
+      '<pre class="mm-xml" style="display:none">'+esc(xml)+'</pre></div></div>';
+  const close = () => back.remove();
+  back.onclick = e => { if(e.target === back) close(); };
+  document.body.appendChild(back);
+  const dia = back.querySelector('.mm-diagram'), pre = back.querySelector('.mm-xml');
+  back.querySelector('.mm-close').onclick = close;
+  back.querySelector('.mm-dl').onclick = () => downloadModel(card);
+  back.querySelector('.mm-tab-dia').onclick = () => { pre.style.display='none'; dia.style.display=''; };
+  back.querySelector('.mm-tab-xml').onclick = () => { dia.style.display='none'; pre.style.display=''; };
+  document.addEventListener('keydown', function esc(e){ if(e.key==='Escape'){ close(); document.removeEventListener('keydown', esc); } });
+  renderBpmnInto(dia, xml);
+}
+
+// Lazily render diagrams as cards scroll into view (cheap + avoids rendering a
+// long backlog up-front). Re-used across chat redraws.
+const modelCardObserver = ('IntersectionObserver' in window)
+  ? new IntersectionObserver((entries, obs) => {
+      entries.forEach(en => { if(en.isIntersecting){ ensureCardDiagram(en.target); obs.unobserve(en.target); } });
+    }, { root: null, rootMargin: '120px' })
+  : null;
+
+function observeModelCards(scope){
+  (scope || document).querySelectorAll('.modelcard[data-rendered="0"]').forEach(card => {
+    if(modelCardObserver) modelCardObserver.observe(card);
+    else ensureCardDiagram(card); // no IO support: render immediately
+  });
+}
+
+// One delegated handler for every model card (survives chat re-renders).
+if(!window.__modelCardsWired){
+  window.__modelCardsWired = true;
+  document.addEventListener('click', e => {
+    const t = e.target;
+    const tab = t.closest && t.closest('.mc-tab');
+    if(tab){ switchModelTab(tab.closest('.modelcard'), tab.dataset.mcTab); return; }
+    const exp = t.closest && t.closest('.mc-expand');
+    if(exp){ openModelModal(exp.closest('.modelcard')); return; }
+    const dl = t.closest && t.closest('.mc-dl');
+    if(dl){ downloadModel(dl.closest('.modelcard')); return; }
+  });
 }
 
 // Copy-to-clipboard for droid bubbles (delegated once; survives chat re-renders).
@@ -1133,6 +1314,7 @@ function drawChat(turns){
   if(!log) return;
   if(!turns || !turns.length){ log.innerHTML = '<div class="empty">No messages yet. Ask the droid a question to begin investigating this dataset.</div>'; return; }
   log.innerHTML = turns.map(chatBub).join('');
+  observeModelCards(log);
   log.scrollTop = log.scrollHeight;
 }
 
