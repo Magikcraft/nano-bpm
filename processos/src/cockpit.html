@@ -247,6 +247,13 @@
   .bub .answer.md code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 4px; padding: 1px 4px; font: 0.88em ui-monospace, monospace; color: #fca5a5; }
   .bub .answer.md pre.md-code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 8px; padding: 10px 12px; margin: 6px 0 8px; overflow: auto; max-height: 320px; }
   .bub .answer.md pre.md-code { white-space: pre; font: 12px/1.5 ui-monospace, monospace; color: #a1a1aa; }
+  /* Folded large code/XML blobs (e.g. BPMN the droid dumps inline while thinking) so they
+     don't dominate the panel or look like a stalled render — click to expand. */
+  .md-codefold { border: 1px solid #26262b; border-radius: 6px; margin: 5px 0; background: #0c0c0e; }
+  .md-codefold > summary { cursor: pointer; padding: 5px 10px; font: 11px ui-monospace, monospace; color: #93a3c4; list-style: none; }
+  .md-codefold > summary::before { content: '\25B8  '; color: #6b7280; }
+  .md-codefold[open] > summary::before { content: '\25BE  '; }
+  .md-codefold > pre.md-code { margin: 0; border: none; border-top: 1px solid #26262b; border-radius: 0 0 6px 6px; }
   .bub .answer.md a { color: #93c5fd; }
   .bub .answer.md strong { color: #f1f5f9; }
   .bub .steps details { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
@@ -359,10 +366,34 @@ function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp
 function mdToHtml(src){
   const e = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const blocks = [];
-  src = String(src||'').replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    blocks.push('<pre class="md-code">'+e(code.replace(/\n$/,''))+'</pre>');
-    return '\u0000B'+(blocks.length-1)+'\u0000';
-  });
+  // Render a code blob: large blobs (and BPMN/XML the model often dumps inline while it
+  // "thinks out loud") are folded into a collapsed disclosure so they don't dominate the
+  // panel and look like a stalled render. Returns the placeholder token.
+  const pushCode = (lang, code) => {
+    const body = e(code.replace(/\n+$/,''));
+    const nLines = body.split('\n').length;
+    const looksXml = /^\s*(<\?xml|<(?:\w+:)?(?:definitions|process)[\s>])/.test(code);
+    const label = (looksXml ? 'BPMN XML' : (lang ? lang.toUpperCase() : 'code'));
+    if(body.length > 600 || nLines > 14){
+      blocks.push('<details class="md-codefold"><summary>'+esc(label)+' \u00b7 '+nLines+' lines</summary>'+
+        '<pre class="md-code">'+body+'</pre></details>');
+    } else {
+      blocks.push('<pre class="md-code">'+body+'</pre>');
+    }
+    return '\n\u0000B'+(blocks.length-1)+'\u0000\n';
+  };
+  src = String(src||'');
+  // Fenced code first.
+  src = src.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (_, lang, code) => pushCode(lang, code));
+  // Then any *unfenced* BPMN/XML document the model dumped straight into its prose — bounded
+  // by the matching close tag — so a raw model dump folds away the same as a fenced one.
+  src = src.replace(/(?:<\?xml[\s\S]*?\?>\s*)?<(\w+:)?(definitions|process)\b[\s\S]*?<\/\1?\2>/g,
+    (m) => (m.length > 200 ? pushCode('xml', m) : m));
+  // An *in-flight* XML dump (open tag, no close yet) — common while the droid streams a model
+  // into its reasoning live. Fold the trailing blob so the thinking panel doesn't balloon and
+  // look stalled as the XML is authored token by token.
+  src = src.replace(/(?:<\?xml[\s\S]*?\?>\s*)?<(\w+:)?(definitions|process)\b[\s\S]*$/,
+    (m) => (m.length > 200 ? pushCode('xml', m) : m));
   const inline = t => {
     t = e(t);
     t = t.replace(/`([^`]+)`/g, (_,c)=>'<code>'+c+'</code>');
