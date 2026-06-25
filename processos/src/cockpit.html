@@ -1395,12 +1395,31 @@ function modelCardHtml(m){
 // ("no diagram to display") — those we auto-layout first.
 function bpmnHasDi(xml){ return /BPMNDiagram|BPMNPlane/.test(xml || ''); }
 
-// Add a generated layout to DI-less BPMN so the viewer can render it; returns the original XML
-// on any failure (the viewer will then surface its own message).
+// LLM-authored variants are sometimes a bare <bpmn:process> fragment with no <bpmn:definitions>
+// root ("failed to parse document as <bpmn:Definitions>"). Wrap such fragments in a synthesized
+// definitions envelope (the inner elements keep their own xmlns decls) so bpmn-moddle has a valid
+// root. Full documents (already containing <...:definitions>) pass through unchanged.
+function ensureBpmnDefinitions(xml){
+  const s = (xml || '').trim();
+  if(!s || /<(\w+:)?definitions[\s>]/.test(s)) return xml;
+  const body = s.replace(/^<\?xml[^>]*\?>\s*/i, '');
+  return '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" ' +
+    'xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" ' +
+    'xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" ' +
+    'xmlns:di="http://www.omg.org/spec/DD/20100524/DI" ' +
+    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ' +
+    'xmlns:zeebe="http://camunda.org/schema/zeebe" ' +
+    'targetNamespace="http://bpmn.io/schema/bpmn">\n' + body + '\n</bpmn:definitions>';
+}
+
+// Add a generated layout to DI-less BPMN so the viewer can render it; returns the (definitions-
+// wrapped) XML on any failure (the viewer will then surface its own message).
 async function ensureBpmnLayout(xml){
-  if(bpmnHasDi(xml) || typeof BpmnAutoLayout === 'undefined' || !BpmnAutoLayout.layoutProcess) return xml;
-  try { return await BpmnAutoLayout.layoutProcess(xml); }
-  catch(_){ return xml; }
+  const doc = ensureBpmnDefinitions(xml);
+  if(bpmnHasDi(doc) || typeof BpmnAutoLayout === 'undefined' || !BpmnAutoLayout.layoutProcess) return doc;
+  try { return await BpmnAutoLayout.layoutProcess(doc); }
+  catch(_){ return doc; }
 }
 
 // Render BPMN xml into a container with a fresh viewer; returns the viewer or null.
