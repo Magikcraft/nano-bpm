@@ -287,8 +287,10 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                         "Your previous turn ran on, repeating the same text many times without \
                          finishing. Writing SQL in your answer (e.g. in backticks) does NOTHING \
                          — the ONLY way to run a query is to emit a query_traces tool call. Stop \
-                         repeating yourself. Now do exactly one thing: emit a single query_traces \
-                         tool call, or give a concise final answer."
+                         repeating yourself. Prefer feedback from tool calls to pure reasoning: \
+                         you can get it wrong and iterate on the tool feedback. Now do exactly \
+                         one thing: emit a single query_traces tool call, or give a concise \
+                         final answer."
                     } else if thinking_only {
                         "Your previous turn was all reasoning and produced no answer or \
                          tool call — you likely ran out of room mid-thought. Do NOT author \
