@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
-use nanobpmn_engine_core::{Element, ElementKind, ProcessDefinition};
+use nanobpmn_engine_core::{Condition, Element, ElementKind, ProcessDefinition, SequenceFlow};
 use serde_json::{json, Value};
 
 /// Parse `xml` and return its first process definition, or an error message.
@@ -884,6 +884,842 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Structured authoring: serialize → edit → re-validate
+//
+// The Experiment Designer is good at process *ideas* but poor at one-shotting whole BPMN
+// documents by hand (Investigation 1 thrashed on `<errorBoundaryEvent>` and a
+// `zeebe:taskDefinition` attribute it could not see was wrong). `edit_model` flips the
+// authoring contract: the model proposes high-level, *validated* operations against the
+// CURRENT model and OUR code owns XML correctness — emitting engine-parseable XML and
+// re-parsing it before returning. The LLM never types raw whole-document XML again; it
+// composes a variant from patches that cannot produce the syntax mistakes it falls into.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Escape the five predefined XML entities for safe emission into attribute values and text
+/// (the inverse of the engine tokenizer's `unescape`). `&` first so we don't double-escape.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// A safe id fragment: keep alphanumerics and `_`/`-`, map everything else to `_`.
+fn id_fragment(s: &str) -> String {
+    let frag: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if frag.is_empty() {
+        "x".to_string()
+    } else {
+        frag
+    }
+}
+
+/// Render a duration in milliseconds as an ISO-8601 duration the engine parser accepts
+/// (`P[nD]T[nH][nM][nS]`). Sub-second precision is not representable in that grammar, so the
+/// value is floored to whole seconds; authoring timers at second granularity round-trips.
+fn millis_to_iso8601(ms: u64) -> String {
+    let mut rem = ms / 1000;
+    let days = rem / 86_400;
+    rem %= 86_400;
+    let hours = rem / 3_600;
+    rem %= 3_600;
+    let mins = rem / 60;
+    let secs = rem % 60;
+    let mut date = String::from("P");
+    if days > 0 {
+        date.push_str(&format!("{days}D"));
+    }
+    let mut time = String::new();
+    if hours > 0 {
+        time.push_str(&format!("{hours}H"));
+    }
+    if mins > 0 {
+        time.push_str(&format!("{mins}M"));
+    }
+    if secs > 0 || (days == 0 && hours == 0 && mins == 0) {
+        time.push_str(&format!("{secs}S"));
+    }
+    if !time.is_empty() {
+        date.push('T');
+        date.push_str(&time);
+    }
+    date
+}
+
+/// Collect the definitions-level `<bpmn:error>` declarations a model needs: one per distinct
+/// error code carried by an error boundary event. Returns a code → synthesized-error-id map.
+fn collect_error_ids(def: &ProcessDefinition) -> BTreeMap<String, String> {
+    let mut codes: BTreeMap<String, String> = BTreeMap::new();
+    for el in def.elements.values() {
+        if let ElementKind::ErrorBoundaryEvent { error_code, .. } = &el.kind {
+            codes
+                .entry(error_code.clone())
+                .or_insert_with(|| format!("Error_{}", id_fragment(error_code)));
+        }
+    }
+    codes
+}
+
+/// A definitions-level `<bpmn:message>` declaration needed by a message start/catch/boundary.
+struct MessageDecl {
+    id: String,
+    name: String,
+    correlation_key: Option<String>,
+}
+
+/// Collect the `<bpmn:message>` declarations a model needs, keyed for lookup by
+/// `(name, correlation_key)` so events that differ in correlation get distinct declarations.
+fn collect_messages(
+    def: &ProcessDefinition,
+) -> (Vec<MessageDecl>, HashMap<(String, Option<String>), String>) {
+    let mut decls: Vec<MessageDecl> = Vec::new();
+    let mut lookup: HashMap<(String, Option<String>), String> = HashMap::new();
+    let mut want: Vec<(String, Option<String>)> = Vec::new();
+    let mut ids: Vec<&String> = def.elements.keys().collect();
+    ids.sort();
+    for id in ids {
+        match &def.elements[id].kind {
+            ElementKind::MessageStartEvent { message_name } => {
+                want.push((message_name.clone(), None));
+            }
+            ElementKind::MessageIntermediateCatchEvent {
+                message_name,
+                correlation_key,
+            }
+            | ElementKind::MessageBoundaryEvent {
+                message_name,
+                correlation_key,
+                ..
+            } => {
+                want.push((message_name.clone(), Some(correlation_key.clone())));
+            }
+            _ => {}
+        }
+    }
+    for (name, key) in want {
+        let entry = (name.clone(), key.clone());
+        if lookup.contains_key(&entry) {
+            continue;
+        }
+        let mid = format!("Message_{}_{}", id_fragment(&name), decls.len());
+        lookup.insert(entry, mid.clone());
+        decls.push(MessageDecl {
+            id: mid,
+            name,
+            correlation_key: key,
+        });
+    }
+    (decls, lookup)
+}
+
+/// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
+/// flows are emitted separately and flat, so this only renders the node and its event/extension
+/// definitions. `errors`/`messages` provide the synthesized declaration ids to reference.
+fn emit_element(
+    def: &ProcessDefinition,
+    id: &str,
+    errors: &BTreeMap<String, String>,
+    messages: &HashMap<(String, Option<String>), String>,
+    children_by_parent: &HashMap<String, Vec<String>>,
+    out: &mut String,
+) {
+    let el = &def.elements[id];
+    let eid = xml_escape(id);
+    match &el.kind {
+        ElementKind::StartEvent => {
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"/>\n"));
+        }
+        ElementKind::EndEvent => {
+            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"/>\n"));
+        }
+        ElementKind::ExclusiveGateway => {
+            out.push_str(&format!("    <bpmn:exclusiveGateway id=\"{eid}\"/>\n"));
+        }
+        ElementKind::ParallelGateway => {
+            out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"/>\n"));
+        }
+        ElementKind::ServiceTask { job_type, priority } => {
+            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\">\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            out.push_str(&format!(
+                "        <zeebe:taskDefinition type=\"{}\"/>\n",
+                xml_escape(job_type)
+            ));
+            if let Some(p) = priority {
+                out.push_str(&format!(
+                    "        <zeebe:priorityDefinition priority=\"{}\"/>\n",
+                    xml_escape(p)
+                ));
+            }
+            out.push_str("      </bpmn:extensionElements>\n");
+            out.push_str("    </bpmn:serviceTask>\n");
+        }
+        ElementKind::UserTask(props) => {
+            out.push_str(&format!("    <bpmn:userTask id=\"{eid}\">\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            if props.assignee.is_some()
+                || props.candidate_groups.is_some()
+                || props.candidate_users.is_some()
+            {
+                out.push_str("        <zeebe:assignmentDefinition");
+                if let Some(a) = &props.assignee {
+                    out.push_str(&format!(" assignee=\"{}\"", xml_escape(a)));
+                }
+                if let Some(g) = &props.candidate_groups {
+                    out.push_str(&format!(" candidateGroups=\"{}\"", xml_escape(g)));
+                }
+                if let Some(u) = &props.candidate_users {
+                    out.push_str(&format!(" candidateUsers=\"{}\"", xml_escape(u)));
+                }
+                out.push_str("/>\n");
+            }
+            if props.due_date.is_some() || props.follow_up_date.is_some() {
+                out.push_str("        <zeebe:taskSchedule");
+                if let Some(d) = &props.due_date {
+                    out.push_str(&format!(" dueDate=\"{}\"", xml_escape(d)));
+                }
+                if let Some(f) = &props.follow_up_date {
+                    out.push_str(&format!(" followUpDate=\"{}\"", xml_escape(f)));
+                }
+                out.push_str("/>\n");
+            }
+            if let Some(p) = &props.priority {
+                out.push_str(&format!(
+                    "        <zeebe:priorityDefinition priority=\"{}\"/>\n",
+                    xml_escape(p)
+                ));
+            }
+            out.push_str("      </bpmn:extensionElements>\n");
+            out.push_str("    </bpmn:userTask>\n");
+        }
+        ElementKind::ErrorBoundaryEvent {
+            attached_to,
+            error_code,
+        } => {
+            let err_id = errors
+                .get(error_code)
+                .cloned()
+                .unwrap_or_else(|| format!("Error_{}", id_fragment(error_code)));
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\" attachedToRef=\"{}\">\n",
+                xml_escape(attached_to)
+            ));
+            out.push_str(&format!(
+                "      <bpmn:errorEventDefinition errorRef=\"{}\"/>\n",
+                xml_escape(&err_id)
+            ));
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
+        ElementKind::TimerBoundaryEvent {
+            attached_to,
+            duration_millis,
+            interrupting,
+            repeating,
+        } => {
+            let cancel = if *interrupting {
+                ""
+            } else {
+                " cancelActivity=\"false\""
+            };
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\" attachedToRef=\"{}\"{cancel}>\n",
+                xml_escape(attached_to)
+            ));
+            out.push_str("      <bpmn:timerEventDefinition>\n");
+            if *repeating && !*interrupting {
+                out.push_str(&format!(
+                    "        <bpmn:timeCycle>R/{}</bpmn:timeCycle>\n",
+                    millis_to_iso8601(*duration_millis)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
+                    millis_to_iso8601(*duration_millis)
+                ));
+            }
+            out.push_str("      </bpmn:timerEventDefinition>\n");
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
+        ElementKind::MessageBoundaryEvent {
+            attached_to,
+            message_name,
+            correlation_key,
+            interrupting,
+        } => {
+            let mref = messages
+                .get(&(message_name.clone(), Some(correlation_key.clone())))
+                .cloned()
+                .unwrap_or_default();
+            let cancel = if *interrupting {
+                ""
+            } else {
+                " cancelActivity=\"false\""
+            };
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\" attachedToRef=\"{}\"{cancel}>\n",
+                xml_escape(attached_to)
+            ));
+            out.push_str(&format!(
+                "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
+                xml_escape(&mref)
+            ));
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
+        ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
+            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\">\n"));
+            out.push_str("      <bpmn:timerEventDefinition>\n");
+            out.push_str(&format!(
+                "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
+                millis_to_iso8601(*duration_millis)
+            ));
+            out.push_str("      </bpmn:timerEventDefinition>\n");
+            out.push_str("    </bpmn:intermediateCatchEvent>\n");
+        }
+        ElementKind::MessageIntermediateCatchEvent {
+            message_name,
+            correlation_key,
+        } => {
+            let mref = messages
+                .get(&(message_name.clone(), Some(correlation_key.clone())))
+                .cloned()
+                .unwrap_or_default();
+            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\">\n"));
+            out.push_str(&format!(
+                "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
+                xml_escape(&mref)
+            ));
+            out.push_str("    </bpmn:intermediateCatchEvent>\n");
+        }
+        ElementKind::MessageStartEvent { message_name } => {
+            let mref = messages
+                .get(&(message_name.clone(), None))
+                .cloned()
+                .unwrap_or_default();
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\">\n"));
+            out.push_str(&format!(
+                "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
+                xml_escape(&mref)
+            ));
+            out.push_str("    </bpmn:startEvent>\n");
+        }
+        ElementKind::TimerStartEvent {
+            interval_millis,
+            repeating,
+        } => {
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\">\n"));
+            out.push_str("      <bpmn:timerEventDefinition>\n");
+            if *repeating {
+                out.push_str(&format!(
+                    "        <bpmn:timeCycle>R/{}</bpmn:timeCycle>\n",
+                    millis_to_iso8601(*interval_millis)
+                ));
+            } else {
+                out.push_str(&format!(
+                    "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
+                    millis_to_iso8601(*interval_millis)
+                ));
+            }
+            out.push_str("      </bpmn:timerEventDefinition>\n");
+            out.push_str("    </bpmn:startEvent>\n");
+        }
+        ElementKind::SubProcess { .. } => {
+            out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\">\n"));
+            if let Some(kids) = children_by_parent.get(id) {
+                for child in kids {
+                    // Children are emitted at the same indentation; the engine parser keys
+                    // containment off the scope stack, not indentation, so this is faithful.
+                    emit_element(def, child, errors, messages, children_by_parent, out);
+                }
+            }
+            out.push_str("    </bpmn:subProcess>\n");
+        }
+    }
+}
+
+/// Serialize a [`ProcessDefinition`] back to BPMN XML that the engine's own parser round-trips
+/// (start event, every node kind, sequence flows with conditions, and the definitions-level
+/// `<bpmn:error>` / `<bpmn:message>` declarations boundary and message events reference).
+///
+/// Diagram-interchange (`<bpmndi>`) is intentionally omitted — these are *candidate* models for
+/// simulation, and the cockpit renders DI-less variants. The contract this guarantees is the one
+/// that matters for authoring: `parse_bpmn(definition_to_xml(def))` reproduces `def`'s structure.
+pub fn definition_to_xml(def: &ProcessDefinition) -> String {
+    let errors = collect_error_ids(def);
+    let (messages, msg_lookup) = collect_messages(def);
+
+    // Group sub-process children by parent so a container emits its contents inline.
+    let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, el) in &def.elements {
+        if let Some(parent) = &el.parent {
+            children_by_parent
+                .entry(parent.clone())
+                .or_default()
+                .push(id.clone());
+        }
+    }
+    for kids in children_by_parent.values_mut() {
+        kids.sort();
+    }
+
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(
+        "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
+         xmlns:zeebe=\"http://camunda.org/schema/zeebe/1.0\" \
+         targetNamespace=\"http://bpmn.io/schema/bpmn\">\n",
+    );
+    for (code, eid) in &errors {
+        out.push_str(&format!(
+            "  <bpmn:error id=\"{}\" errorCode=\"{}\"/>\n",
+            xml_escape(eid),
+            xml_escape(code)
+        ));
+    }
+    for m in &messages {
+        if let Some(key) = &m.correlation_key {
+            out.push_str(&format!(
+                "  <bpmn:message id=\"{}\" name=\"{}\">\n",
+                xml_escape(&m.id),
+                xml_escape(&m.name)
+            ));
+            out.push_str("    <bpmn:extensionElements>\n");
+            out.push_str(&format!(
+                "      <zeebe:subscription correlationKey=\"={}\"/>\n",
+                xml_escape(key)
+            ));
+            out.push_str("    </bpmn:extensionElements>\n");
+            out.push_str("  </bpmn:message>\n");
+        } else {
+            out.push_str(&format!(
+                "  <bpmn:message id=\"{}\" name=\"{}\"/>\n",
+                xml_escape(&m.id),
+                xml_escape(&m.name)
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
+        xml_escape(&def.id)
+    ));
+
+    // Emit top-level nodes (parent == None) in a stable order; sub-processes recurse.
+    let mut top: Vec<&String> = def
+        .elements
+        .iter()
+        .filter(|(_, e)| e.parent.is_none())
+        .map(|(id, _)| id)
+        .collect();
+    top.sort();
+    for id in top {
+        emit_element(def, id, &errors, &msg_lookup, &children_by_parent, &mut out);
+    }
+
+    // Emit every sequence flow flat with a synthesized id. The engine parser builds flows purely
+    // from sourceRef/targetRef, so flat emission (scope-independent) is faithful.
+    let mut sources: Vec<&String> = def.elements.keys().collect();
+    sources.sort();
+    let mut n = 0usize;
+    for src in sources {
+        for flow in &def.elements[src].outgoing {
+            n += 1;
+            let fid = format!("Flow_{n}");
+            match &flow.condition {
+                Some(cond) => {
+                    out.push_str(&format!(
+                        "    <bpmn:sequenceFlow id=\"{fid}\" sourceRef=\"{}\" targetRef=\"{}\">\n",
+                        xml_escape(src),
+                        xml_escape(&flow.to)
+                    ));
+                    out.push_str(&format!(
+                        "      <bpmn:conditionExpression>{}</bpmn:conditionExpression>\n",
+                        xml_escape(&cond.expression)
+                    ));
+                    out.push_str("    </bpmn:sequenceFlow>\n");
+                }
+                None => {
+                    out.push_str(&format!(
+                        "    <bpmn:sequenceFlow id=\"{fid}\" sourceRef=\"{}\" targetRef=\"{}\"/>\n",
+                        xml_escape(src),
+                        xml_escape(&flow.to)
+                    ));
+                }
+            }
+        }
+    }
+
+    out.push_str("  </bpmn:process>\n");
+    out.push_str("</bpmn:definitions>\n");
+    out
+}
+
+/// Build a sequence-flow condition from an optional expression string. An empty/whitespace
+/// expression clears the condition (an unconditional flow).
+fn condition_from(expr: Option<&str>) -> Option<Condition> {
+    match expr.map(str::trim) {
+        Some(e) if !e.is_empty() => Some(Condition::new(e.to_string())),
+        _ => None,
+    }
+}
+
+/// Require a string field on an edit op, or return a clear error naming the op and field.
+fn req_str<'a>(op: &'a Value, field: &str, op_name: &str) -> Result<&'a str, String> {
+    op.get(field)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("op '{op_name}' requires a non-empty string '{field}'"))
+}
+
+/// Apply a single structured edit operation to `def` in place, returning a human-readable note
+/// describing what changed. Each op fully owns the XML-level correctness of its change; an op that
+/// references a missing node or would duplicate an id fails with an actionable message so the model
+/// can correct the *operation* rather than re-typing raw XML.
+fn apply_edit_op(def: &mut ProcessDefinition, op: &Value) -> Result<String, String> {
+    let op_name = op
+        .get("op")
+        .and_then(|v| v.as_str())
+        .ok_or("each edit op needs a string 'op' field")?;
+    match op_name {
+        "set_task_job_type" => {
+            let task = req_str(op, "task", op_name)?;
+            let job_type = req_str(op, "jobType", op_name)?;
+            let el = def
+                .elements
+                .get_mut(task)
+                .ok_or_else(|| format!("set_task_job_type: no node '{task}' in the model"))?;
+            match &mut el.kind {
+                ElementKind::ServiceTask { job_type: jt, .. } => {
+                    *jt = job_type.to_string();
+                    Ok(format!("Set serviceTask '{task}' jobType to '{job_type}'."))
+                }
+                _ => Err(format!("set_task_job_type: '{task}' is not a serviceTask")),
+            }
+        }
+        "set_flow_condition" => {
+            let from = req_str(op, "from", op_name)?;
+            let to = req_str(op, "to", op_name)?;
+            let cond = condition_from(op.get("condition").and_then(|v| v.as_str()));
+            let el = def
+                .elements
+                .get_mut(from)
+                .ok_or_else(|| format!("set_flow_condition: no node '{from}' in the model"))?;
+            let flow = el
+                .outgoing
+                .iter_mut()
+                .find(|f| f.to == to)
+                .ok_or_else(|| format!("set_flow_condition: no flow '{from}' -> '{to}'"))?;
+            flow.condition = cond.clone();
+            Ok(match cond {
+                Some(c) => format!("Set condition on '{from}' -> '{to}' to `{}`.", c.expression),
+                None => format!("Cleared the condition on '{from}' -> '{to}'."),
+            })
+        }
+        "insert_service_task_after" => {
+            let after = req_str(op, "after", op_name)?;
+            let id = req_str(op, "id", op_name)?;
+            let job_type = req_str(op, "jobType", op_name)?;
+            if def.elements.contains_key(id) {
+                return Err(format!(
+                    "insert_service_task_after: node id '{id}' already exists"
+                ));
+            }
+            let anchor = def
+                .elements
+                .get_mut(after)
+                .ok_or_else(|| format!("insert_service_task_after: no node '{after}'"))?;
+            // The new task inherits the anchor's outgoing flows; the anchor flows unconditionally
+            // into it. So: after -> NEW -> (original targets, conditions preserved).
+            let moved: Vec<SequenceFlow> = std::mem::take(&mut anchor.outgoing);
+            anchor.outgoing.push(SequenceFlow {
+                to: id.to_string(),
+                condition: None,
+            });
+            let parent = anchor.parent.clone();
+            def.elements.insert(
+                id.to_string(),
+                Element {
+                    id: id.to_string(),
+                    kind: ElementKind::ServiceTask {
+                        job_type: job_type.to_string(),
+                        priority: None,
+                    },
+                    outgoing: moved,
+                    parent,
+                },
+            );
+            Ok(format!(
+                "Inserted serviceTask '{id}' (jobType '{job_type}') immediately after '{after}'."
+            ))
+        }
+        "add_error_boundary" => {
+            let task = req_str(op, "task", op_name)?;
+            let error_code = req_str(op, "errorCode", op_name)?;
+            let target = req_str(op, "target", op_name)?;
+            let id = op
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("Boundary_{}_{}", id_fragment(task), id_fragment(error_code))
+                });
+            if def.elements.contains_key(&id) {
+                return Err(format!("add_error_boundary: node id '{id}' already exists"));
+            }
+            match def.elements.get(task).map(|e| &e.kind) {
+                Some(ElementKind::ServiceTask { .. }) => {}
+                Some(_) => {
+                    return Err(format!("add_error_boundary: '{task}' is not a serviceTask"))
+                }
+                None => return Err(format!("add_error_boundary: no node '{task}'")),
+            }
+            if !def.elements.contains_key(target) {
+                return Err(format!(
+                    "add_error_boundary: target node '{target}' does not exist"
+                ));
+            }
+            def.elements.insert(
+                id.clone(),
+                Element {
+                    id: id.clone(),
+                    kind: ElementKind::ErrorBoundaryEvent {
+                        attached_to: task.to_string(),
+                        error_code: error_code.to_string(),
+                    },
+                    outgoing: vec![SequenceFlow {
+                        to: target.to_string(),
+                        condition: None,
+                    }],
+                    parent: None,
+                },
+            );
+            Ok(format!(
+                "Added an error boundary '{id}' (errorCode '{error_code}') on '{task}', routing to '{target}'."
+            ))
+        }
+        "reroute_flow" => {
+            let from = req_str(op, "from", op_name)?;
+            let to = req_str(op, "to", op_name)?;
+            let new_to = req_str(op, "newTo", op_name)?;
+            if !def.elements.contains_key(new_to) {
+                return Err(format!(
+                    "reroute_flow: newTo node '{new_to}' does not exist"
+                ));
+            }
+            let el = def
+                .elements
+                .get_mut(from)
+                .ok_or_else(|| format!("reroute_flow: no node '{from}'"))?;
+            let flow = el
+                .outgoing
+                .iter_mut()
+                .find(|f| f.to == to)
+                .ok_or_else(|| format!("reroute_flow: no flow '{from}' -> '{to}'"))?;
+            flow.to = new_to.to_string();
+            Ok(format!(
+                "Rerouted flow '{from}' -> '{to}' to target '{new_to}'."
+            ))
+        }
+        "remove_node" => {
+            let id = req_str(op, "id", op_name)?;
+            if id == def.start_event {
+                return Err("remove_node: refusing to remove the start event".to_string());
+            }
+            let removed = def
+                .elements
+                .remove(id)
+                .ok_or_else(|| format!("remove_node: no node '{id}'"))?;
+            // Heal flows: every predecessor that pointed at the removed node now points at each of
+            // the removed node's successors (carrying the predecessor's own condition).
+            let successors: Vec<SequenceFlow> = removed.outgoing;
+            for el in def.elements.values_mut() {
+                let mut rewired: Vec<SequenceFlow> = Vec::new();
+                for flow in std::mem::take(&mut el.outgoing) {
+                    if flow.to == id {
+                        for succ in &successors {
+                            rewired.push(SequenceFlow {
+                                to: succ.to.clone(),
+                                condition: flow.condition.clone(),
+                            });
+                        }
+                    } else {
+                        rewired.push(flow);
+                    }
+                }
+                el.outgoing = rewired;
+            }
+            // Drop any boundary events that were attached to the removed node (they would dangle).
+            let orphaned: Vec<String> = def
+                .elements
+                .iter()
+                .filter(|(_, e)| {
+                    matches!(&e.kind,
+                    ElementKind::ErrorBoundaryEvent { attached_to, .. }
+                    | ElementKind::TimerBoundaryEvent { attached_to, .. }
+                    | ElementKind::MessageBoundaryEvent { attached_to, .. }
+                    if attached_to == id)
+                })
+                .map(|(bid, _)| bid.clone())
+                .collect();
+            for bid in &orphaned {
+                def.elements.remove(bid);
+            }
+            Ok(format!(
+                "Removed node '{id}', reconnecting its predecessors to its successors{}.",
+                if orphaned.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (also dropped {} attached boundary event(s))",
+                        orphaned.len()
+                    )
+                }
+            ))
+        }
+        "add_exclusive_gateway" => {
+            let id = req_str(op, "id", op_name)?;
+            let after = req_str(op, "after", op_name)?;
+            if def.elements.contains_key(id) {
+                return Err(format!(
+                    "add_exclusive_gateway: node id '{id}' already exists"
+                ));
+            }
+            let branches = op
+                .get("branches")
+                .and_then(|v| v.as_array())
+                .ok_or("add_exclusive_gateway requires a 'branches' array")?;
+            if branches.is_empty() {
+                return Err(
+                    "add_exclusive_gateway: 'branches' must list at least one target".into(),
+                );
+            }
+            let mut outgoing: Vec<SequenceFlow> = Vec::new();
+            for (i, b) in branches.iter().enumerate() {
+                let to = b
+                    .get("to")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        format!("add_exclusive_gateway: branch {i} needs a 'to' node")
+                    })?;
+                if !def.elements.contains_key(to) {
+                    return Err(format!(
+                        "add_exclusive_gateway: branch target '{to}' does not exist"
+                    ));
+                }
+                outgoing.push(SequenceFlow {
+                    to: to.to_string(),
+                    condition: condition_from(b.get("condition").and_then(|v| v.as_str())),
+                });
+            }
+            // Splice the gateway onto the anchor's single outgoing edge: after -> G, and G fans out
+            // to the requested branches. The anchor's original targets are preserved as the LAST,
+            // unconditional (default) branch so no path is silently dropped.
+            let anchor = def
+                .elements
+                .get_mut(after)
+                .ok_or_else(|| format!("add_exclusive_gateway: no node '{after}'"))?;
+            let original: Vec<SequenceFlow> = std::mem::take(&mut anchor.outgoing);
+            anchor.outgoing.push(SequenceFlow {
+                to: id.to_string(),
+                condition: None,
+            });
+            let parent = anchor.parent.clone();
+            for f in original {
+                // Carried as default branches (conditions dropped: the gateway now decides).
+                outgoing.push(SequenceFlow {
+                    to: f.to,
+                    condition: None,
+                });
+            }
+            def.elements.insert(
+                id.to_string(),
+                Element {
+                    id: id.to_string(),
+                    kind: ElementKind::ExclusiveGateway,
+                    outgoing,
+                    parent,
+                },
+            );
+            Ok(format!(
+                "Inserted exclusiveGateway '{id}' after '{after}' with {} branch(es).",
+                branches.len()
+            ))
+        }
+        other => Err(format!(
+            "unknown edit op '{other}'. Supported: set_task_job_type, set_flow_condition, \
+             insert_service_task_after, add_error_boundary, reroute_flow, remove_node, \
+             add_exclusive_gateway."
+        )),
+    }
+}
+
+/// `edit_model` — compose a candidate BPMN variant from a list of **validated structured
+/// operations** applied to a base model, instead of one-shotting raw whole-document XML.
+///
+/// The base is auto-healed (`normalize_authoring`) and parsed with the engine's own parser; each
+/// op mutates the parsed model and OUR serializer re-emits engine-parseable XML, which is re-parsed
+/// to guarantee the result deploys. Returns the new XML, the per-op change notes, and the
+/// post-edit [`analyze_model`] structural findings so the model sees the consequences immediately.
+pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
+    if ops.is_empty() {
+        return Err("edit_model needs at least one operation in 'ops'".to_string());
+    }
+    let (healed, heal_notes) = normalize_authoring(base_xml);
+    let (wrapped, _) = ensure_definitions(&healed);
+    let mut def = parse_bpmn(&wrapped)
+        .map_err(|e| {
+            let err = format!("{e:?}");
+            match deploy_fix_hint(&err) {
+                Some(h) => format!("base model failed to parse: {err}\nFix: {h}"),
+                None => format!("base model failed to parse: {err}"),
+            }
+        })?
+        .into_iter()
+        .next()
+        .ok_or("base model contained no process definitions")?;
+
+    let mut applied: Vec<String> = heal_notes;
+    for (i, op) in ops.iter().enumerate() {
+        let note = apply_edit_op(&mut def, op).map_err(|e| format!("op {} failed: {e}", i + 1))?;
+        applied.push(note);
+    }
+
+    let xml = definition_to_xml(&def);
+    // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
+    // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.
+    if let Err(e) = parse_bpmn(&xml) {
+        let err = format!("{e:?}");
+        let hint = deploy_fix_hint(&err);
+        return Err(format!(
+            "the edited model does not parse ({err}){}. This usually means an operation left a \
+             dangling reference (e.g. a flow to a removed node).",
+            hint.map(|h| format!("\nFix: {h}")).unwrap_or_default()
+        ));
+    }
+    let analysis = analyze_model(&xml).unwrap_or_else(|_| json!({}));
+
+    Ok(json!({
+        "ok": true,
+        "model": xml,
+        "appliedOps": applied,
+        "findings": analysis.get("findings").cloned().unwrap_or(json!([])),
+        "metrics": analysis.get("metrics").cloned().unwrap_or(json!({})),
+        "note": "This XML is engine-validated and ready to simulate. Pass it to simulate (start \
+                 with limit:1) or compare_variants. Do NOT hand-edit it — apply further changes \
+                 with another edit_model call.",
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,5 +2000,176 @@ mod tests {
         assert!(g.start_tasks.contains("CreditCheck"));
         assert!(g.end_tasks.contains("Approve") && g.end_tasks.contains("Reject"));
         assert!(!g.end_tasks.contains("CreditCheck"));
+    }
+
+    // ── Structured authoring: serializer round-trip + edit_model operations ──────────────────
+
+    /// Structural equivalence ignoring the verbatim `xml` field (which the serializer rewrites).
+    fn assert_same_structure(a: &ProcessDefinition, b: &ProcessDefinition) {
+        assert_eq!(a.id, b.id, "process id");
+        assert_eq!(a.start_event, b.start_event, "start event");
+        assert_eq!(a.elements, b.elements, "elements");
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_the_loan_model() {
+        // serialize -> re-parse must reproduce the exact structure (nodes, kinds, job types,
+        // gateway split with a guarded branch + a default, error declarations).
+        let (orig, _) = first_def(LOAN_BPMN).expect("parse loan");
+        let xml = definition_to_xml(&orig);
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&orig, &reparsed[0]);
+        // The guarded branch's FEEL condition (with an escaped '>=') survives the round trip.
+        let decision = &reparsed[0].elements["Decision"];
+        assert!(decision
+            .outgoing
+            .iter()
+            .any(|f| f.to == "Approve" && f.condition.is_some()));
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_error_boundary() {
+        // The healed Investigation-1 shape: a serviceTask with an error boundary routing to an
+        // error end. Round-tripping must re-synthesize the <bpmn:error> declaration + errorRef.
+        let healed = normalize_authoring(ERROR_BOUNDARY_MISSPELLED).0;
+        let (orig, _) = first_def(&healed).expect("parse healed");
+        let xml = definition_to_xml(&orig);
+        assert!(xml.contains("<bpmn:error "), "emits an error declaration");
+        let reparsed = parse_bpmn(&xml).expect("re-parses");
+        assert_same_structure(&orig, &reparsed[0]);
+    }
+
+    #[test]
+    fn edit_model_sets_a_task_job_type() {
+        let ops =
+            vec![json!({"op":"set_task_job_type","task":"CreditCheck","jobType":"bureau-pull"})];
+        let v = edit_model(LOAN_BPMN, &ops).expect("edit");
+        assert_eq!(v["ok"], true);
+        let xml = v["model"].as_str().unwrap();
+        let def = first_def(xml).unwrap().0;
+        match &def.elements["CreditCheck"].kind {
+            ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, "bureau-pull"),
+            _ => panic!("CreditCheck should still be a serviceTask"),
+        }
+    }
+
+    #[test]
+    fn edit_model_inserts_a_service_task_after() {
+        let ops = vec![json!({
+            "op":"insert_service_task_after","after":"CreditCheck","id":"FraudCheck","jobType":"fraud-check"
+        })];
+        let v = edit_model(LOAN_BPMN, &ops).expect("edit");
+        let xml = v["model"].as_str().unwrap();
+        let def = first_def(xml).unwrap().0;
+        // CreditCheck now flows into the new task, which flows on to the original target (Decision).
+        let cc = &def.elements["CreditCheck"];
+        assert!(cc.outgoing.iter().any(|f| f.to == "FraudCheck"));
+        let fc = &def.elements["FraudCheck"];
+        assert!(fc.outgoing.iter().any(|f| f.to == "Decision"));
+    }
+
+    #[test]
+    fn edit_model_adds_an_error_boundary_that_parses() {
+        // Investigation 1's intent, expressed as a validated op instead of hand-written XML.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" targetNamespace="t">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:serviceTask id="Credit"><bpmn:extensionElements><zeebe:taskDefinition type="credit-check"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="Done"/>
+    <bpmn:endEvent id="Err"/>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="Credit"/>
+    <bpmn:sequenceFlow id="b" sourceRef="Credit" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let ops = vec![json!({
+            "op":"add_error_boundary","task":"Credit","errorCode":"CREDIT_BUREAU_ERROR","target":"Err"
+        })];
+        let v = edit_model(base, &ops).expect("edit");
+        let xml = v["model"].as_str().unwrap();
+        let def = first_def(xml).unwrap().0;
+        let boundary = def
+            .elements
+            .values()
+            .find(|e| matches!(&e.kind, ElementKind::ErrorBoundaryEvent { .. }))
+            .expect("an error boundary was added");
+        match &boundary.kind {
+            ElementKind::ErrorBoundaryEvent {
+                attached_to,
+                error_code,
+            } => {
+                assert_eq!(attached_to, "Credit");
+                assert_eq!(error_code, "CREDIT_BUREAU_ERROR");
+            }
+            _ => unreachable!(),
+        }
+        assert!(boundary.outgoing.iter().any(|f| f.to == "Err"));
+    }
+
+    #[test]
+    fn edit_model_removes_a_node_and_heals_flows() {
+        // Remove the gateway: its predecessor (CreditCheck) should reconnect to the gateway's
+        // successors (Approve, Reject), so no dangling reference remains.
+        let ops = vec![json!({"op":"remove_node","id":"Decision"})];
+        let v = edit_model(LOAN_BPMN, &ops).expect("edit");
+        let xml = v["model"].as_str().unwrap();
+        let def = first_def(xml).unwrap().0;
+        assert!(!def.elements.contains_key("Decision"));
+        let cc = &def.elements["CreditCheck"];
+        assert!(cc.outgoing.iter().any(|f| f.to == "Approve"));
+        assert!(cc.outgoing.iter().any(|f| f.to == "Reject"));
+    }
+
+    #[test]
+    fn edit_model_adds_an_exclusive_gateway() {
+        // Splice a decision gateway after CreditCheck, branching to Approve (guarded) with the
+        // original path (to Decision) preserved as the default branch.
+        let ops = vec![json!({
+            "op":"add_exclusive_gateway","id":"Triage","after":"CreditCheck",
+            "branches":[{"to":"Approve","condition":"= score > 800"}]
+        })];
+        let v = edit_model(LOAN_BPMN, &ops).expect("edit");
+        let xml = v["model"].as_str().unwrap();
+        let def = first_def(xml).unwrap().0;
+        assert!(matches!(
+            def.elements["Triage"].kind,
+            ElementKind::ExclusiveGateway
+        ));
+        let cc = &def.elements["CreditCheck"];
+        assert!(cc.outgoing.iter().any(|f| f.to == "Triage"));
+        let triage = &def.elements["Triage"];
+        assert!(triage
+            .outgoing
+            .iter()
+            .any(|f| f.to == "Approve" && f.condition.is_some()));
+        // The original CreditCheck -> Decision path is preserved through the gateway as default.
+        assert!(triage
+            .outgoing
+            .iter()
+            .any(|f| f.to == "Decision" && f.condition.is_none()));
+    }
+
+    #[test]
+    fn edit_model_auto_heals_the_base_then_applies_ops() {
+        // The base uses the bogus <errorBoundaryEvent>; edit_model heals it before editing, so a
+        // job-type tweak still succeeds (and the heal is reported in appliedOps).
+        let ops =
+            vec![json!({"op":"set_task_job_type","task":"Task_CreditCheck","jobType":"bureau"})];
+        let v = edit_model(ERROR_BOUNDARY_MISSPELLED, &ops).expect("edit heals + applies");
+        let applied = v["appliedOps"].as_array().unwrap();
+        assert!(applied
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("errorBoundaryEvent")));
+        let xml = v["model"].as_str().unwrap();
+        assert!(!xml.contains("errorBoundaryEvent"));
+        parse_bpmn(xml).expect("edited model parses");
+    }
+
+    #[test]
+    fn edit_model_rejects_an_unknown_node_with_a_clear_error() {
+        let ops = vec![json!({"op":"set_task_job_type","task":"Nope","jobType":"x"})];
+        let err = edit_model(LOAN_BPMN, &ops).expect_err("should fail");
+        assert!(err.contains("op 1 failed"), "got: {err}");
+        assert!(err.contains("Nope"), "names the missing node: {err}");
     }
 }

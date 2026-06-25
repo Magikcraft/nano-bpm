@@ -213,6 +213,52 @@ impl ToolBox for AnalysisTools {
                 }),
             });
             specs.push(ToolSpec {
+                name: "edit_model".into(),
+                description: "AUTHOR a candidate BPMN variant by applying VALIDATED structured \
+                    operations to the current model — instead of hand-writing whole-document XML \
+                    (which is error-prone: a misspelled element or a misplaced attribute silently \
+                    breaks the model). This tool OWNS XML correctness: it parses the base with the \
+                    engine's parser, applies your ops to the model, and re-emits engine-validated \
+                    XML, returning the new full `model` (ready to pass straight to simulate / \
+                    compare_variants), the `appliedOps` notes, and the post-edit analyze_model \
+                    findings. PREFER THIS over typing BPMN by hand. Args: ops (array, applied in \
+                    order), base (optional BPMN XML to edit; omit to edit the current process \
+                    model). Each op is an object with an `op` field:\n\
+                    • set_task_job_type {task, jobType} — change a serviceTask's job type.\n\
+                    • set_flow_condition {from, to, condition} — set/replace (empty clears) the \
+                    FEEL guard on the flow from->to.\n\
+                    • insert_service_task_after {after, id, jobType} — splice a new serviceTask \
+                    onto `after`'s outgoing edge (after -> NEW -> original targets).\n\
+                    • add_error_boundary {task, errorCode, target, id?} — attach an error boundary \
+                    to a serviceTask routing to `target` (synthesizes the <bpmn:error> + errorRef \
+                    for you — the exact thing models get wrong by hand).\n\
+                    • reroute_flow {from, to, newTo} — repoint the flow from->to at newTo.\n\
+                    • remove_node {id} — delete a node and reconnect its predecessors to its \
+                    successors (and drop any boundary events attached to it).\n\
+                    • add_exclusive_gateway {id, after, branches:[{to, condition?}]} — splice an \
+                    XOR gateway after a node; `after`'s original target(s) are kept as the default \
+                    branch."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "ops": {
+                            "type": "array",
+                            "description": "Structured edit operations, applied in order. Each is \
+                                an object whose `op` field names the operation (see the tool \
+                                description for the per-op fields).",
+                            "items": { "type": "object" }
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "BPMN XML to edit. Omit to edit the current process \
+                                model. Pass a previous edit_model `model` to chain edits."
+                        }
+                    },
+                    "required": ["ops"]
+                }),
+            });
+            specs.push(ToolSpec {
                 name: "conformance_check".into(),
                 description: "Replay the mined trace behaviour against the BPMN MODEL and report \
                     where reality diverges from design: a transition-fitness score, nonconformant \
@@ -395,6 +441,21 @@ impl ToolBox for AnalysisTools {
                 };
                 let v = crate::bpmn_model::validate_model(xml)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise validation: {e}"))
+            }
+            "edit_model" => {
+                let ops = args
+                    .get("ops")
+                    .and_then(|v| v.as_array())
+                    .ok_or("edit_model requires an 'ops' array")?;
+                let base = match args.get("base").and_then(|v| v.as_str()) {
+                    Some(b) => b,
+                    None => self.model.as_deref().ok_or(
+                        "edit_model needs a 'base' argument: this process has no BPMN model to \
+                         edit",
+                    )?,
+                };
+                let v = crate::bpmn_model::edit_model(base, ops)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise edit: {e}"))
             }
             "conformance_check" => {
                 let xml = self

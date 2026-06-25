@@ -323,6 +323,21 @@ instead of picking from a fixed menu.
   `fixHint` (`bpmn_model::deploy_fix_hint`) for the recurring boundary-event and unknown-element
   errors. *(Next step on the roadmap: a structured `edit_model` patch tool so the model composes a
   variant from validated operations instead of one-shotting raw XML at all.)*
+- **`edit_model` — structured, validated authoring (no more one-shotting raw XML).** The durable
+  fix for "hand-writing whole-document BPMN is the LLM's weakest link": instead of emitting raw XML,
+  the persona composes a variant from **validated structured operations** applied to the current
+  model, and ProcessOS owns the XML correctness end-to-end (`bpmn_model::edit_model` +
+  `definition_to_xml`). The base is auto-healed and parsed with the engine's own parser; each op
+  mutates the parsed `ProcessDefinition`; the result is re-serialized to engine-parseable XML and
+  re-parsed before it is returned — so the model literally **cannot** produce the element/attribute
+  syntax mistakes it falls into by hand. Supported ops: `set_task_job_type`, `set_flow_condition`,
+  `insert_service_task_after`, `add_error_boundary` (synthesizes the `<bpmn:error>` + `errorRef`
+  for you), `reroute_flow`, `remove_node` (reconnects predecessors→successors, drops attached
+  boundaries), and `add_exclusive_gateway`. The call returns the new full `model` XML (ready to pass
+  straight to `simulate` / `compare_variants`), per-op `appliedOps` notes, and the post-edit
+  `analyze_model` findings. The Experiment Designer persona now reaches for `edit_model` as the
+  authoring primitive (rung 0 of its iterate-cheaply ladder). *(DI is intentionally omitted — these
+  are candidate models for simulation, and the cockpit renders DI-less variants.)*
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:

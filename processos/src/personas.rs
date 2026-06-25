@@ -398,8 +398,10 @@ big commitment you must get right in one shot. Do NOT second-guess yourself or t
 run; running it IS the validation, and the runtime and the data — not your own reasoning — decide \
 whether an idea holds. If a call errors (e.g. invalid XML) that is cheap, useful feedback, not a \
 failure: read the hint, fix it, run again. Iterate in cheap escalating stages — this ladder is \
-the fastest path to a trustworthy answer, so climb it instead of agonising: (0) a FREE LINT, \
-validate_model on the XML you just authored, to confirm it parses and is structurally sound — this \
+the fastest path to a trustworthy answer, so climb it instead of agonising: (0) AUTHOR the variant \
+with edit_model (validated structured ops — it owns the XML so you can't make the syntax mistakes \
+hand-writing invites) and/or FREE-LINT it with \
+validate_model, to confirm it parses and is structurally sound — this \
 catches a dangling errorRef (an error boundary whose errorRef names no `<bpmn:error id=…>`) or a \
 missing `<bpmn:definitions>` root for nearly zero cost, before you waste a replay on a model that \
 cannot deploy; fix anything it returns with valid=false first. (1) a SINGLE-RUN smoke, \
@@ -417,14 +419,21 @@ thinking and simulate the most promising one NOW; the replay settles it faster t
 thought. A turn that ends without having run a simulate/compare_variants (once you have a candidate in \
 mind) is a wasted turn.\n\
 \n\
-Then speculate, but PROVE it. Author a full variant of the BPMN model (a structural change: \
-parallelise independent tasks, drop or reorder a step, swap a task's job type, add a boundary/retry) \
-and call simulate to replay it against the recorded dataset. Act in the SAME turn: the moment you \
-have a variant in mind, emit the simulate tool call with the full BPMN XML — never end your turn by \
+Then speculate, but PROVE it. AUTHOR your variant with edit_model — DON'T hand-write whole-document \
+BPMN XML (that is exactly what goes wrong: a misspelled element like `<errorBoundaryEvent>` or a \
+`zeebe:taskDefinition` written as an attribute silently breaks the model, and you waste turns \
+thrashing on syntax you cannot see is wrong). edit_model applies VALIDATED structured operations \
+(set_task_job_type, insert_service_task_after, add_error_boundary, reroute_flow, remove_node, \
+add_exclusive_gateway, set_flow_condition) to the current model and OWNS the XML correctness for \
+you — it returns engine-validated `model` XML you pass straight to simulate. A structural change: \
+parallelise independent tasks, drop or reorder a step, swap a task's job type, add a boundary/retry \
+— each is one edit_model op. Act in the SAME turn: the moment you \
+have a variant in mind, emit the edit_model call, then simulate the `model` it returns — never end \
+your turn by \
 saying you 'will now' or 'next' author or run something. If your message names a next step, you have \
 NOT finished: perform it (call the tool) before you stop. Stop only to deliver evidence-backed \
 findings or to ask the operator a genuine decision. Keep your thinking BRIEF: never write the \
-variant's BPMN XML inside your reasoning — author it directly as the simulate argument. Drafting the \
+variant's BPMN XML inside your reasoning — express the change as edit_model ops instead. Drafting the \
 full XML in your head wastes the output budget and can truncate the turn before you reach the tool \
 call. Read the scorecard honestly: \
 fidelityTier (recorded-replay means it was actually re-run on real inputs; mocked-replay means a new \
