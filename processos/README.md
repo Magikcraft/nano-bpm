@@ -450,7 +450,9 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   false negatives (any transport/parse failure ⇒ "not circling" ⇒ no intervention). The
   watcher emits `{type:"monitor"}` SSE events, rendered as a distinct centered note in the
   thread. Enable per-request (`monitor:{enabled, profileId, personaId}`) or globally via the
-  `PROCESSOS_MONITOR` env var (`1`/`profileId` ⇒ on).
+  `PROCESSOS_MONITOR` env var (`1`/`profileId` ⇒ on). In the cockpit it's a **Monitor** toggle in
+  the compose row (a second "pairing mode" alongside Pair AI); its profile picker defaults to the
+  local **sidecar** model so it's cheap to keep watching.
 - `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
   persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
   Ships four built-ins led by an **open investigation** (the default, pre-loaded into a

@@ -913,6 +913,13 @@ async function renderWorkspace(ws, proc){
               <select id="chatPairProfile" title="The reviewer's LLM profile (its own model)"></select>
               <select id="chatPairPersona" title="The reviewer's persona (how it reviews)"></select>
             </span>
+            <label class="persona-pick" id="chatMonitorToggle" title="Loop monitor: a second model watches this investigation's live transcript and steers it (then forces a wrap-up) when it detects the droid circling — rephrasing dead-ends, oscillating hypotheses, or re-attacking an unreachable path. Off by default. Defaults to the local sidecar model so it's cheap to keep watching.">
+              <span><input type="checkbox" id="chatMonitorOn" style="vertical-align:-1px"> Monitor</span>
+            </label>
+            <span class="persona-pick" id="chatMonitorCfg" style="display:none">
+              <select id="chatMonitorProfile" title="The monitor's LLM profile (defaults to the local sidecar)"></select>
+              <select id="chatMonitorPersona" title="The monitor's persona (how it decides to intervene)"></select>
+            </span>
             <select id="chatPrompt"><option value="">Load a prompt…</option></select>
             <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
             <span class="fontctl" title="Chat text size">
@@ -1774,8 +1781,10 @@ async function loadPersonas(){
   } catch(e){ STATE.personas = []; }
   const all = STATE.personas || [];
   const isPair = p => p.kind === 'pair';
-  const primary = all.filter(p => !isPair(p));
+  const isMonitor = p => p.kind === 'monitor';
+  const primary = all.filter(p => !isPair(p) && !isMonitor(p));
   const pairPersonas = all.filter(isPair);
+  const monitorPersonas = all.filter(isMonitor);
   if(sel){
     const def = (primary.find(p => p.default) || primary[0] || {}).id || '';
     sel.innerHTML = primary.map(p =>
@@ -1793,8 +1802,20 @@ async function loadPersonas(){
     psel.title = personaSummary(psel.value);
     psel.onchange = () => { psel.title = personaSummary(psel.value); localStorage.setItem('processos.pairPersona', psel.value); };
   }
+  // Loop-monitor persona picker (monitor-kind personas only).
+  const msel = $('#chatMonitorPersona');
+  if(msel){
+    const want = localStorage.getItem('processos.monitorPersona') || 'monitor-loop-breaker';
+    msel.innerHTML = monitorPersonas.map(p =>
+      '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
+      || '<option value="monitor-loop-breaker">Loop Breaker</option>';
+    msel.title = personaSummary(msel.value);
+    msel.onchange = () => { msel.title = personaSummary(msel.value); localStorage.setItem('processos.monitorPersona', msel.value); };
+  }
   await fillPairProfiles();
   wirePairControls();
+  await fillMonitorProfiles();
+  wireMonitorControls();
 }
 // Populate the Pair AI reviewer's LLM-profile picker from the configured profiles. Defaults to a
 // profile *other* than the active primary when possible (cross-model pairing decorrelates errors).
@@ -1829,6 +1850,40 @@ function pairRequest(){
   if(!on || !on.checked) return null;
   const profileId = ($('#chatPairProfile')||{}).value || undefined;
   const personaId = ($('#chatPairPersona')||{}).value || undefined;
+  return { enabled: true, profileId, personaId };
+}
+// Populate the loop monitor's LLM-profile picker. Defaults to the local sidecar profile when one
+// is configured (cheap to keep watching), else a profile other than the active primary.
+async function fillMonitorProfiles(){
+  const sel = $('#chatMonitorProfile'); if(!sel) return;
+  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
+  const profiles = s.profiles || [];
+  const saved = localStorage.getItem('processos.monitorProfile');
+  const sidecar = (profiles.find(p => p.sidecar) || {}).id;
+  const fallback = sidecar || (profiles.find(p => p.id !== s.activeProfile) || profiles[0] || {}).id || '';
+  const want = (saved && profiles.some(p => p.id===saved)) ? saved : fallback;
+  sel.innerHTML = profiles.length
+    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
+    : '<option value="">No profiles configured</option>';
+  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.monitorProfile', sel.value); };
+}
+// Wire the Monitor on/off toggle: reveal the monitor config when on and persist the choice.
+function wireMonitorControls(){
+  const on = $('#chatMonitorOn'), cfg = $('#chatMonitorCfg'); if(!on || !cfg) return;
+  const sync = () => {
+    cfg.style.display = on.checked ? '' : 'none';
+    localStorage.setItem('processos.monitorOn', on.checked ? '1' : '0');
+  };
+  on.checked = localStorage.getItem('processos.monitorOn') === '1';
+  on.onchange = sync;
+  sync();
+}
+// The loop-monitor config the composer will send (or null when off / unavailable).
+function monitorRequest(){
+  const on = $('#chatMonitorOn');
+  if(!on || !on.checked) return null;
+  const profileId = ($('#chatMonitorProfile')||{}).value || undefined;
+  const personaId = ($('#chatMonitorPersona')||{}).value || undefined;
   return { enabled: true, profileId, personaId };
 }
 function personaSummary(id){
@@ -1875,7 +1930,7 @@ async function sendChat(ws, proc){
     onErrorRestore: () => { box.value = msg; },
     fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined })
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined })
     }),
   });
 }
