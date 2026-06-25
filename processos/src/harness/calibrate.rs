@@ -117,10 +117,11 @@ pub fn calibrate_from_measured(scenario: &Scenario, measured: &[MeasuredJobType]
             // validates the pool up front, so just skip rather than invent one.
             continue;
         };
-        if a.service_samples > 0 {
+        if let Some(latency) =
+            (a.service_weighted + a.service_samples / 2).checked_div(a.service_samples)
+        {
             // Round to nearest millisecond.
-            w.latency_ms =
-                ((a.service_weighted + a.service_samples / 2) / a.service_samples) as u64;
+            w.latency_ms = latency as u64;
         }
         if a.samples > 0 {
             let rate = a.failures as f64 / a.samples as f64;

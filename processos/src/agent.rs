@@ -62,6 +62,14 @@ pub enum Msg {
     },
 }
 
+/// Optional sink for persisting the *in-progress* transcript at agent round boundaries.
+///
+/// When supplied, [`run_agent_streaming`] invokes it with the running messages so the caller
+/// can checkpoint the conversation incrementally (e.g. throttled to disk every couple of
+/// seconds), leaving a debuggable transcript even when a turn times out, errors, or is
+/// interrupted — instead of only persisting on clean completion.
+pub type Checkpoint<'a> = Option<&'a mut dyn FnMut(&[Msg])>;
+
 /// A set of callable tools.
 pub trait ToolBox {
     fn specs(&self) -> Vec<ToolSpec>;
@@ -115,13 +123,17 @@ pub trait AgentStep {
     }
 
     /// Streaming variant: same contract as [`AgentStep::step`], but `on_delta` is invoked with
-    /// each token fragment as it arrives so the caller can surface live progress. The default
-    /// implementation is non-streaming (emits no deltas) so mock transports need not implement it.
+    /// each token fragment as it arrives so the caller can surface live progress. `cancel`, when
+    /// set mid-stream, asks the transport to STOP reading (which cancels generation) and return
+    /// what it has — so an operator can interrupt a model caught in a loop while still generating,
+    /// not only between rounds. The default implementation is non-streaming (emits no deltas,
+    /// ignores `cancel`) so mock transports need not implement it.
     async fn step_streaming(
         &self,
         msgs: &[Msg],
         tools: &[ToolSpec],
         _on_delta: &mut dyn FnMut(Delta),
+        _cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Turn, String> {
         self.step(msgs, tools).await
     }
@@ -183,13 +195,22 @@ pub async fn run_agent_resumable_cancellable<M: AgentStep, T: ToolBox + ?Sized>(
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<AgentRun, String> {
     let mut sink = |_ev: AgentEvent| {};
-    run_agent_streaming(model, tools, msgs, max_rounds, cancel, None, &mut sink).await
+    run_agent_streaming(
+        model, tools, msgs, max_rounds, cancel, None, &mut sink, None,
+    )
+    .await
 }
 
 /// As [`run_agent_resumable_cancellable`], but emits [`AgentEvent`]s through `sink` as the run
 /// progresses — token fragments of the droid's thinking and answer, plus tool-call boundaries —
 /// so the cockpit can render the investigation live instead of waiting for the whole turn. This
 /// is the canonical loop; the non-streaming entry points delegate here with a no-op sink.
+///
+/// `checkpoint`, when supplied, is invoked with the *running* transcript at each round boundary
+/// and after each batch of tool results, so the caller can PERSIST the in-progress conversation
+/// incrementally (rather than only when the whole turn completes). This is what lets a turn that
+/// times out, errors, or is interrupted still leave a debuggable transcript on disk.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
     model: &M,
     tools: &T,
@@ -198,6 +219,7 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     steer: Option<&std::sync::Mutex<Vec<String>>>,
     sink: &mut dyn FnMut(AgentEvent),
+    mut checkpoint: Checkpoint<'_>,
 ) -> Result<AgentRun, String> {
     use std::sync::atomic::Ordering;
     let specs = tools.specs();
@@ -238,6 +260,12 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
             }
         }
         sink(AgentEvent::Round(round));
+        // Persist the running transcript at the round boundary (the user/steer messages are now
+        // in `msgs`). On round 1 this lands the operator's message immediately, so even a turn
+        // that dies in its first generation leaves something on disk to debug.
+        if let Some(cp) = checkpoint.as_deref_mut() {
+            cp(msgs);
+        }
         // Surface the exact payload this round sends to the model, so the debug view can show
         // everything it receives (system prompt + tool specs + full transcript), not just the
         // operator's latest message.
@@ -258,8 +286,17 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                 }
                 Delta::Answer(t) => sink(AgentEvent::Answer(t)),
             };
-            model.step_streaming(msgs, &specs, &mut on_delta).await?
+            model
+                .step_streaming(msgs, &specs, &mut on_delta, cancel)
+                .await?
         };
+        // If the operator interrupted while the model was still generating (cancel flipped
+        // mid-stream, so step_streaming returned early), don't process the partial turn —
+        // stop and summarise from what we have, immediately, rather than nudging on a
+        // truncated runaway. (Round-top also checks cancel, but only between rounds.)
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return wrap_up(model, msgs, steps, round, sink).await;
+        }
         match turn {
             Turn::Final(answer) => {
                 // Two failure modes end a turn without progress: (a) the model NAMES a
@@ -373,6 +410,11 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                         content: result,
                     });
                 }
+                // The assistant's tool calls and their results are now in `msgs`; persist this
+                // progress so a turn that later stalls/times out still shows the tools it ran.
+                if let Some(cp) = checkpoint.as_deref_mut() {
+                    cp(msgs);
+                }
                 if is_repeat {
                     repeat_nudges += 1;
                     if repeat_nudges > MAX_REPEAT_NUDGES {
@@ -417,7 +459,9 @@ async fn wrap_up<M: AgentStep>(
             Delta::Reasoning(t) => sink(AgentEvent::Reasoning(t)),
             Delta::Answer(t) => sink(AgentEvent::Answer(t)),
         };
-        match model.step_streaming(msgs, &[], &mut on_delta).await? {
+        // Pass no cancel: wrap-up is the *consequence* of an interrupt/budget stop, so the
+        // summary generation must be allowed to run even though `cancel` is (often) still set.
+        match model.step_streaming(msgs, &[], &mut on_delta, None).await? {
             Turn::Final(a) => a,
             Turn::ToolCalls(_) => String::new(),
         }
@@ -524,8 +568,10 @@ impl AgentStep for OpenAiAgent {
         msgs: &[Msg],
         tools: &[ToolSpec],
         on_delta: &mut dyn FnMut(Delta),
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Turn, String> {
         use futures_util::StreamExt;
+        use std::sync::atomic::Ordering;
         if !self.cfg.is_ready() {
             return Err("no LLM model configured (set PROCESSOS_LLM_MODEL)".into());
         }
@@ -563,6 +609,12 @@ impl AgentStep for OpenAiAgent {
         let mut next_check = RUNAWAY_TAIL_MIN;
         let mut stream = resp.bytes_stream();
         'outer: while let Some(chunk) = stream.next().await {
+            // Operator interrupted (wrap-up/steer) while the model is still generating: stop
+            // reading the stream — which cancels generation upstream — and return what we have
+            // so the harness can summarise immediately instead of waiting out a runaway.
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break 'outer;
+            }
             let bytes = chunk.map_err(|e| format!("LLM stream error: {e}"))?;
             buf.push_str(&String::from_utf8_lossy(&bytes));
             // Process complete SSE lines; keep the trailing partial line in `buf`.
@@ -1214,6 +1266,7 @@ mod tests {
             None,
             Some(&steer),
             &mut sink,
+            None,
         )
         .await
         .unwrap();
@@ -1225,6 +1278,53 @@ mod tests {
             msgs.iter()
                 .any(|m| matches!(m, Msg::User(t) if t == "focus on credit-check")),
             "steer must be injected as a user turn: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_is_invoked_with_the_running_transcript() {
+        use std::cell::RefCell;
+        // The checkpoint must fire at the round-1 boundary (capturing system+user before the
+        // model is even called) and again after the tool results land — so a turn that later
+        // dies still leaves the user message and any tool work on disk.
+        let model = ScriptedModel {
+            turns: vec![vec![ToolCall {
+                id: "c".into(),
+                name: "echo".into(),
+                arguments: json!({"x":"a"}),
+            }]],
+            idx: Cell::new(0),
+            final_answer: "done".into(),
+        };
+        let mut msgs = vec![Msg::System("sys".into()), Msg::User("go".into())];
+        let mut sink = |_ev: AgentEvent| {};
+        // Record the transcript length at each checkpoint call.
+        let snapshots: RefCell<Vec<usize>> = RefCell::new(Vec::new());
+        let mut cp = |m: &[Msg]| snapshots.borrow_mut().push(m.len());
+        let run = run_agent_streaming(
+            &model,
+            &EchoTools,
+            &mut msgs,
+            5,
+            None,
+            None,
+            &mut sink,
+            Some(&mut cp),
+        )
+        .await
+        .unwrap();
+        assert_eq!(run.answer, "done");
+        let snaps = snapshots.into_inner();
+        // First checkpoint (round 1 top) sees exactly system+user …
+        assert_eq!(
+            snaps.first(),
+            Some(&2),
+            "round-1 checkpoint snapshots: {snaps:?}"
+        );
+        // … and a later checkpoint (after tool results) sees a longer transcript.
+        assert!(
+            snaps.iter().any(|&n| n > 2),
+            "expected a post-tool checkpoint with more messages: {snaps:?}"
         );
     }
 

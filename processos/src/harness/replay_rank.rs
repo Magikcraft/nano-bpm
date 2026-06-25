@@ -175,7 +175,7 @@ pub fn rank_candidates_by_replay(
         .map(|c| score_candidate(c, dataset, default_process_id))
         .collect();
 
-    ranked.sort_by(|a, b| candidate_order(a).cmp(&candidate_order(b)));
+    ranked.sort_by_key(candidate_order);
 
     let best = ranked
         .iter()

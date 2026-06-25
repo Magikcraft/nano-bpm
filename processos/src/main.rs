@@ -59,6 +59,10 @@ use crate::harness::{
 };
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 
+/// Per-session steering queues: an operator instruction stack drained into the running turn.
+type SteerQueues =
+    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>;
+
 #[derive(Clone)]
 struct AppState {
     /// The client's production engine — the read-only analysis TARGET. Traces,
@@ -103,9 +107,7 @@ struct AppState {
     /// Steering queues for in-flight chat turns, keyed by session. The cockpit's "Steer …"
     /// control appends an operator instruction; the agent loop drains it at the next round
     /// boundary and injects it as a user turn, redirecting an investigation without restarting it.
-    chat_steers: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>,
-    >,
+    chat_steers: Arc<SteerQueues>,
     /// The exact model request bodies sent during each session's most recent turn, keyed by
     /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
     /// (not persisted) — it shows what was last sent and is cleared on restart.
@@ -1846,6 +1848,7 @@ async fn cockpit_chat_send(
                 &pairs,
                 prior,
                 &message,
+                None,
             ))
         })
         .await;
@@ -1976,6 +1979,26 @@ async fn cockpit_chat_stream(
             }
         };
         let live_for_sink = task_live.clone();
+        // Incrementally PERSIST the running transcript (throttled to ~2s) so a turn that times
+        // out, errors, or is interrupted still leaves a debuggable transcript on disk — instead
+        // of the old behaviour where nothing was saved unless the whole turn completed cleanly.
+        let cp_chat = task_state.chat.clone();
+        let cp_key = task_key.clone();
+        let cp_sid = task_sid.clone();
+        let cp_prior_stamps = prior_stamps.clone();
+        let cp_user_ts = user_ts;
+        // Start "stale" so the first checkpoint (which carries the operator's message) saves at once.
+        let mut last_save = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        let mut checkpoint = move |msgs: &[agent::Msg]| {
+            let now = std::time::Instant::now();
+            if now.duration_since(last_save) < std::time::Duration::from_secs(2) {
+                return;
+            }
+            last_save = now;
+            let stamps =
+                chat::extend_stamps(msgs, cp_prior_stamps.clone(), cp_user_ts, chat_now_ms());
+            cp_chat.save(&cp_key, &cp_sid, msgs.to_vec(), stamps);
+        };
         // Accumulate this turn's exact request payloads for the session's Debug tab while also
         // forwarding each over the wire so the tab can update live.
         let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -2024,6 +2047,7 @@ async fn cockpit_chat_stream(
             &pairs,
             prior,
             &message,
+            Some(&mut checkpoint),
         ));
         // Persist the captured payloads regardless of outcome (a failed turn still sent a request).
         let bodies = dbg.lock().map(|d| d.clone()).unwrap_or_default();

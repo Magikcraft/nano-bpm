@@ -217,7 +217,7 @@ pub async fn list_experiments(
             awaiting,
         ));
     }
-    out.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    out.sort_by_key(|b| std::cmp::Reverse(b.started_at));
     Ok(out)
 }
 
@@ -256,7 +256,7 @@ pub async fn overview(
             }
         })
         .collect();
-    processes.sort_by(|a, b| b.instances.cmp(&a.instances));
+    processes.sort_by_key(|b| std::cmp::Reverse(b.instances));
 
     Ok(Overview {
         nano_base_url: target.base_url().to_string(),

@@ -1027,11 +1027,13 @@ struct MessageDecl {
     correlation_key: Option<String>,
 }
 
+/// The message declarations a model needs, paired with a lookup from `(name, correlation_key)`
+/// to the declaration id (so events differing only in correlation get distinct declarations).
+type MessageCollection = (Vec<MessageDecl>, HashMap<(String, Option<String>), String>);
+
 /// Collect the `<bpmn:message>` declarations a model needs, keyed for lookup by
 /// `(name, correlation_key)` so events that differ in correlation get distinct declarations.
-fn collect_messages(
-    def: &ProcessDefinition,
-) -> (Vec<MessageDecl>, HashMap<(String, Option<String>), String>) {
+fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
     let mut decls: Vec<MessageDecl> = Vec::new();
     let mut lookup: HashMap<(String, Option<String>), String> = HashMap::new();
     let mut want: Vec<(String, Option<String>)> = Vec::new();

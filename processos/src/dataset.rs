@@ -69,7 +69,7 @@ impl DatasetSource {
         }
 
         // De-dup by instance key (a file may also appear in the bundle); keep first.
-        traces.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        traces.sort_by_key(|b| std::cmp::Reverse(b.started_at));
         traces.dedup_by(|a, b| a.instance_key == b.instance_key);
 
         let summaries = traces.iter().map(summary_of).collect();

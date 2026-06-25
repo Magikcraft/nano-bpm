@@ -677,12 +677,7 @@ fn sample_queue_ms(c: u32, lambda_per_sec: f64, service_s: f64, seed: u64) -> u6
     (wait_s * 1000.0).round() as u64
 }
 
-fn pick_input<'a>(
-    inputs: &'a [InputCase],
-    total_weight: f64,
-    seed: u64,
-    idx: u64,
-) -> &'a InputCase {
+fn pick_input(inputs: &[InputCase], total_weight: f64, seed: u64, idx: u64) -> &InputCase {
     let mut r = draw(seed, idx) * total_weight;
     for c in inputs {
         r -= c.weight.max(0.0);
@@ -877,7 +872,7 @@ pub fn infer(dataset_dir: &Path, target_p99_wait_ms: u64) -> Result<Inference, S
                 on += n;
             }
         }
-        let offpeak_q = if on > 0 { osum / on } else { 0 };
+        let offpeak_q = osum.checked_div(on).unwrap_or(0);
         let inflation = peak_q.saturating_sub(offpeak_q);
         let better = match &best {
             Some((_, _, bp, bo, _)) => inflation > bp.saturating_sub(*bo),

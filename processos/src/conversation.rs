@@ -116,8 +116,7 @@ impl ConversationStore {
     }
 
     fn persist(&self, key: &str, msg: &Message) -> std::io::Result<()> {
-        let line = serde_json::to_string(msg)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(msg).map_err(std::io::Error::other)?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)

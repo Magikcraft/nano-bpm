@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn a_saved_fork_is_durable_across_reopen() {
         let dir = tmp();
-        let forked = DEFAULT_PILOT_BPMN.replace("pilotSelfOptimize", "pilotSelfOptimize");
+        let forked = DEFAULT_PILOT_BPMN.to_string();
         // A real, parseable variant: tweak a non-id attribute so bytes differ but the
         // process id stays the one the cockpit drives.
         let forked = forked.replace(

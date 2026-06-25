@@ -130,6 +130,8 @@
   .cs-main { flex: 1; min-width: 0; }
   .cs-name { font-size: 13px; color: #e4e4e7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .cs-tab.on .cs-name { color: #c7d2fe; }
+  .cs-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid #3b3b52; border-top-color: #818cf8; border-radius: 50%; animation: cs-spin 0.7s linear infinite; }
+  @keyframes cs-spin { to { transform: rotate(360deg); } }
   .cs-meta { font-size: 10.5px; color: #6b7280; margin-top: 1px; }
   .cs-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .1s; }
   .cs-tab:hover .cs-actions, .cs-tab.on .cs-actions { opacity: 1; }
@@ -1209,6 +1211,8 @@ function setChatBusy(busy){
     if(busy){ btn.textContent = 'Steer ' + (STATE.profileName || 'the droid'); }
     else { labelSendButton(); }
   }
+  // Start/stop the spinner next to the active session in the left-hand list.
+  if(STATE.ws && STATE.wsProc) drawSessions(STATE.ws, STATE.wsProc);
 }
 
 // The Send button and Cmd/Ctrl+Enter route to steering while a turn is in flight,
@@ -1342,6 +1346,22 @@ function splitThinking(text){
 }
 
 function droidName(){ return STATE.profileName || 'Droid'; }
+// Render an error as a droid bubble. Context-window exhaustion (the most common hard failure
+// for local models on long investigations) is detected and explained, so the operator knows to
+// start a fresh chat or trim context rather than staring at a raw provider error.
+function chatErrorHtml(msg){
+  const raw = (msg==null ? '' : String(msg));
+  const low = raw.toLowerCase();
+  const ctx = low.includes('context') && (low.includes('length') || low.includes('exceed') || low.includes('window') || low.includes('too long') || low.includes('maximum'));
+  let body = '<span style="color:#fca5a5">'+esc(raw)+'</span>';
+  if(ctx){
+    body = '<span style="color:#fca5a5">⚠ The model ran out of context (its input window filled up).</span>'+
+      '<div style="color:#a1a1aa;font-size:12px;margin-top:4px">This investigation got too long for the model. Start a new chat, or switch to a model with a larger context window, then continue.</div>'+
+      '<details style="margin-top:4px"><summary style="cursor:pointer;color:#71717a;font-size:11px">details</summary><span style="color:#a1a1aa;font-size:11px">'+esc(raw)+'</span></details>';
+  }
+  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div>'+body+'</div>';
+}
+
 // The droid's bubble title: the active profile name, with the model id in a smaller, dimmer
 // parenthetical — e.g. "Remote Qwen 3.6 (UNSLOTH/QWEN3.6-35B-A3B-GGUF:UD-Q6_K)".
 function droidWhoHtml(){
@@ -1668,9 +1688,12 @@ function drawSessions(ws, proc){
   list.innerHTML = ss.map(s => {
     const on = s.id===STATE.sessionId ? ' on' : '';
     const when = s.updated ? fmtTime(s.updated) : '';
+    // Spinner next to whichever session is actively investigating (the in-flight turn always
+    // belongs to the selected session); cleared on done/error via the setChatBusy redraw.
+    const spin = (STATE.chatBusy && s.id===STATE.sessionId) ? '<span class="cs-spin" title="Investigating…"></span>' : '';
     return '<div class="cs-tab'+on+'" data-id="'+esc(s.id)+'">'+
       '<div class="cs-main">'+
-        '<div class="cs-name" title="'+esc(s.name)+'">'+esc(s.name)+'</div>'+
+        '<div class="cs-name" title="'+esc(s.name)+'">'+spin+esc(s.name)+'</div>'+
         '<div class="cs-meta">'+esc(when)+(s.turns?(' · '+s.turns+' msg'+(s.turns===1?'':'s')):'')+'</div>'+
       '</div>'+
       '<div class="cs-actions">'+
@@ -1976,7 +1999,7 @@ async function consumeLiveStream(ws, proc, opts){
     else if(ev.type==='error'){
       errored = true;
       if(pend) pend.remove();
-      log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(ev.message)+'</span></div>');
+      log.insertAdjacentHTML('beforeend', chatErrorHtml(ev.message));
     }
   }
 
@@ -2009,7 +2032,9 @@ async function consumeLiveStream(ws, proc, opts){
         const payload = dataLine.slice(5).trim();
         if(!payload) continue;
         let ev; try { ev = JSON.parse(payload); } catch(e){ continue; }
-        handleEvent(ev);
+        // A single malformed/unexpected event must never take down the whole stream loop
+        // (which previously could leave the page blank and the button stuck on "Steer").
+        try { handleEvent(ev); } catch(err){ console.error('chat event handler failed', err, ev); }
         if(ev.type==='done' || ev.type==='error') finished = true;
       }
     }
@@ -2021,7 +2046,7 @@ async function consumeLiveStream(ws, proc, opts){
   } catch(e){
     errored = true;
     if(pend) pend.remove();
-    log.insertAdjacentHTML('beforeend', '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div><span style="color:#fca5a5">'+esc(e.message||e)+'</span></div>');
+    log.insertAdjacentHTML('beforeend', chatErrorHtml(e.message||e));
   } finally {
     setChatBusy(false);
     if(errored && opts.onErrorRestore) opts.onErrorRestore();

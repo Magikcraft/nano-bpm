@@ -147,7 +147,7 @@ impl ChatStore {
                 })
             })
             .unwrap_or_default();
-        metas.sort_by(|a, b| b.updated.cmp(&a.updated));
+        metas.sort_by_key(|b| std::cmp::Reverse(b.updated));
         metas
     }
 

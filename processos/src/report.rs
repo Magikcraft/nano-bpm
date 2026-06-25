@@ -264,7 +264,7 @@ fn fold_incident_clusters(details: &[InstanceTrace]) -> Vec<IncidentCluster> {
             }
         })
         .collect();
-    out.sort_by(|a, b| b.count.cmp(&a.count));
+    out.sort_by_key(|b| std::cmp::Reverse(b.count));
     out
 }
 
@@ -349,7 +349,7 @@ mod tests {
             stimuli: None,
             stimuli_truncated: false,
         };
-        let procs = fold_processes(&[t.clone()]);
+        let procs = fold_processes(std::slice::from_ref(&t));
         assert_eq!(procs.len(), 1);
         let p = &procs[0];
         assert_eq!(p.instances, 1);

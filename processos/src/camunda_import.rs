@@ -287,10 +287,10 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     let mut job_to_inst: HashMap<i64, i64> = HashMap::new();
 
     let touch = |insts: &mut HashMap<i64, InstAcc>, inst_order: &mut Vec<i64>, pik: i64| {
-        if !insts.contains_key(&pik) {
+        insts.entry(pik).or_insert_with(|| {
             inst_order.push(pik);
-            insts.insert(pik, InstAcc::default());
-        }
+            InstAcc::default()
+        });
     };
 
     for &i in &order {
@@ -665,13 +665,11 @@ fn collect_from_value(v: Json, out: &mut Vec<RawRecord>) {
         }
         Json::Object(ref m) => {
             // ES search response.
-            if let Some(hits) = m.get("hits").and_then(|h| h.get("hits")) {
-                if let Json::Array(arr) = hits {
-                    for h in arr.clone() {
-                        collect_from_value(h, out);
-                    }
-                    return;
+            if let Some(Json::Array(arr)) = m.get("hits").and_then(|h| h.get("hits")) {
+                for h in arr.clone() {
+                    collect_from_value(h, out);
                 }
+                return;
             }
             // ES document wrapper.
             if let Some(src) = m.get("_source") {

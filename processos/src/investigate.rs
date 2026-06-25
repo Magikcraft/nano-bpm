@@ -14,7 +14,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::agent::{
-    run_agent, run_agent_streaming, AgentEvent, AgentRun, Msg, OpenAiAgent, ToolBox, ToolSpec,
+    run_agent, run_agent_streaming, AgentEvent, AgentRun, Checkpoint, Msg, OpenAiAgent, ToolBox,
+    ToolSpec,
 };
 use crate::analysis::Analysis;
 use crate::dataset::TraceSource;
@@ -643,6 +644,7 @@ pub async fn run_chat_turn(
     pairs: &[PairStage],
     mut messages: Vec<Msg>,
     user_message: &str,
+    mut checkpoint: Checkpoint<'_>,
 ) -> Result<ChatTurnResult, String> {
     let analysis = Analysis::from_source(src, limit).await?;
     let dataset = DatasetShape {
@@ -693,6 +695,10 @@ pub async fn run_chat_turn(
     }
     messages.push(Msg::User(user_message.to_string()));
 
+    let cp_fwd: Checkpoint<'_> = match checkpoint {
+        Some(ref mut c) => Some(&mut **c),
+        None => None,
+    };
     let run = run_agent_streaming(
         &model,
         &tools,
@@ -701,6 +707,7 @@ pub async fn run_chat_turn(
         cancel,
         steer,
         sink,
+        cp_fwd,
     )
     .await?;
     let mut total_rounds = run.rounds;
@@ -736,6 +743,7 @@ pub async fn run_chat_turn(
             cancel,
             steer,
             sink,
+            None,
         )
         .await?;
         total_rounds += pair_run.rounds;
