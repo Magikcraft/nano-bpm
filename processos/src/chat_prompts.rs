@@ -95,9 +95,7 @@ impl ChatPromptStore {
                 .map_err(|_| "prompt store lock poisoned".to_string())?;
             match m.get(id) {
                 None => return Err(format!("no such prompt: {id}")),
-                Some(p) if p.builtin => {
-                    return Err(format!("cannot delete built-in prompt: {id}"))
-                }
+                Some(p) if p.builtin => return Err(format!("cannot delete built-in prompt: {id}")),
                 Some(_) => {
                     m.remove(id);
                 }

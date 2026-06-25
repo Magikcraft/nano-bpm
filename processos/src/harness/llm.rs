@@ -219,7 +219,12 @@ async fn complete_openai(
     v["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("LLM response missing choices[0].message.content: {}", truncate(&text, 300)))
+        .ok_or_else(|| {
+            format!(
+                "LLM response missing choices[0].message.content: {}",
+                truncate(&text, 300)
+            )
+        })
 }
 
 async fn complete_anthropic(
@@ -262,7 +267,12 @@ async fn complete_anthropic(
     v["content"][0]["text"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("LLM response missing content[0].text: {}", truncate(&text, 300)))
+        .ok_or_else(|| {
+            format!(
+                "LLM response missing content[0].text: {}",
+                truncate(&text, 300)
+            )
+        })
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -352,7 +362,10 @@ pub async fn list_models(cfg: &LlmConfig) -> Result<Vec<ModelInfo>, String> {
         .await
         .map_err(|e| format!("reading model list: {e}"))?;
     if !status.is_success() {
-        return Err(format!("endpoint returned {status}: {}", truncate(&text, 300)));
+        return Err(format!(
+            "endpoint returned {status}: {}",
+            truncate(&text, 300)
+        ));
     }
     let v: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("model list not JSON: {e}"))?;

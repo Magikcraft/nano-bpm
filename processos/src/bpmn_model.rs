@@ -175,7 +175,10 @@ fn adjacency(def: &ProcessDefinition) -> HashMap<String, Vec<String>> {
 }
 
 /// The set of element ids reachable from the start event over [`adjacency`].
-fn reachable_from_start(def: &ProcessDefinition, adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
+fn reachable_from_start(
+    def: &ProcessDefinition,
+    adj: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
     let mut seen = HashSet::new();
     let mut stack = vec![def.start_event.clone()];
     while let Some(id) = stack.pop() {
@@ -225,20 +228,31 @@ fn ancestors(node: &str, rev: &HashMap<String, Vec<String>>) -> HashSet<String> 
 
 /// Tarjan strongly-connected components over the structural graph. Returns the components
 /// that constitute a loop (size > 1, or a single self-looping node).
-fn loop_components(def: &ProcessDefinition, adj: &HashMap<String, Vec<String>>) -> Vec<Vec<String>> {
+fn loop_components(
+    def: &ProcessDefinition,
+    adj: &HashMap<String, Vec<String>>,
+) -> Vec<Vec<String>> {
     // Index the nodes deterministically.
     let ids: Vec<String> = {
         let mut v: Vec<String> = def.elements.keys().cloned().collect();
         v.sort();
         v
     };
-    let index_of: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
+    let index_of: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
     let n = ids.len();
     let neighbours: Vec<Vec<usize>> = ids
         .iter()
         .map(|id| {
             adj.get(id)
-                .map(|tos| tos.iter().filter_map(|t| index_of.get(t.as_str()).copied()).collect())
+                .map(|tos| {
+                    tos.iter()
+                        .filter_map(|t| index_of.get(t.as_str()).copied())
+                        .collect()
+                })
                 .unwrap_or_default()
         })
         .collect();
@@ -576,7 +590,9 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
             let exclusive_split_upstream = anc.iter().any(|a| {
                 def.elements
                     .get(a)
-                    .map(|e| matches!(e.kind, ElementKind::ExclusiveGateway) && e.outgoing.len() > 1)
+                    .map(|e| {
+                        matches!(e.kind, ElementKind::ExclusiveGateway) && e.outgoing.len() > 1
+                    })
                     .unwrap_or(false)
             });
             if exclusive_split_upstream {
@@ -629,10 +645,7 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
     }
 
     // Severity tallies for a quick read.
-    let warns = findings
-        .iter()
-        .filter(|f| f["severity"] == "warn")
-        .count();
+    let warns = findings.iter().filter(|f| f["severity"] == "warn").count();
     let infos = findings.iter().filter(|f| f["severity"] == "info").count();
 
     Ok(json!({
@@ -679,7 +692,10 @@ fn ensure_definitions(xml: &str) -> (String, bool) {
         return (xml.to_string(), false);
     }
     let body = match trimmed.strip_prefix("<?xml") {
-        Some(rest) => rest.find("?>").map(|i| rest[i + 2..].trim_start()).unwrap_or(trimmed),
+        Some(rest) => rest
+            .find("?>")
+            .map(|i| rest[i + 2..].trim_start())
+            .unwrap_or(trimmed),
         None => trimmed,
     };
     let wrapped = format!(
@@ -744,7 +760,14 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
                     if let Some(w) = obj.get("warnings").and_then(|n| n.as_u64()) {
                         obj.insert("warnings".into(), json!(w + 1));
                     }
-                    obj.insert("findingCount".into(), json!(obj.get("findings").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0)));
+                    obj.insert(
+                        "findingCount".into(),
+                        json!(obj
+                            .get("findings")
+                            .and_then(|f| f.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)),
+                    );
                     obj.insert("wrapped".into(), Value::Bool(true));
                 }
             }
@@ -903,7 +926,10 @@ mod tests {
         let v = analyze_model(bpmn).expect("analyze");
         assert_eq!(v["metrics"]["loops"], 1);
         let findings = v["findings"].as_array().unwrap();
-        let loop_finding = findings.iter().find(|f| f["code"] == "rework-loop").unwrap();
+        let loop_finding = findings
+            .iter()
+            .find(|f| f["code"] == "rework-loop")
+            .unwrap();
         let msg = loop_finding["message"].as_str().unwrap();
         assert!(msg.contains("\"A\""));
         assert!(msg.contains("\"G\""));
@@ -940,7 +966,9 @@ mod tests {
         assert_eq!(v["valid"], true);
         assert_eq!(v["wrapped"], true);
         let findings = v["findings"].as_array().unwrap();
-        assert!(findings.iter().any(|f| f["code"] == "missing-definitions-root"));
+        assert!(findings
+            .iter()
+            .any(|f| f["code"] == "missing-definitions-root"));
     }
 
     #[test]

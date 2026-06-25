@@ -790,7 +790,10 @@ mod tests {
 
         // Delete falls back the active to the first remaining.
         store.delete_profile("cloud").unwrap();
-        assert_eq!(store.view().active_profile.as_deref(), Some("gemma-4-local"));
+        assert_eq!(
+            store.view().active_profile.as_deref(),
+            Some("gemma-4-local")
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("PROCESSOS_CONFIG_DIR");

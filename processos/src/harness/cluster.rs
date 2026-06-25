@@ -385,7 +385,14 @@ fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn summary(key: &str, proc: &str, outcome: &str, start: u64, end: u64, dur: u64) -> TraceSummary {
+    fn summary(
+        key: &str,
+        proc: &str,
+        outcome: &str,
+        start: u64,
+        end: u64,
+        dur: u64,
+    ) -> TraceSummary {
         TraceSummary {
             instance_key: key.into(),
             process_id: proc.into(),
@@ -425,16 +432,12 @@ mod tests {
     fn counts_outcomes_and_incidents() {
         let mut a = summary("1", "p", "completed", 0, 100, 100);
         a.incident_count = 1;
-        let summaries = vec![
-            a,
-            summary("2", "p", "terminated", 0, 50, 50),
-            {
-                let mut act = summary("3", "p", "active", 10, 10, 0);
-                act.ended_at = None;
-                act.duration_ms = None;
-                act
-            },
-        ];
+        let summaries = vec![a, summary("2", "p", "terminated", 0, 50, 50), {
+            let mut act = summary("3", "p", "active", 10, 10, 0);
+            act.ended_at = None;
+            act.duration_ms = None;
+            act
+        }];
         let s = summarize_run("p", &summaries, &[]);
         assert_eq!(s.completed, 1);
         assert_eq!(s.terminated, 1);
@@ -512,8 +515,11 @@ mod tests {
         };
         let summaries = vec![summary("1", "order", "completed", 0, 160, 160)];
         let s = summarize_run("order", &summaries, &[detail]);
-        let by: std::collections::HashMap<_, _> =
-            s.by_job_type.iter().map(|j| (j.job_type.as_str(), j)).collect();
+        let by: std::collections::HashMap<_, _> = s
+            .by_job_type
+            .iter()
+            .map(|j| (j.job_type.as_str(), j))
+            .collect();
         let classify = by["classify"];
         let summarize = by["summarize"];
         // queue-bound: queue >> service
@@ -538,9 +544,21 @@ mod tests {
         let topo = Topology {
             brokers: vec![
                 // node 0 advertises a non-dialable bind address; we must NOT use it.
-                Broker { node_id: 0, host: "0.0.0.0".into(), port: 8080 },
-                Broker { node_id: 1, host: "127.0.0.1".into(), port: 8081 },
-                Broker { node_id: 2, host: "127.0.0.1".into(), port: 8082 },
+                Broker {
+                    node_id: 0,
+                    host: "0.0.0.0".into(),
+                    port: 8080,
+                },
+                Broker {
+                    node_id: 1,
+                    host: "127.0.0.1".into(),
+                    port: 8081,
+                },
+                Broker {
+                    node_id: 2,
+                    host: "127.0.0.1".into(),
+                    port: 8082,
+                },
             ],
         };
         let eps = cluster_endpoints("http://127.0.0.1:8080", &topo);

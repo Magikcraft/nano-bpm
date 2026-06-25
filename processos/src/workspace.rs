@@ -157,7 +157,11 @@ impl WorkspaceCatalog {
 
     /// Create a workspace from a display name (slug derived from it). Idempotent: an
     /// existing slug has its metadata refreshed rather than erroring.
-    pub fn create_workspace(&self, display_name: &str, notes: Option<String>) -> Result<Workspace, String> {
+    pub fn create_workspace(
+        &self,
+        display_name: &str,
+        notes: Option<String>,
+    ) -> Result<Workspace, String> {
         let slug = slugify(display_name);
         if slug.is_empty() {
             return Err("workspace name produced an empty slug".into());
@@ -206,12 +210,11 @@ impl WorkspaceCatalog {
         if !dir.is_dir() {
             return None;
         }
-        let config: ProcessConfig = read_json(&dir.join("process.json")).unwrap_or_else(|| {
-            ProcessConfig {
+        let config: ProcessConfig =
+            read_json(&dir.join("process.json")).unwrap_or_else(|| ProcessConfig {
                 display_name: process.to_string(),
                 ..Default::default()
-            }
-        });
+            });
         let (binding, dataset_path) = self.binding_of(&dir, &config);
         Some(Process {
             slug: process.to_string(),
@@ -318,7 +321,6 @@ impl WorkspaceCatalog {
         std::fs::create_dir_all(&traces).map_err(|e| format!("create traces dir: {e}"))?;
         Ok(traces)
     }
-
 
     /// Classify how a process is bound and resolve its dataset directory.
     fn binding_of(&self, dir: &Path, config: &ProcessConfig) -> (String, Option<String>) {
@@ -502,7 +504,9 @@ mod tests {
         let root = tmp();
         let ws = WorkspaceCatalog::open(&root);
         ws.create_workspace("C", None).unwrap();
-        let p = ws.create_process("c", "P", ProcessConfig::default()).unwrap();
+        let p = ws
+            .create_process("c", "P", ProcessConfig::default())
+            .unwrap();
         assert_eq!(p.binding, "unbound");
 
         // drop a traces/ dataset beside process.json

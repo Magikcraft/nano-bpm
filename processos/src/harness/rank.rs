@@ -228,7 +228,11 @@ pub(crate) fn baked_candidates(
         }
         let assignment = effective_assignment(scenario, &overrides);
         let name = candidate_name(&option_lists, combo, &baseline_assignment, &assignment);
-        let source = if name == "baseline" { "baseline" } else { "baked" };
+        let source = if name == "baseline" {
+            "baseline"
+        } else {
+            "baked"
+        };
         variants.push(evaluate(
             scenario,
             defs,
@@ -350,7 +354,10 @@ pub(crate) fn evaluate(
     rationale: Option<String>,
     assignment: &BTreeMap<String, String>,
 ) -> VariantResult {
-    let lookup: HashMap<String, String> = assignment.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let lookup: HashMap<String, String> = assignment
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let n = scenario.inputs.len().max(1);
     let mut completed = 0usize;
     let mut correct = 0usize;
@@ -387,8 +394,8 @@ pub(crate) fn evaluate(
     let completion_rate = completed as f64 / nf;
     let correctness_rate = correct as f64 / nf;
     let incident_rate = with_incident as f64 / nf;
-    let feasible =
-        correctness_rate >= objective.min_correctness && incident_rate <= objective.max_incident_rate;
+    let feasible = correctness_rate >= objective.min_correctness
+        && incident_rate <= objective.max_incident_rate;
 
     VariantResult {
         name: name.to_string(),
@@ -464,7 +471,11 @@ mod tests {
         let report = run_scenario(&scenario).expect("example scenario runs");
         // The example is built so the golden (cheap classify, premium summarize)
         // is the cheapest fully-correct, incident-free candidate.
-        assert!(report.recovered_golden, "expected golden recovery; notes: {:?}", report.notes);
+        assert!(
+            report.recovered_golden,
+            "expected golden recovery; notes: {:?}",
+            report.notes
+        );
         assert_eq!(report.golden_distance, Some(0));
         let best = report.variants.first().unwrap();
         assert!(best.feasible);

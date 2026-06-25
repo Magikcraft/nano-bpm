@@ -51,7 +51,10 @@ pub struct WorkerStaffing {
 /// Derive per-job-type staffing recommendations from a measured cluster run, holding
 /// the given p99 queue-wait target (ms). One entry per `byJobType` row, in the same
 /// order. Pure: it reads only the already-measured summary.
-pub fn staff_for_summary(summary: &ClusterRunSummary, target_p99_wait_ms: u64) -> Vec<WorkerStaffing> {
+pub fn staff_for_summary(
+    summary: &ClusterRunSummary,
+    target_p99_wait_ms: u64,
+) -> Vec<WorkerStaffing> {
     let window_s = summary
         .window_ms
         .map(|w| w as f64 / 1000.0)
@@ -108,12 +111,20 @@ pub struct StaffingPlan {
 /// `target_p99_wait_ms`, given arrival rate (per sec) and mean service time (ms).
 /// Always returns a stable pool (ρ < 1). A search cap guards against runaway, though
 /// in practice the wait tail collapses to zero a few servers past the stability point.
-pub fn min_workers_for_p99(arrival_per_sec: f64, service_ms: u64, target_p99_wait_ms: u64) -> StaffingPlan {
+pub fn min_workers_for_p99(
+    arrival_per_sec: f64,
+    service_ms: u64,
+    target_p99_wait_ms: u64,
+) -> StaffingPlan {
     let s = service_ms as f64 / 1000.0;
     let a = arrival_per_sec * s; // offered load (Erlangs)
 
     if a <= 0.0 {
-        return StaffingPlan { workers: 1, p99_wait_ms: 0, utilization: 0.0 };
+        return StaffingPlan {
+            workers: 1,
+            p99_wait_ms: 0,
+            utilization: 0.0,
+        };
     }
 
     // The smallest integer worker count that is stable (ρ < 1).
@@ -264,9 +275,21 @@ mod tests {
             avg_service_ms: None,
             by_job_type: vec![
                 // fittable: 100 jobs / 10s = 10/s, S=500ms
-                JobTypeStat { job_type: "charge".into(), samples: 100, avg_queue_ms: Some(900), avg_service_ms: Some(500), failures: 0 },
+                JobTypeStat {
+                    job_type: "charge".into(),
+                    samples: 100,
+                    avg_queue_ms: Some(900),
+                    avg_service_ms: Some(500),
+                    failures: 0,
+                },
                 // unfittable: no service time
-                JobTypeStat { job_type: "notify".into(), samples: 50, avg_queue_ms: Some(5), avg_service_ms: None, failures: 0 },
+                JobTypeStat {
+                    job_type: "notify".into(),
+                    samples: 50,
+                    avg_queue_ms: Some(5),
+                    avg_service_ms: None,
+                    failures: 0,
+                },
             ],
             by_node: vec![],
         };

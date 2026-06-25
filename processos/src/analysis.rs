@@ -219,10 +219,7 @@ impl Analysis {
         // DuckDB only knows the result schema after execution, so run the query first,
         // then read column names from the executed statement behind `Rows`.
         let mut rows = stmt.query([]).map_err(|e| format!("execute failed: {e}"))?;
-        let columns: Vec<String> = rows
-            .as_ref()
-            .map(|s| s.column_names())
-            .unwrap_or_default();
+        let columns: Vec<String> = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
         let ncols = columns.len();
 
         let mut out: Vec<Vec<String>> = Vec::new();
@@ -322,9 +319,9 @@ fn guard_read_only(sql: &str) -> Result<String, String> {
     }
     // Word-level scan for mutating/side-effecting keywords (CTE-hidden writes etc.).
     const BANNED: &[&str] = &[
-        "insert", "update", "delete", "drop", "create", "alter", "attach", "detach",
-        "copy", "pragma", "install", "load", "export", "import", "call", "set",
-        "truncate", "replace", "vacuum",
+        "insert", "update", "delete", "drop", "create", "alter", "attach", "detach", "copy",
+        "pragma", "install", "load", "export", "import", "call", "set", "truncate", "replace",
+        "vacuum",
     ];
     for word in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
         if BANNED.contains(&word) {
@@ -464,9 +461,7 @@ mod tests {
         assert!(a.query("DROP TABLE jobs").is_err());
         assert!(a.query("INSERT INTO jobs VALUES (1)").is_err());
         assert!(a.query("SELECT 1; DELETE FROM jobs").is_err());
-        assert!(a
-            .query("WITH x AS (SELECT 1) DELETE FROM jobs")
-            .is_err());
+        assert!(a.query("WITH x AS (SELECT 1) DELETE FROM jobs").is_err());
         assert!(a.query("SELECT count(*) FROM jobs").is_ok());
     }
 

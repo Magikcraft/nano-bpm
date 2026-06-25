@@ -18,39 +18,39 @@
 //! ranking. `engine-core` is consumed read-only over a `path` dependency and is
 //! never modified.
 
+mod calibrate;
 mod cluster;
 mod evolve;
 mod example;
 mod hypothesize;
 pub(crate) mod llm;
 mod production;
+mod prompts;
 mod queueing;
 mod rank;
 mod replay;
 mod replay_rank;
 mod sim;
-mod calibrate;
-mod prompts;
 
 pub use calibrate::{apply as apply_calibration, calibrate_from_measured};
 #[allow(unused_imports)]
 pub use calibrate::{calibrate_from_cluster, Calibration, MeasuredJobType};
-pub use hypothesize::DEFAULT_SYSTEM_PROMPT;
-pub use prompts::{Prompt, PromptLibrary, DEFAULT_ID as DEFAULT_PROMPT_ID};
 pub use cluster::build_cluster_summary;
 #[allow(unused_imports)]
 pub use cluster::ClusterRunSummary;
-pub use example::example_scenario;
 #[allow(unused_imports)]
 pub use evolve::{
     build_evolve_prompt, parse_structural_candidates, summarize_dataset, DatasetSignal,
     DEFAULT_EVOLVE_SYSTEM_PROMPT,
 };
+pub use example::example_scenario;
 pub use hypothesize::run_hypothesis;
+pub use hypothesize::DEFAULT_SYSTEM_PROMPT;
 pub use llm::{complete as llm_complete, list_models, LlmConfig, LlmOverride};
 pub use production::build_baseline;
 #[allow(unused_imports)]
 pub use production::ProductionBaseline;
+pub use prompts::{Prompt, PromptLibrary, DEFAULT_ID as DEFAULT_PROMPT_ID};
 pub use queueing::staff_for_summary;
 #[allow(unused_imports)]
 pub use queueing::WorkerStaffing;
@@ -197,9 +197,7 @@ pub struct Scenario {
 /// Used for mock-worker failure decisions so a candidate's outcome depends only
 /// on the scenario seed + job identity, never on wall-clock or iteration order.
 pub(crate) fn draw(seed: u64, salt: u64) -> f64 {
-    let mut z = seed
-        .wrapping_add(salt)
-        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = seed.wrapping_add(salt).wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;

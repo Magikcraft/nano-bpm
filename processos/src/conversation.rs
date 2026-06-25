@@ -90,7 +90,12 @@ impl ConversationStore {
 
     /// Lazily hydrate one experiment's history from disk into the in-memory index.
     fn ensure_loaded(&self, key: &str) {
-        if self.mem.read().map(|m| m.contains_key(key)).unwrap_or(false) {
+        if self
+            .mem
+            .read()
+            .map(|m| m.contains_key(key))
+            .unwrap_or(false)
+        {
             return;
         }
         let loaded = self.load_from_disk(key);
@@ -124,7 +129,13 @@ impl ConversationStore {
     fn path_for(&self, key: &str) -> PathBuf {
         let safe: String = key
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         self.dir.join(format!("{safe}.jsonl"))
     }

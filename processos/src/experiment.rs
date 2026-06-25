@@ -60,7 +60,9 @@ pub async fn build_recorded_dataset(src: &TraceSource, cap: usize) -> RecordedDa
             },
             Err(_) => {
                 ds.skipped += 1;
-                *ds.skip_reasons.entry("trace fetch failed".into()).or_insert(0) += 1;
+                *ds.skip_reasons
+                    .entry("trace fetch failed".into())
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -123,7 +125,11 @@ fn surface_deploy_error(scorecard: &mut Value) {
 }
 
 /// `simulate` — replay one candidate model against the recorded dataset.
-pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Value) -> Result<Value, String> {
+pub fn simulate(
+    _base_model: Option<&str>,
+    dataset: &RecordedDataset,
+    args: &Value,
+) -> Result<Value, String> {
     let model = args["model"]
         .as_str()
         .ok_or("simulate requires a string 'model' argument (the candidate BPMN XML)")?;
@@ -134,13 +140,15 @@ pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Val
     let rationale = args["rationale"].as_str().map(|s| s.to_string());
     let mock_workers = parse_mock_workers(&args["mockWorkers"]);
     let pid = default_process_id(dataset);
-    let candidate = CandidateModel { name, rationale, model: model.to_string(), mock_workers };
+    let candidate = CandidateModel {
+        name,
+        rationale,
+        model: model.to_string(),
+        mock_workers,
+    };
     let instances = sample_slice(&dataset.instances, args);
-    let ranking = rank_candidates_by_replay(
-        std::slice::from_ref(&candidate),
-        instances,
-        pid.as_deref(),
-    );
+    let ranking =
+        rank_candidates_by_replay(std::slice::from_ref(&candidate), instances, pid.as_deref());
     let total = dataset.instances.len();
     let sampled = (ranking.dataset_size as usize) < total;
     let mut v = serde_json::to_value(&ranking).map_err(|e| format!("serialise ranking: {e}"))?;
@@ -171,7 +179,9 @@ pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Val
 /// dataset**. Execution is cheap — staging the run is just for fast iteration,
 /// never a correctness concern. An absent / zero / oversized limit replays all.
 fn sample_slice<'a>(instances: &'a [RecordedInstance], args: &Value) -> &'a [RecordedInstance] {
-    let limit = args["limit"].as_u64().or_else(|| args["sampleSize"].as_u64());
+    let limit = args["limit"]
+        .as_u64()
+        .or_else(|| args["sampleSize"].as_u64());
     match limit {
         Some(n) if n > 0 && (n as usize) < instances.len() => &instances[..n as usize],
         _ => instances,
@@ -180,7 +190,11 @@ fn sample_slice<'a>(instances: &'a [RecordedInstance], args: &Value) -> &'a [Rec
 
 /// `compare_variants` — score and rank a population of candidate models (optionally
 /// including the current model as the `baseline`) against the same recorded dataset.
-pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, args: &Value) -> Result<Value, String> {
+pub fn compare_variants(
+    base_model: Option<&str>,
+    dataset: &RecordedDataset,
+    args: &Value,
+) -> Result<Value, String> {
     let raw = args["candidates"]
         .as_array()
         .ok_or("compare_variants requires a 'candidates' array of {name, model, rationale?}")?;
@@ -213,7 +227,10 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
             mock_workers.insert(jt, out);
         }
         candidates.push(CandidateModel {
-            name: c["name"].as_str().unwrap_or(&format!("variant {}", i + 1)).to_string(),
+            name: c["name"]
+                .as_str()
+                .unwrap_or(&format!("variant {}", i + 1))
+                .to_string(),
             rationale: c["rationale"].as_str().map(|s| s.to_string()),
             model: model.to_string(),
             mock_workers,
@@ -297,19 +314,32 @@ mod tests {
                         at: 1100,
                         kind: "jobCompleted".into(),
                         reference: Some("classify".into()),
-                        variables: Some([("label".to_string(), json!("A"))].into_iter().collect::<HashMap<_, _>>()),
+                        variables: Some(
+                            [("label".to_string(), json!("A"))]
+                                .into_iter()
+                                .collect::<HashMap<_, _>>(),
+                        ),
                     },
                     RecordedStimulus {
                         seq: 2,
                         at: 1300,
                         kind: "jobCompleted".into(),
                         reference: Some("summarize".into()),
-                        variables: Some([("summary".to_string(), json!("S"))].into_iter().collect::<HashMap<_, _>>()),
+                        variables: Some(
+                            [("summary".to_string(), json!("S"))]
+                                .into_iter()
+                                .collect::<HashMap<_, _>>(),
+                        ),
                     },
                 ],
             })
             .collect();
-        RecordedDataset { instances, matched: 3, skipped: 0, skip_reasons: BTreeMap::new() }
+        RecordedDataset {
+            instances,
+            matched: 3,
+            skipped: 0,
+            skip_reasons: BTreeMap::new(),
+        }
     }
 
     #[test]
@@ -372,9 +402,13 @@ mod tests {
         let empty = RecordedDataset {
             matched: 5,
             skipped: 5,
-            skip_reasons: [("trace has no recorded-input log (run the source node with c8 nano --capture)".to_string(), 5)]
-                .into_iter()
-                .collect(),
+            skip_reasons: [(
+                "trace has no recorded-input log (run the source node with c8 nano --capture)"
+                    .to_string(),
+                5,
+            )]
+            .into_iter()
+            .collect(),
             ..Default::default()
         };
         let v = simulate(None, &empty, &json!({ "model": TWO_TASK })).unwrap();
@@ -396,9 +430,15 @@ mod tests {
         assert_eq!(v["best"], "baseline (current model)");
         let cands = v["candidates"].as_array().unwrap();
         assert_eq!(cands.len(), 2);
-        let baseline = cands.iter().find(|c| c["name"] == "baseline (current model)").unwrap();
+        let baseline = cands
+            .iter()
+            .find(|c| c["name"] == "baseline (current model)")
+            .unwrap();
         assert_eq!(baseline["report"]["conserved"], 3);
-        let fork = cands.iter().find(|c| c["name"] == "drop-summarize").unwrap();
+        let fork = cands
+            .iter()
+            .find(|c| c["name"] == "drop-summarize")
+            .unwrap();
         assert_eq!(fork["report"]["conserved"], 0);
     }
 
@@ -418,7 +458,11 @@ mod tests {
                     at: 1100,
                     kind: "jobCompleted".into(),
                     reference: Some("classify".into()),
-                    variables: Some([("label".to_string(), json!("A"))].into_iter().collect::<HashMap<_, _>>()),
+                    variables: Some(
+                        [("label".to_string(), json!("A"))]
+                            .into_iter()
+                            .collect::<HashMap<_, _>>(),
+                    ),
                 }],
             }],
             matched: 1,
@@ -454,7 +498,10 @@ mod tests {
             }
         });
         surface_deploy_error(&mut sc);
-        assert!(sc["deployError"].as_str().unwrap().contains("InvalidBoundaryEvent"));
+        assert!(sc["deployError"]
+            .as_str()
+            .unwrap()
+            .contains("InvalidBoundaryEvent"));
         assert!(sc["fixHint"].as_str().unwrap().contains("errorRef"));
     }
 

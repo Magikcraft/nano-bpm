@@ -246,8 +246,10 @@ fn json_to_value(v: &Json) -> Value {
         }
         Json::String(s) => Value::Str(s.clone()),
         Json::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        Json::Object(map) => {
-            Value::Map(map.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
-        }
+        Json::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
     }
 }

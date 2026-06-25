@@ -379,6 +379,24 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   index — so the cockpit shows the droid's thinking, tool calls, and answer **as they happen**
   (live "Thinking" disclosure shown open, then collapsed once the turn completes). The
   non-streaming `POST .../chat` endpoint still exists (same loop, no-op sink) for curl/API use.
+- **Pair AI — a second model reviews each turn (N-tier ready).** Optionally, after the primary
+  droid answers, one or more **Pair AI** reviewers run in sequence, each a *fresh* sub-conversation
+  (its own LLM profile + a **pair-kind persona**) that is handed the user's question and the prior
+  answer and re-runs over the **same** data/model tools (`query_traces`, `validate_model`,
+  `simulate`, …) to verify, refine, or challenge it. Built-in pair personas: **Skeptic / Red-Team**
+  (the default — stress-tests the conclusion), **Synthesizer** (reconciles into one answer), and
+  **Refiner** (tightens and corrects). Only the reviewer's final answer is appended to the
+  transcript — marked so `render_view` surfaces it as an attributed `pair` turn (purple bubble,
+  "🤝 Pair AI · {name}") — keeping the thread a single coherent conversation. The orchestration
+  lives in `investigate::run_chat_turn`, which accepts a **chain** of `PairStage`s (`pairs:
+  Vec<PairRequest>`; the convenience `pair` field is a 1-stage chain), emitting an `agent`
+  SSE/provenance boundary before each reviewer — so the design generalises from one reviewer to an
+  N-tier network of cooperating agents. Pair AI is **off by default**; enable it in the compose row,
+  pick the reviewer's profile (ideally a *different* model family, so errors decorrelate) and
+  persona. Pair personas carry `kind: "pair"` and are offered only in the Pair AI picker, never as
+  the primary chat persona. A **carry-forward** button (↪) on any droid/pair answer quotes it into
+  the composer, so you can also hand one model's conclusion to another model on the next turn
+  (cross-provider refinement) without enabling synchronous Pair AI.
 - `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
   persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
   Ships four built-ins led by an **open investigation** (the default, pre-loaded into a
@@ -401,6 +419,10 @@ curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat \
 # Same turn, streamed live as Server-Sent Events (round/reasoning/answer/tool/toolResult/done):
 curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream?session={id} \
   -d '{"message":"Which job type has the worst queue tail?","allowPython":false}'
+# Pair AI: after the droid answers, a reviewer (its own profile + pair persona) re-checks it.
+# Emits an extra `agent` SSE before the reviewer; its answer renders as a `pair` turn.
+curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream \
+  -d '{"message":"Which job type has the worst queue tail?","pair":{"enabled":true,"profileId":"qwen-8b","personaId":"pair-skeptic"}}'
 curl       .../api/workspaces/{workspace}/processes/{process}/chat        # load transcript
 curl       .../api/workspaces/{workspace}/processes/{process}/chat/sessions          # list tabs
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/sessions -d '{"name":"Probe"}' # new

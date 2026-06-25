@@ -56,7 +56,10 @@ pub enum Msg {
         tool_calls: Vec<ToolCall>,
     },
     /// The result of one tool call, fed back to the model.
-    Tool { call_id: String, content: String },
+    Tool {
+        call_id: String,
+        content: String,
+    },
 }
 
 /// A set of callable tools.
@@ -78,6 +81,14 @@ pub enum Delta {
 pub enum AgentEvent {
     /// A new round of the tool-calling loop began.
     Round(usize),
+    /// A provenance boundary: the agent now producing events changed (Pair AI). All events
+    /// after this — until the next `Agent` — belong to `name` acting in `role` ("primary" or
+    /// "pair"). The cockpit starts a fresh, attributed bubble on each boundary.
+    Agent {
+        id: String,
+        name: String,
+        role: String,
+    },
     /// The exact request body about to be sent to the model this round (for the debug view).
     Request { round: usize, body: Value },
     /// A chunk of the droid's thinking.
@@ -455,7 +466,10 @@ impl OpenAiAgent {
     }
 
     fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'))
+        format!(
+            "{}/chat/completions",
+            self.cfg.base_url.trim_end_matches('/')
+        )
     }
 }
 
@@ -704,7 +718,9 @@ fn wire_messages(msgs: &[Msg]) -> Vec<Value> {
             match m {
                 // Strip the model's own reasoning from every assistant turn we resend.
                 Msg::Assistant { text, tool_calls } => {
-                    let stripped = text.as_deref().map(|t| strip_think_blocks(t).trim().to_string());
+                    let stripped = text
+                        .as_deref()
+                        .map(|t| strip_think_blocks(t).trim().to_string());
                     openai_message(&Msg::Assistant {
                         text: stripped.filter(|s| !s.is_empty()),
                         tool_calls: tool_calls.clone(),
@@ -1020,7 +1036,6 @@ fn runaway_tail(s: &str) -> bool {
     has_repeated_line(&s[start..], RUNAWAY_MIN_LINE, RUNAWAY_MAX_REPEATS)
 }
 
-
 /// SQL over and over instead of acting on the result). Tool name plus normalised
 /// arguments: JSON object keys are sorted and string values whitespace-collapsed and
 /// lower-cased, so trivially-reformatted repeats (re-indented SQL, case changes) still
@@ -1028,7 +1043,11 @@ fn runaway_tail(s: &str) -> bool {
 fn tool_call_signature(calls: &[ToolCall]) -> String {
     fn norm(v: &Value) -> String {
         match v {
-            Value::String(s) => s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase(),
+            Value::String(s) => s
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase(),
             Value::Object(map) => {
                 let mut keys: Vec<&String> = map.keys().collect();
                 keys.sort();
@@ -1122,8 +1141,16 @@ mod tests {
         // findings. The scripted model returns its final answer once tools are withheld.
         let model = ScriptedModel {
             turns: vec![
-                vec![ToolCall { id: "c".into(), name: "echo".into(), arguments: json!({"x":"a"}) }],
-                vec![ToolCall { id: "c".into(), name: "echo".into(), arguments: json!({"x":"b"}) }],
+                vec![ToolCall {
+                    id: "c".into(),
+                    name: "echo".into(),
+                    arguments: json!({"x":"a"}),
+                }],
+                vec![ToolCall {
+                    id: "c".into(),
+                    name: "echo".into(),
+                    arguments: json!({"x":"b"}),
+                }],
             ],
             idx: Cell::new(0),
             final_answer: "wrapped up".into(),
@@ -1177,15 +1204,24 @@ mod tests {
         let steer = Mutex::new(vec!["focus on credit-check".to_string()]);
         let mut msgs = vec![Msg::System("sys".into()), Msg::User("go".into())];
         let mut sink = |_ev: AgentEvent| {};
-        let run = run_agent_streaming(&model, &EchoTools, &mut msgs, 5, None, Some(&steer), &mut sink)
-            .await
-            .unwrap();
+        let run = run_agent_streaming(
+            &model,
+            &EchoTools,
+            &mut msgs,
+            5,
+            None,
+            Some(&steer),
+            &mut sink,
+        )
+        .await
+        .unwrap();
         assert_eq!(run.answer, "done");
         // The steer was consumed from the queue …
         assert!(steer.lock().unwrap().is_empty());
         // … and appears as a user message in the transcript.
         assert!(
-            msgs.iter().any(|m| matches!(m, Msg::User(t) if t == "focus on credit-check")),
+            msgs.iter()
+                .any(|m| matches!(m, Msg::User(t) if t == "focus on credit-check")),
             "steer must be injected as a user turn: {msgs:?}"
         );
     }
@@ -1292,7 +1328,9 @@ mod tests {
         assert!(signals_deferred_action(
             "Next Step: I will now author the Retry Logic variant to see if we can recover those instances."
         ));
-        assert!(signals_deferred_action("Let me author a variant that parallelises the two tasks."));
+        assert!(signals_deferred_action(
+            "Let me author a variant that parallelises the two tasks."
+        ));
         // Plain recommendation / refusal prose must NOT trip the detector.
         assert!(!signals_deferred_action(
             "I would not change the logic; this is a provisioning problem, not a design one."
@@ -1369,10 +1407,14 @@ mod tests {
     fn thinking_only_detector_distinguishes_blank_reasoning_from_real_answers() {
         // Reasoning with no visible content (incl. a truncated, unterminated block).
         assert!(is_thinking_only("<think>lots of reasoning here</think>\n"));
-        assert!(is_thinking_only("<think>authored XML then ran out of tokens"));
+        assert!(is_thinking_only(
+            "<think>authored XML then ran out of tokens"
+        ));
         assert!(is_thinking_only("<think>a</think>   \n  "));
         // A real answer (with or without a preceding think block) is not thinking-only.
-        assert!(!is_thinking_only("<think>reasoned</think>\nThe bottleneck is credit-check."));
+        assert!(!is_thinking_only(
+            "<think>reasoned</think>\nThe bottleneck is credit-check."
+        ));
         assert!(!is_thinking_only("Plain final answer, no thinking."));
         assert!(!is_thinking_only(""));
     }
@@ -1390,7 +1432,10 @@ mod tests {
             idx: Cell::new(0),
         };
         let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
-        assert_eq!(run.answer, "Variant simulated: conservedRate 1.0, P99 down 38x.");
+        assert_eq!(
+            run.answer,
+            "Variant simulated: conservedRate 1.0, P99 down 38x."
+        );
     }
 
     #[test]
@@ -1421,11 +1466,18 @@ mod tests {
             Msg::System("sys".into()),
             Msg::User("go".into()),
             // An old, oversized tool result (e.g. a full read_model XML) — should be clipped.
-            Msg::Tool { call_id: "t0".into(), content: big.clone() },
+            Msg::Tool {
+                call_id: "t0".into(),
+                content: big.clone(),
+            },
             // An assistant turn whose text is pure chain-of-thought — should not be resent.
             Msg::Assistant {
                 text: Some("<think>I will author a big BPMN variant…</think>".into()),
-                tool_calls: vec![ToolCall { id: "c1".into(), name: "simulate".into(), arguments: json!({"model":"<x/>"}) }],
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "simulate".into(),
+                    arguments: json!({"model":"<x/>"}),
+                }],
             },
         ];
         let old_tool_idx = 2;
@@ -1435,15 +1487,24 @@ mod tests {
             msgs.push(Msg::User(format!("round {k}")));
         }
         // Recent messages (within KEEP_RECENT of the end) — kept verbatim.
-        msgs.push(Msg::Tool { call_id: "c9".into(), content: big.clone() });
+        msgs.push(Msg::Tool {
+            call_id: "c9".into(),
+            content: big.clone(),
+        });
         let recent_tool_idx = msgs.len() - 1;
-        msgs.push(Msg::Assistant { text: Some("<think>done</think>The bottleneck is credit-check.".into()), tool_calls: vec![] });
+        msgs.push(Msg::Assistant {
+            text: Some("<think>done</think>The bottleneck is credit-check.".into()),
+            tool_calls: vec![],
+        });
         let final_asst_idx = msgs.len() - 1;
         let wire = wire_messages(&msgs);
 
         // Reasoning is gone from BOTH assistant turns; the user-facing answer survives.
         assert_eq!(wire[old_asst_idx]["content"], "");
-        assert_eq!(wire[old_asst_idx]["tool_calls"][0]["function"]["name"], "simulate");
+        assert_eq!(
+            wire[old_asst_idx]["tool_calls"][0]["function"]["name"],
+            "simulate"
+        );
         let final_content = wire[final_asst_idx]["content"].as_str().unwrap();
         assert!(!final_content.contains("<think>"));
         assert!(final_content.contains("credit-check"));
@@ -1452,7 +1513,10 @@ mod tests {
         let old_tool = wire[old_tool_idx]["content"].as_str().unwrap();
         assert!(old_tool.len() < big.len());
         assert!(old_tool.contains("truncated"));
-        assert_eq!(wire[recent_tool_idx]["content"].as_str().unwrap().len(), big.len());
+        assert_eq!(
+            wire[recent_tool_idx]["content"].as_str().unwrap().len(),
+            big.len()
+        );
     }
 
     /// Mock that always asks for the SAME tool call, but answers in prose once the
@@ -1483,7 +1547,9 @@ mod tests {
             },
             summary: "Stuck — summarising what I have.".into(),
         };
-        let run = run_agent(&model, &EchoTools, "sys", "go", 20).await.unwrap();
+        let run = run_agent(&model, &EchoTools, "sys", "go", 20)
+            .await
+            .unwrap();
         assert_eq!(run.answer, "Stuck — summarising what I have.");
         // Terminated well before the 20-round budget (1 first call + 3 repeats).
         assert_eq!(run.rounds, 4);
@@ -1498,7 +1564,9 @@ mod tests {
         s.push_str(&cycle.repeat(50));
         assert!(runaway_tail(&s));
         // A long but non-repeating tail must not trip it.
-        let varied: String = (0..200).map(|i| format!("Distinct analysis line number {i}.\n")).collect();
+        let varied: String = (0..200)
+            .map(|i| format!("Distinct analysis line number {i}.\n"))
+            .collect();
         assert!(!runaway_tail(&varied));
     }
 
@@ -1528,7 +1596,9 @@ mod tests {
             idx: Cell::new(0),
             final_answer: "found it".into(),
         };
-        let run = run_agent(&model, &EchoTools, "sys", "go", 20).await.unwrap();
+        let run = run_agent(&model, &EchoTools, "sys", "go", 20)
+            .await
+            .unwrap();
         assert_eq!(run.answer, "found it");
         assert_eq!(run.steps.len(), 2);
     }
@@ -1562,6 +1632,9 @@ mod tests {
             idx: Cell::new(0),
         };
         let run = run_agent(&model, &EchoTools, "sys", "go", 8).await.unwrap();
-        assert_eq!(run.answer, "Bottleneck is credit-check; recommend retry + workers.");
+        assert_eq!(
+            run.answer,
+            "Bottleneck is credit-check; recommend retry + workers."
+        );
     }
 }

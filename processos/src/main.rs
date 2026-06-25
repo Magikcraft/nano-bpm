@@ -15,9 +15,9 @@ mod bpmn_model;
 mod camunda_import;
 mod chat;
 mod chat_prompts;
+mod cockpit;
 mod conformance;
 mod contracts;
-mod cockpit;
 mod conversation;
 mod corpus;
 mod dataset;
@@ -51,11 +51,11 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, build_evolve_prompt,
-    calibrate_from_measured, example_scenario, list_models, llm_complete, parse_structural_candidates,
-    rank_candidates_by_replay, replay_dataset, replay_instance, run_hypothesis, run_scenario,
-    staff_for_summary, summarize_dataset, CandidateModel, LlmConfig, LlmOverride, MeasuredJobType,
-    Prompt, PromptLibrary, RecordedInstance, Scenario, DEFAULT_EVOLVE_SYSTEM_PROMPT,
-    DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
+    calibrate_from_measured, example_scenario, list_models, llm_complete,
+    parse_structural_candidates, rank_candidates_by_replay, replay_dataset, replay_instance,
+    run_hypothesis, run_scenario, staff_for_summary, summarize_dataset, CandidateModel, LlmConfig,
+    LlmOverride, MeasuredJobType, Prompt, PromptLibrary, RecordedInstance, Scenario,
+    DEFAULT_EVOLVE_SYSTEM_PROMPT, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 
@@ -97,11 +97,15 @@ struct AppState {
     personas: Arc<personas::PersonaStore>,
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
-    chat_cancels: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    chat_cancels: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    >,
     /// Steering queues for in-flight chat turns, keyed by session. The cockpit's "Steer …"
     /// control appends an operator instruction; the agent loop drains it at the next round
     /// boundary and injects it as a user turn, redirecting an investigation without restarting it.
-    chat_steers: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>>,
+    chat_steers: Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>,
+    >,
     /// The exact model request bodies sent during each session's most recent turn, keyed by
     /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
     /// (not persisted) — it shows what was last sent and is cleared on restart.
@@ -174,11 +178,7 @@ fn sse_from_live(
                 let notified = live.notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                let item = live
-                    .events
-                    .lock()
-                    .ok()
-                    .and_then(|e| e.get(cursor).cloned());
+                let item = live.events.lock().ok().and_then(|e| e.get(cursor).cloned());
                 if let Some(v) = item {
                     return Some((
                         Ok::<Event, std::convert::Infallible>(Event::default().data(v.to_string())),
@@ -360,9 +360,15 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/insights", get(insights))
         .route("/api/cockpit/overview", get(cockpit_overview))
-        .route("/api/cockpit/experiments", get(cockpit_experiments).post(cockpit_create))
+        .route(
+            "/api/cockpit/experiments",
+            get(cockpit_experiments).post(cockpit_create),
+        )
         .route("/api/cockpit/experiments/{key}", get(cockpit_experiment))
-        .route("/api/cockpit/experiments/{key}/decision", post(cockpit_decision))
+        .route(
+            "/api/cockpit/experiments/{key}/decision",
+            post(cockpit_decision),
+        )
         .route(
             "/api/cockpit/experiments/{key}/conversation",
             get(cockpit_conversation).post(cockpit_message),
@@ -459,7 +465,10 @@ async fn main() {
             "/api/chat-prompts",
             get(chat_prompts_list).post(chat_prompts_upsert),
         )
-        .route("/api/chat-prompts/{id}", axum::routing::delete(chat_prompts_delete))
+        .route(
+            "/api/chat-prompts/{id}",
+            axum::routing::delete(chat_prompts_delete),
+        )
         .route("/api/personas", get(personas_list).post(personas_upsert))
         .route("/api/personas/{id}", axum::routing::delete(personas_delete))
         .route("/assets/bpmn/{file}", get(bpmn_asset))
@@ -533,21 +542,24 @@ fn run_cli_infer(args: &[String]) {
         std::process::exit(2);
     }
     let dataset_dir = std::path::Path::new(&args[0]);
-    let target = args.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(500);
+    let target = args
+        .get(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(500);
     let inference = corpus::infer(dataset_dir, target).unwrap_or_else(|e| {
         eprintln!("infer failed: {e}");
         std::process::exit(1);
     });
-    println!("{}", serde_json::to_string_pretty(&inference).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&inference).unwrap_or_default()
+    );
 
     // Score against expected.json if it sits beside the dataset.
     let expected = dataset_dir.join("expected.json");
     if expected.is_file() {
         match corpus::score(&inference, &expected) {
-            Ok(s) => println!(
-                "SCORE {}",
-                serde_json::to_string(&s).unwrap_or_default()
-            ),
+            Ok(s) => println!("SCORE {}", serde_json::to_string(&s).unwrap_or_default()),
             Err(e) => eprintln!("score failed: {e}"),
         }
     }
@@ -729,7 +741,15 @@ async fn cockpit_create(
         },
     };
     let max_iterations = req.max_iterations.unwrap_or(2).clamp(1, 50);
-    match cockpit::create_experiment(&state.own, &req.process_id, baseline, max_iterations, req.prompt_id.clone()).await {
+    match cockpit::create_experiment(
+        &state.own,
+        &req.process_id,
+        baseline,
+        max_iterations,
+        req.prompt_id.clone(),
+    )
+    .await
+    {
         Ok(key) => {
             // Seed the durable conversation with the engine's framing turn so the log
             // is a complete dialogue from the first render, not just from round 1.
@@ -993,7 +1013,10 @@ async fn ws_update_process(
     Path((workspace, process)): Path<(String, String)>,
     Json(config): Json<workspace::ProcessConfig>,
 ) -> impl IntoResponse {
-    match state.workspaces.update_process(&workspace, &process, config) {
+    match state
+        .workspaces
+        .update_process(&workspace, &process, config)
+    {
         Ok(p) => Json(p).into_response(),
         Err(e) => unprocessable(e),
     }
@@ -1031,7 +1054,10 @@ async fn ws_process_model(
 ) -> impl IntoResponse {
     match state.workspaces.read_model(&workspace, &process) {
         Some(xml) => (
-            [(axum::http::header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/xml; charset=utf-8",
+            )],
             xml,
         )
             .into_response(),
@@ -1106,7 +1132,10 @@ fn seed_demo(
     ws_name: &str,
     proc_name: &str,
 ) -> Result<serde_json::Value, String> {
-    let ws = workspaces.create_workspace(ws_name, Some("Demo engagement (bundled loan-approval corpus)".into()))?;
+    let ws = workspaces.create_workspace(
+        ws_name,
+        Some("Demo engagement (bundled loan-approval corpus)".into()),
+    )?;
     let proc_cfg = workspace::ProcessConfig {
         display_name: proc_name.to_string(),
         objective: Some("keep loan approvals fast and reliable as volume grows".into()),
@@ -1124,7 +1153,8 @@ fn seed_demo(
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("seed tmp: {e}"))?;
-    std::fs::write(tmp.join("pack.json"), LOAN_PACK_JSON).map_err(|e| format!("write pack: {e}"))?;
+    std::fs::write(tmp.join("pack.json"), LOAN_PACK_JSON)
+        .map_err(|e| format!("write pack: {e}"))?;
     std::fs::write(tmp.join("loan-approval.bpmn"), LOAN_MODEL_BPMN)
         .map_err(|e| format!("write bpmn: {e}"))?;
 
@@ -1140,7 +1170,6 @@ fn seed_demo(
         "instances": summary.instances,
     }))
 }
-
 
 /// folded Insights report for this process, read from whatever source it is bound
 /// to (live customer Nano or a loaded trace dataset).
@@ -1160,7 +1189,6 @@ async fn ws_process_insights(
         Err(e) => bad_gateway(e),
     }
 }
-
 
 /// `GET /api/settings` — the operator's persisted settings (LLM profiles + active
 /// profile + Python interpreter), redacted so API keys are never echoed back.
@@ -1309,6 +1337,67 @@ fn resolve_llm(state: &AppState, req: Option<&LlmOverride>) -> LlmConfig {
     cfg
 }
 
+/// Resolve an LLM config for a **specific named profile** (not the active one): env defaults →
+/// the named profile's settings → an optional one-off override. Used for Pair AI reviewers,
+/// which target their own profile independent of the operator's active primary profile. Returns
+/// `None` if `profile_id` is given but no such profile exists.
+fn resolve_llm_for_profile(
+    state: &AppState,
+    profile_id: Option<&str>,
+    ovr: Option<&LlmOverride>,
+) -> Option<LlmConfig> {
+    let mut cfg = LlmConfig::from_env();
+    if let Some(pid) = profile_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let snap = state.settings.snapshot();
+        let p = snap.profiles.iter().find(|p| p.id == pid)?;
+        cfg = cfg.with_override(&p.as_llm_override());
+    }
+    if let Some(o) = ovr {
+        cfg = cfg.with_override(o);
+    }
+    Some(cfg)
+}
+
+/// Build the Pair AI reviewer pipeline from a chat request. An explicit `pairs` chain wins;
+/// otherwise the single `pair` (if enabled) becomes a one-stage chain. Each enabled stage must
+/// resolve to a ready LLM config and a pairing persona, else the whole turn is rejected (the
+/// operator asked for a reviewer — failing loudly beats silently dropping it).
+fn build_pair_stages(
+    state: &AppState,
+    req: &ChatSendRequest,
+) -> Result<Vec<investigate::PairStage>, String> {
+    let specs: Vec<&PairRequest> = if !req.pairs.is_empty() {
+        req.pairs.iter().collect()
+    } else {
+        req.pair.iter().collect()
+    };
+    let mut stages = Vec::new();
+    for spec in specs.into_iter().filter(|p| p.enabled) {
+        let cfg = resolve_llm_for_profile(state, spec.profile_id.as_deref(), spec.llm.as_ref())
+            .ok_or_else(|| {
+                format!(
+                    "Pair AI reviewer references unknown profile '{}'",
+                    spec.profile_id.as_deref().unwrap_or("")
+                )
+            })?;
+        if !cfg.is_ready() {
+            return Err(
+                "Pair AI is enabled but its reviewer has no model configured — pick a profile \
+                 for the Pair AI in the composer, or disable Pair AI"
+                    .to_string(),
+            );
+        }
+        let (id, name, system) = state.personas.resolve_pair(spec.persona_id.as_deref());
+        stages.push(investigate::PairStage {
+            id,
+            name,
+            cfg,
+            system,
+        });
+    }
+    Ok(stages)
+}
+
 /// Request body for an investigation: optional LLM override + bounds.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1363,7 +1452,12 @@ async fn ws_process_investigate(
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
         rt.block_on(investigate::run_investigation(
-            &src, cfg, py, limit, max_rounds, allow_python,
+            &src,
+            cfg,
+            py,
+            limit,
+            max_rounds,
+            allow_python,
         ))
     })
     .await;
@@ -1373,7 +1467,6 @@ async fn ws_process_investigate(
         Err(e) => bad_gateway(format!("investigation task failed: {e}")),
     }
 }
-
 
 // --- Interactive cockpit chat ----------------------------------------------------
 
@@ -1570,11 +1663,10 @@ async fn cockpit_chat_load(
     // If a turn is mid-flight for this session (e.g. the page was reloaded), surface its user
     // message so the cockpit can redraw the in-flight user bubble and reattach to the live stream.
     let cancel_key = chat_cancel_key(&key, &meta.id);
-    let inflight = state
-        .chat_live
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&cancel_key).map(|lt| serde_json::json!({ "user": lt.user })));
+    let inflight = state.chat_live.lock().ok().and_then(|m| {
+        m.get(&cancel_key)
+            .map(|lt| serde_json::json!({ "user": lt.user }))
+    });
     Json(serde_json::json!({
         "sessionId": meta.id,
         "turns": chat::render_view_stamped(&session.messages, &session.stamps),
@@ -1627,6 +1719,34 @@ struct ChatSendRequest {
     allow_python: bool,
     /// The persona (standing system prompt) for this conversation. Only takes effect on the
     /// first turn of a session — afterwards the persona is baked into the persisted transcript.
+    #[serde(default)]
+    persona_id: Option<String>,
+    /// Pair AI: a single reviewer agent that runs after the primary each turn (off unless
+    /// `enabled`). Convenience for the cockpit's one-reviewer UI.
+    #[serde(default)]
+    pair: Option<PairRequest>,
+    /// Pair AI (N-tier): an explicit chain of reviewer stages run in sequence after the primary,
+    /// each handed the previous stage's answer. Takes precedence over `pair` when non-empty.
+    #[serde(default)]
+    pairs: Vec<PairRequest>,
+}
+
+/// One configured Pair AI reviewer in a chat request.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairRequest {
+    /// Whether this reviewer is active. The cockpit sends `enabled:false` (or omits the object)
+    /// when Pair AI is switched off, so the turn runs exactly as a single-agent investigation.
+    #[serde(default)]
+    enabled: bool,
+    /// The saved LLM profile the reviewer uses (its own model — ideally a different family from
+    /// the primary). Falls back to the env default when absent.
+    #[serde(default)]
+    profile_id: Option<String>,
+    /// A one-off LLM override layered on top of the profile (rarely needed).
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    /// The pairing persona (reviewer system prompt); defaults to the built-in skeptic.
     #[serde(default)]
     persona_id: Option<String>,
 }
@@ -1682,6 +1802,10 @@ async fn cockpit_chat_send(
         state.chat.set_persona(&key, &sid, &persona_id);
     }
     let user_ts = chat_now_ms();
+    let pairs = match build_pair_stages(&state, &req) {
+        Ok(p) => p,
+        Err(e) => return unprocessable(e),
+    };
     let message = req.message;
     // Register a wrap-up flag for this in-flight turn so `POST .../chat/wrapup` can ask the
     // agent to report early. Cleared in all exit paths below.
@@ -1719,6 +1843,7 @@ async fn cockpit_chat_send(
                 Some(&cancel),
                 None,
                 &mut sink,
+                &pairs,
                 prior,
                 &message,
             ))
@@ -1803,6 +1928,10 @@ async fn cockpit_chat_stream(
         state.chat.set_persona(&key, &sid, &persona_id);
     }
     let user_ts = chat_now_ms();
+    let pairs = match build_pair_stages(&state, &req) {
+        Ok(p) => p,
+        Err(e) => return unprocessable(e),
+    };
     let message = req.message;
     // Register a wrap-up flag so `POST .../chat/wrapup` can ask this in-flight turn to report early.
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1837,7 +1966,9 @@ async fn cockpit_chat_stream(
         {
             Ok(rt) => rt,
             Err(e) => {
-                task_live.emit(serde_json::json!({ "type": "error", "message": format!("runtime: {e}") }));
+                task_live.emit(
+                    serde_json::json!({ "type": "error", "message": format!("runtime: {e}") }),
+                );
                 if let Ok(mut m) = task_state.chat_live.lock() {
                     m.remove(&task_cancel_key);
                 }
@@ -1855,17 +1986,24 @@ async fn cockpit_chat_stream(
                 agent::AgentEvent::Request { round, body } => {
                     let ts = chat_now_ms();
                     if let Ok(mut d) = dbg_for_sink.lock() {
-                        d.push(serde_json::json!({ "round": round, "ts": ts, "body": body.clone() }));
+                        d.push(
+                            serde_json::json!({ "round": round, "ts": ts, "body": body.clone() }),
+                        );
                     }
                     serde_json::json!({ "type": "request", "round": round, "ts": ts, "body": body })
                 }
-                agent::AgentEvent::Reasoning(t) => serde_json::json!({ "type": "reasoning", "text": t }),
+                agent::AgentEvent::Reasoning(t) => {
+                    serde_json::json!({ "type": "reasoning", "text": t })
+                }
                 agent::AgentEvent::Answer(t) => serde_json::json!({ "type": "answer", "text": t }),
                 agent::AgentEvent::ToolCall { tool, arguments } => {
                     serde_json::json!({ "type": "tool", "tool": tool, "arguments": arguments })
                 }
                 agent::AgentEvent::ToolResult { tool, result } => {
                     serde_json::json!({ "type": "toolResult", "tool": tool, "result": result })
+                }
+                agent::AgentEvent::Agent { id, name, role } => {
+                    serde_json::json!({ "type": "agent", "id": id, "name": name, "role": role })
                 }
             };
             live_for_sink.emit(v);
@@ -1883,6 +2021,7 @@ async fn cockpit_chat_stream(
             Some(&cancel),
             Some(&steer),
             &mut sink,
+            &pairs,
             prior,
             &message,
         ));
@@ -1893,8 +2032,7 @@ async fn cockpit_chat_stream(
         }
         match result {
             Ok(r) => {
-                let stamps =
-                    chat::extend_stamps(&r.messages, prior_stamps, user_ts, chat_now_ms());
+                let stamps = chat::extend_stamps(&r.messages, prior_stamps, user_ts, chat_now_ms());
                 task_state
                     .chat
                     .save(&task_key, &task_sid, r.messages.clone(), stamps.clone());
@@ -2101,7 +2239,6 @@ async fn personas_delete(
     }
 }
 
-
 // --- The optimization harness (MVP, design §7) ----------------------------------
 
 /// `GET /api/harness/example` — the bundled example scenario JSON, so callers have
@@ -2142,8 +2279,7 @@ async fn harness_calibrate(Json(req): Json<CalibrateRequest>) -> impl IntoRespon
     let calibration = calibrate_from_measured(&req.scenario, &req.measured);
     let calibrated_scenario = apply_calibration(&req.scenario, &calibration);
     let scenario = calibrated_scenario.clone();
-    let ranked =
-        tokio::task::spawn_blocking(move || run_scenario(&scenario)).await;
+    let ranked = tokio::task::spawn_blocking(move || run_scenario(&scenario)).await;
     match ranked {
         Ok(Ok(report)) => Json(serde_json::json!({
             "calibration": calibration,
@@ -2241,7 +2377,15 @@ async fn harness_hypothesize(
         let calibration = calibrate_from_measured(&req.scenario, &req.measured);
         apply_calibration(&req.scenario, &calibration)
     };
-    match run_hypothesis(&scenario, &cfg, req.include_baked, &req.measured, &system_prompt).await {
+    match run_hypothesis(
+        &scenario,
+        &cfg,
+        req.include_baked,
+        &req.measured,
+        &system_prompt,
+    )
+    .await
+    {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2386,10 +2530,7 @@ async fn harness_replay_batch(
                 .into_response();
         }
     };
-    let process_id = req
-        .process_id
-        .clone()
-        .unwrap_or_else(|| defs[0].id.clone());
+    let process_id = req.process_id.clone().unwrap_or_else(|| defs[0].id.clone());
 
     let limit = req.limit.unwrap_or(200);
     let summaries = match client.list_traces(limit).await {
@@ -2444,7 +2585,9 @@ async fn distil_recorded_dataset(
             Ok(t) => t,
             Err(_) => {
                 skipped += 1;
-                *skip_reasons.entry("trace fetch failed".to_string()).or_insert(0) += 1;
+                *skip_reasons
+                    .entry("trace fetch failed".to_string())
+                    .or_insert(0) += 1;
                 continue;
             }
         };
@@ -3211,8 +3354,11 @@ mod config_tests {
 
     #[test]
     fn a_single_role_override_leaves_the_other_on_the_alias() {
-        let (t, o) =
-            resolve_nano_urls(Some("http://base:8080".into()), None, Some("http://own:8081".into()));
+        let (t, o) = resolve_nano_urls(
+            Some("http://base:8080".into()),
+            None,
+            Some("http://own:8081".into()),
+        );
         assert_eq!(t, "http://base:8080");
         assert_eq!(o, "http://own:8081");
     }

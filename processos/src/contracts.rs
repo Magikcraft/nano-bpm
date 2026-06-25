@@ -274,9 +274,7 @@ impl NanoClient {
         if !res.status().is_success() {
             return Err(format!("GET {url}: HTTP {}", res.status()));
         }
-        res.text()
-            .await
-            .map_err(|e| format!("read {url}: {e}"))
+        res.text().await.map_err(|e| format!("read {url}: {e}"))
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T, String> {
@@ -305,7 +303,11 @@ impl NanoClient {
     /// resource. Used by the supervisor to install the pilot process on the own
     /// engine after it boots. Idempotent on the engine side (a byte-identical
     /// redeploy is a no-op), so it is safe to call on every startup.
-    pub async fn deploy_bpmn(&self, filename: &str, xml: &str) -> Result<serde_json::Value, String> {
+    pub async fn deploy_bpmn(
+        &self,
+        filename: &str,
+        xml: &str,
+    ) -> Result<serde_json::Value, String> {
         let url = format!("{}/v2/deployments", self.base_url);
         let part = reqwest::multipart::Part::text(xml.to_string())
             .file_name(filename.to_string())

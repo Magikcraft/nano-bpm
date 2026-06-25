@@ -70,9 +70,11 @@ pub fn probe_data_science(cfg: &PyConfig) -> DataScienceProbe {
             let missing: Vec<String> = serde_json::from_slice::<serde_json::Value>(&o.stdout)
                 .ok()
                 .and_then(|v| {
-                    v.get("missing")
-                        .and_then(|m| m.as_array())
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    v.get("missing").and_then(|m| m.as_array()).map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
                 })
                 .unwrap_or_default();
             let data_science =
@@ -168,8 +170,7 @@ except Exception:
 pub fn run_python(cfg: &PyConfig, data_dir: &Path, code: &str) -> Result<String, String> {
     let harness_path = data_dir.join("_harness.py");
     {
-        let mut f =
-            File::create(&harness_path).map_err(|e| format!("write harness: {e}"))?;
+        let mut f = File::create(&harness_path).map_err(|e| format!("write harness: {e}"))?;
         f.write_all(preamble().as_bytes())
             .and_then(|_| f.write_all(code.as_bytes()))
             .map_err(|e| format!("write harness: {e}"))?;
@@ -276,7 +277,11 @@ mod tests {
             return;
         }
         let dir = tmpdir("stdout");
-        write_csv(&dir, "jobs", "job_type,queue_ms\ncredit-check,100\ncredit-check,900\n");
+        write_csv(
+            &dir,
+            "jobs",
+            "job_type,queue_ms\ncredit-check,100\ncredit-check,900\n",
+        );
         write_csv(&dir, "instances", "instance_key\n1\n");
         write_csv(&dir, "incidents", "kind\n");
         let cfg = PyConfig::default();
@@ -303,7 +308,10 @@ mod tests {
         write_csv(&dir, "incidents", "k\n");
         let out = run_python(&PyConfig::default(), &dir, "raise ValueError('boom')\n")
             .expect("run returns Ok with stderr");
-        assert!(out.contains("ValueError") && out.contains("boom"), "got: {out}");
+        assert!(
+            out.contains("ValueError") && out.contains("boom"),
+            "got: {out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -323,7 +331,10 @@ mod tests {
         let start = Instant::now();
         let out = run_python(&cfg, &dir, "import time\ntime.sleep(10)\n").expect("run");
         assert!(out.contains("timed out"), "got: {out}");
-        assert!(start.elapsed() < Duration::from_secs(5), "should not wait the full sleep");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "should not wait the full sleep"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

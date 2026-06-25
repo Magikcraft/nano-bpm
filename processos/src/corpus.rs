@@ -274,7 +274,8 @@ pub struct GenerateSummary {
 
 /// Load a pack from `pack.json` (or any JSON file), resolving `bpmn` relative to it.
 pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> {
-    let bytes = std::fs::read(pack_path).map_err(|e| format!("read {}: {e}", pack_path.display()))?;
+    let bytes =
+        std::fs::read(pack_path).map_err(|e| format!("read {}: {e}", pack_path.display()))?;
     let pack: Pack = serde_json::from_slice(&bytes).map_err(|e| format!("parse pack: {e}"))?;
 
     let bpmn_path = {
@@ -282,10 +283,7 @@ pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> 
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            pack_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(p)
+            pack_path.parent().unwrap_or_else(|| Path::new(".")).join(p)
         }
     };
     let xml = std::fs::read_to_string(&bpmn_path)
@@ -294,14 +292,24 @@ pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> 
     let def = defs
         .into_iter()
         .find(|d| d.id == pack.process_id)
-        .ok_or_else(|| format!("process id '{}' not found in {}", pack.process_id, bpmn_path.display()))?;
+        .ok_or_else(|| {
+            format!(
+                "process id '{}' not found in {}",
+                pack.process_id,
+                bpmn_path.display()
+            )
+        })?;
     Ok((pack, def))
 }
 
 /// Generate the corpus into `out_dir`: a single `traces.json` array (the shape a
 /// `DatasetSource` reads) + `metrics.json` + `expected.json`. Deterministic in
 /// `pack.seed`.
-pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<GenerateSummary, String> {
+pub fn generate(
+    pack: &Pack,
+    def: &ProcessDefinition,
+    out_dir: &Path,
+) -> Result<GenerateSummary, String> {
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
 
     // 1. Build the arrival timeline: per hour draw a Poisson instance count from the
@@ -323,14 +331,26 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
     arrivals.sort_unstable();
 
     // 2. Per instance: run the engine for the path, overlay timing + queue waits.
-    let total_weight: f64 = pack.inputs.iter().map(|i| i.weight.max(0.0)).sum::<f64>().max(1e-9);
+    let total_weight: f64 = pack
+        .inputs
+        .iter()
+        .map(|i| i.weight.max(0.0))
+        .sum::<f64>()
+        .max(1e-9);
     let mut completed = 0usize;
     let mut terminated = 0usize;
     let mut traces: Vec<TraceOut> = Vec::with_capacity(arrivals.len());
 
     for (idx, &arrival) in arrivals.iter().enumerate() {
         let input = pick_input(&pack.inputs, total_weight, pack.seed ^ 0xC33E, idx as u64);
-        let path = run_path(def, &pack.process_id, &input.vars, pack, pack.seed, idx as u64);
+        let path = run_path(
+            def,
+            &pack.process_id,
+            &input.vars,
+            pack,
+            pack.seed,
+            idx as u64,
+        );
 
         let day = ((arrival - EPOCH_BASE_MS) / MS_PER_DAY) as u32;
         let hour = (((arrival - EPOCH_BASE_MS) % MS_PER_DAY) / MS_PER_HOUR) as u32;
@@ -354,7 +374,8 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
 
             // Offered load for THIS job type in THIS hour: every reached instance hits
             // each job on its path once, so the job's arrival rate is the instance rate.
-            let queue_ms = sample_queue_ms(cap, inst_rate_per_sec, service_s, mix(svc_seed, 0x5151));
+            let queue_ms =
+                sample_queue_ms(cap, inst_rate_per_sec, service_s, mix(svc_seed, 0x5151));
 
             let failures = if jstep.failed { 1 } else { 0 };
             if jstep.failed {
@@ -390,7 +411,11 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
             }
         }
 
-        let outcome = if path.completed { "completed" } else { "terminated" };
+        let outcome = if path.completed {
+            "completed"
+        } else {
+            "terminated"
+        };
         if path.completed {
             completed += 1;
         } else {
@@ -398,7 +423,9 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
         }
 
         let creation_values = serde_json::to_value(&input.vars).unwrap_or(Json::Null);
-        let creation_bytes = serde_json::to_vec(&input.vars).map(|v| v.len()).unwrap_or(0);
+        let creation_bytes = serde_json::to_vec(&input.vars)
+            .map(|v| v.len())
+            .unwrap_or(0);
 
         traces.push(TraceOut {
             instance_key: format!("{}", 100_000 + idx),
@@ -421,7 +448,8 @@ pub fn generate(pack: &Pack, def: &ProcessDefinition, out_dir: &Path) -> Result<
 
     let traces_file = out_dir.join("traces.json");
     let bytes = serde_json::to_vec(&traces).map_err(|e| format!("serialize traces: {e}"))?;
-    std::fs::write(&traces_file, bytes).map_err(|e| format!("write {}: {e}", traces_file.display()))?;
+    std::fs::write(&traces_file, bytes)
+        .map_err(|e| format!("write {}: {e}", traces_file.display()))?;
 
     // 3. Sidecars: the ground-truth label + a tiny metrics gauge.
     let expected = serde_json::json!({
@@ -531,7 +559,11 @@ fn run_path(
                     clock,
                 );
             }
-            let fr = pack.jobs.get(&job_type).map(|i| i.failure_rate).unwrap_or(0.0);
+            let fr = pack
+                .jobs
+                .get(&job_type)
+                .map(|i| i.failure_rate)
+                .unwrap_or(0.0);
             let failed = draw(seed ^ 0xE55A, mix(inst_index, job_key)) < fr;
             steps.push(JobStep {
                 element_id: element_id.clone(),
@@ -645,7 +677,12 @@ fn sample_queue_ms(c: u32, lambda_per_sec: f64, service_s: f64, seed: u64) -> u6
     (wait_s * 1000.0).round() as u64
 }
 
-fn pick_input<'a>(inputs: &'a [InputCase], total_weight: f64, seed: u64, idx: u64) -> &'a InputCase {
+fn pick_input<'a>(
+    inputs: &'a [InputCase],
+    total_weight: f64,
+    seed: u64,
+    idx: u64,
+) -> &'a InputCase {
     let mut r = draw(seed, idx) * total_weight;
     for c in inputs {
         r -= c.weight.max(0.0);
@@ -671,9 +708,11 @@ fn json_to_value(v: &Json) -> Value {
         }
         Json::String(s) => Value::Str(s.clone()),
         Json::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        Json::Object(map) => {
-            Value::Map(map.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
-        }
+        Json::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -776,7 +815,8 @@ pub fn infer(dataset_dir: &Path, target_p99_wait_ms: u64) -> Result<Inference, S
     // and a `traces/` subdir.
     let bundle = dataset_dir.join("traces.json");
     if bundle.is_file() {
-        let bytes = std::fs::read(&bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
+        let bytes =
+            std::fs::read(&bundle).map_err(|e| format!("read {}: {e}", bundle.display()))?;
         let arr: Vec<ReadTrace> =
             serde_json::from_slice(&bytes).map_err(|e| format!("parse traces.json: {e}"))?;
         for t in &arr {
@@ -816,7 +856,12 @@ pub fn infer(dataset_dir: &Path, target_p99_wait_ms: u64) -> Result<Inference, S
         let mut windows: Vec<(String, u64, u64, u64)> = Vec::new(); // window, mean_q, mean_s, n
         for ((j, w), acc) in &per {
             if j == jt && acc.n > 0 {
-                windows.push((w.clone(), acc.queue_sum / acc.n, acc.service_sum / acc.n, acc.n));
+                windows.push((
+                    w.clone(),
+                    acc.queue_sum / acc.n,
+                    acc.service_sum / acc.n,
+                    acc.n,
+                ));
             }
         }
         if windows.is_empty() {
@@ -878,7 +923,9 @@ pub fn infer(dataset_dir: &Path, target_p99_wait_ms: u64) -> Result<Inference, S
         }
         None => (None, None, 0, 0, None),
     };
-    evidence.push(format!("domain classified as '{domain}' from job types {job_types:?}"));
+    evidence.push(format!(
+        "domain classified as '{domain}' from job types {job_types:?}"
+    ));
 
     Ok(Inference {
         domain,
@@ -927,8 +974,14 @@ pub fn score(inference: &Inference, expected_path: &Path) -> Result<Score, Strin
         serde_json::from_slice(&bytes).map_err(|e| format!("parse expected: {e}"))?;
     let exp_domain = exp.get("domain").and_then(|v| v.as_str()).unwrap_or("");
     let fault = exp.get("plantedFault");
-    let exp_job = fault.and_then(|f| f.get("jobType")).and_then(|v| v.as_str()).unwrap_or("");
-    let exp_window = fault.and_then(|f| f.get("window")).and_then(|v| v.as_str()).unwrap_or("");
+    let exp_job = fault
+        .and_then(|f| f.get("jobType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let exp_window = fault
+        .and_then(|f| f.get("window"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let domain_ok = inference.domain == exp_domain;
     let job_ok = inference.bottleneck_job.as_deref() == Some(exp_job);
@@ -1086,7 +1139,10 @@ pub(crate) mod tests {
     fn unstable_pool_produces_a_large_queue_wait() {
         // c=1, λ=10/s, service=0.8s → a=8 >> 1: saturated, should be large.
         let q = sample_queue_ms(1, 10.0, 0.8, 123);
-        assert!(q > 800, "saturated queue should dwarf service time, got {q}");
+        assert!(
+            q > 800,
+            "saturated queue should dwarf service time, got {q}"
+        );
         // A well-provisioned pool barely waits.
         let q2 = sample_queue_ms(20, 1.0, 0.8, 123);
         assert!(q2 < 800, "idle pool should rarely wait, got {q2}");
@@ -1112,7 +1168,10 @@ pub(crate) mod tests {
         );
 
         let score = score(&inference, &tmp.join("expected.json")).expect("score");
-        assert_eq!(score.points, 3, "should recover domain+job+window: {score:?}");
+        assert_eq!(
+            score.points, 3,
+            "should recover domain+job+window: {score:?}"
+        );
 
         // The generated corpus must load through the workspace DatasetSource and fold
         // an Insights report — i.e. it is byte-compatible with a real Nano capture.

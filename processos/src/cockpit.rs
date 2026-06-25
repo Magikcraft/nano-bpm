@@ -135,8 +135,16 @@ async fn pending_review_task(nano: &NanoClient, instance_key: &str) -> Option<St
     let res: Value = nano.post_json("/v2/user-tasks/search", &body).await.ok()?;
     res.get("items")
         .and_then(|i| i.as_array())
-        .and_then(|items| items.iter().find(|t| t.get("elementId").and_then(|e| e.as_str()) == Some("Review")))
-        .and_then(|t| t.get("userTaskKey").and_then(|k| k.as_str()).map(str::to_string))
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|t| t.get("elementId").and_then(|e| e.as_str()) == Some("Review"))
+        })
+        .and_then(|t| {
+            t.get("userTaskKey")
+                .and_then(|k| k.as_str())
+                .map(str::to_string)
+        })
 }
 
 fn as_i64(v: Option<&Value>) -> Option<i64> {
@@ -187,13 +195,19 @@ fn summarize(
 
 /// List every experiment (pilot instance) in the recent trace window, newest
 /// first, each annotated with its target process and loop position.
-pub async fn list_experiments(nano: &NanoClient, limit: usize) -> Result<Vec<ExperimentSummary>, String> {
+pub async fn list_experiments(
+    nano: &NanoClient,
+    limit: usize,
+) -> Result<Vec<ExperimentSummary>, String> {
     let traces = nano.list_traces(limit).await?;
     let mut out = Vec::new();
-    for t in traces.into_iter().filter(|t| t.process_id == PILOT_PROCESS_ID) {
+    for t in traces
+        .into_iter()
+        .filter(|t| t.process_id == PILOT_PROCESS_ID)
+    {
         let vars = instance_variables(nano, &t.instance_key).await;
-        let awaiting = t.outcome != "completed"
-            && pending_review_task(nano, &t.instance_key).await.is_some();
+        let awaiting =
+            t.outcome != "completed" && pending_review_task(nano, &t.instance_key).await.is_some();
         out.push(summarize(
             &t.instance_key,
             &t.outcome,
@@ -255,7 +269,10 @@ pub async fn overview(
 /// Build the full cockpit view for one experiment (pilot instance): the stepper
 /// and the conversation, reconstructed from the instance's trace path, current
 /// variables, and any open user task.
-pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<ExperimentDetail, String> {
+pub async fn experiment_detail(
+    nano: &NanoClient,
+    instance_key: &str,
+) -> Result<ExperimentDetail, String> {
     let trace = nano.trace(instance_key).await?;
     if trace.process_id != PILOT_PROCESS_ID {
         return Err(format!(
@@ -267,7 +284,11 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
     let pending = pending_review_task(nano, instance_key).await;
     let completed = trace.outcome == "completed";
 
-    let path: Vec<String> = trace.elements.iter().map(|e| e.element_id.clone()).collect();
+    let path: Vec<String> = trace
+        .elements
+        .iter()
+        .map(|e| e.element_id.clone())
+        .collect();
     let evolved = path.iter().any(|e| e == "Evolve");
     let best_name = as_string(vars.get("bestName"));
     let best_rate = as_f64(vars.get("bestConservedRate"));
@@ -323,7 +344,11 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
     steps.push(Step {
         id: "rank".into(),
         label: "Stress-test & rank".into(),
-        status: if best_rate.is_some() { "done".into() } else { "todo".into() },
+        status: if best_rate.is_some() {
+            "done".into()
+        } else {
+            "todo".into()
+        },
         detail: best_rate.map(|r| format!("best conserved-rate {:.3} on real traces", r)),
     });
     steps.push(Step {
@@ -343,7 +368,11 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
                 "Stopped" => "loop stopped".to_string(),
                 other => other.to_string(),
             })
-            .or_else(|| pending.as_ref().map(|_| "awaiting your decision".to_string())),
+            .or_else(|| {
+                pending
+                    .as_ref()
+                    .map(|_| "awaiting your decision".to_string())
+            }),
     });
 
     // The droid-conversation pane: engine framing, the droid's latest proposal,
@@ -398,7 +427,11 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
                     } else {
                         format!(" · needs new workers: {new_workers}")
                     },
-                    if why.is_empty() { String::new() } else { format!(" — {why}") },
+                    if why.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {why}")
+                    },
                 ),
             });
         }
@@ -419,7 +452,8 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
         }),
         (None, Some(_)) => conversation.push(Turn {
             role: "pilot".into(),
-            text: "Your turn: accept this candidate, ask the droid to iterate, or stop the loop.".into(),
+            text: "Your turn: accept this candidate, ask the droid to iterate, or stop the loop."
+                .into(),
         }),
         _ => {}
     }
@@ -438,7 +472,9 @@ pub async fn experiment_detail(nano: &NanoClient, instance_key: &str) -> Result<
 /// experiment's baseline when the caller does not supply one).
 pub async fn latest_process_xml(nano: &NanoClient, process_id: &str) -> Result<String, String> {
     let body = json!({ "filter": { "processDefinitionId": process_id } });
-    let res: Value = nano.post_json("/v2/process-definitions/search", &body).await?;
+    let res: Value = nano
+        .post_json("/v2/process-definitions/search", &body)
+        .await?;
     let key = res
         .get("items")
         .and_then(|i| i.as_array())
@@ -449,7 +485,8 @@ pub async fn latest_process_xml(nano: &NanoClient, process_id: &str) -> Result<S
         })
         .and_then(|d| d.get("processDefinitionKey").and_then(|k| k.as_str()))
         .ok_or_else(|| format!("no deployed definition for process '{process_id}'"))?;
-    nano.get_text(&format!("/v2/process-definitions/{key}/xml")).await
+    nano.get_text(&format!("/v2/process-definitions/{key}/xml"))
+        .await
 }
 
 /// Start an experiment: create a `pilotSelfOptimize` instance for a target

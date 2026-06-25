@@ -223,6 +223,12 @@
   .bub .who .copybtn { float: right; margin-left: 8px; background: none; border: none; cursor: pointer; color: #6b7280; font-size: 13px; padding: 0 2px; line-height: 1; }
   .bub .who .copybtn:hover { color: #c7d2fe; }
   .bub .who .copybtn.done { color: #86efac; }
+  .bub .who .carrybtn { float: right; margin-left: 6px; background: none; border: none; cursor: pointer; color: #6b7280; font-size: 14px; padding: 0 2px; line-height: 1; }
+  .bub .who .carrybtn:hover { color: #fbbf24; }
+  .bub .who .carrybtn.done { color: #86efac; }
+  /* Pair AI reviewer bubble + badge */
+  .bub.droid.pair { border-left: 2px solid #a855f7; background: rgba(168,85,247,0.05); }
+  .pair-badge { color: #c084fc; font-weight: 700; }
   /* GitHub-style markdown tables (answers + thinking) */
   .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
   .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
@@ -896,6 +902,13 @@ async function renderWorkspace(ws, proc){
               <span>Persona</span>
               <select id="chatPersona"></select>
             </label>
+            <label class="persona-pick" id="chatPairToggle" title="Pair AI: a second model reviews the droid's answer each turn — verifying, refining, or challenging it with the same data/model tools. Off by default. Pick a different model family for the reviewer so their errors decorrelate.">
+              <span><input type="checkbox" id="chatPairOn" style="vertical-align:-1px"> Pair AI</span>
+            </label>
+            <span class="persona-pick" id="chatPairCfg" style="display:none">
+              <select id="chatPairProfile" title="The reviewer's LLM profile (its own model)"></select>
+              <select id="chatPairPersona" title="The reviewer's persona (how it reviews)"></select>
+            </span>
             <select id="chatPrompt"><option value="">Load a prompt…</option></select>
             <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
             <span class="fontctl" title="Chat text size">
@@ -1363,8 +1376,16 @@ function chatBub(t){
   const summary = 'Thinking' + (toolCount ? ' · '+toolCount+' tool call'+(toolCount===1?'':'s') : '');
   const thinkHtml = inner ? '<details class="think"><summary>'+esc(summary)+'</summary><div class="think-tl">'+inner+'</div></details>' : '';
   const copyBtn = answer ? '<button class="copybtn" title="Copy response" data-copy="'+esc(answer)+'">\u29C9</button>' : '';
+  // Carry-forward: drop a quoted version of this answer into the composer, so the operator can hand
+  // one model's conclusion to the next model (cross-provider refinement) on the following turn.
+  const carryBtn = answer ? '<button class="carrybtn" title="Quote into composer for the next model" data-carry="'+esc(answer)+'">\u21AA</button>' : '';
   const modelsHtml = suggestedModelsHtml(items);
-  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+copyBtn+time+'</div>'+thinkHtml+
+  if(t.role === 'pair'){
+    const who = '<span class="pair-badge" title="Pair AI reviewer">\uD83E\uDD1D Pair AI'+(t.name?(' \u00B7 '+esc(t.name)):'')+'</span>';
+    return '<div class="bub droid pair"><div class="who">'+who+copyBtn+carryBtn+time+'</div>'+thinkHtml+
+      '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div>'+modelsHtml+'</div>';
+  }
+  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+copyBtn+carryBtn+time+'</div>'+thinkHtml+
     '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div>'+modelsHtml+'</div>';
 }
 
@@ -1570,6 +1591,24 @@ if(!window.__copyWired){
   });
 }
 
+// Carry-forward handler: quote a prior answer into the composer so the next model picks up where
+// the last one left off (cross-provider refinement / hand-off between turns).
+if(!window.__carryWired){
+  window.__carryWired = true;
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.carrybtn');
+    if(!btn) return;
+    const txt = btn.getAttribute('data-carry') || '';
+    const box = $('#chatBox'); if(!box) return;
+    const quoted = txt.split('\n').map(l => '> ' + l).join('\n');
+    const lead = 'The previous model concluded:\n\n' + quoted + '\n\n';
+    box.value = box.value ? (lead + box.value) : lead;
+    box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+    const prev = btn.textContent; btn.textContent = '\u2713'; btn.classList.add('done');
+    setTimeout(()=>{ btn.textContent = prev; btn.classList.remove('done'); }, 1200);
+  });
+}
+
 function drawChat(turns){
   const log = $('#chatLog');
   if(!log) return;
@@ -1708,13 +1747,64 @@ async function loadPersonas(){
   try {
     STATE.personas = await api('/api/personas') || [];
   } catch(e){ STATE.personas = []; }
+  const all = STATE.personas || [];
+  const isPair = p => p.kind === 'pair';
+  const primary = all.filter(p => !isPair(p));
+  const pairPersonas = all.filter(isPair);
   if(sel){
-    const def = (STATE.personas.find(p => p.default) || STATE.personas[0] || {}).id || '';
-    sel.innerHTML = (STATE.personas||[]).map(p =>
+    const def = (primary.find(p => p.default) || primary[0] || {}).id || '';
+    sel.innerHTML = primary.map(p =>
       '<option value="'+esc(p.id)+'"'+(p.id===def?' selected':'')+'>'+esc(p.name||p.id)+(p.default?' (default)':'')+(p.builtin?'':' ✎')+'</option>').join('');
     sel.title = personaSummary(def);
     sel.onchange = () => { sel.title = personaSummary(sel.value); };
   }
+  // Pair AI reviewer persona picker (pair-kind personas only).
+  const psel = $('#chatPairPersona');
+  if(psel){
+    const want = localStorage.getItem('processos.pairPersona') || 'pair-skeptic';
+    psel.innerHTML = pairPersonas.map(p =>
+      '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
+      || '<option value="pair-skeptic">Skeptic / Red-Team</option>';
+    psel.title = personaSummary(psel.value);
+    psel.onchange = () => { psel.title = personaSummary(psel.value); localStorage.setItem('processos.pairPersona', psel.value); };
+  }
+  await fillPairProfiles();
+  wirePairControls();
+}
+// Populate the Pair AI reviewer's LLM-profile picker from the configured profiles. Defaults to a
+// profile *other* than the active primary when possible (cross-model pairing decorrelates errors).
+async function fillPairProfiles(){
+  const sel = $('#chatPairProfile'); if(!sel) return;
+  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
+  const profiles = s.profiles || [];
+  const saved = localStorage.getItem('processos.pairProfile');
+  const fallback = (profiles.find(p => p.id !== s.activeProfile) || profiles[0] || {}).id || '';
+  const want = (saved && profiles.some(p => p.id===saved)) ? saved : fallback;
+  sel.innerHTML = profiles.length
+    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
+    : '<option value="">No profiles configured</option>';
+  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.pairProfile', sel.value); };
+}
+// Wire the Pair AI on/off toggle: reveal the reviewer config when on, persist the choice, and
+// relabel the Send button so the operator knows a reviewer will run.
+function wirePairControls(){
+  const on = $('#chatPairOn'), cfg = $('#chatPairCfg'); if(!on || !cfg) return;
+  const sync = () => {
+    cfg.style.display = on.checked ? '' : 'none';
+    localStorage.setItem('processos.pairOn', on.checked ? '1' : '0');
+    labelSendButton();
+  };
+  on.checked = localStorage.getItem('processos.pairOn') === '1';
+  on.onchange = sync;
+  sync();
+}
+// The Pair AI config the composer will send (or null when off / unavailable).
+function pairRequest(){
+  const on = $('#chatPairOn');
+  if(!on || !on.checked) return null;
+  const profileId = ($('#chatPairProfile')||{}).value || undefined;
+  const personaId = ($('#chatPairPersona')||{}).value || undefined;
+  return { enabled: true, profileId, personaId };
 }
 function personaSummary(id){
   const p = (STATE.personas||[]).find(x => x.id===id);
@@ -1737,9 +1827,9 @@ function applyPersonaState(){
 }
 
 // Build the live "pending" droid bubble whose regions fill in as SSE events stream.
-function livePendingHtml(){
-  return '<div class="bub droid pending" id="chatPending">'+
-    '<div class="who">'+droidWhoHtml()+'</div>'+
+function livePendingHtml(whoHtml, cls){
+  return '<div class="bub droid pending'+(cls?(' '+cls):'')+'" id="chatPending">'+
+    '<div class="who">'+(whoHtml||droidWhoHtml())+'</div>'+
     '<details class="think live" open id="liveThinkWrap" style="display:none"><summary>Thinking…</summary>'+
       '<div class="think-tl" id="liveTimeline"></div>'+
     '</details>'+
@@ -1760,7 +1850,7 @@ async function sendChat(ws, proc){
     onErrorRestore: () => { box.value = msg; },
     fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined })
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined })
     }),
   });
 }
@@ -1791,9 +1881,9 @@ async function consumeLiveStream(ws, proc, opts){
   log.insertAdjacentHTML('beforeend', livePendingHtml());
   log.scrollTop = log.scrollHeight;
 
-  const pend = $('#chatPending');
-  const liveThinkWrap = $('#liveThinkWrap'), liveTimeline = $('#liveTimeline');
-  const liveAnswer = $('#liveAnswer'), liveStatus = $('#liveStatus');
+  let pend = $('#chatPending');
+  let liveThinkWrap = $('#liveThinkWrap'), liveTimeline = $('#liveTimeline');
+  let liveAnswer = $('#liveAnswer'), liveStatus = $('#liveStatus');
   let answerBuf = '';
   // Set when the turn ends in an error (a transport failure, or an SSE `error` event such
   // as the LLM backend returning 404/503). On any error we run onErrorRestore (see `finally`)
@@ -1808,12 +1898,28 @@ async function consumeLiveStream(ws, proc, opts){
   // in the Simulations tab as the droid forks and replays variants.
   STATE.liveSims = []; STATE.liveSimsSid = STATE.sessionId;
   let curReason = null, curReasonBuf = ''; // the reasoning block currently streaming
-  const pendingSteps = []; // FIFO of {tool, el} awaiting their result
+  let pendingSteps = []; // FIFO of {tool, el} awaiting their result
   const nearBottom = () => (log.scrollHeight - log.scrollTop - log.clientHeight) < 80;
   const autoscroll = () => { if(nearBottom()) log.scrollTop = log.scrollHeight; };
 
+  // Pair AI provenance: freeze the current agent's pending bubble into a finished one and open a
+  // fresh attributed bubble for the next agent (the reviewer), so primary vs Pair AI output never
+  // run together. The terminal `done` event later redraws everything from the persisted transcript.
+  function beginAgent(ev){
+    if(pend){ pend.classList.remove('pending'); pend.removeAttribute('id'); const st = pend.querySelector('.live-status'); if(st) st.remove(); }
+    const who = '<span class="pair-badge" title="Pair AI reviewer">🤝 Pair AI · '+esc(ev.name||'reviewer')+'</span>';
+    log.insertAdjacentHTML('beforeend', livePendingHtml(who, 'pair'));
+    pend = $('#chatPending');
+    liveThinkWrap = $('#liveThinkWrap'); liveTimeline = $('#liveTimeline');
+    liveAnswer = $('#liveAnswer'); liveStatus = $('#liveStatus');
+    answerBuf = ''; curReason = null; curReasonBuf = ''; pendingSteps = [];
+    if(liveStatus) liveStatus.textContent = 'reviewing the droid\u2019s answer…';
+    autoscroll();
+  }
+
   function handleEvent(ev){
-    if(ev.type==='round'){ if(liveStatus) liveStatus.textContent = 'round '+ev.n+' — investigating…'; }
+    if(ev.type==='agent'){ if(ev.role==='pair') beginAgent(ev); }
+    else if(ev.type==='round'){ if(liveStatus) liveStatus.textContent = 'round '+ev.n+' — investigating…'; }
     else if(ev.type==='request'){
       liveDebug.push({ round: ev.round, ts: ev.ts || Date.now(), body: ev.body });
       if(STATE.chatTab==='debug'){ const host=$('#chatDebug'); if(host) host.innerHTML = renderDebug({ requests: liveDebug }); }

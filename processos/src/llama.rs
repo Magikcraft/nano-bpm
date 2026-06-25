@@ -75,7 +75,11 @@ impl LaunchPlan {
         // Hugging Face `repo[:quant]` spec that llama-server downloads into LLAMA_CACHE.
         if model.to_ascii_lowercase().ends_with(".gguf") {
             let p = PathBuf::from(&model);
-            let resolved = if p.is_absolute() { p } else { models_dir.join(&p) };
+            let resolved = if p.is_absolute() {
+                p
+            } else {
+                models_dir.join(&p)
+            };
             args.push("-m".into());
             args.push(resolved.display().to_string());
         } else {
@@ -104,7 +108,11 @@ impl LaunchPlan {
     /// The equivalent shell command, so the operator can run the same server in a terminal to
     /// watch its output directly. Includes the `LLAMA_CACHE` export.
     pub fn command_line(&self) -> String {
-        let mut s = format!("LLAMA_CACHE={} {}", shell_quote(&self.models_dir.display().to_string()), shell_quote(&self.bin));
+        let mut s = format!(
+            "LLAMA_CACHE={} {}",
+            shell_quote(&self.models_dir.display().to_string()),
+            shell_quote(&self.bin)
+        );
         for a in &self.args {
             s.push(' ');
             s.push_str(&shell_quote(a));
@@ -152,7 +160,10 @@ fn split_args(s: &str) -> Vec<String> {
 
 /// Minimal shell quoting for the display-only command line.
 fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=".contains(c)) {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=".contains(c))
+    {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
@@ -481,7 +492,10 @@ mod tests {
 
     #[test]
     fn split_args_honours_quotes() {
-        assert_eq!(split_args("-ngl 99 -c 32768"), vec!["-ngl", "99", "-c", "32768"]);
+        assert_eq!(
+            split_args("-ngl 99 -c 32768"),
+            vec!["-ngl", "99", "-c", "32768"]
+        );
         assert_eq!(
             split_args("--chat-template '/a b/t.jinja' -ngl 99"),
             vec!["--chat-template", "/a b/t.jinja", "-ngl", "99"]

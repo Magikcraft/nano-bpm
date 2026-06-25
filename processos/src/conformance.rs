@@ -150,25 +150,29 @@ pub fn conformance_check(analysis: &Analysis, model_xml: &str) -> Result<Value, 
     let (node_rows, _) = rows(analysis, NODES_SQL)?;
     let mut observed_execs: BTreeMap<String, i64> = BTreeMap::new();
     for row in &node_rows {
-        observed_execs.insert(
-            cell(row, 0).to_string(),
-            as_i64(cell(row, 1)),
-        );
+        observed_execs.insert(cell(row, 0).to_string(), as_i64(cell(row, 1)));
     }
 
     let total_occurrences: i64 = edges.iter().map(|e| e.count).sum();
     let mut conformant_occurrences = 0i64;
     let mut conformant_edges = 0usize;
     let mut nonconformant: Vec<Value> = Vec::new();
-    let observed_pairs: HashSet<(String, String)> =
-        edges.iter().map(|e| (e.from.clone(), e.to.clone())).collect();
+    let observed_pairs: HashSet<(String, String)> = edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
 
     for e in &edges {
         let reason = if !mtg.tasks.contains(&e.from) {
             Some("source task is not in the model")
         } else if !mtg.tasks.contains(&e.to) {
             Some("target task is not in the model")
-        } else if !mtg.allowed.get(&e.from).map(|s| s.contains(&e.to)).unwrap_or(false) {
+        } else if !mtg
+            .allowed
+            .get(&e.from)
+            .map(|s| s.contains(&e.to))
+            .unwrap_or(false)
+        {
             Some("the model permits no task-path from source to target")
         } else {
             None
@@ -370,7 +374,10 @@ mod tests {
         for i in 0..2 {
             traces.push(inst(
                 &format!("r{i}"),
-                &[("CreditCheck", "credit-check"), ("Reject", "reject-application")],
+                &[
+                    ("CreditCheck", "credit-check"),
+                    ("Reject", "reject-application"),
+                ],
             ));
         }
         // 1 nonconformant: Approve runs before CreditCheck (model permits no such path)

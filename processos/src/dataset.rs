@@ -37,7 +37,10 @@ impl DatasetSource {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, String> {
         let dir = dir.as_ref();
         if !dir.is_dir() {
-            return Err(format!("dataset path is not a directory: {}", dir.display()));
+            return Err(format!(
+                "dataset path is not a directory: {}",
+                dir.display()
+            ));
         }
 
         let mut traces: Vec<InstanceTrace> = Vec::new();

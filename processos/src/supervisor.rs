@@ -67,7 +67,12 @@ impl SpawnConfig {
             .ok()
             .map(|v| truthy(&v))
             .unwrap_or(true);
-        Some(Self { bin, port, data_dir, capture })
+        Some(Self {
+            bin,
+            port,
+            data_dir,
+            capture,
+        })
     }
 }
 
@@ -176,7 +181,11 @@ async fn wait_until_healthy(client: &NanoClient, timeout: Duration) -> Result<()
 
 /// Parse `LISTENING_PORT=<n>` from a gateway stdout line.
 fn parse_listening_port(line: &str) -> Option<u16> {
-    line.trim().strip_prefix("LISTENING_PORT=")?.trim().parse().ok()
+    line.trim()
+        .strip_prefix("LISTENING_PORT=")?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Best-effort default for the gateway binary: a release `--features console` build
@@ -193,7 +202,10 @@ fn default_gateway_bin() -> Option<PathBuf> {
 }
 
 fn truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[cfg(test)]

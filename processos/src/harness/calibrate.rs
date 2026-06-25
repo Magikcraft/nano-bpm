@@ -119,7 +119,8 @@ pub fn calibrate_from_measured(scenario: &Scenario, measured: &[MeasuredJobType]
         };
         if a.service_samples > 0 {
             // Round to nearest millisecond.
-            w.latency_ms = ((a.service_weighted + a.service_samples / 2) / a.service_samples) as u64;
+            w.latency_ms =
+                ((a.service_weighted + a.service_samples / 2) / a.service_samples) as u64;
         }
         if a.samples > 0 {
             let rate = a.failures as f64 / a.samples as f64;

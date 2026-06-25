@@ -16,11 +16,9 @@ use std::collections::HashMap;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use serde::Deserialize;
 
-use super::llm::{self, LlmConfig};
-use super::rank::{
-    self, HarnessReport, LlmMeta, RejectedCandidate,
-};
 use super::calibrate::MeasuredJobType;
+use super::llm::{self, LlmConfig};
+use super::rank::{self, HarnessReport, LlmMeta, RejectedCandidate};
 use super::Scenario;
 
 /// One candidate as proposed by the model.
@@ -221,7 +219,10 @@ fn build_prompt(
             w.cost,
             w.latency_ms,
             w.failure_rate,
-            keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+            keys.iter()
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
 
@@ -245,7 +246,12 @@ fn build_prompt(
                 opts.push(o.clone());
             }
         }
-        s.push_str(&format!("  - {}: {} -> [{}]\n", jt, default, opts.join(", ")));
+        s.push_str(&format!(
+            "  - {}: {} -> [{}]\n",
+            jt,
+            default,
+            opts.join(", ")
+        ));
     }
 
     s.push_str(&format!(
@@ -262,9 +268,7 @@ fn build_prompt(
     // bottleneck rather than reasoning purely off the synthetic baseline.
     let signal: Vec<&MeasuredJobType> = measured.iter().filter(|m| m.samples > 0).collect();
     if !signal.is_empty() {
-        s.push_str(
-            "\nMeasured production signal (per job type, observed live — target these):\n",
-        );
+        s.push_str("\nMeasured production signal (per job type, observed live — target these):\n");
         let mut rows: Vec<&MeasuredJobType> = signal;
         rows.sort_by(|a, b| a.job_type.cmp(&b.job_type));
         for m in rows {
@@ -362,7 +366,10 @@ mod tests {
         let c = parse_candidates(txt).unwrap();
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].name.as_deref(), Some("a"));
-        assert_eq!(c[0].assignment.get("classify").map(|s| s.as_str()), Some("cheap-llm"));
+        assert_eq!(
+            c[0].assignment.get("classify").map(|s| s.as_str()),
+            Some("cheap-llm")
+        );
     }
 
     #[test]
@@ -390,7 +397,15 @@ mod tests {
         let scenario = crate::harness::example_scenario();
         let (defs, pid) = rank::prepare(&scenario).unwrap();
         let base_assign = rank::effective_assignment(&scenario, &HashMap::new());
-        let baseline = rank::evaluate(&scenario, &defs, &pid, "baseline", "baseline", None, &base_assign);
+        let baseline = rank::evaluate(
+            &scenario,
+            &defs,
+            &pid,
+            "baseline",
+            "baseline",
+            None,
+            &base_assign,
+        );
         let prompt = build_prompt(&scenario, &baseline, &[]);
         assert!(prompt.contains("cheap-llm"));
         assert!(prompt.contains("classify"));
@@ -405,7 +420,15 @@ mod tests {
         let scenario = crate::harness::example_scenario();
         let (defs, pid) = rank::prepare(&scenario).unwrap();
         let base_assign = rank::effective_assignment(&scenario, &HashMap::new());
-        let baseline = rank::evaluate(&scenario, &defs, &pid, "baseline", "baseline", None, &base_assign);
+        let baseline = rank::evaluate(
+            &scenario,
+            &defs,
+            &pid,
+            "baseline",
+            "baseline",
+            None,
+            &base_assign,
+        );
         let measured = vec![
             MeasuredJobType {
                 job_type: "classify".to_string(),

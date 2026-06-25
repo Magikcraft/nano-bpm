@@ -81,14 +81,23 @@ impl PilotStore {
     pub fn open(data_dir: &Path) -> Self {
         let path = data_dir.join(PILOT_FILE);
         let state = match std::fs::read_to_string(&path) {
-            Ok(xml) if !xml.trim().is_empty() => PilotState { xml, source: Source::Forked },
+            Ok(xml) if !xml.trim().is_empty() => PilotState {
+                xml,
+                source: Source::Forked,
+            },
             _ => {
                 let _ = std::fs::create_dir_all(data_dir);
                 let _ = std::fs::write(&path, DEFAULT_PILOT_BPMN);
-                PilotState { xml: DEFAULT_PILOT_BPMN.to_string(), source: Source::Default }
+                PilotState {
+                    xml: DEFAULT_PILOT_BPMN.to_string(),
+                    source: Source::Default,
+                }
             }
         };
-        Self { path, state: Mutex::new(state) }
+        Self {
+            path,
+            state: Mutex::new(state),
+        }
     }
 
     /// The XML the supervisor should deploy on boot.
@@ -215,10 +224,7 @@ mod tests {
     fn reset_restores_the_default() {
         let dir = tmp();
         let store = PilotStore::open(&dir);
-        let forked = DEFAULT_PILOT_BPMN.replace(
-            "<bpmn:process",
-            "<!-- fork --><bpmn:process",
-        );
+        let forked = DEFAULT_PILOT_BPMN.replace("<bpmn:process", "<!-- fork --><bpmn:process");
         store.save(&forked).unwrap();
         assert_eq!(store.doc().source, "forked");
         let doc = store.reset();

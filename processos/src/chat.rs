@@ -26,6 +26,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Msg, ToolCall};
 
+/// Sentinel that marks an assistant message as a **Pair AI** contribution in the persisted
+/// transcript. Format: `"{PAIR_MARK}{name}{PAIR_MARK}{answer}"`. The control char (SOH) never
+/// occurs in model prose, so detection is unambiguous and the marker stays invisible if any
+/// path renders the raw text. See [`mark_pair`] / [`render_view`].
+pub const PAIR_MARK: &str = "\u{1}";
+
+/// Wrap a Pair AI reviewer's `answer` (authored by reviewer `name`) for persistence in the
+/// primary transcript, so it renders with provenance and is carried into the next turn.
+pub fn mark_pair(name: &str, answer: &str) -> String {
+    format!("{PAIR_MARK}{name}{PAIR_MARK}{answer}")
+}
+
+/// If `text` is a [`mark_pair`]-encoded Pair AI message, return `(name, answer)`.
+fn unmark_pair(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix(PAIR_MARK)?;
+    let idx = rest.find(PAIR_MARK)?;
+    Some((
+        rest[..idx].to_string(),
+        rest[idx + PAIR_MARK.len()..].to_string(),
+    ))
+}
+
 /// Monotonic suffix so two sessions created in the same millisecond get distinct ids.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -155,10 +177,10 @@ impl ChatStore {
     /// Load a session by id (its full transcript + stamps).
     pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {
         self.ensure_loaded(key);
-        self.mem
-            .read()
-            .ok()
-            .and_then(|m| m.get(key).and_then(|s| s.iter().find(|s| s.id == session_id).cloned()))
+        self.mem.read().ok().and_then(|m| {
+            m.get(key)
+                .and_then(|s| s.iter().find(|s| s.id == session_id).cloned())
+        })
     }
 
     /// Replace a session's transcript + stamps, bumping `updated`. Creates the session if
@@ -271,7 +293,12 @@ impl ChatStore {
     }
 
     fn ensure_loaded(&self, key: &str) {
-        if self.mem.read().map(|m| m.contains_key(key)).unwrap_or(false) {
+        if self
+            .mem
+            .read()
+            .map(|m| m.contains_key(key))
+            .unwrap_or(false)
+        {
             return;
         }
         let loaded = self.load_from_disk(key).unwrap_or_default();
@@ -293,7 +320,11 @@ impl ChatStore {
         if legacy.messages.is_empty() {
             return Some(Vec::new());
         }
-        let updated = if legacy.updated > 0 { legacy.updated } else { now_ms() };
+        let updated = if legacy.updated > 0 {
+            legacy.updated
+        } else {
+            now_ms()
+        };
         Some(vec![ChatSession {
             id: new_session_id(),
             name: default_name(1),
@@ -401,8 +432,11 @@ pub enum ThoughtItem {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatTurnView {
-    /// `user` (the operator) or `droid` (the model).
+    /// `user` (the operator), `droid` (the primary model), or `pair` (a Pair AI reviewer).
     pub role: String,
+    /// For `pair` turns, the reviewer persona's display name (e.g. "Skeptic / Red-Team").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub text: String,
     /// For droid turns, the tool calls it ran before replying (flat, legacy view).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -535,6 +569,7 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
             Msg::User(text) => {
                 turns.push(ChatTurnView {
                     role: "user".into(),
+                    name: None,
                     text: text.clone(),
                     steps: Vec::new(),
                     thought: Vec::new(),
@@ -555,6 +590,18 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                             });
                         }
                     }
+                } else if let Some((name, answer)) = text.as_deref().and_then(unmark_pair) {
+                    // A Pair AI reviewer's contribution: its own attributed turn. Its tool work
+                    // ran in a separate sub-conversation, so it carries no steps/thought here.
+                    let (_, clean) = split_thinking(&answer);
+                    turns.push(ChatTurnView {
+                        role: "pair".into(),
+                        name: Some(name),
+                        text: if clean.is_empty() { answer } else { clean },
+                        steps: Vec::new(),
+                        thought: Vec::new(),
+                        ts: None,
+                    });
                 } else {
                     // A final answer: split off its reasoning, then drain the timeline.
                     let (think, answer) = split_thinking(text.as_deref().unwrap_or(""));
@@ -565,6 +612,7 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                     }
                     turns.push(ChatTurnView {
                         role: "droid".into(),
+                        name: None,
                         text: answer,
                         steps: std::mem::take(&mut steps),
                         thought: std::mem::take(&mut thought),
@@ -617,11 +665,20 @@ pub fn render_view_stamped(messages: &[Msg], stamps: &[u64]) -> Vec<ChatTurnView
 /// Extend `stamps` so it aligns with the rendered turns of `messages`: a newly-appeared user
 /// turn is stamped `user_ts` and newly-appeared droid turns `droid_ts`. Existing stamps are
 /// preserved; the result is truncated to the turn count.
-pub fn extend_stamps(messages: &[Msg], mut stamps: Vec<u64>, user_ts: u64, droid_ts: u64) -> Vec<u64> {
+pub fn extend_stamps(
+    messages: &[Msg],
+    mut stamps: Vec<u64>,
+    user_ts: u64,
+    droid_ts: u64,
+) -> Vec<u64> {
     let view = render_view(messages);
     while stamps.len() < view.len() {
         let i = stamps.len();
-        let ts = if view[i].role == "user" { user_ts } else { droid_ts };
+        let ts = if view[i].role == "user" {
+            user_ts
+        } else {
+            droid_ts
+        };
         stamps.push(ts);
     }
     stamps.truncate(view.len());
@@ -711,7 +768,12 @@ mod tests {
     fn keys_cannot_escape_the_data_dir() {
         let dir = tmp();
         let store = ChatStore::open(&dir);
-        store.save("../../etc/passwd", "sid", vec![Msg::User("x".into())], vec![0]);
+        store.save(
+            "../../etc/passwd",
+            "sid",
+            vec![Msg::User("x".into())],
+            vec![0],
+        );
         let entries: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
@@ -727,7 +789,10 @@ mod tests {
         let transcript = vec![
             Msg::System("s".into()),
             Msg::User("q".into()),
-            Msg::Assistant { text: Some("a".into()), tool_calls: vec![] },
+            Msg::Assistant {
+                text: Some("a".into()),
+                tool_calls: vec![],
+            },
         ];
         let stamps = extend_stamps(&transcript, vec![], 100, 200);
         assert_eq!(stamps, vec![100, 200]); // user turn, droid turn
@@ -801,7 +866,10 @@ mod tests {
         assert_eq!(runs[0]["tool"], "simulate");
         assert_eq!(runs[0]["arguments"]["model"], "<bpmn/>");
         assert_eq!(runs[0]["result"]["datasetSize"], 42);
-        assert_eq!(runs[0]["result"]["scorecard"]["fidelityTier"], "recorded-replay");
+        assert_eq!(
+            runs[0]["result"]["scorecard"]["fidelityTier"],
+            "recorded-replay"
+        );
     }
 
     #[test]
@@ -819,8 +887,14 @@ mod tests {
                     arguments: json!({"sql": "SELECT 1"}),
                 }],
             },
-            Msg::Tool { call_id: "c1".into(), content: "1".into() },
-            Msg::Assistant { text: Some("credit-check.".into()), tool_calls: vec![] },
+            Msg::Tool {
+                call_id: "c1".into(),
+                content: "1".into(),
+            },
+            Msg::Assistant {
+                text: Some("credit-check.".into()),
+                tool_calls: vec![],
+            },
         ];
         let view = render_view(&transcript);
         assert_eq!(view.len(), 2);
@@ -828,8 +902,12 @@ mod tests {
         assert_eq!(view[1].text, "credit-check.");
         // The reasoning from the tool round survives in the interleaved thought timeline,
         // ordered before the tool call it preceded.
-        assert!(matches!(&view[1].thought[0], ThoughtItem::Reasoning { text } if text.contains("let me check durations")));
-        assert!(matches!(&view[1].thought[1], ThoughtItem::Tool { tool, .. } if tool == "query_traces"));
+        assert!(
+            matches!(&view[1].thought[0], ThoughtItem::Reasoning { text } if text.contains("let me check durations"))
+        );
+        assert!(
+            matches!(&view[1].thought[1], ThoughtItem::Tool { tool, .. } if tool == "query_traces")
+        );
     }
 
     #[test]
@@ -840,5 +918,43 @@ mod tests {
         let (think, answer) = split_thinking("still thinking <think>not closed");
         assert_eq!(think, "not closed");
         assert_eq!(answer, "still thinking");
+    }
+
+    #[test]
+    fn render_view_decodes_pair_marked_reviewer_turn() {
+        // A Pair AI reviewer's answer persists as a marked assistant message; render_view must
+        // surface it as an attributed `pair` turn carrying the reviewer persona's display name.
+        let transcript = vec![
+            Msg::System("sys".into()),
+            Msg::User("why slow?".into()),
+            Msg::Assistant {
+                text: Some("credit-check.".into()),
+                tool_calls: vec![],
+            },
+            Msg::Assistant {
+                text: Some(mark_pair(
+                    "Skeptic / Red-Team",
+                    "<think>hmm</think>Actually check identity-check too.",
+                )),
+                tool_calls: vec![],
+            },
+        ];
+        let view = render_view(&transcript);
+        assert_eq!(view.len(), 3);
+        assert_eq!(view[1].role, "droid");
+        assert_eq!(view[2].role, "pair");
+        assert_eq!(view[2].name.as_deref(), Some("Skeptic / Red-Team"));
+        // The reviewer's <think> is stripped from the visible answer.
+        assert_eq!(view[2].text, "Actually check identity-check too.");
+    }
+
+    #[test]
+    fn mark_unmark_pair_round_trips() {
+        let marked = mark_pair("Synthesizer", "final answer");
+        let (name, answer) = unmark_pair(&marked).expect("decodes");
+        assert_eq!(name, "Synthesizer");
+        assert_eq!(answer, "final answer");
+        // Plain prose (no sentinel) is not mistaken for a pair turn.
+        assert!(unmark_pair("just an answer").is_none());
     }
 }

@@ -162,9 +162,8 @@ struct ProposedStructural {
 pub fn parse_structural_candidates(text: &str) -> Result<Vec<CandidateModel>, String> {
     let cleaned = strip_code_fences(text);
 
-    let parsed: Option<Vec<ProposedStructural>> = serde_json::from_str(cleaned.trim())
-        .ok()
-        .or_else(|| {
+    let parsed: Option<Vec<ProposedStructural>> =
+        serde_json::from_str(cleaned.trim()).ok().or_else(|| {
             // Last resort: slice to the outermost JSON array.
             match (cleaned.find('['), cleaned.rfind(']')) {
                 (Some(start), Some(end)) if end > start => {
@@ -232,7 +231,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     fn job(seq: u32, at: u64, jt: &str, out: &[(&str, Json)]) -> RecordedStimulus {
@@ -272,7 +274,10 @@ mod tests {
         ];
         let sig = summarize_dataset("P", &ds);
         assert_eq!(sig.instance_count, 2);
-        assert_eq!(sig.job_types, vec!["classify".to_string(), "summarize".to_string()]);
+        assert_eq!(
+            sig.job_types,
+            vec!["classify".to_string(), "summarize".to_string()]
+        );
         // boundary keys: creation (input, priority) + outputs (label, summary), sorted.
         assert_eq!(
             sig.boundary_keys,
@@ -290,7 +295,10 @@ mod tests {
     fn prompt_includes_the_signal_and_model() {
         let sig = summarize_dataset(
             "P",
-            &[rec(&[("input", json!("x"))], vec![job(1, 1100, "classify", &[("label", json!("A"))])])],
+            &[rec(
+                &[("input", json!("x"))],
+                vec![job(1, 1100, "classify", &[("label", json!("A"))])],
+            )],
         );
         let p = build_evolve_prompt(&sig, "<bpmn:definitions/>", None);
         assert!(p.contains("Process id: P"));
@@ -304,7 +312,10 @@ mod tests {
     fn prompt_includes_pilot_guidance_when_present() {
         let sig = summarize_dataset(
             "P",
-            &[rec(&[("input", json!("x"))], vec![job(1, 1100, "classify", &[("label", json!("A"))])])],
+            &[rec(
+                &[("input", json!("x"))],
+                vec![job(1, 1100, "classify", &[("label", json!("A"))])],
+            )],
         );
         let p = build_evolve_prompt(&sig, "<bpmn:definitions/>", Some("cut the tail latency"));
         assert!(p.contains("Operator guidance for this round"));

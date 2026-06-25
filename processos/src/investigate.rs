@@ -408,10 +408,9 @@ impl ToolBox for AnalysisTools {
                 serde_json::to_string(&v).map_err(|e| format!("serialise simulation: {e}"))
             }
             "compare_variants" => {
-                let ds = self
-                    .recorded
-                    .as_ref()
-                    .ok_or("compare_variants is not available: no recorded dataset for this process")?;
+                let ds = self.recorded.as_ref().ok_or(
+                    "compare_variants is not available: no recorded dataset for this process",
+                )?;
                 let v = crate::experiment::compare_variants(self.model.as_deref(), ds, args)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise comparison: {e}"))
             }
@@ -505,6 +504,35 @@ Style: reply in clear prose, citing the concrete figures you measured. Stay focu
 what the operator asked; when useful, suggest a sharp next question. Do NOT force your \
 answer into JSON — write for a human reading a chat.";
 
+/// One stage of a Pair AI pipeline: a reviewer agent that runs *after* the primary (and after
+/// any earlier pair stages), receiving the previous stage's answer as input. A `Vec<PairStage>`
+/// is an N-tier sequential chain; the cockpit currently configures one, but the orchestration
+/// in [`run_chat_turn`] generalises to any number.
+#[derive(Clone)]
+pub struct PairStage {
+    /// The reviewer persona id (provenance / display).
+    pub id: String,
+    /// Human-friendly reviewer name shown in the cockpit (e.g. "Skeptic / Red-Team").
+    pub name: String,
+    /// The reviewer's LLM connection (its own profile — typically a different model/family).
+    pub cfg: LlmConfig,
+    /// The reviewer persona's system prompt.
+    pub system: String,
+}
+
+/// Frame the handoff from the previous agent to the next reviewer: the operator's question plus
+/// the prior answer, presented as a claim to verify rather than a fact to trust.
+fn pair_handoff(user_message: &str, prior_answer: &str) -> String {
+    format!(
+        "The operator asked:\n\"{}\"\n\nA primary analyst reviewed the dataset and answered \
+         (treat this as a CLAIM to verify against the data, not an established fact):\n\n--- BEGIN \
+         PRIMARY ANSWER ---\n{}\n--- END PRIMARY ANSWER ---\n\nNow do your job as described in your \
+         instructions: investigate with the tools, then deliver your response.",
+        user_message.trim(),
+        prior_answer.trim()
+    )
+}
+
 /// The outcome of one interactive chat turn: the droid's reply, the tool calls it ran
 /// this turn (the lab notebook), and the **full updated transcript** the caller must
 /// persist so the next turn resumes with memory.
@@ -534,6 +562,7 @@ pub async fn run_chat_turn(
     cancel: Option<&std::sync::atomic::AtomicBool>,
     steer: Option<&std::sync::Mutex<Vec<String>>>,
     sink: &mut dyn FnMut(AgentEvent),
+    pairs: &[PairStage],
     mut messages: Vec<Msg>,
     user_message: &str,
 ) -> Result<ChatTurnResult, String> {
@@ -551,10 +580,14 @@ pub async fn run_chat_turn(
     // A model unlocks structural reasoning AND the Alternate Reality Engine: when one is
     // present, distil a (bounded) recorded-input dataset so simulate/compare_variants can
     // replay real instances against forked variants.
-    let has_model = model_xml.as_ref().map(|x| !x.trim().is_empty()).unwrap_or(false);
+    let has_model = model_xml
+        .as_ref()
+        .map(|x| !x.trim().is_empty())
+        .unwrap_or(false);
     tools.set_model(model_xml);
     if has_model {
-        let recorded = crate::experiment::build_recorded_dataset(src, crate::experiment::RECORDED_CAP).await;
+        let recorded =
+            crate::experiment::build_recorded_dataset(src, crate::experiment::RECORDED_CAP).await;
         tools.set_recorded(Some(recorded));
     }
     let model = OpenAiAgent { cfg };
@@ -582,11 +615,62 @@ pub async fn run_chat_turn(
     }
     messages.push(Msg::User(user_message.to_string()));
 
-    let run =
-        run_agent_streaming(&model, &tools, &mut messages, max_rounds, cancel, steer, sink).await?;
+    let run = run_agent_streaming(
+        &model,
+        &tools,
+        &mut messages,
+        max_rounds,
+        cancel,
+        steer,
+        sink,
+    )
+    .await?;
+    let mut total_rounds = run.rounds;
+
+    // Pair AI: after the primary, run each reviewer in sequence over the SAME data/model tools,
+    // handing the previous answer forward. Each reviewer runs in its own sub-conversation (its
+    // system prompt + the handoff), so the primary transcript stays a single coherent thread; we
+    // append only the reviewer's final answer, marked for provenance and carried into next turn.
+    let mut prior_answer = run.answer.clone();
+    for stage in pairs {
+        sink(AgentEvent::Agent {
+            id: stage.id.clone(),
+            name: stage.name.clone(),
+            role: "pair".into(),
+        });
+        let reviewer = OpenAiAgent {
+            cfg: stage.cfg.clone(),
+        };
+        let sys = format!(
+            "{}\n\nDataset bound for this review: {} instances, {} job executions, {} \
+             incidents. You may use the same read-only query/model tools as the primary.",
+            stage.system, dataset.instances, dataset.jobs, dataset.incidents
+        );
+        let mut pair_msgs = vec![
+            Msg::System(sys),
+            Msg::User(pair_handoff(user_message, &prior_answer)),
+        ];
+        let pair_run = run_agent_streaming(
+            &reviewer,
+            &tools,
+            &mut pair_msgs,
+            max_rounds,
+            cancel,
+            steer,
+            sink,
+        )
+        .await?;
+        total_rounds += pair_run.rounds;
+        prior_answer = pair_run.answer.clone();
+        messages.push(Msg::Assistant {
+            text: Some(crate::chat::mark_pair(&stage.name, &pair_run.answer)),
+            tool_calls: Vec::new(),
+        });
+    }
+
     Ok(ChatTurnResult {
         answer: run.answer,
-        rounds: run.rounds,
+        rounds: total_rounds,
         messages,
         dataset,
     })
@@ -800,7 +884,9 @@ print('bottleneck', worst); print('ratio', round(worst_ratio, 2))
             !tools.specs().iter().any(|s| s.name == "run_python"),
             "run_python must not be exposed on the SQL-only toolbox"
         );
-        let err = tools.call("run_python", &json!({"code": "print(1)"})).unwrap_err();
+        let err = tools
+            .call("run_python", &json!({"code": "print(1)"}))
+            .unwrap_err();
         assert!(err.contains("not enabled"), "got: {err}");
     }
 }

@@ -70,7 +70,12 @@ pub struct MockWorker {
 impl MockWorker {
     /// A deterministic mock that always emits `output`.
     pub fn deterministic(output: HashMap<String, Json>) -> Self {
-        Self { outcomes: vec![MockOutcome { weight: 1.0, output }] }
+        Self {
+            outcomes: vec![MockOutcome {
+                weight: 1.0,
+                output,
+            }],
+        }
     }
 
     /// True when this worker can emit more than one distinct output.
@@ -408,8 +413,7 @@ pub fn replay_instance_with_mocks(
     // Walk the recorded stimulus timeline only for its timestamps: each job we
     // complete advances the clock to the next recorded input's `at`, so the
     // replayed latency tracks the real timeline rather than a model.
-    let mut next_at: std::collections::VecDeque<u64> =
-        rec.stimuli.iter().map(|s| s.at).collect();
+    let mut next_at: std::collections::VecDeque<u64> = rec.stimuli.iter().map(|s| s.at).collect();
     let mut last_consumed_at = rec.started_at;
 
     let max_steps = 100_000usize;
@@ -756,7 +760,10 @@ pub fn replay_dataset_with_mocks(
             .find_map(|r| r.error.clone())
             .or_else(|| Some("candidate is invalid for every recorded instance".to_string()))
     } else if instances_total == 0 {
-        Some("no replayable instances in the dataset (was the cluster run with --capture?)".to_string())
+        Some(
+            "no replayable instances in the dataset (was the cluster run with --capture?)"
+                .to_string(),
+        )
     } else {
         None
     };
@@ -823,9 +830,11 @@ fn json_to_value(v: &Json) -> Value {
         }
         Json::String(s) => Value::Str(s.clone()),
         Json::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        Json::Object(map) => {
-            Value::Map(map.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
-        }
+        Json::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
     }
 }
 
@@ -875,7 +884,10 @@ mod tests {
 </bpmn:definitions>"#;
 
     fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     fn job(seq: u32, at: u64, job_type: &str, out: Option<&[(&str, Json)]>) -> RecordedStimulus {
@@ -918,8 +930,16 @@ mod tests {
         assert_eq!(
             res.coverage,
             vec![
-                JobCoverage { job_type: "classify".into(), issued: 1, recorded: 1 },
-                JobCoverage { job_type: "summarize".into(), issued: 1, recorded: 1 },
+                JobCoverage {
+                    job_type: "classify".into(),
+                    issued: 1,
+                    recorded: 1
+                },
+                JobCoverage {
+                    job_type: "summarize".into(),
+                    issued: 1,
+                    recorded: 1
+                },
             ]
         );
     }
@@ -975,7 +995,10 @@ mod tests {
 
         let res = replay_instance_with_mocks(&defs, "P", &r, &mocks);
         assert!(res.valid && res.completed);
-        assert!(res.uncovered_job_types.is_empty(), "mocked type must not be uncovered");
+        assert!(
+            res.uncovered_job_types.is_empty(),
+            "mocked type must not be uncovered"
+        );
         assert_eq!(res.mocked_job_types, vec!["summarize".to_string()]);
         assert!(res.conserved, "divergences: {:?}", res.divergences);
     }
@@ -986,8 +1009,14 @@ mod tests {
         // population across its two outcomes (deterministically per instance key).
         let worker = MockWorker {
             outcomes: vec![
-                MockOutcome { weight: 0.7, output: map(&[("preApproved", json!(true))]) },
-                MockOutcome { weight: 0.3, output: map(&[("preApproved", json!(false))]) },
+                MockOutcome {
+                    weight: 0.7,
+                    output: map(&[("preApproved", json!(true))]),
+                },
+                MockOutcome {
+                    weight: 0.3,
+                    output: map(&[("preApproved", json!(false))]),
+                },
             ],
         };
         assert!(worker.is_random());
@@ -1006,7 +1035,10 @@ mod tests {
         }
         // Expect roughly 70% true; allow a generous band so the test isn't flaky.
         let frac = trues as f64 / total as f64;
-        assert!((0.6..0.8).contains(&frac), "split was {frac} ({trues}/{total})");
+        assert!(
+            (0.6..0.8).contains(&frac),
+            "split was {frac} ({trues}/{total})"
+        );
     }
 
     #[test]
@@ -1019,9 +1051,15 @@ mod tests {
             ] }
         });
         let mocks = parse_mock_workers(&v);
-        assert!(!mocks["fraud-check"].is_random(), "static form is deterministic");
+        assert!(
+            !mocks["fraud-check"].is_random(),
+            "static form is deterministic"
+        );
         assert_eq!(mocks["fraud-check"].outcomes.len(), 1);
-        assert!(mocks["credit-check"].is_random(), "outcomes form is non-deterministic");
+        assert!(
+            mocks["credit-check"].is_random(),
+            "outcomes form is non-deterministic"
+        );
         assert_eq!(mocks["credit-check"].outcomes.len(), 2);
     }
 
@@ -1126,7 +1164,11 @@ mod tests {
             duration_ms: None,
             elements: vec![],
             incidents: vec![],
-            creation_variables: Some(Variables { truncated: true, bytes: 99999, values: None }),
+            creation_variables: Some(Variables {
+                truncated: true,
+                bytes: 99999,
+                values: None,
+            }),
             stimuli: Some(vec![Stimulus {
                 seq: 1,
                 at: 1,

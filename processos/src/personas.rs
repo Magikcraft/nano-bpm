@@ -22,11 +22,37 @@ use serde::{Deserialize, Serialize};
 /// The id of the built-in default persona (used when a request names none).
 pub const DEFAULT_PERSONA_ID: &str = "performance-analyst";
 
+/// The id of the default Pair AI reviewer (used when Pair AI is enabled with no pair persona).
+pub const DEFAULT_PAIR_PERSONA_ID: &str = "pair-skeptic";
+
+/// Last-resort pair system prompt if the built-in library is somehow unavailable.
+const FALLBACK_PAIR_SYSTEM: &str = "\
+You are a skeptical reviewer paired with a primary analyst on a captured BPMN trace dataset. \
+You are shown the operator's question and the primary analyst's answer. Pressure-test that \
+answer against the data using query_traces, name what held up and what did not with figures, \
+and deliver a sharper corrected bottom line. Clear prose for a human; do NOT emit JSON.";
+
+/// What an agent built from this persona is *for*. An **investigator** is a primary analyst
+/// the operator drives directly; a **pair** is a second agent that reviews/refines a primary's
+/// output in Pair AI mode (it is offered only in the Pair AI persona picker, never as the
+/// primary chat persona). Defaults to `investigator` so older personas keep working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PersonaKind {
+    #[default]
+    Investigator,
+    Pair,
+}
+
 /// A selectable chat persona (a standing system prompt).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Persona {
     pub id: String,
+    /// Whether this persona drives a primary investigation or a Pair AI reviewer. See
+    /// [`PersonaKind`].
+    #[serde(default)]
+    pub kind: PersonaKind,
     #[serde(default)]
     pub name: String,
     /// A one-line description shown under the persona's name in the picker/library.
@@ -97,6 +123,31 @@ impl PersonaStore {
                     crate::investigate::CHAT_SYSTEM.to_string(),
                 )
             })
+    }
+
+    /// Resolve a Pair AI reviewer persona to `(id, name, system_prompt)`. Falls back to the
+    /// default pair reviewer ([`DEFAULT_PAIR_PERSONA_ID`]) when the id is unknown/absent, and to
+    /// a built-in skeptic prompt if even that is missing — Pair AI must always be able to run.
+    pub fn resolve_pair(&self, id: Option<&str>) -> (String, String, String) {
+        let want = id.map(str::trim).filter(|s| !s.is_empty());
+        let pick = want
+            .and_then(|id| self.get(id))
+            .or_else(|| self.get(DEFAULT_PAIR_PERSONA_ID));
+        match pick {
+            Some(p) => {
+                let name = if p.name.trim().is_empty() {
+                    p.id.clone()
+                } else {
+                    p.name.clone()
+                };
+                (p.id, name, p.system)
+            }
+            None => (
+                DEFAULT_PAIR_PERSONA_ID.to_string(),
+                "Skeptic / Red-Team".to_string(),
+                FALLBACK_PAIR_SYSTEM.to_string(),
+            ),
+        }
     }
 
     /// Author or update a persona (create or update by id). Validates a non-empty id and
@@ -172,6 +223,7 @@ fn builtins() -> BTreeMap<String, Persona> {
     let seed = [
         Persona {
             id: DEFAULT_PERSONA_ID.into(),
+            kind: PersonaKind::Investigator,
             name: "Performance Analyst".into(),
             summary: "Profiles the process openly and localises the dominant pathology with \
                       effect sizes and held-out replication."
@@ -182,6 +234,7 @@ fn builtins() -> BTreeMap<String, Persona> {
         },
         Persona {
             id: "sre-incident".into(),
+            kind: PersonaKind::Investigator,
             name: "SRE / Incident Responder".into(),
             summary: "Triages reliability: where failures and queue blow-ups concentrate, blast \
                       radius, and the fastest mitigation."
@@ -209,6 +262,7 @@ clear prose for a human in a chat — do NOT emit JSON."
         },
         Persona {
             id: "capacity-planner".into(),
+            kind: PersonaKind::Investigator,
             name: "Capacity Planner".into(),
             summary: "Looks at throughput, utilisation and headroom: where the bottleneck is and \
                       what scaling would buy."
@@ -237,6 +291,7 @@ the quantified headroom of any recommendation, with its uncertainty. Do NOT emit
         },
         Persona {
             id: "process-architect".into(),
+            kind: PersonaKind::Investigator,
             name: "Process Architect".into(),
             summary: "Reviews the BPMN model's structure for soundness and anti-patterns, then \
                       intersects structural risk with the trace data."
@@ -270,6 +325,7 @@ prose for a human in a chat — do NOT emit JSON."
         },
         Persona {
             id: "conformance-miner".into(),
+            kind: PersonaKind::Investigator,
             name: "Conformance Miner".into(),
             summary: "Mines the process the traces actually imply and diffs it against the \
       designed model — where reality and design diverge."
@@ -304,6 +360,7 @@ match reality, or fix the process to match the model. Clear prose for a human; d
         },
         Persona {
             id: "experiment-designer".into(),
+            kind: PersonaKind::Investigator,
             name: "Experiment Designer".into(),
             summary: "Forks the model into what-if variants and runs the Nano Alternate Reality \
                       Engine — a multiverse of variants replayed against real instances, ranked."
@@ -412,6 +469,86 @@ human; do NOT emit JSON."
             builtin: true,
             default: false,
         },
+        // ── Pair AI reviewers ────────────────────────────────────────────────
+        // Offered only as the *second* agent in Pair AI mode. Each receives a primary
+        // analyst's answer and pulls on it with the SAME data/model tools, so its pushback is
+        // evidence-based rather than vibes. Pair the critic with a DIFFERENT model family from
+        // the primary so their errors decorrelate.
+        Persona {
+            id: "pair-skeptic".into(),
+            kind: PersonaKind::Pair,
+            name: "Skeptic / Red-Team".into(),
+            summary: "Challenges a primary analyst's conclusion: re-checks the numbers, hunts \
+                      for the overlooked confound, and validates any proposed model."
+                .into(),
+            system: "\
+You are a skeptical reviewer paired with a primary analyst on a captured BPMN trace dataset. \
+You are shown the operator's question and the primary analyst's answer. Your job is NOT to \
+agree — it is to PRESSURE-TEST that answer against the data, then deliver a sharper, more \
+trustworthy verdict.\n\
+\n\
+Work the evidence, never vibes. Use query_traces (read-only DuckDB SQL) to RE-DERIVE the \
+primary's key numbers and to probe the holes: a claimed effect that vanishes on a held-out \
+slice; a confound (volume/time-of-day/job-mix) the primary didn't rule out; a sample so small \
+the finding is noise; a correlation sold as causation. If a model variant was proposed, run \
+validate_model on its XML and sanity-check any simulate scorecard before trusting it.\n\
+\n\
+Be specific and fair: name exactly what you checked, what HELD UP, and what DID NOT, with the \
+figures. If the primary is right, say so and add the caveats they missed; if they are wrong, \
+correct the record and show the query that proves it. End with a crisp, corrected bottom line. \
+Clear prose for a human; do NOT emit JSON."
+                .into(),
+            builtin: true,
+            default: false,
+        },
+        Persona {
+            id: "pair-synthesizer".into(),
+            kind: PersonaKind::Pair,
+            name: "Synthesizer".into(),
+            summary: "Reconciles a primary analyst's findings into one decisive answer, \
+                      keeping what the data supports and dropping what it doesn't."
+                .into(),
+            system: "\
+You are a synthesizer paired with a primary analyst on a captured BPMN trace dataset. You are \
+shown the operator's question and the primary analyst's answer. Your job is to turn that into \
+the single, decision-ready answer the operator should act on.\n\
+\n\
+Keep only what the evidence supports. Where the primary's reasoning is sound, carry it \
+forward; where it is thin or hand-wavy, use query_traces (read-only DuckDB SQL) to either \
+firm it up or drop it. Resolve any internal contradictions, separate the load-bearing finding \
+from the asides, and state the ONE thing that matters most plus the next action.\n\
+\n\
+Style: lead with the bottom line, then the 2-3 figures that justify it, then the recommended \
+next step and its main uncertainty. Tighter and more decisive than the input, never longer. \
+Clear prose for a human; do NOT emit JSON."
+                .into(),
+            builtin: true,
+            default: false,
+        },
+        Persona {
+            id: "pair-refiner".into(),
+            kind: PersonaKind::Pair,
+            name: "Refiner".into(),
+            summary: "Improves a primary analyst's answer — deepens the analysis and fills the \
+                      gaps — rather than tearing it down."
+                .into(),
+            system: "\
+You are a refiner paired with a primary analyst on a captured BPMN trace dataset. You are \
+shown the operator's question and the primary analyst's answer. Your job is to make that \
+answer BETTER — not to rebut it.\n\
+\n\
+Build on the primary's work: accept its sound parts, then use query_traces (read-only DuckDB \
+SQL) to go one level deeper — quantify an effect the primary only named, add the held-out \
+check it skipped, surface the obvious follow-up it left on the table. If a model variant is in \
+play, validate_model it and, where useful, propose a concrete improvement. Add signal, not \
+length.\n\
+\n\
+Style: deliver the improved answer in full (so it stands alone), foregrounding what you added \
+and the figures behind it. Clear prose for a human; do NOT emit JSON."
+                .into(),
+            builtin: true,
+            default: false,
+        },
     ];
     seed.into_iter().map(|p| (p.id.clone(), p)).collect()
 }
@@ -424,7 +561,11 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("processos-personas-{}-{}.json", std::process::id(), n))
+        std::env::temp_dir().join(format!(
+            "processos-personas-{}-{}.json",
+            std::process::id(),
+            n
+        ))
     }
 
     #[test]
@@ -454,6 +595,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_pair_picks_pair_personas_and_falls_back() {
+        let path = tmp();
+        let store = PersonaStore::open(&path);
+        // The named pair persona resolves directly.
+        let (id, name, _sys) = store.resolve_pair(Some("pair-synthesizer"));
+        assert_eq!(id, "pair-synthesizer");
+        assert!(!name.trim().is_empty());
+        // Unknown / absent ids fall back to the default pair reviewer (never the investigator).
+        let (id2, _, _) = store.resolve_pair(Some("does-not-exist"));
+        assert_eq!(id2, DEFAULT_PAIR_PERSONA_ID);
+        let (id3, _, _) = store.resolve_pair(None);
+        assert_eq!(id3, DEFAULT_PAIR_PERSONA_ID);
+        // The default pair persona is a pair-kind builtin.
+        let p = store.get(DEFAULT_PAIR_PERSONA_ID).unwrap();
+        assert_eq!(p.kind, PersonaKind::Pair);
+        assert!(p.builtin);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn authored_persona_persists_and_cannot_forge_flags() {
         let path = tmp();
         {
@@ -461,6 +622,7 @@ mod tests {
             store
                 .upsert(Persona {
                     id: "mine".into(),
+                    kind: PersonaKind::Investigator,
                     name: String::new(),
                     summary: String::new(),
                     system: "You are a contrarian reviewer.".into(),
@@ -484,6 +646,7 @@ mod tests {
         assert!(store
             .upsert(Persona {
                 id: "  ".into(),
+                kind: PersonaKind::Investigator,
                 name: String::new(),
                 summary: String::new(),
                 system: "x".into(),
@@ -494,6 +657,7 @@ mod tests {
         assert!(store
             .upsert(Persona {
                 id: "blank".into(),
+                kind: PersonaKind::Investigator,
                 name: String::new(),
                 summary: String::new(),
                 system: "   ".into(),

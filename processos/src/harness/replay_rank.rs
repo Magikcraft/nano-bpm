@@ -215,7 +215,11 @@ fn score_candidate(
                 report,
             }
         }
-        Ok(_) => infeasible(c, default_process_id, "candidate contained no process definitions"),
+        Ok(_) => infeasible(
+            c,
+            default_process_id,
+            "candidate contained no process definitions",
+        ),
         Err(e) => infeasible(c, default_process_id, &format!("failed to parse: {e:?}")),
     }
 }
@@ -223,7 +227,11 @@ fn score_candidate(
 /// Build an infeasible `RankedCandidate` carrying the reason in `report.error`.
 /// Scored over an empty dataset (the report is just a carrier for the parse
 /// error), keeping every aggregate counter at zero.
-fn infeasible(c: &CandidateModel, default_process_id: Option<&str>, reason: &str) -> RankedCandidate {
+fn infeasible(
+    c: &CandidateModel,
+    default_process_id: Option<&str>,
+    reason: &str,
+) -> RankedCandidate {
     let no_defs: [ProcessDefinition; 0] = [];
     let process_id = default_process_id.unwrap_or("").to_string();
     let mut report = replay_dataset(&no_defs, &process_id, &[]);
@@ -330,7 +338,10 @@ mod tests {
 </bpmn:definitions>"#;
 
     fn map(pairs: &[(&str, Json)]) -> HashMap<String, Json> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
     }
 
     fn rec(creation: &[(&str, Json)], stimuli: Vec<RecordedStimulus>) -> RecordedInstance {
@@ -507,7 +518,9 @@ mod tests {
         with_mock.mock_workers.insert(
             "translate".to_string(),
             crate::harness::MockWorker::deterministic(
-                [("translated".to_string(), json!(true))].into_iter().collect(),
+                [("translated".to_string(), json!(true))]
+                    .into_iter()
+                    .collect(),
             ),
         );
         let without_mock = CandidateModel {
@@ -535,8 +548,16 @@ mod tests {
         assert_eq!(unmocked.fidelity_tier, FidelityTier::RequiresGenerativeMock);
 
         // A mock-applied (evaluable) candidate ranks above one that still needs a mock.
-        let mocked_idx = ranking.candidates.iter().position(|c| c.name == "translate-with-mock").unwrap();
-        let unmocked_idx = ranking.candidates.iter().position(|c| c.name == "translate-no-mock").unwrap();
+        let mocked_idx = ranking
+            .candidates
+            .iter()
+            .position(|c| c.name == "translate-with-mock")
+            .unwrap();
+        let unmocked_idx = ranking
+            .candidates
+            .iter()
+            .position(|c| c.name == "translate-no-mock")
+            .unwrap();
         assert!(mocked_idx < unmocked_idx);
     }
 }

@@ -106,7 +106,11 @@ struct VariablesOut {
 impl VariablesOut {
     fn of(values: Json) -> Self {
         let bytes = serde_json::to_vec(&values).map(|v| v.len()).unwrap_or(0);
-        Self { truncated: false, bytes, values }
+        Self {
+            truncated: false,
+            bytes,
+            values,
+        }
     }
 }
 
@@ -282,9 +286,7 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     // instances and carries no processInstanceKey) can route activation back.
     let mut job_to_inst: HashMap<i64, i64> = HashMap::new();
 
-    let touch = |insts: &mut HashMap<i64, InstAcc>,
-                     inst_order: &mut Vec<i64>,
-                     pik: i64| {
+    let touch = |insts: &mut HashMap<i64, InstAcc>, inst_order: &mut Vec<i64>, pik: i64| {
         if !insts.contains_key(&pik) {
             inst_order.push(pik);
             insts.insert(pik, InstAcc::default());
@@ -304,7 +306,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
 
         match vt {
             "PROCESS_INSTANCE" => {
-                let Some(pik) = vi64(v, "processInstanceKey") else { continue };
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
                 touch(&mut insts, &mut inst_order, pik);
                 let inst = insts.get_mut(&pik).unwrap();
                 let element_id = vstr(v, "elementId").unwrap_or("").to_string();
@@ -361,7 +365,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 if intent != "CREATED" {
                     continue;
                 }
-                let Some(pik) = vi64(v, "processInstanceKey") else { continue };
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
                 touch(&mut insts, &mut inst_order, pik);
                 let inst = insts.get_mut(&pik).unwrap();
                 if let Some(pid) = vstr(v, "bpmnProcessId") {
@@ -377,7 +383,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
             }
 
             "JOB" => {
-                let Some(pik) = vi64(v, "processInstanceKey") else { continue };
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
                 touch(&mut insts, &mut inst_order, pik);
                 let job_key = r.key;
                 let job_type = vstr(v, "type").unwrap_or("").to_string();
@@ -406,7 +414,14 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 }
                 match intent {
                     "CREATED" => {
-                        insts.get_mut(&pik).unwrap().jobs.get_mut(&job_key).unwrap().created_at.get_or_insert(ts);
+                        insts
+                            .get_mut(&pik)
+                            .unwrap()
+                            .jobs
+                            .get_mut(&job_key)
+                            .unwrap()
+                            .created_at
+                            .get_or_insert(ts);
                     }
                     "COMPLETED" => {
                         let inst = insts.get_mut(&pik).unwrap();
@@ -425,7 +440,13 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                         }
                     }
                     "FAILED" | "ERROR_THROWN" => {
-                        insts.get_mut(&pik).unwrap().jobs.get_mut(&job_key).unwrap().failures += 1;
+                        insts
+                            .get_mut(&pik)
+                            .unwrap()
+                            .jobs
+                            .get_mut(&job_key)
+                            .unwrap()
+                            .failures += 1;
                     }
                     _ => {}
                 }
@@ -456,7 +477,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 if intent != "CREATED" {
                     continue;
                 }
-                let Some(pik) = vi64(v, "processInstanceKey") else { continue };
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
                 touch(&mut insts, &mut inst_order, pik);
                 let inst = insts.get_mut(&pik).unwrap();
                 let element_id = vstr(v, "elementId").unwrap_or("").to_string();
@@ -560,9 +583,7 @@ fn finish(pik: i64, mut inst: InstAcc, tier2: bool) -> TraceOut {
 /// the whole `created→completed` wait is reported as service.
 fn job_timing(j: &JobAcc) -> (Option<u64>, Option<u64>) {
     match (j.created_at, j.activated_at, j.completed_at) {
-        (Some(c), Some(a), Some(done)) if a >= c && done >= a => {
-            (Some(a - c), Some(done - a))
-        }
+        (Some(c), Some(a), Some(done)) if a >= c && done >= a => (Some(a - c), Some(done - a)),
         (Some(c), _, Some(done)) if done >= c => (None, Some(done - c)),
         _ => (None, None),
     }
@@ -605,7 +626,10 @@ pub fn load_records(input: &Path) -> Result<Vec<RawRecord>, String> {
         parse_blob(&bytes, &mut out);
     }
     if out.is_empty() {
-        return Err(format!("no parseable Camunda records in {}", input.display()));
+        return Err(format!(
+            "no parseable Camunda records in {}",
+            input.display()
+        ));
     }
     Ok(out)
 }
@@ -679,8 +703,7 @@ pub fn import(input: &Path, out_dir: &Path, tier2: bool) -> Result<ImportSummary
         return Err("no process instances reconstructed from the records".into());
     }
 
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("create {}: {e}", out_dir.display()))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {}: {e}", out_dir.display()))?;
     let traces_file = out_dir.join("traces.json");
     let bytes = serde_json::to_vec_pretty(&traces).map_err(|e| format!("serialize traces: {e}"))?;
     std::fs::write(&traces_file, &bytes)
@@ -859,18 +882,54 @@ mod tests {
         let eik = 8;
         let jk = 9;
         let recs = vec![
-            rec("PROCESS_INSTANCE", "ELEMENT_ACTIVATED", pik, 0, 1,
-                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"})),
-            rec("PROCESS_INSTANCE", "ELEMENT_ACTIVATED", eik, 10, 2,
-                json!({"processInstanceKey": pik, "elementId": "t", "bpmnElementType": "SERVICE_TASK"})),
-            rec("JOB", "CREATED", jk, 10, 3,
-                json!({"processInstanceKey": pik, "type": "t-job", "elementInstanceKey": eik})),
-            rec("JOB", "FAILED", jk, 40, 4,
-                json!({"processInstanceKey": pik, "type": "t-job", "elementInstanceKey": eik})),
-            rec("JOB", "COMPLETED", jk, 100, 5,
-                json!({"processInstanceKey": pik, "type": "t-job", "elementInstanceKey": eik})),
-            rec("PROCESS_INSTANCE", "ELEMENT_COMPLETED", eik, 110, 6,
-                json!({"processInstanceKey": pik, "elementId": "t", "bpmnElementType": "SERVICE_TASK"})),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                eik,
+                10,
+                2,
+                json!({"processInstanceKey": pik, "elementId": "t", "bpmnElementType": "SERVICE_TASK"}),
+            ),
+            rec(
+                "JOB",
+                "CREATED",
+                jk,
+                10,
+                3,
+                json!({"processInstanceKey": pik, "type": "t-job", "elementInstanceKey": eik}),
+            ),
+            rec(
+                "JOB",
+                "FAILED",
+                jk,
+                40,
+                4,
+                json!({"processInstanceKey": pik, "type": "t-job", "elementInstanceKey": eik}),
+            ),
+            rec(
+                "JOB",
+                "COMPLETED",
+                jk,
+                100,
+                5,
+                json!({"processInstanceKey": pik, "type": "t-job", "elementInstanceKey": eik}),
+            ),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_COMPLETED",
+                eik,
+                110,
+                6,
+                json!({"processInstanceKey": pik, "elementId": "t", "bpmnElementType": "SERVICE_TASK"}),
+            ),
         ];
         let t = &transform(&recs, true)[0];
         assert_eq!(t.outcome, "active"); // process never completed
@@ -885,13 +944,31 @@ mod tests {
         let pik = 5;
         let eik = 6;
         let recs = vec![
-            rec("PROCESS_INSTANCE", "ELEMENT_ACTIVATED", pik, 0, 1,
-                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"})),
-            rec("PROCESS_INSTANCE", "ELEMENT_ACTIVATED", eik, 10, 2,
-                json!({"processInstanceKey": pik, "elementId": "task", "bpmnElementType": "SERVICE_TASK"})),
-            rec("INCIDENT", "CREATED", 99, 20, 3,
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                eik,
+                10,
+                2,
+                json!({"processInstanceKey": pik, "elementId": "task", "bpmnElementType": "SERVICE_TASK"}),
+            ),
+            rec(
+                "INCIDENT",
+                "CREATED",
+                99,
+                20,
+                3,
                 json!({"processInstanceKey": pik, "elementId": "task", "elementInstanceKey": eik,
-                       "errorType": "IO_MAPPING_ERROR", "errorMessage": "no var 'x'"})),
+                       "errorType": "IO_MAPPING_ERROR", "errorMessage": "no var 'x'"}),
+            ),
         ];
         let t = &transform(&recs, true)[0];
         assert_eq!(t.incidents.len(), 1);
@@ -905,10 +982,22 @@ mod tests {
     fn terminated_process_sets_outcome() {
         let pik = 42;
         let recs = vec![
-            rec("PROCESS_INSTANCE", "ELEMENT_ACTIVATED", pik, 0, 1,
-                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"})),
-            rec("PROCESS_INSTANCE", "ELEMENT_TERMINATED", pik, 50, 2,
-                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"})),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_TERMINATED",
+                pik,
+                50,
+                2,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
         ];
         let t = &transform(&recs, true)[0];
         assert_eq!(t.outcome, "terminated");
@@ -918,12 +1007,24 @@ mod tests {
     #[test]
     fn commands_are_ignored_only_events_fold() {
         let pik = 1;
-        let mut create = rec("PROCESS_INSTANCE", "ELEMENT_COMPLETED", pik, 100, 2,
-            json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}));
+        let mut create = rec(
+            "PROCESS_INSTANCE",
+            "ELEMENT_COMPLETED",
+            pik,
+            100,
+            2,
+            json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}),
+        );
         create.record_type = "COMMAND".into();
         let recs = vec![
-            rec("PROCESS_INSTANCE", "ELEMENT_ACTIVATED", pik, 0, 1,
-                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"})),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p", "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
             create,
         ];
         let t = &transform(&recs, true)[0];
