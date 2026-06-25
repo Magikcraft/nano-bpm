@@ -25,6 +25,9 @@ pub const DEFAULT_PERSONA_ID: &str = "performance-analyst";
 /// The id of the default Pair AI reviewer (used when Pair AI is enabled with no pair persona).
 pub const DEFAULT_PAIR_PERSONA_ID: &str = "pair-skeptic";
 
+/// The id of the default loop-monitor persona (used when the monitor is enabled with none named).
+pub const DEFAULT_MONITOR_PERSONA_ID: &str = "monitor-loop-breaker";
+
 /// Last-resort pair system prompt if the built-in library is somehow unavailable.
 const FALLBACK_PAIR_SYSTEM: &str = "\
 You are a skeptical reviewer paired with a primary analyst on a captured BPMN trace dataset. \
@@ -42,6 +45,10 @@ pub enum PersonaKind {
     #[default]
     Investigator,
     Pair,
+    /// A loop monitor: a supervisor agent that watches a primary investigation and steers it
+    /// when it goes in circles. Offered only in the monitor picker, never as a primary chat
+    /// persona. See [`crate::monitor`].
+    Monitor,
 }
 
 /// A selectable chat persona (a standing system prompt).
@@ -147,6 +154,21 @@ impl PersonaStore {
                 "Skeptic / Red-Team".to_string(),
                 FALLBACK_PAIR_SYSTEM.to_string(),
             ),
+        }
+    }
+
+    /// Resolve a loop-monitor persona to its `(id, system_prompt)`. Falls back to the built-in
+    /// monitor when the id is unknown/absent, and to an empty prompt (the monitor module then
+    /// uses its own built-in system prompt) if even that is missing — the monitor must always be
+    /// able to run when enabled.
+    pub fn resolve_monitor(&self, id: Option<&str>) -> (String, String) {
+        let want = id.map(str::trim).filter(|s| !s.is_empty());
+        let pick = want
+            .and_then(|id| self.get(id))
+            .or_else(|| self.get(DEFAULT_MONITOR_PERSONA_ID));
+        match pick {
+            Some(p) => (p.id, p.system),
+            None => (DEFAULT_MONITOR_PERSONA_ID.to_string(), String::new()),
         }
     }
 
@@ -564,6 +586,47 @@ length.\n\
 \n\
 Style: deliver the improved answer in full (so it stands alone), foregrounding what you added \
 and the figures behind it. Clear prose for a human; do NOT emit JSON."
+                .into(),
+            builtin: true,
+            default: false,
+        },
+        // ── Loop monitor ─────────────────────────────────────────────────────
+        // A supervisor that watches a primary investigation and steers it when it goes in
+        // circles. Never a primary or pair agent — it runs out-of-band and writes into the
+        // steer/cancel channels. Its system prompt MUST keep eliciting the strict JSON verdict
+        // the monitor module parses.
+        Persona {
+            id: DEFAULT_MONITOR_PERSONA_ID.into(),
+            kind: PersonaKind::Monitor,
+            name: "Loop Breaker".into(),
+            summary: "Watches the primary for circular reasoning and dead-end loops, and nudges \
+                      it toward the one concrete next action — or a graceful wrap-up."
+                .into(),
+            system: "\
+You are a loop monitor supervising another AI agent investigating a captured BPMN process dataset \
+for a human operator. You do not investigate yourself. You read the agent's recent transcript and \
+decide whether it is making progress or going in circles, and if it is stuck you hand it the \
+single concrete next action that breaks the loop.\n\
+\n\
+Circling means any of: repeating the same reasoning or hypothesis without new evidence; \
+re-attempting an action that keeps failing the same way; oscillating between options without \
+deciding; or spending several rounds thinking without issuing a tool call, running a simulation, \
+or giving an answer.\n\
+\n\
+The agent has escape hatches it often forgets — when it is stuck on an UNREACHABLE path the fix \
+is usually to change a constraint, not to keep reasoning: query_traces (the only way to actually \
+run SQL); simulate/compare_variants with mockWorkers (mock a job OUTPUT, or mock a job FAILURE \
+with \"throwError\":\"<CODE>\" to exercise an error/timeout boundary that is otherwise never \
+reached); edit_model (add or change tasks, gateways, boundary events); validate_model (fast \
+static check of BPMN XML before deploying).\n\
+\n\
+Respond with ONLY a JSON object and nothing else:\n\
+{\"circling\": true or false, \"reason\": \"<one sentence>\", \"steer\": \"<one short concrete \
+instruction, or empty>\"}\n\
+\n\
+When circling is true, 'steer' must name the ONE concrete next action to take now. Prefer letting \
+the agent act and iterate over more analysis. If it is genuinely progressing, return \
+circling=false with an empty steer."
                 .into(),
             builtin: true,
             default: false,

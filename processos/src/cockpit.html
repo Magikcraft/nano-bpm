@@ -231,6 +231,8 @@
   /* Pair AI reviewer bubble + badge */
   .bub.droid.pair { border-left: 2px solid #a855f7; background: rgba(168,85,247,0.05); }
   .pair-badge { color: #c084fc; font-weight: 700; }
+  .bub.monitor { align-self: center; max-width: 92%; background: rgba(245,158,11,0.07); border: 1px dashed #b45309; color: #fcd34d; font-size: 12.5px; padding: 7px 11px; }
+  .bub.monitor .who { color: #f59e0b; text-transform: none; letter-spacing: 0; margin-bottom: 2px; }
   /* GitHub-style markdown tables (answers + thinking) */
   .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
   .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
@@ -1981,6 +1983,16 @@ async function consumeLiveStream(ws, proc, opts){
         if(rec){ try { rec.result = JSON.parse(ev.result); } catch(_){ rec.result = { raw: ev.result }; } }
         if(STATE.chatTab==='sims') renderSimsCombined();
       }
+      autoscroll();
+    }
+    else if(ev.type==='monitor'){
+      // The loop monitor stepped in: render a distinct inline note so the operator can see the
+      // supervisor's reasoning. A 'steer' nudges the primary; a 'wrapup' forces it to conclude.
+      const isWrap = ev.action==='wrapup';
+      const label = isWrap ? 'Loop monitor — forcing wrap-up' : 'Loop monitor — steering';
+      const detail = isWrap ? (ev.reason||'') : (ev.steer || ev.reason || '');
+      log.insertAdjacentHTML('beforeend',
+        '<div class="bub monitor"><div class="who">🔍 '+esc(label)+'</div>'+esc(detail)+'</div>');
       autoscroll();
     }
     else if(ev.type==='done'){

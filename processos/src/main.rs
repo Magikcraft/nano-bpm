@@ -25,6 +25,7 @@ mod experiment;
 mod harness;
 mod investigate;
 mod llama;
+mod monitor;
 mod personas;
 mod pilot;
 mod pyrunner;
@@ -1400,6 +1401,121 @@ fn build_pair_stages(
     Ok(stages)
 }
 
+/// Resolve the loop-monitor config from a chat request, honouring an env default. Returns the
+/// `(LlmConfig, persona_system)` to run the monitor with, or `None` when monitoring is off or no
+/// model can be resolved (in which case the turn simply runs without a monitor).
+///
+/// Enablement: the request's `monitor.enabled` wins; absent that, `PROCESSOS_MONITOR` set to a
+/// truthy value (or a profile id) enables it so the monitor can be used without UI.
+fn resolve_monitor(state: &AppState, mon: Option<&MonitorRequest>) -> Option<(LlmConfig, String)> {
+    let env = std::env::var("PROCESSOS_MONITOR").ok();
+    let (enabled, profile_id, ovr, persona_id) = match mon {
+        Some(m) if m.enabled => (
+            true,
+            m.profile_id.clone(),
+            m.llm.clone(),
+            m.persona_id.clone(),
+        ),
+        _ => {
+            // Env fallback: "0"/"off"/"false"/"" disable; anything else enables (and a non-bool
+            // value is treated as the profile id to run the monitor on).
+            let raw = env.as_deref().map(str::trim).unwrap_or("");
+            let off = matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "" | "0" | "off" | "false" | "no"
+            );
+            if off {
+                return None;
+            }
+            let is_bool = matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "1" | "on" | "true" | "yes"
+            );
+            let profile = if is_bool { None } else { Some(raw.to_string()) };
+            (true, profile, None, None)
+        }
+    };
+    if !enabled {
+        return None;
+    }
+    let cfg = resolve_llm_for_profile(state, profile_id.as_deref(), ovr.as_ref())?;
+    if !cfg.is_ready() {
+        return None;
+    }
+    let (_id, system) = state.personas.resolve_monitor(persona_id.as_deref());
+    Some((cfg, system))
+}
+
+/// How often the loop monitor re-reads the primary's transcript, and how many times it may steer
+/// before escalating to a forced wrap-up. Deliberately conservative so the monitor is cheap and
+/// can never itself spam the conversation.
+const MONITOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(12);
+const MONITOR_MAX_STEERS: usize = 3;
+
+/// The out-of-band loop-monitor watcher. Polls the (incrementally persisted) transcript on a
+/// fixed cadence; when its model says the primary is circling it pushes a steer into the running
+/// turn's steer queue, and after its steer budget is spent it flips the cancel flag to force a
+/// graceful wrap-up. It never blocks the primary and any monitor error is swallowed (the monitor
+/// failing must never take down the investigation).
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_monitor(
+    cfg: LlmConfig,
+    persona_system: String,
+    chat: Arc<chat::ChatStore>,
+    key: String,
+    sid: String,
+    steer: Arc<std::sync::Mutex<Vec<String>>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    live: LiveTurn,
+    done: Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut policy = monitor::MonitorPolicy::new(MONITOR_MAX_STEERS);
+    let mut last_window = String::new();
+    loop {
+        tokio::time::sleep(MONITOR_INTERVAL).await;
+        if done.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let messages = chat.get(&key, &sid).map(|s| s.messages).unwrap_or_default();
+        let window = monitor::render_window(&messages);
+        // Skip when the transcript hasn't advanced since the last evaluation — no new behaviour
+        // to judge, so don't spend a monitor call (and don't risk re-flagging the same state).
+        if window.is_empty() || window == last_window {
+            continue;
+        }
+        last_window = window.clone();
+        let verdict = monitor::evaluate(&cfg, &persona_system, &window).await;
+        // The primary may have finished while the monitor was thinking.
+        if done.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        match policy.observe(&verdict) {
+            monitor::MonitorAction::None => {}
+            monitor::MonitorAction::Steer(text) => {
+                if let Ok(mut q) = steer.lock() {
+                    q.push(format!("[loop monitor] {text}"));
+                }
+                live.emit(serde_json::json!({
+                    "type": "monitor",
+                    "action": "steer",
+                    "reason": verdict.reason,
+                    "steer": text,
+                }));
+            }
+            monitor::MonitorAction::WrapUp(reason) => {
+                cancel.store(true, Ordering::Relaxed);
+                live.emit(serde_json::json!({
+                    "type": "monitor",
+                    "action": "wrapup",
+                    "reason": reason,
+                }));
+                return;
+            }
+        }
+    }
+}
+
 /// Request body for an investigation: optional LLM override + bounds.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1731,6 +1847,10 @@ struct ChatSendRequest {
     /// each handed the previous stage's answer. Takes precedence over `pair` when non-empty.
     #[serde(default)]
     pairs: Vec<PairRequest>,
+    /// Loop monitor: a second model that watches this turn's live transcript and steers the
+    /// primary when it goes in circles (off unless `enabled`).
+    #[serde(default)]
+    monitor: Option<MonitorRequest>,
 }
 
 /// One configured Pair AI reviewer in a chat request.
@@ -1749,6 +1869,26 @@ struct PairRequest {
     #[serde(default)]
     llm: Option<LlmOverride>,
     /// The pairing persona (reviewer system prompt); defaults to the built-in skeptic.
+    #[serde(default)]
+    persona_id: Option<String>,
+}
+
+/// Loop-monitor configuration for a chat turn. When `enabled`, a second model watches the
+/// primary's live transcript at a fixed cadence and steers it (or, after its budget, forces a
+/// wrap-up) when it goes in circles. Off unless `enabled` — existing turns are unaffected.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorRequest {
+    #[serde(default)]
+    enabled: bool,
+    /// The saved LLM profile the monitor uses (ideally a small/cheap model). Falls back to the
+    /// env default when absent.
+    #[serde(default)]
+    profile_id: Option<String>,
+    /// A one-off LLM override layered on top of the profile (rarely needed).
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    /// The monitor persona (its system prompt); defaults to the built-in loop breaker.
     #[serde(default)]
     persona_id: Option<String>,
 }
@@ -1955,6 +2095,26 @@ async fn cockpit_chat_stream(
         m.insert(cancel_key.clone(), live.clone());
     }
 
+    // Loop monitor (off by default): a second model that watches this turn's transcript and
+    // steers the primary when it circles. It runs out-of-band on the main runtime and writes into
+    // the same steer/cancel channels as the operator's manual controls; `monitor_done` lets the
+    // primary signal completion so the watcher stops. Resolved before the blocking task so a
+    // misconfiguration just means "no monitor", never a failed turn.
+    let monitor_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some((mon_cfg, mon_persona)) = resolve_monitor(&state, req.monitor.as_ref()) {
+        tokio::spawn(run_loop_monitor(
+            mon_cfg,
+            mon_persona,
+            state.chat.clone(),
+            key.clone(),
+            sid.clone(),
+            steer.clone(),
+            cancel.clone(),
+            live.clone(),
+            monitor_done.clone(),
+        ));
+    }
+
     // The agent loop runs on a blocking thread (DuckDB is !Send) and pushes events into the live
     // buffer; the SSE response(s) follow that buffer on the main runtime.
     let task_state = state.clone();
@@ -1962,6 +2122,7 @@ async fn cockpit_chat_stream(
     let task_sid = sid.clone();
     let task_cancel_key = cancel_key.clone();
     let task_live = live.clone();
+    let task_monitor_done = monitor_done.clone();
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2049,6 +2210,8 @@ async fn cockpit_chat_stream(
             &message,
             Some(&mut checkpoint),
         ));
+        // Signal the loop monitor (if any) that the primary has finished, so it stops polling.
+        task_monitor_done.store(true, std::sync::atomic::Ordering::Relaxed);
         // Persist the captured payloads regardless of outcome (a failed turn still sent a request).
         let bodies = dbg.lock().map(|d| d.clone()).unwrap_or_default();
         if let Ok(mut m) = task_state.chat_debug.lock() {

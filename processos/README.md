@@ -435,6 +435,22 @@ earlier answers (ask *"where is the bottleneck?"* then *"when does **that** happ
   the primary chat persona. A **carry-forward** button (↪) on any droid/pair answer quotes it into
   the composer, so you can also hand one model's conclusion to another model on the next turn
   (cross-provider refinement) without enabling synchronous Pair AI.
+- **Loop monitor — a second model breaks circling (`src/monitor.rs`).** A long investigation can
+  *semantically* circle — rephrasing the same dead-end, oscillating between hypotheses, or
+  re-attacking a genuinely unreachable path — which the cheap lexical guards in `agent.rs`
+  (identical-line / identical-tool-call repetition) don't catch. Optionally enable a **loop
+  monitor**: an async watcher that periodically reads the live transcript (made fresh by the
+  ~2s incremental persistence), renders a recent window, and asks a *second* model (its own
+  profile + a `kind: "monitor"` persona, the built-in **Loop Breaker**) whether the primary is
+  circling. If so it injects a `[loop monitor] …` **steer** into the same queue the human
+  Steer button uses — primed with the escape hatches (mock workers, failure mocking,
+  `edit_model`) so it nudges toward forward progress. After a bounded steer budget
+  (`MONITOR_MAX_STEERS`, default 3) of continued circling it escalates to a forced **wrap-up**
+  (the same cancel path as the human Wrap-up button). It's **off by default** and biased to
+  false negatives (any transport/parse failure ⇒ "not circling" ⇒ no intervention). The
+  watcher emits `{type:"monitor"}` SSE events, rendered as a distinct centered note in the
+  thread. Enable per-request (`monitor:{enabled, profileId, personaId}`) or globally via the
+  `PROCESSOS_MONITOR` env var (`1`/`profileId` ⇒ on).
 - `chat_prompts.rs` — a **prompt library** of reusable compose-box message templates,
   persisted to the user **config dir** (`chat-prompts.json`, alongside `settings.json`).
   Ships four built-ins led by an **open investigation** (the default, pre-loaded into a
@@ -461,6 +477,9 @@ curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream?se
 # Emits an extra `agent` SSE before the reviewer; its answer renders as a `pair` turn.
 curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream \
   -d '{"message":"Which job type has the worst queue tail?","pair":{"enabled":true,"profileId":"qwen-8b","personaId":"pair-skeptic"}}'
+# Loop monitor: a second model watches the live transcript and steers/wraps-up on circling.
+curl -N -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/stream \
+  -d '{"message":"Find the bottleneck and propose a fix","monitor":{"enabled":true,"profileId":"qwen-8b","personaId":"monitor-loop-breaker"}}'
 curl       .../api/workspaces/{workspace}/processes/{process}/chat        # load transcript
 curl       .../api/workspaces/{workspace}/processes/{process}/chat/sessions          # list tabs
 curl -XPOST .../api/workspaces/{workspace}/processes/{process}/chat/sessions -d '{"name":"Probe"}' # new
