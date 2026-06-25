@@ -97,6 +97,14 @@
       '<div class="row">' +
         '<label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048" title="Token budget; Fetch fills this from the model\u2019s context window"></label>' +
         '<label>Temperature <input id="s-temp" type="number" step="0.05" min="0" placeholder="0.2"></label>' +
+        '<label title="Caps reasoning tokens as a fraction of Max tokens (Fast 20%, Medium 50%, Max 100%). Sent as thinking_budget_tokens/reasoning_budget; ignored by models without reasoning control.">Thinking level ' +
+          '<select id="s-thinking">' +
+            '<option value="">Default (unconstrained)</option>' +
+            '<option value="fast">Fast (20%)</option>' +
+            '<option value="medium">Medium (50%)</option>' +
+            '<option value="max">Max (100%)</option>' +
+          '</select>' +
+        '</label>' +
       '</div>' +
       '<div class="bar"><button id="s-save" class="primary">Save profile</button><button id="s-clearkey" class="ghost">Clear API key</button></div>' +
       '<div class="sep"></div>' +
@@ -192,6 +200,7 @@
     if (!p) {
       ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp', 's-modelFile', 's-port', 's-sidecarArgs'].forEach(function (i) { $(i).value = ''; });
       $('s-provider').value = ''; $('s-apiKey').value = '';
+      $('s-thinking').value = '';
       $('s-type-external').checked = true;
       applyTypeUI();
       $('s-activeline').textContent = 'No profiles';
@@ -207,6 +216,7 @@
     $('s-modelFile').value = p.modelFile || '';
     $('s-port').value = portFromUrl(p.baseUrl);
     $('s-sidecarArgs').value = p.sidecarArgs || '';
+    $('s-thinking').value = p.thinkingLevel || '';
     if (p.sidecar) $('s-type-sidecar').checked = true; else $('s-type-external').checked = true;
     applyTypeUI();
     var isActive = p.id === STATE.view.activeProfile;
@@ -251,6 +261,7 @@
       name: $('s-name').value,
       maxTokens: $('s-maxTokens').value ? Number($('s-maxTokens').value) : 0,
       temperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1,
+      thinkingLevel: $('s-thinking').value || '',
       sidecar: type === 'sidecar'
     };
     if (type === 'sidecar') {

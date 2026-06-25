@@ -24,7 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
-use crate::harness::{LlmConfig, LlmOverride};
+use crate::harness::{LlmConfig, LlmOverride, ThinkingLevel};
 use crate::pyrunner::PyConfig;
 
 /// A named LLM connection. Every connection field is optional: an unset field falls back
@@ -63,6 +63,11 @@ pub struct LlmProfile {
     /// supplies `--host`, `--port` and the model flag; these are appended verbatim.
     #[serde(default)]
     pub sidecar_args: Option<String>,
+    /// Coarse reasoning budget (Fast/Medium/Max) for this profile, applied to **both** the
+    /// investigative primary and any pairing/partner role this profile fills. `None` leaves the
+    /// model's thinking unconstrained.
+    #[serde(default)]
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 impl LlmProfile {
@@ -76,6 +81,7 @@ impl LlmProfile {
             api_key: self.api_key.clone(),
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            thinking_level: self.thinking_level,
         }
     }
 
@@ -111,6 +117,10 @@ impl LlmProfile {
         }
         if let Some(v) = patch.sidecar_args {
             self.sidecar_args = non_empty(v);
+        }
+        if let Some(v) = patch.thinking_level {
+            // Empty/unknown string clears the level (back to unconstrained thinking).
+            self.thinking_level = ThinkingLevel::parse(&v);
         }
     }
 
@@ -249,6 +259,7 @@ fn seeded() -> Settings {
             sidecar: true,
             model_file: Some(model.to_string()),
             sidecar_args: Some("-ngl 99 -c 32768 --jinja".to_string()),
+            thinking_level: None,
         }
     }
     Settings {
@@ -379,6 +390,8 @@ pub struct ProfilePatch {
     pub sidecar: Option<bool>,
     pub model_file: Option<String>,
     pub sidecar_args: Option<String>,
+    /// Coarse reasoning budget label (`fast`/`medium`/`max`); empty/unknown clears it.
+    pub thinking_level: Option<String>,
 }
 
 /// Partial update for the global (non-profile) settings.
@@ -419,6 +432,7 @@ pub struct ProfileView {
     pub sidecar: bool,
     pub model_file: Option<String>,
     pub sidecar_args: Option<String>,
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 impl ProfileView {
@@ -435,6 +449,7 @@ impl ProfileView {
             sidecar: p.sidecar,
             model_file: p.model_file.clone(),
             sidecar_args: p.sidecar_args.clone(),
+            thinking_level: p.thinking_level,
         }
     }
 }
@@ -548,6 +563,7 @@ impl SettingsStore {
             sidecar: false,
             model_file: None,
             sidecar_args: None,
+            thinking_level: None,
         };
         profile.apply(ProfilePatch {
             name: None,
@@ -669,6 +685,7 @@ fn migrate(s: &str) -> Option<Settings> {
                 sidecar: false,
                 model_file: None,
                 sidecar_args: None,
+                thinking_level: None,
             });
             settings
                 .active_profile
@@ -772,6 +789,7 @@ mod tests {
             sidecar: true,
             model_file: None,
             sidecar_args: None,
+            thinking_level: None,
         };
         assert_eq!(p.sidecar_port(), 9090);
     }

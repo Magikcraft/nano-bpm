@@ -515,7 +515,7 @@ impl OpenAiAgent {
                 })
             })
             .collect();
-        json!({
+        let mut body = json!({
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
             "max_tokens": self.cfg.max_tokens,
@@ -523,7 +523,9 @@ impl OpenAiAgent {
             "tools": tool_defs,
             "stream": stream,
             "messages": wire_messages(msgs),
-        })
+        });
+        crate::harness::llm::apply_thinking_budget(&mut body, &self.cfg);
+        body
     }
 
     fn endpoint(&self) -> String {

@@ -45,6 +45,48 @@ impl Provider {
     }
 }
 
+/// How much chain-of-thought budget the model is allowed, expressed as a coarse level the
+/// operator picks per profile. Resolved to a concrete token budget against the profile's
+/// `max_tokens` capacity (see [`ThinkingLevel::budget_tokens`]) and sent on each request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    /// Minimal deliberation — ~20% of capacity. Snappy; good for a cheap loop-monitor.
+    Fast,
+    /// Balanced — ~50% of capacity.
+    Medium,
+    /// Up to the full token budget — 100% of capacity.
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Percentage of the token capacity this level grants the model's reasoning.
+    pub fn percent(self) -> u32 {
+        match self {
+            ThinkingLevel::Fast => 20,
+            ThinkingLevel::Medium => 50,
+            ThinkingLevel::Max => 100,
+        }
+    }
+
+    /// Concrete reasoning token budget for a profile whose token `capacity` (its `max_tokens`)
+    /// is given. Always at least 1 token so a configured level never accidentally disables
+    /// thinking entirely (that is what *omitting* a level is for).
+    pub fn budget_tokens(self, capacity: u32) -> u32 {
+        (capacity.saturating_mul(self.percent()) / 100).max(1)
+    }
+
+    /// Parse a level from a label (case-insensitive). Unknown/empty → `None`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" | "low" => Some(ThinkingLevel::Fast),
+            "medium" | "med" | "balanced" => Some(ThinkingLevel::Medium),
+            "max" | "high" | "full" => Some(ThinkingLevel::Max),
+            _ => None,
+        }
+    }
+}
+
 /// Resolved LLM configuration. `model` is required to make any call.
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
@@ -59,6 +101,10 @@ pub struct LlmConfig {
     /// until they hit the token budget); a modest penalty (>0) discourages that at the
     /// sampler. Default 0.3; set `PROCESSOS_LLM_FREQUENCY_PENALTY` to tune (0 disables).
     pub frequency_penalty: f32,
+    /// Optional coarse reasoning budget (Fast/Medium/Max). When set, each request carries a
+    /// `thinking_budget_tokens`/`reasoning_budget` sized at that fraction of `max_tokens`.
+    /// `None` leaves the model's reasoning unconstrained (the historical behaviour).
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 /// Per-request overrides (any subset) accepted on the hypothesize endpoint.
@@ -71,6 +117,7 @@ pub struct LlmOverride {
     pub api_key: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub thinking_level: Option<ThinkingLevel>,
 }
 
 impl LlmConfig {
@@ -109,6 +156,10 @@ impl LlmConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.3);
+        let thinking_level = std::env::var("PROCESSOS_LLM_THINKING")
+            .ok()
+            .as_deref()
+            .and_then(ThinkingLevel::parse);
         Self {
             provider,
             base_url,
@@ -117,6 +168,7 @@ impl LlmConfig {
             max_tokens,
             temperature,
             frequency_penalty,
+            thinking_level,
         }
     }
 
@@ -146,6 +198,9 @@ impl LlmConfig {
         if let Some(t) = o.temperature {
             self.temperature = t;
         }
+        if let Some(l) = o.thinking_level {
+            self.thinking_level = Some(l);
+        }
         self
     }
 
@@ -153,12 +208,35 @@ impl LlmConfig {
     pub fn is_ready(&self) -> bool {
         !self.model.is_empty()
     }
+
+    /// The concrete reasoning token budget for this request, if a thinking level is set.
+    /// `None` means "no budget sent" — the model reasons without an imposed cap.
+    pub fn thinking_budget(&self) -> Option<u32> {
+        self.thinking_level.map(|l| l.budget_tokens(self.max_tokens))
+    }
 }
 
 fn default_base_url(provider: Provider) -> String {
     match provider {
         Provider::Openai => "http://127.0.0.1:8080/v1".to_string(),
         Provider::Anthropic => "https://api.anthropic.com".to_string(),
+    }
+}
+
+/// Inject the reasoning-token budget for [`LlmConfig::thinking_level`] into an OpenAI-style
+/// request `body` (a JSON object). No-op when no level is configured.
+///
+/// We send **two** keys for the same budget: `thinking_budget_tokens` (the forward-looking
+/// ProcessOS field) and `reasoning_budget` (what current llama.cpp's server understands — its
+/// `--reasoning-budget` / `LLAMA_ARG_THINK_BUDGET` knob, settable per request). An endpoint that
+/// recognises neither simply ignores the extra fields, so this is safe across providers.
+pub fn apply_thinking_budget(body: &mut serde_json::Value, cfg: &LlmConfig) {
+    let Some(budget) = cfg.thinking_budget() else {
+        return;
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("thinking_budget_tokens".into(), json!(budget));
+        obj.insert("reasoning_budget".into(), json!(budget));
     }
 }
 
@@ -188,7 +266,7 @@ async fn complete_openai(
     user: &str,
 ) -> Result<String, String> {
     let url = format!("{base}/chat/completions");
-    let body = json!({
+    let mut body = json!({
         "model": cfg.model,
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
@@ -198,6 +276,7 @@ async fn complete_openai(
             { "role": "user", "content": user },
         ],
     });
+    apply_thinking_budget(&mut body, cfg);
     let mut req = client.post(&url).json(&body);
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
@@ -430,6 +509,7 @@ mod tests {
             max_tokens: 1024,
             temperature: 0.2,
             frequency_penalty: 0.0,
+            thinking_level: None,
         };
         let o = LlmOverride {
             provider: Some("anthropic".into()),
@@ -452,6 +532,7 @@ mod tests {
             max_tokens: 1024,
             temperature: 0.2,
             frequency_penalty: 0.0,
+            thinking_level: None,
         };
         let o = LlmOverride {
             base_url: Some("http://gpu-box.lan:8000/v1".into()),
@@ -459,5 +540,43 @@ mod tests {
         };
         let merged = cfg.with_override(&o);
         assert_eq!(merged.base_url, "http://gpu-box.lan:8000/v1");
+    }
+
+    #[test]
+    fn thinking_level_maps_to_a_fraction_of_capacity() {
+        assert_eq!(ThinkingLevel::Fast.budget_tokens(10_000), 2_000);
+        assert_eq!(ThinkingLevel::Medium.budget_tokens(10_000), 5_000);
+        assert_eq!(ThinkingLevel::Max.budget_tokens(10_000), 10_000);
+        // Always at least one token, never zero, even for a tiny capacity.
+        assert_eq!(ThinkingLevel::Fast.budget_tokens(1), 1);
+        assert_eq!(ThinkingLevel::parse("FAST"), Some(ThinkingLevel::Fast));
+        assert_eq!(ThinkingLevel::parse("balanced"), Some(ThinkingLevel::Medium));
+        assert_eq!(ThinkingLevel::parse("max"), Some(ThinkingLevel::Max));
+        assert_eq!(ThinkingLevel::parse("nope"), None);
+    }
+
+    #[test]
+    fn apply_thinking_budget_sets_both_keys_only_when_a_level_is_set() {
+        let mut cfg = LlmConfig {
+            provider: Provider::Openai,
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            max_tokens: 8_000,
+            temperature: 0.2,
+            frequency_penalty: 0.0,
+            thinking_level: None,
+        };
+        // No level → no fields added.
+        let mut body = json!({ "model": "m" });
+        apply_thinking_budget(&mut body, &cfg);
+        assert!(body.get("thinking_budget_tokens").is_none());
+        assert!(body.get("reasoning_budget").is_none());
+
+        // Medium → 50% of 8000 on both keys.
+        cfg.thinking_level = Some(ThinkingLevel::Medium);
+        apply_thinking_budget(&mut body, &cfg);
+        assert_eq!(body["thinking_budget_tokens"], json!(4_000));
+        assert_eq!(body["reasoning_budget"], json!(4_000));
     }
 }

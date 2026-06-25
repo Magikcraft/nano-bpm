@@ -29,6 +29,7 @@ mod monitor;
 mod personas;
 mod pilot;
 mod pyrunner;
+mod reasoning;
 mod report;
 mod settings;
 mod supervisor;
@@ -488,6 +489,7 @@ async fn main() {
         .route("/api/llama/start", post(llama_start))
         .route("/api/llama/stop", post(llama_stop))
         .route("/api/llama/logs", get(llama_logs))
+        .route("/api/llama/reasoning-control", get(reasoning_control_status))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -1409,6 +1411,29 @@ async fn llama_logs(
     }))
 }
 
+/// `GET /api/llama/reasoning-control?profileId=…` — probe whether the target endpoint exposes the
+/// optional reasoning-control surface (`/v1/chat/completions/control`). When `profileId` is given
+/// the named profile's endpoint is probed, otherwise the active profile's. Lets the UI tell the
+/// operator whether wrap-up/monitor can halt mid-thinking or only at a round boundary (fallback).
+async fn reasoning_control_status(
+    State(state): State<AppState>,
+    Query(q): Query<LlamaLogsQuery>,
+) -> impl IntoResponse {
+    let cfg = match q.profile_id.as_deref() {
+        Some(pid) => resolve_llm_for_profile(&state, Some(pid), None),
+        None => Some(resolve_llm(&state, None)),
+    };
+    let Some(cfg) = cfg.filter(|c| c.is_ready()) else {
+        return Json(serde_json::json!({ "supported": false, "ready": false }));
+    };
+    let supported = reasoning::supports_control(&cfg.base_url).await;
+    Json(serde_json::json!({
+        "supported": supported,
+        "ready": true,
+        "baseUrl": cfg.base_url,
+    }))
+}
+
 /// Resolve the effective LLM config for a request: built-in defaults → `PROCESSOS_LLM_*`
 /// env → the active operator profile → per-request override. Each later layer wins when
 /// present, so the console is authoritative over the environment while a one-off request
@@ -1586,6 +1611,17 @@ async fn run_loop_monitor(
             }
             monitor::MonitorAction::WrapUp(reason) => {
                 cancel.store(true, Ordering::Relaxed);
+                // Best-effort mid-thinking halt via the reasoning-control surface when present;
+                // the cancel flag remains the round-boundary fallback on builds without it.
+                if cfg.is_ready() {
+                    let _ = crate::reasoning::interrupt(
+                        &cfg.base_url,
+                        &cfg.model,
+                        "wrapup",
+                        Some("loop monitor requested wrap-up"),
+                    )
+                    .await;
+                }
                 live.emit(serde_json::json!({
                     "type": "monitor",
                     "action": "wrapup",
@@ -2369,6 +2405,19 @@ async fn cockpit_chat_wrapup(
     match flagged {
         Some(flag) => {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Best-effort: if the active sidecar exposes the reasoning-control surface, also halt
+            // it mid-thinking now instead of only at the next round boundary. Unsupported builds
+            // (the common case today) no-op and the cancel flag above remains the guarantee.
+            let cfg = resolve_llm(&state, None);
+            if cfg.is_ready() {
+                let _ = reasoning::interrupt(
+                    &cfg.base_url,
+                    &cfg.model,
+                    "wrapup",
+                    Some("operator requested wrap-up"),
+                )
+                .await;
+            }
             StatusCode::ACCEPTED.into_response()
         }
         None => (

@@ -124,10 +124,15 @@ For a **Managed sidecar** profile, give it a **Model file / HF spec** — either
 `.gguf` path resolved against the **Models directory** — a **Port** (each sidecar needs its
 own so two can run at once), and optional **Startup args** (e.g. `-ngl 99 -c 32768 --jinja`,
 appended verbatim). An **External** profile instead shows **Provider**, **Base URL**,
-**Model** (with a **Fetch** button) and **API key**. **Max tokens**/**Temperature** and the
-editable **Name** apply to both, and the **Save profile** button sits at the bottom of the
-form. The global **Local model server** section sets the shared **Models directory**
-(pre-filled with llama.cpp's own cache — `$LLAMA_CACHE`, else macOS
+**Model** (with a **Fetch** button) and **API key**. **Max tokens**/**Temperature**, a
+**Thinking level**, and the editable **Name** apply to both, and the **Save profile** button
+sits at the bottom of the form. The **Thinking level** caps reasoning tokens as a fraction of
+**Max tokens** — **Fast** 20%, **Medium** 50%, **Max** 100%, or **Default** (unconstrained) —
+sent to the endpoint as both `thinking_budget_tokens` and `reasoning_budget` (the latter is
+current llama.cpp's per-request `--reasoning-budget` knob; endpoints that recognise neither
+ignore the extra fields). The level applies to **both** the investigative primary and any
+pairing/monitor partner. The global **Local model server** section sets the shared **Models
+directory** (pre-filled with llama.cpp's own cache — `$LLAMA_CACHE`, else macOS
 `~/Library/Caches/llama.cpp` / Linux `~/.cache/llama.cpp` — so models are shared with any
 separately-run llama.cpp) and an optional **llama-server binary** path (otherwise found on
 `PATH`).
@@ -149,6 +154,15 @@ one **partner** — a sparring partner (Pair AI) or a loop **monitor** — and b
 supervisor runs at most **two** `llama-server` children, each on a distinct port; starting a third,
 re-starting one already up, or starting two that share a port is rejected with a clear message
 (give each sidecar profile its own port in its Base URL). See the [llama endpoints](#endpoints).
+
+**Wrap-up / loop monitor and reasoning control.** When the loop monitor decides a turn is
+spinning (or the operator hits **wrap it up**), ProcessOS sets the per-session cancel flag that
+stops the agent at its next round boundary. If the target endpoint also exposes the optional
+reasoning-control surface (`POST /v1/chat/completions/control` with `{"reasoning_control":true}`),
+ProcessOS additionally issues a best-effort *mid-thinking* halt so the model stops sooner; builds
+without that surface (including the currently-shipping llama.cpp) simply fall back to the
+round-boundary cancel with no change in behaviour. `GET /api/llama/reasoning-control` probes
+whether the active (or a named) profile's endpoint supports it.
 
 **First-class `LLM sidecars` nav surface.** The left rail — the principal navigation menu shown
 on every page after the landing page (cockpit and workspaces share it) — carries a first-class
@@ -709,6 +723,7 @@ for it automatically.
 | `POST` | `/api/llama/start` | Start a sidecar for a profile (`{profileId}`; must have `sidecar:true`). Up to **two** run at once, each on a distinct port. Returns the new status |
 | `POST` | `/api/llama/stop` | Stop one sidecar (`{profileId}`) or **all** of them (empty body). Returns the resulting pool state |
 | `GET` | `/api/llama/logs?profileId=…&since=N` | Tail a sidecar's combined stdout/stderr from offset `N`; returns `{lines, text, nextOffset, running}` for incremental polling |
+| `GET` | `/api/llama/reasoning-control?profileId=…` | Probe whether the active (or named) profile's endpoint exposes the optional reasoning-control surface (`/v1/chat/completions/control`). Returns `{supported, ready, baseUrl}`; wrap-up/monitor use it for a mid-thinking halt when present, else fall back to the round-boundary cancel |
 
 ## Layout
 
