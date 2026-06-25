@@ -97,7 +97,7 @@ fn classify_tier(feasible: bool, report: &ReplayReport) -> FidelityTier {
 
 /// A short, honest confidence band for the candidate's tier — never overstated.
 fn confidence_band(tier: FidelityTier, report: &ReplayReport) -> String {
-    match tier {
+    let base = match tier {
         FidelityTier::Infeasible => "n/a — candidate did not deploy".to_string(),
         FidelityTier::RecordedReplay => format!(
             "Level 2 · measured on {} recorded instance(s), {} boundary-conserved",
@@ -115,6 +115,17 @@ fn confidence_band(tier: FidelityTier, report: &ReplayReport) -> String {
             report.uncovered_job_types.len(),
             report.uncovered_job_types.join(", ")
         ),
+    };
+    // A divergence note when the candidate over-issues EXISTING workers (a broken
+    // structure, not a missing worker) — steer toward fixing topology, not mocking.
+    if report.divergent_job_types.is_empty() {
+        base
+    } else {
+        format!(
+            "{base} · structural divergence: existing worker(s) ({}) were issued more often \
+             than history recorded — check gateway/condition placement, not mockWorkers",
+            report.divergent_job_types.join(", ")
+        )
     }
 }
 
@@ -141,6 +152,11 @@ pub struct RankedCandidate {
     /// New job types that WERE scored, served from an operator/LLM-supplied mock
     /// (the new workers this candidate introduced and provided a mock for).
     pub mocked_workers: Vec<String>,
+    /// **Existing** workers (with recorded history) the candidate issued more often
+    /// than history did — a structural-divergence signal pointing at a broken
+    /// gateway/condition or duplicated branch. Distinct from `requires_new_workers`:
+    /// these must NOT be mocked; the topology should be fixed instead.
+    pub divergent_workers: Vec<String>,
     /// A short confidence band qualifying the metrics by their fidelity tier.
     pub confidence: String,
     /// The full Level-2 scorecard for this candidate.
@@ -211,6 +227,7 @@ fn score_candidate(
                 fidelity_tier: tier,
                 requires_new_workers: report.uncovered_job_types.clone(),
                 mocked_workers: report.mocked_job_types.clone(),
+                divergent_workers: report.divergent_job_types.clone(),
                 confidence: confidence_band(tier, &report),
                 report,
             }
@@ -245,6 +262,7 @@ fn infeasible(
         fidelity_tier: tier,
         requires_new_workers: report.uncovered_job_types.clone(),
         mocked_workers: report.mocked_job_types.clone(),
+        divergent_workers: report.divergent_job_types.clone(),
         confidence: confidence_band(tier, &report),
         report,
     }
@@ -402,6 +420,51 @@ mod tests {
         // The diverging candidate is ranked below and still carries its scorecard.
         assert_eq!(ranking.candidates[1].name, "drop-summarize");
         assert_eq!(ranking.candidates[1].report.conserved, 0);
+    }
+
+    #[test]
+    fn an_existing_worker_run_dry_is_a_divergence_not_a_required_new_worker() {
+        // A dataset where summarize is recorded in instance 1 but not instance 2.
+        // TWO_TASK issues summarize for both ⇒ it runs dry in instance 2. Because
+        // summarize HAS history in the dataset, the candidate must report it as a
+        // structural divergence (not a required new worker), and the confidence band
+        // must steer toward fixing topology rather than supplying a mock.
+        let ds = vec![
+            rec(
+                &[("input", json!("x"))],
+                vec![
+                    job(1, 1100, "classify", Some(&[("label", json!("A"))])),
+                    job(2, 1300, "summarize", Some(&[("summary", json!("S"))])),
+                ],
+            ),
+            rec(
+                &[("input", json!("y"))],
+                vec![job(1, 1100, "classify", Some(&[("label", json!("B"))]))],
+            ),
+        ];
+        let cands = vec![CandidateModel {
+            name: "keep-both".into(),
+            rationale: None,
+            model: TWO_TASK.into(),
+            ..Default::default()
+        }];
+        let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
+        let c = &ranking.candidates[0];
+        assert_eq!(c.divergent_workers, vec!["summarize".to_string()]);
+        assert!(
+            c.requires_new_workers.is_empty(),
+            "an existing worker must not be flagged as requiring a new worker"
+        );
+        assert_ne!(
+            c.fidelity_tier,
+            FidelityTier::RequiresGenerativeMock,
+            "an over-issued EXISTING worker is not a generative-mock-required candidate"
+        );
+        assert!(
+            c.confidence.contains("structural divergence"),
+            "confidence must point at the topology, got: {}",
+            c.confidence
+        );
     }
 
     #[test]

@@ -489,7 +489,14 @@ worker raises that BPMN business error rather than completing; pair it with an e
 `uncoveredJobTypes` value that EQUALS a service task's id (look for a `jobTypeHints` entry), that is \
 NOT an engine bug matching on element_id — your task's `zeebe:taskDefinition` did not bind, so the job \
 type defaulted to the id. Fix the binding with edit_model `set_task_job_type` (use the RECORDED job \
-type) so the existing worker output replays; do not invent a new worker for it. When a measured \
+type) so the existing worker output replays; do not invent a new worker for it. If a scorecard reports \
+a `structuralDivergence` hint (or a non-empty `divergentWorkers`), an EXISTING worker with real \
+recorded history was issued more often than history did — your topology routes a branch that did not \
+occur (a broken gateway, a condition on the wrong element, or a duplicated path). Do NOT add \
+mockWorkers for those job types; instead FIX THE STRUCTURE — note that this engine only evaluates flow \
+conditions on an exclusive (XOR) gateway, so branch conditions belong on a `<bpmn:exclusiveGateway>`, \
+never on a service task's or event's outgoing flows (run analyze_model and heed any \
+`condition-on-non-gateway` warning). When a measured \
 (Level-2) change is available, prefer it: reordering or \
 parallelising EXISTING tasks, or adding a retry on an existing one, scores at full fidelity with no \
 mock needed. To choose between \

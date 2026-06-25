@@ -739,9 +739,16 @@ pub struct ReplayReport {
     pub conserved: u32,
     /// `conserved / instances_total` in `[0,1]`; `0.0` when nothing was replayable.
     pub conserved_rate: f64,
-    /// Union of job types the candidate issued that history never produced an
-    /// output for — i.e. the workers a deploy of this candidate would require.
+    /// Union of job types the candidate issued that the replayed dataset holds
+    /// **no recorded output for anywhere** — genuinely new workers a deploy of
+    /// this candidate would require (and a generative mock to score).
     pub uncovered_job_types: Vec<String>,
+    /// Union of job types that *do* have recorded history in the dataset yet still
+    /// ran their recorded-output FIFO dry under this candidate — i.e. the candidate
+    /// issued an **existing** worker more often (or on a path) than history did.
+    /// This is a **structural-divergence** signal (a broken gateway/condition or a
+    /// duplicated branch), NOT a request to mock a real worker.
+    pub divergent_job_types: Vec<String>,
     /// Union of job types served from an operator/LLM-supplied generative mock
     /// (the new workers the candidate introduced, scored on assumed output).
     pub mocked_job_types: Vec<String>,
@@ -789,13 +796,34 @@ pub fn replay_dataset_with_mocks(
     let completed = results.iter().filter(|r| r.completed).count() as u32;
     let conserved = results.iter().filter(|r| r.conserved).count() as u32;
 
-    // Union of uncovered job types (requires-new-workers), sorted + deduped.
-    let mut uncovered: Vec<String> = results
+    // Union of uncovered job types, sorted + deduped. We then split them by
+    // whether the dataset records ANY output of that type: a type with zero
+    // recorded outputs anywhere is a genuinely-new worker (requires a mock); a
+    // type that *does* have recorded history but still ran dry here diverged
+    // structurally (the candidate over-issues an existing worker).
+    let mut uncovered_all: Vec<String> = results
         .iter()
         .flat_map(|r| r.uncovered_job_types.iter().cloned())
         .collect();
-    uncovered.sort();
-    uncovered.dedup();
+    uncovered_all.sort();
+    uncovered_all.dedup();
+
+    let recorded_job_types: std::collections::HashSet<String> = dataset
+        .iter()
+        .flat_map(|rec| rec.stimuli.iter())
+        .filter(|s| s.kind == "jobCompleted")
+        .filter_map(|s| s.reference.clone())
+        .collect();
+
+    let mut uncovered: Vec<String> = Vec::new();
+    let mut divergent: Vec<String> = Vec::new();
+    for jt in uncovered_all {
+        if recorded_job_types.contains(&jt) {
+            divergent.push(jt);
+        } else {
+            uncovered.push(jt);
+        }
+    }
 
     // Union of mocked job types (new workers served from a supplied mock).
     let mut mocked: Vec<String> = results
@@ -861,6 +889,7 @@ pub fn replay_dataset_with_mocks(
         conserved,
         conserved_rate,
         uncovered_job_types: uncovered,
+        divergent_job_types: divergent,
         mocked_job_types: mocked,
         divergent_keys,
         avg_e2e_latency_ms,
@@ -1271,6 +1300,52 @@ mod tests {
             .collect();
         assert_eq!(cov["summarize"], (1, 0));
         assert_eq!(cov["classify"], (1, 1));
+    }
+
+    #[test]
+    fn dataset_split_existing_starved_worker_is_divergent_not_uncovered() {
+        // Two recorded instances replayed against TWO_TASK (classify -> summarize):
+        //  A records BOTH classify + summarize (fully covered),
+        //  B records only classify, so summarize runs its FIFO dry in B.
+        // Because summarize HAS recorded history somewhere in the dataset, it must be
+        // reported as a STRUCTURAL DIVERGENCE (existing worker over-issued), never as a
+        // genuinely-new worker the operator should mock.
+        let a = rec(
+            &[("input", json!("x"))],
+            vec![
+                job(1, 1100, "classify", Some(&[("label", json!("A"))])),
+                job(2, 1200, "summarize", Some(&[("text", json!("done"))])),
+            ],
+        );
+        let b = rec(
+            &[("input", json!("y"))],
+            vec![job(1, 1100, "classify", Some(&[("label", json!("B"))]))],
+        );
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+        let report = replay_dataset(&defs, "P", &[a, b]);
+        assert_eq!(
+            report.divergent_job_types,
+            vec!["summarize".to_string()],
+            "an existing worker that ran dry is a structural divergence"
+        );
+        assert!(
+            report.uncovered_job_types.is_empty(),
+            "an existing worker must not be reported as requiring a new worker"
+        );
+    }
+
+    #[test]
+    fn dataset_genuinely_new_worker_stays_uncovered() {
+        // History records only classify; the candidate (TWO_TASK) also issues summarize,
+        // which is recorded NOWHERE in the dataset ⇒ a genuinely-new worker (uncovered).
+        let r = rec(
+            &[("input", json!("x"))],
+            vec![job(1, 1100, "classify", Some(&[("label", json!("A"))]))],
+        );
+        let defs = parse_bpmn(TWO_TASK).unwrap();
+        let report = replay_dataset(&defs, "P", &[r]);
+        assert_eq!(report.uncovered_job_types, vec!["summarize".to_string()]);
+        assert!(report.divergent_job_types.is_empty());
     }
 
     #[test]

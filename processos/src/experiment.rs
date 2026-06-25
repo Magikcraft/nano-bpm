@@ -124,6 +124,37 @@ fn surface_deploy_error(scorecard: &mut Value) {
     }
 }
 
+/// When the candidate over-issues an EXISTING worker (a job type with recorded
+/// history that still ran its replay FIFO dry), lift a prominent top-level
+/// `structuralDivergence` hint so the agent fixes the topology (gateway/condition
+/// placement, a duplicated branch) instead of being tempted to mock a real worker.
+fn surface_divergence_hint(scorecard: &mut Value) {
+    let divergent: Vec<String> = scorecard
+        .get("divergentWorkers")
+        .and_then(|w| w.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if divergent.is_empty() {
+        return;
+    }
+    if let Some(obj) = scorecard.as_object_mut() {
+        obj.insert(
+            "structuralDivergence".into(),
+            Value::String(format!(
+                "Existing worker(s) ({}) were issued more often than history recorded — your \
+                 variant routes a branch that did not occur (a broken gateway/condition or a \
+                 duplicated path). Fix the topology; do NOT add mockWorkers for these — they \
+                 have real recorded history.",
+                divergent.join(", ")
+            )),
+        );
+    }
+}
+
 /// When simulate flags uncovered job types that are actually a serviceTask's id
 /// (the taskDefinition-binding mistake surfacing as "uses element_id as job type"),
 /// attach an actionable `jobTypeHints` array so the agent gets a crisp fix instead
@@ -180,6 +211,7 @@ pub fn simulate(
     if let Some(c) = v["candidates"].as_array_mut().and_then(|a| a.first_mut()) {
         trim_report(&mut c["report"]);
         surface_deploy_error(c);
+        surface_divergence_hint(c);
         surface_job_type_hints(c, &candidate.model);
         if !fixes.is_empty() {
             c["authoringFixes"] = json!(fixes);
@@ -294,6 +326,7 @@ pub fn compare_variants(
         for c in arr.iter_mut() {
             trim_report(&mut c["report"]);
             surface_deploy_error(c);
+            surface_divergence_hint(c);
             if let Some(healed) = c["name"].as_str().and_then(|n| healed_by_name.get(n)) {
                 let healed = healed.clone();
                 surface_job_type_hints(c, &healed);
@@ -607,5 +640,21 @@ mod tests {
         surface_deploy_error(&mut sc);
         assert!(sc.get("deployError").is_none());
         assert!(sc.get("fixHint").is_none());
+    }
+
+    #[test]
+    fn surface_divergence_hint_lifts_existing_over_issued_workers() {
+        let mut sc = json!({ "divergentWorkers": ["credit-check", "reject-application"] });
+        surface_divergence_hint(&mut sc);
+        let hint = sc.get("structuralDivergence").and_then(|v| v.as_str()).unwrap();
+        assert!(hint.contains("credit-check"));
+        assert!(hint.contains("do NOT add mockWorkers"));
+    }
+
+    #[test]
+    fn surface_divergence_hint_is_a_noop_without_divergent_workers() {
+        let mut sc = json!({ "divergentWorkers": [] });
+        surface_divergence_hint(&mut sc);
+        assert!(sc.get("structuralDivergence").is_none());
     }
 }

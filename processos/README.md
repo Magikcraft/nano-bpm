@@ -310,7 +310,15 @@ instead of picking from a fixed menu.
   equal a service task's **id**, the scorecard attaches a `jobTypeHints` entry explaining it is the
   `zeebe:taskDefinition`-didn't-bind mistake (the job type defaulted to the element id) — not the
   engine matching on element_id — and points at the `edit_model set_task_job_type` fix, so the model
-  stops perceiving it as an engine bug. `compare_variants` scores a whole *multiverse* of candidates against the
+  stops perceiving it as an engine bug. The scorecard also distinguishes a **genuinely-new worker**
+  (a job type with *no* recorded history — the only thing `requiresNewWorkers` now lists, fixable
+  with a `mockWorkers` entry) from a **structural divergence**: an *existing* worker (with real
+  recorded history) the candidate issued more often than history did. The latter is reported under
+  `divergentWorkers` plus a prominent `structuralDivergence` hint that steers the model to fix the
+  topology (a broken gateway, a condition on the wrong element, a duplicated branch) instead of
+  mocking a real worker. Relatedly, `analyze_model` now emits a `condition-on-non-gateway` warning
+  when a flow condition sits on anything other than an exclusive (XOR) gateway — the engine only
+  evaluates conditions on a gateway split, so such a condition is silently ignored. `compare_variants` scores a whole *multiverse* of candidates against the
   same recorded dataset — the current model included as the `baseline` — and ranks them
   fidelity-first. Both are built on the deterministic replay harness and need **Tier-2
   recorded-input capture** (`c8 nano --capture` / `NANOBPMN_TRACE_STIMULI`); without it they

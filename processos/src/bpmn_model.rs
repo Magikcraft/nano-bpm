@@ -538,6 +538,30 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
             }
         }
 
+        // Conditional sequence flow leaving a node that is NOT an exclusive gateway:
+        // this engine only honours flow conditions on an exclusive (XOR) split. A
+        // condition on a service task's / event's / parallel split's outgoing flow is
+        // silently ignored — a common authoring corruption where branch conditions get
+        // moved off the gateway onto a downstream task (the routing then breaks, but no
+        // exclusive-no-default warning fires). Flag it so the model fixes the topology.
+        if !matches!(kind, ElementKind::ExclusiveGateway)
+            && el.outgoing.iter().any(|f| f.condition.is_some())
+        {
+            let conds = el.outgoing.iter().filter(|f| f.condition.is_some()).count();
+            findings.push(finding(
+                "warn",
+                "condition-on-non-gateway",
+                Some(id),
+                format!(
+                    "'{id}' ({}) has {conds} conditional outgoing flow(s), but only an \
+                     exclusive (XOR) gateway evaluates flow conditions here — these conditions \
+                     are ignored and routing is wrong. Put the branch conditions on an exclusive \
+                     gateway, not on this node.",
+                    kind_label(kind)
+                ),
+            ));
+        }
+
         match kind {
             // Exclusive split with every branch guarded: if no condition matches and there
             // is no default flow, the token has nowhere to go.
@@ -1874,6 +1898,51 @@ mod tests {
             .iter()
             .any(|f| f["code"] == "dead-end" && f["element"] == "T"));
         assert!(findings.iter().any(|f| f["code"] == "no-end-event"));
+    }
+
+    #[test]
+    fn analyze_model_flags_conditions_on_a_non_gateway_source() {
+        // A service task (not a gateway) carrying conditional outgoing flows — the
+        // Investigation-9 corruption where branch conditions are moved off the gateway.
+        let bpmn = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="Handler">
+      <bpmn:extensionElements><zeebe:taskDefinition type="handler"/></bpmn:extensionElements>
+      <bpmn:incoming>a</bpmn:incoming>
+      <bpmn:outgoing>hi</bpmn:outgoing>
+      <bpmn:outgoing>lo</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EHi"><bpmn:incoming>hi</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="ELo"><bpmn:incoming>lo</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="Handler"/>
+    <bpmn:sequenceFlow id="hi" sourceRef="Handler" targetRef="EHi">
+      <bpmn:conditionExpression>= creditScore &gt;= 700</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="lo" sourceRef="Handler" targetRef="ELo">
+      <bpmn:conditionExpression>= creditScore &lt; 700</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let v = analyze_model(bpmn).expect("analyze");
+        let findings = v["findings"].as_array().unwrap();
+        assert!(findings
+            .iter()
+            .any(|f| f["code"] == "condition-on-non-gateway"
+                && f["element"] == "Handler"
+                && f["severity"] == "warn"));
+    }
+
+    #[test]
+    fn analyze_model_does_not_flag_conditions_on_an_exclusive_gateway() {
+        // Conditions on an exclusive gateway's outgoing flows are correct — no warning.
+        let v = analyze_model(LOAN_BPMN).expect("analyze");
+        let findings = v["findings"].as_array().unwrap();
+        assert!(!findings
+            .iter()
+            .any(|f| f["code"] == "condition-on-non-gateway"));
     }
 
     #[test]
