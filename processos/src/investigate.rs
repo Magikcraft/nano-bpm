@@ -182,6 +182,32 @@ impl ToolBox for AnalysisTools {
                 parameters: json!({ "type": "object", "properties": {} }),
             });
             specs.push(ToolSpec {
+                name: "validate_model".into(),
+                description: "LINT / VALIDATE a candidate BPMN model BEFORE you simulate or \
+                    propose it — cheap, fast, and deploys nothing. It parses the XML with the \
+                    SAME engine production uses and catches the authoring mistakes that otherwise \
+                    waste a simulate round-trip: a dangling errorRef (an error boundary whose \
+                    errorRef points at no `<bpmn:error id=…>` definition — a common one), a bare \
+                    `<bpmn:process>` fragment missing its `<bpmn:definitions>` root, or otherwise \
+                    unparseable XML. On a parse error it returns valid=false with the error and an \
+                    actionable `fix`. On a clean parse it returns valid=true plus the full \
+                    analyze_model structural findings (unreachable nodes, dead ends, unguarded \
+                    service tasks, rework loops). ALWAYS validate a model you authored here first; \
+                    only simulate models that pass. Args: model (BPMN XML; omit to validate the \
+                    current process model)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "model": {
+                            "type": "string",
+                            "description": "Candidate BPMN XML to validate. Omit to validate the \
+                                current process model."
+                        }
+                    }
+                }),
+            });
+            specs.push(ToolSpec {
                 name: "conformance_check".into(),
                 description: "Replay the mined trace behaviour against the BPMN MODEL and report \
                     where reality diverges from design: a transition-fitness score, nonconformant \
@@ -353,6 +379,17 @@ impl ToolBox for AnalysisTools {
                     .ok_or("analyze_model is not available: this process has no BPMN model")?;
                 let v = crate::bpmn_model::analyze_model(xml)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise findings: {e}"))
+            }
+            "validate_model" => {
+                let xml = match args["model"].as_str() {
+                    Some(m) => m,
+                    None => self.model.as_deref().ok_or(
+                        "validate_model needs a 'model' argument: this process has no BPMN model \
+                         to fall back to",
+                    )?,
+                };
+                let v = crate::bpmn_model::validate_model(xml)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise validation: {e}"))
             }
             "conformance_check" => {
                 let xml = self

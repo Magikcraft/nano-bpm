@@ -651,6 +651,127 @@ pub fn analyze_model(xml: &str) -> Result<Value, String> {
     }))
 }
 
+/// Does this XML carry a `<…:definitions>` root element? LLM-authored variants are sometimes
+/// a bare `<bpmn:process>` fragment (xmlns decls hoisted onto the process) with no definitions
+/// wrapper — the engine parser and bpmn-js both reject those.
+fn has_definitions_root(xml: &str) -> bool {
+    for part in xml.split('<') {
+        let name = part
+            .trim_start_matches('/')
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .next()
+            .unwrap_or("");
+        let local = name.rsplit(':').next().unwrap_or(name);
+        if local.eq_ignore_ascii_case("definitions") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Wrap a bare `<…:process>` fragment in a synthesized `<bpmn:definitions>` envelope so it can be
+/// parsed and analysed. Returns `(xml, wrapped)`; a document that already has a definitions root is
+/// returned unchanged. Mirrors the cockpit's `ensureBpmnDefinitions` render-side normalization.
+fn ensure_definitions(xml: &str) -> (String, bool) {
+    let trimmed = xml.trim();
+    if trimmed.is_empty() || has_definitions_root(trimmed) {
+        return (xml.to_string(), false);
+    }
+    let body = match trimmed.strip_prefix("<?xml") {
+        Some(rest) => rest.find("?>").map(|i| rest[i + 2..].trim_start()).unwrap_or(trimmed),
+        None => trimmed,
+    };
+    let wrapped = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
+         xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" \
+         xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" \
+         xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" \
+         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+         xmlns:zeebe=\"http://camunda.org/schema/zeebe\" \
+         targetNamespace=\"http://bpmn.io/schema/bpmn\">\n{body}\n</bpmn:definitions>"
+    );
+    (wrapped, true)
+}
+
+/// Map a known BPMN deploy/parse error to a concrete, actionable fix, so the model stops repeating
+/// the same authoring mistake. Shared by `validate_model` and the experiment replay scorecard.
+pub fn deploy_fix_hint(err: &str) -> Option<String> {
+    if err.contains("InvalidBoundaryEvent") && err.contains("unknown error") {
+        return Some(
+            "The error boundary event has an empty or unknown errorRef. A BPMN error \
+             boundary needs BOTH a top-level `<bpmn:error id=\"E_X\" errorCode=\"...\"/>` \
+             definition AND `<bpmn:errorEventDefinition errorRef=\"E_X\"/>` on the boundary \
+             event referencing that id (errorRef points at the error's `id`, not its \
+             `errorCode`). To model a RETRY, prefer a timer boundary event \
+             (interrupting=false) that loops back to the task, or reuse the model's existing \
+             error definition — do not leave errorRef empty."
+                .into(),
+        );
+    }
+    None
+}
+
+/// `validate_model` — a cheap, dataset-independent **lint/validate** pass over a candidate BPMN
+/// model. It parses the XML with the engine's own parser (the same one production deploys with),
+/// surfacing structural mistakes the LLM commonly makes — a dangling `errorRef`, a missing
+/// `<bpmn:definitions>` root, unparseable XML — before the model is ever simulated or deployed. A
+/// bare `<bpmn:process>` fragment is wrapped for analysis (with a warning to emit a full document).
+/// On a clean parse it folds in the full [`analyze_model`] structural findings.
+pub fn validate_model(xml: &str) -> Result<Value, String> {
+    let (doc, wrapped) = ensure_definitions(xml);
+    match analyze_model(&doc) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("valid".into(), Value::Bool(true));
+                if wrapped {
+                    if let Some(arr) = obj.get_mut("findings").and_then(|f| f.as_array_mut()) {
+                        arr.insert(
+                            0,
+                            finding(
+                                "warn",
+                                "missing-definitions-root",
+                                None,
+                                "Model was a bare <bpmn:process> fragment with no \
+                                 <bpmn:definitions> root; it was wrapped for analysis. Emit a \
+                                 full <bpmn:definitions …> document so it deploys and renders \
+                                 without normalization."
+                                    .into(),
+                            ),
+                        );
+                    }
+                    if let Some(w) = obj.get("warnings").and_then(|n| n.as_u64()) {
+                        obj.insert("warnings".into(), json!(w + 1));
+                    }
+                    obj.insert("findingCount".into(), json!(obj.get("findings").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0)));
+                    obj.insert("wrapped".into(), Value::Bool(true));
+                }
+            }
+            Ok(v)
+        }
+        Err(parse_error) => {
+            let fix = deploy_fix_hint(&parse_error);
+            let mut message = parse_error.clone();
+            if let Some(h) = &fix {
+                message.push_str("\nFix: ");
+                message.push_str(h);
+            }
+            Ok(json!({
+                "valid": false,
+                "parseError": parse_error,
+                "fix": fix,
+                "findingCount": 1,
+                "warnings": 0,
+                "infos": 0,
+                "findings": [finding("error", "parse-error", None, message)],
+                "note": "The model does not parse and cannot be deployed or simulated. Fix the \
+                         error above and re-run validate_model.",
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,6 +913,42 @@ mod tests {
     fn rejects_unparseable_xml() {
         assert!(read_model("not bpmn").is_err());
         assert!(analyze_model("<bpmn/>").is_err());
+    }
+
+    // The exact authoring mistake from the loan-approval variant: an error boundary whose
+    // errorRef points at no <bpmn:error> definition AND no <bpmn:definitions> root.
+    const BARE_DANGLING_ERRORREF: &str = r#"<bpmn:process id="loan-approval" isExecutable="true" xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe"><bpmn:startEvent id="StartEvent_1"/><bpmn:sequenceFlow id="f1" sourceRef="StartEvent_1" targetRef="Task_CreditCheck"/><bpmn:serviceTask id="Task_CreditCheck" name="Credit Check"><bpmn:extensionElements><zeebe:taskDefinition type="credit-check"/></bpmn:extensionElements></bpmn:serviceTask><bpmn:sequenceFlow id="f2" sourceRef="Task_CreditCheck" targetRef="EndEvent_Done"/><bpmn:endEvent id="EndEvent_Done"/><bpmn:boundaryEvent id="BoundaryEvent_CreditError" attachedToRef="Task_CreditCheck"><bpmn:errorEventDefinition errorRef="CREDIT_BUREAU_ERROR"/></bpmn:boundaryEvent><bpmn:sequenceFlow id="f3" sourceRef="BoundaryEvent_CreditError" targetRef="EndEvent_Err"/><bpmn:endEvent id="EndEvent_Err"/></bpmn:process>"#;
+
+    #[test]
+    fn validate_model_flags_a_dangling_error_ref_with_a_fix() {
+        let v = validate_model(BARE_DANGLING_ERRORREF).expect("validate returns Ok");
+        assert_eq!(v["valid"], false);
+        let pe = v["parseError"].as_str().unwrap();
+        assert!(pe.contains("unknown error"), "got: {pe}");
+        // The fix names the real cause: errorRef must point at an <bpmn:error id=…>.
+        let fix = v["fix"].as_str().unwrap();
+        assert!(fix.contains("errorRef"));
+        assert!(fix.contains("bpmn:error"));
+        assert_eq!(v["findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_model_wraps_a_bare_process_fragment() {
+        // A bare <bpmn:process> with a VALID error definition is still missing a definitions root.
+        let bare = r#"<bpmn:process id="p" isExecutable="true" xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"><bpmn:startEvent id="S"><bpmn:outgoing>f0</bpmn:outgoing></bpmn:startEvent><bpmn:endEvent id="E"><bpmn:incoming>f0</bpmn:incoming></bpmn:endEvent><bpmn:sequenceFlow id="f0" sourceRef="S" targetRef="E"/></bpmn:process>"#;
+        let v = validate_model(bare).expect("validate");
+        assert_eq!(v["valid"], true);
+        assert_eq!(v["wrapped"], true);
+        let findings = v["findings"].as_array().unwrap();
+        assert!(findings.iter().any(|f| f["code"] == "missing-definitions-root"));
+    }
+
+    #[test]
+    fn validate_model_passes_a_clean_document() {
+        let v = validate_model(LOAN_BPMN).expect("validate");
+        assert_eq!(v["valid"], true);
+        assert!(v.get("wrapped").is_none() || v["wrapped"] == false);
+        assert_eq!(v["processId"], "loan-approval");
     }
 
     #[test]

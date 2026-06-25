@@ -340,8 +340,12 @@ production, changes nothing, and cannot fail destructively — treat it like run
 big commitment you must get right in one shot. Do NOT second-guess yourself or talk yourself out of a \
 run; running it IS the validation, and the runtime and the data — not your own reasoning — decide \
 whether an idea holds. If a call errors (e.g. invalid XML) that is cheap, useful feedback, not a \
-failure: read the hint, fix it, run again. Iterate in three cheap escalating stages — this ladder is \
-the fastest path to a trustworthy answer, so climb it instead of agonising: (1) a SINGLE-RUN smoke, \
+failure: read the hint, fix it, run again. Iterate in cheap escalating stages — this ladder is \
+the fastest path to a trustworthy answer, so climb it instead of agonising: (0) a FREE LINT, \
+validate_model on the XML you just authored, to confirm it parses and is structurally sound — this \
+catches a dangling errorRef (an error boundary whose errorRef names no `<bpmn:error id=…>`) or a \
+missing `<bpmn:definitions>` root for nearly zero cost, before you waste a replay on a model that \
+cannot deploy; fix anything it returns with valid=false first. (1) a SINGLE-RUN smoke, \
 simulate with limit:1, to confirm the variant parses and conserves on one instance; (2) a SMALL \
 EXPERIMENT, limit:25, to surface obvious regressions fast; (3) the FULL dataset — drop limit, or \
 compare_variants against the baseline — for the verdict. Each rung is cheap and tells you whether the \

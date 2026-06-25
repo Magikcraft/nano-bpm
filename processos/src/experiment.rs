@@ -115,27 +115,11 @@ fn surface_deploy_error(scorecard: &mut Value) {
         .map(|s| s.to_string());
     let Some(err) = err else { return };
     if let Some(obj) = scorecard.as_object_mut() {
-        if let Some(hint) = deploy_fix_hint(&err) {
+        if let Some(hint) = crate::bpmn_model::deploy_fix_hint(&err) {
             obj.insert("fixHint".into(), Value::String(hint));
         }
         obj.insert("deployError".into(), Value::String(err));
     }
-}
-
-/// Map a known BPMN deploy/parse error to a concrete fix, so the model stops repeating it.
-fn deploy_fix_hint(err: &str) -> Option<String> {
-    if err.contains("InvalidBoundaryEvent") && err.contains("unknown error") {
-        return Some(
-            "The error boundary event has an empty or unknown errorRef. A BPMN error \
-             boundary needs BOTH a top-level `<bpmn:error id=\"E_X\" errorCode=\"...\"/>` \
-             definition AND `<bpmn:errorEventDefinition errorRef=\"E_X\"/>` on the boundary \
-             event referencing that id. To model a RETRY, prefer a timer boundary event \
-             (interrupting=false) that loops back to the task, or reuse the model's existing \
-             error definition — do not leave errorRef empty."
-                .into(),
-        );
-    }
-    None
 }
 
 /// `simulate` — replay one candidate model against the recorded dataset.
