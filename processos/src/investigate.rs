@@ -189,12 +189,17 @@ impl ToolBox for AnalysisTools {
                     waste a simulate round-trip: a dangling errorRef (an error boundary whose \
                     errorRef points at no `<bpmn:error id=…>` definition — a common one), a bare \
                     `<bpmn:process>` fragment missing its `<bpmn:definitions>` root, or otherwise \
-                    unparseable XML. On a parse error it returns valid=false with the error and an \
-                    actionable `fix`. On a clean parse it returns valid=true plus the full \
-                    analyze_model structural findings (unreachable nodes, dead ends, unguarded \
-                    service tasks, rework loops). ALWAYS validate a model you authored here first; \
-                    only simulate models that pass. Args: model (BPMN XML; omit to validate the \
-                    current process model)."
+                    unparseable XML. It also AUTO-HEALS the most common slip — `<errorBoundaryEvent>` \
+                    (not a real element) is rewritten to `<boundaryEvent>` — and FLAGS the silent \
+                    `zeebe:taskDefinition` ATTRIBUTE mistake (the engine ignores it, so the job type \
+                    defaults to the task id; use the `<bpmn:extensionElements><zeebe:taskDefinition \
+                    type=…/></bpmn:extensionElements>` child form), reporting both under `autoFixed` \
+                    / a `task-definition-as-attribute` finding. On a parse error it returns \
+                    valid=false with the error and an actionable `fix`. On a clean parse it returns \
+                    valid=true plus the full analyze_model structural findings (unreachable nodes, \
+                    dead ends, unguarded service tasks, rework loops). ALWAYS validate a model you \
+                    authored here first; only simulate models that pass. Args: model (BPMN XML; omit \
+                    to validate the current process model)."
                     .into(),
                 parameters: json!({
                     "type": "object",

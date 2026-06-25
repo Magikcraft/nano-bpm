@@ -307,6 +307,22 @@ instead of picking from a fixed menu.
   return `replayable:false` with skip accounting rather than fabricating a result. The recorded
   dataset is distilled once per chat turn (bounded to the most recent instances) whenever the
   process has a `model.bpmn`. The **Experiment Designer** persona drives these tools.
+- **Authoring guardrails — runtime errors pulled forward to the authoring boundary.** Hand-writing
+  whole-document BPMN is the weakest link for an LLM, so the two highest-frequency mistakes are
+  auto-healed and surfaced (IDE-red-squiggle style) instead of looping the model on opaque parse
+  errors (`bpmn_model::normalize_authoring` / `lint_task_definition_attribute`): (1) `<…:errorBoundaryEvent>`
+  — **not a real BPMN element** — is rewritten to `<…:boundaryEvent>` (an error boundary is a
+  `boundaryEvent` carrying a nested `errorEventDefinition`), the single most common cause of the
+  `sequence flow … has unknown source element` parse loop; (2) `zeebe:taskDefinition` written as a
+  serviceTask **attribute** (which the engine silently ignores, defaulting the job type to the task
+  id, so the worker never binds to recorded job types) is flagged as a `task-definition-as-attribute`
+  finding with the child-element fix. `validate_model` applies both (reporting them under `autoFixed`
+  / findings); `simulate` and `compare_variants` apply the same heal **at the deploy boundary** —
+  so the green light is on the same artifact that gets replayed — echoing what changed in
+  `authoringFixes`. The opaque engine `deployError` is additionally mapped to a concrete `fix` /
+  `fixHint` (`bpmn_model::deploy_fix_hint`) for the recurring boundary-event and unknown-element
+  errors. *(Next step on the roadmap: a structured `edit_model` patch tool so the model composes a
+  variant from validated operations instead of one-shotting raw XML at all.)*
 
 ```bash
 # Point the configured LLM at a workspace process bound to a dataset:

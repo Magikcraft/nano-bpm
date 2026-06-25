@@ -140,10 +140,13 @@ pub fn simulate(
     let rationale = args["rationale"].as_str().map(|s| s.to_string());
     let mock_workers = parse_mock_workers(&args["mockWorkers"]);
     let pid = default_process_id(dataset);
+    // Heal the common authoring mistakes at the deploy boundary so the model that gets REPLAYED is
+    // the one we validated — the green light is on the same artifact (no validate-X-but-simulate-Y).
+    let (healed, fixes) = crate::bpmn_model::normalize_authoring(model);
     let candidate = CandidateModel {
         name,
         rationale,
-        model: model.to_string(),
+        model: healed,
         mock_workers,
     };
     let instances = sample_slice(&dataset.instances, args);
@@ -155,11 +158,15 @@ pub fn simulate(
     if let Some(c) = v["candidates"].as_array_mut().and_then(|a| a.first_mut()) {
         trim_report(&mut c["report"]);
         surface_deploy_error(c);
+        if !fixes.is_empty() {
+            c["authoringFixes"] = json!(fixes);
+        }
         return Ok(json!({
             "replayable": true,
             "datasetSize": ranking.dataset_size,
             "datasetTotal": total,
             "sampled": sampled,
+            "authoringFixes": fixes,
             "scorecard": c,
         }));
     }
@@ -208,6 +215,9 @@ pub fn compare_variants(
     let shared_mocks = parse_mock_workers(&args["mockWorkers"]);
 
     let mut candidates: Vec<CandidateModel> = Vec::new();
+    // name -> authoring fixes applied, so we can surface them on the matching ranked output below.
+    let mut fixes_by_name: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     if include_baseline {
         if let Some(base) = base_model {
             candidates.push(CandidateModel {
@@ -226,13 +236,19 @@ pub fn compare_variants(
         for (jt, out) in parse_mock_workers(&c["mockWorkers"]) {
             mock_workers.insert(jt, out);
         }
+        let name = c["name"]
+            .as_str()
+            .unwrap_or(&format!("variant {}", i + 1))
+            .to_string();
+        // Heal authoring mistakes at the deploy boundary (see `simulate`); surface what changed.
+        let (healed, fixes) = crate::bpmn_model::normalize_authoring(model);
+        if !fixes.is_empty() {
+            fixes_by_name.insert(name.clone(), fixes);
+        }
         candidates.push(CandidateModel {
-            name: c["name"]
-                .as_str()
-                .unwrap_or(&format!("variant {}", i + 1))
-                .to_string(),
+            name,
             rationale: c["rationale"].as_str().map(|s| s.to_string()),
-            model: model.to_string(),
+            model: healed,
             mock_workers,
         });
     }
@@ -250,6 +266,9 @@ pub fn compare_variants(
         for c in arr.iter_mut() {
             trim_report(&mut c["report"]);
             surface_deploy_error(c);
+            if let Some(fixes) = c["name"].as_str().and_then(|n| fixes_by_name.get(n)) {
+                c["authoringFixes"] = json!(fixes);
+            }
         }
     }
     v["datasetTotal"] = json!(total);
@@ -354,6 +373,51 @@ mod tests {
         assert!((sc["report"]["conservedRate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
         // The heavy per-instance results were trimmed out.
         assert!(sc["report"].get("results").is_none());
+    }
+
+    // TWO_TASK plus an error boundary authored as the NON-EXISTENT `<bpmn:errorBoundaryEvent>` —
+    // unparseable as-is; the deploy boundary must auto-heal it (the Investigation 1 failure).
+    const TWO_TASK_ERR_BOUNDARY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Defs">
+  <bpmn:error id="E1" errorCode="BOOM"/>
+  <bpmn:process id="P" name="P" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Classify" />
+    <bpmn:serviceTask id="Classify" name="Classify">
+      <bpmn:extensionElements><zeebe:taskDefinition type="classify" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Classify" targetRef="Summarize" />
+    <bpmn:serviceTask id="Summarize" name="Summarize">
+      <bpmn:extensionElements><zeebe:taskDefinition type="summarize" /></bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming><bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="Summarize" targetRef="End" />
+    <bpmn:endEvent id="End"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+    <bpmn:errorBoundaryEvent id="BE" attachedToRef="Classify"><bpmn:errorEventDefinition errorRef="E1"/></bpmn:errorBoundaryEvent>
+    <bpmn:sequenceFlow id="f4" sourceRef="BE" targetRef="ErrEnd" />
+    <bpmn:endEvent id="ErrEnd" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn simulate_auto_heals_a_misspelled_error_boundary_at_the_deploy_boundary() {
+        let ds = dataset();
+        let v = simulate(
+            None,
+            &ds,
+            &json!({ "model": TWO_TASK_ERR_BOUNDARY, "name": "err" }),
+        )
+        .unwrap();
+        // It deployed and scored (not infeasible) because the deploy boundary healed the XML,
+        // and the fix is surfaced so the model learns rather than re-submitting the same mistake.
+        let sc = &v["scorecard"];
+        assert_eq!(sc["feasible"], true, "should deploy after healing: {sc}");
+        assert_eq!(sc["report"]["conserved"], 3);
+        let fixes = v["authoringFixes"].as_array().expect("authoringFixes");
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].as_str().unwrap().contains("errorBoundaryEvent"));
     }
 
     #[test]

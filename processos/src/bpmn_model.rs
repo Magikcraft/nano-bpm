@@ -726,7 +726,72 @@ pub fn deploy_fix_hint(err: &str) -> Option<String> {
                 .into(),
         );
     }
+    // A sequence flow points at a node id the process never declares. The most common cause is an
+    // error boundary authored as `<bpmn:errorBoundaryEvent>` (NOT a real BPMN element) — the engine
+    // never creates the node, so a flow whose sourceRef/targetRef names it dangles.
+    if err.contains("unknown source element") || err.contains("unknown target element") {
+        return Some(
+            "A sequence flow references a node id that the process never declares. Most common \
+             cause: an error boundary written as `<bpmn:errorBoundaryEvent …>` — that element does \
+             NOT exist in BPMN, so the node is never created and the flow referencing it dangles. \
+             Use `<bpmn:boundaryEvent id=\"X\" attachedToRef=\"Task\"><bpmn:errorEventDefinition \
+             errorRef=\"E\"/></bpmn:boundaryEvent>`. Otherwise check for a typo: every sequenceFlow \
+             sourceRef/targetRef must match a declared node id exactly."
+                .into(),
+        );
+    }
     None
+}
+
+/// Auto-heal the highest-frequency LLM BPMN authoring mistake **before** the model is parsed, so
+/// the experimenter iterates on process *semantics* instead of thrashing on syntax. The runtime
+/// error is pulled forward (and fixed) at the authoring boundary, IDE-red-squiggle style.
+///
+/// `<…:errorBoundaryEvent>` is not a real BPMN element — the engine models an error boundary as a
+/// `boundaryEvent` carrying a nested `errorEventDefinition`. When a model uses it, the boundary node
+/// is never created and every sequence flow referencing it fails with "unknown source element". We
+/// rename it in place and report what changed. (`errorBoundaryEvent` never legitimately occurs as a
+/// substring, so a plain rename is safe.) Returns `(healed_xml, notes)`; `notes` is empty when
+/// nothing was touched.
+pub fn normalize_authoring(xml: &str) -> (String, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut out = xml.to_string();
+    if out.contains("errorBoundaryEvent") {
+        out = out.replace("errorBoundaryEvent", "boundaryEvent");
+        notes.push(
+            "Renamed <errorBoundaryEvent> to <boundaryEvent>: errorBoundaryEvent is not a valid \
+             BPMN element. An error boundary is a <bpmn:boundaryEvent attachedToRef=\"Task\"> with \
+             a nested <bpmn:errorEventDefinition errorRef=\"…\"/>."
+                .to_string(),
+        );
+    }
+    (out, notes)
+}
+
+/// Lint for the silent `zeebe:taskDefinition` ATTRIBUTE mistake. Written as an attribute on a
+/// serviceTask (`<…:serviceTask … zeebe:taskDefinition="x">`), the engine **ignores it** and the
+/// job type silently defaults to the task **id** — so the variant's worker never binds to the
+/// recorded job types (it surfaces as an uncovered / brand-new worker, derailing the scorecard).
+/// The engine only reads the *child element* form `<zeebe:taskDefinition type="x"/>`. The element
+/// form writes `taskDefinition ` followed by ` type=`, so a literal `taskDefinition=` (no space)
+/// uniquely identifies the attribute misuse. Returns one advisory finding when present.
+pub(crate) fn lint_task_definition_attribute(xml: &str) -> Vec<Value> {
+    let count = xml.matches("taskDefinition=").count();
+    if count == 0 {
+        return Vec::new();
+    }
+    vec![finding(
+        "warn",
+        "task-definition-as-attribute",
+        None,
+        format!(
+            "{count} service task(s) declare zeebe:taskDefinition as an ATTRIBUTE \
+             (zeebe:taskDefinition=\"…\"). The engine IGNORES this — the job type silently \
+             defaults to the task id, so the worker will not bind to recorded job types (it shows \
+             up as uncovered / a new worker). Move it to the child element form: \
+             <bpmn:extensionElements><zeebe:taskDefinition type=\"your-job-type\"/></bpmn:extensionElements>."
+        ),
+    )]
 }
 
 /// `validate_model` — a cheap, dataset-independent **lint/validate** pass over a candidate BPMN
@@ -736,11 +801,26 @@ pub fn deploy_fix_hint(err: &str) -> Option<String> {
 /// bare `<bpmn:process>` fragment is wrapped for analysis (with a warning to emit a full document).
 /// On a clean parse it folds in the full [`analyze_model`] structural findings.
 pub fn validate_model(xml: &str) -> Result<Value, String> {
-    let (doc, wrapped) = ensure_definitions(xml);
+    let (healed, fixes) = normalize_authoring(xml);
+    let lint = lint_task_definition_attribute(&healed);
+    let (doc, wrapped) = ensure_definitions(&healed);
     match analyze_model(&doc) {
         Ok(mut v) => {
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("valid".into(), Value::Bool(true));
+                if let Some(arr) = obj.get_mut("findings").and_then(|f| f.as_array_mut()) {
+                    // Surface the silent taskDefinition-attribute mistake (advisory) and report any
+                    // syntax we auto-healed, so the model learns rather than re-submitting it.
+                    for l in lint.into_iter().rev() {
+                        arr.insert(0, l);
+                    }
+                    for note in fixes.iter().rev() {
+                        arr.insert(0, finding("info", "auto-fixed", None, note.clone()));
+                    }
+                }
+                if !fixes.is_empty() {
+                    obj.insert("autoFixed".into(), json!(fixes));
+                }
                 if wrapped {
                     if let Some(arr) = obj.get_mut("findings").and_then(|f| f.as_array_mut()) {
                         arr.insert(
@@ -757,18 +837,21 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
                             ),
                         );
                     }
-                    if let Some(w) = obj.get("warnings").and_then(|n| n.as_u64()) {
-                        obj.insert("warnings".into(), json!(w + 1));
-                    }
-                    obj.insert(
-                        "findingCount".into(),
-                        json!(obj
-                            .get("findings")
-                            .and_then(|f| f.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0)),
-                    );
                     obj.insert("wrapped".into(), Value::Bool(true));
+                }
+                // Recompute the headline counts so they reflect the findings we just inserted.
+                if let Some(arr) = obj.get("findings").and_then(|f| f.as_array()) {
+                    let (mut warns, mut infos) = (0u64, 0u64);
+                    for f in arr {
+                        match f.get("severity").and_then(|s| s.as_str()) {
+                            Some("warn") => warns += 1,
+                            Some("info") => infos += 1,
+                            _ => {}
+                        }
+                    }
+                    obj.insert("findingCount".into(), json!(arr.len()));
+                    obj.insert("warnings".into(), json!(warns));
+                    obj.insert("infos".into(), json!(infos));
                 }
             }
             Ok(v)
@@ -780,14 +863,20 @@ pub fn validate_model(xml: &str) -> Result<Value, String> {
                 message.push_str("\nFix: ");
                 message.push_str(h);
             }
+            let mut findings = Vec::new();
+            for note in &fixes {
+                findings.push(finding("info", "auto-fixed", None, note.clone()));
+            }
+            findings.push(finding("error", "parse-error", None, message));
             Ok(json!({
                 "valid": false,
                 "parseError": parse_error,
                 "fix": fix,
-                "findingCount": 1,
+                "autoFixed": fixes,
+                "findingCount": findings.len(),
                 "warnings": 0,
-                "infos": 0,
-                "findings": [finding("error", "parse-error", None, message)],
+                "infos": fixes.len(),
+                "findings": findings,
                 "note": "The model does not parse and cannot be deployed or simulated. Fix the \
                          error above and re-run validate_model.",
             }))
@@ -977,6 +1066,85 @@ mod tests {
         assert_eq!(v["valid"], true);
         assert!(v.get("wrapped").is_none() || v["wrapped"] == false);
         assert_eq!(v["processId"], "loan-approval");
+    }
+
+    // The exact loop from Investigation 1: an error boundary authored as the NON-EXISTENT element
+    // `<bpmn:errorBoundaryEvent>`, so the node is never created and the flow off it dangles.
+    const ERROR_BOUNDARY_MISSPELLED: &str = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:error id="E_CREDIT" errorCode="CREDIT_BUREAU_ERROR"/>
+  <bpmn:process id="loan-approval" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="Task_CreditCheck"/>
+    <bpmn:serviceTask id="Task_CreditCheck" name="Credit Check"><bpmn:extensionElements><zeebe:taskDefinition type="credit-check"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Task_CreditCheck" targetRef="EndDone"/>
+    <bpmn:endEvent id="EndDone"/>
+    <bpmn:errorBoundaryEvent id="BoundaryEvent_CreditError" attachedToRef="Task_CreditCheck"><bpmn:errorEventDefinition errorRef="E_CREDIT"/></bpmn:errorBoundaryEvent>
+    <bpmn:sequenceFlow id="f3" sourceRef="BoundaryEvent_CreditError" targetRef="EndErr"/>
+    <bpmn:endEvent id="EndErr"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn normalize_authoring_renames_error_boundary_event() {
+        // Before: errorBoundaryEvent makes the model unparseable (dangling flow source).
+        assert!(analyze_model(ERROR_BOUNDARY_MISSPELLED).is_err());
+        let (healed, notes) = normalize_authoring(ERROR_BOUNDARY_MISSPELLED);
+        assert!(!healed.contains("errorBoundaryEvent"));
+        assert!(healed.contains("boundaryEvent"));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("errorBoundaryEvent"));
+        // After healing it parses cleanly.
+        analyze_model(&healed).expect("healed model parses");
+    }
+
+    #[test]
+    fn validate_model_auto_heals_a_misspelled_error_boundary() {
+        let v = validate_model(ERROR_BOUNDARY_MISSPELLED).expect("validate returns Ok");
+        // The model that thrashed Investigation 1 now passes, with a note on what was fixed.
+        assert_eq!(v["valid"], true);
+        assert!(v["autoFixed"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false));
+        let findings = v["findings"].as_array().unwrap();
+        assert!(findings.iter().any(|f| f["code"] == "auto-fixed"));
+    }
+
+    #[test]
+    fn deploy_fix_hint_explains_an_unknown_source_element() {
+        let err = "InvalidProcess { process_id: \"loan-approval\", reason: \"sequence flow \
+                   BoundaryEvent_CreditError->EndEvent_CreditError has unknown source element \
+                   BoundaryEvent_CreditError\" }";
+        let hint = deploy_fix_hint(err).expect("hint");
+        assert!(hint.contains("errorBoundaryEvent"));
+        assert!(hint.contains("boundaryEvent"));
+    }
+
+    #[test]
+    fn validate_model_flags_task_definition_used_as_an_attribute() {
+        // The silent mistake: zeebe:taskDefinition as a serviceTask attribute (engine ignores it,
+        // job type defaults to the task id) — parses fine, so it must be surfaced as a warning.
+        let bad = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="T"/>
+    <bpmn:serviceTask id="T" name="Pre Screen" zeebe:taskDefinition="pre-screen"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="T" targetRef="E"/>
+    <bpmn:endEvent id="E"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let v = validate_model(bad).expect("validate");
+        assert_eq!(v["valid"], true);
+        let findings = v["findings"].as_array().unwrap();
+        assert!(findings
+            .iter()
+            .any(|f| f["code"] == "task-definition-as-attribute"));
+    }
+
+    #[test]
+    fn lint_task_definition_attribute_ignores_the_correct_element_form() {
+        // The proper child-element form must NOT trip the lint.
+        assert!(lint_task_definition_attribute(LOAN_BPMN).is_empty());
     }
 
     #[test]
