@@ -450,7 +450,7 @@ impl OpenAiAgent {
             "frequency_penalty": self.cfg.frequency_penalty,
             "tools": tool_defs,
             "stream": stream,
-            "messages": msgs.iter().map(openai_message).collect::<Vec<_>>(),
+            "messages": wire_messages(msgs),
         })
     }
 
@@ -677,6 +677,68 @@ fn openai_message(m: &Msg) -> Value {
             "content": content,
         }),
     }
+}
+
+/// Build the wire `messages` array, shrinking the resent context so long investigations don't
+/// blow past the model's context window (the agent transcript is otherwise never trimmed — it
+/// is re-sent in full every round, and the Experiment persona's read_model XML, simulate
+/// scorecards and authored variants accumulate fast). Two reductions, neither of which touches
+/// the persisted transcript the cockpit renders:
+///   1. The model's own `<think>…</think>` reasoning is NEVER resent — a chat API does not need
+///      a model's past chain-of-thought, and on a local model that drafts BPMN XML in its head
+///      it is the single biggest amplifier. The `<think>` block stays in the saved transcript so
+///      the UI's "Thinking" disclosure is unaffected.
+///   2. Large tool results from EARLIER rounds are truncated to a cap; the most recent messages
+///      are kept verbatim so the model still reasons over fresh data in full.
+fn wire_messages(msgs: &[Msg]) -> Vec<Value> {
+    // Trailing messages kept fully verbatim (covers roughly the last couple of rounds).
+    const KEEP_RECENT: usize = 6;
+    // Earlier tool results longer than this (chars) are clipped — generous enough to keep a
+    // full small model intact, bounded enough to stop unbounded growth.
+    const TOOL_RESULT_CAP: usize = 6000;
+    let n = msgs.len();
+    msgs.iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let recent = i + KEEP_RECENT >= n;
+            match m {
+                // Strip the model's own reasoning from every assistant turn we resend.
+                Msg::Assistant { text, tool_calls } => {
+                    let stripped = text.as_deref().map(|t| strip_think_blocks(t).trim().to_string());
+                    openai_message(&Msg::Assistant {
+                        text: stripped.filter(|s| !s.is_empty()),
+                        tool_calls: tool_calls.clone(),
+                    })
+                }
+                // Clip big tool results from earlier rounds; keep recent ones whole.
+                Msg::Tool { call_id, content } if !recent && content.len() > TOOL_RESULT_CAP => {
+                    openai_message(&Msg::Tool {
+                        call_id: call_id.clone(),
+                        content: clip(content, TOOL_RESULT_CAP),
+                    })
+                }
+                other => openai_message(other),
+            }
+        })
+        .collect()
+}
+
+/// Truncate a tool result on a char boundary, leaving a note so the model knows content was
+/// dropped to fit the context window (rather than silently seeing a half result).
+fn clip(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n…[truncated {} chars of an earlier tool result to fit the context window — \
+         re-run the tool if you need the full output]",
+        &s[..end],
+        s.len() - end
+    )
 }
 
 fn parse_openai_turn(message: &Value) -> Result<Turn, String> {
@@ -1350,6 +1412,47 @@ mod tests {
         }];
         assert_eq!(tool_call_signature(&a), tool_call_signature(&b));
         assert_ne!(tool_call_signature(&a), tool_call_signature(&c));
+    }
+
+    #[test]
+    fn wire_messages_strips_reasoning_and_clips_old_tool_results() {
+        let big = "X".repeat(9000);
+        let mut msgs = vec![
+            Msg::System("sys".into()),
+            Msg::User("go".into()),
+            // An old, oversized tool result (e.g. a full read_model XML) — should be clipped.
+            Msg::Tool { call_id: "t0".into(), content: big.clone() },
+            // An assistant turn whose text is pure chain-of-thought — should not be resent.
+            Msg::Assistant {
+                text: Some("<think>I will author a big BPMN variant…</think>".into()),
+                tool_calls: vec![ToolCall { id: "c1".into(), name: "simulate".into(), arguments: json!({"model":"<x/>"}) }],
+            },
+        ];
+        let old_tool_idx = 2;
+        let old_asst_idx = 3;
+        // Pad with later rounds so the result above is well outside KEEP_RECENT of the end.
+        for k in 0..8 {
+            msgs.push(Msg::User(format!("round {k}")));
+        }
+        // Recent messages (within KEEP_RECENT of the end) — kept verbatim.
+        msgs.push(Msg::Tool { call_id: "c9".into(), content: big.clone() });
+        let recent_tool_idx = msgs.len() - 1;
+        msgs.push(Msg::Assistant { text: Some("<think>done</think>The bottleneck is credit-check.".into()), tool_calls: vec![] });
+        let final_asst_idx = msgs.len() - 1;
+        let wire = wire_messages(&msgs);
+
+        // Reasoning is gone from BOTH assistant turns; the user-facing answer survives.
+        assert_eq!(wire[old_asst_idx]["content"], "");
+        assert_eq!(wire[old_asst_idx]["tool_calls"][0]["function"]["name"], "simulate");
+        let final_content = wire[final_asst_idx]["content"].as_str().unwrap();
+        assert!(!final_content.contains("<think>"));
+        assert!(final_content.contains("credit-check"));
+
+        // The OLD oversized tool result is clipped; the RECENT one is kept whole.
+        let old_tool = wire[old_tool_idx]["content"].as_str().unwrap();
+        assert!(old_tool.len() < big.len());
+        assert!(old_tool.contains("truncated"));
+        assert_eq!(wire[recent_tool_idx]["content"].as_str().unwrap().len(), big.len());
     }
 
     /// Mock that always asks for the SAME tool call, but answers in prose once the
