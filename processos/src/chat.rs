@@ -487,6 +487,41 @@ fn split_thinking(text: &str) -> (String, String) {
 /// each round's `<think>` block) with the tool calls in chronological order, so the cockpit
 /// can render each tool call exactly where it happened in the thinking. The visible `text` is
 /// the final answer with its `<think>` stripped; the system message is omitted.
+/// Extract the Alternate Reality Engine runs (`simulate` / `compare_variants`) from a persisted
+/// transcript, pairing each tool call with its result, for the cockpit's Simulations tab. Each
+/// returned run carries the raw tool `arguments` (which include the candidate BPMN XML) and the
+/// parsed `result` (the fidelity scorecard / ranking), in transcript order.
+pub fn extract_simulations(messages: &[Msg]) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+    // Tool results, by the call_id they answer.
+    let mut results: HashMap<&str, &str> = HashMap::new();
+    for m in messages {
+        if let Msg::Tool { call_id, content } = m {
+            results.insert(call_id.as_str(), content.as_str());
+        }
+    }
+    let mut runs = Vec::new();
+    for m in messages {
+        if let Msg::Assistant { tool_calls, .. } = m {
+            for tc in tool_calls {
+                if tc.name != "simulate" && tc.name != "compare_variants" {
+                    continue;
+                }
+                let result = results.get(tc.id.as_str()).map(|c| {
+                    serde_json::from_str::<serde_json::Value>(c)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": c }))
+                });
+                runs.push(serde_json::json!({
+                    "tool": tc.name,
+                    "arguments": tc.arguments,
+                    "result": result,
+                }));
+            }
+        }
+    }
+    runs
+}
+
 pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
     let mut turns: Vec<ChatTurnView> = Vec::new();
     // Tool calls awaiting their results / a final answer, by call_id.
@@ -732,6 +767,41 @@ mod tests {
         assert_eq!(view[1].steps.len(), 1);
         assert_eq!(view[1].steps[0].tool, "query_traces");
         assert_eq!(view[1].steps[0].result, "1");
+    }
+
+    #[test]
+    fn extract_simulations_pairs_runs_with_scorecards() {
+        let transcript = vec![
+            Msg::System("sys".into()),
+            Msg::User("make it faster".into()),
+            Msg::Assistant {
+                text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "q1".into(),
+                        name: "query_traces".into(),
+                        arguments: json!({"sql": "SELECT 1"}),
+                    },
+                    ToolCall {
+                        id: "s1".into(),
+                        name: "simulate".into(),
+                        arguments: json!({"name": "parallelised", "model": "<bpmn/>"}),
+                    },
+                ],
+            },
+            Msg::Tool { call_id: "q1".into(), content: "1".into() },
+            Msg::Tool {
+                call_id: "s1".into(),
+                content: json!({"replayable": true, "datasetSize": 42, "scorecard": {"fidelityTier": "recorded-replay"}}).to_string(),
+            },
+        ];
+        let runs = extract_simulations(&transcript);
+        // Only the simulate call is extracted (query_traces is ignored).
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["tool"], "simulate");
+        assert_eq!(runs[0]["arguments"]["model"], "<bpmn/>");
+        assert_eq!(runs[0]["result"]["datasetSize"], 42);
+        assert_eq!(runs[0]["result"]["scorecard"]["fidelityTier"], "recorded-replay");
     }
 
     #[test]

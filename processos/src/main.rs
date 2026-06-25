@@ -417,6 +417,10 @@ async fn main() {
             get(cockpit_chat_session_debug),
         )
         .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/simulations",
+            get(cockpit_chat_session_simulations),
+        )
+        .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/stream",
             post(cockpit_chat_stream),
         )
@@ -1405,6 +1409,24 @@ async fn cockpit_chat_session_debug(
         .and_then(|m| m.get(&cancel_key).cloned())
         .unwrap_or_default();
     Json(serde_json::json!({ "sessionId": id, "requests": requests }))
+}
+
+/// `GET .../chat/sessions/{id}/simulations` — the Alternate Reality Engine runs
+/// (`simulate` / `compare_variants`) recorded in this session's persisted transcript, each
+/// pairing the candidate model(s) with their fidelity scorecard. Powers the cockpit's
+/// "Simulations" tab so the operator can watch the droid's exploration — the variants it forked
+/// and how each scored. Reads the persisted transcript, so it survives restarts (unlike Debug).
+async fn cockpit_chat_session_simulations(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let runs = state
+        .chat
+        .get(&key, &id)
+        .map(|s| chat::extract_simulations(&s.messages))
+        .unwrap_or_default();
+    Json(serde_json::json!({ "sessionId": id, "runs": runs }))
 }
 
 /// `DELETE .../chat/sessions/{id}` — delete a chat session.
