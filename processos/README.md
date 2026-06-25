@@ -300,13 +300,20 @@ instead of picking from a fixed menu.
   REAL recorded production instances through it on an in-process engine, returning a fidelity
   scorecard (fidelity tier, boundary-conserved count and conserved-rate, replayed latency,
   per-job-type coverage, the job types it would need new workers for, and any output keys it
-  failed to reproduce). `compare_variants` scores a whole *multiverse* of candidates against the
+  failed to reproduce). When a flagged `requiresNewWorkers` / `uncoveredJobTypes` value happens to
+  equal a service task's **id**, the scorecard attaches a `jobTypeHints` entry explaining it is the
+  `zeebe:taskDefinition`-didn't-bind mistake (the job type defaulted to the element id) — not the
+  engine matching on element_id — and points at the `edit_model set_task_job_type` fix, so the model
+  stops perceiving it as an engine bug. `compare_variants` scores a whole *multiverse* of candidates against the
   same recorded dataset — the current model included as the `baseline` — and ranks them
   fidelity-first. Both are built on the deterministic replay harness and need **Tier-2
   recorded-input capture** (`c8 nano --capture` / `NANOBPMN_TRACE_STIMULI`); without it they
   return `replayable:false` with skip accounting rather than fabricating a result. The recorded
   dataset is distilled once per chat turn (bounded to the most recent instances) whenever the
-  process has a `model.bpmn`. The **Experiment Designer** persona drives these tools.
+  process has a `model.bpmn`. A new worker can also be mocked as a **failure** — a mock outcome
+  with `"throwError": "<ERROR_CODE>"` (instead of `"output"`) makes the worker raise that BPMN
+  business error so a candidate's **error boundary** is actually exercised under replay (weight it
+  to fail a fraction of the population). The **Experiment Designer** persona drives these tools.
 - **Authoring guardrails — runtime errors pulled forward to the authoring boundary.** Hand-writing
   whole-document BPMN is the weakest link for an LLM, so the two highest-frequency mistakes are
   auto-healed and surfaced (IDE-red-squiggle style) instead of looping the model on opaque parse

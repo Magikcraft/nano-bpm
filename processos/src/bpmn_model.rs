@@ -794,6 +794,56 @@ pub(crate) fn lint_task_definition_attribute(xml: &str) -> Vec<Value> {
     )]
 }
 
+/// Explain the **"the simulate engine uses the element id as the job type"** symptom.
+///
+/// When a candidate's serviceTask carries no parseable `zeebe:taskDefinition` *child*
+/// element, the engine has nothing to bind and the job type silently defaults to the
+/// task **id**. Simulate then reports that id under `uncoveredJobTypes` /
+/// `requiresNewWorkers`, which reads like an engine bug ("it matched on element_id!")
+/// — but it is the taskDefinition-binding mistake surfacing one step downstream.
+///
+/// Given the (healed) candidate XML and the job types simulate flagged as uncovered,
+/// this returns an actionable hint for every uncovered job type that exactly equals a
+/// serviceTask id in the model — pulling the runtime confusion forward into a crisp,
+/// fixable signal. Returns an empty vec on a parse failure or when no uncovered job
+/// type matches a task id (the normal, correctly-bound case).
+pub(crate) fn job_type_binding_hints(xml: &str, uncovered: &[String]) -> Vec<Value> {
+    if uncovered.is_empty() {
+        return Vec::new();
+    }
+    let Ok((def, _)) = first_def(xml) else {
+        return Vec::new();
+    };
+    let mut hints = Vec::new();
+    for (id, el) in &def.elements {
+        if let ElementKind::ServiceTask { job_type, .. } = &el.kind {
+            // The job type defaulted to the task id *and* simulate flagged it as a
+            // worker history never recorded — the binding-mistake signature.
+            if job_type == id && uncovered.iter().any(|u| u == id) {
+                hints.push(finding(
+                    "warn",
+                    "job-type-defaulted-to-task-id",
+                    Some(id),
+                    format!(
+                        "Job type '{id}' equals the serviceTask id — this is NOT an engine bug. \
+                         The engine fell back to the element id because '{id}' has no parseable \
+                         <zeebe:taskDefinition> CHILD element, so its worker never bound to the \
+                         recorded job types (it shows up as uncovered / requires-new-worker). Fix \
+                         the binding: either set it with edit_model \
+                         {{\"op\":\"set_task_job_type\",\"task\":\"{id}\",\"jobType\":\"<recorded-job-type>\"}} \
+                         or write the child-element form \
+                         <bpmn:extensionElements><zeebe:taskDefinition type=\"<recorded-job-type>\"/></bpmn:extensionElements> \
+                         (a taskDefinition ATTRIBUTE is ignored). Use a job type that matches the \
+                         recorded dataset so the existing worker output is replayed."
+                    ),
+                ));
+            }
+        }
+    }
+    hints.sort_by(|a, b| a["element"].as_str().cmp(&b["element"].as_str()));
+    hints
+}
+
 /// `validate_model` — a cheap, dataset-independent **lint/validate** pass over a candidate BPMN
 /// model. It parses the XML with the engine's own parser (the same one production deploys with),
 /// surfacing structural mistakes the LLM commonly makes — a dangling `errorRef`, a missing
@@ -2037,6 +2087,52 @@ mod tests {
         assert!(xml.contains("<bpmn:error "), "emits an error declaration");
         let reparsed = parse_bpmn(&xml).expect("re-parses");
         assert_same_structure(&orig, &reparsed[0]);
+    }
+
+    #[test]
+    fn job_type_binding_hints_flags_task_id_as_job_type() {
+        // A serviceTask with NO parseable taskDefinition child: the engine defaults its
+        // job type to the element id. When simulate reports that id as uncovered, the
+        // hint must fire and name the task.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Defs">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Task_CreditCheck" />
+    <bpmn:serviceTask id="Task_CreditCheck" name="Credit Check">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Task_CreditCheck" targetRef="End" />
+    <bpmn:endEvent id="End"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let hints = job_type_binding_hints(xml, &["Task_CreditCheck".to_string()]);
+        assert_eq!(hints.len(), 1, "exactly one binding hint expected");
+        assert_eq!(hints[0]["code"], "job-type-defaulted-to-task-id");
+        assert_eq!(hints[0]["element"], "Task_CreditCheck");
+    }
+
+    #[test]
+    fn job_type_binding_hints_silent_when_job_type_is_bound() {
+        // A correctly-bound serviceTask whose job type differs from its id must not
+        // trip the hint, even if its (real) job type is uncovered for other reasons.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Defs">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Task_CreditCheck" />
+    <bpmn:serviceTask id="Task_CreditCheck" name="Credit Check">
+      <bpmn:extensionElements><zeebe:taskDefinition type="credit-check" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="Task_CreditCheck" targetRef="End" />
+    <bpmn:endEvent id="End"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let hints = job_type_binding_hints(xml, &["credit-check".to_string()]);
+        assert!(hints.is_empty(), "bound job type must not trip the hint");
     }
 
     #[test]

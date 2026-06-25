@@ -458,7 +458,17 @@ NON-DETERMINISTIC with a weighted distribution instead of a single value, e.g. \
 the replayed instances reproducibly, so ~70% take the approve branch and ~30% the reject branch. The \
 variant then \
 scores at mocked-replay (Level 3) instead of being unscorable — just be explicit that the result \
-rests on your mock assumption. When a measured (Level-2) change is available, prefer it: reordering or \
+rests on your mock assumption. To MOCK A FAILURE (exercise an error boundary or see how a fault \
+propagates), give a mock outcome `\"throwError\": \"<ERROR_CODE>\"` instead of `\"output\"` — the \
+worker raises that BPMN business error rather than completing; pair it with an error boundary whose \
+`errorRef` resolves to that code. Fail a fraction of the population by weighting it, e.g. \
+{\"credit-check\": {\"outcomes\": [{\"weight\": 0.9, \"output\": {\"score\": 700}}, {\"weight\": 0.1, \
+\"throwError\": \"CREDIT_DECLINED\"}]}}. If a scorecard reports a `requiresNewWorkers` / \
+`uncoveredJobTypes` value that EQUALS a service task's id (look for a `jobTypeHints` entry), that is \
+NOT an engine bug matching on element_id — your task's `zeebe:taskDefinition` did not bind, so the job \
+type defaulted to the id. Fix the binding with edit_model `set_task_job_type` (use the RECORDED job \
+type) so the existing worker output replays; do not invent a new worker for it. When a measured \
+(Level-2) change is available, prefer it: reordering or \
 parallelising EXISTING tasks, or adding a retry on an existing one, scores at full fidelity with no \
 mock needed. To choose between \
 several ideas, call compare_variants with the whole population (the current model is included as the \

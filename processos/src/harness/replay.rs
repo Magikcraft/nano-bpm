@@ -52,11 +52,20 @@ use crate::contracts::{InstanceTrace, Variables};
 pub type MockWorkers = HashMap<String, MockWorker>;
 
 /// One possible output of a mock worker, with a relative `weight` within its
-/// worker's distribution.
+/// worker's distribution. An outcome is normally a *completion* carrying `output`
+/// deltas, but when `error_code` is set it is instead a *business-error throw* —
+/// the mock worker raises a BPMN error (consuming the job) so the candidate's
+/// error-handling path (an error boundary event) can be exercised under replay.
+/// This is how an LLM mocks a *failure*, not just a success, of a new worker.
 #[derive(Clone, Debug)]
 pub struct MockOutcome {
     pub weight: f64,
     pub output: HashMap<String, Json>,
+    /// When set, this outcome throws a BPMN business error with this code instead
+    /// of completing the job. `output` is ignored for a throw outcome.
+    pub error_code: Option<String>,
+    /// Optional human-readable message accompanying a thrown error.
+    pub error_message: Option<String>,
 }
 
 /// A mock worker for one new job type: a weighted distribution over output
@@ -74,6 +83,21 @@ impl MockWorker {
             outcomes: vec![MockOutcome {
                 weight: 1.0,
                 output,
+                error_code: None,
+                error_message: None,
+            }],
+        }
+    }
+
+    /// A deterministic mock that always throws the business error `error_code`.
+    #[allow(dead_code)] // used in tests and a useful constructor for callers
+    pub fn always_throws(error_code: impl Into<String>) -> Self {
+        Self {
+            outcomes: vec![MockOutcome {
+                weight: 1.0,
+                output: HashMap::new(),
+                error_code: Some(error_code.into()),
+                error_message: None,
             }],
         }
     }
@@ -84,27 +108,27 @@ impl MockWorker {
         self.outcomes.len() > 1
     }
 
-    /// Choose an outcome's output for a job invocation, given a stable `seed` in
+    /// Choose an outcome for a job invocation, given a stable `seed` in
     /// `[0, u64::MAX]`. Weights are relative; a non-positive total collapses to
     /// the first outcome. Returns `None` only when there are no outcomes.
-    fn pick(&self, seed: u64) -> Option<&HashMap<String, Json>> {
+    fn pick(&self, seed: u64) -> Option<&MockOutcome> {
         match self.outcomes.as_slice() {
             [] => None,
-            [only] => Some(&only.output),
+            [only] => Some(only),
             many => {
                 let total: f64 = many.iter().map(|o| o.weight.max(0.0)).sum();
                 if total <= 0.0 {
-                    return Some(&many[0].output);
+                    return Some(&many[0]);
                 }
                 let target = (seed as f64 / u64::MAX as f64) * total;
                 let mut acc = 0.0;
                 for o in many {
                     acc += o.weight.max(0.0);
                     if target < acc {
-                        return Some(&o.output);
+                        return Some(o);
                     }
                 }
-                many.last().map(|o| &o.output)
+                many.last()
             }
         }
     }
@@ -132,9 +156,17 @@ fn fnv1a64(s: &str) -> u64 {
 ///   non-deterministic worker whose outcomes are spread across the replayed
 ///   population (so a downstream split is exercised both ways).
 ///
+/// Either form can model a **failure** instead of a completion. An outcome (or a
+/// static spec) carrying `"throwError": "CODE"` (alias `"errorCode"`) raises a BPMN
+/// business error from the worker rather than completing it — so the candidate's
+/// error boundary path is exercised. A distribution lets a worker fail a fraction
+/// of the population: `{ "credit-check": { "outcomes": [
+///     { "weight": 0.9, "output": { "score": 700 } },
+///     { "weight": 0.1, "throwError": "CREDIT_DECLINED" } ] } }`.
+///
 /// The distribution form is recognised by an `outcomes` array; any other object is
-/// taken verbatim as a single deterministic output. A non-object (or absent) value,
-/// and per-type values that are not objects, yield no mock for that type.
+/// taken verbatim as a single deterministic output (or throw). A non-object (or
+/// absent) value, and per-type values that are not objects, yield no mock.
 pub fn parse_mock_workers(v: &Json) -> MockWorkers {
     let mut mocks = MockWorkers::new();
     if let Some(obj) = v.as_object() {
@@ -145,6 +177,24 @@ pub fn parse_mock_workers(v: &Json) -> MockWorkers {
         }
     }
     mocks
+}
+
+/// Read a thrown-error code from a spec/outcome object: `throwError` (preferred)
+/// or `errorCode` — each a string. (A bare `error` key is *not* a trigger: it is a
+/// common data-variable name and would collide with completion output.) Returns
+/// `(error_code, error_message)`.
+fn parse_throw(obj: &serde_json::Map<String, Json>) -> (Option<String>, Option<String>) {
+    let code = obj
+        .get("throwError")
+        .or_else(|| obj.get("errorCode"))
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string());
+    let message = obj
+        .get("errorMessage")
+        .or_else(|| obj.get("message"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    (code, message)
 }
 
 fn parse_mock_worker(spec: &Json) -> Option<MockWorker> {
@@ -163,7 +213,13 @@ fn parse_mock_worker(spec: &Json) -> Option<MockWorker> {
                     .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default();
                 let weight = io.get("weight").and_then(|w| w.as_f64()).unwrap_or(1.0);
-                outcomes.push(MockOutcome { weight, output });
+                let (error_code, error_message) = parse_throw(io);
+                outcomes.push(MockOutcome {
+                    weight,
+                    output,
+                    error_code,
+                    error_message,
+                });
             }
             if outcomes.is_empty() {
                 None
@@ -172,6 +228,17 @@ fn parse_mock_worker(spec: &Json) -> Option<MockWorker> {
             }
         }
         _ => {
+            let (error_code, error_message) = parse_throw(obj);
+            if error_code.is_some() {
+                return Some(MockWorker {
+                    outcomes: vec![MockOutcome {
+                        weight: 1.0,
+                        output: HashMap::new(),
+                        error_code,
+                        error_message,
+                    }],
+                });
+            }
             let output: HashMap<String, Json> =
                 obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             Some(MockWorker::deterministic(output))
@@ -504,17 +571,36 @@ pub fn replay_instance_with_mocks(
                             if !mocked.contains(&job_type) {
                                 mocked.push(job_type.clone());
                             }
-                            let out: HashMap<String, Value> = mock_out
-                                .iter()
-                                .map(|(k, v)| (k.clone(), json_to_value(v)))
-                                .collect();
-                            let _ = engine.apply_command_at(
-                                Command::CompleteJob {
-                                    job_key,
-                                    variables: out,
-                                },
-                                clock,
-                            );
+                            if let Some(code) = &mock_out.error_code {
+                                // The mock models a *failure*: throw a BPMN business
+                                // error so the candidate's error boundary (if any)
+                                // runs. With no matching boundary the engine raises
+                                // an incident — exactly the historic failure mode.
+                                let _ = engine.apply_command_at(
+                                    Command::ThrowJobError {
+                                        job_key,
+                                        error_code: code.clone(),
+                                        error_message: mock_out
+                                            .error_message
+                                            .clone()
+                                            .unwrap_or_default(),
+                                    },
+                                    clock,
+                                );
+                            } else {
+                                let out: HashMap<String, Value> = mock_out
+                                    .output
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), json_to_value(v)))
+                                    .collect();
+                                let _ = engine.apply_command_at(
+                                    Command::CompleteJob {
+                                        job_key,
+                                        variables: out,
+                                    },
+                                    clock,
+                                );
+                            }
                         }
                         None => {
                             if !uncovered.contains(&job_type) {
@@ -1012,10 +1098,14 @@ mod tests {
                 MockOutcome {
                     weight: 0.7,
                     output: map(&[("preApproved", json!(true))]),
+                    error_code: None,
+                    error_message: None,
                 },
                 MockOutcome {
                     weight: 0.3,
                     output: map(&[("preApproved", json!(false))]),
+                    error_code: None,
+                    error_message: None,
                 },
             ],
         };
@@ -1028,8 +1118,8 @@ mod tests {
             let seed = fnv1a64(&format!("{key}|credit-check|1"));
             let out = worker.pick(seed).unwrap();
             // Selection is stable for a given key.
-            assert_eq!(out, worker.pick(seed).unwrap());
-            if out.get("preApproved") == Some(&json!(true)) {
+            assert_eq!(out.output, worker.pick(seed).unwrap().output);
+            if out.output.get("preApproved") == Some(&json!(true)) {
                 trues += 1;
             }
         }
@@ -1061,6 +1151,90 @@ mod tests {
             "outcomes form is non-deterministic"
         );
         assert_eq!(mocks["credit-check"].outcomes.len(), 2);
+    }
+
+    #[test]
+    fn parse_mock_workers_reads_throw_error_in_both_forms() {
+        // Static throw form, and a distribution where one outcome throws.
+        let v = json!({
+            "always-fail": { "throwError": "BOOM", "message": "kaboom" },
+            "sometimes-fail": { "outcomes": [
+                { "weight": 0.9, "output": { "ok": true } },
+                { "weight": 0.1, "errorCode": "CREDIT_DECLINED" }
+            ] }
+        });
+        let mocks = parse_mock_workers(&v);
+
+        let always = &mocks["always-fail"];
+        assert_eq!(always.outcomes.len(), 1);
+        assert_eq!(always.outcomes[0].error_code.as_deref(), Some("BOOM"));
+        assert_eq!(always.outcomes[0].error_message.as_deref(), Some("kaboom"));
+
+        let sometimes = &mocks["sometimes-fail"];
+        assert_eq!(sometimes.outcomes.len(), 2);
+        assert!(sometimes.outcomes[0].error_code.is_none());
+        assert_eq!(
+            sometimes.outcomes[1].error_code.as_deref(),
+            Some("CREDIT_DECLINED")
+        );
+    }
+
+    // start -> Risk(serviceTask job=risk-check) with an error boundary catching
+    // CREDIT_DECLINED -> Rejected end; normal exit -> Approved end. Process id "PR".
+    const ERROR_BOUNDARY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Defs">
+  <bpmn:error id="Err_CD" name="CreditDeclined" errorCode="CREDIT_DECLINED" />
+  <bpmn:process id="PR" name="PR" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Risk" />
+    <bpmn:serviceTask id="Risk" name="Risk">
+      <bpmn:extensionElements><zeebe:taskDefinition type="risk-check" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="OnDeclined" attachedToRef="Risk">
+      <bpmn:errorEventDefinition errorRef="Err_CD" />
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+    <bpmn:sequenceFlow id="f2" sourceRef="Risk" targetRef="Approved" />
+    <bpmn:sequenceFlow id="f3" sourceRef="OnDeclined" targetRef="Rejected" />
+    <bpmn:endEvent id="Approved"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Rejected"><bpmn:incoming>f3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn a_mock_that_throws_routes_through_the_error_boundary() {
+        // History recorded nothing for risk-check (a new worker). A mock that THROWS
+        // CREDIT_DECLINED must make the engine take the error boundary path and reach
+        // the Rejected end — the instance completes via the modelled failure handler,
+        // and the type is reported mocked, not uncovered.
+        let r = RecordedInstance {
+            instance_key: "1".into(),
+            process_id: "PR".into(),
+            started_at: 1000,
+            creation_variables: map(&[("input", json!("x"))]),
+            stimuli: vec![],
+        };
+        let defs = parse_bpmn(ERROR_BOUNDARY).unwrap();
+
+        let mut mocks = MockWorkers::new();
+        mocks.insert(
+            "risk-check".to_string(),
+            MockWorker::always_throws("CREDIT_DECLINED"),
+        );
+
+        let res = replay_instance_with_mocks(&defs, "PR", &r, &mocks);
+        assert!(res.valid, "model is valid");
+        assert!(
+            res.completed,
+            "the error boundary should route to an end so the instance completes"
+        );
+        assert!(
+            res.uncovered_job_types.is_empty(),
+            "a thrown mock is still a supplied worker, not uncovered"
+        );
+        assert_eq!(res.mocked_job_types, vec!["risk-check".to_string()]);
     }
 
     #[test]

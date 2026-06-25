@@ -315,8 +315,15 @@ impl ToolBox for AnalysisTools {
                                 {\"preApproved\": false}}]}}. Use the distribution form when the \
                                 worker's output drives a downstream split/gateway and you want to \
                                 see how the population flows down each branch (outcomes are spread \
-                                across instances reproducibly, ~70/30 here). Supply one entry per \
-                                new job type; existing (recorded) job types do not need a mock.",
+                                across instances reproducibly, ~70/30 here). To MOCK A FAILURE \
+                                (exercise an error boundary), give an outcome (or a static spec) a \
+                                \"throwError\": \"<ERROR_CODE>\" instead of \"output\" — the worker \
+                                raises that BPMN business error rather than completing. e.g. fail \
+                                10% of the population: {\"credit-check\": {\"outcomes\": [{\"weight\": \
+                                0.9, \"output\": {\"score\": 700}}, {\"weight\": 0.1, \"throwError\": \
+                                \"CREDIT_DECLINED\"}]}} — pair it with an error boundary on the task \
+                                whose errorRef resolves to CREDIT_DECLINED. Supply one entry per new \
+                                job type; existing (recorded) job types do not need a mock.",
                             "additionalProperties": { "type": "object" }
                         }
                     },
@@ -359,7 +366,10 @@ impl ToolBox for AnalysisTools {
                                             adds. Each job type maps to a static output object \
                                             (deterministic) or a {\"outcomes\":[{\"weight\",\"output\"}]} \
                                             distribution for a non-deterministic worker that drives a \
-                                            downstream split.",
+                                            downstream split. To mock a FAILURE, give an outcome (or a \
+                                            static spec) \"throwError\":\"<ERROR_CODE>\" instead of \
+                                            \"output\" — the worker raises that BPMN business error so \
+                                            an error boundary is exercised.",
                                         "additionalProperties": { "type": "object" }
                                     }
                                 },
@@ -381,7 +391,9 @@ impl ToolBox for AnalysisTools {
                                 Each job type maps to a static output object (deterministic), e.g. \
                                 {\"fraud-check\": {\"isFraud\": false}}, or a {\"outcomes\": [{\"weight\", \
                                 \"output\"}]} distribution for a non-deterministic worker (e.g. a \
-                                preApproved true/false split spread across the population).",
+                                preApproved true/false split spread across the population). An outcome \
+                                with \"throwError\":\"<ERROR_CODE>\" (instead of \"output\") mocks a \
+                                FAILURE, raising that BPMN business error to exercise an error boundary.",
                             "additionalProperties": { "type": "object" }
                         }
                     },

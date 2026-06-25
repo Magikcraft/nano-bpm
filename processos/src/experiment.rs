@@ -124,6 +124,28 @@ fn surface_deploy_error(scorecard: &mut Value) {
     }
 }
 
+/// When simulate flags uncovered job types that are actually a serviceTask's id
+/// (the taskDefinition-binding mistake surfacing as "uses element_id as job type"),
+/// attach an actionable `jobTypeHints` array so the agent gets a crisp fix instead
+/// of perceiving an engine bug. `healed` is the model actually replayed.
+fn surface_job_type_hints(scorecard: &mut Value, healed: &str) {
+    let uncovered: Vec<String> = scorecard
+        .get("requiresNewWorkers")
+        .and_then(|w| w.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let hints = crate::bpmn_model::job_type_binding_hints(healed, &uncovered);
+    if !hints.is_empty() {
+        if let Some(obj) = scorecard.as_object_mut() {
+            obj.insert("jobTypeHints".into(), json!(hints));
+        }
+    }
+}
+
 /// `simulate` — replay one candidate model against the recorded dataset.
 pub fn simulate(
     _base_model: Option<&str>,
@@ -158,6 +180,7 @@ pub fn simulate(
     if let Some(c) = v["candidates"].as_array_mut().and_then(|a| a.first_mut()) {
         trim_report(&mut c["report"]);
         surface_deploy_error(c);
+        surface_job_type_hints(c, &candidate.model);
         if !fixes.is_empty() {
             c["authoringFixes"] = json!(fixes);
         }
@@ -218,6 +241,9 @@ pub fn compare_variants(
     // name -> authoring fixes applied, so we can surface them on the matching ranked output below.
     let mut fixes_by_name: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    // name -> the (healed) model actually replayed, for job-type-binding hints below.
+    let mut healed_by_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     if include_baseline {
         if let Some(base) = base_model {
             candidates.push(CandidateModel {
@@ -226,6 +252,7 @@ pub fn compare_variants(
                 model: base.to_string(),
                 ..Default::default()
             });
+            healed_by_name.insert("baseline (current model)".into(), base.to_string());
         }
     }
     for (i, c) in raw.iter().enumerate() {
@@ -245,6 +272,7 @@ pub fn compare_variants(
         if !fixes.is_empty() {
             fixes_by_name.insert(name.clone(), fixes);
         }
+        healed_by_name.insert(name.clone(), healed.clone());
         candidates.push(CandidateModel {
             name,
             rationale: c["rationale"].as_str().map(|s| s.to_string()),
@@ -266,6 +294,10 @@ pub fn compare_variants(
         for c in arr.iter_mut() {
             trim_report(&mut c["report"]);
             surface_deploy_error(c);
+            if let Some(healed) = c["name"].as_str().and_then(|n| healed_by_name.get(n)) {
+                let healed = healed.clone();
+                surface_job_type_hints(c, &healed);
+            }
             if let Some(fixes) = c["name"].as_str().and_then(|n| fixes_by_name.get(n)) {
                 c["authoringFixes"] = json!(fixes);
             }
