@@ -466,6 +466,21 @@ async fn wrap_up<M: AgentStep>(
             Turn::ToolCalls(_) => String::new(),
         }
     };
+    // The wrap-up turn forbids tools, but a Hermes-style model may still emit a `<tool_call>`
+    // block as content (its grammar isn't applied when no tools are offered). Strip that markup
+    // so the conversation doesn't end on a wall of raw XML; fall back to a brief note if nothing
+    // intelligible remains.
+    let answer = {
+        let stripped = strip_leaked_tool_markup(&answer);
+        if stripped.is_empty() && !answer.trim().is_empty() {
+            "I reached the step budget while drafting a candidate model and did not finish a \
+             prose summary. Based on the work so far, re-run with a concrete next step (validate \
+             the candidate, then simulate it on a small sample) to continue."
+                .to_string()
+        } else {
+            stripped
+        }
+    };
     msgs.push(Msg::Assistant {
         text: Some(answer.clone()),
         tool_calls: Vec::new(),
@@ -898,7 +913,126 @@ fn parse_leaked_tool_calls(content: &str) -> Vec<ToolCall> {
         }
         rest = &rest[consumed..];
     }
+    // Also recover the Hermes/Qwen XML tool-call form, which some llama.cpp-served models
+    // (observed: Qwen3.x) emit as content — notably on a no-tools wrap-up turn, where the
+    // server's tool-call grammar is not applied. e.g.:
+    //   <tool_call><function=simulate><parameter=limit>25</parameter>...</function></tool_call>
+    calls.extend(parse_hermes_tool_calls(content));
     calls
+}
+
+/// Recover Hermes/Qwen-style XML tool calls leaked into `content`:
+/// `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>`.
+/// Also accepts a JSON body (`<tool_call>{"name":…,"arguments":{…}}</tool_call>`).
+fn parse_hermes_tool_calls(content: &str) -> Vec<ToolCall> {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut calls = Vec::new();
+    let mut rest = content;
+    let mut idx = 0usize;
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let (segment, consumed) = match after_open.find(CLOSE) {
+            Some(end) => (&after_open[..end], start + OPEN.len() + end + CLOSE.len()),
+            None => (after_open, rest.len()),
+        };
+        if let Some(call) = parse_hermes_segment(segment.trim(), idx) {
+            calls.push(call);
+            idx += 1;
+        }
+        rest = &rest[consumed..];
+    }
+    calls
+}
+
+/// Parse one Hermes `<function=NAME>…</function>` (or JSON) tool-call body.
+fn parse_hermes_segment(segment: &str, idx: usize) -> Option<ToolCall> {
+    // JSON body form: {"name": "...", "arguments": {...}}
+    if segment.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(segment) {
+            let name = v.get("name").and_then(|n| n.as_str())?.to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let arguments = v.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            return Some(ToolCall {
+                id: format!("hermes_call_{idx}"),
+                name,
+                arguments,
+            });
+        }
+        return None;
+    }
+    // XML body form: <function=NAME> <parameter=KEY>VALUE</parameter> … </function>
+    const FN_OPEN: &str = "<function=";
+    let fn_start = segment.find(FN_OPEN)?;
+    let after_fn = &segment[fn_start + FN_OPEN.len()..];
+    let name_end = after_fn.find('>')?;
+    let name = after_fn[..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut body = &after_fn[name_end + 1..];
+    let mut map = serde_json::Map::new();
+    const P_OPEN: &str = "<parameter=";
+    const P_CLOSE: &str = "</parameter>";
+    while let Some(p) = body.find(P_OPEN) {
+        let after_p = &body[p + P_OPEN.len()..];
+        let Some(key_end) = after_p.find('>') else {
+            break;
+        };
+        let key = after_p[..key_end].trim().to_string();
+        let val_region = &after_p[key_end + 1..];
+        let (raw_val, advance) = match val_region.find(P_CLOSE) {
+            Some(end) => (&val_region[..end], end + P_CLOSE.len()),
+            None => (val_region, val_region.len()),
+        };
+        let val = raw_val.trim();
+        if !key.is_empty() {
+            // Keep XML/multiline values as strings; coerce bare scalars (e.g. 25, true) to JSON.
+            let parsed = serde_json::from_str::<Value>(val)
+                .ok()
+                .filter(|p| p.is_number() || p.is_boolean())
+                .unwrap_or_else(|| Value::String(val.to_string()));
+            map.insert(key, parsed);
+        }
+        body = &val_region[advance..];
+    }
+    Some(ToolCall {
+        id: format!("hermes_call_{idx}"),
+        name,
+        arguments: Value::Object(map),
+    })
+}
+
+/// Remove any leaked tool-call markup spans (both the `<|tool_call>…<tool_call|>` template form
+/// and the Hermes `<tool_call>…</tool_call>` XML form) from a final answer, returning the trimmed
+/// remainder. Used to keep a forced wrap-up from ending on a wall of raw markup when the model
+/// emits a tool call despite being told to answer in prose.
+fn strip_leaked_tool_markup(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let tmpl = rest.find("<|tool_call>");
+        let hermes = rest.find("<tool_call>");
+        let Some(start) = [tmpl, hermes].into_iter().flatten().min() else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let consumed = if tail.starts_with("<|tool_call>") {
+            tail.find("<tool_call|>")
+                .map(|e| e + "<tool_call|>".len())
+                .unwrap_or(tail.len())
+        } else {
+            tail.find("</tool_call>")
+                .map(|e| e + "</tool_call>".len())
+                .unwrap_or(tail.len())
+        };
+        rest = &tail[consumed..];
+    }
+    out.trim().to_string()
 }
 
 /// Parse one `call:NAME{ ... }` segment into a [`ToolCall`].
@@ -1422,6 +1556,43 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "simulate");
         assert_eq!(calls[0].arguments["limit"], 500);
+    }
+
+    #[test]
+    fn recovers_a_hermes_xml_tool_call_leaked_into_content() {
+        // Verbatim shape observed from Qwen in Investigation 3: on the no-tools wrap-up turn the
+        // model emitted a Hermes `<tool_call><function=…>` block as content. It must be recovered
+        // as a structured call (so a non-wrap-up turn keeps iterating instead of stalling).
+        let leaked = "<tool_call>\n<function=simulate>\n<parameter=limit>\n25\n</parameter>\n<parameter=model>\n<bpmn:definitions><bpmn:process id=\"loan\"/></bpmn:definitions>\n</parameter>\n<parameter=name>\nbaseline\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "simulate");
+        assert_eq!(calls[0].arguments["limit"], 25);
+        assert_eq!(calls[0].arguments["name"], "baseline");
+        assert!(calls[0].arguments["model"]
+            .as_str()
+            .unwrap()
+            .contains("bpmn:process"));
+    }
+
+    #[test]
+    fn recovers_a_hermes_json_body_tool_call() {
+        let leaked = "<tool_call>{\"name\": \"read_model\", \"arguments\": {}}</tool_call>";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_model");
+    }
+
+    #[test]
+    fn strip_leaked_tool_markup_clears_a_hermes_block_but_keeps_prose() {
+        let answer = "Here is my conclusion.\n<tool_call>\n<function=simulate>\n<parameter=limit>\n25\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(strip_leaked_tool_markup(answer), "Here is my conclusion.");
+        // A pure-markup answer collapses to empty (the wrap-up fallback then kicks in).
+        let only =
+            "<tool_call><function=simulate><parameter=limit>25</parameter></function></tool_call>";
+        assert_eq!(strip_leaked_tool_markup(only), "");
+        // Plain prose is untouched.
+        assert_eq!(strip_leaked_tool_markup("just prose"), "just prose");
     }
 
     #[test]
