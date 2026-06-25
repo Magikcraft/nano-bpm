@@ -125,29 +125,41 @@ sets the shared **Models directory** (pre-filled with llama.cpp's own cache —
 models are shared with any separately-run llama.cpp) and an optional **llama-server binary**
 path (otherwise found on `PATH`).
 
-**Start sidecar / Stop** spawn and kill the process; the sidecar is also stopped on graceful
+**Start sidecar / Stop** spawn and kill the process; sidecars are also stopped on graceful
 shutdown. The port is parsed from the profile's Base URL (so the profile both *launches* and
 *talks to* the same endpoint). **Logs** opens a streaming viewer that tails the process
 output and shows the **equivalent terminal command** (including `LLAMA_CACHE=…`) so you can
 run it yourself instead. Fresh installs ship four sidecar profiles — **Gemma 4** (needs
 ~48 GB) and **Qwen 3.6** (needs ~64 GB) plus **Qwen3-8B** (~16 GB) and **Qwen3-4B** (~8 GB)
-for resource-constrained machines — all pointing the sidecar at `http://127.0.0.1:8888/v1`.
-Only **one** sidecar runs at a time. See the [llama endpoints](#endpoints).
+for resource-constrained machines — each on its **own port** (`8888`–`8891`).
+
+**Up to two sidecars run at once.** An investigation can drive a **primary** model plus, optionally,
+one **partner** — a sparring partner (Pair AI) or a loop **monitor** — and both can be local. The
+supervisor runs at most **two** `llama-server` children, each on a distinct port; starting a third,
+re-starting one already up, or starting two that share a port is rejected with a clear message
+(give each sidecar profile its own port in its Base URL). See the [llama endpoints](#endpoints).
 
 **First-class `LLM sidecars` nav surface.** The left rail — the principal navigation menu shown
 on every page after the landing page (cockpit and workspaces share it) — carries a first-class
-**LLM sidecars** entry with a live **status dot**: **green** when a sidecar process is up,
-**yellow** when off. The entry opens a dedicated view that lists every sidecar-capable profile,
-marks the **active** and **running** one, and offers **Start / Stop / Make active / View logs**
-inline (the same controls as the Settings cog, promoted to a top-level surface). Other pages
-deep-link into a named cockpit view via `/cockpit?view=sidecars` (also `console`, `processes`,
-`prompts`, `experiments`).
+**LLM sidecars** entry with a live **status dot**: **green** when *any* sidecar is up, **yellow**
+when off. The entry opens a dedicated view that lists every sidecar-capable profile, shows each
+**running** sidecar with its own **Stop / Logs** (plus **Stop all**), warns when two profiles
+**share a port**, and offers **Start / Make active** inline (the same controls as the Settings
+cog, promoted to a top-level surface). Other pages deep-link into a named cockpit view via
+`/cockpit?view=sidecars` (also `console`, `processes`, `prompts`, `experiments`).
 
-**Just-in-time start from chat.** If the active (primary) chat profile is a sidecar that isn't
-up yet, sending a cockpit message prompts **"Sidecar not started. Start it now?"** — *Yes* starts
-it, waits for the model to finish loading (polling `GET /api/llama/ready`, which probes
-`llama-server`'s `/health`), then sends the queued message; *No* leaves the message in the
-composer unsent.
+**Active-model roster + partner exclusion.** Beside the investigation's **Send** button a roster
+shows which models are active — the **primary** plus any enabled **pair**/**monitor** partner —
+each with a dot (green = its sidecar is running, yellow = configured-but-off, blue = remote). A
+model can hold only one role: the partner pickers exclude the primary (and each other), and the
+primary send-menu **disables** whatever profile is acting as the partner, so you can't send the
+investigation message to the model that's meant to be the sparring partner.
+
+**Just-in-time start from chat.** If the primary chat profile **or an enabled partner** is a
+sidecar that isn't up yet, sending a cockpit message prompts **"Sidecar(s) not started. Start
+them now?"** — *Yes* starts the missing ones, waits for each model to finish loading (polling
+`GET /api/llama/ready?profileId=…`, which probes `llama-server`'s `/health`), then sends; *No*
+leaves the message in the composer unsent.
 
 
 ## Workspaces — bounded contexts & processes (multi-tenant + datasets)
@@ -681,11 +693,11 @@ for it automatically.
 | `POST` | `/api/settings/profiles` | Create a new LLM profile (optional `name`); returns the new `id` + the updated settings |
 | `PUT`/`DELETE` | `/api/settings/profiles/{id}` | Partial-update / delete one profile. On `PUT`, absent fields are unchanged, an empty string (or `0`/negative number) clears a field back to the env default; the API key is set only when a non-empty `apiKey` is sent |
 | `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id; each entry includes its `contextWindow` when the endpoint reports one |
-| `GET` | `/api/llama/status` | Local llama.cpp sidecar status (`running`, `model`, `port`, `pid`, `command`, `startedAt`, `error`) |
-| `GET` | `/api/llama/ready` | Whether the running sidecar is answering its `/health` probe (model loaded). Returns `{running, ready}`; polled by the cockpit's just-in-time start before sending a queued message |
-| `POST` | `/api/llama/start` | Start the sidecar for a profile (`{profileId}`; the profile must have `sidecar:true`). Returns the new status |
-| `POST` | `/api/llama/stop` | Stop the running sidecar |
-| `GET` | `/api/llama/logs?since=N` | Tail the sidecar's combined stdout/stderr from offset `N`; returns `{lines, nextOffset, running}` for incremental polling |
+| `GET` | `/api/llama/status` | Local llama.cpp sidecar pool: `{running, count, max, sidecars[], error}` where each entry has `profileId`, `model`, `port`, `pid`, `command`, `startedAt`. `running` is true when ≥1 is up |
+| `GET` | `/api/llama/ready?profileId=…` | Whether a sidecar is answering its `/health` probe (model loaded). Returns `{running, ready, profileId}`; polled by the cockpit's just-in-time start before sending a queued message |
+| `POST` | `/api/llama/start` | Start a sidecar for a profile (`{profileId}`; must have `sidecar:true`). Up to **two** run at once, each on a distinct port. Returns the new status |
+| `POST` | `/api/llama/stop` | Stop one sidecar (`{profileId}`) or **all** of them (empty body). Returns the resulting pool state |
+| `GET` | `/api/llama/logs?profileId=…&since=N` | Tail a sidecar's combined stdout/stderr from offset `N`; returns `{lines, text, nextOffset, running}` for incremental polling |
 
 ## Layout
 

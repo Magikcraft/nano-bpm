@@ -2,8 +2,10 @@
 //!
 //! ProcessOS reaches its LLM over an OpenAI-compatible HTTP endpoint (see [`crate::settings`]).
 //! Rather than make the operator download, configure and run `llama-server` separately, this
-//! module lets ProcessOS *start and stop one itself* — a supervised child process, exactly like
-//! [`crate::supervisor::OwnNano`] does for the Nano gateway. A profile flagged `sidecar:true`
+//! module lets ProcessOS *start and stop them itself* — supervised child processes, exactly like
+//! [`crate::supervisor::OwnNano`] does for the Nano gateway. Up to [`MAX_SIDECARS`] run at once
+//! (each on its own port), so an investigation can pair a primary model with a sparring-partner or
+//! loop-monitor model. A profile flagged `sidecar:true`
 //! describes which model to load ([`LlmProfile::model_file`]) and any extra launch args
 //! ([`LlmProfile::sidecar_args`]); the manager builds the `llama-server` command, spawns it,
 //! drains its combined stdout/stderr into a bounded ring buffer, and serves the model at the
@@ -13,7 +15,7 @@
 //! weights are the real cost (downloaded on demand by `llama-server` into the shared models dir),
 //! and a profile can still point at a remote endpoint instead.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -26,6 +28,10 @@ use crate::settings::LlmProfile;
 
 /// Most recent log lines kept in memory for the streaming viewer.
 const LOG_CAPACITY: usize = 2000;
+
+/// How many `llama-server` sidecars may run at once. Two lets an investigation pair a primary
+/// model with a sparring-partner / loop-monitor model (each on its own port).
+pub const MAX_SIDECARS: usize = 2;
 
 /// The plan for launching `llama-server`: the resolved binary, argv, and the `LLAMA_CACHE`
 /// (models) directory. Split out from the spawn so it can be unit-tested and shown to the operator
@@ -213,7 +219,7 @@ impl LogBuffer {
 }
 
 /// What's currently running (or last attempted), surfaced to the status endpoint.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlamaStatus {
     pub running: bool,
@@ -225,6 +231,20 @@ pub struct LlamaStatus {
     pub models_dir: Option<String>,
     pub started_at: Option<String>,
     /// Set when the last start/stop attempt failed.
+    pub error: Option<String>,
+}
+
+/// The aggregate sidecar state surfaced to `/api/llama/status`: every running sidecar plus the
+/// pool's capacity, so the UI can decide whether another may be started.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusList {
+    /// True when at least one sidecar is running (drives the rail status dot).
+    pub running: bool,
+    pub count: usize,
+    pub max: usize,
+    pub sidecars: Vec<LlamaStatus>,
+    /// The most recent start/stop/exit error, if any.
     pub error: Option<String>,
 }
 
@@ -241,16 +261,19 @@ struct Running {
 
 #[derive(Default)]
 struct ManagerInner {
-    running: Option<Running>,
+    running: Vec<Running>,
     last_error: Option<String>,
 }
 
-/// The supervised-sidecar handle held in `AppState`. Cloneable (shares the inner lock + log
-/// buffer) so it can live in the axum state and be driven from handlers.
+/// The supervised-sidecar handle held in `AppState`. Cloneable (shares the inner lock + the
+/// per-profile log buffers) so it can live in the axum state and be driven from handlers. Up to
+/// [`MAX_SIDECARS`] `llama-server` children run concurrently, each keyed by its profile id.
 #[derive(Clone, Default)]
 pub struct LlamaManager {
     inner: Arc<Mutex<ManagerInner>>,
-    logs: LogBuffer,
+    /// One ring buffer per profile id, kept even after the sidecar stops so its final output is
+    /// still viewable.
+    logs: Arc<Mutex<HashMap<String, LogBuffer>>>,
 }
 
 impl LlamaManager {
@@ -258,17 +281,42 @@ impl LlamaManager {
         Self::default()
     }
 
-    /// Start `llama-server` for `plan`. Errors if a sidecar is already running or the spawn fails.
+    /// The log buffer for `profile_id`, created on first use.
+    fn log_buf(&self, profile_id: &str) -> LogBuffer {
+        self.logs
+            .lock()
+            .unwrap()
+            .entry(profile_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Start `llama-server` for `plan`. Errors if that profile is already running, another sidecar
+    /// already holds the port, the pool is full, or the spawn fails.
     pub fn start(&self, plan: LaunchPlan) -> Result<LlamaStatus, String> {
+        self.reap();
         {
             let g = self.inner.lock().unwrap();
-            if g.running.is_some() {
-                return Err("a model server is already running; stop it first".into());
+            if g.running.iter().any(|r| r.profile_id == plan.profile_id) {
+                return Err(format!("sidecar '{}' is already running", plan.profile_id));
+            }
+            if let Some(other) = g.running.iter().find(|r| r.port == plan.port) {
+                return Err(format!(
+                    "port {} is already in use by sidecar '{}'; give this profile a different port \
+                     in its base URL so the two can run side by side",
+                    plan.port, other.profile_id
+                ));
+            }
+            if g.running.len() >= MAX_SIDECARS {
+                return Err(format!(
+                    "already running {MAX_SIDECARS} sidecars (the maximum); stop one first"
+                ));
             }
         }
         let command = plan.command_line();
-        self.logs.clear();
-        self.logs.push(format!("$ {command}"));
+        let logs = self.log_buf(&plan.profile_id);
+        logs.clear();
+        logs.push(format!("$ {command}"));
 
         let mut cmd = Command::new(&plan.bin);
         cmd.args(&plan.args)
@@ -280,7 +328,7 @@ impl LlamaManager {
         let mut child = cmd.spawn().map_err(|e| {
             let msg = format!("failed to start {}: {e}", plan.bin);
             self.set_error(&msg);
-            self.logs.push(msg.clone());
+            logs.push(msg.clone());
             msg
         })?;
         let pid = child.id();
@@ -288,10 +336,10 @@ impl LlamaManager {
         // Drain BOTH stdout and stderr into the ring buffer so the pipe never blocks the child and
         // the operator sees everything (llama-server logs mostly to stderr).
         if let Some(out) = child.stdout.take() {
-            self.spawn_drain(out);
+            self.spawn_drain(out, logs.clone());
         }
         if let Some(err) = child.stderr.take() {
-            self.spawn_drain(err);
+            self.spawn_drain(err, logs.clone());
         }
 
         let started_at = now_iso();
@@ -305,60 +353,99 @@ impl LlamaManager {
             models_dir: plan.models_dir.display().to_string(),
             started_at,
         };
+        let status = running_status(&running, None);
         let mut g = self.inner.lock().unwrap();
         g.last_error = None;
-        g.running = Some(running);
-        Ok(status_of(&g))
+        g.running.push(running);
+        Ok(status)
     }
 
-    /// Stop the running sidecar (best-effort). A no-op when nothing is running.
-    pub async fn stop(&self) -> LlamaStatus {
-        let mut child = {
+    /// Stop a sidecar by profile id, or — when `profile_id` is `None` — all of them (best-effort).
+    /// Returns the resulting pool state.
+    pub async fn stop(&self, profile_id: Option<&str>) -> StatusList {
+        let to_kill: Vec<Running> = {
             let mut g = self.inner.lock().unwrap();
-            match g.running.take() {
-                Some(r) => r.child,
-                None => return status_of(&g),
+            match profile_id {
+                Some(id) => match g.running.iter().position(|r| r.profile_id == id) {
+                    Some(pos) => vec![g.running.remove(pos)],
+                    None => Vec::new(),
+                },
+                None => std::mem::take(&mut g.running),
             }
         };
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        self.logs.push("[server stopped]".into());
-        status_of(&self.inner.lock().unwrap())
+        for mut r in to_kill {
+            let _ = r.child.start_kill();
+            let _ = r.child.wait().await;
+            self.log_buf(&r.profile_id).push("[server stopped]".into());
+        }
+        self.statuses()
     }
 
-    /// Reap the child if it exited on its own, so status reflects reality.
+    /// Reap any children that exited on their own, so status reflects reality.
     pub fn reap(&self) {
-        let mut g = self.inner.lock().unwrap();
-        let exited = g
-            .running
-            .as_mut()
-            .map(|r| matches!(r.child.try_wait(), Ok(Some(_))))
-            .unwrap_or(false);
-        if exited {
-            if let Some(r) = g.running.take() {
-                self.logs.push("[server process exited]".into());
-                g.last_error = Some(format!("model server for '{}' exited", r.profile_id));
+        let mut exited_ids: Vec<String> = Vec::new();
+        {
+            let mut g = self.inner.lock().unwrap();
+            let mut i = 0;
+            while i < g.running.len() {
+                let exited = matches!(g.running[i].child.try_wait(), Ok(Some(_)));
+                if exited {
+                    let r = g.running.remove(i);
+                    g.last_error = Some(format!("model server for '{}' exited", r.profile_id));
+                    exited_ids.push(r.profile_id);
+                } else {
+                    i += 1;
+                }
             }
+        }
+        for id in exited_ids {
+            self.log_buf(&id).push("[server process exited]".into());
         }
     }
 
-    pub fn status(&self) -> LlamaStatus {
+    /// The full pool state: every running sidecar plus capacity.
+    pub fn statuses(&self) -> StatusList {
         self.reap();
-        status_of(&self.inner.lock().unwrap())
+        let g = self.inner.lock().unwrap();
+        let sidecars: Vec<LlamaStatus> =
+            g.running.iter().map(|r| running_status(r, None)).collect();
+        StatusList {
+            running: !sidecars.is_empty(),
+            count: sidecars.len(),
+            max: MAX_SIDECARS,
+            sidecars,
+            error: g.last_error.clone(),
+        }
     }
 
-    /// Log lines at or after `since`, plus the next offset and the running flag.
-    pub fn logs_since(&self, since: u64) -> (Vec<String>, u64, bool) {
-        let (lines, next) = self.logs.since(since);
-        let running = self.inner.lock().unwrap().running.is_some();
+    /// The status of a single profile's sidecar (running:false when it isn't up).
+    pub fn status_of(&self, profile_id: &str) -> LlamaStatus {
+        self.reap();
+        let g = self.inner.lock().unwrap();
+        match g.running.iter().find(|r| r.profile_id == profile_id) {
+            Some(r) => running_status(r, g.last_error.clone()),
+            None => empty_status(g.last_error.clone()),
+        }
+    }
+
+    /// Log lines for `profile_id` at or after `since`, plus the next offset and whether that
+    /// sidecar is still running.
+    pub fn logs_since(&self, profile_id: &str, since: u64) -> (Vec<String>, u64, bool) {
+        let (lines, next) = self.log_buf(profile_id).since(since);
+        let running = self
+            .inner
+            .lock()
+            .unwrap()
+            .running
+            .iter()
+            .any(|r| r.profile_id == profile_id);
         (lines, next, running)
     }
 
-    fn spawn_drain<R>(&self, reader: R)
+    fn spawn_drain<R>(&self, reader: R, logs: LogBuffer)
     where
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
     {
-        let logs = self.logs.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -372,30 +459,31 @@ impl LlamaManager {
     }
 }
 
-fn status_of(g: &ManagerInner) -> LlamaStatus {
-    match &g.running {
-        Some(r) => LlamaStatus {
-            running: true,
-            profile_id: Some(r.profile_id.clone()),
-            model: Some(r.model.clone()),
-            port: Some(r.port),
-            pid: r.pid,
-            command: Some(r.command.clone()),
-            models_dir: Some(r.models_dir.clone()),
-            started_at: Some(r.started_at.clone()),
-            error: g.last_error.clone(),
-        },
-        None => LlamaStatus {
-            running: false,
-            profile_id: None,
-            model: None,
-            port: None,
-            pid: None,
-            command: None,
-            models_dir: None,
-            started_at: None,
-            error: g.last_error.clone(),
-        },
+fn running_status(r: &Running, last_error: Option<String>) -> LlamaStatus {
+    LlamaStatus {
+        running: true,
+        profile_id: Some(r.profile_id.clone()),
+        model: Some(r.model.clone()),
+        port: Some(r.port),
+        pid: r.pid,
+        command: Some(r.command.clone()),
+        models_dir: Some(r.models_dir.clone()),
+        started_at: Some(r.started_at.clone()),
+        error: last_error,
+    }
+}
+
+fn empty_status(last_error: Option<String>) -> LlamaStatus {
+    LlamaStatus {
+        running: false,
+        profile_id: None,
+        model: None,
+        port: None,
+        pid: None,
+        command: None,
+        models_dir: None,
+        started_at: None,
+        error: last_error,
     }
 }
 
@@ -521,5 +609,80 @@ mod tests {
         let s = now_iso();
         assert_eq!(s.len(), 20);
         assert!(s.ends_with('Z') && s.contains('T'));
+    }
+
+    /// A launch plan that runs a harmless long-lived child (`sleep`) standing in for `llama-server`,
+    /// so the supervisor's bookkeeping/guards can be tested without a model.
+    fn sleep_plan(profile_id: &str, port: u16) -> LaunchPlan {
+        LaunchPlan {
+            bin: "sleep".into(),
+            args: vec!["30".into()],
+            models_dir: PathBuf::from("/tmp"),
+            profile_id: profile_id.into(),
+            model: "stub".into(),
+            port,
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_two_sidecars_then_caps_at_max() {
+        let mgr = LlamaManager::new();
+        let a = mgr.start(sleep_plan("a", 9001)).unwrap();
+        assert!(a.running && a.profile_id.as_deref() == Some("a"));
+        // A second, distinct profile on a distinct port is allowed (up to MAX_SIDECARS).
+        let b = mgr.start(sleep_plan("b", 9002)).unwrap();
+        assert!(b.running);
+        let st = mgr.statuses();
+        assert_eq!(st.count, 2);
+        assert_eq!(st.max, MAX_SIDECARS);
+        assert!(st.running);
+        // A third exceeds the pool cap.
+        let third = mgr.start(sleep_plan("c", 9003));
+        assert!(third.unwrap_err().contains("maximum"));
+        mgr.stop(None).await;
+        assert_eq!(mgr.statuses().count, 0);
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_profile_and_port_collision() {
+        let mgr = LlamaManager::new();
+        mgr.start(sleep_plan("a", 9101)).unwrap();
+        // Same profile id → already running.
+        assert!(mgr
+            .start(sleep_plan("a", 9109))
+            .unwrap_err()
+            .contains("already running"));
+        // Different profile but the same port → collision with a clear hint.
+        let err = mgr.start(sleep_plan("b", 9101)).unwrap_err();
+        assert!(err.contains("port 9101") && err.contains("different port"));
+        mgr.stop(None).await;
+    }
+
+    #[tokio::test]
+    async fn stop_targets_one_sidecar_and_keeps_the_other() {
+        let mgr = LlamaManager::new();
+        mgr.start(sleep_plan("a", 9201)).unwrap();
+        mgr.start(sleep_plan("b", 9202)).unwrap();
+        let after = mgr.stop(Some("a")).await;
+        assert_eq!(after.count, 1);
+        assert_eq!(after.sidecars[0].profile_id.as_deref(), Some("b"));
+        assert!(!mgr.status_of("a").running);
+        assert!(mgr.status_of("b").running);
+        mgr.stop(None).await;
+    }
+
+    #[tokio::test]
+    async fn logs_are_kept_per_profile() {
+        let mgr = LlamaManager::new();
+        // Before anything starts, an unknown profile's buffer is empty.
+        assert!(mgr.logs_since("b", 0).0.is_empty());
+        mgr.start(sleep_plan("a", 9301)).unwrap();
+        // 'a' has its launch line; 'b' is still untouched (separate buffer).
+        let (la, _, a_running) = mgr.logs_since("a", 0);
+        assert!(a_running && la.iter().any(|l| l.starts_with("$ ")));
+        assert!(mgr.logs_since("b", 0).0.is_empty());
+        mgr.start(sleep_plan("b", 9302)).unwrap();
+        assert!(mgr.logs_since("b", 0).0.iter().any(|l| l.starts_with("$ ")));
+        mgr.stop(None).await;
     }
 }

@@ -513,8 +513,8 @@ async fn main() {
     if let Some(engine) = own_engine {
         engine.shutdown().await;
     }
-    // Stop the local model sidecar (if running) so llama-server doesn't linger.
-    llama_for_shutdown.stop().await;
+    // Stop all local model sidecars (if any) so llama-server doesn't linger.
+    llama_for_shutdown.stop(None).await;
 }
 
 /// `processos gen <pack.json> <out-dir>` — generate a synthetic trace corpus.
@@ -1265,20 +1265,36 @@ async fn post_models(
     }
 }
 
-/// `GET /api/llama/status` — the local model sidecar's current state (running, model, port, pid,
-/// the equivalent terminal command, models dir).
+/// `GET /api/llama/status` — the local sidecar pool: every running `llama-server` (model, port,
+/// pid, the equivalent terminal command) plus the capacity, so the UI knows whether another may
+/// be started.
 async fn llama_status(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.llama.status())
+    Json(state.llama.statuses())
 }
 
-/// `GET /api/llama/ready` — whether the running sidecar is not just spawned but actually
+/// `GET /api/llama/ready?profileId=…` — whether a sidecar is not just spawned but actually
 /// answering (its model has finished loading). Probes the `llama-server` `/health` endpoint
-/// (200 once ready, 503 while loading). Returns `{ running, ready }`. The cockpit polls this
-/// after a just-in-time sidecar start, before sending a queued chat message.
-async fn llama_ready(State(state): State<AppState>) -> impl IntoResponse {
-    let status = state.llama.status();
+/// (200 once ready, 503 while loading). With `profileId` it checks that specific sidecar; without
+/// it, any running sidecar. Returns `{ running, ready, profileId }`. The cockpit polls this after
+/// a just-in-time sidecar start, before sending a queued chat message.
+async fn llama_ready(
+    State(state): State<AppState>,
+    Query(q): Query<LlamaProfileQuery>,
+) -> impl IntoResponse {
+    let status = match q.profile_id.as_deref() {
+        Some(id) => state.llama.status_of(id),
+        None => state
+            .llama
+            .statuses()
+            .sidecars
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| state.llama.status_of("")),
+    };
     let Some(port) = status.port.filter(|_| status.running) else {
-        return Json(serde_json::json!({ "running": false, "ready": false }));
+        return Json(serde_json::json!({
+            "running": false, "ready": false, "profileId": status.profile_id,
+        }));
     };
     let url = format!("http://127.0.0.1:{port}/health");
     let ready = match reqwest::Client::builder()
@@ -1288,7 +1304,9 @@ async fn llama_ready(State(state): State<AppState>) -> impl IntoResponse {
         Ok(client) => matches!(client.get(&url).send().await, Ok(r) if r.status().is_success()),
         Err(_) => false,
     };
-    Json(serde_json::json!({ "running": true, "ready": ready }))
+    Json(serde_json::json!({
+        "running": true, "ready": ready, "profileId": status.profile_id,
+    }))
 }
 
 /// Request body for starting the sidecar: which saved profile to serve.
@@ -1299,7 +1317,8 @@ struct LlamaStartRequest {
 }
 
 /// `POST /api/llama/start` — launch `llama-server` for the named `sidecar:true` profile, serving
-/// it at the profile's base-URL port. The models directory is exported as `LLAMA_CACHE`.
+/// it at the profile's base-URL port. Up to [`llama::MAX_SIDECARS`] run at once (each must use a
+/// distinct port). The models directory is exported as `LLAMA_CACHE`.
 async fn llama_start(
     State(state): State<AppState>,
     Json(req): Json<LlamaStartRequest>,
@@ -1326,27 +1345,68 @@ async fn llama_start(
     }
 }
 
-/// `POST /api/llama/stop` — stop the running sidecar (idempotent).
-async fn llama_stop(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.llama.stop().await)
+/// Request body for stopping a sidecar: an optional profile id (omit to stop all).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlamaStopRequest {
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
-/// Query for incremental log polling (`?since=<offset>`).
+/// `POST /api/llama/stop` — stop one sidecar (`{profileId}`) or all of them (empty body).
+/// Idempotent. Returns the resulting pool state.
+async fn llama_stop(
+    State(state): State<AppState>,
+    body: Option<Json<LlamaStopRequest>>,
+) -> impl IntoResponse {
+    let profile_id = body.and_then(|Json(b)| b.profile_id);
+    Json(state.llama.stop(profile_id.as_deref()).await)
+}
+
+/// Query for incremental log polling (`?profileId=…&since=<offset>`).
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LlamaLogsQuery {
     #[serde(default)]
     since: u64,
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
-/// `GET /api/llama/logs?since=N` — the sidecar's captured stdout/stderr from offset `N` onward,
-/// plus the next offset to poll and whether the process is still running. Powers the streaming
-/// log viewer.
+/// Query carrying just a profile id (`?profileId=…`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlamaProfileQuery {
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+/// `GET /api/llama/logs?profileId=…&since=N` — a sidecar's captured stdout/stderr from offset `N`
+/// onward, plus the next offset to poll and whether the process is still running. Powers the
+/// streaming log viewer. When `profileId` is omitted, the single running sidecar is used.
 async fn llama_logs(
     State(state): State<AppState>,
     Query(q): Query<LlamaLogsQuery>,
 ) -> impl IntoResponse {
-    let (lines, next, running) = state.llama.logs_since(q.since);
-    Json(serde_json::json!({ "lines": lines, "nextOffset": next, "running": running }))
+    let profile_id = q.profile_id.or_else(|| {
+        state
+            .llama
+            .statuses()
+            .sidecars
+            .into_iter()
+            .next()
+            .and_then(|s| s.profile_id)
+    });
+    let Some(profile_id) = profile_id else {
+        return Json(serde_json::json!({
+            "lines": [], "text": "", "nextOffset": q.since, "running": false,
+        }));
+    };
+    let (lines, next, running) = state.llama.logs_since(&profile_id, q.since);
+    let text = lines.join("\n");
+    Json(serde_json::json!({
+        "lines": lines, "text": text, "nextOffset": next, "running": running, "profileId": profile_id,
+    }))
 }
 
 /// Resolve the effective LLM config for a request: built-in defaults → `PROCESSOS_LLM_*`

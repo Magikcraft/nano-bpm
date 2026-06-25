@@ -310,11 +310,11 @@ route();
   async function refreshDot(){
     const dot = document.getElementById('navLlamaDot');
     if(!dot) return;
-    let on = false;
-    try { const st = await api('/api/llama/status'); on = !!(st && st.running); } catch(e){}
+    let on = false, count = 0;
+    try { const st = await api('/api/llama/status'); on = !!(st && st.running); count = (st && st.count) || 0; } catch(e){}
     dot.classList.toggle('on', on);
     dot.classList.toggle('off', !on);
-    dot.title = on ? 'local sidecar: running' : 'local sidecar: off';
+    dot.title = on ? ('local sidecars running ('+count+'/2)') : 'local sidecars: off';
   }
   refreshDot();
   setInterval(refreshDot, 4000);

@@ -229,16 +229,17 @@ impl Settings {
 
 /// The seeded default when no settings file exists. Ships ready-to-run **local llama.cpp
 /// sidecar** profiles: two large models the author runs (Gemma 4 / Qwen 3.6, with a RAM hint in
-/// the name) plus two small models for resource-constrained machines. All point the sidecar at
-/// `127.0.0.1:8888`; the operator picks one as active and presses Start. Models download/cache
-/// to the shared models directory ([`default_models_dir`]).
+/// the name) plus two small models for resource-constrained machines. Each is given its **own
+/// port** (8888–8891) so two can run side by side — a primary plus a sparring-partner / monitor.
+/// The operator picks one as active and presses Start. Models download/cache to the shared models
+/// directory ([`default_models_dir`]).
 fn seeded() -> Settings {
-    fn local(id: &str, name: &str, model: &str, max_tokens: u32) -> LlmProfile {
+    fn local(id: &str, name: &str, model: &str, port: u16, max_tokens: u32) -> LlmProfile {
         LlmProfile {
             id: id.to_string(),
             name: name.to_string(),
             provider: Some("openai".to_string()),
-            base_url: Some("http://127.0.0.1:8888/v1".to_string()),
+            base_url: Some(format!("http://127.0.0.1:{port}/v1")),
             model: Some(model.to_string()),
             api_key: None,
             max_tokens: Some(max_tokens),
@@ -254,24 +255,28 @@ fn seeded() -> Settings {
                 "gemma-4-local",
                 "Gemma 4 · local (needs 48GB)",
                 "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M",
+                8888,
                 16000,
             ),
             local(
                 "qwen-36-local",
                 "Qwen 3.6 · local (needs 64GB)",
                 "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q6_K",
+                8889,
                 32768,
             ),
             local(
                 "qwen3-8b-local",
                 "Qwen3 8B · local (needs 16GB)",
                 "unsloth/Qwen3-8B-GGUF:UD-Q4_K_XL",
+                8890,
                 16000,
             ),
             local(
                 "qwen3-4b-local",
                 "Qwen3 4B · local (needs 8GB)",
                 "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL",
+                8891,
                 8192,
             ),
         ],

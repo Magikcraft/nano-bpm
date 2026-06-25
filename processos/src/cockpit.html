@@ -663,13 +663,14 @@ async function decide(key, decision){
 }
 
 // ---- LLM sidecars (first-class) ----
-// The supervised local llama.cpp sidecar: ProcessOS ships several sidecar-capable profiles but
-// runs ONE llama-server at a time. This view lists them, shows which is active/running, and lets
-// the operator start/stop/switch — the same controls the Settings cog exposes, promoted to a
-// first-class nav surface with a live status dot.
+// The supervised local llama.cpp sidecars: ProcessOS ships several sidecar-capable profiles and
+// runs up to TWO llama-server processes at once (each on its own port) — so an investigation can
+// pair a primary model with a sparring-partner / loop-monitor model. This view lists the profiles,
+// shows which are active/running, and lets the operator start/stop/switch each — the same controls
+// the Settings cog exposes, promoted to a first-class nav surface with a live status dot.
 let LLAMA_DOT_TIMER = null;
 
-// Paint the rail status dot green (a sidecar process is up) or yellow (off). Best-effort.
+// Paint the rail status dot green (≥1 sidecar process is up) or yellow (off). Best-effort.
 async function refreshLlamaDot(){
   const dot = document.getElementById('navLlamaDot');
   if(!dot) return;
@@ -677,7 +678,12 @@ async function refreshLlamaDot(){
   const on = !!(st && st.running);
   dot.classList.toggle('on', on);
   dot.classList.toggle('off', !on);
-  dot.title = on ? ('local sidecar: running'+(st.profileId?(' ('+st.profileId+')'):'')) : 'local sidecar: off';
+  const names = (st && st.sidecars || []).map(s => s.profileId).filter(Boolean);
+  dot.title = on
+    ? ('local sidecars running: '+(names.join(', ')||'?')+' ('+(st.count||names.length)+'/'+(st.max||2)+')')
+    : 'local sidecars: off';
+  // Keep the chat roster's dots in sync when the composer is on screen.
+  if(document.getElementById('chatRoster')) refreshChatRoster();
 }
 // Poll the dot on a slow timer so the rail reflects sidecar state from any view.
 function startLlamaDotPoll(){
@@ -690,26 +696,46 @@ async function renderSidecars(){
   STATE.view='sidecars'; setActive(); main.innerHTML='Loading…';
   let s, st;
   try { s = await api('/api/settings') || {}; } catch(e){ return fail(e); }
-  try { st = await api('/api/llama/status'); } catch(e){ st = {running:false}; }
+  try { st = await api('/api/llama/status'); } catch(e){ st = {running:false, sidecars:[], count:0, max:2}; }
   const profiles = (s.profiles||[]).filter(p => p.sidecar);
   const active = s.activeProfile;
-  const running = !!st.running;
-  const runId = st.profileId || null;
+  const sidecars = st.sidecars || [];
+  const max = st.max || 2;
+  const runById = {}; sidecars.forEach(r => { if(r.profileId) runById[r.profileId] = r; });
+  const atCap = sidecars.length >= max;
+
+  // Detect sidecar-capable profiles that collide on a port (can't both run at once).
+  const ports = {};
+  profiles.forEach(p => { const m = (p.baseUrl||p.base_url||'').match(/:(\d+)/); const port = m?m[1]:null; if(port){ (ports[port]=ports[port]||[]).push(p.id); } });
+  const collisions = Object.entries(ports).filter(([,ids]) => ids.length>1);
 
   let h = '<h1>LLM sidecars</h1>'
     + '<p class="lede">Local models ProcessOS supervises itself via <code>llama-server</code> (llama.cpp). '
-    + 'Pick one as the active model and press Start — only <b>one</b> sidecar runs at a time. '
-    + 'The dot in the menu is green while a sidecar is up, yellow when off.</p>';
+    + 'Up to <b>'+max+'</b> run at once (each on its own port) — so an investigation can pair a primary '
+    + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>';
 
-  // Live status banner.
-  if(running){
+  // Port-collision warning: two sidecar profiles can't share a port if you want both running.
+  if(collisions.length){
+    h += '<div class="tile" style="cursor:default;border-color:#7c2d12">'
+      + '<h3 style="color:#fdba74">Port conflict</h3>'
+      + '<div class="meta">These sidecar profiles share a port, so they can\'t run side by side. '
+      + 'Give each a distinct port (edit its base URL in the Settings cog):</div>'
+      + '<ul class="meta" style="margin:6px 0 0 18px">'
+      + collisions.map(([port,ids]) => '<li>port '+esc(port)+': '+ids.map(esc).join(', ')+'</li>').join('')
+      + '</ul></div>';
+  }
+
+  // Live status banner: one row per running sidecar.
+  if(sidecars.length){
     h += '<div class="tile" style="cursor:default;border-color:#14532d">'
-      + '<h3 style="color:#6ee7b7">Running <span class="pill accept">on</span></h3>'
-      + '<div class="meta">'+esc(st.profileId||'?')+' · '+esc(st.model||'')+(st.port?(' · port '+st.port):'')+(st.pid?(' · pid '+st.pid):'')+'</div>'
-      + (st.command?('<div class="meta" style="margin-top:6px;font-family:ui-monospace,monospace;color:#8b8b93;word-break:break-all">'+esc(st.command)+'</div>'):'')
-      + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px">'
-      + '<button class="btn warn" id="llStop">Stop sidecar</button>'
-      + '<button class="btn ghost" id="llLogs">View logs</button></div></div>';
+      + '<h3 style="color:#6ee7b7">Running <span class="pill accept">'+sidecars.length+'/'+max+'</span></h3>'
+      + sidecars.map(r =>
+          '<div class="meta" style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+          + '<b style="color:#d1fae5">'+esc(r.profileId||'?')+'</b> · '+esc(r.model||'')+(r.port?(' · port '+r.port):'')+(r.pid?(' · pid '+r.pid):'')
+          + '<button class="btn warn" data-stop="'+esc(r.profileId||'')+'" style="padding:2px 8px">Stop</button>'
+          + '<button class="btn ghost" data-logs="'+esc(r.profileId||'')+'" style="padding:2px 8px">Logs</button>'
+          + '</div>').join('')
+      + '<div class="btnrow" style="margin-top:10px"><button class="btn ghost" id="llStopAll">Stop all</button></div></div>';
   } else {
     h += '<div class="tile" style="cursor:default"><h3>Off <span class="pill wait">idle</span></h3>'
       + '<div class="meta">No sidecar is running. Start one below.'
@@ -722,18 +748,25 @@ async function renderSidecars(){
   } else {
     h += '<div class="grid">' + profiles.map(p => {
       const isActive = p.id===active;
-      const isRunning = running && runId===p.id;
+      const isRunning = !!runById[p.id];
       const pills = (isActive?'<span class="pill run">active</span> ':'')
                   + (isRunning?'<span class="pill accept">running</span>':'');
-      const startDisabled = running ? 'disabled' : '';
+      // Start is disabled if this one runs, the pool is full, or its port clashes with a running one.
+      const myPort = (p.baseUrl||p.base_url||'').match(/:(\d+)/);
+      const portClash = myPort && sidecars.some(r => r.profileId!==p.id && String(r.port)===myPort[1]);
+      const startDisabled = (isRunning || atCap || portClash) ? 'disabled' : '';
+      const startTitle = isRunning ? 'Already running'
+                       : portClash ? 'Its port is already in use by a running sidecar'
+                       : atCap ? ('Already running '+max+' sidecars — stop one first')
+                       : 'Start this sidecar';
       return '<div class="tile" style="cursor:default">'
         + '<h3>'+esc(p.name||p.id)+' '+pills+'</h3>'
-        + '<div class="meta">'+esc(p.modelFile||p.model||'')+'</div>'
+        + '<div class="meta">'+esc(p.modelFile||p.model||'')+(myPort?(' · port '+esc(myPort[1])):'')+'</div>'
         + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
         + (isRunning
-            ? '<button class="btn warn" data-stop="1">Stop</button>'
-            : '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+(running?'Stop the running sidecar first':'Start this sidecar')+'">Start</button>')
+            ? '<button class="btn warn" data-stop="'+esc(p.id)+'">Stop</button>'
+            : '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+esc(startTitle)+'">Start</button>')
         + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
         + '</div></div>';
     }).join('') + '</div>';
@@ -750,9 +783,9 @@ async function renderSidecars(){
     try { await startBtn(b.dataset.start); } catch(e){ window.alert('Could not start: '+(e.message||e)); }
     refreshLlamaDot(); renderSidecars();
   });
-  const stopAll = async (b) => { if(b){ b.disabled=true; b.textContent='Stopping…'; } try { await api('/api/llama/stop', {method:'POST'}); } catch(e){ window.alert('Could not stop: '+(e.message||e)); } refreshLlamaDot(); renderSidecars(); };
-  const stopTop = document.getElementById('llStop'); if(stopTop) stopTop.onclick = () => stopAll(stopTop);
-  main.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => stopAll(b));
+  const stopOne = async (b, id) => { if(b){ b.disabled=true; b.textContent='Stopping…'; } try { await api('/api/llama/stop', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(id?{profileId:id}:{})}); } catch(e){ window.alert('Could not stop: '+(e.message||e)); } refreshLlamaDot(); renderSidecars(); };
+  const stopAllBtn = document.getElementById('llStopAll'); if(stopAllBtn) stopAllBtn.onclick = () => stopOne(stopAllBtn, null);
+  main.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => stopOne(b, b.dataset.stop || null));
   main.querySelectorAll('[data-active]').forEach(b => b.onclick = async () => {
     b.disabled = true;
     try {
@@ -761,14 +794,14 @@ async function renderSidecars(){
     } catch(e){ window.alert('Could not switch active model: '+(e.message||e)); }
     renderSidecars();
   });
-  const logsBtn = document.getElementById('llLogs');
-  if(logsBtn) logsBtn.onclick = async () => {
+  const showLogs = async (id) => {
     const out = document.getElementById('llLogsOut');
     if(!out) return;
     out.hidden = false; out.textContent = 'Loading logs…';
-    try { const r = await api('/api/llama/logs'); out.textContent = (r.text||'').trim() || '(no output yet)'; out.scrollTop = out.scrollHeight; }
+    try { const r = await api('/api/llama/logs'+(id?('?profileId='+encodeURIComponent(id)):'')); out.textContent = (r.text||'').trim() || '(no output yet)'; out.scrollTop = out.scrollHeight; }
     catch(e){ out.textContent = 'Could not load logs: '+(e.message||e); }
   };
+  main.querySelectorAll('[data-logs]').forEach(b => b.onclick = () => showLogs(b.dataset.logs || null));
 }
 
 // ---- Prompts (authoring) ----
@@ -1051,7 +1084,8 @@ async function renderWorkspace(ws, proc){
             </span>
             <button class="btn warn" id="chatWrapup" style="display:none" title="Tell the droid to stop and report its findings so far">Wrap it up →</button>
             <label class="muted" id="chatPyLabel"><input type="checkbox" id="chatPy" /> <span id="chatPyText">allow Python escape hatch</span></label>
-            <span class="muted" id="chatHint" style="margin-left:auto"></span>
+            <span class="muted" id="chatRoster" style="margin-left:auto;display:flex;gap:12px;align-items:center;flex-wrap:wrap"></span>
+            <span class="muted" id="chatHint" style="margin-left:12px"></span>
           </div>
         </div>
       </div>
@@ -1320,7 +1354,7 @@ async function labelSendButton(){
 }
 
 // Live-update the Send button + droid label + Python label when settings change.
-window.addEventListener('processos:settings-changed', () => { labelSendButton(); refreshPythonLabel(); });
+window.addEventListener('processos:settings-changed', () => { labelSendButton(); refreshPythonLabel(); refreshPartnerPickers(); });
 
 // ── busy state + steering ────────────────────────────────────────────────────
 // While the droid is working we DON'T lock the compose box. The Send button stays
@@ -1406,14 +1440,18 @@ async function toggleProfileMenu(){
   try { s = await api('/api/settings'); }
   catch(e){ $('#chatHint').textContent = 'could not load profiles: '+(e.message||e); return; }
   const profiles = s.profiles||[];
+  // The model already acting as the partner (pair/monitor) can't also be the primary you send to.
+  const partners = partnerProfileIds();
   menu.innerHTML = profiles.length ? profiles.map(p => {
     const active = p.id===s.activeProfile;
-    return '<button data-id="'+esc(p.id)+'"'+(active?' class="on"':'')+'>'+
+    const isPartner = partners.has(p.id) && !active;
+    return '<button data-id="'+esc(p.id)+'"'+(active?' class="on"':'')+(isPartner?' disabled title="In use as this investigation\'s partner"':'')+'>'+
       '<span class="mi-name">'+esc(p.name||p.id)+'</span>'+
       (p.model?' <span class="mi-model">'+esc(p.model)+'</span>':'')+
-      (active?' <span class="mi-on">✓</span>':'')+'</button>';
+      (active?' <span class="mi-on">✓</span>':'')+
+      (isPartner?' <span class="mi-model">partner</span>':'')+'</button>';
   }).join('') : '<div class="mi-empty">No profiles configured</div>';
-  menu.querySelectorAll('button[data-id]').forEach(b => {
+  menu.querySelectorAll('button[data-id]:not([disabled])').forEach(b => {
     b.onclick = () => selectProfile(b.getAttribute('data-id'), b.getAttribute('data-id')===s.activeProfile);
   });
   menu.hidden = false; caret.setAttribute('aria-expanded','true');
@@ -1931,28 +1969,51 @@ async function loadPersonas(){
   await fillMonitorProfiles();
   wireMonitorControls();
 }
-// Populate the Pair AI reviewer's LLM-profile picker from the configured profiles. Defaults to a
-// profile *other* than the active primary when possible (cross-model pairing decorrelates errors).
+// ── partner roles (pair / monitor) + active-model roster ─────────────────────
+// An investigation runs a PRIMARY model plus, optionally, ONE partner — a sparring partner
+// (Pair AI) or a loop monitor. A profile can hold only one role at a time, so the partner pickers
+// exclude the primary (and each other), and the primary send-menu excludes whatever is the partner.
+
+// The profile ids currently bound to an enabled partner role.
+function partnerProfileIds(){
+  const ids = new Set();
+  const pr = pairRequest(); if(pr && pr.profileId) ids.add(pr.profileId);
+  const mr = monitorRequest(); if(mr && mr.profileId) ids.add(mr.profileId);
+  return ids;
+}
+// Re-fill both partner pickers (preserving each selection when still valid) so they always exclude
+// the active primary and the other partner. Then repaint the active-model roster.
+async function refreshPartnerPickers(){
+  await fillPairProfiles();
+  await fillMonitorProfiles();
+  refreshChatRoster();
+}
+// Populate the Pair AI reviewer's LLM-profile picker. Excludes the active primary and the monitor's
+// profile (one role per model). Defaults to a profile other than the active primary.
 async function fillPairProfiles(){
   const sel = $('#chatPairProfile'); if(!sel) return;
   let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
-  const profiles = s.profiles || [];
+  const monSel = $('#chatMonitorProfile');
+  const monActive = $('#chatMonitorOn') && $('#chatMonitorOn').checked && monSel ? monSel.value : null;
+  const taken = new Set([s.activeProfile, monActive].filter(Boolean));
+  const profiles = (s.profiles || []).filter(p => !taken.has(p.id));
   const saved = localStorage.getItem('processos.pairProfile');
-  const fallback = (profiles.find(p => p.id !== s.activeProfile) || profiles[0] || {}).id || '';
-  const want = (saved && profiles.some(p => p.id===saved)) ? saved : fallback;
+  const fallback = (profiles[0] || {}).id || '';
+  const want = (saved && profiles.some(p => p.id===saved)) ? saved : ((sel.value && profiles.some(p=>p.id===sel.value)) ? sel.value : fallback);
   sel.innerHTML = profiles.length
-    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
-    : '<option value="">No profiles configured</option>';
-  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.pairProfile', sel.value); };
+    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
+    : '<option value="">No other profile available</option>';
+  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.pairProfile', sel.value); fillMonitorProfiles(); refreshChatRoster(); };
 }
 // Wire the Pair AI on/off toggle: reveal the reviewer config when on, persist the choice, and
-// relabel the Send button so the operator knows a reviewer will run.
+// relabel the Send button + roster so the operator knows a reviewer will run.
 function wirePairControls(){
   const on = $('#chatPairOn'), cfg = $('#chatPairCfg'); if(!on || !cfg) return;
   const sync = () => {
     cfg.style.display = on.checked ? '' : 'none';
     localStorage.setItem('processos.pairOn', on.checked ? '1' : '0');
     labelSendButton();
+    refreshPartnerPickers();
   };
   on.checked = localStorage.getItem('processos.pairOn') === '1';
   on.onchange = sync;
@@ -1966,20 +2027,23 @@ function pairRequest(){
   const personaId = ($('#chatPairPersona')||{}).value || undefined;
   return { enabled: true, profileId, personaId };
 }
-// Populate the loop monitor's LLM-profile picker. Defaults to the local sidecar profile when one
-// is configured (cheap to keep watching), else a profile other than the active primary.
+// Populate the loop monitor's LLM-profile picker. Excludes the active primary and the pair's
+// profile. Defaults to the local sidecar profile when one is free (cheap to keep watching).
 async function fillMonitorProfiles(){
   const sel = $('#chatMonitorProfile'); if(!sel) return;
   let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
-  const profiles = s.profiles || [];
+  const pairSel = $('#chatPairProfile');
+  const pairActive = $('#chatPairOn') && $('#chatPairOn').checked && pairSel ? pairSel.value : null;
+  const taken = new Set([s.activeProfile, pairActive].filter(Boolean));
+  const profiles = (s.profiles || []).filter(p => !taken.has(p.id));
   const saved = localStorage.getItem('processos.monitorProfile');
   const sidecar = (profiles.find(p => p.sidecar) || {}).id;
-  const fallback = sidecar || (profiles.find(p => p.id !== s.activeProfile) || profiles[0] || {}).id || '';
-  const want = (saved && profiles.some(p => p.id===saved)) ? saved : fallback;
+  const fallback = sidecar || (profiles[0] || {}).id || '';
+  const want = (saved && profiles.some(p => p.id===saved)) ? saved : ((sel.value && profiles.some(p=>p.id===sel.value)) ? sel.value : fallback);
   sel.innerHTML = profiles.length
     ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
-    : '<option value="">No profiles configured</option>';
-  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.monitorProfile', sel.value); };
+    : '<option value="">No other profile available</option>';
+  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.monitorProfile', sel.value); fillPairProfiles(); refreshChatRoster(); };
 }
 // Wire the Monitor on/off toggle: reveal the monitor config when on and persist the choice.
 function wireMonitorControls(){
@@ -1987,6 +2051,7 @@ function wireMonitorControls(){
   const sync = () => {
     cfg.style.display = on.checked ? '' : 'none';
     localStorage.setItem('processos.monitorOn', on.checked ? '1' : '0');
+    refreshPartnerPickers();
   };
   on.checked = localStorage.getItem('processos.monitorOn') === '1';
   on.onchange = sync;
@@ -2000,31 +2065,73 @@ function monitorRequest(){
   const personaId = ($('#chatMonitorPersona')||{}).value || undefined;
   return { enabled: true, profileId, personaId };
 }
-// If the primary chat model is a local llama.cpp sidecar that isn't up yet, prompt the operator
-// to start it just-in-time. Returns true to proceed with the send, false to abort (leaving the
-// composer untouched). Any settings/status lookup failure is non-blocking — we proceed and let
-// the chat call surface its own error rather than wrongly suppressing a send.
-async function ensureSidecarReady(){
+
+// Paint the active-model roster beside the Send button: the PRIMARY plus any enabled partner,
+// each with a status dot (green = its sidecar is running, yellow = sidecar configured but off,
+// blue = remote/non-sidecar). Lets the operator see at a glance which models this investigation
+// will drive — and that the partner is a different model than the one being sent to.
+async function refreshChatRoster(){
+  const el = $('#chatRoster'); if(!el) return;
+  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){ el.textContent=''; return; }
+  let st = {sidecars:[]}; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){}
+  const running = new Set((st.sidecars||[]).map(x => x.profileId));
+  const byId = {}; (s.profiles||[]).forEach(p => byId[p.id]=p);
+  const dot = (p) => {
+    const color = !p ? '#64748b' : (!p.sidecar ? '#3b82f6' : (running.has(p.id) ? '#22c55e' : '#eab308'));
+    const tip = !p ? '' : (!p.sidecar ? 'remote model' : (running.has(p.id) ? 'sidecar running' : 'sidecar off'));
+    return '<span title="'+esc(tip)+'" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+color+';margin-right:5px;vertical-align:0"></span>';
+  };
+  const chip = (p, role) => p ? (dot(p)+'<b style="color:#cbd5e1">'+esc(p.name||p.id)+'</b> <span style="opacity:.6">'+role+'</span>') : '';
+  const primary = byId[s.activeProfile];
+  const parts = [chip(primary, 'primary')];
+  const pr = pairRequest(); if(pr && pr.profileId && byId[pr.profileId]) parts.push(chip(byId[pr.profileId], 'pair'));
+  const mr = monitorRequest(); if(mr && mr.profileId && byId[mr.profileId]) parts.push(chip(byId[mr.profileId], 'monitor'));
+  // Warn if the primary somehow equals an enabled partner (the send would hit the partner).
+  const clash = primary && partnerProfileIds().has(primary.id);
+  el.innerHTML = parts.filter(Boolean).join('<span style="opacity:.4">·</span> ')
+    + (clash ? ' <span style="color:#f87171" title="Pick a different partner — you can\'t send to the model already acting as the partner">⚠ partner = primary</span>' : '');
+}
+// Ensure every sidecar this investigation needs is up: the PRIMARY (when it's a sidecar) plus any
+// enabled partner (pair/monitor) that is a sidecar — up to two distinct local servers. Prompts
+// once to start the missing ones, then waits for each to finish loading. Returns true to proceed
+// with the send, false to abort (composer untouched). Any settings/status lookup failure is
+// non-blocking — we proceed and let the chat call surface its own error.
+async function ensureSidecarsReady(){
   let s; try { s = await api('/api/settings') || {}; } catch(e){ return true; }
-  const profiles = s.profiles || [];
-  const active = profiles.find(p => p.id === s.activeProfile);
-  if(!active || !active.sidecar) return true;   // primary model isn't a sidecar
-  let st; try { st = await api('/api/llama/status'); } catch(e){ return true; }
-  if(st && st.running && (!st.profileId || st.profileId === active.id)) return true; // already up
-  if(!window.confirm('Sidecar not started. Start it now?')) return false;            // leave unsent
-  try {
-    await api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId: active.id})});
-  } catch(e){ window.alert('Could not start the sidecar: ' + (e.message||e)); return false; }
-  await waitForSidecarReady();   // queue the message until the model finishes loading
+  const byId = {}; (s.profiles||[]).forEach(p => byId[p.id]=p);
+  const needed = new Map();   // id → profile
+  const primary = byId[s.activeProfile];
+  if(primary && primary.sidecar) needed.set(primary.id, primary);
+  const addPartner = (req) => { if(req && req.profileId){ const p = byId[req.profileId]; if(p && p.sidecar) needed.set(p.id, p); } };
+  addPartner(pairRequest()); addPartner(monitorRequest());
+  if(!needed.size) return true;   // nothing local to start
+
+  let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return true; }
+  const running = new Set((st.sidecars||[]).map(x => x.profileId));
+  const missing = [...needed.values()].filter(p => !running.has(p.id));
+  if(missing.length){
+    const names = missing.map(p => p.name||p.id).join(' + ');
+    const word = missing.length>1 ? 'Sidecars' : 'Sidecar';
+    if(!window.confirm(word+' not started: '+names+'. Start '+(missing.length>1?'them':'it')+' now?')) return false;
+    for(const p of missing){
+      try { await api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId: p.id})}); }
+      catch(e){ window.alert('Could not start '+(p.name||p.id)+': '+(e.message||e)); return false; }
+    }
+    refreshLlamaDot();
+  }
+  // Wait for each needed sidecar's model to finish loading before sending.
+  for(const p of needed.values()){ await waitForSidecarReady(undefined, p.id); }
+  refreshLlamaDot();
   return true;
 }
-// Poll /api/llama/ready until the sidecar answers its health probe (model loaded), or a timeout.
-// Returns true once ready; false on timeout (the caller proceeds anyway so the chat call can
-// report a precise error if it's still not up).
-async function waitForSidecarReady(timeoutMs){
+// Poll /api/llama/ready until a sidecar answers its health probe (model loaded), or a timeout.
+// `profileId` targets a specific sidecar. Returns true once ready; false on timeout (the caller
+// proceeds anyway so the chat call can report a precise error if it's still not up).
+async function waitForSidecarReady(timeoutMs, profileId){
   const deadline = Date.now() + (timeoutMs || 120000);
+  const qs = profileId ? ('?profileId='+encodeURIComponent(profileId)) : '';
   while(Date.now() < deadline){
-    let r; try { r = await api('/api/llama/ready'); } catch(e){ r = null; }
+    let r; try { r = await api('/api/llama/ready'+qs); } catch(e){ r = null; }
     if(r && r.ready) return true;
     await new Promise(res => setTimeout(res, 1500));
   }
@@ -2065,9 +2172,20 @@ function livePendingHtml(whoHtml, cls){
 async function sendChat(ws, proc){
   const box = $('#chatBox'); const msg = box.value.trim();
   if(!msg) return;
-  // If the primary chat model is a local sidecar that isn't up yet, offer to start it. If the
-  // operator declines, the message stays in the composer unsent.
-  if(!(await ensureSidecarReady())) return;
+  // The message is sent to the PRIMARY model. Refuse if the primary is also the configured
+  // partner (pair/monitor) — you can't send to the model that's meant to be the sparring partner.
+  try {
+    const s = await api('/api/settings') || {};
+    if(s.activeProfile && partnerProfileIds().has(s.activeProfile)){
+      const hint = $('#chatHint');
+      if(hint) hint.textContent = 'Primary and partner are the same model — pick a different partner before sending.';
+      refreshChatRoster();
+      return;
+    }
+  } catch(e){ /* non-blocking */ }
+  // If the primary or an enabled partner is a local sidecar that isn't up yet, offer to start it
+  // (both, when paired). If the operator declines, the message stays in the composer unsent.
+  if(!(await ensureSidecarsReady())) return;
   const allowPython = $('#chatPy').checked && !$('#chatPy').disabled;
   pushPromptHistory(msg);
   box.value = '';
