@@ -12,6 +12,7 @@
 mod agent;
 mod analysis;
 mod bpmn_model;
+mod camunda_import;
 mod chat;
 mod chat_prompts;
 mod conformance;
@@ -262,10 +263,15 @@ async fn main() {
                 run_cli_infer(&args[2..]);
                 return;
             }
+            "import-camunda" => {
+                run_cli_import_camunda(&args[2..]);
+                return;
+            }
             other => {
                 eprintln!("unknown subcommand '{other}'. usage:");
                 eprintln!("  processos gen <pack.json> <out-dir>");
                 eprintln!("  processos infer <dataset-dir> [target-p99-wait-ms]");
+                eprintln!("  processos import-camunda <records.json|dir> <out-dir> [--no-tier2]");
                 std::process::exit(2);
             }
         }
@@ -531,6 +537,28 @@ fn run_cli_infer(args: &[String]) {
             Err(e) => eprintln!("score failed: {e}"),
         }
     }
+}
+
+/// `processos import-camunda <records.json|dir> <out-dir> [--no-tier2]` — fold a
+/// Camunda 8 record export (Elasticsearch/Opensearch/debug-log JSON) into a
+/// `traces.json` dataset directly loadable by `DatasetSource`.
+fn run_cli_import_camunda(args: &[String]) {
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    if positional.len() < 2 {
+        eprintln!("usage: processos import-camunda <records.json|dir> <out-dir> [--no-tier2]");
+        std::process::exit(2);
+    }
+    let tier2 = !args.iter().any(|a| a == "--no-tier2");
+    let input = std::path::Path::new(positional[0].as_str());
+    let out_dir = std::path::Path::new(positional[1].as_str());
+    let summary = camunda_import::import(input, out_dir, tier2).unwrap_or_else(|e| {
+        eprintln!("import-camunda failed: {e}");
+        std::process::exit(1);
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).unwrap_or_default()
+    );
 }
 
 async fn shutdown_signal() {

@@ -181,6 +181,38 @@ rate to an Erlang-C staffing recommendation, and classifies the domain — then 
 grades that against `expected.json` (domain + job + window = 3 points). The generator is
 the symmetric write-side of `replay.rs`, so a corpus also feeds `replay-rank`/`evolve`.
 
+## Camunda 8 import — analyse existing C8 history offline (`src/camunda_import.rs`)
+
+A consultant often has a customer's **Camunda 8 / Zeebe** history but no Nano engine.
+`import-camunda` folds a C8 record export into the same `traces.json` dataset shape, so
+that history loads straight into a workspace `DatasetSource` — no engine, no Java.
+
+Camunda brokers stream every state change as an ordered `Record<?>` log; the
+Elasticsearch/Opensearch and debug-log exporters persist those as JSON. This is the
+offline counterpart of the Nano gateway's in-engine fold (`server/src/console/trace.rs`):
+the same projection, run over Camunda's records. The intent vocabularies map ~1:1
+(`PROCESS_INSTANCE` element lifecycle → instance/element timing; `JOB`
+CREATED/COMPLETED/FAILED + `JOB_BATCH` ACTIVATED → job queue/service split & failures;
+`INCIDENT` CREATED → incidents; `PROCESS_INSTANCE_CREATION` → Tier-1 creation variables;
+`JOB` COMPLETED variables → Tier-2 `jobCompleted` stimulus log for recorded-input replay).
+
+```bash
+# input may be a file or a directory of NDJSON / JSON-array / ES `_search` dumps
+processos import-camunda ./zeebe-records.ndjson /tmp/c8-dataset
+#  -> traces.json (load via a workspace dataset); prints a fold summary
+#  -> { recordsRead, traces, completed, withCreationVariables, withStimuli, processes, … }
+
+processos import-camunda ./zeebe-records.ndjson /tmp/c8-dataset --no-tier2  # skip stimulus capture
+```
+
+**Fidelity tiers.** Tier-0 (instance + element durations + jobs + incidents) is always
+produced. Tier-1 (`creationVariables`) needs the `PROCESS_INSTANCE_CREATION` record. Tier-2
+(`stimuli`) captures `jobCompleted` outputs only — a model that also consumes messages,
+timers, or user-task inputs is therefore only partially replayable. The queue-vs-service
+split needs `JOB_BATCH ACTIVATED` records in the export; without them the whole job wait is
+reported as `serviceMs`. Accepted input layouts: NDJSON, a JSON array, an Elasticsearch
+search response (`hits.hits[]._source`), bare `_source` wrappers, or a directory of any.
+
 ## LLM-driven investigation — open-ended sensing over the data (`src/analysis.rs`, `agent.rs`, `investigate.rs`)
 
 The pre-built analyzers above (`corpus::infer`, `queueing`, `cluster`) encode *our*
@@ -531,6 +563,7 @@ src/
   workspace.rs    workspaces/processes tree + persistence + CRUD + source binding
   dataset.rs      DatasetSource (loaded trace folder) + TraceSource enum (live | dataset)
   corpus.rs       synthetic labelled trace corpus: generator + inference + scorer
+  camunda_import.rs  fold a Camunda 8 / Zeebe record export into a Nano traces.json dataset
   analysis.rs     flatten traces into in-memory DuckDB; read-only query_traces surface
   agent.rs        provider-agnostic tool-calling loop (OpenAI transport) + lab notebook
   investigate.rs  LLM-driven investigation: analysis ToolBox + disciplined system prompt
