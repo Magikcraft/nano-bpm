@@ -228,9 +228,10 @@ impl Settings {
 }
 
 /// The seeded default when no settings file exists. Ships ready-to-run **local llama.cpp
-/// sidecar** profiles: two large models the author runs (Gemma 4 / Qwen 3.6, with a RAM hint in
-/// the name) plus two small models for resource-constrained machines. Each is given its **own
-/// port** (8888–8891) so two can run side by side — a primary plus a sparring-partner / monitor.
+/// sidecar** profiles spanning a size spread for two model families — **Gemma 4** (E4B / 12B /
+/// 26B-A4B / 31B) and **Qwen** (Qwen3 4B / 8B / 32B and Qwen 3.6 35B-A3B) — at the 8 / 16 / 48 /
+/// 64 GB tiers (a RAM hint is in each name). Each is given its **own port** (8888–8895) so two can
+/// run side by side — a primary plus a sparring-partner / monitor.
 /// The operator picks one as active and presses Start. Models download/cache to the shared models
 /// directory ([`default_models_dir`]).
 fn seeded() -> Settings {
@@ -278,6 +279,38 @@ fn seeded() -> Settings {
                 "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL",
                 8891,
                 8192,
+            ),
+            // A 48GB-class dense Qwen, filling the gap between Qwen3 8B (16GB) and
+            // Qwen 3.6 35B-A3B (64GB).
+            local(
+                "qwen3-32b-local",
+                "Qwen3 32B · local (needs 48GB)",
+                "unsloth/Qwen3-32B-GGUF:UD-Q4_K_XL",
+                8892,
+                32768,
+            ),
+            // Gemma 4 across the same size spread as Qwen (8 / 16 / 48 / 64 GB): the
+            // existing 26B-A4B is the 48GB tier; these add the small, mid and top tiers.
+            local(
+                "gemma-4-e4b-local",
+                "Gemma 4 E4B · local (needs 8GB)",
+                "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL",
+                8893,
+                8192,
+            ),
+            local(
+                "gemma-4-12b-local",
+                "Gemma 4 12B · local (needs 16GB)",
+                "unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL",
+                8894,
+                16000,
+            ),
+            local(
+                "gemma-4-31b-local",
+                "Gemma 4 31B · local (needs 64GB)",
+                "unsloth/gemma-4-31B-it-GGUF:UD-Q4_K_XL",
+                8895,
+                32768,
             ),
         ],
         active_profile: Some("gemma-4-local".to_string()),
@@ -681,10 +714,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let store = store_in(&tmp);
         let v = store.view();
-        // Ships ready-to-run local sidecar models, large + small, with RAM hints in the name.
-        assert_eq!(v.profiles.len(), 4);
+        // Ships ready-to-run local sidecar models across a size spread, with RAM hints in the name.
+        assert_eq!(v.profiles.len(), 8);
         assert_eq!(v.active_profile.as_deref(), Some("gemma-4-local"));
         assert!(v.profiles.iter().all(|p| p.sidecar));
+        // Every sidecar gets its own port so several can run side by side.
+        let ports: std::collections::HashSet<u16> = v
+            .profiles
+            .iter()
+            .filter_map(|p| p.base_url.as_deref().and_then(parse_port))
+            .collect();
+        assert_eq!(ports.len(), v.profiles.len());
         let gemma = v.profiles.iter().find(|p| p.id == "gemma-4-local").unwrap();
         assert!(gemma.name.contains("48GB"));
         assert_eq!(gemma.base_url.as_deref(), Some("http://127.0.0.1:8888/v1"));

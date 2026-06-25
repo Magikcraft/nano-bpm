@@ -137,9 +137,10 @@ shutdown. The port set on the Managed-sidecar form is woven into the profile's B
 (`http://127.0.0.1:<port>/v1`), so the profile both *launches* and *talks to* the same
 endpoint. **Logs** opens a streaming viewer that tails the process
 output and shows the **equivalent terminal command** (including `LLAMA_CACHE=…`) so you can
-run it yourself instead. Fresh installs ship four sidecar profiles — **Gemma 4** (needs
-~48 GB) and **Qwen 3.6** (needs ~64 GB) plus **Qwen3-8B** (~16 GB) and **Qwen3-4B** (~8 GB)
-for resource-constrained machines — each on its **own port** (`8888`–`8891`).
+run it yourself instead. Fresh installs ship eight sidecar profiles covering a size spread for
+two model families — **Gemma 4** (E4B ~8 GB, 12B ~16 GB, 26B-A4B ~48 GB, 31B ~64 GB) and **Qwen**
+(Qwen3 4B ~8 GB, 8B ~16 GB, 32B ~48 GB, and Qwen 3.6 35B-A3B ~64 GB) — so you can match the model
+to the machine. Each is on its **own port** (`8888`–`8895`) so two can run at once.
 
 **Up to two sidecars run at once.** An investigation can drive a **primary** model plus, optionally,
 one **partner** — a sparring partner (Pair AI) or a loop **monitor** — and both can be local. The
