@@ -151,11 +151,14 @@ pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Val
     let mock_workers = parse_mock_workers(&args["mockWorkers"]);
     let pid = default_process_id(dataset);
     let candidate = CandidateModel { name, rationale, model: model.to_string(), mock_workers };
+    let instances = sample_slice(&dataset.instances, args);
     let ranking = rank_candidates_by_replay(
         std::slice::from_ref(&candidate),
-        &dataset.instances,
+        instances,
         pid.as_deref(),
     );
+    let total = dataset.instances.len();
+    let sampled = (ranking.dataset_size as usize) < total;
     let mut v = serde_json::to_value(&ranking).map_err(|e| format!("serialise ranking: {e}"))?;
     if let Some(c) = v["candidates"].as_array_mut().and_then(|a| a.first_mut()) {
         trim_report(&mut c["report"]);
@@ -163,10 +166,32 @@ pub fn simulate(_base_model: Option<&str>, dataset: &RecordedDataset, args: &Val
         return Ok(json!({
             "replayable": true,
             "datasetSize": ranking.dataset_size,
+            "datasetTotal": total,
+            "sampled": sampled,
             "scorecard": c,
         }));
     }
-    Ok(json!({ "replayable": true, "datasetSize": ranking.dataset_size, "scorecard": Value::Null }))
+    Ok(json!({
+        "replayable": true,
+        "datasetSize": ranking.dataset_size,
+        "datasetTotal": total,
+        "sampled": sampled,
+        "scorecard": Value::Null,
+    }))
+}
+
+/// Resolve how many recorded instances to replay this call. `limit` (alias
+/// `sampleSize`) lets the investigator run a **cheap single-instance smoke**
+/// (`limit:1`) to validate a model parses & conserves, then a **small sample**
+/// (e.g. `limit:25`) to surface obvious issues, before committing to the **full
+/// dataset**. Execution is cheap — staging the run is just for fast iteration,
+/// never a correctness concern. An absent / zero / oversized limit replays all.
+fn sample_slice<'a>(instances: &'a [RecordedInstance], args: &Value) -> &'a [RecordedInstance] {
+    let limit = args["limit"].as_u64().or_else(|| args["sampleSize"].as_u64());
+    match limit {
+        Some(n) if n > 0 && (n as usize) < instances.len() => &instances[..n as usize],
+        _ => instances,
+    }
 }
 
 /// `compare_variants` — score and rank a population of candidate models (optionally
@@ -215,7 +240,10 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
     }
 
     let pid = default_process_id(dataset);
-    let ranking = rank_candidates_by_replay(&candidates, &dataset.instances, pid.as_deref());
+    let instances = sample_slice(&dataset.instances, args);
+    let ranking = rank_candidates_by_replay(&candidates, instances, pid.as_deref());
+    let total = dataset.instances.len();
+    let sampled = (ranking.dataset_size as usize) < total;
     let mut v = serde_json::to_value(&ranking).map_err(|e| format!("serialise ranking: {e}"))?;
     if let Some(arr) = v["candidates"].as_array_mut() {
         for c in arr.iter_mut() {
@@ -223,6 +251,8 @@ pub fn compare_variants(base_model: Option<&str>, dataset: &RecordedDataset, arg
             surface_deploy_error(c);
         }
     }
+    v["datasetTotal"] = json!(total);
+    v["sampled"] = json!(sampled);
     Ok(v)
 }
 
@@ -310,6 +340,47 @@ mod tests {
         assert!((sc["report"]["conservedRate"].as_f64().unwrap() - 1.0).abs() < 1e-9);
         // The heavy per-instance results were trimmed out.
         assert!(sc["report"].get("results").is_none());
+    }
+
+    #[test]
+    fn simulate_reports_total_and_unsampled_by_default() {
+        let ds = dataset();
+        let v = simulate(None, &ds, &json!({ "model": TWO_TASK })).unwrap();
+        assert_eq!(v["datasetSize"], 3);
+        assert_eq!(v["datasetTotal"], 3);
+        assert_eq!(v["sampled"], false);
+    }
+
+    #[test]
+    fn simulate_limit_replays_only_a_sample() {
+        let ds = dataset();
+        // limit:1 — the cheap single-run smoke.
+        let v = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 1 })).unwrap();
+        assert_eq!(v["datasetSize"], 1, "only one instance replayed");
+        assert_eq!(v["datasetTotal"], 3, "full size still reported");
+        assert_eq!(v["sampled"], true);
+        assert_eq!(v["scorecard"]["report"]["instancesTotal"], 1);
+
+        // sampleSize alias works too; an oversized limit falls back to the full set.
+        let s = simulate(None, &ds, &json!({ "model": TWO_TASK, "sampleSize": 2 })).unwrap();
+        assert_eq!(s["datasetSize"], 2);
+        let full = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 999 })).unwrap();
+        assert_eq!(full["datasetSize"], 3);
+        assert_eq!(full["sampled"], false);
+    }
+
+    #[test]
+    fn compare_variants_honours_limit() {
+        let ds = dataset();
+        let v = compare_variants(
+            Some(TWO_TASK),
+            &ds,
+            &json!({ "candidates": [ { "name": "identity", "model": TWO_TASK } ], "limit": 1 }),
+        )
+        .unwrap();
+        assert_eq!(v["datasetSize"], 1);
+        assert_eq!(v["datasetTotal"], 3);
+        assert_eq!(v["sampled"], true);
     }
 
     #[test]

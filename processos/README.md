@@ -210,8 +210,12 @@ produced. Tier-1 (`creationVariables`) needs the `PROCESS_INSTANCE_CREATION` rec
 (`stimuli`) captures `jobCompleted` outputs only — a model that also consumes messages,
 timers, or user-task inputs is therefore only partially replayable. The queue-vs-service
 split needs `JOB_BATCH ACTIVATED` records in the export; without them the whole job wait is
-reported as `serviceMs`. Accepted input layouts: NDJSON, a JSON array, an Elasticsearch
-search response (`hits.hits[]._source`), bare `_source` wrappers, or a directory of any.
+reported as `serviceMs`.
+
+See **[`docs/processos-camunda-import.md`](../docs/processos-camunda-import.md)** for the
+full reference: the complete record→trace mapping, accepted input layouts, getting records
+out of Camunda, known limits, and the path from this offline transformer to an in-engine
+Zeebe exporter.
 
 ## LLM-driven investigation — open-ended sensing over the data (`src/analysis.rs`, `agent.rs`, `investigate.rs`)
 

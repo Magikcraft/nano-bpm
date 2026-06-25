@@ -29,6 +29,12 @@ worker internals, and the physical resources/deployment at the bottom.
 | 4 | [`processos-deployment-cooptimization.md`](./processos-deployment-cooptimization.md) | Structure, binding, and **resourcing** as coupled layers of one process→deployment mapping; the **observability/actuation regimes** (offline engine-sim / queueing-model-sim / live act-and-measure); the full layer taxonomy incl. **cross-process/portfolio** contention; and the ProcessOS additions implied (a third **scaling** control verb, a second **queueing** simulator, portfolio-scoped ingest). | you're reasoning about cluster/worker resources, scaling, and why they escape isolated-engine simulation. |
 | 5 | [`processos-worker-and-semantic-layers.md`](./processos-worker-and-semantic-layers.md) | The two **ends** of the stack: **worker-internal logic** (SDK instrumentation → OTel sub-spans, auto-harvested side-effect/purity safety data, observe→configure→transform actuation) and the **business-semantic layer** (where the verifier's safety model inverts, autonomy drops to advisory, and a *grounded* LLM becomes a business-redesign copilot). | you want the bottom (worker internals) and top (business redesign) of the space. |
 
+### Companion: implemented features
+
+| Document | What it covers |
+|----------|----------------|
+| [`processos-camunda-import.md`](./processos-camunda-import.md) | **Implemented.** The `import-camunda` transformer: fold a **Camunda 8 / Zeebe** record export (Elasticsearch/Opensearch/debug-log JSON) into a Nano `traces.json` dataset, so a customer's existing C8 history loads into a workspace `DatasetSource` with no Nano engine and no Java. Includes the record→trace mapping, fidelity tiers, and the path to an in-engine Zeebe exporter. |
+
 ## The mental model that unifies them
 
 A deployed process is a **mapping from a logical specification down to a physical

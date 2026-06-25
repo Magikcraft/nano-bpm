@@ -201,13 +201,19 @@ impl ToolBox for AnalysisTools {
                     return its fidelity scorecard: fidelityTier, boundary-conserved count and \
                     conservedRate, replayed avg/p99 end-to-end latency, per-job-type coverage, the \
                     job types it would need NEW WORKERS for (requiresNewWorkers), and which recorded \
-                    output keys it failed to reproduce. Author a full variant of the current model \
-                    (use read_model first) and pass its XML. If your variant adds a NEW worker (a \
-                    job type history never recorded), supply a generative mock for it in \
-                    `mockWorkers` so it can still be scored (fidelityTier becomes 'mocked-replay', \
-                    a Level-3 assumption-based result) instead of being unscorable. Needs \
-                    recorded-input capture; if none is available it returns replayable=false with \
-                    the reason. Args: model (BPMN XML, required), name, rationale, mockWorkers."
+                    output keys it failed to reproduce. This is SAFE, FAST and CHEAP: it runs an \
+                    in-process engine, deploys nothing to production, and cannot break anything — \
+                    so REACH FOR IT EARLY and OFTEN instead of reasoning in your head. Best loop: \
+                    first `limit:1` to validate the model parses and conserves a single instance, \
+                    then `limit:25` to catch obvious issues on a small sample, then drop `limit` \
+                    (or use compare_variants) for the full-dataset verdict. Author a full variant of \
+                    the current model (use read_model first) and pass its XML. If your variant adds \
+                    a NEW worker (a job type history never recorded), supply a generative mock for \
+                    it in `mockWorkers` so it can still be scored (fidelityTier becomes \
+                    'mocked-replay', a Level-3 assumption-based result) instead of being unscorable. \
+                    Needs recorded-input capture; if none is available it returns replayable=false \
+                    with the reason. Args: model (BPMN XML, required), name, rationale, mockWorkers, \
+                    limit (replay only the first N instances — for a quick smoke before the full run)."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -215,6 +221,12 @@ impl ToolBox for AnalysisTools {
                         "model": { "type": "string", "description": "Candidate BPMN XML to replay." },
                         "name": { "type": "string", "description": "Short label for the variant." },
                         "rationale": { "type": "string", "description": "Why this variant was proposed." },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Replay only the first N recorded instances (a cheap \
+                                smoke). Use 1 to validate the model, ~25 for a quick sample, then \
+                                omit it for the full dataset. Absent = replay everything."
+                        },
                         "mockWorkers": {
                             "type": "object",
                             "description": "Generative mocks for NEW workers the variant introduces. \
@@ -242,11 +254,15 @@ impl ToolBox for AnalysisTools {
                     model is included as the 'baseline' by default (set includeBaseline=false to \
                     omit). Use this to decide whether a redesign actually beats today's process on \
                     real history. Returns datasetSize, the ranked candidates with their scorecards, \
-                    and the best one. Needs recorded-input capture. A variant that adds a NEW \
-                    worker can be scored by supplying a generative mock for it — either per \
-                    candidate (mockWorkers on that item) or a top-level mockWorkers shared by all. \
-                    Args: candidates (array of {name, model (BPMN XML), rationale?, mockWorkers?}), \
-                    includeBaseline (bool), mockWorkers (shared map)."
+                    and the best one. This is SAFE, FAST and CHEAP — it deploys nothing and cannot \
+                    break production; tip: validate each variant with a single `simulate(limit:1)` \
+                    first, then compare the survivors here. You can also pass `limit` to compare on \
+                    a small sample before the full run. Needs recorded-input capture. A variant that \
+                    adds a NEW worker can be scored by supplying a generative mock for it — either \
+                    per candidate (mockWorkers on that item) or a top-level mockWorkers shared by \
+                    all. Args: candidates (array of {name, model (BPMN XML), rationale?, \
+                    mockWorkers?}), includeBaseline (bool), mockWorkers (shared map), limit \
+                    (replay only the first N instances)."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -276,6 +292,11 @@ impl ToolBox for AnalysisTools {
                         "includeBaseline": {
                             "type": "boolean",
                             "description": "Include the current model as 'baseline' (default true)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Replay only the first N recorded instances (a cheap \
+                                sample) before the full comparison. Absent = compare on everything."
                         },
                         "mockWorkers": {
                             "type": "object",

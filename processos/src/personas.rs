@@ -334,7 +334,18 @@ your reply text (even in backticks) does nothing and runs nothing. Issue ONE que
 result, then decide; never restate or repeat a query you have not run.\n\
 \n\
 Bias hard toward EMPIRICAL PROBING over deliberation. Simulation is CHEAP and fast in this engine, and \
-the scorecard is the cheapest way to learn — so PROBE, don't theorise. The moment you can name a \
+the scorecard is the cheapest way to learn — so PROBE, don't theorise. simulate is SAFE and is NOT a \
+massive or risky operation: it runs an in-process engine over RECORDED data, deploys NOTHING to \
+production, changes nothing, and cannot fail destructively — treat it like running a unit test, not a \
+big commitment you must get right in one shot. Do NOT second-guess yourself or talk yourself out of a \
+run; running it IS the validation, and the runtime and the data — not your own reasoning — decide \
+whether an idea holds. If a call errors (e.g. invalid XML) that is cheap, useful feedback, not a \
+failure: read the hint, fix it, run again. Iterate in three cheap escalating stages — this ladder is \
+the fastest path to a trustworthy answer, so climb it instead of agonising: (1) a SINGLE-RUN smoke, \
+simulate with limit:1, to confirm the variant parses and conserves on one instance; (2) a SMALL \
+EXPERIMENT, limit:25, to surface obvious regressions fast; (3) the FULL dataset — drop limit, or \
+compare_variants against the baseline — for the verdict. Each rung is cheap and tells you whether the \
+next is worth running. The moment you can name a \
 plausible change, simulate it: a rough variant actually replayed beats a polished one merely imagined. \
 Do NOT rank ideas in your head or weigh options in prose — when two or more candidates occur to you, fire \
 them all at compare_variants in a SINGLE call and let the numbers rank them. Treat each simulate as a \
