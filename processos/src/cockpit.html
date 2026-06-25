@@ -345,6 +345,7 @@
 </dialog>
 
 <script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
+<script src="/assets/bpmn/bpmn-auto-layout.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const main = $('#main');
@@ -1389,14 +1390,28 @@ function modelCardHtml(m){
     '</div></div>';
 }
 
+// Does this BPMN XML already carry diagram-interchange (layout) info? LLM-authored variants are
+// usually pure semantics with no <bpmndi:BPMNDiagram>, which the viewer can't render
+// ("no diagram to display") — those we auto-layout first.
+function bpmnHasDi(xml){ return /BPMNDiagram|BPMNPlane/.test(xml || ''); }
+
+// Add a generated layout to DI-less BPMN so the viewer can render it; returns the original XML
+// on any failure (the viewer will then surface its own message).
+async function ensureBpmnLayout(xml){
+  if(bpmnHasDi(xml) || typeof BpmnAutoLayout === 'undefined' || !BpmnAutoLayout.layoutProcess) return xml;
+  try { return await BpmnAutoLayout.layoutProcess(xml); }
+  catch(_){ return xml; }
+}
+
 // Render BPMN xml into a container with a fresh viewer; returns the viewer or null.
 async function renderBpmnInto(el, xml){
   if(!el) return null;
   if(typeof BpmnJS === 'undefined'){ el.innerHTML = '<div class="mc-err">diagram viewer unavailable</div>'; return null; }
   try {
     el.innerHTML = '';
+    const ready = await ensureBpmnLayout(xml);
     const viewer = new BpmnJS({ container: el });
-    await viewer.importXML(xml);
+    await viewer.importXML(ready);
     try { viewer.get('canvas').zoom('fit-viewport', 'auto'); } catch(_){}
     return viewer;
   } catch(e){
@@ -1913,7 +1928,7 @@ async function renderWsModel(url){
   try {
     const xml = await (await fetch(url)).text();
     const viewer = new BpmnJS({ container: el });
-    await viewer.importXML(xml);
+    await viewer.importXML(await ensureBpmnLayout(xml));
     viewer.get('canvas').zoom('fit-viewport', 'auto');
   } catch(e){ el.innerHTML = '<p class="err" style="padding:12px">could not render model: '+esc(e.message||e)+'</p>'; }
 }
