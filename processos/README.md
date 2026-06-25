@@ -112,6 +112,29 @@ layers **built-in default → `PROCESSOS_LLM_*` env → active profile → per-r
 environment without a relaunch. The panel also configures `PROCESSOS_PYTHON`
 (the `run_python` interpreter). See the [settings endpoints](#endpoints).
 
+### Local model sidecar — run llama.cpp from ProcessOS (`src/llama.rs`)
+
+ProcessOS can supervise a local **`llama-server`** (llama.cpp) so the operator never has to
+launch one in a separate terminal. In the Settings panel, tick **"Served by local llama.cpp
+sidecar"** on a profile and give it a **Model file / HF spec** — either a Hugging Face
+`repo[:quant]` spec (e.g. `unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL`, downloaded on demand) or a
+`.gguf` path resolved against the **Models directory**. **Startup args** (e.g.
+`-ngl 99 -c 32768 --jinja`) are appended verbatim. The global **Local model server** section
+sets the shared **Models directory** (pre-filled with llama.cpp's own cache —
+`$LLAMA_CACHE`, else macOS `~/Library/Caches/llama.cpp` / Linux `~/.cache/llama.cpp` — so
+models are shared with any separately-run llama.cpp) and an optional **llama-server binary**
+path (otherwise found on `PATH`).
+
+**Start sidecar / Stop** spawn and kill the process; the sidecar is also stopped on graceful
+shutdown. The port is parsed from the profile's Base URL (so the profile both *launches* and
+*talks to* the same endpoint). **Logs** opens a streaming viewer that tails the process
+output and shows the **equivalent terminal command** (including `LLAMA_CACHE=…`) so you can
+run it yourself instead. Fresh installs ship four sidecar profiles — **Gemma 4** (needs
+~48 GB) and **Qwen 3.6** (needs ~64 GB) plus **Qwen3-8B** (~16 GB) and **Qwen3-4B** (~8 GB)
+for resource-constrained machines — all pointing the sidecar at `http://127.0.0.1:8888/v1`.
+See the [llama endpoints](#endpoints).
+
+
 ## Workspaces — bounded contexts & processes (multi-tenant + datasets)
 
 A consultant manages many engagements, so ProcessOS roots a **workspace tree** of
@@ -550,10 +573,14 @@ for it automatically.
 | `GET`/`POST` | `/api/personas` | List / author chat **personas** (standing system prompts; persisted to the config dir). Built-ins are read-only |
 | `DELETE` | `/api/personas/{id}` | Delete a non-built-in persona |
 | `GET` | `/assets/bpmn/{file}` | Vendored bpmn-js viewer assets (model rendering) |
-| `GET`/`PUT` | `/api/settings` | Read settings / update the **globals** (`activeProfile`, `pythonBin`). `GET` lists LLM profiles (each redacting its key as `apiKeySet`) + the active profile + the Python interpreter |
+| `GET`/`PUT` | `/api/settings` | Read settings / update the **globals** (`activeProfile`, `pythonBin`, `modelsDir`, `llamaBin`). `GET` lists LLM profiles (each redacting its key as `apiKeySet`, plus `sidecar`/`modelFile`/`sidecarArgs`) + the active profile + the Python interpreter + the sidecar models dir / binary + the `defaultModelsDir` prefill |
 | `POST` | `/api/settings/profiles` | Create a new LLM profile (optional `name`); returns the new `id` + the updated settings |
 | `PUT`/`DELETE` | `/api/settings/profiles/{id}` | Partial-update / delete one profile. On `PUT`, absent fields are unchanged, an empty string (or `0`/negative number) clears a field back to the env default; the API key is set only when a non-empty `apiKey` is sent |
 | `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id; each entry includes its `contextWindow` when the endpoint reports one |
+| `GET` | `/api/llama/status` | Local llama.cpp sidecar status (`running`, `model`, `port`, `pid`, `command`, `startedAt`, `error`) |
+| `POST` | `/api/llama/start` | Start the sidecar for a profile (`{profileId}`; the profile must have `sidecar:true`). Returns the new status |
+| `POST` | `/api/llama/stop` | Stop the running sidecar |
+| `GET` | `/api/llama/logs?since=N` | Tail the sidecar's combined stdout/stderr from offset `N`; returns `{lines, nextOffset, running}` for incremental polling |
 
 ## Layout
 
@@ -573,6 +600,7 @@ src/
   investigate.rs  LLM-driven investigation: analysis ToolBox + disciplined system prompt
   pyrunner.rs     optional run_python escape hatch: CSV export + timeout subprocess runner
   settings.rs     operator-editable LLM + Python settings, persisted to ~/.config/processos
+  llama.rs        local llama.cpp `llama-server` sidecar supervisor (start/stop/logs)
   cockpit.rs      the cockpit: Console -> Process -> Experiment surface
   chat.rs         interactive cockpit chat: file-backed transcript store + view projection
   chat_prompts.rs reusable compose-box prompt library, persisted to the config dir

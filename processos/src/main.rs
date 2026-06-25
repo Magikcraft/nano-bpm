@@ -24,6 +24,7 @@ mod dataset;
 mod experiment;
 mod harness;
 mod investigate;
+mod llama;
 mod personas;
 mod pilot;
 mod pyrunner;
@@ -111,6 +112,9 @@ struct AppState {
     /// This decouples the running investigation from the fetch that started it, so reloading the
     /// page no longer loses the live view. Removed once the turn ends.
     chat_live: Arc<std::sync::Mutex<std::collections::HashMap<String, LiveTurn>>>,
+    /// The supervised local llama.cpp `llama-server` sidecar (start/stop/status/logs). Optional at
+    /// runtime — nothing runs until the operator presses Start for a `sidecar:true` profile.
+    llama: llama::LlamaManager,
 }
 
 /// An append-only buffer for one in-flight chat turn's SSE events, shared between the producing
@@ -342,7 +346,11 @@ async fn main() {
         chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        llama: llama::LlamaManager::new(),
     };
+
+    // A handle to stop the llama sidecar on shutdown (the router takes ownership of `state`).
+    let llama_for_shutdown = state.llama.clone();
 
     let app = Router::new()
         .route("/", get(landing))
@@ -463,6 +471,10 @@ async fn main() {
             axum::routing::put(put_profile).delete(delete_profile),
         )
         .route("/api/settings/models", post(post_models))
+        .route("/api/llama/status", get(llama_status))
+        .route("/api/llama/start", post(llama_start))
+        .route("/api/llama/stop", post(llama_stop))
+        .route("/api/llama/logs", get(llama_logs))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -488,6 +500,8 @@ async fn main() {
     if let Some(engine) = own_engine {
         engine.shutdown().await;
     }
+    // Stop the local model sidecar (if running) so llama-server doesn't linger.
+    llama_for_shutdown.stop().await;
 }
 
 /// `processos gen <pack.json> <out-dir>` — generate a synthetic trace corpus.
@@ -1217,6 +1231,70 @@ async fn post_models(
         Ok(models) => Json(serde_json::json!({ "models": models })).into_response(),
         Err(e) => bad_gateway(e),
     }
+}
+
+/// `GET /api/llama/status` — the local model sidecar's current state (running, model, port, pid,
+/// the equivalent terminal command, models dir).
+async fn llama_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.llama.status())
+}
+
+/// Request body for starting the sidecar: which saved profile to serve.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlamaStartRequest {
+    profile_id: String,
+}
+
+/// `POST /api/llama/start` — launch `llama-server` for the named `sidecar:true` profile, serving
+/// it at the profile's base-URL port. The models directory is exported as `LLAMA_CACHE`.
+async fn llama_start(
+    State(state): State<AppState>,
+    Json(req): Json<LlamaStartRequest>,
+) -> impl IntoResponse {
+    let snap = state.settings.snapshot();
+    let profile = match snap.profiles.iter().find(|p| p.id == req.profile_id) {
+        Some(p) => p.clone(),
+        None => return unprocessable(format!("no such profile: {}", req.profile_id)),
+    };
+    if !profile.sidecar {
+        return unprocessable(format!(
+            "profile '{}' is not configured to use the local sidecar",
+            profile.id
+        ));
+    }
+    let models_dir = snap.effective_models_dir();
+    let plan = match llama::LaunchPlan::build(&profile, &models_dir, snap.llama_bin.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return unprocessable(e),
+    };
+    match state.llama.start(plan) {
+        Ok(status) => Json(status).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/llama/stop` — stop the running sidecar (idempotent).
+async fn llama_stop(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.llama.stop().await)
+}
+
+/// Query for incremental log polling (`?since=<offset>`).
+#[derive(Debug, Default, Deserialize)]
+struct LlamaLogsQuery {
+    #[serde(default)]
+    since: u64,
+}
+
+/// `GET /api/llama/logs?since=N` — the sidecar's captured stdout/stderr from offset `N` onward,
+/// plus the next offset to poll and whether the process is still running. Powers the streaming
+/// log viewer.
+async fn llama_logs(
+    State(state): State<AppState>,
+    Query(q): Query<LlamaLogsQuery>,
+) -> impl IntoResponse {
+    let (lines, next, running) = state.llama.logs_since(q.since);
+    Json(serde_json::json!({ "lines": lines, "nextOffset": next, "running": running }))
 }
 
 /// Resolve the effective LLM config for a request: built-in defaults → `PROCESSOS_LLM_*`

@@ -29,7 +29,23 @@
     '.settings-body .sep{height:1px;background:#1f1f23;margin:6px 0}',
     '#s-status{color:#a1a1aa;font-size:12px;min-height:16px}',
     '#s-path{color:#71717a;font-size:11px;word-break:break-all}',
-    '.s-active-tag{font-size:10px;color:#86efac;border:1px solid #14532d;border-radius:999px;padding:0 7px}'
+    '.s-active-tag{font-size:10px;color:#86efac;border:1px solid #14532d;border-radius:999px;padding:0 7px}',
+    '.settings-body .hint{font-size:11px;color:#71717a}',
+    '.settings-body .hint a{color:#818cf8}',
+    '.settings-body label.ck{flex-direction:row;align-items:center;gap:7px;color:#e4e4e7;cursor:pointer}',
+    '.settings-body label.ck input{flex:0 0 auto;width:auto}',
+    '#s-llama-status{font-size:12px;color:#a1a1aa;min-height:16px}',
+    '.s-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52525b;margin-right:6px;vertical-align:middle}',
+    '.s-dot.on{background:#22c55e}',
+    '#llama-logs-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:70;display:flex}',
+    '#llama-logs-overlay[hidden]{display:none}',
+    '#llama-logs-panel{margin:auto;width:780px;max-width:94vw;height:80vh;background:#0b0b0d;border:1px solid #27272a;border-radius:8px;display:flex;flex-direction:column;color:#e4e4e7;font:13px/1.5 system-ui,sans-serif}',
+    '#llama-logs-panel .llh{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid #27272a}',
+    '#llama-logs-panel .llh strong{font-size:13px}',
+    '#llama-logs-panel .llh button{background:none;border:none;color:#a1a1aa;font-size:16px;cursor:pointer}',
+    '.ll-cmd{padding:8px 14px;font:12px/1.45 ui-monospace,Menlo,monospace;color:#a5b4fc;border-bottom:1px solid #1f1f23;word-break:break-all;background:#111}',
+    '.ll-cmd .lbl{display:block;color:#71717a;font-family:system-ui,sans-serif;font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px}',
+    '#ll-body{margin:0;padding:10px 14px;overflow:auto;flex:1;font:12px/1.45 ui-monospace,Menlo,monospace;color:#d4d4d8;white-space:pre-wrap;word-break:break-word}'
   ].join('\n');
 
   var HTML =
@@ -64,12 +80,29 @@
       '</div>' +
       '<div class="bar"><button id="s-save" class="primary">Save profile</button><button id="s-clearkey" class="ghost">Clear API key</button></div>' +
       '<div class="sep"></div>' +
+      '<label class="ck"><input type="checkbox" id="s-sidecar"> Served by local llama.cpp sidecar</label>' +
+      '<label>Model file / HF spec <input id="s-modelFile" placeholder="unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL or /path/model.gguf"></label>' +
+      '<label>Startup args <input id="s-sidecarArgs" placeholder="-ngl 99 -c 32768 --jinja"></label>' +
+      '<div class="hint">A <code>:quant</code> HF spec is downloaded into the models directory; a <code>.gguf</code> path is resolved against it. Browse GGUF models on <a href="https://huggingface.co/models?library=gguf&sort=trending" target="_blank" rel="noopener noreferrer">HuggingFace</a>.</div>' +
+      '<div class="bar"><button id="s-llama-start" class="ghost">Start sidecar</button><button id="s-llama-stop" class="ghost">Stop</button><button id="s-llama-logs" class="ghost">Logs</button></div>' +
+      '<div id="s-llama-status"></div>' +
+      '<div class="sep"></div>' +
+      '<h4>Local model server (llama.cpp)</h4>' +
+      '<label>Models directory <input id="s-modelsDir" placeholder="(default)"></label>' +
+      '<label>llama-server binary <input id="s-llamaBin" placeholder="llama-server (found on PATH)"></label>' +
+      '<div class="bar"><button id="s-savellama" class="ghost">Save server config</button></div>' +
+      '<div class="sep"></div>' +
       '<h4>Python (analysis escape hatch)</h4>' +
       '<label>Interpreter <input id="s-python" placeholder="python3 or /path/to/venv/bin/python"></label>' +
       '<div class="bar"><button id="s-savepy" class="ghost">Save interpreter</button></div>' +
       '<div id="s-status"></div>' +
       '<div id="s-path"></div>' +
-    '</div></div></div>';
+    '</div></div></div>' +
+    '<div id="llama-logs-overlay" hidden><div id="llama-logs-panel" role="dialog" aria-label="llama-server output">' +
+      '<div class="llh"><strong>llama-server output</strong><button id="ll-close" aria-label="Close">&#10005;</button></div>' +
+      '<div class="ll-cmd"><span class="lbl">Run it yourself in a terminal</span><span id="ll-cmd"></span></div>' +
+      '<pre id="ll-body"></pre>' +
+    '</div></div>';
 
   var style = document.createElement('style');
   style.textContent = CSS;
@@ -117,8 +150,8 @@
   function fillFields() {
     var p = currentProfile();
     if (!p) {
-      ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp'].forEach(function (i) { $(i).value = ''; });
-      $('s-provider').value = ''; $('s-apiKey').value = '';
+      ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp', 's-modelFile', 's-sidecarArgs'].forEach(function (i) { $(i).value = ''; });
+      $('s-provider').value = ''; $('s-apiKey').value = ''; $('s-sidecar').checked = false;
       $('s-activeline').textContent = 'No profiles';
       return;
     }
@@ -129,6 +162,9 @@
     $('s-apiKey').value = ''; $('s-apiKey').placeholder = keyPh(p.apiKeySet);
     $('s-maxTokens').value = p.maxTokens != null ? p.maxTokens : '';
     $('s-temp').value = p.temperature != null ? p.temperature : '';
+    $('s-sidecar').checked = !!p.sidecar;
+    $('s-modelFile').value = p.modelFile || '';
+    $('s-sidecarArgs').value = p.sidecarArgs || '';
     var isActive = p.id === STATE.view.activeProfile;
     $('s-activeline').innerHTML = isActive
       ? 'This profile is <span class="s-active-tag">active</span>'
@@ -141,7 +177,11 @@
     renderProfileList();
     fillFields();
     $('s-python').value = v.pythonBin || '';
+    $('s-modelsDir').value = v.modelsDir || '';
+    $('s-modelsDir').placeholder = v.defaultModelsDir || '(default)';
+    $('s-llamaBin').value = v.llamaBin || '';
     $('s-path').textContent = v.path ? ('Persisted to ' + v.path) : '';
+    refreshLlama();
     // Let host surfaces (e.g. the cockpit's Send button + Python label) react to a change.
     try { window.dispatchEvent(new CustomEvent('processos:settings-changed', { detail: v })); }
     catch (e) { /* CustomEvent unsupported — non-fatal */ }
@@ -168,7 +208,10 @@
       baseUrl: $('s-baseUrl').value,
       model: $('s-model').value,
       maxTokens: $('s-maxTokens').value ? Number($('s-maxTokens').value) : 0,
-      temperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1
+      temperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1,
+      sidecar: $('s-sidecar').checked,
+      modelFile: $('s-modelFile').value,
+      sidecarArgs: $('s-sidecarArgs').value
     };
     var key = $('s-apiKey').value;
     if (key) patch.apiKey = key;
@@ -255,4 +298,81 @@
     try { applyView(await api('PUT', '/api/settings', { pythonBin: $('s-python').value })); status('Interpreter saved'); }
     catch (e) { status('error: ' + e.message); }
   });
+
+  // --- Local llama.cpp sidecar ---------------------------------------------
+  var LLAMA = { command: '', logTimer: null, since: 0 };
+
+  function llamaStatusLine(s) {
+    var el = $('s-llama-status');
+    if (!el) return;
+    if (s && s.running) {
+      el.innerHTML = '<span class="s-dot on"></span>Running ' + (s.model || '') +
+        ' on port ' + (s.port != null ? s.port : '?') + ' (pid ' + (s.pid != null ? s.pid : '?') + ')';
+    } else if (s && s.error) {
+      el.innerHTML = '<span class="s-dot"></span>Exited: ' + s.error;
+    } else {
+      el.innerHTML = '<span class="s-dot"></span>Sidecar not running';
+    }
+  }
+
+  async function refreshLlama() {
+    if (!$('s-llama-status')) return;
+    try { var s = await api('GET', '/api/llama/status'); LLAMA.command = s.command || ''; llamaStatusLine(s); }
+    catch (e) { /* status endpoint absent on older servers — non-fatal */ }
+  }
+
+  $('s-savellama').addEventListener('click', async function () {
+    status('Saving\u2026');
+    try {
+      applyView(await api('PUT', '/api/settings', { modelsDir: $('s-modelsDir').value, llamaBin: $('s-llamaBin').value }));
+      status('Server config saved');
+    } catch (e) { status('error: ' + e.message); }
+  });
+
+  $('s-llama-start').addEventListener('click', async function () {
+    var p = currentProfile(); if (!p) { status('add a sidecar profile first'); return; }
+    status('Starting sidecar\u2026');
+    try {
+      var s = await api('POST', '/api/llama/start', { profileId: p.id });
+      LLAMA.command = s.command || ''; llamaStatusLine(s);
+      status(s.running ? 'Sidecar started \u2014 open Logs to watch it load' : 'Sidecar did not start');
+    } catch (e) { status('start failed: ' + e.message); llamaStatusLine(null); }
+  });
+
+  $('s-llama-stop').addEventListener('click', async function () {
+    status('Stopping sidecar\u2026');
+    try { llamaStatusLine(await api('POST', '/api/llama/stop')); status('Sidecar stopped'); }
+    catch (e) { status('stop failed: ' + e.message); }
+  });
+
+  var logsOverlay = $('llama-logs-overlay');
+  function stopLogPolling() { if (LLAMA.logTimer) { clearInterval(LLAMA.logTimer); LLAMA.logTimer = null; } }
+  function closeLogs() { logsOverlay.hidden = true; stopLogPolling(); }
+
+  async function pollLogs() {
+    try {
+      var d = await api('GET', '/api/llama/logs?since=' + LLAMA.since);
+      if (d.lines && d.lines.length) {
+        var body = $('ll-body');
+        var atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 24;
+        body.textContent += d.lines.join('\n') + '\n';
+        if (atBottom) body.scrollTop = body.scrollHeight;
+      }
+      if (typeof d.nextOffset === 'number') LLAMA.since = d.nextOffset;
+    } catch (e) { /* keep polling; transient errors are non-fatal */ }
+  }
+
+  $('s-llama-logs').addEventListener('click', async function () {
+    LLAMA.since = 0;
+    $('ll-body').textContent = '';
+    await refreshLlama();
+    $('ll-cmd').textContent = LLAMA.command || '(start the sidecar to see its command)';
+    logsOverlay.hidden = false;
+    await pollLogs();
+    stopLogPolling();
+    LLAMA.logTimer = setInterval(pollLogs, 1500);
+  });
+
+  $('ll-close').addEventListener('click', closeLogs);
+  logsOverlay.addEventListener('click', function (e) { if (e.target === logsOverlay) closeLogs(); });
 })();

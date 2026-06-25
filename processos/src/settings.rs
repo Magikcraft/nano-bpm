@@ -48,6 +48,21 @@ pub struct LlmProfile {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// When true, this profile is served by ProcessOS's **local llama.cpp `llama-server`
+    /// sidecar**: the supervisor launches `llama-server` for [`model_file`] and serves it at
+    /// [`base_url`]'s port. When false it is a plain remote/external endpoint (the original
+    /// behaviour).
+    #[serde(default)]
+    pub sidecar: bool,
+    /// The model the sidecar loads: either a Hugging Face `repo[:quant]` spec (e.g.
+    /// `unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M`, downloaded/cached under the models dir) or a
+    /// local `.gguf` path (absolute, or relative to the models directory).
+    #[serde(default)]
+    pub model_file: Option<String>,
+    /// Extra `llama-server` startup arguments (e.g. `-ngl 99 -c 32768`). The supervisor always
+    /// supplies `--host`, `--port` and the model flag; these are appended verbatim.
+    #[serde(default)]
+    pub sidecar_args: Option<String>,
 }
 
 impl LlmProfile {
@@ -88,7 +103,32 @@ impl LlmProfile {
         if let Some(v) = patch.temperature {
             self.temperature = (v >= 0.0).then_some(v);
         }
+        if let Some(v) = patch.sidecar {
+            self.sidecar = v;
+        }
+        if let Some(v) = patch.model_file {
+            self.model_file = non_empty(v);
+        }
+        if let Some(v) = patch.sidecar_args {
+            self.sidecar_args = non_empty(v);
+        }
     }
+
+    /// The TCP port the sidecar should serve on, parsed from [`base_url`] (e.g.
+    /// `http://127.0.0.1:8888/v1` → 8888). Falls back to llama-server's default 8080.
+    pub fn sidecar_port(&self) -> u16 {
+        self.base_url
+            .as_deref()
+            .and_then(parse_port)
+            .unwrap_or(8080)
+    }
+}
+
+/// Pull the port out of a base URL like `http://host:PORT/v1`.
+fn parse_port(url: &str) -> Option<u16> {
+    let after_scheme = url.split("//").nth(1).unwrap_or(url);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    authority.rsplit(':').next().and_then(|p| p.parse().ok())
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -107,6 +147,14 @@ pub struct Settings {
     pub active_profile: Option<String>,
     #[serde(default)]
     pub python_bin: Option<String>,
+    /// Directory the local llama.cpp sidecar uses for GGUF models / Hugging Face downloads
+    /// (exported as `LLAMA_CACHE` to the child). Unset ⇒ llama.cpp's own default cache, so models
+    /// are shared with a separately-run llama.cpp. See [`default_models_dir`].
+    #[serde(default)]
+    pub models_dir: Option<String>,
+    /// Path to the `llama-server` binary for the sidecar. Unset ⇒ found on `PATH`.
+    #[serde(default)]
+    pub llama_bin: Option<String>,
 }
 
 impl Settings {
@@ -139,6 +187,17 @@ impl Settings {
         cfg
     }
 
+    /// The models directory the sidecar should use: the operator's choice, else llama.cpp's
+    /// own default cache (so models are shared with a separately-run llama.cpp).
+    pub fn effective_models_dir(&self) -> PathBuf {
+        self.models_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(default_models_dir)
+    }
+
     fn profile_mut(&mut self, id: &str) -> Option<&mut LlmProfile> {
         self.profiles.iter_mut().find(|p| p.id == id)
     }
@@ -168,23 +227,85 @@ impl Settings {
     }
 }
 
-/// The seeded default when no settings file exists: a local llama.cpp profile pointing at
-/// `localhost:8888/v1`, ready for the operator to fetch + pick a model.
+/// The seeded default when no settings file exists. Ships ready-to-run **local llama.cpp
+/// sidecar** profiles: two large models the author runs (Gemma 4 / Qwen 3.6, with a RAM hint in
+/// the name) plus two small models for resource-constrained machines. All point the sidecar at
+/// `127.0.0.1:8888`; the operator picks one as active and presses Start. Models download/cache
+/// to the shared models directory ([`default_models_dir`]).
 fn seeded() -> Settings {
-    Settings {
-        profiles: vec![LlmProfile {
-            id: "local".to_string(),
-            name: "Local (llama.cpp)".to_string(),
+    fn local(id: &str, name: &str, model: &str, max_tokens: u32) -> LlmProfile {
+        LlmProfile {
+            id: id.to_string(),
+            name: name.to_string(),
             provider: Some("openai".to_string()),
-            base_url: Some("http://localhost:8888/v1".to_string()),
-            model: None,
+            base_url: Some("http://127.0.0.1:8888/v1".to_string()),
+            model: Some(model.to_string()),
             api_key: None,
-            max_tokens: Some(8192),
-            temperature: Some(0.2),
-        }],
-        active_profile: Some("local".to_string()),
-        python_bin: None,
+            max_tokens: Some(max_tokens),
+            temperature: None,
+            sidecar: true,
+            model_file: Some(model.to_string()),
+            sidecar_args: Some("-ngl 99 -c 32768 --jinja".to_string()),
+        }
     }
+    Settings {
+        profiles: vec![
+            local(
+                "gemma-4-local",
+                "Gemma 4 · local (needs 48GB)",
+                "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M",
+                16000,
+            ),
+            local(
+                "qwen-36-local",
+                "Qwen 3.6 · local (needs 64GB)",
+                "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q6_K",
+                32768,
+            ),
+            local(
+                "qwen3-8b-local",
+                "Qwen3 8B · local (needs 16GB)",
+                "unsloth/Qwen3-8B-GGUF:UD-Q4_K_XL",
+                16000,
+            ),
+            local(
+                "qwen3-4b-local",
+                "Qwen3 4B · local (needs 8GB)",
+                "unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL",
+                8192,
+            ),
+        ],
+        active_profile: Some("gemma-4-local".to_string()),
+        python_bin: None,
+        models_dir: None,
+        llama_bin: None,
+    }
+}
+
+/// llama.cpp's own default model/download cache, so ProcessOS's sidecar shares models with a
+/// separately-run llama.cpp: `$LLAMA_CACHE`, else the platform cache (`~/Library/Caches/llama.cpp`
+/// on macOS, `${XDG_CACHE_HOME:-~/.cache}/llama.cpp` elsewhere).
+pub fn default_models_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("LLAMA_CACHE").filter(|s| !s.is_empty()) {
+        return PathBuf::from(d);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(h) = home {
+            return h.join("Library/Caches/llama.cpp");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
+            return PathBuf::from(x).join("llama.cpp");
+        }
+        if let Some(h) = home {
+            return h.join(".cache/llama.cpp");
+        }
+    }
+    PathBuf::from(".")
 }
 
 /// Partial update for a single profile (the `name` plus connection fields).
@@ -198,6 +319,9 @@ pub struct ProfilePatch {
     pub api_key: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub sidecar: Option<bool>,
+    pub model_file: Option<String>,
+    pub sidecar_args: Option<String>,
 }
 
 /// Partial update for the global (non-profile) settings.
@@ -206,6 +330,8 @@ pub struct ProfilePatch {
 pub struct GlobalsPatch {
     pub active_profile: Option<String>,
     pub python_bin: Option<String>,
+    pub models_dir: Option<String>,
+    pub llama_bin: Option<String>,
 }
 
 /// An ad-hoc endpoint descriptor for listing models — either a saved profile (by id, so
@@ -233,6 +359,9 @@ pub struct ProfileView {
     pub api_key_set: bool,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub sidecar: bool,
+    pub model_file: Option<String>,
+    pub sidecar_args: Option<String>,
 }
 
 impl ProfileView {
@@ -246,6 +375,9 @@ impl ProfileView {
             api_key_set: p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
             max_tokens: p.max_tokens,
             temperature: p.temperature,
+            sidecar: p.sidecar,
+            model_file: p.model_file.clone(),
+            sidecar_args: p.sidecar_args.clone(),
         }
     }
 }
@@ -257,6 +389,10 @@ pub struct SettingsView {
     pub profiles: Vec<ProfileView>,
     pub active_profile: Option<String>,
     pub python_bin: Option<String>,
+    pub models_dir: Option<String>,
+    pub llama_bin: Option<String>,
+    /// llama.cpp's default cache dir, shown as the placeholder/prefill when `models_dir` is unset.
+    pub default_models_dir: String,
     pub path: String,
 }
 
@@ -266,6 +402,9 @@ impl SettingsView {
             profiles: s.profiles.iter().map(ProfileView::of).collect(),
             active_profile: s.active().map(|p| p.id.clone()),
             python_bin: s.python_bin.clone(),
+            models_dir: s.models_dir.clone(),
+            llama_bin: s.llama_bin.clone(),
+            default_models_dir: default_models_dir().display().to_string(),
             path: path.display().to_string(),
         }
     }
@@ -320,6 +459,12 @@ impl SettingsStore {
         if let Some(v) = patch.python_bin {
             g.python_bin = non_empty(v);
         }
+        if let Some(v) = patch.models_dir {
+            g.models_dir = non_empty(v);
+        }
+        if let Some(v) = patch.llama_bin {
+            g.llama_bin = non_empty(v);
+        }
         self.persist(&g)?;
         Ok(SettingsView::of(&g, &self.path))
     }
@@ -343,6 +488,9 @@ impl SettingsStore {
             api_key: None,
             max_tokens: None,
             temperature: None,
+            sidecar: false,
+            model_file: None,
+            sidecar_args: None,
         };
         profile.apply(ProfilePatch {
             name: None,
@@ -426,6 +574,8 @@ fn migrate(s: &str) -> Option<Settings> {
         profiles: Vec<LlmProfile>,
         active_profile: Option<String>,
         python_bin: Option<String>,
+        models_dir: Option<String>,
+        llama_bin: Option<String>,
         // legacy flat fields (pre-profiles)
         llm_provider: Option<String>,
         llm_base_url: Option<String>,
@@ -439,6 +589,8 @@ fn migrate(s: &str) -> Option<Settings> {
         profiles: st.profiles,
         active_profile: st.active_profile,
         python_bin: st.python_bin,
+        models_dir: st.models_dir,
+        llama_bin: st.llama_bin,
     };
     if settings.profiles.is_empty() {
         let has_legacy = st.llm_provider.is_some()
@@ -457,6 +609,9 @@ fn migrate(s: &str) -> Option<Settings> {
                 api_key: st.llm_api_key,
                 max_tokens: st.llm_max_tokens,
                 temperature: st.llm_temperature,
+                sidecar: false,
+                model_file: None,
+                sidecar_args: None,
             });
             settings
                 .active_profile
@@ -502,29 +657,95 @@ fn restrict_permissions(_path: &std::path::Path) {}
 mod tests {
     use super::*;
 
+    // These tests mutate the process-global PROCESSOS_CONFIG_DIR env var, so they must not run
+    // concurrently. Serialize them through one lock (recovering from a poisoned guard).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn store_in(dir: &std::path::Path) -> SettingsStore {
         std::env::set_var("PROCESSOS_CONFIG_DIR", dir);
         SettingsStore::open()
     }
 
     #[test]
-    fn ships_with_a_local_profile() {
+    fn ships_with_local_sidecar_profiles() {
+        let _g = env_guard();
         let tmp = std::env::temp_dir().join(format!("processos-set-seed-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = store_in(&tmp);
         let v = store.view();
-        assert_eq!(v.profiles.len(), 1);
-        assert_eq!(v.active_profile.as_deref(), Some("local"));
+        // Ships ready-to-run local sidecar models, large + small, with RAM hints in the name.
+        assert_eq!(v.profiles.len(), 4);
+        assert_eq!(v.active_profile.as_deref(), Some("gemma-4-local"));
+        assert!(v.profiles.iter().all(|p| p.sidecar));
+        let gemma = v.profiles.iter().find(|p| p.id == "gemma-4-local").unwrap();
+        assert!(gemma.name.contains("48GB"));
+        assert_eq!(gemma.base_url.as_deref(), Some("http://127.0.0.1:8888/v1"));
+        assert!(gemma.model_file.as_deref().unwrap().contains("gemma-4"));
+        assert!(v.profiles.iter().any(|p| p.name.contains("64GB")));
+        // A non-empty default models dir is surfaced for the UI to prefill.
+        assert!(!v.default_models_dir.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("PROCESSOS_CONFIG_DIR");
+    }
+
+    #[test]
+    fn parses_sidecar_port_from_base_url() {
+        assert_eq!(parse_port("http://127.0.0.1:8888/v1"), Some(8888));
+        assert_eq!(parse_port("http://localhost:1234"), Some(1234));
+        assert_eq!(parse_port("http://localhost/v1"), None);
+        let p = LlmProfile {
+            id: "x".into(),
+            name: "x".into(),
+            provider: None,
+            base_url: Some("http://127.0.0.1:9090/v1".into()),
+            model: None,
+            api_key: None,
+            max_tokens: None,
+            temperature: None,
+            sidecar: true,
+            model_file: None,
+            sidecar_args: None,
+        };
+        assert_eq!(p.sidecar_port(), 9090);
+    }
+
+    #[test]
+    fn globals_patch_sets_models_dir_and_llama_bin() {
+        let _g = env_guard();
+        let tmp = std::env::temp_dir().join(format!("processos-set-md-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = store_in(&tmp);
+        let v = store
+            .update_globals(GlobalsPatch {
+                models_dir: Some("/models".into()),
+                llama_bin: Some("/usr/bin/llama-server".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(v.models_dir.as_deref(), Some("/models"));
+        assert_eq!(v.llama_bin.as_deref(), Some("/usr/bin/llama-server"));
         assert_eq!(
-            v.profiles[0].base_url.as_deref(),
-            Some("http://localhost:8888/v1")
+            store.snapshot().effective_models_dir(),
+            std::path::PathBuf::from("/models")
         );
+        // Clearing models_dir falls back to the llama.cpp default.
+        let v = store
+            .update_globals(GlobalsPatch {
+                models_dir: Some("".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(v.models_dir, None);
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("PROCESSOS_CONFIG_DIR");
     }
 
     #[test]
     fn add_switch_and_redact_profiles() {
+        let _g = env_guard();
         let tmp = std::env::temp_dir().join(format!("processos-set-multi-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let store = store_in(&tmp);
@@ -545,6 +766,7 @@ mod tests {
             .update_globals(GlobalsPatch {
                 active_profile: Some(id.clone()),
                 python_bin: None,
+                ..Default::default()
             })
             .unwrap();
         let ovr = store.snapshot().as_llm_override();
@@ -561,13 +783,14 @@ mod tests {
         assert!(store
             .update_globals(GlobalsPatch {
                 active_profile: Some("nope".into()),
-                python_bin: None
+                python_bin: None,
+                ..Default::default()
             })
             .is_err());
 
         // Delete falls back the active to the first remaining.
         store.delete_profile("cloud").unwrap();
-        assert_eq!(store.view().active_profile.as_deref(), Some("local"));
+        assert_eq!(store.view().active_profile.as_deref(), Some("gemma-4-local"));
 
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::remove_var("PROCESSOS_CONFIG_DIR");
@@ -575,6 +798,7 @@ mod tests {
 
     #[test]
     fn migrates_legacy_flat_file() {
+        let _g = env_guard();
         let tmp = std::env::temp_dir().join(format!("processos-set-legacy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
