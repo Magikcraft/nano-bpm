@@ -134,6 +134,12 @@ run it yourself instead. Fresh installs ship four sidecar profiles — **Gemma 4
 for resource-constrained machines — all pointing the sidecar at `http://127.0.0.1:8888/v1`.
 See the [llama endpoints](#endpoints).
 
+**Just-in-time start from chat.** If the active (primary) chat profile is a sidecar that isn't
+up yet, sending a cockpit message prompts **"Sidecar not started. Start it now?"** — *Yes* starts
+it, waits for the model to finish loading (polling `GET /api/llama/ready`, which probes
+`llama-server`'s `/health`), then sends the queued message; *No* leaves the message in the
+composer unsent.
+
 
 ## Workspaces — bounded contexts & processes (multi-tenant + datasets)
 
@@ -659,6 +665,7 @@ for it automatically.
 | `PUT`/`DELETE` | `/api/settings/profiles/{id}` | Partial-update / delete one profile. On `PUT`, absent fields are unchanged, an empty string (or `0`/negative number) clears a field back to the env default; the API key is set only when a non-empty `apiKey` is sent |
 | `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id; each entry includes its `contextWindow` when the endpoint reports one |
 | `GET` | `/api/llama/status` | Local llama.cpp sidecar status (`running`, `model`, `port`, `pid`, `command`, `startedAt`, `error`) |
+| `GET` | `/api/llama/ready` | Whether the running sidecar is answering its `/health` probe (model loaded). Returns `{running, ready}`; polled by the cockpit's just-in-time start before sending a queued message |
 | `POST` | `/api/llama/start` | Start the sidecar for a profile (`{profileId}`; the profile must have `sidecar:true`). Returns the new status |
 | `POST` | `/api/llama/stop` | Stop the running sidecar |
 | `GET` | `/api/llama/logs?since=N` | Tail the sidecar's combined stdout/stderr from offset `N`; returns `{lines, nextOffset, running}` for incremental polling |

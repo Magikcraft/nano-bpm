@@ -484,6 +484,7 @@ async fn main() {
         )
         .route("/api/settings/models", post(post_models))
         .route("/api/llama/status", get(llama_status))
+        .route("/api/llama/ready", get(llama_ready))
         .route("/api/llama/start", post(llama_start))
         .route("/api/llama/stop", post(llama_stop))
         .route("/api/llama/logs", get(llama_logs))
@@ -1268,6 +1269,26 @@ async fn post_models(
 /// the equivalent terminal command, models dir).
 async fn llama_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.llama.status())
+}
+
+/// `GET /api/llama/ready` — whether the running sidecar is not just spawned but actually
+/// answering (its model has finished loading). Probes the `llama-server` `/health` endpoint
+/// (200 once ready, 503 while loading). Returns `{ running, ready }`. The cockpit polls this
+/// after a just-in-time sidecar start, before sending a queued chat message.
+async fn llama_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.llama.status();
+    let Some(port) = status.port.filter(|_| status.running) else {
+        return Json(serde_json::json!({ "running": false, "ready": false }));
+    };
+    let url = format!("http://127.0.0.1:{port}/health");
+    let ready = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => matches!(client.get(&url).send().await, Ok(r) if r.status().is_success()),
+        Err(_) => false,
+    };
+    Json(serde_json::json!({ "running": true, "ready": ready }))
 }
 
 /// Request body for starting the sidecar: which saved profile to serve.
