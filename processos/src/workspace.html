@@ -11,13 +11,18 @@
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; }
   a { color: inherit; text-decoration: none; }
-  header { border-bottom: 1px solid #1f1f23; padding: 14px 26px; background: #0c0c0e; display: flex; align-items: baseline; gap: 16px; }
-  .brand { font-weight: 700; font-size: 16px; }
+  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
+  .rail .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
   .brand .dot { color: #a5b4fc; }
-  .tag { color: #71717a; font-size: 12px; }
-  header nav { margin-left: auto; display: flex; gap: 14px; }
-  header nav a { color: #a1a1aa; font-size: 13px; }
-  header nav a:hover { color: #c7d2fe; }
+  .rail .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; display: block; }
+  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; }
+  .nav a:hover { background: #18181b; color: #e4e4e7; }
+  .nav a.active { background: #1d1d22; color: #c7d2fe; }
+  .nav a.with-dot { display: flex; align-items: center; }
+  .dot-status { width: 9px; height: 9px; border-radius: 50%; margin-left: auto; flex: none; background: #52525b; box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
+  .dot-status.on { background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
+  .dot-status.off { background: #eab308; box-shadow: 0 0 0 2px rgba(234,179,8,.16); }
   main { padding: 24px 30px; max-width: 1100px; }
   .crumbs { color: #71717a; font-size: 12px; margin-bottom: 14px; }
   .crumbs a { color: #a5b4fc; cursor: pointer; }
@@ -61,16 +66,21 @@
 </style>
 </head>
 <body>
-<header>
-  <a class="brand" href="/">Nano Process<span class="dot">OS</span></a>
-  <span class="tag">Workspaces</span>
-  <nav>
-    <a href="/cockpit">Cockpit</a>
-    <a href="/console">Live insights</a>
-    <a href="/">Home</a>
-  </nav>
-</header>
-<main id="app">Loading…</main>
+<div class="app">
+  <aside class="rail">
+    <a class="brand" href="/">Nano Process<span class="dot">OS</span></a>
+    <span class="tag">the cockpit</span>
+    <nav class="nav">
+      <a href="/workspace" class="active">Workspaces</a>
+      <a href="/cockpit?view=console">Console</a>
+      <a href="/cockpit?view=processes">Processes</a>
+      <a href="/cockpit?view=prompts">Prompts</a>
+      <a href="/cockpit?view=experiments">Experiments</a>
+      <a href="/cockpit?view=sidecars" class="with-dot">LLM sidecars <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
+    </nav>
+  </aside>
+  <main id="app">Loading…</main>
+</div>
 
 <script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
 <script>
@@ -293,6 +303,22 @@ function route() {
 }
 window.addEventListener('hashchange', route);
 route();
+
+// Keep the rail's sidecar status dot live on this page too (green = a llama.cpp
+// sidecar is running, yellow = off). Best-effort and non-blocking.
+(function(){
+  async function refreshDot(){
+    const dot = document.getElementById('navLlamaDot');
+    if(!dot) return;
+    let on = false;
+    try { const st = await api('/api/llama/status'); on = !!(st && st.running); } catch(e){}
+    dot.classList.toggle('on', on);
+    dot.classList.toggle('off', !on);
+    dot.title = on ? 'local sidecar: running' : 'local sidecar: off';
+  }
+  refreshDot();
+  setInterval(refreshDot, 4000);
+})();
 </script>
 </body>
 </html>

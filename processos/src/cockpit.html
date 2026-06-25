@@ -20,6 +20,10 @@
   .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; cursor: pointer; }
   .nav a:hover { background: #18181b; color: #e4e4e7; }
   .nav a.active { background: #1d1d22; color: #c7d2fe; }
+  .nav a.with-dot { display: flex; align-items: center; }
+  .dot-status { width: 9px; height: 9px; border-radius: 50%; margin-left: auto; flex: none; background: #52525b; box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
+  .dot-status.on { background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
+  .dot-status.off { background: #eab308; box-shadow: 0 0 0 2px rgba(234,179,8,.16); }
   /* main */
   main { padding: 26px 30px; max-width: 1180px; }
   .crumbs { color: #71717a; font-size: 12px; margin-bottom: 14px; }
@@ -341,6 +345,7 @@
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
       <a data-view="experiments">Experiments</a>
+      <a data-view="sidecars" class="with-dot">LLM sidecars <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
   </aside>
   <main id="main">Loading…</main>
@@ -655,6 +660,115 @@ async function decide(key, decision){
   try { await api('/api/cockpit/experiments/'+key+'/decision', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({decision, note})}); }
   catch(e){ alert('Decision failed: '+e.message); }
   setTimeout(()=>renderExp(key), 600);
+}
+
+// ---- LLM sidecars (first-class) ----
+// The supervised local llama.cpp sidecar: ProcessOS ships several sidecar-capable profiles but
+// runs ONE llama-server at a time. This view lists them, shows which is active/running, and lets
+// the operator start/stop/switch — the same controls the Settings cog exposes, promoted to a
+// first-class nav surface with a live status dot.
+let LLAMA_DOT_TIMER = null;
+
+// Paint the rail status dot green (a sidecar process is up) or yellow (off). Best-effort.
+async function refreshLlamaDot(){
+  const dot = document.getElementById('navLlamaDot');
+  if(!dot) return;
+  let st; try { st = await api('/api/llama/status'); } catch(e){ st = null; }
+  const on = !!(st && st.running);
+  dot.classList.toggle('on', on);
+  dot.classList.toggle('off', !on);
+  dot.title = on ? ('local sidecar: running'+(st.profileId?(' ('+st.profileId+')'):'')) : 'local sidecar: off';
+}
+// Poll the dot on a slow timer so the rail reflects sidecar state from any view.
+function startLlamaDotPoll(){
+  if(LLAMA_DOT_TIMER) return;
+  refreshLlamaDot();
+  LLAMA_DOT_TIMER = setInterval(refreshLlamaDot, 4000);
+}
+
+async function renderSidecars(){
+  STATE.view='sidecars'; setActive(); main.innerHTML='Loading…';
+  let s, st;
+  try { s = await api('/api/settings') || {}; } catch(e){ return fail(e); }
+  try { st = await api('/api/llama/status'); } catch(e){ st = {running:false}; }
+  const profiles = (s.profiles||[]).filter(p => p.sidecar);
+  const active = s.activeProfile;
+  const running = !!st.running;
+  const runId = st.profileId || null;
+
+  let h = '<h1>LLM sidecars</h1>'
+    + '<p class="lede">Local models ProcessOS supervises itself via <code>llama-server</code> (llama.cpp). '
+    + 'Pick one as the active model and press Start — only <b>one</b> sidecar runs at a time. '
+    + 'The dot in the menu is green while a sidecar is up, yellow when off.</p>';
+
+  // Live status banner.
+  if(running){
+    h += '<div class="tile" style="cursor:default;border-color:#14532d">'
+      + '<h3 style="color:#6ee7b7">Running <span class="pill accept">on</span></h3>'
+      + '<div class="meta">'+esc(st.profileId||'?')+' · '+esc(st.model||'')+(st.port?(' · port '+st.port):'')+(st.pid?(' · pid '+st.pid):'')+'</div>'
+      + (st.command?('<div class="meta" style="margin-top:6px;font-family:ui-monospace,monospace;color:#8b8b93;word-break:break-all">'+esc(st.command)+'</div>'):'')
+      + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px">'
+      + '<button class="btn warn" id="llStop">Stop sidecar</button>'
+      + '<button class="btn ghost" id="llLogs">View logs</button></div></div>';
+  } else {
+    h += '<div class="tile" style="cursor:default"><h3>Off <span class="pill wait">idle</span></h3>'
+      + '<div class="meta">No sidecar is running. Start one below.'
+      + (st.error?(' · last error: '+esc(st.error)):'')+'</div></div>';
+  }
+
+  h += '<h2>Sidecar profiles ('+profiles.length+')</h2>';
+  if(!profiles.length){
+    h += '<p class="muted">No sidecar-capable profiles. Add one in the Settings cog (mark it "Served by local llama.cpp sidecar").</p>';
+  } else {
+    h += '<div class="grid">' + profiles.map(p => {
+      const isActive = p.id===active;
+      const isRunning = running && runId===p.id;
+      const pills = (isActive?'<span class="pill run">active</span> ':'')
+                  + (isRunning?'<span class="pill accept">running</span>':'');
+      const startDisabled = running ? 'disabled' : '';
+      return '<div class="tile" style="cursor:default">'
+        + '<h3>'+esc(p.name||p.id)+' '+pills+'</h3>'
+        + '<div class="meta">'+esc(p.modelFile||p.model||'')+'</div>'
+        + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
+        + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
+        + (isRunning
+            ? '<button class="btn warn" data-stop="1">Stop</button>'
+            : '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+(running?'Stop the running sidecar first':'Start this sidecar')+'">Start</button>')
+        + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
+        + '</div></div>';
+    }).join('') + '</div>';
+  }
+
+  // Optional logs panel target.
+  h += '<pre id="llLogsOut" hidden style="margin-top:16px;max-height:340px;overflow:auto;background:#0c0c0e;border:1px solid #26262b;border-radius:8px;padding:12px;font:11.5px/1.5 ui-monospace,monospace;color:#c7d2fe;white-space:pre-wrap"></pre>';
+
+  main.innerHTML = h;
+
+  const startBtn = (id) => api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId:id})});
+  main.querySelectorAll('[data-start]').forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'Starting…';
+    try { await startBtn(b.dataset.start); } catch(e){ window.alert('Could not start: '+(e.message||e)); }
+    refreshLlamaDot(); renderSidecars();
+  });
+  const stopAll = async (b) => { if(b){ b.disabled=true; b.textContent='Stopping…'; } try { await api('/api/llama/stop', {method:'POST'}); } catch(e){ window.alert('Could not stop: '+(e.message||e)); } refreshLlamaDot(); renderSidecars(); };
+  const stopTop = document.getElementById('llStop'); if(stopTop) stopTop.onclick = () => stopAll(stopTop);
+  main.querySelectorAll('[data-stop]').forEach(b => b.onclick = () => stopAll(b));
+  main.querySelectorAll('[data-active]').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await api('/api/settings', {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({activeProfile:b.dataset.active})});
+      try { window.dispatchEvent(new CustomEvent('processos:settings-changed')); } catch(e){}
+    } catch(e){ window.alert('Could not switch active model: '+(e.message||e)); }
+    renderSidecars();
+  });
+  const logsBtn = document.getElementById('llLogs');
+  if(logsBtn) logsBtn.onclick = async () => {
+    const out = document.getElementById('llLogsOut');
+    if(!out) return;
+    out.hidden = false; out.textContent = 'Loading logs…';
+    try { const r = await api('/api/llama/logs'); out.textContent = (r.text||'').trim() || '(no output yet)'; out.scrollTop = out.scrollHeight; }
+    catch(e){ out.textContent = 'Could not load logs: '+(e.message||e); }
+  };
 }
 
 // ---- Prompts (authoring) ----
@@ -2220,15 +2334,27 @@ document.querySelectorAll('.nav a[data-view]').forEach(a => a.onclick = () => {
   else if(v==='processes') renderProcesses();
   else if(v==='prompts') renderPrompts();
   else if(v==='experiments') renderExperiments();
+  else if(v==='sidecars') renderSidecars();
 });
 
+// Map a ?view= param (used by other pages linking into the cockpit) to its renderer.
+function renderView(v){
+  if(v==='processes') return renderProcesses();
+  if(v==='prompts') return renderPrompts();
+  if(v==='experiments') return renderExperiments();
+  if(v==='sidecars') return renderSidecars();
+  return renderConsole();
+}
+
 // Boot: a workspace-process deep-link (?workspace=&process=) opens the
-// investigation surface; otherwise the default console.
+// investigation surface; a ?view= param selects a named rail view; otherwise the
+// default console. The rail's sidecar status dot polls regardless of the view.
 (function(){
+  startLlamaDotPoll();
   const q = new URLSearchParams(location.search);
   const ws = q.get('workspace'), proc = q.get('process');
   if(ws && proc) renderWorkspace(ws, proc);
-  else renderConsole();
+  else renderView(q.get('view'));
 })();
 </script>
 <script src="/assets/settings.js"></script>

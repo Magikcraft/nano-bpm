@@ -132,7 +132,16 @@ output and shows the **equivalent terminal command** (including `LLAMA_CACHE=…
 run it yourself instead. Fresh installs ship four sidecar profiles — **Gemma 4** (needs
 ~48 GB) and **Qwen 3.6** (needs ~64 GB) plus **Qwen3-8B** (~16 GB) and **Qwen3-4B** (~8 GB)
 for resource-constrained machines — all pointing the sidecar at `http://127.0.0.1:8888/v1`.
-See the [llama endpoints](#endpoints).
+Only **one** sidecar runs at a time. See the [llama endpoints](#endpoints).
+
+**First-class `LLM sidecars` nav surface.** The left rail — the principal navigation menu shown
+on every page after the landing page (cockpit and workspaces share it) — carries a first-class
+**LLM sidecars** entry with a live **status dot**: **green** when a sidecar process is up,
+**yellow** when off. The entry opens a dedicated view that lists every sidecar-capable profile,
+marks the **active** and **running** one, and offers **Start / Stop / Make active / View logs**
+inline (the same controls as the Settings cog, promoted to a top-level surface). Other pages
+deep-link into a named cockpit view via `/cockpit?view=sidecars` (also `console`, `processes`,
+`prompts`, `experiments`).
 
 **Just-in-time start from chat.** If the active (primary) chat profile is a sidecar that isn't
 up yet, sending a cockpit message prompts **"Sidecar not started. Start it now?"** — *Yes* starts
