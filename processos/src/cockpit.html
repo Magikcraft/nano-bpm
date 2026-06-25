@@ -712,7 +712,8 @@ async function renderSidecars(){
   let h = '<h1>LLM sidecars</h1>'
     + '<p class="lede">Local models ProcessOS supervises itself via <code>llama-server</code> (llama.cpp). '
     + 'Up to <b>'+max+'</b> run at once (each on its own port) — so an investigation can pair a primary '
-    + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>';
+    + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>'
+    + '<div class="btnrow" style="margin:0 0 14px"><button class="btn ghost" id="llConfigProfiles">\u2699 Configure LLM profiles</button></div>';
 
   // Port-collision warning: two sidecar profiles can't share a port if you want both running.
   if(collisions.length){
@@ -744,7 +745,7 @@ async function renderSidecars(){
 
   h += '<h2>Sidecar profiles ('+profiles.length+')</h2>';
   if(!profiles.length){
-    h += '<p class="muted">No sidecar-capable profiles. Add one in the Settings cog (mark it "Served by local llama.cpp sidecar").</p>';
+    h += '<p class="muted">No sidecar-capable profiles. <a href="#" id="llAddProfile">Add one in the LLM config</a> (choose the "Managed sidecar" type).</p>';
   } else {
     h += '<div class="grid">' + profiles.map(p => {
       const isActive = p.id===active;
@@ -768,6 +769,7 @@ async function renderSidecars(){
             ? '<button class="btn warn" data-stop="'+esc(p.id)+'">Stop</button>'
             : '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+esc(startTitle)+'">Start</button>')
         + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
+        + '<button class="btn ghost" data-config="'+esc(p.id)+'">Edit profile</button>'
         + '</div></div>';
     }).join('') + '</div>';
   }
@@ -802,6 +804,13 @@ async function renderSidecars(){
     catch(e){ out.textContent = 'Could not load logs: '+(e.message||e); }
   };
   main.querySelectorAll('[data-logs]').forEach(b => b.onclick = () => showLogs(b.dataset.logs || null));
+  const openConfig = (id) => {
+    if(typeof window.processosOpenSettings === 'function') window.processosOpenSettings(id || undefined);
+    else { const cog = document.getElementById('cog'); if(cog) cog.click(); }
+  };
+  const cfgBtn = document.getElementById('llConfigProfiles'); if(cfgBtn) cfgBtn.onclick = () => openConfig(null);
+  const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
+  main.querySelectorAll('[data-config]').forEach(b => b.onclick = () => openConfig(b.dataset.config));
 }
 
 // ---- Prompts (authoring) ----

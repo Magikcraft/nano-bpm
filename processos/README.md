@@ -115,19 +115,27 @@ environment without a relaunch. The panel also configures `PROCESSOS_PYTHON`
 ### Local model sidecar — run llama.cpp from ProcessOS (`src/llama.rs`)
 
 ProcessOS can supervise a local **`llama-server`** (llama.cpp) so the operator never has to
-launch one in a separate terminal. In the Settings panel, tick **"Served by local llama.cpp
-sidecar"** on a profile and give it a **Model file / HF spec** — either a Hugging Face
+launch one in a separate terminal. Open the **LLM config** panel (the ⚙ cog, or **Configure
+LLM profiles** / **Edit profile** from the `LLM sidecars` view). Each profile is one of two
+types, chosen with a radio: **Managed sidecar** or **External**.
+
+For a **Managed sidecar** profile, give it a **Model file / HF spec** — either a Hugging Face
 `repo[:quant]` spec (e.g. `unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL`, downloaded on demand) or a
-`.gguf` path resolved against the **Models directory**. **Startup args** (e.g.
-`-ngl 99 -c 32768 --jinja`) are appended verbatim. The global **Local model server** section
-sets the shared **Models directory** (pre-filled with llama.cpp's own cache —
-`$LLAMA_CACHE`, else macOS `~/Library/Caches/llama.cpp` / Linux `~/.cache/llama.cpp` — so
-models are shared with any separately-run llama.cpp) and an optional **llama-server binary**
-path (otherwise found on `PATH`).
+`.gguf` path resolved against the **Models directory** — a **Port** (each sidecar needs its
+own so two can run at once), and optional **Startup args** (e.g. `-ngl 99 -c 32768 --jinja`,
+appended verbatim). An **External** profile instead shows **Provider**, **Base URL**,
+**Model** (with a **Fetch** button) and **API key**. **Max tokens**/**Temperature** and the
+editable **Name** apply to both, and the **Save profile** button sits at the bottom of the
+form. The global **Local model server** section sets the shared **Models directory**
+(pre-filled with llama.cpp's own cache — `$LLAMA_CACHE`, else macOS
+`~/Library/Caches/llama.cpp` / Linux `~/.cache/llama.cpp` — so models are shared with any
+separately-run llama.cpp) and an optional **llama-server binary** path (otherwise found on
+`PATH`).
 
 **Start sidecar / Stop** spawn and kill the process; sidecars are also stopped on graceful
-shutdown. The port is parsed from the profile's Base URL (so the profile both *launches* and
-*talks to* the same endpoint). **Logs** opens a streaming viewer that tails the process
+shutdown. The port set on the Managed-sidecar form is woven into the profile's Base URL
+(`http://127.0.0.1:<port>/v1`), so the profile both *launches* and *talks to* the same
+endpoint. **Logs** opens a streaming viewer that tails the process
 output and shows the **equivalent terminal command** (including `LLAMA_CACHE=…`) so you can
 run it yourself instead. Fresh installs ship four sidecar profiles — **Gemma 4** (needs
 ~48 GB) and **Qwen 3.6** (needs ~64 GB) plus **Qwen3-8B** (~16 GB) and **Qwen3-4B** (~8 GB)

@@ -34,6 +34,13 @@
     '.settings-body .hint a{color:#818cf8}',
     '.settings-body label.ck{flex-direction:row;align-items:center;gap:7px;color:#e4e4e7;cursor:pointer}',
     '.settings-body label.ck input{flex:0 0 auto;width:auto}',
+    '.settings-body .s-types{display:flex;gap:10px;margin:2px 0 2px}',
+    '.settings-body label.rd{flex:1;flex-direction:row;align-items:center;gap:7px;color:#e4e4e7;cursor:pointer;background:#18181b;border:1px solid #3f3f46;border-radius:6px;padding:7px 9px;font-size:13px}',
+    '.settings-body label.rd input{flex:0 0 auto;width:auto}',
+    '.settings-body label.rd.sel{border-color:#6366f1;background:#1e1b3a}',
+    '.settings-body .s-typefields{display:flex;flex-direction:column;gap:12px}',
+    '.settings-body .s-typefields[hidden]{display:none}',
+    '#s-sidecar-controls[hidden]{display:none}',
     '#s-llama-status{font-size:12px;color:#a1a1aa;min-height:16px}',
     '.s-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#52525b;margin-right:6px;vertical-align:middle}',
     '.s-dot.on{background:#22c55e}',
@@ -62,31 +69,42 @@
       '<div class="bar"><span id="s-activeline"></span><button id="s-setactive" class="ghost">Set active</button></div>' +
       '<div class="sep"></div>' +
       '<label>Name <input id="s-name" placeholder="e.g. Local (llama.cpp)"></label>' +
-      '<label>Provider <select id="s-provider">' +
-        '<option value="">(env default)</option>' +
-        '<option value="openai">openai / local</option>' +
-        '<option value="anthropic">anthropic</option>' +
-      '</select></label>' +
-      '<label>Base URL <input id="s-baseUrl" placeholder="e.g. http://localhost:8888/v1"></label>' +
-      '<label>Model' +
-        '<div class="row"><input id="s-model" list="s-modellist" placeholder="model id" style="flex:3">' +
-        '<button id="s-fetch" class="ghost" style="flex:1" title="Query the endpoint for its models">Fetch</button></div>' +
-        '<datalist id="s-modellist"></datalist>' +
-      '</label>' +
-      '<label>API key <input id="s-apiKey" type="password" placeholder="(unset)"></label>' +
+      '<div class="s-types">' +
+        '<label class="rd" id="s-type-sidecar-l"><input type="radio" name="s-type" id="s-type-sidecar" value="sidecar"> Managed sidecar</label>' +
+        '<label class="rd" id="s-type-external-l"><input type="radio" name="s-type" id="s-type-external" value="external"> External</label>' +
+      '</div>' +
+      '<div id="s-fields-sidecar" class="s-typefields">' +
+        '<div class="hint">ProcessOS launches <code>llama-server</code> for this model and talks to it locally.</div>' +
+        '<label>Model file / HF spec <input id="s-modelFile" placeholder="unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL or /path/model.gguf"></label>' +
+        '<label>Port <input id="s-port" type="number" min="1" max="65535" placeholder="8888" title="Local port llama-server listens on. Give each sidecar a unique port so two can run at once."></label>' +
+        '<label>Startup args <input id="s-sidecarArgs" placeholder="-ngl 99 -c 32768 --jinja"></label>' +
+        '<div class="hint">A <code>:quant</code> HF spec is downloaded into the models directory; a <code>.gguf</code> path is resolved against it. Browse GGUF models on <a href="https://huggingface.co/models?library=gguf&sort=trending" target="_blank" rel="noopener noreferrer">HuggingFace</a>.</div>' +
+      '</div>' +
+      '<div id="s-fields-external" class="s-typefields">' +
+        '<label>Provider <select id="s-provider">' +
+          '<option value="">(env default)</option>' +
+          '<option value="openai">openai / local</option>' +
+          '<option value="anthropic">anthropic</option>' +
+        '</select></label>' +
+        '<label>Base URL <input id="s-baseUrl" placeholder="e.g. https://api.openai.com/v1"></label>' +
+        '<label>Model' +
+          '<div class="row"><input id="s-model" list="s-modellist" placeholder="model id" style="flex:3">' +
+          '<button id="s-fetch" class="ghost" style="flex:1" title="Query the endpoint for its models">Fetch</button></div>' +
+          '<datalist id="s-modellist"></datalist>' +
+        '</label>' +
+        '<label>API key <input id="s-apiKey" type="password" placeholder="(unset)"></label>' +
+      '</div>' +
       '<div class="row">' +
         '<label>Max tokens <input id="s-maxTokens" type="number" min="1" placeholder="2048" title="Token budget; Fetch fills this from the model\u2019s context window"></label>' +
         '<label>Temperature <input id="s-temp" type="number" step="0.05" min="0" placeholder="0.2"></label>' +
       '</div>' +
       '<div class="bar"><button id="s-save" class="primary">Save profile</button><button id="s-clearkey" class="ghost">Clear API key</button></div>' +
       '<div class="sep"></div>' +
-      '<label class="ck"><input type="checkbox" id="s-sidecar"> Served by local llama.cpp sidecar</label>' +
-      '<label>Model file / HF spec <input id="s-modelFile" placeholder="unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL or /path/model.gguf"></label>' +
-      '<label>Startup args <input id="s-sidecarArgs" placeholder="-ngl 99 -c 32768 --jinja"></label>' +
-      '<div class="hint">A <code>:quant</code> HF spec is downloaded into the models directory; a <code>.gguf</code> path is resolved against it. Browse GGUF models on <a href="https://huggingface.co/models?library=gguf&sort=trending" target="_blank" rel="noopener noreferrer">HuggingFace</a>.</div>' +
-      '<div class="bar"><button id="s-llama-start" class="ghost">Start sidecar</button><button id="s-llama-stop" class="ghost">Stop</button><button id="s-llama-logs" class="ghost">Logs</button></div>' +
-      '<div id="s-llama-status"></div>' +
-      '<div class="sep"></div>' +
+      '<div id="s-sidecar-controls">' +
+        '<div class="bar"><button id="s-llama-start" class="ghost">Start sidecar</button><button id="s-llama-stop" class="ghost">Stop</button><button id="s-llama-logs" class="ghost">Logs</button></div>' +
+        '<div id="s-llama-status"></div>' +
+        '<div class="sep"></div>' +
+      '</div>' +
       '<h4>Local model server (llama.cpp)</h4>' +
       '<label>Models directory <input id="s-modelsDir" placeholder="(default)"></label>' +
       '<label>llama-server binary <input id="s-llamaBin" placeholder="llama-server (found on PATH)"></label>' +
@@ -147,11 +165,35 @@
     else if (active) sel.value = active;
   }
 
+  function currentType() {
+    return $('s-type-sidecar').checked ? 'sidecar' : 'external';
+  }
+
+  // Pull the port out of a base URL like http://127.0.0.1:8888/v1 -> 8888.
+  function portFromUrl(url) {
+    if (!url) return '';
+    var m = String(url).match(/:(\d{2,5})(?:\/|$)/);
+    return m ? m[1] : '';
+  }
+
+  // Show only the fields for the selected profile type; the sidecar runtime controls
+  // (Start/Stop/Logs) and the highlighted radio follow suit.
+  function applyTypeUI() {
+    var t = currentType();
+    $('s-fields-sidecar').hidden = t !== 'sidecar';
+    $('s-fields-external').hidden = t !== 'external';
+    $('s-sidecar-controls').hidden = t !== 'sidecar';
+    $('s-type-sidecar-l').classList.toggle('sel', t === 'sidecar');
+    $('s-type-external-l').classList.toggle('sel', t === 'external');
+  }
+
   function fillFields() {
     var p = currentProfile();
     if (!p) {
-      ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp', 's-modelFile', 's-sidecarArgs'].forEach(function (i) { $(i).value = ''; });
-      $('s-provider').value = ''; $('s-apiKey').value = ''; $('s-sidecar').checked = false;
+      ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp', 's-modelFile', 's-port', 's-sidecarArgs'].forEach(function (i) { $(i).value = ''; });
+      $('s-provider').value = ''; $('s-apiKey').value = '';
+      $('s-type-external').checked = true;
+      applyTypeUI();
       $('s-activeline').textContent = 'No profiles';
       return;
     }
@@ -162,9 +204,11 @@
     $('s-apiKey').value = ''; $('s-apiKey').placeholder = keyPh(p.apiKeySet);
     $('s-maxTokens').value = p.maxTokens != null ? p.maxTokens : '';
     $('s-temp').value = p.temperature != null ? p.temperature : '';
-    $('s-sidecar').checked = !!p.sidecar;
     $('s-modelFile').value = p.modelFile || '';
+    $('s-port').value = portFromUrl(p.baseUrl);
     $('s-sidecarArgs').value = p.sidecarArgs || '';
+    if (p.sidecar) $('s-type-sidecar').checked = true; else $('s-type-external').checked = true;
+    applyTypeUI();
     var isActive = p.id === STATE.view.activeProfile;
     $('s-activeline').innerHTML = isActive
       ? 'This profile is <span class="s-active-tag">active</span>'
@@ -202,19 +246,30 @@
   }
 
   function profilePatch() {
+    var type = currentType();
     var patch = {
       name: $('s-name').value,
-      provider: $('s-provider').value,
-      baseUrl: $('s-baseUrl').value,
-      model: $('s-model').value,
       maxTokens: $('s-maxTokens').value ? Number($('s-maxTokens').value) : 0,
       temperature: $('s-temp').value !== '' ? Number($('s-temp').value) : -1,
-      sidecar: $('s-sidecar').checked,
-      modelFile: $('s-modelFile').value,
-      sidecarArgs: $('s-sidecarArgs').value
+      sidecar: type === 'sidecar'
     };
-    var key = $('s-apiKey').value;
-    if (key) patch.apiKey = key;
+    if (type === 'sidecar') {
+      var port = $('s-port').value ? Number($('s-port').value) : 0;
+      var modelFile = $('s-modelFile').value;
+      patch.modelFile = modelFile;
+      patch.sidecarArgs = $('s-sidecarArgs').value;
+      patch.provider = 'openai';
+      patch.baseUrl = port ? ('http://127.0.0.1:' + port + '/v1') : '';
+      patch.model = modelFile; // llama-server serves under the loaded model name
+    } else {
+      patch.provider = $('s-provider').value;
+      patch.baseUrl = $('s-baseUrl').value;
+      patch.model = $('s-model').value;
+      patch.modelFile = ''; // not a sidecar — clear any managed-model fields
+      patch.sidecarArgs = '';
+      var key = $('s-apiKey').value;
+      if (key) patch.apiKey = key;
+    }
     return patch;
   }
 
@@ -222,6 +277,20 @@
   $('s-close').addEventListener('click', function () { overlay.hidden = true; });
   overlay.addEventListener('click', function (e) { if (e.target === overlay) overlay.hidden = true; });
   $('s-profile').addEventListener('change', fillFields);
+  $('s-type-sidecar').addEventListener('change', applyTypeUI);
+  $('s-type-external').addEventListener('change', applyTypeUI);
+
+  // Open the panel from another surface (e.g. the cockpit's LLM sidecars view),
+  // optionally focused on a specific profile.
+  window.processosOpenSettings = function (profileId) {
+    overlay.hidden = false;
+    reload().then(function () {
+      if (profileId && STATE.view && STATE.view.profiles.some(function (p) { return p.id === profileId; })) {
+        $('s-profile').value = profileId;
+        fillFields();
+      }
+    });
+  };
 
   $('s-add').addEventListener('click', async function () {
     var name = prompt('New profile name:', 'New profile');
@@ -302,6 +371,13 @@
   // --- Local llama.cpp sidecar ---------------------------------------------
   var LLAMA = { command: '', logTimer: null, since: 0 };
 
+  // Find the running sidecar entry for the profile shown in the editor, if any.
+  function currentSidecar(list) {
+    var p = currentProfile();
+    if (!p || !list || !list.sidecars) return null;
+    return list.sidecars.find(function (s) { return s.profileId === p.id; }) || null;
+  }
+
   function llamaStatusLine(s) {
     var el = $('s-llama-status');
     if (!el) return;
@@ -311,14 +387,18 @@
     } else if (s && s.error) {
       el.innerHTML = '<span class="s-dot"></span>Exited: ' + s.error;
     } else {
-      el.innerHTML = '<span class="s-dot"></span>Sidecar not running';
+      el.innerHTML = '<span class="s-dot"></span>This profile\u2019s sidecar is not running';
     }
   }
 
   async function refreshLlama() {
     if (!$('s-llama-status')) return;
-    try { var s = await api('GET', '/api/llama/status'); LLAMA.command = s.command || ''; llamaStatusLine(s); }
-    catch (e) { /* status endpoint absent on older servers — non-fatal */ }
+    try {
+      var list = await api('GET', '/api/llama/status');
+      var s = currentSidecar(list);
+      LLAMA.command = (s && s.command) || '';
+      llamaStatusLine(s);
+    } catch (e) { /* status endpoint absent on older servers — non-fatal */ }
   }
 
   $('s-savellama').addEventListener('click', async function () {
@@ -340,8 +420,9 @@
   });
 
   $('s-llama-stop').addEventListener('click', async function () {
+    var p = currentProfile(); if (!p) return;
     status('Stopping sidecar\u2026');
-    try { llamaStatusLine(await api('POST', '/api/llama/stop')); status('Sidecar stopped'); }
+    try { await api('POST', '/api/llama/stop', { profileId: p.id }); await refreshLlama(); status('Sidecar stopped'); }
     catch (e) { status('stop failed: ' + e.message); }
   });
 
@@ -350,8 +431,9 @@
   function closeLogs() { logsOverlay.hidden = true; stopLogPolling(); }
 
   async function pollLogs() {
+    var p = currentProfile(); if (!p) return;
     try {
-      var d = await api('GET', '/api/llama/logs?since=' + LLAMA.since);
+      var d = await api('GET', '/api/llama/logs?profileId=' + encodeURIComponent(p.id) + '&since=' + LLAMA.since);
       if (d.lines && d.lines.length) {
         var body = $('ll-body');
         var atBottom = body.scrollTop + body.clientHeight >= body.scrollHeight - 24;
