@@ -289,8 +289,8 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                          — the ONLY way to run a query is to emit a query_traces tool call. Stop \
                          repeating yourself. Prefer feedback from tool calls to pure reasoning: \
                          you can get it wrong and iterate on the tool feedback. Now do exactly \
-                         one thing: emit a single query_traces tool call, or give a concise \
-                         final answer."
+                         one thing: emit a single query_traces tool call, run a simulation, or \
+                         give a concise final answer."
                     } else if thinking_only {
                         "Your previous turn was all reasoning and produced no answer or \
                          tool call — you likely ran out of room mid-thought. Do NOT author \
