@@ -718,6 +718,10 @@ async function renderSidecars(){
   const sidecars = st.sidecars || [];
   const max = st.max || 2;
   const runById = {}; sidecars.forEach(r => { if(r.profileId) runById[r.profileId] = r; });
+  // Per-profile download state: which models are already cached, and which are downloading now.
+  const downloadedById = {}; (st.models||[]).forEach(m => { downloadedById[m.profileId] = !!m.downloaded; });
+  const dlById = {}; (st.downloads||[]).forEach(d => { if(d.profileId) dlById[d.profileId] = d; });
+  const fmtGB = (b) => (b==null) ? '' : (b/1073741824).toFixed(1)+' GB';
   const atCap = sidecars.length >= max;
   // Map a running sidecar's lifecycle phase to a pill + a human one-liner. A spawned llama-server
   // is NOT immediately usable: it downloads the model, then loads it into memory, then serves.
@@ -766,9 +770,17 @@ async function renderSidecars(){
     h += '<div class="grid">' + profiles.map(p => {
       const isActive = p.id===active;
       const isRunning = !!runById[p.id];
+      const dl = dlById[p.id];               // active background download, if any
+      const isDownloading = !!dl;
+      const isDownloaded = !!downloadedById[p.id];
       const pm = isRunning ? phaseMeta(runById[p.id]) : null;
+      // A small state pill so "configured / downloaded / available" is legible at a glance.
+      const statePill = isRunning ? ''                                            // phase pill already shown
+        : isDownloading ? '<span class="pill wait">downloading…</span>'
+        : isDownloaded ? '<span class="pill accept">downloaded</span>'
+        : '<span class="pill">not downloaded</span>';
       const pills = (isActive?'<span class="pill run">active</span> ':'')
-                  + (isRunning?pm.pill:'');
+                  + (isRunning?pm.pill:statePill);
       // Start is disabled only if this one already runs or the pool is full — ports are
       // auto-assigned at start, so there is never a pre-start port clash to guard against.
       const startDisabled = (isRunning || atCap) ? 'disabled' : '';
@@ -776,15 +788,28 @@ async function renderSidecars(){
                        : atCap ? ('Already running '+max+' sidecars — stop one first')
                        : 'Start this sidecar';
       const runPort = isRunning ? runById[p.id].port : null;
+      // The action button reflects the lifecycle: download the weights, then start (serve) them.
+      let actions;
+      if(isRunning){
+        actions = '<button class="btn warn" data-stop="'+esc(p.id)+'">Stop</button>';
+      } else if(isDownloading){
+        const gb = fmtGB(dl.bytes);
+        actions = '<button class="btn ghost" data-logs="'+esc(p.id)+'">Logs</button>'
+                + '<button class="btn warn" data-cancel-dl="'+esc(p.id)+'">Cancel download</button>'
+                + '<span class="meta" style="color:#7dd3fc;align-self:center">downloading'+(gb?(' · '+esc(gb)):'')+'…</span>';
+      } else if(isDownloaded){
+        actions = '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+esc(startTitle)+'">Start</button>';
+      } else {
+        actions = '<button class="btn primary" data-download="'+esc(p.id)+'" title="Download this model in the background">Download</button>'
+                + '<button class="btn ghost" data-start="'+esc(p.id)+'" '+startDisabled+' title="Start now (downloads first, then serves)">Start</button>';
+      }
       return '<div class="tile" style="cursor:default">'
         + '<h3>'+esc(p.name||p.id)+' '+pills+'</h3>'
         + '<div class="meta">'+esc(p.modelFile||p.model||'')+(runPort?(' · port '+esc(String(runPort))):'')+'</div>'
         + (pm && pm.detail?('<div class="meta" style="margin-top:4px;color:#93c5fd">'+esc(pm.detail)+'</div>'):'')
         + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
-        + (isRunning
-            ? '<button class="btn warn" data-stop="'+esc(p.id)+'">Stop</button>'
-            : '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+esc(startTitle)+'">Start</button>')
+        + actions
         + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
         + '<button class="btn ghost" data-config="'+esc(p.id)+'">Edit profile</button>'
         + '</div></div>';
@@ -798,6 +823,21 @@ async function renderSidecars(){
     b.disabled = true; b.textContent = 'Starting…';
     try { await startBtn(b.dataset.start); } catch(e){ window.alert('Could not start: '+(e.message||e)); }
     refreshLlamaDot(); renderSidecars();
+  });
+  // Download a model's weights in the background (separate from running it). The background
+  // downloader auto-stops once the GGUF is fully cached, flipping the tile to "downloaded → Start".
+  main.querySelectorAll('[data-download]').forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'Starting download…';
+    try {
+      const r = await api('/api/llama/download', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId:b.dataset.download})});
+      if(r && r.alreadyDownloaded){ /* nothing to do — re-render shows Start */ }
+    } catch(e){ window.alert('Could not start download: '+(e.message||e)); }
+    renderSidecars();
+  });
+  main.querySelectorAll('[data-cancel-dl]').forEach(b => b.onclick = async () => {
+    b.disabled = true; b.textContent = 'Cancelling…';
+    try { await api('/api/llama/download/cancel', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId:b.dataset.cancelDl})}); } catch(e){ window.alert('Could not cancel: '+(e.message||e)); }
+    renderSidecars();
   });
   const stopOne = async (b, id) => { if(b){ b.disabled=true; b.textContent='Stopping…'; } try { await api('/api/llama/stop', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(id?{profileId:id}:{})}); } catch(e){ window.alert('Could not stop: '+(e.message||e)); } refreshLlamaDot(); renderSidecars(); };
   const stopAllBtn = document.getElementById('llStopAll'); if(stopAllBtn) stopAllBtn.onclick = () => stopOne(stopAllBtn, null);
@@ -820,11 +860,12 @@ async function renderSidecars(){
   const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
   main.querySelectorAll('[data-config]').forEach(b => b.onclick = () => openConfig(b.dataset.config));
 
-  // While any sidecar is still downloading/loading (not yet ready), re-render on a timer so the
-  // operator watches it progress to "ready" without manually refreshing. Guarded so it stops once
-  // the view changes or everything is ready.
+  // While any sidecar is still downloading/loading (not yet ready) OR a background model download
+  // is active, re-render on a timer so the operator watches progress without manually refreshing.
+  // Guarded so it stops once the view changes or everything is settled.
   const stillWarming = sidecars.some(r => r.phase && r.phase!=='ready');
-  if(stillWarming){
+  const anyDownloading = (st.downloads||[]).length > 0;
+  if(stillWarming || anyDownloading){
     setTimeout(() => { if(STATE.view==='sidecars') renderSidecars(); }, 3000);
   }
 }
@@ -863,7 +904,10 @@ function openLogStream(profileId){
   back.querySelector('#lmClose').onclick = closeLogStream;
   back.querySelector('#lmStop').onclick = async (e) => {
     e.target.disabled = true; e.target.textContent = 'Stopping…';
+    // The same button stops a serving sidecar OR cancels a background download (whichever this is);
+    // the inapplicable call is a harmless no-op.
     try { await api('/api/llama/stop', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(profileId?{profileId}:{})}); } catch(err){}
+    if(profileId){ try { await api('/api/llama/download/cancel', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId})}); } catch(err){} }
     refreshLlamaDot(); if(STATE.view==='sidecars') renderSidecars();
   };
   document.addEventListener('keydown', function esc(ev){ if(ev.key==='Escape'){ closeLogStream(); document.removeEventListener('keydown', esc); } });
@@ -888,7 +932,9 @@ function openLogStream(profileId){
       try {
         const st = await api('/api/llama/status');
         const sc = (st.sidecars||[]).find(s => !profileId || s.profileId===profileId);
+        const dl = (st.downloads||[]).find(d => !profileId || d.profileId===profileId);
         if(sc){ dot.className = 'dot-status '+(sc.phase==='ready'?'on':'loading'); phaseEl.textContent = '· '+(sc.detail||sc.phase||''); }
+        else if(dl){ const gb = (dl.bytes==null)?'':(' '+(dl.bytes/1073741824).toFixed(1)+' GB'); dot.className = 'dot-status loading'; phaseEl.textContent = '· downloading model…'+gb; }
         else { dot.className = 'dot-status off'; phaseEl.textContent = '· stopped'; }
       } catch(e){}
     }

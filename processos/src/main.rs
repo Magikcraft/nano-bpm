@@ -498,6 +498,8 @@ async fn main() {
         .route("/api/llama/status", get(llama_status))
         .route("/api/llama/ready", get(llama_ready))
         .route("/api/llama/start", post(llama_start))
+        .route("/api/llama/download", post(llama_download))
+        .route("/api/llama/download/cancel", post(llama_download_cancel))
         .route("/api/llama/stop", post(llama_stop))
         .route("/api/llama/logs", get(llama_logs))
         .route("/api/llama/reasoning-control", get(reasoning_control_status))
@@ -1304,6 +1306,63 @@ fn download_in_progress(models_dir: &std::path::Path, model: &str) -> Option<u64
     best
 }
 
+/// Whether `model`'s GGUF is already fully present in the local cache under `models_dir`, so it
+/// can be started without a (re)download. Distinguishes "downloaded" from "configured" and from
+/// "available for use" (running). Two cases:
+///   * a local `*.gguf` model spec → the file exists on disk;
+///   * a Hugging Face `repo[:quant]` spec → the llama.cpp cache folder `models--org--repo` has a
+///     usable `snapshots/<rev>/<file>.gguf` (whose backing blob exists) AND no half-finished
+///     `*.downloadInProgress` blob. When a `:quant` is given, the snapshot filename must contain it
+///     (case-insensitive) so a different quant already in the cache doesn't read as downloaded.
+fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    if model.to_ascii_lowercase().ends_with(".gguf") {
+        let p = std::path::PathBuf::from(model);
+        let resolved = if p.is_absolute() { p } else { models_dir.join(&p) };
+        return resolved.exists();
+    }
+    // Hugging Face spec: split repo from the optional :quant tag.
+    let (repo, quant) = match model.split_once(':') {
+        Some((r, q)) => (r, Some(q.to_ascii_lowercase())),
+        None => (model, None),
+    };
+    let base = models_dir.join(format!("models--{}", repo.replace('/', "--")));
+    // A still-in-progress blob means the download is not complete.
+    if download_in_progress(models_dir, model).is_some() {
+        return false;
+    }
+    // Look for a usable .gguf under any snapshot revision whose backing blob exists.
+    let snaps = base.join("snapshots");
+    let Ok(revs) = std::fs::read_dir(&snaps) else {
+        return false;
+    };
+    for rev in revs.flatten() {
+        let Ok(files) = std::fs::read_dir(rev.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let name = f.file_name().to_string_lossy().to_ascii_lowercase();
+            if !name.ends_with(".gguf") {
+                continue;
+            }
+            if let Some(q) = &quant {
+                if !name.contains(q.as_str()) {
+                    continue;
+                }
+            }
+            // `f.path()` is usually a symlink into blobs/; `exists()` follows it, so a dangling
+            // link (blob evicted) correctly reads as not-downloaded.
+            if f.path().exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The real, operator-facing lifecycle phase of a sidecar — beyond the binary "the process is
 /// running" flag, which is misleading because a freshly-spawned `llama-server` is NOT usable for
 /// minutes: it first downloads the model (no port yet), then loads it into memory (`/health` 503),
@@ -1363,12 +1422,51 @@ async fn llama_status(State(state): State<AppState>) -> impl IntoResponse {
         }
         sidecars.push(v);
     }
+    // Per-sidecar-profile download state, so the UI can show "Download" vs "Start" vs running and
+    // keep "configured" / "downloaded" / "available for use" distinct.
+    let snap = state.settings.snapshot();
+    let models_dir = snap.effective_models_dir();
+    let downloads: Vec<serde_json::Value> = state
+        .llama
+        .download_states()
+        .into_iter()
+        .map(|d| {
+            let bytes = download_in_progress(&models_dir, &d.model);
+            serde_json::json!({
+                "profileId": d.profile_id,
+                "model": d.model,
+                "port": d.port,
+                "startedAt": d.started_at,
+                "bytes": bytes,
+            })
+        })
+        .collect();
+    let models: Vec<serde_json::Value> = snap
+        .profiles
+        .iter()
+        .filter(|p| p.sidecar)
+        .map(|p| {
+            let model = p
+                .model_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or(p.model.as_deref())
+                .unwrap_or("");
+            serde_json::json!({
+                "profileId": p.id,
+                "downloaded": model_downloaded(&models_dir, model),
+            })
+        })
+        .collect();
     Json(serde_json::json!({
         "running": list.running,
         "anyReady": any_ready,
         "count": list.count,
         "max": list.max,
         "sidecars": sidecars,
+        "downloads": downloads,
+        "models": models,
         "error": list.error,
     }))
 }
@@ -1448,6 +1546,61 @@ async fn llama_start(
         }
     }
     Json(status).into_response()
+}
+
+/// `POST /api/llama/download` — start a BACKGROUND download of a `sidecar:true` profile's model
+/// into the cache, without serving it. A transient `llama-server` fetches the GGUF and is stopped
+/// the moment it is fully cached, so "downloaded" stays distinct from "available for use". Returns
+/// the download state, or 200 `{ alreadyDownloaded:true }` when the model is already present.
+async fn llama_download(
+    State(state): State<AppState>,
+    Json(req): Json<LlamaStartRequest>,
+) -> impl IntoResponse {
+    let snap = state.settings.snapshot();
+    let profile = match snap.profiles.iter().find(|p| p.id == req.profile_id) {
+        Some(p) => p.clone(),
+        None => return unprocessable(format!("no such profile: {}", req.profile_id)),
+    };
+    if !profile.sidecar {
+        return unprocessable(format!(
+            "profile '{}' is not configured to use the local sidecar",
+            profile.id
+        ));
+    }
+    let models_dir = snap.effective_models_dir();
+    let model = profile
+        .model_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(profile.model.as_deref())
+        .unwrap_or("")
+        .to_string();
+    if model_downloaded(&models_dir, &model) {
+        return Json(serde_json::json!({ "alreadyDownloaded": true, "profileId": profile.id }))
+            .into_response();
+    }
+    // The watcher polls this to know when the GGUF is fully cached (cache scan lives in main.rs).
+    let dir = models_dir.clone();
+    let m = model.clone();
+    let is_complete: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
+        std::sync::Arc::new(move || model_downloaded(&dir, &m));
+    match state
+        .llama
+        .start_download(&profile, &models_dir, snap.llama_bin.as_deref(), is_complete)
+    {
+        Ok(s) => Json(s).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/llama/download/cancel` — cancel a background download (`{profileId}`). Idempotent.
+async fn llama_download_cancel(
+    State(state): State<AppState>,
+    Json(req): Json<LlamaStartRequest>,
+) -> impl IntoResponse {
+    let cancelled = state.llama.cancel_download(&req.profile_id);
+    Json(serde_json::json!({ "cancelled": cancelled, "profileId": req.profile_id }))
 }
 
 /// Request body for stopping a sidecar: an optional profile id (omit to stop all).
@@ -3820,7 +3973,7 @@ mod config_tests {
 
 #[cfg(test)]
 mod sidecar_phase_tests {
-    use super::download_in_progress;
+    use super::{download_in_progress, model_downloaded};
     use std::fs;
 
     #[test]
@@ -3847,5 +4000,54 @@ mod sidecar_phase_tests {
     fn no_download_for_an_unknown_model_dir() {
         let dir = std::env::temp_dir().join("se-dl-absent");
         assert_eq!(download_in_progress(&dir, "org/repo:tag"), None);
+    }
+
+    #[test]
+    fn model_downloaded_tracks_the_hf_cache_lifecycle() {
+        let dir = std::env::temp_dir().join(format!("se-dlc-{}", std::process::id()));
+        let repo = dir.join("models--unsloth--Qwen3-8B-GGUF");
+        let blobs = repo.join("blobs");
+        let snap = repo.join("snapshots").join("rev0");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::create_dir_all(&snap).unwrap();
+        let model = "unsloth/Qwen3-8B-GGUF:UD-Q4_K_XL";
+
+        // Mid-download: only a .downloadInProgress blob, no snapshot file yet.
+        fs::write(blobs.join("sha1.downloadInProgress"), vec![0u8; 4096]).unwrap();
+        assert!(!model_downloaded(&dir, model), "partial download is not downloaded");
+
+        // Complete: a snapshot .gguf (whose name carries the quant) backed by a real blob, and the
+        // partial file gone.
+        fs::remove_file(blobs.join("sha1.downloadInProgress")).unwrap();
+        let blob = blobs.join("sha1");
+        fs::write(&blob, vec![0u8; 8192]).unwrap();
+        let gguf = snap.join("Qwen3-8B-UD-Q4_K_XL.gguf");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&blob, &gguf).unwrap();
+        #[cfg(not(unix))]
+        fs::write(&gguf, vec![0u8; 8192]).unwrap();
+        assert!(model_downloaded(&dir, model), "complete cache reads as downloaded");
+
+        // A different quant of the same repo must not read as downloaded.
+        assert!(
+            !model_downloaded(&dir, "unsloth/Qwen3-8B-GGUF:Q8_0"),
+            "a different quant is not satisfied by an existing one"
+        );
+
+        // A still-in-progress blob alongside the complete snapshot still reads as not-ready.
+        fs::write(blobs.join("sha2.downloadInProgress"), vec![0u8; 16]).unwrap();
+        assert!(!model_downloaded(&dir, model), "an active partial blocks downloaded");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_downloaded_handles_a_local_gguf_path() {
+        let dir = std::env::temp_dir().join(format!("se-dll-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!model_downloaded(&dir, "local-model.gguf"));
+        fs::write(dir.join("local-model.gguf"), vec![0u8; 16]).unwrap();
+        assert!(model_downloaded(&dir, "local-model.gguf"));
+        fs::remove_dir_all(&dir).ok();
     }
 }

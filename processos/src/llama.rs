@@ -18,7 +18,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -32,6 +34,11 @@ const LOG_CAPACITY: usize = 2000;
 /// How many `llama-server` sidecars may run at once. Two lets an investigation pair a primary
 /// model with a sparring-partner / loop-monitor model (each on its own port).
 pub const MAX_SIDECARS: usize = 2;
+
+/// How many background model downloads may run at once. Independent of the serving sidecar pool —
+/// a download is a transient `llama-server` that fetches the GGUF into the cache and is stopped
+/// before it loads into memory, so it never occupies a serving slot.
+pub const MAX_DOWNLOADS: usize = 2;
 
 /// The plan for launching `llama-server`: the resolved binary, argv, and the `LLAMA_CACHE`
 /// (models) directory. Split out from the spawn so it can be unit-tested and shown to the operator
@@ -284,6 +291,30 @@ struct Running {
     started_at: String,
 }
 
+/// A live background model download. The owning watcher task holds the `llama-server` child; this
+/// handle stays in the manager so status can report it and the operator can cancel it. `cancel`
+/// asks the watcher to kill the child; `finished` flips true once the watcher exits (complete,
+/// cancelled, or the process died), at which point the handle is pruned.
+struct DownloadHandle {
+    profile_id: String,
+    model: String,
+    port: u16,
+    started_at: String,
+    cancel: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+
+/// A background download surfaced to `/api/llama/status` so the UI can show "Downloading…" with a
+/// Logs/Cancel affordance and distinguish it from a configured-but-absent model.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadState {
+    pub profile_id: String,
+    pub model: String,
+    pub port: u16,
+    pub started_at: String,
+}
+
 #[derive(Default)]
 struct ManagerInner {
     running: Vec<Running>,
@@ -299,6 +330,8 @@ pub struct LlamaManager {
     /// One ring buffer per profile id, kept even after the sidecar stops so its final output is
     /// still viewable.
     logs: Arc<Mutex<HashMap<String, LogBuffer>>>,
+    /// Active background downloads (each a transient `llama-server` fetching a GGUF into the cache).
+    downloads: Arc<Mutex<Vec<DownloadHandle>>>,
 }
 
 impl LlamaManager {
@@ -369,10 +402,43 @@ impl LlamaManager {
                 ));
             }
         }
+        // Refuse to serve a profile that is mid background-download — two llama-servers writing the
+        // same cache blob would corrupt it.
+        if self.is_downloading(&plan.profile_id) {
+            return Err(format!(
+                "profile '{}' is downloading in the background; wait for it to finish",
+                plan.profile_id
+            ));
+        }
         let command = plan.command_line();
+        let (child, pid) = self.spawn_child(&plan)?;
+
+        let started_at = now_iso();
+        let running = Running {
+            child,
+            profile_id: plan.profile_id.clone(),
+            model: plan.model.clone(),
+            port: plan.port,
+            pid,
+            command,
+            models_dir: plan.models_dir.display().to_string(),
+            started_at,
+        };
+        let status = running_status(&running, None);
+        let mut g = self.inner.lock().unwrap();
+        g.last_error = None;
+        g.running.push(running);
+        Ok(status)
+    }
+
+    /// Spawn the `llama-server` child for `plan`: clears + seeds the profile's log buffer with the
+    /// equivalent command, exports `LLAMA_CACHE`, and drains stdout+stderr into the ring buffer.
+    /// Shared by [`Self::start`] (a serving sidecar) and [`Self::start_download`] (a background
+    /// fetch). Returns the live child and its pid.
+    fn spawn_child(&self, plan: &LaunchPlan) -> Result<(Child, Option<u32>), String> {
         let logs = self.log_buf(&plan.profile_id);
         logs.clear();
-        logs.push(format!("$ {command}"));
+        logs.push(format!("$ {}", plan.command_line()));
 
         let mut cmd = Command::new(&plan.bin);
         cmd.args(&plan.args)
@@ -397,23 +463,167 @@ impl LlamaManager {
         if let Some(err) = child.stderr.take() {
             self.spawn_drain(err, logs.clone());
         }
+        Ok((child, pid))
+    }
 
+    /// Start a BACKGROUND download of `profile`'s model into the cache, separate from the serving
+    /// sidecar pool. Spawns a transient `llama-server` (which fetches the GGUF) and a watcher that
+    /// stops it the moment the model is fully cached — before it loads the weights into memory — so
+    /// the operator can pre-fetch a model without occupying a serving slot or RAM. `is_complete`
+    /// reports whether the GGUF is fully present (the cache check lives in `main.rs`). Errors if the
+    /// profile is already running/downloading, the download pool is full, no port is free, the model
+    /// is already cached, or the spawn fails.
+    pub fn start_download(
+        &self,
+        profile: &LlmProfile,
+        models_dir: &Path,
+        llama_bin: Option<&str>,
+        is_complete: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<DownloadState, String> {
+        self.reap();
+        self.reap_downloads();
+        if is_complete() {
+            return Err(format!("model for '{}' is already downloaded", profile.id));
+        }
+        let mut excluded: Vec<u16> = {
+            let g = self.inner.lock().unwrap();
+            if g.running.iter().any(|r| r.profile_id == profile.id) {
+                return Err(format!(
+                    "profile '{}' is already running as a sidecar",
+                    profile.id
+                ));
+            }
+            g.running.iter().map(|r| r.port).collect()
+        };
+        {
+            let d = self.downloads.lock().unwrap();
+            if d.iter().any(|h| h.profile_id == profile.id) {
+                return Err(format!("profile '{}' is already downloading", profile.id));
+            }
+            if d.len() >= MAX_DOWNLOADS {
+                return Err(format!(
+                    "already downloading {MAX_DOWNLOADS} models (the maximum); wait for one to finish"
+                ));
+            }
+            excluded.extend(d.iter().map(|h| h.port));
+        }
+        let port = pick_free_port(profile.preferred_port(), &excluded)
+            .ok_or_else(|| "no free TCP port available for the download".to_string())?;
+        let plan = LaunchPlan::build(profile, models_dir, llama_bin, port)?;
+        let (mut child, _pid) = self.spawn_child(&plan)?;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
         let started_at = now_iso();
-        let running = Running {
-            child,
-            profile_id: plan.profile_id.clone(),
+        self.downloads.lock().unwrap().push(DownloadHandle {
+            profile_id: profile.id.clone(),
             model: plan.model.clone(),
-            port: plan.port,
-            pid,
-            command,
-            models_dir: plan.models_dir.display().to_string(),
+            port,
+            started_at: started_at.clone(),
+            cancel: cancel.clone(),
+            finished: finished.clone(),
+        });
+        let state = DownloadState {
+            profile_id: profile.id.clone(),
+            model: plan.model.clone(),
+            port,
             started_at,
         };
-        let status = running_status(&running, None);
-        let mut g = self.inner.lock().unwrap();
-        g.last_error = None;
-        g.running.push(running);
-        Ok(status)
+
+        // Watcher: poll until the GGUF is fully cached (or the operator cancels / the process dies),
+        // then kill the downloader so it never proceeds to load the model into memory.
+        let logs = self.log_buf(&profile.id);
+        tokio::spawn(async move {
+            let mut stable: u8 = 0;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    logs.push("[download cancelled]".into());
+                    break;
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if is_complete() {
+                            logs.push("[download complete — model cached]".into());
+                        } else {
+                            logs.push(format!("[downloader exited before completing: {status}]"));
+                        }
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+                // Require the cache to read complete for two consecutive polls (~3s) before stopping,
+                // so we don't kill in a brief gap between sharded-GGUF parts.
+                if is_complete() {
+                    stable += 1;
+                    if stable >= 2 {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        logs.push(
+                            "[download complete — model cached; stopped the downloader before it loaded into memory]"
+                                .into(),
+                        );
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            finished.store(true, Ordering::Relaxed);
+        });
+
+        Ok(state)
+    }
+
+    /// Ask the background download for `profile_id` to stop (the watcher kills the child on its next
+    /// poll). Returns true if a matching active download was found.
+    pub fn cancel_download(&self, profile_id: &str) -> bool {
+        self.reap_downloads();
+        let d = self.downloads.lock().unwrap();
+        match d.iter().find(|h| h.profile_id == profile_id) {
+            Some(h) => {
+                h.cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Snapshot of the active background downloads, for `/api/llama/status`.
+    pub fn download_states(&self) -> Vec<DownloadState> {
+        self.reap_downloads();
+        self.downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| DownloadState {
+                profile_id: h.profile_id.clone(),
+                model: h.model.clone(),
+                port: h.port,
+                started_at: h.started_at.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether a background download is active for `profile_id`.
+    fn is_downloading(&self, profile_id: &str) -> bool {
+        self.reap_downloads();
+        self.downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.profile_id == profile_id)
+    }
+
+    /// Drop the handles of downloads whose watcher has finished (complete / cancelled / died).
+    fn reap_downloads(&self) {
+        self.downloads
+            .lock()
+            .unwrap()
+            .retain(|h| !h.finished.load(Ordering::Relaxed));
     }
 
     /// Stop a sidecar by profile id, or — when `profile_id` is `None` — all of them (best-effort).
@@ -485,16 +695,17 @@ impl LlamaManager {
     }
 
     /// Log lines for `profile_id` at or after `since`, plus the next offset and whether that
-    /// sidecar is still running.
+    /// sidecar (or a background download for it) is still running.
     pub fn logs_since(&self, profile_id: &str, since: u64) -> (Vec<String>, u64, bool) {
         let (lines, next) = self.log_buf(profile_id).since(since);
-        let running = self
+        let serving = self
             .inner
             .lock()
             .unwrap()
             .running
             .iter()
             .any(|r| r.profile_id == profile_id);
+        let running = serving || self.is_downloading(profile_id);
         (lines, next, running)
     }
 
