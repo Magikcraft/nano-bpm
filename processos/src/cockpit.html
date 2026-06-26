@@ -409,6 +409,7 @@
 
 <script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
 <script src="/assets/bpmn/bpmn-auto-layout.js"></script>
+<script src="/assets/bpmn/elk.bundled.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 // #main hosts two panes: #viewHost for the console/processes/prompts/etc renderers (which clobber
@@ -2119,10 +2120,6 @@ function modelCardHtml(m){
     '</div></div>';
 }
 
-// Does this BPMN XML already carry diagram-interchange (layout) info? LLM-authored variants are
-// usually pure semantics with no <bpmndi:BPMNDiagram>, which the viewer can't render
-// ("no diagram to display") — those we auto-layout first.
-function bpmnHasDi(xml){ return /BPMNDiagram|BPMNPlane/.test(xml || ''); }
 
 // LLM-authored variants are sometimes a bare <bpmn:process> fragment with no <bpmn:definitions>
 // root ("failed to parse document as <bpmn:Definitions>"). Wrap such fragments in a synthesized
@@ -2142,13 +2139,172 @@ function ensureBpmnDefinitions(xml){
     'targetNamespace="http://bpmn.io/schema/bpmn">\n' + body + '\n</bpmn:definitions>';
 }
 
-// Add a generated layout to DI-less BPMN so the viewer can render it; returns the (definitions-
-// wrapped) XML on any failure (the viewer will then surface its own message).
+// --- ELK-based BPMN layout ------------------------------------------------------------------
+// LLM-authored models carry either no DI or our server's simple hand-rolled DI (which can show
+// crossing edges and overlapping labels). We re-lay-out every model with ELK (the Eclipse Layout
+// Kernel, layered algorithm) which does proper crossing minimization, orthogonal edge routing and
+// edge-label placement, then write fresh BPMN DI. This is authoritative: any incoming DI is
+// stripped first so ELK's layout always wins. Falls back to bpmn-auto-layout, then to the input.
+
+let _moddleHostViewer = null;
+// A hidden bpmn-js instance purely to borrow its BpmnModdle (parse/serialize BPMN <-> objects).
+function getBpmnModdle(){
+  if(_moddleHostViewer) return _moddleHostViewer.get('moddle');
+  if(typeof BpmnJS === 'undefined') return null;
+  const host = document.createElement('div');
+  host.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;left:-9999px;top:-9999px';
+  document.body.appendChild(host);
+  _moddleHostViewer = new BpmnJS({ container: host });
+  return _moddleHostViewer.get('moddle');
+}
+
+// Default on-canvas dimensions per BPMN element type (matches bpmn-js conventions).
+function elkNodeSize(type){
+  if(/Task$|CallActivity$|SubProcess$/.test(type)) return { w: 100, h: 80 };
+  if(/Gateway$/.test(type)) return { w: 50, h: 50 };
+  return { w: 36, h: 36 }; // events
+}
+
+const ELK_GRAPH_OPTS = {
+  'elk.algorithm': 'layered',
+  'elk.direction': 'RIGHT',
+  'elk.edgeRouting': 'ORTHOGONAL',
+  'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
+  'elk.layered.nodePlacement.strategy': 'BRANDES_KOEPF',
+  'elk.layered.spacing.nodeNodeBetweenLayers': '70',
+  'elk.layered.spacing.edgeNodeBetweenLayers': '30',
+  'elk.spacing.nodeNode': '50',
+  'elk.spacing.edgeNode': '25',
+  'elk.spacing.edgeEdge': '20',
+  'elk.spacing.edgeLabel': '8',
+  'elk.layered.spacing.edgeEdgeBetweenLayers': '15',
+  'elk.layered.mergeEdges': 'true'
+};
+
+// Lay out DI-less BPMN with ELK and return BPMN XML carrying fresh DI. Throws on any problem so the
+// caller can fall back.
+async function elkBpmnLayout(xml){
+  if(typeof ELK === 'undefined') throw new Error('ELK unavailable');
+  const moddle = getBpmnModdle();
+  if(!moddle) throw new Error('moddle unavailable');
+
+  const { rootElement: defs } = await moddle.fromXML(ensureBpmnDefinitions(xml));
+
+  // Pick the process with the most flow elements (handles bare collaborations/pools loosely).
+  const procs = (defs.rootElements || []).filter(e => e.$type === 'bpmn:Process' && (e.flowElements||[]).length);
+  if(!procs.length) throw new Error('no process with flow elements');
+  const proc = procs.sort((a,b)=> (b.flowElements.length - a.flowElements.length))[0];
+  const fe = proc.flowElements || [];
+
+  const isFlow = (e)=> e.$type === 'bpmn:SequenceFlow';
+  const isBoundary = (e)=> e.$type === 'bpmn:BoundaryEvent';
+  const byId = {}; fe.forEach(e => { byId[e.id] = e; });
+
+  // ELK children = every non-flow, non-boundary node. Boundary events become SOUTH ports on host.
+  const children = [];
+  fe.filter(e => !isFlow(e) && !isBoundary(e)).forEach(e => {
+    const sz = elkNodeSize(e.$type);
+    children.push({ id: e.id, width: sz.w, height: sz.h, ports: [], layoutOptions: {} });
+  });
+  const childById = {}; children.forEach(c => { childById[c.id] = c; });
+
+  fe.filter(isBoundary).forEach(be => {
+    const hostId = be.attachedToRef && be.attachedToRef.id;
+    const host = hostId && childById[hostId];
+    if(!host){ // orphan boundary: fall back to a normal node
+      const sz = elkNodeSize(be.$type);
+      children.push({ id: be.id, width: sz.w, height: sz.h, ports: [], layoutOptions: {} });
+      childById[be.id] = children[children.length-1];
+      return;
+    }
+    host.layoutOptions['elk.portConstraints'] = 'FIXED_SIDE';
+    host.ports.push({ id: be.id, width: 36, height: 36, layoutOptions: { 'elk.port.side': 'SOUTH' } });
+  });
+
+  // ELK edges from sequence flows. A flow's name becomes an edge label so ELK reserves room for it.
+  const edges = [];
+  fe.filter(isFlow).forEach(f => {
+    const src = f.sourceRef && f.sourceRef.id;
+    const tgt = f.targetRef && f.targetRef.id;
+    if(!src || !tgt) return;
+    const edge = { id: f.id, sources: [src], targets: [tgt] };
+    const name = (f.name || '').trim();
+    if(name){
+      edge.labels = [{ id: f.id+'_lbl', text: name,
+        width: Math.min(160, name.length * 6 + 12), height: 16,
+        layoutOptions: { 'elk.edgeLabels.placement': 'CENTER' } }];
+    }
+    edges.push(edge);
+  });
+
+  const graph = { id: 'root', layoutOptions: ELK_GRAPH_OPTS, children, edges };
+  const elk = new ELK();
+  const res = await elk.layout(graph);
+
+  // --- Write DI from the laid-out graph. ---
+  const shapes = [];
+  (res.children||[]).forEach(c => {
+    const el = byId[c.id];
+    const attrs = { id: c.id+'_di', bpmnElement: el,
+      bounds: moddle.create('dc:Bounds', { x: c.x, y: c.y, width: c.width, height: c.height }) };
+    if(el && el.$type === 'bpmn:ExclusiveGateway') attrs.isMarkerVisible = true;
+    shapes.push(moddle.create('bpmndi:BPMNShape', attrs));
+    // Boundary-event ports -> their own shapes, positioned absolutely on the host edge.
+    (c.ports||[]).forEach(p => {
+      const be = byId[p.id]; if(!be) return;
+      shapes.push(moddle.create('bpmndi:BPMNShape', {
+        id: p.id+'_di', bpmnElement: be,
+        bounds: moddle.create('dc:Bounds', { x: c.x + p.x, y: c.y + p.y, width: p.width, height: p.height })
+      }));
+    });
+  });
+
+  const edgeDis = [];
+  (res.edges||[]).forEach(e => {
+    const el = byId[e.id]; if(!el) return;
+    const sec = (e.sections && e.sections[0]) || null;
+    const pts = [];
+    if(sec){
+      pts.push(sec.startPoint);
+      (sec.bendPoints||[]).forEach(bp => pts.push(bp));
+      pts.push(sec.endPoint);
+    }
+    const waypoint = pts.map(pt => moddle.create('dc:Point', { x: pt.x, y: pt.y }));
+    const edgeAttrs = { id: e.id+'_di', bpmnElement: el, waypoint };
+    const lbl = e.labels && e.labels[0];
+    if(lbl && typeof lbl.x === 'number'){
+      edgeAttrs.label = moddle.create('bpmndi:BPMNLabel', {
+        bounds: moddle.create('dc:Bounds', { x: lbl.x, y: lbl.y, width: lbl.width, height: lbl.height })
+      });
+    }
+    edgeDis.push(moddle.create('bpmndi:BPMNEdge', edgeAttrs));
+  });
+
+  const plane = moddle.create('bpmndi:BPMNPlane', { id: 'BPMNPlane_elk', bpmnElement: proc, planeElement: shapes.concat(edgeDis) });
+  const diagram = moddle.create('bpmndi:BPMNDiagram', { id: 'BPMNDiagram_elk', plane });
+  defs.diagrams = [diagram];
+
+  const { xml: out } = await moddle.toXML(defs, { format: true });
+  return out;
+}
+
+// Strip any existing <bpmndi:BPMNDiagram> so a freshly computed layout is authoritative.
+function stripBpmnDi(xml){
+  return (xml || '').replace(/<(\w+:)?BPMNDiagram[\s\S]*?<\/(\w+:)?BPMNDiagram>/g, '');
+}
+
+// Add a generated layout to BPMN so the viewer can render it legibly. Prefers ELK; falls back to
+// bpmn-auto-layout, then to the (definitions-wrapped) input on any failure.
 async function ensureBpmnLayout(xml){
-  const doc = ensureBpmnDefinitions(xml);
-  if(bpmnHasDi(doc) || typeof BpmnAutoLayout === 'undefined' || !BpmnAutoLayout.layoutProcess) return doc;
-  try { return await BpmnAutoLayout.layoutProcess(doc); }
-  catch(_){ return doc; }
+  const semantic = stripBpmnDi(ensureBpmnDefinitions(xml));
+  try { return await elkBpmnLayout(semantic); }
+  catch(_){ /* fall through to the simpler layout */ }
+  try {
+    if(typeof BpmnAutoLayout !== 'undefined' && BpmnAutoLayout.layoutProcess){
+      return await BpmnAutoLayout.layoutProcess(semantic);
+    }
+  } catch(_){}
+  return semantic;
 }
 
 // Render BPMN xml into a container with a fresh viewer; returns the viewer or null.
@@ -2172,8 +2328,10 @@ function modelXmlOf(card){ const p = card.querySelector('.mc-xml'); return p ? p
 function modelNameOf(card){ const n = card.querySelector('.mc-name'); return (n ? n.textContent : 'model') || 'model'; }
 function slugify(s){ return String(s||'model').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,60) || 'model'; }
 
-function downloadModel(card){
-  const xml = modelXmlOf(card);
+async function downloadModel(card){
+  // Export the ELK-laid-out XML (fresh DI) so the file opens cleanly in other BPMN tools.
+  let xml = modelXmlOf(card);
+  try { xml = await ensureBpmnLayout(xml); } catch(_){}
   const blob = new Blob([xml], { type: 'application/xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

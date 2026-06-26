@@ -975,6 +975,7 @@ const WORKSPACE_HTML: &str = include_str!("workspace.html");
 /// the workspace console can render a real BPMN diagram with no CDN/build step.
 const BPMN_VIEWER_JS: &str = include_str!("../assets/bpmn/bpmn-navigated-viewer.js");
 const BPMN_AUTO_LAYOUT_JS: &str = include_str!("../assets/bpmn/bpmn-auto-layout.js");
+const BPMN_ELK_JS: &str = include_str!("../assets/bpmn/elk.bundled.js");
 const BPMN_DIAGRAM_CSS: &str = include_str!("../assets/bpmn/diagram-js.css");
 const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css");
 const SETTINGS_JS: &str = include_str!("../assets/settings.js");
@@ -1109,6 +1110,7 @@ async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
     let (body, ctype): (&'static str, &'static str) = match file.as_str() {
         "bpmn-navigated-viewer.js" => (BPMN_VIEWER_JS, "application/javascript; charset=utf-8"),
         "bpmn-auto-layout.js" => (BPMN_AUTO_LAYOUT_JS, "application/javascript; charset=utf-8"),
+        "elk.bundled.js" => (BPMN_ELK_JS, "application/javascript; charset=utf-8"),
         "diagram-js.css" => (BPMN_DIAGRAM_CSS, "text/css; charset=utf-8"),
         "bpmn-embedded.css" => (BPMN_EMBEDDED_CSS, "text/css; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
