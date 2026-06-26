@@ -289,6 +289,7 @@ impl Engine {
     /// Creates a fresh process instance and queues its start event for
     /// activation. Shared by `CreateInstance`, message-start correlation, and
     /// timer-start firing.
+    #[allow(clippy::too_many_arguments)]
     fn start_instance(
         &mut self,
         log: &mut Vec<Event>,
@@ -328,6 +329,7 @@ impl Engine {
     /// the instance in its own namespace). This spreads start-triggered load
     /// across the cluster instead of piling every such instance onto the deploy
     /// partition.
+    #[allow(clippy::too_many_arguments)]
     fn start_or_dispatch_instance(
         &mut self,
         log: &mut Vec<Event>,

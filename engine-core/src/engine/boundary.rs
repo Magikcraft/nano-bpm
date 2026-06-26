@@ -192,7 +192,7 @@ impl Engine {
             .collect();
         subs.sort_by_key(|s| s.key);
         subs.into_iter()
-            .map(|s| Self::disarm_subscription_event(s))
+            .map(Self::disarm_subscription_event)
             .collect()
     }
 
@@ -502,7 +502,7 @@ impl Engine {
             .collect();
         subs.sort_by_key(|s| s.key);
         subs.into_iter()
-            .map(|s| Self::disarm_subscription_event(s))
+            .map(Self::disarm_subscription_event)
             .collect()
     }
 }

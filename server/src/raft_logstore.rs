@@ -302,6 +302,7 @@ impl RaftLogStore {
     /// Rewrites `log.ndjson` from the in-memory index atomically and reopens the
     /// append handle. Used by `truncate`/`purge`, which remove entries that pure
     /// append cannot express.
+    #[allow(clippy::result_large_err)]
     fn rewrite_log(inner: &mut Inner) -> Result<(), StorageError<NodeId>> {
         let mut bytes = Vec::new();
         for entry in inner.log.values() {
@@ -320,6 +321,7 @@ impl RaftLogStore {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn persist_state(inner: &Inner) -> Result<(), StorageError<NodeId>> {
         let state = PersistedState {
             last_purged: inner.last_purged,

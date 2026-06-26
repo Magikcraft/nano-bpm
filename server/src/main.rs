@@ -488,6 +488,7 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
 /// Parses every deployment resource up front so a deploy is all-or-nothing,
 /// returning the parsed process definitions and a map from process id to its
 /// originating resource name. `Err` is `(title, detail)` for a 400 response.
+#[allow(clippy::type_complexity)]
 fn parse_deploy_resources(
     resources: &[(String, String)],
 ) -> Result<(Vec<ProcessDefinition>, std::collections::HashMap<String, String>), (&'static str, String)>
@@ -1989,8 +1990,8 @@ impl ServerImpl {
         };
 
         let result = self.store.process_instance(key);
-        if result.is_none() {
-            if let Some(node) = self.read_route(key) {
+        if result.is_none()
+            && let Some(node) = self.read_route(key) {
                 let (status, body) = self
                     .forward_get(node, crate::command_stream::ReadKind::ProcessInstance, key)
                     .await;
@@ -2011,7 +2012,6 @@ impl ServerImpl {
                     ),
                 });
             }
-        }
         match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
                 process_instance_result(&instance),
@@ -3316,9 +3316,9 @@ impl ServerImpl {
     /// Peer-side handler for a forwarded `createProcessInstance`: creates on one
     /// of THIS node's own partitions (never re-forwarding) and returns the full
     /// `CreateProcessInstanceResult` as JSON, so the originating gateway can map
-    /// it straight back to its REST response. Mirrors the local REST create core
-    /// + finalize. Backpressure/admission are applied at the receiving gateway,
-    /// not here.
+    /// it straight back to its REST response. Mirrors the local REST create
+    /// core + finalize. Backpressure/admission are applied at the receiving
+    /// gateway, not here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create_forwarded(
         &self,
@@ -3551,6 +3551,7 @@ impl ServerImpl {
     /// a brief blip while leadership moves. Business/validation rejections (400/409)
     /// short-circuit; transient transport/leadership errors retry until the budget
     /// is spent, then surface a retryable 503.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_create_bounded(
         &self,
         by_id: Option<String>,
@@ -3745,8 +3746,8 @@ impl ServerImpl {
         };
 
         let result = self.store.incident(key);
-        if result.is_none() {
-            if let Some(node) = self.read_route(key) {
+        if result.is_none()
+            && let Some(node) = self.read_route(key) {
                 let (status, body) = self
                     .forward_get(node, crate::command_stream::ReadKind::Incident, key)
                     .await;
@@ -3769,7 +3770,6 @@ impl ServerImpl {
                     ),
                 });
             }
-        }
         match result {
             Some(incident) => Ok(Resp::Status200_TheIncidentIsSuccessfullyReturned(
                 incident_result(&incident),
@@ -5497,14 +5497,13 @@ impl ServerImpl {
             // We did not adopt. If we are the standing leader for `p` at this epoch
             // and the sender is a tie-loser/concurrent promoter, pull it back in as a
             // learner so it stops diverging and resumes receiving our log.
-            if i_lead_here && leader_node != me {
-                if let Some(addr) = self
+            if i_lead_here && leader_node != me
+                && let Some(addr) = self
                     .engine
                     .topology()
                     .peer_addr(leader_node as u32)
                     .map(str::to_string)
-                {
-                    if let Some(part) = self.raft.get(p) {
+                    && let Some(part) = self.raft.get(p) {
                         part.add_learner(
                             leader_node,
                             openraft::BasicNode::new(addr),
@@ -5512,8 +5511,6 @@ impl ServerImpl {
                         .await
                         .ok();
                     }
-                }
-            }
             return; // stale / duplicate / tie-loser
         }
 
@@ -6163,9 +6160,9 @@ impl ServerImpl {
 
         let mut produced = false;
         let mut routable: Vec<Event> = Vec::new();
-        if timers_due {
-            if let Ok(resp) = part.propose_result(Command::TriggerTimers { now }, now).await {
-                if resp.error.is_none() && !resp.events.is_empty() {
+        if timers_due
+            && let Ok(resp) = part.propose_result(Command::TriggerTimers { now }, now).await
+                && resp.error.is_none() && !resp.events.is_empty() {
                     produced = true;
                     if multi_partition {
                         routable.extend(
@@ -6184,15 +6181,12 @@ impl ServerImpl {
                         );
                     }
                 }
-            }
-        }
         if jobs_due {
             if self.replicate_activation {
-                if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await {
-                    if resp.error.is_none() && !resp.events.is_empty() {
+                if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await
+                    && resp.error.is_none() && !resp.events.is_empty() {
                         produced = true;
                     }
-                }
             } else {
                 // Leader-local activation: the job lock lives ONLY on this leader's
                 // engine actor (it was never replicated), so expiring leases must
@@ -6263,6 +6257,7 @@ impl ServerImpl {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
         }
+        #[allow(clippy::type_complexity)]
         let outcome: Result<(nanobpmn_engine_core::Key, bool, Vec<Event>, Commit), (u16, String)> = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
@@ -9554,7 +9549,7 @@ mod clustered_startup_tests {
                 .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
         };
         for p in 0..4u64 {
-            let owner = (p % 2) as u64; // owner_of(p) for 2 nodes
+            let owner = p % 2; // owner_of(p) for 2 nodes
             let owner_node = if owner == 0 { &node0 } else { &node1 };
             let mut elected = false;
             for _ in 0..400 {
@@ -10271,14 +10266,14 @@ mod clustered_startup_tests {
         };
         for _ in 0..500 {
             for node in [n1, n2] {
-                if let Some(l) = leader_of(node, p) {
-                    if l != 0 {
-                        return if l == n1.engine.topology().node_id as u64 {
-                            n1
-                        } else {
-                            n2
-                        };
-                    }
+                if let Some(l) = leader_of(node, p)
+                    && l != 0
+                {
+                    return if l == n1.engine.topology().node_id as u64 {
+                        n1
+                    } else {
+                        n2
+                    };
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

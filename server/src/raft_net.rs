@@ -294,6 +294,7 @@ impl RaftTransport for NullTransport {
 /// same registry, so all members and the transport see one map.
 #[derive(Clone, Default)]
 pub struct LocalCluster {
+    #[allow(clippy::type_complexity)]
     nodes: Arc<Mutex<HashMap<(u64, NodeId), openraft::Raft<RaftConfig>>>>,
 }
 

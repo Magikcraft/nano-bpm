@@ -973,8 +973,8 @@ async fn handle_client_frame(
                 });
                 return;
             }
-            if !awaiting {
-                if let Some(node) = server.stream_create_placement() {
+            if !awaiting
+                && let Some(node) = server.stream_create_placement() {
                     match server
                         .create_forwarded_stream(
                             node,
@@ -1006,7 +1006,6 @@ async fn handle_client_frame(
                     }
                     return;
                 }
-            }
 
             let vars = to_engine_vars(variables);
             match server
@@ -1740,6 +1739,7 @@ async fn dispatch_jobs(server: &ServerImpl, registry: &Arc<Registry>) {
     // Regroup the round-robin plan by connection so each connection's whole
     // workload (every job type it subscribes to) is handled by a single task,
     // keeping its credit and socket-room mutations race-free across the pass.
+    #[allow(clippy::type_complexity)]
     let mut by_conn: Vec<(Arc<Connection>, Vec<(String, Arc<Subscription>)>)> = Vec::new();
     let mut index: HashMap<ConnId, usize> = HashMap::new();
     for (job_type, targets) in registry.dispatch_plan() {

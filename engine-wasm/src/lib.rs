@@ -308,7 +308,7 @@ impl TestEngine {
                 due_in_ms: t.due_at.saturating_sub(self.now),
             })
             .collect();
-        timers.sort_by(|a, b| a.due_at.cmp(&b.due_at));
+        timers.sort_by_key(|a| a.due_at);
 
         // Unions for one-shot diagram highlighting.
         let mut active_element_ids: Vec<String> = instances

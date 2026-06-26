@@ -369,8 +369,8 @@ pub enum Event {
     /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],
     /// recorded by [`Event::MessageSubscriptionOpening`]) because the element it
     /// guarded left the flow (cancel, normal completion or a sibling boundary
-    /// firing). Marks the local placeholder cancelled and carries `message_name`
-    /// + `correlation_key` so the host routes a
+    /// firing). Marks the local placeholder cancelled and carries
+    /// `message_name` + `correlation_key` so the host routes a
     /// [`crate::Command::CloseMessageSubscription`] to the message partition
     /// (`hash(correlation_key)`) to disarm the canonical record there. Mirrors
     /// [`Event::MessageSubscriptionOpening`]: only emitted when the canonical
