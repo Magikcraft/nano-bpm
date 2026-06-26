@@ -689,8 +689,17 @@ async fn dashboard() -> Html<&'static str> {
 
 /// `GET /cockpit` — the single-file cockpit app (left rail, process drilldown,
 /// the four-step experiment stepper, and the persistent droid-conversation pane).
-async fn cockpit_page() -> Html<&'static str> {
-    Html(COCKPIT_HTML)
+async fn cockpit_page() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/html; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
+        COCKPIT_HTML,
+    )
 }
 
 /// `GET /api/cockpit/overview` — target-process cards + the experiments list.
@@ -1050,17 +1059,29 @@ async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
         "bpmn-embedded.css" => (BPMN_EMBEDDED_CSS, "text/css; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
-    ([(axum::http::header::CONTENT_TYPE, ctype)], body).into_response()
+    ([
+        (axum::http::header::CONTENT_TYPE, ctype),
+        (axum::http::header::CACHE_CONTROL, NO_CACHE),
+    ], body)
+        .into_response()
 }
+
+/// Cache directive for the single-file UI and its sibling JS/CSS assets. They are recompiled into
+/// the binary (`include_str!`) on every build, so a heuristically-cached copy in the browser makes
+/// a fresh build look stale (missing routes/buttons). `no-cache` forces a revalidation each load.
+const NO_CACHE: &str = "no-cache, no-store, must-revalidate";
 
 /// Serves the shared settings panel module (`/assets/settings.js`), included by both the
 /// console and the cockpit.
 async fn settings_js() -> impl IntoResponse {
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
         SETTINGS_JS,
     )
 }
