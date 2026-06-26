@@ -377,7 +377,7 @@
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
       <a data-view="experiments">Experiments</a>
-      <a data-view="sidecars" class="with-dot">LLM sidecars <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
+      <a data-view="sidecars" class="with-dot">LLMs <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
   </aside>
   <main id="main"><div id="viewHost">Loading…</div><div id="cockpitHost" style="display:none"></div></main>
@@ -700,7 +700,7 @@ async function decide(key, decision){
   setTimeout(()=>renderExp(key), 600);
 }
 
-// ---- LLM sidecars (first-class) ----
+// ---- LLMs view: sidecar profiles (supervised local) + remote profiles ----
 // The supervised local llama.cpp sidecars: ProcessOS ships several sidecar-capable profiles and
 // runs up to TWO llama-server processes at once (each on an auto-assigned port) — so an investigation can
 // pair a primary model with a sparring-partner / loop-monitor model. This view lists the profiles,
@@ -742,6 +742,7 @@ async function renderSidecars(){
   try { s = await api('/api/settings') || {}; } catch(e){ return fail(e); }
   try { st = await api('/api/llama/status'); } catch(e){ st = {running:false, sidecars:[], count:0, max:2}; }
   const profiles = (s.profiles||[]).filter(p => p.sidecar).slice();
+  const remoteProfiles = (s.profiles||[]).filter(p => !p.sidecar).slice();
   const active = s.activeProfile;
   const sidecars = st.sidecars || [];
   const max = st.max || 2;
@@ -767,9 +768,10 @@ async function renderSidecars(){
     }
   };
 
-  let h = '<h1>LLM sidecars</h1>'
-    + '<p class="lede">Local models ProcessOS supervises itself via <code>llama-server</code> (llama.cpp). '
-    + 'Up to <b>'+max+'</b> run at once (each on an auto-assigned port) — so an investigation can pair a primary '
+  let h = '<h1>LLMs</h1>'
+    + '<p class="lede">The models ProcessOS can investigate with — <b>sidecar profiles</b> it supervises locally via '
+    + '<code>llama-server</code> (llama.cpp), and <b>remote profiles</b> pointing at OpenAI-compatible endpoints. '
+    + 'Up to <b>'+max+'</b> sidecars run at once (each on an auto-assigned port) — so an investigation can pair a primary '
     + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>'
     + '<div class="btnrow" style="margin:0 0 14px"><button class="btn ghost" id="llConfigProfiles">\u2699 Configure LLM profiles</button></div>';
 
@@ -850,6 +852,32 @@ async function renderSidecars(){
     }).join('') + '</div>';
   }
 
+  // ── Remote profiles ─────────────────────────────────────────────────────
+  // Non-supervised models: OpenAI-compatible endpoints (base URL + model + key).
+  // No download/start/stop lifecycle — they're either reachable or not — so the
+  // tile only offers Make active / Edit / Star. Starred first, then active.
+  h += '<h2>Remote profiles ('+remoteProfiles.length+')</h2>';
+  if(!remoteProfiles.length){
+    h += '<p class="muted">No remote profiles. <a href="#" id="llAddRemote">Add one in the LLM config</a> (an OpenAI-compatible endpoint — base URL, model, API key).</p>';
+  } else {
+    const rrank = (p) => (p.starred?0:2) + (p.id===active?-1:0);
+    remoteProfiles.sort((a,b) => rrank(a)-rrank(b));
+    h += '<div class="grid">' + remoteProfiles.map(p => {
+      const isActive = p.id===active;
+      const pills = (isActive?'<span class="pill run">active</span> ':'')+'<span class="pill">remote</span>';
+      return '<div class="tile" style="cursor:default">'
+        + '<h3>'+esc(p.name||p.id)+' '+pills
+        + ' <button class="sc-star'+(p.starred?' on':'')+'" data-star="'+esc(p.id)+'" data-starred="'+(p.starred?'1':'0')+'" title="'+(p.starred?'Unstar':'Star (pin to top)')+'">'+(p.starred?'\u2605':'\u2606')+'</button>'
+        + '</h3>'
+        + '<div class="meta">'+esc(p.model||'(model unset)')+(p.baseUrl?(' · '+esc(p.baseUrl)):'')+'</div>'
+        + (p.apiKeySet?'':'<div class="meta" style="margin-top:4px;color:#fca5a5">No API key set</div>')
+        + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
+        + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
+        + '<button class="btn ghost" data-config="'+esc(p.id)+'">Edit profile</button>'
+        + '</div></div>';
+    }).join('') + '</div>';
+  }
+
   main.innerHTML = h;
 
   const startBtn = (id) => api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId:id})});
@@ -892,6 +920,7 @@ async function renderSidecars(){
   };
   const cfgBtn = document.getElementById('llConfigProfiles'); if(cfgBtn) cfgBtn.onclick = () => openConfig(null);
   const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
+  const addRemoteBtn = document.getElementById('llAddRemote'); if(addRemoteBtn) addRemoteBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
   main.querySelectorAll('[data-config]').forEach(b => b.onclick = () => openConfig(b.dataset.config));
   main.querySelectorAll('[data-star]').forEach(b => b.onclick = async () => {
     const want = b.dataset.starred !== '1';
