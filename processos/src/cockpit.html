@@ -148,7 +148,7 @@
   .cs-tab:hover .cs-actions, .cs-tab.on .cs-actions { opacity: 1; }
   .cs-btn { background: none; border: 0; color: #71717a; cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 11px; line-height: 1; }
   .cs-btn:hover { background: #1f1f27; color: #e5e7eb; }
-  .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; height: 64vh; }
+  .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; height: 64vh; --chat-font: 15px; }
   .chat-tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid #1c1c22; }
   .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: #8b8b93; cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
   .chat-tabs .ctab:hover { color: #c7d2fe; }
@@ -200,7 +200,7 @@
   .sc-bad .sc-verdict { color: #fca5a5; font: 700 11px/1 inherit; text-transform: uppercase; letter-spacing: .05em; }
   .sc-bad .sc-err { color: #fca5a5; font: 11.5px/1.5 ui-monospace, monospace; margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
   .sc-bad .sc-hint { color: #fcd34d; font-size: 11.5px; margin-top: 5px; }
-  .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; --chat-font: 15px; }
+  .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; }
   .chatlog .empty { color: #71717a; font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
   .bub { padding: 10px 13px; border-radius: 12px; font-size: var(--chat-font, 15px); line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
   .bub .who { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
@@ -287,7 +287,7 @@
   .persona-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a1a1aa; }
   .persona-pick > span { white-space: nowrap; }
   .persona-pick select:disabled { opacity: .7; cursor: not-allowed; }
-  .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 10px 12px; font: 15px/1.55 inherit; resize: vertical; min-height: 72px; }
+  .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 10px 12px; font-family: inherit; font-size: var(--chat-font, 15px); line-height: 1.55; resize: vertical; min-height: 72px; }
   .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
   .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .fontctl { display: inline-flex; align-items: center; gap: 4px; margin-left: 4px; }
@@ -1276,7 +1276,10 @@ async function renderWorkspace(ws, proc){
 // ── chat text size (user-adjustable, persisted) ──────────────────────────────
 function applyChatFont(){
   const px = Math.min(24, Math.max(11, parseInt(localStorage.getItem('processos.chatFont')||'15', 10)||15));
-  const log = $('#chatLog'); if(log) log.style.setProperty('--chat-font', px+'px');
+  // Set on the .chat container so both the transcript (.chatlog .bub) and the compose box
+  // (.compose textarea) inherit one font size and resize together.
+  const chat = $('#chatLog') && $('#chatLog').closest('.chat');
+  if(chat) chat.style.setProperty('--chat-font', px+'px');
   return px;
 }
 function bumpChatFont(dir){
@@ -1623,7 +1626,17 @@ async function toggleProfileMenu(){
   let s;
   try { s = await api('/api/settings'); }
   catch(e){ $('#chatHint').textContent = 'could not load profiles: '+(e.message||e); return; }
-  const profiles = s.profiles||[];
+  // A sidecar profile is only a usable option once its model is actually on disk. Pull the
+  // download/run state so configured-but-not-downloaded sidecars are hidden from the menu.
+  let avail = null;
+  try {
+    const st = await api('/api/llama/status') || {};
+    avail = new Set();
+    (st.models||[]).forEach(m => { if(m && m.profileId && m.downloaded) avail.add(m.profileId); });
+    (st.sidecars||[]).forEach(x => { if(x && x.profileId && x.phase==='ready') avail.add(x.profileId); });
+  } catch(e){ avail = null; }   // status unavailable → don't hide anything
+  // Keep remote profiles (no local download) and any sidecar whose model is downloaded/ready.
+  const profiles = (s.profiles||[]).filter(p => !p.sidecar || !avail || avail.has(p.id));
   // The model already acting as the partner (pair/monitor) can't also be the primary you send to.
   const partners = partnerProfileIds();
   menu.innerHTML = profiles.length ? profiles.map(p => {
@@ -1634,7 +1647,7 @@ async function toggleProfileMenu(){
       (p.model?' <span class="mi-model">'+esc(p.model)+'</span>':'')+
       (active?' <span class="mi-on">✓</span>':'')+
       (isPartner?' <span class="mi-model">partner</span>':'')+'</button>';
-  }).join('') : '<div class="mi-empty">No profiles configured</div>';
+  }).join('') : '<div class="mi-empty">No available models — download a sidecar model or add a remote profile</div>';
   menu.querySelectorAll('button[data-id]:not([disabled])').forEach(b => {
     b.onclick = () => selectProfile(b.getAttribute('data-id'), b.getAttribute('data-id')===s.activeProfile);
   });
