@@ -3994,3 +3994,156 @@
         assert_eq!(crate::partition_of(instance_key), 5);
         assert_eq!(crate::local_of(instance_key), 1, "install did not consume a local key");
     }
+
+    /// A single phase process: pstart -> work(job) -> pend.
+    fn phase_process(id: &str, job: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("pstart")
+            .service_task("work", job)
+            .end_event("pend")
+            .connect("pstart", "work")
+            .connect("work", "pend")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn inline_call_activities_expands_a_call_into_an_embedded_subprocess() {
+        let orchestrator = ProcessBuilder::new("orch")
+            .start_event("start")
+            .call_activity("c1", "phase")
+            .end_event("end")
+            .connect("start", "c1")
+            .connect("c1", "end")
+            .build()
+            .unwrap();
+        let mut library = std::collections::HashMap::new();
+        library.insert("phase".to_string(), phase_process("phase", "work"));
+
+        let expanded = orchestrator.inline_call_activities(&library).unwrap();
+
+        // The call activity is now a sub-process whose inner start is the
+        // prefixed copy of the callee's start event.
+        let c1 = expanded.element("c1").unwrap();
+        match &c1.kind {
+            ElementKind::SubProcess { start_event } => assert_eq!(start_event, "c1$pstart"),
+            other => panic!("expected SubProcess, got {other:?}"),
+        }
+        // The callee's elements were spliced in, id-prefixed and parented to c1.
+        let inner = expanded.element("c1$work").unwrap();
+        assert_eq!(inner.parent.as_deref(), Some("c1"));
+        match &inner.kind {
+            ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, "work"),
+            other => panic!("expected ServiceTask, got {other:?}"),
+        }
+        // No CallActivity kind survives expansion.
+        assert!(!expanded
+            .elements
+            .values()
+            .any(|e| matches!(e.kind, ElementKind::CallActivity { .. })));
+    }
+
+    #[test]
+    fn an_expanded_call_activity_runs_to_completion_through_the_engine() {
+        let orchestrator = ProcessBuilder::new("orch")
+            .start_event("start")
+            .call_activity("c1", "phase")
+            .end_event("end")
+            .connect("start", "c1")
+            .connect("c1", "end")
+            .build()
+            .unwrap();
+        let mut library = std::collections::HashMap::new();
+        library.insert("phase".to_string(), phase_process("phase", "work"));
+        let expanded = orchestrator.inline_call_activities(&library).unwrap();
+
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(expanded))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("orch"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The token enters the inlined sub-process and parks on the phase's job.
+        assert!(!engine.is_completed(instance_key));
+        assert_eq!(engine.pending_jobs().len(), 1);
+        assert_eq!(engine.pending_jobs()[0].job_type, "work");
+
+        // Completing it drains the sub-process and routes out to the orchestrator end.
+        let events = complete_one(&mut engine, "work");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "c1" && to == "end"
+        )));
+        assert!(engine.is_completed(instance_key));
+    }
+
+    #[test]
+    fn inline_call_activities_expands_nested_calls_with_unique_prefixes() {
+        // orch -> c1(callee=middle); middle -> m(callee=leaf); leaf -> work.
+        let orchestrator = ProcessBuilder::new("orch")
+            .start_event("start")
+            .call_activity("c1", "middle")
+            .end_event("end")
+            .connect("start", "c1")
+            .connect("c1", "end")
+            .build()
+            .unwrap();
+        let middle = ProcessBuilder::new("middle")
+            .start_event("pstart")
+            .call_activity("m", "leaf")
+            .end_event("pend")
+            .connect("pstart", "m")
+            .connect("m", "pend")
+            .build()
+            .unwrap();
+        let mut library = std::collections::HashMap::new();
+        library.insert("middle".to_string(), middle);
+        library.insert("leaf".to_string(), phase_process("leaf", "work"));
+
+        let expanded = orchestrator.inline_call_activities(&library).unwrap();
+
+        // The leaf's job nests two prefixes deep and is parented to the inner call.
+        let leaf_work = expanded.element("c1$m$work").unwrap();
+        assert_eq!(leaf_work.parent.as_deref(), Some("c1$m"));
+        // Both call activities became sub-processes; none remain as calls.
+        assert!(!expanded
+            .elements
+            .values()
+            .any(|e| matches!(e.kind, ElementKind::CallActivity { .. })));
+    }
+
+    #[test]
+    fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
+        let orchestrator = ProcessBuilder::new("orch")
+            .start_event("start")
+            .call_activity("c1", "missing")
+            .end_event("end")
+            .connect("start", "c1")
+            .connect("c1", "end")
+            .build()
+            .unwrap();
+        let empty = std::collections::HashMap::new();
+        assert!(orchestrator
+            .inline_call_activities(&empty)
+            .unwrap_err()
+            .contains("unknown process 'missing'"));
+
+        // A self-recursive callee is rejected rather than expanded forever.
+        let recursive = ProcessBuilder::new("loop")
+            .start_event("start")
+            .call_activity("again", "loop")
+            .end_event("end")
+            .connect("start", "again")
+            .connect("again", "end")
+            .build()
+            .unwrap();
+        let mut library = std::collections::HashMap::new();
+        library.insert("loop".to_string(), recursive.clone());
+        assert!(recursive
+            .inline_call_activities(&library)
+            .unwrap_err()
+            .contains("cycle"));
+    }

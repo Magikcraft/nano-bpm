@@ -140,6 +140,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // Index of the intermediate catch event currently being read (timer or
     // message), and a buffer for its nested `timeDuration` text while inside it.
     let mut cur_intermediate: Option<usize> = None;
+    // Index of the call activity currently being read, so a nested
+    // `zeebe:calledElement processId="…"` child can record its callee.
+    let mut cur_call: Option<usize> = None;
     let mut duration_text: Option<String> = None;
     // Index of the start event currently being read (to attach a nested
     // messageEventDefinition or timerEventDefinition), and a buffer for a timer
@@ -226,10 +229,59 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     cur_service_task = idx;
                                 }
                             }
+                            // A business-rule task (DMN) and a script task are
+                            // both treated as service-task-like work steps: they
+                            // run a job (its type taken from a nested
+                            // zeebe:taskDefinition / zeebe:calledDecision, else
+                            // defaulting to the element id). Nano has no DMN/script
+                            // evaluator, but for trace generation and replay the
+                            // step is faithfully a single job activation.
+                            "businessRuleTask" | "scriptTask" => {
+                                let idx = acc.add_node(attrs, NodeKind::Service);
+                                if !self_closing {
+                                    cur_service_task = idx;
+                                }
+                            }
+                            // zeebe:calledDecision decisionId="…" on a business-rule
+                            // task — use the decision id as the job type.
+                            "calledDecision" => {
+                                if let (Some(idx), Some(d)) =
+                                    (cur_service_task, attr(attrs, "decisionId"))
+                                {
+                                    if acc.nodes[idx].job_type.is_none() {
+                                        acc.nodes[idx].job_type = Some(d.to_string());
+                                    }
+                                }
+                            }
                             "userTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::User);
                                 if !self_closing {
                                     cur_user_task = idx;
+                                }
+                            }
+                            "callActivity" => {
+                                // A call activity invokes another process. The
+                                // callee id may be a `calledElement` attribute
+                                // (Camunda 7) or a nested `zeebe:calledElement
+                                // processId="…"` child (Camunda 8/Zeebe), captured
+                                // below. Nano expands call activities inline (see
+                                // ProcessDefinition::inline_call_activities) rather
+                                // than executing them natively.
+                                let idx = acc.add_node(attrs, NodeKind::Call);
+                                if let (Some(i), Some(c)) = (idx, attr(attrs, "calledElement")) {
+                                    acc.nodes[i].called_process_id = Some(c.to_string());
+                                }
+                                if !self_closing {
+                                    cur_call = idx;
+                                }
+                            }
+                            // zeebe:calledElement processId="…" — the Camunda 8
+                            // form of a call activity's callee reference.
+                            "calledElement" => {
+                                if let (Some(idx), Some(p)) =
+                                    (cur_call, attr(attrs, "processId"))
+                                {
+                                    acc.nodes[idx].called_process_id = Some(p.to_string());
                                 }
                             }
                             "subProcess" => {
@@ -338,6 +390,20 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     cur_intermediate = idx;
                                 }
                             }
+                            // A throw event (none/escalation/signal/message throw)
+                            // is a pure pass-through for path purposes: it routes
+                            // straight to its outgoing flow. Any nested event
+                            // definition is ignored.
+                            "intermediateThrowEvent" => {
+                                acc.add_node(attrs, NodeKind::IntermediateThrow);
+                            }
+                            // A receive task waits for a message. Nano's trace
+                            // generator has no inbound correlation, so model it as
+                            // a pass-through (the awaited event is assumed to
+                            // arrive) rather than a perpetual block.
+                            "receiveTask" => {
+                                acc.add_node(attrs, NodeKind::IntermediateThrow);
+                            }
                             "timeDuration"
                                 if cur_intermediate.is_some()
                                     || cur_boundary.is_some()
@@ -381,9 +447,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_start = None;
                     cycle_text = None;
                     cur_user_task = None;
+                    cur_call = None;
                 }
                 "serviceTask" => cur_service_task = None,
                 "userTask" => cur_user_task = None,
+                "callActivity" => cur_call = None,
                 "subProcess" => {
                     if let Some(acc) = current.as_mut() {
                         acc.scope_stack.pop();
@@ -477,6 +545,9 @@ struct NodeAcc {
     kind: NodeKind,
     /// For service tasks: the resolved job type (defaults to the id at build).
     job_type: Option<String>,
+    /// For call activities: the `calledElement` / `zeebe:calledElement processId`
+    /// of the invoked process, expanded inline at assembly time.
+    called_process_id: Option<String>,
     /// For service tasks: the raw `zeebe:priorityDefinition` job-priority
     /// expression (literal or FEEL), resolved at job creation. Controls
     /// activation order; `None` means no declaration (default priority).
@@ -507,7 +578,10 @@ enum NodeKind {
     Exclusive,
     Parallel,
     IntermediateCatch,
+    IntermediateThrow,
     SubProcess,
+    /// A call activity (callee in `NodeAcc::called_process_id`); expanded inline.
+    Call,
 }
 
 /// A sequence flow collected while scanning.
@@ -570,6 +644,7 @@ impl ProcessAcc {
             id: id.to_string(),
             kind,
             job_type: None,
+            called_process_id: None,
             job_priority: None,
             duration_millis: None,
             message_ref: None,
@@ -597,10 +672,50 @@ impl ProcessAcc {
     /// to their name and correlation-key variable, used to resolve message
     /// intermediate catch and boundary events.
     fn build(
-        self,
+        mut self,
         errors: &HashMap<String, String>,
         messages: &HashMap<String, MessageDecl>,
     ) -> Result<ProcessDefinition, ParseError> {
+        // A process may declare more than one start event (e.g. a "refresh batch"
+        // and a "manual intake" start that merge downstream). The engine begins an
+        // instance at a single process-level start event, so designate one — a
+        // plain none start preferred, tie-broken by id — and demote the surplus
+        // process-level starts to inert throw events. They keep their outgoing
+        // flow (so it still has a valid source) but, lacking any incoming flow,
+        // are never activated; instances created via CreateInstance begin at the
+        // designated start.
+        let proc_starts: Vec<usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.kind, NodeKind::Start) && n.parent.is_none())
+            .map(|(i, _)| i)
+            .collect();
+        if proc_starts.len() > 1 {
+            let is_none_start =
+                |n: &NodeAcc| n.message_ref.is_none() && n.timer_repeating.is_none();
+            let designated = proc_starts
+                .iter()
+                .copied()
+                .filter(|&i| is_none_start(&self.nodes[i]))
+                .min_by(|&a, &b| self.nodes[a].id.cmp(&self.nodes[b].id))
+                .unwrap_or_else(|| {
+                    proc_starts
+                        .iter()
+                        .copied()
+                        .min_by(|&a, &b| self.nodes[a].id.cmp(&self.nodes[b].id))
+                        .expect("non-empty")
+                });
+            for &i in &proc_starts {
+                if i != designated {
+                    self.nodes[i].kind = NodeKind::IntermediateThrow;
+                    self.nodes[i].message_ref = None;
+                    self.nodes[i].timer_repeating = None;
+                    self.nodes[i].duration_millis = None;
+                }
+            }
+        }
+
         let mut builder = ProcessBuilder::new(self.id.clone());
         // Map each sub-process to its inner start event (a start node whose
         // parent is the sub-process).
@@ -641,6 +756,7 @@ impl ProcessAcc {
                     }
                 }
                 NodeKind::End => builder.end_event(node.id),
+                NodeKind::IntermediateThrow => builder.intermediate_throw_event(node.id),
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
                 NodeKind::Service => {
@@ -687,6 +803,20 @@ impl ProcessAcc {
                         }
                     })?;
                     builder.sub_process(node.id, start)
+                }
+                NodeKind::Call => {
+                    // The callee is required; an unresolved call activity is a
+                    // parse error so it never silently becomes an inert step.
+                    let called = node.called_process_id.clone().ok_or_else(|| {
+                        ParseError::InvalidProcess {
+                            process_id: self.id.clone(),
+                            reason: format!(
+                                "call activity {} has no calledElement",
+                                node.id
+                            ),
+                        }
+                    })?;
+                    builder.call_activity(node.id, called)
                 }
             };
             if let Some(parent) = parent {
@@ -1855,5 +1985,64 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "done"));
+    }
+
+    #[test]
+    fn should_parse_call_activities_in_both_camunda_7_and_zeebe_forms() {
+        // Two call activities: one with a `calledElement` attribute (Camunda 7),
+        // one with a nested `zeebe:calledElement processId` (Camunda 8/Zeebe).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="orch">
+              <bpmn:startEvent id="start" />
+              <bpmn:callActivity id="c1" calledElement="Phase01" />
+              <bpmn:callActivity id="c2">
+                <bpmn:extensionElements>
+                  <zeebe:calledElement processId="Phase02" />
+                </bpmn:extensionElements>
+              </bpmn:callActivity>
+              <bpmn:endEvent id="end" />
+              <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="c1" />
+              <bpmn:sequenceFlow id="f1" sourceRef="c1" targetRef="c2" />
+              <bpmn:sequenceFlow id="f2" sourceRef="c2" targetRef="end" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(
+            def.element("c1").unwrap().kind,
+            ElementKind::CallActivity {
+                called_process_id: "Phase01".to_string(),
+            }
+        );
+        assert_eq!(
+            def.element("c2").unwrap().kind,
+            ElementKind::CallActivity {
+                called_process_id: "Phase02".to_string(),
+            }
+        );
+        // The call activity's outgoing flow is preserved for inline expansion.
+        assert!(def
+            .element("c1")
+            .unwrap()
+            .outgoing
+            .iter()
+            .any(|f| f.to == "c2"));
+    }
+
+    #[test]
+    fn a_call_activity_without_a_callee_is_a_parse_error() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="orch">
+              <bpmn:startEvent id="start" />
+              <bpmn:callActivity id="c1" />
+              <bpmn:endEvent id="end" />
+              <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="c1" />
+              <bpmn:sequenceFlow id="f1" sourceRef="c1" targetRef="end" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        assert!(parse_bpmn(xml).is_err());
     }
 }

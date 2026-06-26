@@ -50,6 +50,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::MessageStartEvent { .. } => "messageStartEvent",
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
+        ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::CallActivity { .. } => "callActivity",
     }
 }
 
@@ -1248,6 +1250,17 @@ fn emit_element(
         ElementKind::EndEvent => {
             out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
         }
+        ElementKind::IntermediateThrowEvent => {
+            out.push_str(&format!(
+                "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
+            ));
+        }
+        ElementKind::CallActivity { called_process_id } => {
+            out.push_str(&format!(
+                "    <bpmn:callActivity id=\"{eid}\"{na} calledElement=\"{}\"/>\n",
+                xml_escape(called_process_id)
+            ));
+        }
         ElementKind::ExclusiveGateway => {
             out.push_str(&format!("    <bpmn:exclusiveGateway id=\"{eid}\"{na}/>\n"));
         }
@@ -1651,6 +1664,7 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
     match kind {
         ElementKind::ServiceTask { .. }
         | ElementKind::UserTask(_)
+        | ElementKind::CallActivity { .. }
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
         ElementKind::ExclusiveGateway | ElementKind::ParallelGateway => (50.0, 50.0),
         _ => (36.0, 36.0),

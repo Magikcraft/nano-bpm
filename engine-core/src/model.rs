@@ -307,6 +307,24 @@ pub enum ElementKind {
         /// scope begins.
         start_event: ElementId,
     },
+    /// A none intermediate throw event. A pure pass-through: on activation it
+    /// completes immediately and routes the token along its outgoing flow,
+    /// exactly like a gateway with a single unconditional outgoing flow. Used
+    /// for BPMN `intermediateThrowEvent`s (escalation/signal/none throws that
+    /// don't block a forward path) and as the inert demotion target for the
+    /// surplus start events of a process that declares more than one.
+    IntermediateThrowEvent,
+    /// A call activity: invokes another process (`called_process_id`) and waits
+    /// for it to complete before routing along its outgoing flow. Nano consumes
+    /// call activities by **inline expansion** — [`ProcessDefinition::inline_call_activities`]
+    /// rewrites each call activity into an embedded [`SubProcess`] holding a copy
+    /// of the called process's flow — so the runtime engine itself never executes
+    /// this kind (an unexpanded call activity degrades to a pass-through).
+    CallActivity {
+        /// The `calledElement` / `zeebe:calledElement processId` of the invoked
+        /// process definition.
+        called_process_id: String,
+    },
 }
 
 impl ElementKind {
@@ -371,6 +389,160 @@ impl ProcessDefinition {
             .flat_map(|e| e.outgoing.iter())
             .filter(|f| f.to == id)
             .count()
+    }
+
+    /// Rewrites every [`ElementKind::CallActivity`] in this definition into an
+    /// embedded [`ElementKind::SubProcess`] holding an inlined, id-prefixed copy
+    /// of the called process's flow, resolving callees by id from `library`.
+    ///
+    /// Nano's corpus generator walks paths through the **real** engine, which has
+    /// no first-class call-activity executor; inline expansion lets a multi-stage
+    /// orchestrator (e.g. a CDD/AML refresh that calls nine phase processes) run
+    /// on the existing, well-tested sub-process token-scope machinery without any
+    /// new runtime state, event or snapshot variants.
+    ///
+    /// Expansion is recursive (a called process may itself call others) with a
+    /// cycle guard. Inlined ids are prefixed `"<callId>$"` (recursively nested,
+    /// so collisions across phases are impossible); `attached_to` /
+    /// `start_event` references inside a callee are remapped to the prefixed ids.
+    /// The call activity's own outgoing flow and parent scope are preserved, so
+    /// the surrounding flow is untouched. Returns an error if a `calledElement`
+    /// is missing from `library` or a call cycle is detected.
+    pub fn inline_call_activities(
+        &self,
+        library: &HashMap<String, ProcessDefinition>,
+    ) -> Result<ProcessDefinition, String> {
+        let mut elements = HashMap::new();
+        let mut stack = vec![self.id.clone()];
+        splice_call_activities(&mut elements, &self.elements, "", None, library, &mut stack)?;
+        Ok(ProcessDefinition {
+            id: self.id.clone(),
+            elements,
+            start_event: self.start_event.clone(),
+            xml: self.xml.clone(),
+        })
+    }
+}
+
+/// Recursively copies `src` elements into `out`, prefixing every id (and the
+/// targets of outgoing flows and embedded id references) with `prefix`, and
+/// expanding each [`ElementKind::CallActivity`] into a [`ElementKind::SubProcess`]
+/// whose inner flow is a further-prefixed copy of the callee. `parent_override`
+/// is the new parent id imposed on `src`'s process-level (parentless) elements —
+/// `None` at the orchestrator's own level, `Some(callId)` when splicing a callee
+/// underneath the sub-process that replaced its call activity. `stack` holds the
+/// process ids on the current call path for cycle detection.
+fn splice_call_activities(
+    out: &mut HashMap<ElementId, Element>,
+    src: &HashMap<ElementId, Element>,
+    prefix: &str,
+    parent_override: Option<&str>,
+    library: &HashMap<String, ProcessDefinition>,
+    stack: &mut Vec<String>,
+) -> Result<(), String> {
+    let pfx = |id: &str| format!("{prefix}{id}");
+    for el in src.values() {
+        let new_id = pfx(&el.id);
+        let new_parent = match &el.parent {
+            Some(p) => Some(pfx(p)),
+            None => parent_override.map(|s| s.to_string()),
+        };
+        let outgoing: Vec<SequenceFlow> = el
+            .outgoing
+            .iter()
+            .map(|f| SequenceFlow {
+                to: pfx(&f.to),
+                condition: f.condition.clone(),
+            })
+            .collect();
+        if let ElementKind::CallActivity { called_process_id } = &el.kind {
+            let called = library.get(called_process_id).ok_or_else(|| {
+                format!(
+                    "call activity '{}' references unknown process '{}'",
+                    el.id, called_process_id
+                )
+            })?;
+            if stack.iter().any(|p| p == called_process_id) {
+                return Err(format!(
+                    "call activity cycle detected at process '{called_process_id}'"
+                ));
+            }
+            let inner_prefix = format!("{new_id}$");
+            let inner_start = format!("{inner_prefix}{}", called.start_event);
+            out.insert(
+                new_id.clone(),
+                Element {
+                    id: new_id.clone(),
+                    kind: ElementKind::SubProcess {
+                        start_event: inner_start,
+                    },
+                    outgoing,
+                    parent: new_parent,
+                },
+            );
+            stack.push(called_process_id.clone());
+            splice_call_activities(
+                out,
+                &called.elements,
+                &inner_prefix,
+                Some(&new_id),
+                library,
+                stack,
+            )?;
+            stack.pop();
+        } else {
+            out.insert(
+                new_id.clone(),
+                Element {
+                    id: new_id,
+                    kind: remap_kind_ids(&el.kind, &pfx),
+                    outgoing,
+                    parent: new_parent,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Returns a clone of `kind` with every embedded element-id reference (a
+/// sub-process inner start, a boundary event's `attached_to`) rewritten through
+/// `pfx`. Kinds without id references are cloned unchanged.
+fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementKind {
+    match kind {
+        ElementKind::SubProcess { start_event } => ElementKind::SubProcess {
+            start_event: pfx(start_event),
+        },
+        ElementKind::ErrorBoundaryEvent {
+            attached_to,
+            error_code,
+        } => ElementKind::ErrorBoundaryEvent {
+            attached_to: pfx(attached_to),
+            error_code: error_code.clone(),
+        },
+        ElementKind::TimerBoundaryEvent {
+            attached_to,
+            duration_millis,
+            interrupting,
+            repeating,
+        } => ElementKind::TimerBoundaryEvent {
+            attached_to: pfx(attached_to),
+            duration_millis: *duration_millis,
+            interrupting: *interrupting,
+            repeating: *repeating,
+        },
+        ElementKind::MessageBoundaryEvent {
+            attached_to,
+            message_name,
+            correlation_key,
+            interrupting,
+        } => ElementKind::MessageBoundaryEvent {
+            attached_to: pfx(attached_to),
+            message_name: message_name.clone(),
+            correlation_key: correlation_key.clone(),
+            interrupting: *interrupting,
+        },
+        other => other.clone(),
     }
 }
 
@@ -465,6 +637,28 @@ impl ProcessBuilder {
     /// Adds a none end event.
     pub fn end_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::EndEvent)
+    }
+
+    /// Adds a none intermediate throw event (a pass-through; see
+    /// [`ElementKind::IntermediateThrowEvent`]).
+    pub fn intermediate_throw_event(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::IntermediateThrowEvent)
+    }
+
+    /// Adds a call activity invoking `called_process_id` (see
+    /// [`ElementKind::CallActivity`]). Expanded inline before deployment by
+    /// [`ProcessDefinition::inline_call_activities`].
+    pub fn call_activity(
+        self,
+        id: impl Into<String>,
+        called_process_id: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::CallActivity {
+                called_process_id: called_process_id.into(),
+            },
+        )
     }
 
     /// Adds a service task that creates jobs of the given `job_type`.

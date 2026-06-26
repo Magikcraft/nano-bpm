@@ -29,7 +29,7 @@ use serde_json::Value as Json;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    Command, Engine, JobState, ProcessDefinition, ProcessInstanceState, Value,
+    Command, ElementKind, Engine, JobState, ProcessDefinition, ProcessInstanceState, Value,
 };
 
 use crate::harness::{draw, min_workers_for_p99};
@@ -53,6 +53,15 @@ pub struct Pack {
     pub process_id: String,
     /// Path to the BPMN file, absolute or relative to the pack file's directory.
     pub bpmn: String,
+    /// Additional BPMN files or directories holding the processes invoked by
+    /// `bpmn`'s call activities (a multi-stage orchestrator references its phase
+    /// processes by id). Each entry is a `.bpmn` file or a directory scanned for
+    /// `*.bpmn`, resolved relative to the pack file. Every `<process>` found
+    /// (plus those in `bpmn` itself) forms the call-activity resolution library;
+    /// the selected `process_id` is then expanded inline. Empty for single-file
+    /// packs.
+    #[serde(default)]
+    pub bpmn_library: Vec<String>,
     /// Domain label (ground truth for classification), e.g. `"loan-origination"`.
     pub domain: String,
     /// Master seed — the whole corpus is deterministic in it.
@@ -272,33 +281,78 @@ pub struct GenerateSummary {
 // Generation.
 // ---------------------------------------------------------------------------
 
-/// Load a pack from `pack.json` (or any JSON file), resolving `bpmn` relative to it.
+/// Load a pack from `pack.json` (or any JSON file), resolving `bpmn` (and any
+/// `bpmn_library` entries) relative to it. Every `<process>` found across the
+/// main BPMN and the library forms the call-activity resolution library; the
+/// selected `process_id` is returned with its call activities expanded inline.
 pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> {
     let bytes =
         std::fs::read(pack_path).map_err(|e| format!("read {}: {e}", pack_path.display()))?;
     let pack: Pack = serde_json::from_slice(&bytes).map_err(|e| format!("parse pack: {e}"))?;
 
-    let bpmn_path = {
-        let p = Path::new(&pack.bpmn);
+    let pack_dir = pack_path.parent().unwrap_or_else(|| Path::new("."));
+    let resolve = |raw: &str| -> std::path::PathBuf {
+        let p = Path::new(raw);
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            pack_path.parent().unwrap_or_else(|| Path::new(".")).join(p)
+            pack_dir.join(p)
         }
     };
-    let xml = std::fs::read_to_string(&bpmn_path)
-        .map_err(|e| format!("read bpmn {}: {e}", bpmn_path.display()))?;
-    let defs = parse_bpmn(&xml).map_err(|e| format!("parse bpmn: {e}"))?;
-    let def = defs
-        .into_iter()
-        .find(|d| d.id == pack.process_id)
-        .ok_or_else(|| {
-            format!(
-                "process id '{}' not found in {}",
-                pack.process_id,
-                bpmn_path.display()
-            )
-        })?;
+
+    // Build the resolution library from the main BPMN plus every library entry
+    // (a file, or a directory scanned for `*.bpmn`). A single BPMN file may
+    // itself declare several `<process>` elements.
+    let mut library: HashMap<String, ProcessDefinition> = HashMap::new();
+    let add_file = |path: &Path, library: &mut HashMap<String, ProcessDefinition>| -> Result<(), String> {
+        let xml = std::fs::read_to_string(path)
+            .map_err(|e| format!("read bpmn {}: {e}", path.display()))?;
+        let defs =
+            parse_bpmn(&xml).map_err(|e| format!("parse bpmn {}: {e}", path.display()))?;
+        for d in defs {
+            library.insert(d.id.clone(), d);
+        }
+        Ok(())
+    };
+
+    let bpmn_path = resolve(&pack.bpmn);
+    add_file(&bpmn_path, &mut library)?;
+    for entry in &pack.bpmn_library {
+        let path = resolve(entry);
+        if path.is_dir() {
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&path)
+                .map_err(|e| format!("read dir {}: {e}", path.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().map(|x| x == "bpmn").unwrap_or(false))
+                .collect();
+            files.sort();
+            for f in files {
+                add_file(&f, &mut library)?;
+            }
+        } else {
+            add_file(&path, &mut library)?;
+        }
+    }
+
+    let def = library.get(&pack.process_id).cloned().ok_or_else(|| {
+        format!(
+            "process id '{}' not found in {} or its bpmn_library",
+            pack.process_id,
+            bpmn_path.display()
+        )
+    })?;
+
+    // Expand call activities inline so the generator's real-engine walk runs the
+    // multi-stage flow on the existing sub-process machinery.
+    let has_calls = def
+        .elements
+        .values()
+        .any(|e| matches!(e.kind, ElementKind::CallActivity { .. }));
+    let def = if has_calls {
+        def.inline_call_activities(&library)?
+    } else {
+        def
+    };
     Ok((pack, def))
 }
 
@@ -1042,6 +1096,7 @@ pub(crate) mod tests {
         Pack {
             process_id: "loan-approval".into(),
             bpmn: "loan.bpmn".into(),
+            bpmn_library: Vec::new(),
             domain: "loan-origination".into(),
             seed: 7,
             horizon_days: 2,
