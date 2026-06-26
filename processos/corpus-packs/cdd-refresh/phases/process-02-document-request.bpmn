@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_Process02" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1">
+  <bpmn:message id="Message_NotificationBounced" name="NotificationBounced">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=notificationId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmn:process id="Process02DocumentRequest" name="Phase 2: Document Request RM-Gated" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_DocsRequested" name="Case PENDING DOCUMENTS">
+      <bpmn:outgoing>Flow_StartToGenerateLink</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Task_GenerateUploadLink" name="Generate upload link">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="generate-upload-link" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_StartToGenerateLink</bpmn:incoming>
+      <bpmn:outgoing>Flow_GenerateLinkToRmReview</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="Task_RmReview" name="RM reviews CDD refresh request">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-rm-review" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_GenerateLinkToRmReview</bpmn:incoming>
+      <bpmn:outgoing>Flow_RmReviewToSend</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="Task_SendRefreshRequest" name="Send CDD refresh request">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="send-cdd-refresh-request" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_RmReviewToSend</bpmn:incoming>
+      <bpmn:outgoing>Flow_SendToPatchStatus</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_PatchCaseStatus" name="Patch case status to PENDING DOCUMENTS">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="patch-case-status-to-pending-documents" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SendToPatchStatus</bpmn:incoming>
+      <bpmn:outgoing>Flow_PatchToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndEvent_RequestSent" name="Request sent awaiting docs">
+      <bpmn:incoming>Flow_PatchToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="BoundaryEvent_Bounce" name="Notification bounced" attachedToRef="Task_SendRefreshRequest">
+      <bpmn:outgoing>Flow_BounceToBounceHandler</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_Bounce" messageRef="Message_NotificationBounced" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="EndEvent_DelegatedToBounceEdge" name="Delegated to edge-03 bounce handler">
+      <bpmn:incoming>Flow_BounceToBounceHandler</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_StartToGenerateLink" sourceRef="StartEvent_DocsRequested" targetRef="Task_GenerateUploadLink" />
+    <bpmn:sequenceFlow id="Flow_GenerateLinkToRmReview" sourceRef="Task_GenerateUploadLink" targetRef="Task_RmReview" />
+    <bpmn:sequenceFlow id="Flow_RmReviewToSend" sourceRef="Task_RmReview" targetRef="Task_SendRefreshRequest" />
+    <bpmn:sequenceFlow id="Flow_SendToPatchStatus" sourceRef="Task_SendRefreshRequest" targetRef="Task_PatchCaseStatus" />
+    <bpmn:sequenceFlow id="Flow_PatchToEnd" sourceRef="Task_PatchCaseStatus" targetRef="EndEvent_RequestSent" />
+    <bpmn:sequenceFlow id="Flow_BounceToBounceHandler" sourceRef="BoundaryEvent_Bounce" targetRef="EndEvent_DelegatedToBounceEdge" />
+    <bpmn:textAnnotation id="Annotation_Triggered">
+      <bpmn:text>Triggered by: Phase 1 — case opened with status PENDING_DOCUMENTS, RM heads-up sent in parallel</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Triggered" sourceRef="StartEvent_DocsRequested" targetRef="Annotation_Triggered" />
+    <bpmn:textAnnotation id="Annotation_GenerateLink">
+      <bpmn:text>Implementation: DocuSafe POST /cases/{caseId}/request-upload-link — returns uploadLink with 48h TTL</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_GenerateLink" sourceRef="Task_GenerateUploadLink" targetRef="Annotation_GenerateLink" />
+    <bpmn:textAnnotation id="Annotation_RmReview">
+      <bpmn:text>Manual: RM review IMMEDIATELY adjacent to send (Hard Constraint 5 / Governance Guardrail 1) — no intervening service task allowed</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_RmReview" sourceRef="Task_RmReview" targetRef="Annotation_RmReview" />
+    <bpmn:textAnnotation id="Annotation_Send">
+      <bpmn:text>Implementation: Notification Service POST /notifications template=CDD_REFRESH_REQUEST — vars clientLegalName/deadline/uploadLink; auto-CC RM, auto-log COMMUNICATION note; gated by clientCommsFreeze</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Send" sourceRef="Task_SendRefreshRequest" targetRef="Annotation_Send" />
+    <bpmn:textAnnotation id="Annotation_Patch">
+      <bpmn:text>Implementation: ClientVault PATCH /cdd-cases/{caseId} status=PENDING_DOCUMENTS</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Patch" sourceRef="Task_PatchCaseStatus" targetRef="Annotation_Patch" />
+    <bpmn:textAnnotation id="Annotation_End">
+      <bpmn:text>Follow-up: case enters Phase 3 wait-for-documents sub-state with non-interrupting timer boundaries (Day 7 / 14 / 21 / 35)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_End" sourceRef="EndEvent_RequestSent" targetRef="Annotation_End" />
+    <bpmn:textAnnotation id="Annotation_Bounce">
+      <bpmn:text>On deliveryStatus=bounced — see edge-03-bounced-notification.bpmn for analyst contact-correction flow</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Bounce" sourceRef="BoundaryEvent_Bounce" targetRef="Annotation_Bounce" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process02DocumentRequest">
+      <bpmndi:BPMNShape id="StartEvent_DocsRequested_di" bpmnElement="StartEvent_DocsRequested">
+        <dc:Bounds x="220" y="280" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="201" y="323" width="79" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_GenerateUploadLink_di" bpmnElement="Task_GenerateUploadLink">
+        <dc:Bounds x="300" y="258" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_RmReview_di" bpmnElement="Task_RmReview">
+        <dc:Bounds x="460" y="258" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendRefreshRequest_di" bpmnElement="Task_SendRefreshRequest">
+        <dc:Bounds x="620" y="258" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PatchCaseStatus_di" bpmnElement="Task_PatchCaseStatus">
+        <dc:Bounds x="780" y="258" width="120" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_RequestSent_di" bpmnElement="EndEvent_RequestSent">
+        <dc:Bounds x="940" y="280" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="927" y="323" width="67" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_DelegatedToBounceEdge_di" bpmnElement="EndEvent_DelegatedToBounceEdge">
+        <dc:Bounds x="660" y="120" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="638" y="80" width="80" height="40" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_GenerateLink_di" bpmnElement="Association_GenerateLink">
+        <di:waypoint x="360" y="258" />
+        <di:waypoint x="360" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Bounce_di" bpmnElement="Association_Bounce">
+        <di:waypoint x="662" y="251" />
+        <di:waypoint x="587" y="195" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_End_di" bpmnElement="Association_End">
+        <di:waypoint x="971" y="286" />
+        <di:waypoint x="1010" y="247" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Patch_di" bpmnElement="Association_Patch">
+        <di:waypoint x="840" y="258" />
+        <di:waypoint x="840" y="195" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="Annotation_Triggered_di" bpmnElement="Annotation_Triggered">
+        <dc:Bounds x="160" y="380" width="180" height="60" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_RmReview_di" bpmnElement="Annotation_RmReview">
+        <dc:Bounds x="460" y="380" width="160" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Send_di" bpmnElement="Annotation_Send">
+        <dc:Bounds x="620" y="380" width="200" height="100" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_Bounce_di" bpmnElement="BoundaryEvent_Bounce">
+        <dc:Bounds x="660" y="240" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="692" y="210" width="55" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_StartToGenerateLink_di" bpmnElement="Flow_StartToGenerateLink">
+        <di:waypoint x="256" y="298" />
+        <di:waypoint x="300" y="298" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_GenerateLinkToRmReview_di" bpmnElement="Flow_GenerateLinkToRmReview">
+        <di:waypoint x="420" y="298" />
+        <di:waypoint x="460" y="298" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_RmReviewToSend_di" bpmnElement="Flow_RmReviewToSend">
+        <di:waypoint x="580" y="298" />
+        <di:waypoint x="620" y="298" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SendToPatchStatus_di" bpmnElement="Flow_SendToPatchStatus">
+        <di:waypoint x="740" y="298" />
+        <di:waypoint x="780" y="298" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PatchToEnd_di" bpmnElement="Flow_PatchToEnd">
+        <di:waypoint x="900" y="298" />
+        <di:waypoint x="940" y="298" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_BounceToBounceHandler_di" bpmnElement="Flow_BounceToBounceHandler">
+        <di:waypoint x="678" y="240" />
+        <di:waypoint x="678" y="156" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Triggered_di" bpmnElement="Association_Triggered">
+        <di:waypoint x="238" y="316" />
+        <di:waypoint x="238" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_RmReview_di" bpmnElement="Association_RmReview">
+        <di:waypoint x="520" y="338" />
+        <di:waypoint x="520" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Send_di" bpmnElement="Association_Send">
+        <di:waypoint x="680" y="338" />
+        <di:waypoint x="680" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="Annotation_GenerateLink_di" bpmnElement="Annotation_GenerateLink">
+        <dc:Bounds x="300" y="120" width="160" height="90" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Bounce_di" bpmnElement="Annotation_Bounce">
+        <dc:Bounds x="470" y="135" width="180" height="60" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_End_di" bpmnElement="Annotation_End">
+        <dc:Bounds x="1010" y="190" width="180" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Patch_di" bpmnElement="Annotation_Patch">
+        <dc:Bounds x="780" y="110" width="160" height="85" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -1,0 +1,72 @@
+{
+  "processId": "CddRefreshOrchestrator",
+  "bpmn": "orchestrator.bpmn",
+  "bpmnLibrary": ["phases"],
+  "domain": "kyc-cdd-refresh",
+
+  "seed": 11,
+  "horizonDays": 14,
+
+  "baseArrivalsPerHour": 12.0,
+  "peak": {
+    "pattern": "weekday-morning",
+    "multiplier": 8.0,
+    "startHour": 9,
+    "endHour": 12
+  },
+
+  "jobs": {
+    "io.camunda.agenticai:aiagent:1": {
+      "serviceMsMean": 90000,
+      "serviceMsSigma": 0.4,
+      "cost": 0.8,
+      "failureRate": 0.0,
+      "poolCapacity": 2
+    },
+    "io.camunda:http-json:1": {
+      "serviceMsMean": 1500,
+      "serviceMsSigma": 0.3,
+      "cost": 0.02,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "decision-aggregate-screening-result": {
+      "serviceMsMean": 800,
+      "serviceMsSigma": 0.2,
+      "cost": 0.01,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "decision-assess-cdd-risk": {
+      "serviceMsMean": 800,
+      "serviceMsSigma": 0.2,
+      "cost": 0.01,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "send-cdd-refresh-request": {
+      "serviceMsMean": 3000,
+      "serviceMsSigma": 0.25,
+      "cost": 0.03,
+      "failureRate": 0.01,
+      "poolCapacity": 16
+    },
+    "close-cdd-case": {
+      "serviceMsMean": 4000,
+      "serviceMsSigma": 0.25,
+      "cost": 0.05,
+      "failureRate": 0.0,
+      "poolCapacity": 16
+    }
+  },
+
+  "inputs": [
+    { "weight": 1.0, "vars": {}, "expectedOutcome": "completed" }
+  ],
+
+  "plantedFault": {
+    "jobType": "io.camunda.agenticai:aiagent:1",
+    "kind": "under-provisioned",
+    "window": "weekday-morning"
+  }
+}

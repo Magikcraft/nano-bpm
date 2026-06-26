@@ -259,6 +259,38 @@ rate to an Erlang-C staffing recommendation, and classifies the domain — then 
 grades that against `expected.json` (domain + job + window = 3 points). The generator is
 the symmetric write-side of `replay.rs`, so a corpus also feeds `replay-rank`/`evolve`.
 
+### Multi-stage orchestrators — call activities (`corpus-packs/cdd-refresh/`)
+
+A pack's `bpmn` may be a **call-activity orchestrator** that invokes other process
+definitions; list the BPMN files (or directories) holding the called processes in
+`bpmnLibrary`. At load time every `<process>` across the main BPMN and the library forms
+a resolution set, and each `callActivity` (Camunda 7 `calledElement` or Camunda 8
+`zeebe:calledElement processId`) is **inline-expanded** into an embedded sub-process — a
+recursive, id-prefixed copy of the callee — so the real engine walks the whole multi-stage
+flow on the existing sub-process machinery (no native call-activity executor).
+
+`corpus-packs/cdd-refresh/` is a corporate **CDD (AML/KYC) refresh**, composed from the
+`process-os` `cdd-refresh` example: an orchestrator wiring eight deployable phase processes
+(intake → document request → reminders → screening → sanctions gate → risk assessment →
+approval → closure) in `phases/`. The planted pathology is a 2-worker
+`io.camunda.agenticai:aiagent:1` adverse-media screening agent overloaded by an 8×
+weekday-morning refresh-batch spike:
+
+```bash
+processos gen corpus-packs/cdd-refresh/pack.json /tmp/cdd-corpus
+processos infer /tmp/cdd-corpus 500
+#  -> domain kyc-cdd-refresh, bottleneckJob io.camunda.agenticai:aiagent:1,
+#     window weekday-morning  ->  SCORE points 3 / 3
+```
+
+Phase 4 (document verification) is omitted: it routes on non-standard FEEL list functions
+(`any(documents, function(d) …)`) the engine does not evaluate. Parser support added
+alongside the call activities — `intermediateThrowEvent`/`receiveTask` (pass-through),
+`businessRuleTask`/`scriptTask` (modelled as jobs; a `calledDecision` decisionId becomes the
+job type), and a multiple-start-event collapse — lets the remaining eight phases parse and
+run; user-task steps are auto-completed (the "user" always acts) but carry no worker-pool
+infra.
+
 ## Camunda 8 import — analyse existing C8 history offline (`src/camunda_import.rs`)
 
 A consultant often has a customer's **Camunda 8 / Zeebe** history but no Nano engine.

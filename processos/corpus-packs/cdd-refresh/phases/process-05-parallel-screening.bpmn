@@ -1,0 +1,927 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.9.0">
+  <bpmn:error id="Error_ScreeningEscalated" name="ScreeningEscalated" errorCode="SCREENING_ESCALATED" />
+  <bpmn:process id="Process05ParallelScreeningProcess" name="Phase 5: Companies House + SanctionGuard Parallel Screening" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_CaseUnderReview" name="Case under review">
+      <bpmn:outgoing>Flow_StartToSplit</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:parallelGateway id="ParallelGateway_Split_Streams">
+      <bpmn:incoming>Flow_StartToSplit</bpmn:incoming>
+      <bpmn:outgoing>Flow_SplitToA1</bpmn:outgoing>
+      <bpmn:outgoing>Flow_SplitToB1</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_GetCompanyProfile" name="Get company profile" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="noAuth" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="GET" target="method" />
+          <zeebe:input source="=&#34;https://companies-house-proxy/company/&#34; + client.companiesHouseNumber" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ chProfile: { status: response.body.company_status, companyName: response.body.company_name, confirmationStatement: response.body.confirmation_statement, raw: response.body } }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 404 then bpmnError(&#34;COMPANY_NOT_FOUND&#34;, &#34;Company not found in Companies House&#34;) else if response.status = 422 then bpmnError(&#34;COMPANY_INACTIVE&#34;, &#34;Company is inactive&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToA1</bpmn:incoming>
+      <bpmn:outgoing>Flow_A1ToA2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:businessRuleTask id="Task_DispositionCompanyStatus" name="Determine company status disposition">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="decision-disposition-company-status" resultVariable="determineCompanyStatusDispositionResult" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=chProfile.status" target="chProfile.status" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_A1ToA2</bpmn:incoming>
+      <bpmn:outgoing>Flow_A2ToGateway</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:exclusiveGateway id="Gateway_StatusDisposition" name="Disposition continue?" default="SequenceFlow_DispositionContinue">
+      <bpmn:incoming>Flow_A2ToGateway</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_DispositionContinue</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_DispositionAnalystReview</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_AnalystReviewCompanyStatus" name="Review company status">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-analyst-review-company-status" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>SequenceFlow_DispositionAnalystReview</bpmn:incoming>
+      <bpmn:outgoing>Flow_AnalystToEscalated</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:parallelGateway id="ParallelGateway_Split_AInner">
+      <bpmn:incoming>SequenceFlow_DispositionContinue</bpmn:incoming>
+      <bpmn:outgoing>Flow_AInnerToA3</bpmn:outgoing>
+      <bpmn:outgoing>Flow_AInnerToA4</bpmn:outgoing>
+      <bpmn:outgoing>Flow_AInnerToA5</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_GetOfficers" name="Get active directors" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="noAuth" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="GET" target="method" />
+          <zeebe:input source="=&#34;https://companies-house-proxy/company/&#34; + client.companiesHouseNumber + &#34;/officers&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input source="={ filter: &#34;active&#34; }" target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ chProfile: { activeDirectors: response.body.items[item.resigned_on = null] }, corporateDirectorDetected: some o in response.body.items satisfies o.officer_role = &#34;corporate-director&#34; }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 429 then bpmnError(&#34;RATE_LIMIT_EXCEEDED&#34;, &#34;Companies House rate limit hit&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_AInnerToA3</bpmn:incoming>
+      <bpmn:outgoing>Flow_A3ToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_GetPSCs" name="Get persons with significant control" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="noAuth" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="GET" target="method" />
+          <zeebe:input source="=&#34;https://companies-house-proxy/company/&#34; + client.companiesHouseNumber + &#34;/persons-with-significant-control&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ chProfile: { pscs: response.body.items }, complexUboFlag: some p in response.body.items satisfies contains(p.kind, &#34;super-secure&#34;) or contains(p.kind, &#34;trust&#34;) or contains(p.kind, &#34;nominee&#34;), complexUboKinds: [for p in response.body.items return p.kind] }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 429 then bpmnError(&#34;RATE_LIMIT_EXCEEDED&#34;, &#34;Companies House rate limit hit&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_AInnerToA4</bpmn:incoming>
+      <bpmn:outgoing>Flow_A4ToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_GetFilingHistory" name="Get filing history" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="noAuth" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="GET" target="method" />
+          <zeebe:input source="=&#34;https://companies-house-proxy/company/&#34; + client.companiesHouseNumber + &#34;/filing-history&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input source="={ since: string(date(now()) - duration(&#34;P24M&#34;)) }" target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ filingHistory: response.body.items }" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_AInnerToA5</bpmn:incoming>
+      <bpmn:outgoing>Flow_A5ToA5b</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:businessRuleTask id="Task_DetectFilingHistoryRedflags" name="Detect filing history red flags">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="decision-detect-filing-history-redflags" resultVariable="detectFilingHistoryRedFlagsResult" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=filingType" target="filingType" />
+          <zeebe:input source="=filedAt" target="filedAt" />
+          <zeebe:input source="=lastReportedToFirmAt" target="lastReportedToFirmAt" />
+          <zeebe:input source="=cs01OverdueMonths" target="cs01OverdueMonths" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_A5ToA5b</bpmn:incoming>
+      <bpmn:outgoing>Flow_A5bToJoin</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:parallelGateway id="ParallelGateway_Join_AInner">
+      <bpmn:incoming>Flow_A3ToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_A4ToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_A5bToJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_AInnerJoinToA6</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:businessRuleTask id="Task_ApplyUboThreshold" name="Apply UBO threshold filter">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="decision-apply-ubo-threshold" resultVariable="applyUboThresholdFilterResult" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=psc.percentageOfShares" target="psc.percentageOfShares" />
+          <zeebe:input source="=psc.percentageOfVotingRights" target="psc.percentageOfVotingRights" />
+          <zeebe:input source="=complexUboFlag" target="complexUboFlag" />
+          <zeebe:input source="=psc.kind" target="psc.kind" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_AInnerJoinToA6</bpmn:incoming>
+      <bpmn:outgoing>Flow_A6ToStreamsJoin</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:serviceTask id="Task_ScreenEntity" name="Screen entity" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="bearer" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input source="{{secrets.SANCTIONGUARD_TOKEN}}" target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://sanctionguard/screen/entity&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input source="120" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ screeningReference: caseId + &#34;_entity_0&#34;, legalName: client.legalName, companiesHouseNumber: client.companiesHouseNumber, jurisdiction: client.jurisdiction }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ screenings: { entity: response.body } }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 504 then bpmnError(&#34;SCREEN_TIMEOUT&#34;, &#34;SanctionGuard screen timed out&#34;) else if response.status = 422 then bpmnError(&#34;INSUFFICIENT_DATA&#34;, &#34;SanctionGuard requires more data&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToB1</bpmn:incoming>
+      <bpmn:outgoing>Flow_B1ToB2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_ScreenDirector" name="Screen each director" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="bearer" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input source="{{secrets.SANCTIONGUARD_TOKEN}}" target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://sanctionguard/screen/individual&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input source="120" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ screeningReference: caseId + &#34;_director_&#34; + string(loopCounter), individual: director }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ directorScreening: response.body }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 504 then bpmnError(&#34;SCREEN_TIMEOUT&#34;, &#34;SanctionGuard screen timed out&#34;) else if response.status = 422 then bpmnError(&#34;INSUFFICIENT_DATA&#34;, &#34;SanctionGuard requires more data&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_B1ToB2</bpmn:incoming>
+      <bpmn:outgoing>Flow_B2ToB3</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=subjectsToScreen.directors" inputElement="director" outputCollection="screenings.directors" outputElement="=directorScreening" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_ScreenUbo" name="Screen each UBO" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="bearer" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input source="{{secrets.SANCTIONGUARD_TOKEN}}" target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://sanctionguard/screen/individual&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input source="120" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ screeningReference: caseId + &#34;_ubo_&#34; + string(loopCounter), individual: ubo }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ uboScreening: response.body }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 504 then bpmnError(&#34;SCREEN_TIMEOUT&#34;, &#34;SanctionGuard screen timed out&#34;) else if response.status = 422 then bpmnError(&#34;INSUFFICIENT_DATA&#34;, &#34;SanctionGuard requires more data&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_B2ToB3</bpmn:incoming>
+      <bpmn:outgoing>Flow_B3ToB4a</bpmn:outgoing>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=subjectsToScreen.ubos" inputElement="ubo" outputCollection="screenings.ubos" outputElement="=uboScreening" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:businessRuleTask id="Task_AggregateScreeningResult" name="Aggregate worst screening result">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="decision-aggregate-screening-result" resultVariable="aggregateWorstScreeningResultResult" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=screenings.entity.status" target="screenings.entity.status" />
+          <zeebe:input source="=screenings.directors" target="screenings.directors" />
+          <zeebe:input source="=screenings.ubos" target="screenings.ubos" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_B3ToB4a</bpmn:incoming>
+      <bpmn:outgoing>Flow_B4aToB4b</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:serviceTask id="Task_AggregateAdverseMediaSeverity" name="Draft adverse-media severity" zeebe:modelerTemplate="io.camunda.connectors.agenticai.aiagent.v1" zeebe:modelerTemplateVersion="7" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzIiIGhlaWdodD0iMzIiIHZpZXdCb3g9IjAgMCAzMiAzMiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMTYiIGN5PSIxNiIgcj0iMTYiIGZpbGw9IiNBNTZFRkYiLz4KPG1hc2sgaWQ9InBhdGgtMi1vdXRzaWRlLTFfMTg1XzYiIG1hc2tVbml0cz0idXNlclNwYWNlT25Vc2UiIHg9IjQiIHk9IjQiIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgZmlsbD0iYmxhY2siPgo8cmVjdCBmaWxsPSJ3aGl0ZSIgeD0iNCIgeT0iNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0Ii8+CjxwYXRoIGZpbGwtcnVsZT0iZXZlbm9kZCIgY2xpcC1ydWxlPSJldmVub2RkIiBkPSJNMjAuMDEwNSAxMi4wOTg3QzE4LjQ5IDEwLjU4OTQgMTcuMTU5NCA4LjEwODE0IDE2LjE3OTkgNi4wMTEwM0MxNi4xNTIgNi4wMDQ1MSAxNi4xMTc2IDYgMTYuMDc5NCA2QzE2LjA0MTEgNiAxNi4wMDY2IDYuMDA0NTEgMTUuOTc4OCA2LjAxMTA0QzE0Ljk5OTQgOC4xMDgxNCAxMy42Njk3IDEwLjU4ODkgMTIuMTQ4MSAxMi4wOTgxQzEwLjYyNjkgMTMuNjA3MSA4LjEyNTY4IDE0LjkyNjQgNi4wMTE1NyAxNS44OTgxQzYuMDA0NzQgMTUuOTI2MSA2IDE1Ljk2MTEgNiAxNkM2IDE2LjAzODcgNi4wMDQ2OCAxNi4wNzM2IDYuMDExNDQgMTYuMTAxNEM4LjEyNTE5IDE3LjA3MjkgMTAuNjI2MiAxOC4zOTE5IDEyLjE0NzcgMTkuOTAxNkMxMy42Njk3IDIxLjQxMDcgMTQuOTk5NiAyMy44OTIgMTUuOTc5MSAyNS45ODlDMTYuMDA2OCAyNS45OTU2IDE2LjA0MTEgMjYgMTYuMDc5MyAyNkMxNi4xMTc1IDI2IDE2LjE1MTkgMjUuOTk1NCAxNi4xNzk2IDI1Ljk4OUMxNy4xNTkxIDIzLjg5MiAxOC40ODg4IDIxLjQxMSAyMC4wMDk5IDE5LjkwMjFNMjAuMDA5OSAxOS45MDIxQzIxLjUyNTMgMTguMzk4NyAyMy45NDY1IDE3LjA2NjkgMjUuOTkxNSAxNi4wODI0QzI1Ljk5NjUgMTYuMDU5MyAyNiAxNi4wMzEgMjYgMTUuOTk5N0MyNiAxNS45Njg0IDI1Ljk5NjUgMTUuOTQwMyAyNS45OTE1IDE1LjkxNzFDMjMuOTQ3NCAxNC45MzI3IDIxLjUyNTkgMTMuNjAxIDIwLjAxMDUgMTIuMDk4NyIvPgo8L21hc2s+CjxwYXRoIGZpbGwtcnVsZT0iZXZlbm9kZCIgY2xpcC1ydWxlPSJldmVub2RkIiBkPSJNMjAuMDEwNSAxMi4wOTg3QzE4LjQ5IDEwLjU4OTQgMTcuMTU5NCA4LjEwODE0IDE2LjE3OTkgNi4wMTEwM0MxNi4xNTIgNi4wMDQ1MSAxNi4xMTc2IDYgMTYuMDc5NCA2QzE2LjA0MTEgNiAxNi4wMDY2IDYuMDA0NTEgMTUuOTc4OCA2LjAxMTA0QzE0Ljk5OTQgOC4xMDgxNCAxMy42Njk3IDEwLjU4ODkgMTIuMTQ4MSAxMi4wOTgxQzEwLjYyNjkgMTMuNjA3MSA4LjEyNTY4IDE0LjkyNjQgNi4wMTE1NyAxNS44OTgxQzYuMDA0NzQgMTUuOTI2MSA2IDE1Ljk2MTEgNiAxNkM2IDE2LjAzODcgNi4wMDQ2OCAxNi4wNzM2IDYuMDExNDQgMTYuMTAxNEM4LjEyNTE5IDE3LjA3MjkgMTAuNjI2MiAxOC4zOTE5IDEyLjE0NzcgMTkuOTAxNkMxMy42Njk3IDIxLjQxMDcgMTQuOTk5NiAyMy44OTIgMTUuOTc5MSAyNS45ODlDMTYuMDA2OCAyNS45OTU2IDE2LjA0MTEgMjYgMTYuMDc5MyAyNkMxNi4xMTc1IDI2IDE2LjE1MTkgMjUuOTk1NCAxNi4xNzk2IDI1Ljk4OUMxNy4xNTkxIDIzLjg5MiAxOC40ODg4IDIxLjQxMSAyMC4wMDk5IDE5LjkwMjFNMjAuMDA5OSAxOS45MDIxQzIxLjUyNTMgMTguMzk4NyAyMy45NDY1IDE3LjA2NjkgMjUuOTkxNSAxNi4wODI0QzI1Ljk5NjUgMTYuMDU5MyAyNiAxNi4wMzEgMjYgMTUuOTk5N0MyNiAxNS45Njg0IDI1Ljk5NjUgMTUuOTQwMyAyNS45OTE1IDE1LjkxNzFDMjMuOTQ3NCAxNC45MzI3IDIxLjUyNTkgMTMuNjAxIDIwLjAxMDUgMTIuMDk4NyIgZmlsbD0id2hpdGUiLz4KPHBhdGggZmlsbC1ydWxlPSJldmVub2RkIiBjbGlwLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0yMC4wMTA1IDEyLjA5ODdDMTguNDkgMTAuNTg5NCAxNy4xNTk0IDguMTA4MTQgMTYuMTc5OSA2LjAxMTAzQzE2LjE1MiA2LjAwNDUxIDE2LjExNzYgNiAxNi4wNzk0IDZDMTYuMDQxMSA2IDE2LjAwNjYgNi4wMDQ1MSAxNS45Nzg4IDYuMDExMDRDMTQuOTk5NCA4LjEwODE0IDEzLjY2OTcgMTAuNTg4OSAxMi4xNDgxIDEyLjA5ODFDMTAuNjI2OSAxMy42MDcxIDguMTI1NjggMTQuOTI2NCA2LjAxMTU3IDE1Ljg5ODFDNi4wMDQ3NCAxNS45MjYxIDYgMTUuOTYxMSA2IDE2QzYgMTYuMDM4NyA2LjAwNDY4IDE2LjA3MzYgNi4wMTE0NCAxNi4xMDE0QzguMTI1MTkgMTcuMDcyOSAxMC42MjYyIDE4LjM5MTkgMTIuMTQ3NyAxOS45MDE2QzEzLjY2OTcgMjEuNDEwNyAxNC45OTk2IDIzLjg5MiAxNS45NzkxIDI1Ljk4OUMxNi4wMDY4IDI1Ljk5NTYgMTYuMDQxMSAyNiAxNi4wNzkzIDI2QzE2LjExNzUgMjYgMTYuMTUxOSAyNS45OTU0IDE2LjE3OTYgMjUuOTg5QzE3LjE1OTEgMjMuODkyIDE4LjQ4ODggMjEuNDExIDIwLjAwOTkgMTkuOTAyMU0yMC4wMDk5IDE5LjkwMjFDMjEuNTI1MyAxOC4zOTg3IDIzLjk0NjUgMTcuMDY2OSAyNS45OTE1IDE2LjA4MjRDMjUuOTk2NSAxNi4wNTkzIDI2IDE2LjAzMSAyNiAxNS45OTk3QzI2IDE1Ljk2ODQgMjUuOTk2NSAxNS45NDAzIDI1Ljk5MTUgMTUuOTE3MUMyMy45NDc0IDE0LjkzMjcgMjEuNTI1OSAxMy42MDEgMjAuMDEwNSAxMi4wOTg3IiBzdHJva2U9IiM0OTFEOEIiIHN0cm9rZS13aWR0aD0iNCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIgbWFzaz0idXJsKCNwYXRoLTItb3V0c2lkZS0xXzE4NV82KSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda.agenticai:aiagent:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="bedrock" target="provider.type" />
+          <zeebe:input target="provider.anthropic.endpoint" />
+          <zeebe:input target="provider.anthropic.authentication.apiKey" />
+          <zeebe:input target="provider.anthropic.timeouts.timeout" />
+          <zeebe:input source="{{secrets.AWS_REGION}}" target="provider.bedrock.region" />
+          <zeebe:input target="provider.bedrock.endpoint" />
+          <zeebe:input source="credentials" target="provider.bedrock.authentication.type" />
+          <zeebe:input source="{{secrets.AWS_ACCESS_KEY}}" target="provider.bedrock.authentication.accessKey" />
+          <zeebe:input source="{{secrets.AWS_SECRET_KEY}}" target="provider.bedrock.authentication.secretKey" />
+          <zeebe:input target="provider.bedrock.authentication.apiKey" />
+          <zeebe:input source="=60" target="provider.bedrock.timeouts.timeout" />
+          <zeebe:input target="provider.azureOpenAi.endpoint" />
+          <zeebe:input source="apiKey" target="provider.azureOpenAi.authentication.type" />
+          <zeebe:input target="provider.azureOpenAi.authentication.apiKey" />
+          <zeebe:input target="provider.azureOpenAi.authentication.clientId" />
+          <zeebe:input target="provider.azureOpenAi.authentication.clientSecret" />
+          <zeebe:input target="provider.azureOpenAi.authentication.tenantId" />
+          <zeebe:input target="provider.azureOpenAi.authentication.authorityHost" />
+          <zeebe:input target="provider.azureOpenAi.timeouts.timeout" />
+          <zeebe:input target="provider.googleVertexAi.projectId" />
+          <zeebe:input target="provider.googleVertexAi.region" />
+          <zeebe:input source="serviceAccountCredentials" target="provider.googleVertexAi.authentication.type" />
+          <zeebe:input target="provider.googleVertexAi.authentication.jsonKey" />
+          <zeebe:input target="provider.openai.authentication.apiKey" />
+          <zeebe:input target="provider.openai.authentication.organizationId" />
+          <zeebe:input target="provider.openai.authentication.projectId" />
+          <zeebe:input target="provider.openai.timeouts.timeout" />
+          <zeebe:input target="provider.openaiCompatible.endpoint" />
+          <zeebe:input target="provider.openaiCompatible.authentication.apiKey" />
+          <zeebe:input target="provider.openaiCompatible.headers" />
+          <zeebe:input target="provider.openaiCompatible.queryParameters" />
+          <zeebe:input target="provider.openaiCompatible.timeouts.timeout" />
+          <zeebe:input source="claude-3-5-sonnet-20240620" target="provider.anthropic.model.model" />
+          <zeebe:input target="provider.anthropic.model.parameters.maxTokens" />
+          <zeebe:input target="provider.anthropic.model.parameters.temperature" />
+          <zeebe:input target="provider.anthropic.model.parameters.topP" />
+          <zeebe:input target="provider.anthropic.model.parameters.topK" />
+          <zeebe:input target="provider.bedrock.model.parameters.maxTokens" />
+          <zeebe:input target="provider.bedrock.model.parameters.temperature" />
+          <zeebe:input target="provider.bedrock.model.parameters.topP" />
+          <zeebe:input target="provider.azureOpenAi.model.deploymentName" />
+          <zeebe:input target="provider.azureOpenAi.model.parameters.maxTokens" />
+          <zeebe:input target="provider.azureOpenAi.model.parameters.temperature" />
+          <zeebe:input target="provider.azureOpenAi.model.parameters.topP" />
+          <zeebe:input target="provider.googleVertexAi.model.model" />
+          <zeebe:input target="provider.googleVertexAi.model.parameters.maxOutputTokens" />
+          <zeebe:input target="provider.googleVertexAi.model.parameters.temperature" />
+          <zeebe:input target="provider.googleVertexAi.model.parameters.topP" />
+          <zeebe:input target="provider.googleVertexAi.model.parameters.topK" />
+          <zeebe:input source="gpt-4o" target="provider.openai.model.model" />
+          <zeebe:input target="provider.openai.model.parameters.maxCompletionTokens" />
+          <zeebe:input target="provider.openai.model.parameters.temperature" />
+          <zeebe:input target="provider.openai.model.parameters.topP" />
+          <zeebe:input source="gpt-4o" target="provider.openaiCompatible.model.model" />
+          <zeebe:input target="provider.openaiCompatible.model.parameters.maxCompletionTokens" />
+          <zeebe:input target="provider.openaiCompatible.model.parameters.temperature" />
+          <zeebe:input target="provider.openaiCompatible.model.parameters.topP" />
+          <zeebe:input target="provider.openaiCompatible.model.parameters.customParameters" />
+          <zeebe:input source="=&#34;You are a CDD adverse-media severity analyst. Aggregate per-hit severity across all screening subjects (entity, directors, UBOs). Output a JSON with adverseMediaSeverity in {NONE, LOW, MEDIUM, HIGH}, a confidence score in [0,1], and a 2-sentence rationale referencing each contributing hit.&#34;" target="data.systemPrompt.prompt" />
+          <zeebe:input source="=&#34;Screening results: &#34; + string(screenings) + &#34;\nProduce JSON: { adverseMediaSeverity, confidence, rationale }&#34;" target="data.userPrompt.prompt" />
+          <zeebe:input target="data.userPrompt.documents" />
+          <zeebe:input target="data.tools.containerElementId" />
+          <zeebe:input target="data.tools.toolCallResults" />
+          <zeebe:input target="data.context" />
+          <zeebe:input source="in-process" target="data.memory.storage.type" />
+          <zeebe:input target="data.memory.storage.timeToLive" />
+          <zeebe:input target="data.memory.storage.customProperties" />
+          <zeebe:input target="data.memory.storage.storeType" />
+          <zeebe:input target="data.memory.storage.parameters" />
+          <zeebe:input target="data.memory.contextWindowSize" />
+          <zeebe:input target="data.limits.maxModelCalls" />
+          <zeebe:input source="text" target="data.response.format.type" />
+          <zeebe:input source="true" target="data.response.format.parseJson" />
+          <zeebe:input target="data.response.format.schema" />
+          <zeebe:input source="Response" target="data.response.format.schemaName" />
+          <zeebe:input target="data.response.includeAssistantMessage" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="7" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.agenticai.aiagent.v1" />
+          <zeebe:header key="resultExpression" value="={ adverseMediaSeverity: response.responseJson.adverseMediaSeverity, adverseMediaConfidence: response.responseJson.confidence, adverseMediaRationale: response.responseJson.rationale }" />
+          <zeebe:header key="errorExpression" value="=if is defined(response.error) then bpmnError(&#34;BEDROCK_UNAVAILABLE&#34;, &#34;Bedrock unreachable, default to HIGH&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_B4aToB4b</bpmn:incoming>
+      <bpmn:outgoing>Flow_B4bToStreamsJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="ParallelGateway_Join_Streams">
+      <bpmn:incoming>Flow_A6ToStreamsJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_B4bToStreamsJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_StreamsJoinToZ</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_WriteScreeningAuditNote" name="Write screening audit note" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="bearer" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input source="{{secrets.CLIENTVAULT_API_KEY}}" target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://clientvault/cdd-cases/&#34; + caseId + &#34;/notes&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ noteType: &#34;SYSTEM&#34;, body: { chProfileStatus: chProfile.status, screeningResult: screeningResult, adverseMediaSeverity: adverseMediaSeverity, subjectsToScreenCount: count(subjectsToScreen.directors) + count(subjectsToScreen.ubos) + 1, complexUboFlag: complexUboFlag, uboComplexity: uboComplexity } }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ phase05CompletedAt: now(), phase05AuditNoteId: response.body.noteId }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 401 then bpmnError(&#34;CLIENTVAULT_AUTH_FAILED&#34;, &#34;ClientVault auth failed - check CLIENTVAULT_API_KEY&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_StreamsJoinToZ</bpmn:incoming>
+      <bpmn:outgoing>Flow_ZToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndEvent_ScreeningCompleted" name="Screening completed">
+      <bpmn:incoming>Flow_ZToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_ScreeningEscalated" name="Screening escalated">
+      <bpmn:incoming>Flow_AnalystToEscalated</bpmn:incoming>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_ScreeningEscalated" errorRef="Error_ScreeningEscalated" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_StartToSplit" sourceRef="StartEvent_CaseUnderReview" targetRef="ParallelGateway_Split_Streams" />
+    <bpmn:sequenceFlow id="Flow_SplitToA1" sourceRef="ParallelGateway_Split_Streams" targetRef="Task_GetCompanyProfile" />
+    <bpmn:sequenceFlow id="Flow_SplitToB1" sourceRef="ParallelGateway_Split_Streams" targetRef="Task_ScreenEntity" />
+    <bpmn:sequenceFlow id="Flow_A1ToA2" sourceRef="Task_GetCompanyProfile" targetRef="Task_DispositionCompanyStatus" />
+    <bpmn:sequenceFlow id="Flow_A2ToGateway" sourceRef="Task_DispositionCompanyStatus" targetRef="Gateway_StatusDisposition" />
+    <bpmn:sequenceFlow id="SequenceFlow_DispositionContinue" name="Continue" sourceRef="Gateway_StatusDisposition" targetRef="ParallelGateway_Split_AInner" />
+    <bpmn:sequenceFlow id="SequenceFlow_DispositionAnalystReview" name="Flag for review" sourceRef="Gateway_StatusDisposition" targetRef="Task_AnalystReviewCompanyStatus">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=chStatusDisposition != "continue"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_AnalystToEscalated" sourceRef="Task_AnalystReviewCompanyStatus" targetRef="EndEvent_ScreeningEscalated" />
+    <bpmn:sequenceFlow id="Flow_AInnerToA3" sourceRef="ParallelGateway_Split_AInner" targetRef="Task_GetOfficers" />
+    <bpmn:sequenceFlow id="Flow_AInnerToA4" sourceRef="ParallelGateway_Split_AInner" targetRef="Task_GetPSCs" />
+    <bpmn:sequenceFlow id="Flow_AInnerToA5" sourceRef="ParallelGateway_Split_AInner" targetRef="Task_GetFilingHistory" />
+    <bpmn:sequenceFlow id="Flow_A3ToJoin" sourceRef="Task_GetOfficers" targetRef="ParallelGateway_Join_AInner" />
+    <bpmn:sequenceFlow id="Flow_A4ToJoin" sourceRef="Task_GetPSCs" targetRef="ParallelGateway_Join_AInner" />
+    <bpmn:sequenceFlow id="Flow_A5ToA5b" sourceRef="Task_GetFilingHistory" targetRef="Task_DetectFilingHistoryRedflags" />
+    <bpmn:sequenceFlow id="Flow_A5bToJoin" sourceRef="Task_DetectFilingHistoryRedflags" targetRef="ParallelGateway_Join_AInner" />
+    <bpmn:sequenceFlow id="Flow_AInnerJoinToA6" sourceRef="ParallelGateway_Join_AInner" targetRef="Task_ApplyUboThreshold" />
+    <bpmn:sequenceFlow id="Flow_A6ToStreamsJoin" sourceRef="Task_ApplyUboThreshold" targetRef="ParallelGateway_Join_Streams" />
+    <bpmn:sequenceFlow id="Flow_B1ToB2" sourceRef="Task_ScreenEntity" targetRef="Task_ScreenDirector" />
+    <bpmn:sequenceFlow id="Flow_B2ToB3" sourceRef="Task_ScreenDirector" targetRef="Task_ScreenUbo" />
+    <bpmn:sequenceFlow id="Flow_B3ToB4a" sourceRef="Task_ScreenUbo" targetRef="Task_AggregateScreeningResult" />
+    <bpmn:sequenceFlow id="Flow_B4aToB4b" sourceRef="Task_AggregateScreeningResult" targetRef="Task_AggregateAdverseMediaSeverity" />
+    <bpmn:sequenceFlow id="Flow_B4bToStreamsJoin" sourceRef="Task_AggregateAdverseMediaSeverity" targetRef="ParallelGateway_Join_Streams" />
+    <bpmn:sequenceFlow id="Flow_StreamsJoinToZ" sourceRef="ParallelGateway_Join_Streams" targetRef="Task_WriteScreeningAuditNote" />
+    <bpmn:sequenceFlow id="Flow_ZToEnd" sourceRef="Task_WriteScreeningAuditNote" targetRef="EndEvent_ScreeningCompleted" />
+    <bpmn:textAnnotation id="TextAnnotation_Triggered_Start">
+      <bpmn:text>Triggered by: Phase 4 case-creation; case.status transitions to UNDER_REVIEW.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_GetCompanyProfile">
+      <bpmn:text>Implementation: Companies House proxy GET /company/{companyNumber}; consumes client.companiesHouseNumber, caseId; produces chProfile.status, chProfile.companyName, chProfile.confirmationStatement, chProfile.raw. Boundary errors COMPANY_NOT_FOUND (404)→edge-02-non-uk-jurisdiction; COMPANY_INACTIVE (422)→analyst escalation; timer 30s non-interrupting log SLOW_CH_LOOKUP, 90s interrupting analyst escalation.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_DispositionCompanyStatus">
+      <bpmn:text>Implementation: DMN ch-status-disposition.dmn (hit policy UNIQUE); input chProfile.status; output chStatusDisposition ∈ {continue, flag_review, reject_case, refer_offboarding, escalate}. Rows: active→continue; active-proposal-to-strike-off / voluntary-arrangement→flag_review (placeholder pending Q15); dissolved/liquidation/receivership/administration/converted-closed→reject_case (defensive — A1 normally raises COMPANY_INACTIVE first).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Eval_StatusDisposition">
+      <bpmn:text>Evaluates: chStatusDisposition</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_AnalystReviewCompanyStatus">
+      <bpmn:text>Manual: Soft-flag dispositions (active-proposal-to-strike-off, voluntary-arrangement, escalate) require KYC analyst judgement until Q15 is answered. Group kyc-analysts; input caseId, chProfile.status, chProfile.raw; output ∈ {continue, escalate, reject_case, refer_offboarding}. Boundary timer 1bd non-interrupting reminder; 3bd interrupting escalate to KYC team lead.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_GetOfficers">
+      <bpmn:text>Implementation: Companies House proxy GET /company/{companyNumber}/officers (filter resigned_on null); produces chProfile.activeDirectors[], corporateDirectorDetected. On corporate-director hit a signal triggers edge-01-complex-ubo-investigation; error boundary RATE_LIMIT_EXCEEDED→retry exponential backoff (3 attempts).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_GetPSCs">
+      <bpmn:text>Implementation: Companies House proxy GET /company/{companyNumber}/persons-with-significant-control; produces chProfile.pscs[], complexUboFlag, complexUboKinds[]. Worker matches super-secure / aggregate / trust/nominee natures_of_control. On complexUboFlag=true a signal triggers edge-01-complex-ubo-investigation; error boundary RATE_LIMIT_EXCEEDED→retry with backoff.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_GetFilingHistory">
+      <bpmn:text>Implementation: Companies House proxy GET /company/{companyNumber}/filing-history?since=now-24m; produces filingHistory[].</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_DetectFilingHistoryRedflags">
+      <bpmn:text>Implementation: DMN filing-history-redflags.dmn (hit policy COLLECT); inputs filingType, filedAt, lastReportedToFirmAt, cs01OverdueMonths; output chProfile.filingHistoryFlags[] ∈ {NONE, UNREPORTED_PSC_CHANGE, CS01_OVERDUE, UNREPORTED_RO_CHANGE, INSOLVENCY}. INSOLVENCY raises COMPANY_INACTIVE (same handler as A1).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_ApplyUboThreshold">
+      <bpmn:text>Implementation: DMN ubo-threshold-filter.dmn (≥10% on percentageOfShares OR percentageOfVotingRights → includeInScreening=true) plus ubo-complexity.dmn (inputs complexUboFlag and any psc.kind ∈ {corporate-entity-with-significant-control, legal-person-with-significant-control}; output uboComplexity ∈ {SIMPLE, CHAIN, TRUST_NOMINEE}). Produces subjectsToScreen.entity, subjectsToScreen.directors[], subjectsToScreen.ubos[], uboComplexity. Stricter than MLR 2017 reg.5 25% — Meridian policy.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_ScreenEntity">
+      <bpmn:text>Implementation: SanctionGuard POST /screen/entity with screeningReference={caseId}_entity_0 (idempotent); inputs caseId, client.legalName, client.companiesHouseNumber, client.jurisdiction; produces screenings.entity. Boundary SCREEN_TIMEOUT (504, &gt;120s)→manual-screening UserTask; INSUFFICIENT_DATA (422)→analyst-enrichment UserTask then auto-retry.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_ScreenDirector">
+      <bpmn:text>Implementation: SanctionGuard POST /screen/individual with screeningReference={caseId}_director_&lt;i&gt;; multi-instance parallel over subjectsToScreen.directors[]; produces screenings.director_&lt;i&gt;. Boundary handlers same as B1.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_ScreenUbo">
+      <bpmn:text>Implementation: SanctionGuard POST /screen/individual with screeningReference={caseId}_ubo_&lt;i&gt;; multi-instance parallel over subjectsToScreen.ubos[]; produces screenings.ubo_&lt;i&gt;. Fan-out extends when edge-01-complex-ubo-investigation augments subjectsToScreen.ubos[]. Boundary handlers same as B1.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_AggregateScreeningResult">
+      <bpmn:text>Implementation: DMN screening-result-aggregation.dmn; reads worstStatusAcrossSubjects across screenings.entity / screenings.director_* / screenings.ubo_*; output screeningResult ∈ {CLEAR, ADVERSE_MEDIA, PEP, SANCTIONS} ordered CLEAR&lt;ADVERSE_MEDIA&lt;PEP&lt;SANCTIONS.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_AggregateAdverseMediaSeverity">
+      <bpmn:text>Implementation: AWS Bedrock Claude Sonnet via AI Agent connector; aggregates per-hit severity across all subjects, produces adverseMediaSeverity ∈ {NONE, LOW, MEDIUM, HIGH} + 2-sentence rationale referencing each contributing hit. Confidence routing: ≥0.90 auto-apply with SYSTEM note; 0.70–0.89 apply + analyst review UserTask; &lt;0.70 analyst review with AI as draft (no autonomous write — hard constraint #1). Boundary 60s timer or BEDROCK_UNAVAILABLE→default HIGH + ANALYST note + analyst review.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Impl_WriteScreeningAuditNote">
+      <bpmn:text>Implementation: ClientVault POST /cdd-cases/{caseId}/notes with noteType=SYSTEM and structured body containing chProfile.status, screeningResult, adverseMediaSeverity, subjectsToScreen[] count, complexUboFlag, uboComplexity. Produces phase05CompletedAt, phase05AuditNoteId. Satisfies MLR 2017 reg.40 5-year retention; closes FCA Q4 2024 missing-record finding. Boundary error 401 (missing CLIENTVAULT_API_KEY) halts process with incident.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Followup_Completed">
+      <bpmn:text>Follow-up: Phase 6 (parallel screening assessment) — case.status → SCREENED; downstream consumes chProfile, screeningResult, adverseMediaSeverity, uboComplexity, complexUboFlag.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Followup_Escalated">
+      <bpmn:text>Follow-up: Routed to KYC team lead per analyst outcome (escalate/reject_case/refer_offboarding); case.status → ESCALATED.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Triggered_Start" associationDirection="None" sourceRef="StartEvent_CaseUnderReview" targetRef="TextAnnotation_Triggered_Start" />
+    <bpmn:association id="Association_Impl_GetCompanyProfile" associationDirection="None" sourceRef="Task_GetCompanyProfile" targetRef="TextAnnotation_Impl_GetCompanyProfile" />
+    <bpmn:association id="Association_Impl_DispositionCompanyStatus" associationDirection="None" sourceRef="Task_DispositionCompanyStatus" targetRef="TextAnnotation_Impl_DispositionCompanyStatus" />
+    <bpmn:association id="Association_Eval_StatusDisposition" associationDirection="None" sourceRef="Gateway_StatusDisposition" targetRef="TextAnnotation_Eval_StatusDisposition" />
+    <bpmn:association id="Association_Impl_AnalystReviewCompanyStatus" associationDirection="None" sourceRef="Task_AnalystReviewCompanyStatus" targetRef="TextAnnotation_Impl_AnalystReviewCompanyStatus" />
+    <bpmn:association id="Association_Impl_GetOfficers" associationDirection="None" sourceRef="Task_GetOfficers" targetRef="TextAnnotation_Impl_GetOfficers" />
+    <bpmn:association id="Association_Impl_GetPSCs" associationDirection="None" sourceRef="Task_GetPSCs" targetRef="TextAnnotation_Impl_GetPSCs" />
+    <bpmn:association id="Association_Impl_GetFilingHistory" associationDirection="None" sourceRef="Task_GetFilingHistory" targetRef="TextAnnotation_Impl_GetFilingHistory" />
+    <bpmn:association id="Association_Impl_DetectFilingHistoryRedflags" associationDirection="None" sourceRef="Task_DetectFilingHistoryRedflags" targetRef="TextAnnotation_Impl_DetectFilingHistoryRedflags" />
+    <bpmn:association id="Association_Impl_ApplyUboThreshold" associationDirection="None" sourceRef="Task_ApplyUboThreshold" targetRef="TextAnnotation_Impl_ApplyUboThreshold" />
+    <bpmn:association id="Association_Impl_ScreenEntity" associationDirection="None" sourceRef="Task_ScreenEntity" targetRef="TextAnnotation_Impl_ScreenEntity" />
+    <bpmn:association id="Association_Impl_ScreenDirector" associationDirection="None" sourceRef="Task_ScreenDirector" targetRef="TextAnnotation_Impl_ScreenDirector" />
+    <bpmn:association id="Association_Impl_ScreenUbo" associationDirection="None" sourceRef="Task_ScreenUbo" targetRef="TextAnnotation_Impl_ScreenUbo" />
+    <bpmn:association id="Association_Impl_AggregateScreeningResult" associationDirection="None" sourceRef="Task_AggregateScreeningResult" targetRef="TextAnnotation_Impl_AggregateScreeningResult" />
+    <bpmn:association id="Association_Impl_AggregateAdverseMediaSeverity" associationDirection="None" sourceRef="Task_AggregateAdverseMediaSeverity" targetRef="TextAnnotation_Impl_AggregateAdverseMediaSeverity" />
+    <bpmn:association id="Association_Impl_WriteScreeningAuditNote" associationDirection="None" sourceRef="Task_WriteScreeningAuditNote" targetRef="TextAnnotation_Impl_WriteScreeningAuditNote" />
+    <bpmn:association id="Association_Followup_Completed" associationDirection="None" sourceRef="EndEvent_ScreeningCompleted" targetRef="TextAnnotation_Followup_Completed" />
+    <bpmn:association id="Association_Followup_Escalated" associationDirection="None" sourceRef="EndEvent_ScreeningEscalated" targetRef="TextAnnotation_Followup_Escalated" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process05ParallelScreeningProcess">
+    <bpmndi:BPMNPlane id="BPMNPlane_Process05ParallelScreeningProcess" bpmnElement="Process05ParallelScreeningProcess">
+      <bpmndi:BPMNShape id="StartEvent_CaseUnderReview_di" bpmnElement="StartEvent_CaseUnderReview">
+        <dc:Bounds x="237" y="462" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="226" y="498" width="58" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Split_Streams_di" bpmnElement="ParallelGateway_Split_Streams">
+        <dc:Bounds x="380" y="455" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_GetCompanyProfile_di" bpmnElement="Task_GetCompanyProfile">
+        <dc:Bounds x="505" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_DispositionCompanyStatus_di" bpmnElement="Task_DispositionCompanyStatus">
+        <dc:Bounds x="655" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_StatusDisposition_di" bpmnElement="Gateway_StatusDisposition" isMarkerVisible="true">
+        <dc:Bounds x="830" y="455" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="828" y="417.5" width="54" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Split_AInner_di" bpmnElement="ParallelGateway_Split_AInner">
+        <dc:Bounds x="980" y="455" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_GetOfficers_di" bpmnElement="Task_GetOfficers">
+        <dc:Bounds x="1105" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Join_AInner_di" bpmnElement="ParallelGateway_Join_AInner">
+        <dc:Bounds x="1430" y="455" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ApplyUboThreshold_di" bpmnElement="Task_ApplyUboThreshold">
+        <dc:Bounds x="1555" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Join_Streams_di" bpmnElement="ParallelGateway_Join_Streams">
+        <dc:Bounds x="1730" y="455" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_WriteScreeningAuditNote_di" bpmnElement="Task_WriteScreeningAuditNote">
+        <dc:Bounds x="1855" y="440" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ScreeningCompleted_di" bpmnElement="EndEvent_ScreeningCompleted">
+        <dc:Bounds x="2037" y="462" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2030" y="498" width="51" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AnalystReviewCompanyStatus_di" bpmnElement="Task_AnalystReviewCompanyStatus">
+        <dc:Bounds x="805" y="560" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ScreeningEscalated_di" bpmnElement="EndEvent_ScreeningEscalated">
+        <dc:Bounds x="962" y="582" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="955" y="618" width="50" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_GetPSCs_di" bpmnElement="Task_GetPSCs">
+        <dc:Bounds x="1105" y="690" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_DetectFilingHistoryRedflags_di" bpmnElement="Task_DetectFilingHistoryRedflags">
+        <dc:Bounds x="1255" y="560" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_GetFilingHistory_di" bpmnElement="Task_GetFilingHistory">
+        <dc:Bounds x="1105" y="560" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AggregateAdverseMediaSeverity_di" bpmnElement="Task_AggregateAdverseMediaSeverity">
+        <dc:Bounds x="1105" y="820" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AggregateScreeningResult_di" bpmnElement="Task_AggregateScreeningResult">
+        <dc:Bounds x="955" y="820" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ScreenUbo_di" bpmnElement="Task_ScreenUbo">
+        <dc:Bounds x="805" y="820" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ScreenDirector_di" bpmnElement="Task_ScreenDirector">
+        <dc:Bounds x="655" y="820" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ScreenEntity_di" bpmnElement="Task_ScreenEntity">
+        <dc:Bounds x="505" y="820" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_Followup_Escalated_di" bpmnElement="Association_Followup_Escalated">
+        <di:waypoint x="970" y="615" />
+        <di:waypoint x="907" y="679" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_ScreenUbo_di" bpmnElement="Association_Impl_ScreenUbo">
+        <di:waypoint x="879" y="900" />
+        <di:waypoint x="870" y="933" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_AnalystReviewCompanyStatus_di" bpmnElement="Association_Impl_AnalystReviewCompanyStatus">
+        <di:waypoint x="805" y="617" />
+        <di:waypoint x="740" y="639" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_ScreenEntity_di" bpmnElement="Association_Impl_ScreenEntity">
+        <di:waypoint x="543" y="900" />
+        <di:waypoint x="510" y="933" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_DetectFilingHistoryRedflags_di" bpmnElement="Association_Impl_DetectFilingHistoryRedflags">
+        <di:waypoint x="1355" y="606" />
+        <di:waypoint x="1835" y="661" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_GetFilingHistory_di" bpmnElement="Association_Impl_GetFilingHistory">
+        <di:waypoint x="1205" y="619" />
+        <di:waypoint x="1820" y="855" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_AggregateScreeningResult_di" bpmnElement="Association_Impl_AggregateScreeningResult">
+        <di:waypoint x="1059" y="860" />
+        <di:waypoint x="1055" y="933" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_ScreenDirector_di" bpmnElement="Association_Impl_ScreenDirector">
+        <di:waypoint x="681" y="900" />
+        <di:waypoint x="704" y="933" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_AggregateAdverseMediaSeverity_di" bpmnElement="Association_Impl_AggregateAdverseMediaSeverity">
+        <di:waypoint x="1205" y="876" />
+        <di:waypoint x="1235" y="1034" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_GetPSCs_di" bpmnElement="Association_Impl_GetPSCs">
+        <di:waypoint x="1209" y="730" />
+        <di:waypoint x="1542" y="954" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_DispositionCompanyStatus_di" bpmnElement="Association_Impl_DispositionCompanyStatus">
+        <di:waypoint x="747" y="440" />
+        <di:waypoint x="733" y="397" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_ApplyUboThreshold_di" bpmnElement="Association_Impl_ApplyUboThreshold">
+        <di:waypoint x="1605" y="440" />
+        <di:waypoint x="1605" y="411" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_WriteScreeningAuditNote_di" bpmnElement="Association_Impl_WriteScreeningAuditNote">
+        <di:waypoint x="1905" y="440" />
+        <di:waypoint x="1905" y="404" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Followup_Completed_di" bpmnElement="Association_Followup_Completed">
+        <di:waypoint x="2073" y="480" />
+        <di:waypoint x="2150" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_Triggered_Start_di" bpmnElement="TextAnnotation_Triggered_Start">
+        <dc:Bounds x="155" y="354" width="200" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_GetCompanyProfile_di" bpmnElement="TextAnnotation_Impl_GetCompanyProfile">
+        <dc:Bounds x="455" y="116" width="200" height="274" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Eval_StatusDisposition_di" bpmnElement="TextAnnotation_Eval_StatusDisposition">
+        <dc:Bounds x="935" y="362" width="200" height="43" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_GetOfficers_di" bpmnElement="TextAnnotation_Impl_GetOfficers">
+        <dc:Bounds x="1235" y="174" width="200" height="216" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_StartToSplit_di" bpmnElement="Flow_StartToSplit">
+        <di:waypoint x="273" y="480" />
+        <di:waypoint x="380" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToA1_di" bpmnElement="Flow_SplitToA1">
+        <di:waypoint x="430" y="480" />
+        <di:waypoint x="505" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToB1_di" bpmnElement="Flow_SplitToB1">
+        <di:waypoint x="405" y="505" />
+        <di:waypoint x="405" y="860" />
+        <di:waypoint x="505" y="860" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A1ToA2_di" bpmnElement="Flow_A1ToA2">
+        <di:waypoint x="605" y="480" />
+        <di:waypoint x="655" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A2ToGateway_di" bpmnElement="Flow_A2ToGateway">
+        <di:waypoint x="755" y="480" />
+        <di:waypoint x="830" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_DispositionContinue_di" bpmnElement="SequenceFlow_DispositionContinue">
+        <di:waypoint x="880" y="480" />
+        <di:waypoint x="980" y="480" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="908" y="455" width="45" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_DispositionAnalystReview_di" bpmnElement="SequenceFlow_DispositionAnalystReview">
+        <di:waypoint x="855" y="505" />
+        <di:waypoint x="855" y="560" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="836" y="525" width="73" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AnalystToEscalated_di" bpmnElement="Flow_AnalystToEscalated">
+        <di:waypoint x="905" y="600" />
+        <di:waypoint x="962" y="600" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AInnerToA3_di" bpmnElement="Flow_AInnerToA3">
+        <di:waypoint x="1030" y="480" />
+        <di:waypoint x="1105" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AInnerToA4_di" bpmnElement="Flow_AInnerToA4">
+        <di:waypoint x="1030" y="480" />
+        <di:waypoint x="1080" y="480" />
+        <di:waypoint x="1080" y="730" />
+        <di:waypoint x="1105" y="730" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AInnerToA5_di" bpmnElement="Flow_AInnerToA5">
+        <di:waypoint x="1030" y="480" />
+        <di:waypoint x="1080" y="480" />
+        <di:waypoint x="1080" y="600" />
+        <di:waypoint x="1105" y="600" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A3ToJoin_di" bpmnElement="Flow_A3ToJoin">
+        <di:waypoint x="1205" y="480" />
+        <di:waypoint x="1430" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A4ToJoin_di" bpmnElement="Flow_A4ToJoin">
+        <di:waypoint x="1205" y="730" />
+        <di:waypoint x="1455" y="730" />
+        <di:waypoint x="1455" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A5bToJoin_di" bpmnElement="Flow_A5bToJoin">
+        <di:waypoint x="1355" y="600" />
+        <di:waypoint x="1455" y="600" />
+        <di:waypoint x="1455" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AInnerJoinToA6_di" bpmnElement="Flow_AInnerJoinToA6">
+        <di:waypoint x="1480" y="480" />
+        <di:waypoint x="1555" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A6ToStreamsJoin_di" bpmnElement="Flow_A6ToStreamsJoin">
+        <di:waypoint x="1655" y="480" />
+        <di:waypoint x="1730" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_B4bToStreamsJoin_di" bpmnElement="Flow_B4bToStreamsJoin">
+        <di:waypoint x="1205" y="860" />
+        <di:waypoint x="1755" y="860" />
+        <di:waypoint x="1755" y="505" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_StreamsJoinToZ_di" bpmnElement="Flow_StreamsJoinToZ">
+        <di:waypoint x="1780" y="480" />
+        <di:waypoint x="1855" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ZToEnd_di" bpmnElement="Flow_ZToEnd">
+        <di:waypoint x="1955" y="480" />
+        <di:waypoint x="2037" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Triggered_Start_di" bpmnElement="Association_Triggered_Start">
+        <di:waypoint x="255" y="462" />
+        <di:waypoint x="255" y="412" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_GetCompanyProfile_di" bpmnElement="Association_Impl_GetCompanyProfile">
+        <di:waypoint x="555" y="440" />
+        <di:waypoint x="555" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Eval_StatusDisposition_di" bpmnElement="Association_Eval_StatusDisposition">
+        <di:waypoint x="880" y="455" />
+        <di:waypoint x="935" y="405" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Impl_GetOfficers_di" bpmnElement="Association_Impl_GetOfficers">
+        <di:waypoint x="1205" y="440" />
+        <di:waypoint x="1235" y="390" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_A5ToA5b_di" bpmnElement="Flow_A5ToA5b">
+        <di:waypoint x="1205" y="600" />
+        <di:waypoint x="1255" y="600" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_B4aToB4b_di" bpmnElement="Flow_B4aToB4b">
+        <di:waypoint x="1055" y="860" />
+        <di:waypoint x="1105" y="860" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_B3ToB4a_di" bpmnElement="Flow_B3ToB4a">
+        <di:waypoint x="905" y="860" />
+        <di:waypoint x="955" y="860" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_B2ToB3_di" bpmnElement="Flow_B2ToB3">
+        <di:waypoint x="755" y="860" />
+        <di:waypoint x="805" y="860" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_B1ToB2_di" bpmnElement="Flow_B1ToB2">
+        <di:waypoint x="605" y="860" />
+        <di:waypoint x="655" y="860" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_Followup_Escalated_di" bpmnElement="TextAnnotation_Followup_Escalated">
+        <dc:Bounds x="820" y="679" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_ScreenUbo_di" bpmnElement="TextAnnotation_Impl_ScreenUbo">
+        <dc:Bounds x="800" y="933" width="200" height="216" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_AnalystReviewCompanyStatus_di" bpmnElement="TextAnnotation_Impl_AnalystReviewCompanyStatus">
+        <dc:Bounds x="540" y="550" width="200" height="245" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_ScreenEntity_di" bpmnElement="TextAnnotation_Impl_ScreenEntity">
+        <dc:Bounds x="320" y="933" width="200" height="245" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_DetectFilingHistoryRedflags_di" bpmnElement="TextAnnotation_Impl_DetectFilingHistoryRedflags">
+        <dc:Bounds x="1835" y="565" width="200" height="216" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_GetFilingHistory_di" bpmnElement="TextAnnotation_Impl_GetFilingHistory">
+        <dc:Bounds x="1820" y="850" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_AggregateScreeningResult_di" bpmnElement="TextAnnotation_Impl_AggregateScreeningResult">
+        <dc:Bounds x="1020" y="933" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_ScreenDirector_di" bpmnElement="TextAnnotation_Impl_ScreenDirector">
+        <dc:Bounds x="560" y="933" width="200" height="173" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_AggregateAdverseMediaSeverity_di" bpmnElement="TextAnnotation_Impl_AggregateAdverseMediaSeverity">
+        <dc:Bounds x="1235" y="933" width="200" height="317" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_GetPSCs_di" bpmnElement="TextAnnotation_Impl_GetPSCs">
+        <dc:Bounds x="1505" y="954" width="200" height="259" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_DispositionCompanyStatus_di" bpmnElement="TextAnnotation_Impl_DispositionCompanyStatus">
+        <dc:Bounds x="700" y="80" width="200" height="317" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_ApplyUboThreshold_di" bpmnElement="TextAnnotation_Impl_ApplyUboThreshold">
+        <dc:Bounds x="1505" y="94" width="200" height="317" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Impl_WriteScreeningAuditNote_di" bpmnElement="TextAnnotation_Impl_WriteScreeningAuditNote">
+        <dc:Bounds x="1805" y="102" width="200" height="302" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Followup_Completed_di" bpmnElement="TextAnnotation_Followup_Completed">
+        <dc:Bounds x="2150" y="415" width="200" height="130" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

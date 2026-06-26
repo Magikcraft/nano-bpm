@@ -1,0 +1,836 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.9.0">
+  <bpmn:process id="Process08ApprovalProcess" name="Phase 8: Tiered Approval (with EDD/MLRO Branch)" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_ApprovalRequested" name="Approval requested">
+      <bpmn:outgoing>Flow_StartToGateway</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gateway_ApprovalRouting" name="Which approval branch?" default="SequenceFlow_ToElevatedBranch">
+      <bpmn:incoming>Flow_StartToGateway</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_ToAnalystBranch</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_ToElevatedBranch</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_ToHighBranch</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_ToMlroBranch</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_PeerAnalystReview" name="Conduct peer analyst review">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-peer-analyst-review" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>SequenceFlow_ToAnalystBranch</bpmn:incoming>
+      <bpmn:outgoing>Flow_PeerReviewToSubmit</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="Task_SubmitAnalystApproval" name="Submit analyst approval" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://clientvault.meridian.local/cdd-cases/&#34; + caseId + &#34;/submit-for-approval&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input source="20" target="connectionTimeoutInSeconds" />
+          <zeebe:input source="20" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ approvalLevel: &#34;ANALYST&#34;, approverUsername: peerReviewerUsername, approvalDate: peerReviewDate }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ analystSubmitStatus: body.status, analystSubmitTimestamp: body.timestamp }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode &#62;= 400 then bpmnError(&#34;SUBMIT_APPROVAL_FAILED&#34;, &#34;ClientVault submit-for-approval failed&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_PeerReviewToSubmit</bpmn:incoming>
+      <bpmn:outgoing>Flow_AnalystSubmitToOutcome</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="Task_SeniorManagerReview" name="Conduct senior manager review">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-senior-manager-review" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>SequenceFlow_ToElevatedBranch</bpmn:incoming>
+      <bpmn:outgoing>Flow_SeniorReviewToSubmit</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="Task_SubmitSeniorApproval" name="Submit senior manager approval" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://clientvault.meridian.local/cdd-cases/&#34; + caseId + &#34;/submit-for-approval&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input source="20" target="connectionTimeoutInSeconds" />
+          <zeebe:input source="20" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ approvalLevel: &#34;SENIOR_MANAGER&#34;, approverUsername: approverUsername, approvalDate: approvalDate }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ seniorSubmitStatus: body.status, seniorSubmitTimestamp: body.timestamp }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode &#62;= 400 then bpmnError(&#34;SUBMIT_APPROVAL_FAILED&#34;, &#34;ClientVault submit-for-approval failed&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SeniorReviewToSubmit</bpmn:incoming>
+      <bpmn:outgoing>Flow_SeniorSubmitToOutcome</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="ParallelGateway_HighSplit" name="">
+      <bpmn:incoming>SequenceFlow_ToHighBranch</bpmn:incoming>
+      <bpmn:outgoing>Flow_HighSplitToSenior</bpmn:outgoing>
+      <bpmn:outgoing>Flow_HighSplitToCompliance</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:userTask id="Task_HighSeniorManagerReview" name="Conduct senior manager co-sign review">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-high-senior-manager-review" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_HighSplitToSenior</bpmn:incoming>
+      <bpmn:outgoing>Flow_HighSeniorToJoin</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="Task_HighComplianceReview" name="Conduct compliance officer co-sign review">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-high-compliance-review" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_HighSplitToCompliance</bpmn:incoming>
+      <bpmn:outgoing>Flow_HighComplianceToJoin</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:parallelGateway id="ParallelGateway_HighJoin" name="">
+      <bpmn:incoming>Flow_HighSeniorToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_HighComplianceToJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_HighJoinToSubmit</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_SubmitHighApprovalAndNote" name="Submit high-tier approval and audit note" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://clientvault.meridian.local/cdd-cases/&#34; + caseId + &#34;/submit-for-approval&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input source="20" target="connectionTimeoutInSeconds" />
+          <zeebe:input source="20" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ approvalLevel: &#34;SENIOR_MANAGER&#34;, approverUsername: complianceApproverUsername, approvalDate: complianceApprovalDate, coApprovers: [{ username: seniorApproverUsername, approvalDate: seniorApprovalDate }, { username: complianceApproverUsername, approvalDate: complianceApprovalDate }], dualCosignRationale: &#34;HIGH-tier dual co-sign per Hard Constraint #10&#34; }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ highSubmitStatus: body.status, highSubmitTimestamp: body.timestamp }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode &#62;= 400 then bpmnError(&#34;SUBMIT_APPROVAL_FAILED&#34;, &#34;ClientVault submit-for-approval failed&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_HighJoinToSubmit</bpmn:incoming>
+      <bpmn:outgoing>Flow_HighSubmitToOutcome</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:subProcess id="SubProcess_EddInvestigation" name="Conduct EDD investigation">
+      <bpmn:incoming>SequenceFlow_ToMlroBranch</bpmn:incoming>
+      <bpmn:outgoing>Flow_EddToMlroSignOff</bpmn:outgoing>
+      <bpmn:startEvent id="StartEvent_EddStart" name="EDD investigation started">
+        <bpmn:outgoing>Flow_EddStartToAi</bpmn:outgoing>
+      </bpmn:startEvent>
+      <bpmn:serviceTask id="Task_DraftEddWithAi" name="Draft EDD investigation with AI" zeebe:modelerTemplate="io.camunda.connectors.aws.bedrock.v1" zeebe:modelerTemplateVersion="3" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPHN2ZyB3aWR0aD0iODBweCIgaGVpZ2h0PSI4MHB4IiB2aWV3Qm94PSIwIDAgODAgODAiIHZlcnNpb249IjEuMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayI+CiAgICA8dGl0bGU+SWNvbi1BcmNoaXRlY3R1cmUvNjQvQXJjaF9BbWF6b24tQmVkcm9ja182NDwvdGl0bGU+CiAgICA8ZyBpZD0iSWNvbi1BcmNoaXRlY3R1cmUvNjQvQXJjaF9BbWF6b24tQmVkcm9ja182NCIgc3Ryb2tlPSJub25lIiBzdHJva2Utd2lkdGg9IjEiIGZpbGw9Im5vbmUiIGZpbGwtcnVsZT0iZXZlbm9kZCI+CiAgICAgICAgPGcgaWQ9Ikljb24tQXJjaGl0ZWN0dXJlLUJHLzY0L01hY2hpbmUtTGVhcm5pbmciIGZpbGw9IiM5OTY5ZjciPgogICAgICAgICAgICA8cmVjdCBpZD0iUmVjdGFuZ2xlIiB4PSIwIiB5PSIwIiB3aWR0aD0iODAiIGhlaWdodD0iODAiPjwvcmVjdD4KICAgICAgICA8L2c+CiAgICAgICAgPGcgaWQ9Ikljb24tU2VydmljZS82NC9BbWF6b24tQmVkcm9ja182NCIgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoMTIuMDAwMDAwLCAxMi4wMDAwMDApIiBmaWxsPSIjRkZGRkZGIj4KICAgICAgICAgICAgPHBhdGggZD0iTTUyLDI2Ljk5OTg5MTggQzUwLjg5NywyNi45OTk4OTE4IDUwLDI2LjEwMjg5MTggNTAsMjQuOTk5ODkxOCBDNTAsMjMuODk2ODkxOCA1MC44OTcsMjIuOTk5ODkxOCA1MiwyMi45OTk4OTE4IEM1My4xMDMsMjIuOTk5ODkxOCA1NCwyMy44OTY4OTE4IDU0LDI0Ljk5OTg5MTggQzU0LDI2LjEwMjg5MTggNTMuMTAzLDI2Ljk5OTg5MTggNTIsMjYuOTk5ODkxOCBMNTIsMjYuOTk5ODkxOCBaIE0yMC4xMTMsNTMuOTA3ODkxOCBMMTYuODY1LDUyLjAxMzg5MTggTDIzLjUzLDQ3Ljg0Nzg5MTggTDIyLjQ3LDQ2LjE1MTg5MTggTDE0LjkxMyw1MC44NzQ4OTE4IEw5LDQ3LjQyNTg5MTggTDksMzguNTM0ODkxOCBMMTQuNTU1LDM0LjgzMTg5MTggTDEzLjQ0NSwzMy4xNjc4OTE4IEw3Ljk1OSwzNi44MjQ4OTE4IEwyLDMzLjQxOTg5MTggTDIsMjguNTc5ODkxOCBMOC40OTYsMjQuODY3ODkxOCBMNy41MDQsMjMuMTMxODkxOCBMMiwyNi4yNzY4OTE4IEwyLDIyLjU3OTg5MTggTDgsMTkuMTUxODkxOCBMMTQsMjIuNTc5ODkxOCBMMTQsMjYuNDMzODkxOCBMOS40ODUsMjkuMTQyODkxOCBMMTAuNTE1LDMwLjg1Njg5MTggTDE1LDI4LjE2NTg5MTggTDE5LjQ4NSwzMC44NTY4OTE4IEwyMC41MTUsMjkuMTQyODkxOCBMMTYsMjYuNDMzODkxOCBMMTYsMjIuNTM0ODkxOCBMMjEuNTU1LDE4LjgzMTg5MTggQzIxLjgzMywxOC42NDU4OTE4IDIyLDE4LjMzMzg5MTggMjIsMTcuOTk5ODkxOCBMMjIsMTAuOTk5ODkxOCBMMjAsMTAuOTk5ODkxOCBMMjAsMTcuNDY0ODkxOCBMMTQuOTU5LDIwLjgyNDg5MTggTDksMTcuNDE5ODkxOCBMOSw4LjU3Mzg5MTgxIEwxNCw1LjY1Nzg5MTgxIEwxNCwxMy45OTk4OTE4IEwxNiwxMy45OTk4OTE4IEwxNiw0LjQ5MDg5MTgxIEwyMC4xMTMsMi4wOTE4OTE4MSBMMjgsNC43MjA4OTE4MSBMMjgsMzMuNDMzODkxOCBMMTMuNDg1LDQyLjE0Mjg5MTggTDE0LjUxNSw0My44NTY4OTE4IEwyOCwzNS43NjU4OTE4IEwyOCw1MS4yNzg4OTE4IEwyMC4xMTMsNTMuOTA3ODkxOCBaIE01MCwzNy45OTk4OTE4IEM1MCwzOS4xMDI4OTE4IDQ5LjEwMywzOS45OTk4OTE4IDQ4LDM5Ljk5OTg5MTggQzQ2Ljg5NywzOS45OTk4OTE4IDQ2LDM5LjEwMjg5MTggNDYsMzcuOTk5ODkxOCBDNDYsMzYuODk2ODkxOCA0Ni44OTcsMzUuOTk5ODkxOCA0OCwzNS45OTk4OTE4IEM0OS4xMDMsMzUuOTk5ODkxOCA1MCwzNi44OTY4OTE4IDUwLDM3Ljk5OTg5MTggTDUwLDM3Ljk5OTg5MTggWiBNNDAsNDcuOTk5ODkxOCBDNDAsNDkuMTAyODkxOCAzOS4xMDMsNDkuOTk5ODkxOCAzOCw0OS45OTk4OTE4IEMzNi44OTcsNDkuOTk5ODkxOCAzNiw0OS4xMDI4OTE4IDM2LDQ3Ljk5OTg5MTggQzM2LDQ2Ljg5Njg5MTggMzYuODk3LDQ1Ljk5OTg5MTggMzgsNDUuOTk5ODkxOCBDMzkuMTAzLDQ1Ljk5OTg5MTggNDAsNDYuODk2ODkxOCA0MCw0Ny45OTk4OTE4IEw0MCw0Ny45OTk4OTE4IFogTTM5LDcuOTk5ODkxODEgQzM5LDYuODk2ODkxODEgMzkuODk3LDUuOTk5ODkxODEgNDEsNS45OTk4OTE4MSBDNDIuMTAzLDUuOTk5ODkxODEgNDMsNi44OTY4OTE4MSA0Myw3Ljk5OTg5MTgxIEM0Myw5LjEwMjg5MTgxIDQyLjEwMyw5Ljk5OTg5MTgxIDQxLDkuOTk5ODkxODEgQzM5Ljg5Nyw5Ljk5OTg5MTgxIDM5LDkuMTAyODkxODEgMzksNy45OTk4OTE4MSBMMzksNy45OTk4OTE4MSBaIE01MiwyMC45OTk4OTE4IEM1MC4xNDEsMjAuOTk5ODkxOCA0OC41ODksMjIuMjc5ODkxOCA0OC4xNDIsMjMuOTk5ODkxOCBMMzAsMjMuOTk5ODkxOCBMMzAsMTguOTk5ODkxOCBMNDEsMTguOTk5ODkxOCBDNDEuNTUzLDE4Ljk5OTg5MTggNDIsMTguNTUxODkxOCA0MiwxNy45OTk4OTE4IEw0MiwxMS44NTc4OTE4IEM0My43MiwxMS40MTA4OTE4IDQ1LDkuODU3ODkxODEgNDUsNy45OTk4OTE4MSBDNDUsNS43OTM4OTE4MSA0My4yMDYsMy45OTk4OTE4MSA0MSwzLjk5OTg5MTgxIEMzOC43OTQsMy45OTk4OTE4MSAzNyw1Ljc5Mzg5MTgxIDM3LDcuOTk5ODkxODEgQzM3LDkuODU3ODkxODEgMzguMjgsMTEuNDEwODkxOCA0MCwxMS44NTc4OTE4IEw0MCwxNi45OTk4OTE4IEwzMCwxNi45OTk4OTE4IEwzMCwzLjk5OTg5MTgxIEMzMCwzLjU2ODg5MTgxIDI5LjcyNSwzLjE4Nzg5MTgxIDI5LjMxNiwzLjA1MDg5MTgxIEwyMC4zMTYsMC4wNTA4OTE4MTEgQzIwLjA0MiwtMC4wMzkxMDgxODkgMTkuNzQ0LC0wLjAwOTEwODE4OTA0IDE5LjQ5NiwwLjEzNTg5MTgxMSBMNy40OTYsNy4xMzU4OTE4MSBDNy4xODgsNy4zMTQ4OTE4MSA3LDcuNjQ0ODkxODEgNyw3Ljk5OTg5MTgxIEw3LDE3LjQxOTg5MTggTDAuNTA0LDIxLjEzMTg5MTggQzAuMTkyLDIxLjMwOTg5MTggMCwyMS42NDA4OTE4IDAsMjEuOTk5ODkxOCBMMCwzMy45OTk4OTE4IEMwLDM0LjM1ODg5MTggMC4xOTIsMzQuNjg5ODkxOCAwLjUwNCwzNC44Njc4OTE4IEw3LDM4LjU3OTg5MTggTDcsNDcuOTk5ODkxOCBDNyw0OC4zNTQ4OTE4IDcuMTg4LDQ4LjY4NDg5MTggNy40OTYsNDguODYzODkxOCBMMTkuNDk2LDU1Ljg2Mzg5MTggQzE5LjY1LDU1Ljk1Mzg5MTggMTkuODI1LDU1Ljk5OTg5MTggMjAsNTUuOTk5ODkxOCBDMjAuMTA2LDU1Ljk5OTg5MTggMjAuMjEzLDU1Ljk4Mjg5MTggMjAuMzE2LDU1Ljk0ODg5MTggTDI5LjMxNiw1Mi45NDg4OTE4IEMyOS43MjUsNTIuODExODkxOCAzMCw1Mi40MzA4OTE4IDMwLDUxLjk5OTg5MTggTDMwLDM5Ljk5OTg5MTggTDM3LDM5Ljk5OTg5MTggTDM3LDQ0LjE0MTg5MTggQzM1LjI4LDQ0LjU4ODg5MTggMzQsNDYuMTQxODkxOCAzNCw0Ny45OTk4OTE4IEMzNCw1MC4yMDU4OTE4IDM1Ljc5NCw1MS45OTk4OTE4IDM4LDUxLjk5OTg5MTggQzQwLjIwNiw1MS45OTk4OTE4IDQyLDUwLjIwNTg5MTggNDIsNDcuOTk5ODkxOCBDNDIsNDYuMTQxODkxOCA0MC43Miw0NC41ODg4OTE4IDM5LDQ0LjE0MTg5MTggTDM5LDM4Ljk5OTg5MTggQzM5LDM4LjQ0Nzg5MTggMzguNTUzLDM3Ljk5OTg5MTggMzgsMzcuOTk5ODkxOCBMMzAsMzcuOTk5ODkxOCBMMzAsMzIuOTk5ODkxOCBMNDIuNSwzMi45OTk4OTE4IEw0NC42MzgsMzUuODQ5ODkxOCBDNDQuMjM5LDM2LjQ3MTg5MTggNDQsMzcuMjA2ODkxOCA0NCwzNy45OTk4OTE4IEM0NCw0MC4yMDU4OTE4IDQ1Ljc5NCw0MS45OTk4OTE4IDQ4LDQxLjk5OTg5MTggQzUwLjIwNiw0MS45OTk4OTE4IDUyLDQwLjIwNTg5MTggNTIsMzcuOTk5ODkxOCBDNTIsMzUuNzkzODkxOCA1MC4yMDYsMzMuOTk5ODkxOCA0OCwzMy45OTk4OTE4IEM0Ny4zMTYsMzMuOTk5ODkxOCA0Ni42ODIsMzQuMTg3ODkxOCA0Ni4xMTksMzQuNDkxODkxOCBMNDMuOCwzMS4zOTk4OTE4IEM0My42MTEsMzEuMTQ3ODkxOCA0My4zMTQsMzAuOTk5ODkxOCA0MywzMC45OTk4OTE4IEwzMCwzMC45OTk4OTE4IEwzMCwyNS45OTk4OTE4IEw0OC4xNDIsMjUuOTk5ODkxOCBDNDguNTg5LDI3LjcxOTg5MTggNTAuMTQxLDI4Ljk5OTg5MTggNTIsMjguOTk5ODkxOCBDNTQuMjA2LDI4Ljk5OTg5MTggNTYsMjcuMjA1ODkxOCA1NiwyNC45OTk4OTE4IEM1NiwyMi43OTM4OTE4IDU0LjIwNiwyMC45OTk4OTE4IDUyLDIwLjk5OTg5MTggTDUyLDIwLjk5OTg5MTggWiIgaWQ9IkZpbGwtMSI+PC9wYXRoPgogICAgICAgIDwvZz4KICAgIDwvZz4KPC9zdmc+">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="io.camunda:aws-bedrock:1" />
+          <zeebe:ioMapping>
+            <zeebe:input source="credentials" target="authentication.type" />
+            <zeebe:input source="{{secrets.AWS_ACCESS_KEY}}" target="authentication.accessKey" />
+            <zeebe:input source="{{secrets.AWS_SECRET_KEY}}" target="authentication.secretKey" />
+            <zeebe:input source="{{secrets.AWS_REGION}}" target="configuration.region" />
+            <zeebe:input target="configuration.endpoint" />
+            <zeebe:input source="invokeModel" target="action" />
+            <zeebe:input source="=&#34;anthropic.claude-3-5-sonnet-20241022-v2:0&#34;" target="data.modelId" />
+            <zeebe:input source="={ messages: [{ role: &#34;user&#34;, content: &#34;Draft an Enhanced Due Diligence investigation report for case &#34; + caseId + &#34; (&#34; + clientLegalName + &#34;), risk tier &#34; + newRiskTier + &#34;. Include source-of-wealth analysis, PEP/sanctions context, jurisdictional risk, and recommended corroboration sources.&#34; }] }" target="data.payload" />
+            <zeebe:input target="data.messagesHistory" />
+            <zeebe:input target="data.modelId" />
+            <zeebe:input target="data.newMessage" />
+            <zeebe:input source="=4096" target="data.maxTokens" />
+            <zeebe:input source="=0.2" target="data.temperature" />
+            <zeebe:input target="data.topP" />
+            <zeebe:input target="data.newDocuments" />
+          </zeebe:ioMapping>
+          <zeebe:taskHeaders>
+            <zeebe:header key="elementTemplateVersion" value="3" />
+            <zeebe:header key="elementTemplateId" value="io.camunda.connectors.aws.bedrock.v1" />
+            <zeebe:header key="resultExpression" value="={ eddDraftContent: response.body.content, eddDraftModelId: response.body.modelId }" />
+          </zeebe:taskHeaders>
+        </bpmn:extensionElements>
+        <bpmn:incoming>Flow_EddStartToAi</bpmn:incoming>
+        <bpmn:outgoing>Flow_EddAiToReview</bpmn:outgoing>
+      </bpmn:serviceTask>
+      <bpmn:userTask id="Task_AnalystReviewEddDraft" name="Review EDD draft">
+        <bpmn:extensionElements>
+          <zeebe:userTask />
+          <zeebe:formDefinition formId="form-review-edd-draft" />
+        </bpmn:extensionElements>
+        <bpmn:incoming>Flow_EddAiToReview</bpmn:incoming>
+        <bpmn:outgoing>Flow_EddReviewToEnd</bpmn:outgoing>
+      </bpmn:userTask>
+      <bpmn:endEvent id="EndEvent_EddEnd" name="EDD draft ready">
+        <bpmn:incoming>Flow_EddReviewToEnd</bpmn:incoming>
+      </bpmn:endEvent>
+      <bpmn:sequenceFlow id="Flow_EddStartToAi" sourceRef="StartEvent_EddStart" targetRef="Task_DraftEddWithAi" />
+      <bpmn:sequenceFlow id="Flow_EddAiToReview" sourceRef="Task_DraftEddWithAi" targetRef="Task_AnalystReviewEddDraft" />
+      <bpmn:sequenceFlow id="Flow_EddReviewToEnd" sourceRef="Task_AnalystReviewEddDraft" targetRef="EndEvent_EddEnd" />
+    </bpmn:subProcess>
+    <bpmn:userTask id="Task_MlroSignOff" name="Sign off EDD case">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-mlro-sign-off" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_EddToMlroSignOff</bpmn:incoming>
+      <bpmn:outgoing>Flow_MlroSignOffToSubmit</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="Task_SubmitMlroApprovalAndChecklist" name="Submit MLRO approval and EDD checklist" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://clientvault.meridian.local/cdd-cases/&#34; + caseId + &#34;/submit-for-approval&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input source="20" target="connectionTimeoutInSeconds" />
+          <zeebe:input source="20" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ approvalLevel: &#34;MLRO&#34;, approverUsername: mlroApproverUsername, approvalDate: mlroApprovalDate, eddChecklist: { meetingType: meetingType, meetingDate: meetingDate, sourceOfWealthEvidenceSummary: sourceOfWealthEvidenceSummary, independentCorroborationSource: independentCorroborationSource, mlroSignOff: mlroSignOff } }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ mlroSubmitStatus: body.status, mlroSubmitTimestamp: body.timestamp }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode &#62;= 400 then bpmnError(&#34;SUBMIT_APPROVAL_FAILED&#34;, &#34;ClientVault submit-for-approval failed&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_MlroSignOffToSubmit</bpmn:incoming>
+      <bpmn:outgoing>Flow_MlroSubmitToOutcome</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="Gateway_ReviewOutcomeMerge" name="">
+      <bpmn:incoming>Flow_AnalystSubmitToOutcome</bpmn:incoming>
+      <bpmn:incoming>Flow_SeniorSubmitToOutcome</bpmn:incoming>
+      <bpmn:incoming>Flow_HighSubmitToOutcome</bpmn:incoming>
+      <bpmn:incoming>Flow_MlroSubmitToOutcome</bpmn:incoming>
+      <bpmn:outgoing>Flow_OutcomeMergeToDecision</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="Gateway_ReviewDecision" name="Review approved?" default="SequenceFlow_ReviewApproved">
+      <bpmn:incoming>Flow_OutcomeMergeToDecision</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_ReviewApproved</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_ReviewRejected</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:endEvent id="EndEvent_CaseApproved" name="Case approved">
+      <bpmn:incoming>SequenceFlow_ReviewApproved</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:serviceTask id="Task_PatchCaseUnderReview" name="Set case status to under review" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="PATCH" target="method" />
+          <zeebe:input source="=&#34;https://clientvault.meridian.local/cdd-cases/&#34; + caseId" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input source="20" target="connectionTimeoutInSeconds" />
+          <zeebe:input source="20" target="readTimeoutInSeconds" />
+          <zeebe:input source="={ status: &#34;UNDER_REVIEW&#34;, rejectionComments: rejectionComments }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ patchUnderReviewStatus: body.status }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode &#62;= 400 then bpmnError(&#34;PATCH_CASE_FAILED&#34;, &#34;ClientVault PATCH /cdd-cases failed&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>SequenceFlow_ReviewRejected</bpmn:incoming>
+      <bpmn:outgoing>Flow_PatchToRevision</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="Task_AnalystRevision" name="Revise case">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-analyst-revision" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_PatchToRevision</bpmn:incoming>
+      <bpmn:outgoing>Flow_RevisionToOutcome</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gateway_RevisionOutcome" name="Revision outcome?" default="SequenceFlow_RevisionResubmit">
+      <bpmn:incoming>Flow_RevisionToOutcome</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_RevisionResubmit</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_RevisionEscalate</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:endEvent id="EndEvent_CaseEscalated" name="Case escalated">
+      <bpmn:incoming>SequenceFlow_RevisionEscalate</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_CaseResubmitted" name="Case resubmitted for re-approval">
+      <bpmn:incoming>SequenceFlow_RevisionResubmit</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_StartToGateway" sourceRef="StartEvent_ApprovalRequested" targetRef="Gateway_ApprovalRouting" />
+    <bpmn:sequenceFlow id="SequenceFlow_ToAnalystBranch" name="Analyst" sourceRef="Gateway_ApprovalRouting" targetRef="Task_PeerAnalystReview">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=approvalLevel = "ANALYST"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SequenceFlow_ToElevatedBranch" name="Senior manager (elevated)" sourceRef="Gateway_ApprovalRouting" targetRef="Task_SeniorManagerReview" />
+    <bpmn:sequenceFlow id="SequenceFlow_ToHighBranch" name="Senior manager (high co-sign)" sourceRef="Gateway_ApprovalRouting" targetRef="ParallelGateway_HighSplit">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=approvalLevel = "SENIOR_MANAGER" and newRiskTier = "HIGH"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SequenceFlow_ToMlroBranch" name="MLRO" sourceRef="Gateway_ApprovalRouting" targetRef="SubProcess_EddInvestigation">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=approvalLevel = "MLRO"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_PeerReviewToSubmit" sourceRef="Task_PeerAnalystReview" targetRef="Task_SubmitAnalystApproval" />
+    <bpmn:sequenceFlow id="Flow_AnalystSubmitToOutcome" sourceRef="Task_SubmitAnalystApproval" targetRef="Gateway_ReviewOutcomeMerge" />
+    <bpmn:sequenceFlow id="Flow_SeniorReviewToSubmit" sourceRef="Task_SeniorManagerReview" targetRef="Task_SubmitSeniorApproval" />
+    <bpmn:sequenceFlow id="Flow_SeniorSubmitToOutcome" sourceRef="Task_SubmitSeniorApproval" targetRef="Gateway_ReviewOutcomeMerge" />
+    <bpmn:sequenceFlow id="Flow_HighSplitToSenior" sourceRef="ParallelGateway_HighSplit" targetRef="Task_HighSeniorManagerReview" />
+    <bpmn:sequenceFlow id="Flow_HighSplitToCompliance" sourceRef="ParallelGateway_HighSplit" targetRef="Task_HighComplianceReview" />
+    <bpmn:sequenceFlow id="Flow_HighSeniorToJoin" sourceRef="Task_HighSeniorManagerReview" targetRef="ParallelGateway_HighJoin" />
+    <bpmn:sequenceFlow id="Flow_HighComplianceToJoin" sourceRef="Task_HighComplianceReview" targetRef="ParallelGateway_HighJoin" />
+    <bpmn:sequenceFlow id="Flow_HighJoinToSubmit" sourceRef="ParallelGateway_HighJoin" targetRef="Task_SubmitHighApprovalAndNote" />
+    <bpmn:sequenceFlow id="Flow_HighSubmitToOutcome" sourceRef="Task_SubmitHighApprovalAndNote" targetRef="Gateway_ReviewOutcomeMerge" />
+    <bpmn:sequenceFlow id="Flow_EddToMlroSignOff" sourceRef="SubProcess_EddInvestigation" targetRef="Task_MlroSignOff" />
+    <bpmn:sequenceFlow id="Flow_MlroSignOffToSubmit" sourceRef="Task_MlroSignOff" targetRef="Task_SubmitMlroApprovalAndChecklist" />
+    <bpmn:sequenceFlow id="Flow_MlroSubmitToOutcome" sourceRef="Task_SubmitMlroApprovalAndChecklist" targetRef="Gateway_ReviewOutcomeMerge" />
+    <bpmn:sequenceFlow id="Flow_OutcomeMergeToDecision" sourceRef="Gateway_ReviewOutcomeMerge" targetRef="Gateway_ReviewDecision" />
+    <bpmn:sequenceFlow id="SequenceFlow_ReviewApproved" name="Approved" sourceRef="Gateway_ReviewDecision" targetRef="EndEvent_CaseApproved" />
+    <bpmn:sequenceFlow id="SequenceFlow_ReviewRejected" name="Rejected" sourceRef="Gateway_ReviewDecision" targetRef="Task_PatchCaseUnderReview">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=reviewOutcome = "reject_back_to_analyst"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_PatchToRevision" sourceRef="Task_PatchCaseUnderReview" targetRef="Task_AnalystRevision" />
+    <bpmn:sequenceFlow id="Flow_RevisionToOutcome" sourceRef="Task_AnalystRevision" targetRef="Gateway_RevisionOutcome" />
+    <bpmn:sequenceFlow id="SequenceFlow_RevisionResubmit" name="Revise and resubmit" sourceRef="Gateway_RevisionOutcome" targetRef="EndEvent_CaseResubmitted" />
+    <bpmn:sequenceFlow id="SequenceFlow_RevisionEscalate" name="Escalate" sourceRef="Gateway_RevisionOutcome" targetRef="EndEvent_CaseEscalated">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=analystRevisionOutcome = "escalate"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:textAnnotation id="TextAnnotation_Start">
+      <bpmn:text>Triggered by: Phase 7 (DMN risk-tier output) — sets approvalLevel and newRiskTier on the case.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Routing">
+      <bpmn:text>Evaluates: approvalLevel, newRiskTier, eddRequired</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_PeerReview">
+      <bpmn:text>Manual: Peer review attestation closes the FCA Q4 2024 ~15% missing-approver gap; cannot be automated. Implementation: Camunda User Task assigned to kyc-analysts group with rule assignee != case.assignedAnalyst; non-interrupting timer 24h notifies kyc-team-lead; interrupting timer 5 business days escalates to KYC team lead.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_AnalystSubmit">
+      <bpmn:text>Implementation: ClientVault REST connector POST /cdd-cases/{caseId}/submit-for-approval with approvalLevel: ANALYST and validated approverUsername/approvalDate (pre-flight completeness guard). HTTP 4xx/5xx routes to incident-handler.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_SeniorReview">
+      <bpmn:text>Manual: Senior manager attestation on ELEVATED-tier risk profile; section-166 exposure sits with the named approver. Implementation: Camunda User Task assigned to kyc-senior-managers group; non-interrupting timer 48h notifies kyc-team-lead; interrupting timer 7 business days escalates to MLRO.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_SeniorSubmit">
+      <bpmn:text>Implementation: ClientVault REST connector POST /cdd-cases/{caseId}/submit-for-approval with approvalLevel: SENIOR_MANAGER. Same pre-flight completeness guard and HTTP error routing as analyst branch.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_HighSeniorReview">
+      <bpmn:text>Manual: HIGH-tier dual co-sign mandated by Hard Constraint #10 (non-delegable human judgement). Implementation: Camunda User Task assigned to kyc-senior-managers group; produces seniorApproverUsername/seniorApprovalDate; same SLA timers as elevated branch.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_HighComplianceReview">
+      <bpmn:text>Manual: Compliance officer co-sign — independent of senior manager review (no data dependency); parallelization advances cycle time without weakening Hard Constraint #10. Implementation: Camunda User Task assigned to compliance-officers group; produces complianceApproverUsername/complianceApprovalDate; same SLA timers.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_HighSubmit">
+      <bpmn:text>Implementation: ClientVault REST connector POST /cdd-cases/{caseId}/submit-for-approval (approvalLevel: SENIOR_MANAGER, last-completed approver) plus POST /cdd-cases/{caseId}/notes capturing both approver identities and dual-cosign rationale. Wrapped in transaction subprocess so a failed audit note rolls back the submit (preserves Hard Constraint #12).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EddSubprocess">
+      <bpmn:text>Implementation: AWS Bedrock (Claude Sonnet) drafts registry summaries, adverse-media digests, and source-of-wealth narratives; analyst review gate is unconditional (no auto-apply branch) per Hard Constraint #1. Bedrock connector failure falls back to manual analyst investigation.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_MlroSignOff">
+      <bpmn:text>Manual: MLRO sign-off is non-delegable human judgement under JMLSG section 5.5.34; criminal liability under MLR 2017. Implementation: Camunda User Task with extended EDD checklist form (meetingType, meetingDate, sourceOfWealthEvidenceSummary, independentCorroborationSource, mlroSignOff); assigned to mlro group (Deputy MLRO permitted up to 12 weeks rolling per JMLSG section 3.19); non-interrupting timer 72h notifies kyc-team-lead; interrupting timer 10 business days escalates to Head of Compliance.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_MlroSubmit">
+      <bpmn:text>Implementation: Transaction subprocess wrapping ClientVault REST POST /cdd-cases/{caseId}/submit-for-approval (approvalLevel: MLRO) and POST /cdd-cases/{caseId}/notes (serialised EDD checklist) — atomic per Hard Constraint #12 to prevent FCA-flagged failure mode of approved case with missing checklist note.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_OutcomeDecision">
+      <bpmn:text>Evaluates: peerReviewOutcome / seniorReviewOutcome / complianceReviewOutcome / mlroOutcome (whichever applies for the taken branch)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Patch">
+      <bpmn:text>Implementation: ClientVault REST connector PATCH /cdd-cases/{caseId} setting case.status: UNDER_REVIEW with rejectionComments. HTTP 4xx/5xx routes to incident-handler.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Revision">
+      <bpmn:text>Manual: Revise/escalate decision is genuine human judgement; rare and requires triage. Implementation: Camunda User Task assigned to original case.assignedAnalyst (NOT a peer); non-interrupting timer 48h notifies kyc-team-lead; interrupting timer 5 business days escalates.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_RevisionOutcome">
+      <bpmn:text>Evaluates: analystRevisionOutcome (revise_and_resubmit | escalate)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Approved">
+      <bpmn:text>Follow-up: Phase 9 (closure) — case.status: APPROVED; SLA dashboard event emitted (caseId, branch taken, approver IDs, durations) to ClientVault /notes (noteType: SYSTEM).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Resubmitted">
+      <bpmn:text>Follow-up: Re-enters Phase 8 at Gateway-1 (manualRiskTier unchanged) or Phase 7 DMN (manualRiskTier changed per JMLSG section 4.50).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_Escalated">
+      <bpmn:text>Follow-up: Routes upward to KYC team lead / MLRO per H-I5 exit shape.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Start" associationDirection="None" sourceRef="StartEvent_ApprovalRequested" targetRef="TextAnnotation_Start" />
+    <bpmn:association id="Association_Routing" associationDirection="None" sourceRef="Gateway_ApprovalRouting" targetRef="TextAnnotation_Routing" />
+    <bpmn:association id="Association_PeerReview" associationDirection="None" sourceRef="Task_PeerAnalystReview" targetRef="TextAnnotation_PeerReview" />
+    <bpmn:association id="Association_AnalystSubmit" associationDirection="None" sourceRef="Task_SubmitAnalystApproval" targetRef="TextAnnotation_AnalystSubmit" />
+    <bpmn:association id="Association_SeniorReview" associationDirection="None" sourceRef="Task_SeniorManagerReview" targetRef="TextAnnotation_SeniorReview" />
+    <bpmn:association id="Association_SeniorSubmit" associationDirection="None" sourceRef="Task_SubmitSeniorApproval" targetRef="TextAnnotation_SeniorSubmit" />
+    <bpmn:association id="Association_HighSeniorReview" associationDirection="None" sourceRef="Task_HighSeniorManagerReview" targetRef="TextAnnotation_HighSeniorReview" />
+    <bpmn:association id="Association_HighComplianceReview" associationDirection="None" sourceRef="Task_HighComplianceReview" targetRef="TextAnnotation_HighComplianceReview" />
+    <bpmn:association id="Association_HighSubmit" associationDirection="None" sourceRef="Task_SubmitHighApprovalAndNote" targetRef="TextAnnotation_HighSubmit" />
+    <bpmn:association id="Association_EddSubprocess" associationDirection="None" sourceRef="SubProcess_EddInvestigation" targetRef="TextAnnotation_EddSubprocess" />
+    <bpmn:association id="Association_MlroSignOff" associationDirection="None" sourceRef="Task_MlroSignOff" targetRef="TextAnnotation_MlroSignOff" />
+    <bpmn:association id="Association_MlroSubmit" associationDirection="None" sourceRef="Task_SubmitMlroApprovalAndChecklist" targetRef="TextAnnotation_MlroSubmit" />
+    <bpmn:association id="Association_OutcomeDecision" associationDirection="None" sourceRef="Gateway_ReviewDecision" targetRef="TextAnnotation_OutcomeDecision" />
+    <bpmn:association id="Association_Patch" associationDirection="None" sourceRef="Task_PatchCaseUnderReview" targetRef="TextAnnotation_Patch" />
+    <bpmn:association id="Association_Revision" associationDirection="None" sourceRef="Task_AnalystRevision" targetRef="TextAnnotation_Revision" />
+    <bpmn:association id="Association_RevisionOutcome" associationDirection="None" sourceRef="Gateway_RevisionOutcome" targetRef="TextAnnotation_RevisionOutcome" />
+    <bpmn:association id="Association_Approved" associationDirection="None" sourceRef="EndEvent_CaseApproved" targetRef="TextAnnotation_Approved" />
+    <bpmn:association id="Association_Resubmitted" associationDirection="None" sourceRef="EndEvent_CaseResubmitted" targetRef="TextAnnotation_Resubmitted" />
+    <bpmn:association id="Association_Escalated" associationDirection="None" sourceRef="EndEvent_CaseEscalated" targetRef="TextAnnotation_Escalated" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process08ApprovalProcess">
+    <bpmndi:BPMNPlane id="BPMNPlane_Process08ApprovalProcess" bpmnElement="Process08ApprovalProcess">
+      <bpmndi:BPMNShape id="StartEvent_ApprovalRequested_di" bpmnElement="StartEvent_ApprovalRequested">
+        <dc:Bounds x="287" y="382" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="281" y="418" width="49" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_ApprovalRouting_di" bpmnElement="Gateway_ApprovalRouting" isMarkerVisible="true">
+        <dc:Bounds x="430" y="375" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="362" y="425" width="76" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PeerAnalystReview_di" bpmnElement="Task_PeerAnalystReview">
+        <dc:Bounds x="555" y="360" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SubmitAnalystApproval_di" bpmnElement="Task_SubmitAnalystApproval">
+        <dc:Bounds x="705" y="360" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SeniorManagerReview_di" bpmnElement="Task_SeniorManagerReview">
+        <dc:Bounds x="555" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SubmitSeniorApproval_di" bpmnElement="Task_SubmitSeniorApproval">
+        <dc:Bounds x="705" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_HighSplit_di" bpmnElement="ParallelGateway_HighSplit">
+        <dc:Bounds x="880" y="585" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_HighSeniorManagerReview_di" bpmnElement="Task_HighSeniorManagerReview">
+        <dc:Bounds x="1005" y="570" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_HighJoin_di" bpmnElement="ParallelGateway_HighJoin">
+        <dc:Bounds x="1180" y="585" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SubmitHighApprovalAndNote_di" bpmnElement="Task_SubmitHighApprovalAndNote">
+        <dc:Bounds x="1305" y="570" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_HighComplianceReview_di" bpmnElement="Task_HighComplianceReview">
+        <dc:Bounds x="1005" y="684" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_MlroSignOff_di" bpmnElement="Task_MlroSignOff">
+        <dc:Bounds x="705" y="780" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SubmitMlroApprovalAndChecklist_di" bpmnElement="Task_SubmitMlroApprovalAndChecklist">
+        <dc:Bounds x="855" y="780" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_ReviewOutcomeMerge_di" bpmnElement="Gateway_ReviewOutcomeMerge" isMarkerVisible="true">
+        <dc:Bounds x="1480" y="375" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_ReviewDecision_di" bpmnElement="Gateway_ReviewDecision" isMarkerVisible="true">
+        <dc:Bounds x="1630" y="375" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1584" y="418" width="52" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_CaseApproved_di" bpmnElement="EndEvent_CaseApproved">
+        <dc:Bounds x="1787" y="382" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1768" y="418" width="75" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PatchCaseUnderReview_di" bpmnElement="Task_PatchCaseUnderReview">
+        <dc:Bounds x="1755" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AnalystRevision_di" bpmnElement="Task_AnalystRevision">
+        <dc:Bounds x="1905" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_RevisionOutcome_di" bpmnElement="Gateway_RevisionOutcome" isMarkerVisible="true">
+        <dc:Bounds x="2080" y="515" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2035" y="565" width="49" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_CaseEscalated_di" bpmnElement="EndEvent_CaseEscalated">
+        <dc:Bounds x="2237" y="662" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2217" y="698" width="76" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_CaseResubmitted_di" bpmnElement="EndEvent_CaseResubmitted">
+        <dc:Bounds x="2237" y="522" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2212" y="558" width="87" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="SubProcess_EddInvestigation_di" bpmnElement="SubProcess_EddInvestigation">
+        <dc:Bounds x="555" y="780" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_Start_di" bpmnElement="Association_Start">
+        <di:waypoint x="305" y="382" />
+        <di:waypoint x="305" y="330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Routing_di" bpmnElement="Association_Routing">
+        <di:waypoint x="455" y="375" />
+        <di:waypoint x="455" y="238" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_OutcomeDecision_di" bpmnElement="Association_OutcomeDecision">
+        <di:waypoint x="1655" y="375" />
+        <di:waypoint x="1655" y="325" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Approved_di" bpmnElement="Association_Approved">
+        <di:waypoint x="1823" y="382" />
+        <di:waypoint x="1825" y="332" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_PeerReview_di" bpmnElement="Association_PeerReview">
+        <di:waypoint x="640" y="360" />
+        <di:waypoint x="592" y="310" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_AnalystSubmit_di" bpmnElement="Association_AnalystSubmit">
+        <di:waypoint x="780" y="360" />
+        <di:waypoint x="825" y="310" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_HighSeniorReview_di" bpmnElement="Association_HighSeniorReview">
+        <di:waypoint x="1110" y="610" />
+        <di:waypoint x="1270" y="311" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_SeniorSubmit_di" bpmnElement="Association_SeniorSubmit">
+        <di:waypoint x="809" y="540" />
+        <di:waypoint x="993" y="267" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EddSubprocess_di" bpmnElement="Association_EddSubprocess">
+        <di:waypoint x="600" y="860" />
+        <di:waypoint x="591" y="924" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_MlroSignOff_di" bpmnElement="Association_MlroSignOff">
+        <di:waypoint x="797" y="860" />
+        <di:waypoint x="774" y="922" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_MlroSubmit_di" bpmnElement="Association_MlroSubmit">
+        <di:waypoint x="941" y="860" />
+        <di:waypoint x="1018" y="920" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_HighComplianceReview_di" bpmnElement="Association_HighComplianceReview">
+        <di:waypoint x="1092" y="764" />
+        <di:waypoint x="1230" y="913" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_HighSubmit_di" bpmnElement="Association_HighSubmit">
+        <di:waypoint x="1373" y="650" />
+        <di:waypoint x="1492" y="906" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_SeniorReview_di" bpmnElement="Association_SeniorReview">
+        <di:waypoint x="555" y="556" />
+        <di:waypoint x="360" y="684" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Patch_di" bpmnElement="Association_Patch">
+        <di:waypoint x="1775" y="580" />
+        <di:waypoint x="1744" y="622" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Revision_di" bpmnElement="Association_Revision">
+        <di:waypoint x="1976" y="500" />
+        <di:waypoint x="2060" y="427" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Resubmitted_di" bpmnElement="Association_Resubmitted">
+        <di:waypoint x="2275" y="540" />
+        <di:waypoint x="2340" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Escalated_di" bpmnElement="Association_Escalated">
+        <di:waypoint x="2273" y="680" />
+        <di:waypoint x="2340" y="680" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_RevisionOutcome_di" bpmnElement="Association_RevisionOutcome">
+        <di:waypoint x="2098" y="558" />
+        <di:waypoint x="2035" y="710" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_Start_di" bpmnElement="TextAnnotation_Start">
+        <dc:Bounds x="205" y="258" width="200" height="72" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Routing_di" bpmnElement="TextAnnotation_Routing">
+        <dc:Bounds x="355" y="195" width="200" height="43" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_OutcomeDecision_di" bpmnElement="TextAnnotation_OutcomeDecision">
+        <dc:Bounds x="1555" y="224" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Approved_di" bpmnElement="TextAnnotation_Approved">
+        <dc:Bounds x="1825" y="217" width="200" height="115" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_StartToGateway_di" bpmnElement="Flow_StartToGateway">
+        <di:waypoint x="323" y="400" />
+        <di:waypoint x="430" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ToAnalystBranch_di" bpmnElement="SequenceFlow_ToAnalystBranch">
+        <di:waypoint x="480" y="400" />
+        <di:waypoint x="555" y="400" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="499" y="375" width="37" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ToElevatedBranch_di" bpmnElement="SequenceFlow_ToElevatedBranch">
+        <di:waypoint x="455" y="425" />
+        <di:waypoint x="455" y="540" />
+        <di:waypoint x="555" y="540" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="460" y="506" width="79" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ToHighBranch_di" bpmnElement="SequenceFlow_ToHighBranch">
+        <di:waypoint x="455" y="425" />
+        <di:waypoint x="455" y="610" />
+        <di:waypoint x="880" y="610" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="460" y="576" width="79" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ToMlroBranch_di" bpmnElement="SequenceFlow_ToMlroBranch">
+        <di:waypoint x="455" y="425" />
+        <di:waypoint x="455" y="820" />
+        <di:waypoint x="555" y="820" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="474" y="803" width="32" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PeerReviewToSubmit_di" bpmnElement="Flow_PeerReviewToSubmit">
+        <di:waypoint x="655" y="400" />
+        <di:waypoint x="705" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AnalystSubmitToOutcome_di" bpmnElement="Flow_AnalystSubmitToOutcome">
+        <di:waypoint x="805" y="400" />
+        <di:waypoint x="1480" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SeniorReviewToSubmit_di" bpmnElement="Flow_SeniorReviewToSubmit">
+        <di:waypoint x="655" y="540" />
+        <di:waypoint x="705" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SeniorSubmitToOutcome_di" bpmnElement="Flow_SeniorSubmitToOutcome">
+        <di:waypoint x="805" y="540" />
+        <di:waypoint x="1505" y="540" />
+        <di:waypoint x="1505" y="425" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HighSplitToSenior_di" bpmnElement="Flow_HighSplitToSenior">
+        <di:waypoint x="930" y="610" />
+        <di:waypoint x="1005" y="610" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HighSplitToCompliance_di" bpmnElement="Flow_HighSplitToCompliance">
+        <di:waypoint x="905" y="635" />
+        <di:waypoint x="905" y="724" />
+        <di:waypoint x="1005" y="724" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HighSeniorToJoin_di" bpmnElement="Flow_HighSeniorToJoin">
+        <di:waypoint x="1105" y="610" />
+        <di:waypoint x="1180" y="610" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HighComplianceToJoin_di" bpmnElement="Flow_HighComplianceToJoin">
+        <di:waypoint x="1105" y="724" />
+        <di:waypoint x="1205" y="724" />
+        <di:waypoint x="1205" y="635" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HighJoinToSubmit_di" bpmnElement="Flow_HighJoinToSubmit">
+        <di:waypoint x="1230" y="610" />
+        <di:waypoint x="1305" y="610" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HighSubmitToOutcome_di" bpmnElement="Flow_HighSubmitToOutcome">
+        <di:waypoint x="1405" y="610" />
+        <di:waypoint x="1505" y="610" />
+        <di:waypoint x="1505" y="425" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_EddToMlroSignOff_di" bpmnElement="Flow_EddToMlroSignOff">
+        <di:waypoint x="655" y="820" />
+        <di:waypoint x="705" y="820" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MlroSignOffToSubmit_di" bpmnElement="Flow_MlroSignOffToSubmit">
+        <di:waypoint x="805" y="820" />
+        <di:waypoint x="855" y="820" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MlroSubmitToOutcome_di" bpmnElement="Flow_MlroSubmitToOutcome">
+        <di:waypoint x="955" y="820" />
+        <di:waypoint x="1505" y="820" />
+        <di:waypoint x="1505" y="425" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_OutcomeMergeToDecision_di" bpmnElement="Flow_OutcomeMergeToDecision">
+        <di:waypoint x="1530" y="400" />
+        <di:waypoint x="1630" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ReviewApproved_di" bpmnElement="SequenceFlow_ReviewApproved">
+        <di:waypoint x="1680" y="400" />
+        <di:waypoint x="1787" y="400" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1710" y="375" width="48" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ReviewRejected_di" bpmnElement="SequenceFlow_ReviewRejected">
+        <di:waypoint x="1655" y="425" />
+        <di:waypoint x="1655" y="540" />
+        <di:waypoint x="1755" y="540" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1658" y="513" width="44" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PatchToRevision_di" bpmnElement="Flow_PatchToRevision">
+        <di:waypoint x="1855" y="540" />
+        <di:waypoint x="1905" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_RevisionToOutcome_di" bpmnElement="Flow_RevisionToOutcome">
+        <di:waypoint x="2005" y="540" />
+        <di:waypoint x="2080" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_RevisionResubmit_di" bpmnElement="SequenceFlow_RevisionResubmit">
+        <di:waypoint x="2130" y="540" />
+        <di:waypoint x="2237" y="540" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2152" y="506" width="56" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_RevisionEscalate_di" bpmnElement="SequenceFlow_RevisionEscalate">
+        <di:waypoint x="2105" y="565" />
+        <di:waypoint x="2105" y="680" />
+        <di:waypoint x="2237" y="680" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2108" y="653" width="43" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_PeerReview_di" bpmnElement="TextAnnotation_PeerReview">
+        <dc:Bounds x="550" y="80" width="200" height="230" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_AnalystSubmit_di" bpmnElement="TextAnnotation_AnalystSubmit">
+        <dc:Bounds x="775" y="152" width="200" height="158" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_HighSeniorReview_di" bpmnElement="TextAnnotation_HighSeniorReview">
+        <dc:Bounds x="1270" y="170" width="200" height="173" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_SeniorSubmit_di" bpmnElement="TextAnnotation_SeniorSubmit">
+        <dc:Bounds x="1000" y="195" width="200" height="144" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EddSubprocess_di" bpmnElement="TextAnnotation_EddSubprocess">
+        <dc:Bounds x="480" y="924" width="200" height="173" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_MlroSignOff_di" bpmnElement="TextAnnotation_MlroSignOff">
+        <dc:Bounds x="740" y="922" width="200" height="331" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_MlroSubmit_di" bpmnElement="TextAnnotation_MlroSubmit">
+        <dc:Bounds x="990" y="920" width="200" height="202" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_HighComplianceReview_di" bpmnElement="TextAnnotation_HighComplianceReview">
+        <dc:Bounds x="1230" y="913" width="200" height="216" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_HighSubmit_di" bpmnElement="TextAnnotation_HighSubmit">
+        <dc:Bounds x="1470" y="906" width="200" height="230" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_SeniorReview_di" bpmnElement="TextAnnotation_SeniorReview">
+        <dc:Bounds x="160" y="627" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Patch_di" bpmnElement="TextAnnotation_Patch">
+        <dc:Bounds x="1600" y="622" width="200" height="115" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Revision_di" bpmnElement="TextAnnotation_Revision">
+        <dc:Bounds x="2060" y="290" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Resubmitted_di" bpmnElement="TextAnnotation_Resubmitted">
+        <dc:Bounds x="2340" y="497" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_Escalated_di" bpmnElement="TextAnnotation_Escalated">
+        <dc:Bounds x="2340" y="651" width="200" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_RevisionOutcome_di" bpmnElement="TextAnnotation_RevisionOutcome">
+        <dc:Bounds x="1920" y="710" width="200" height="72" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram>
+    <bpmndi:BPMNPlane bpmnElement="SubProcess_EddInvestigation">
+      <bpmndi:BPMNShape id="StartEvent_EddStart_di" bpmnElement="StartEvent_EddStart">
+        <dc:Bounds x="180" y="182" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_DraftEddWithAi_di" bpmnElement="Task_DraftEddWithAi">
+        <dc:Bounds x="298" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AnalystReviewEddDraft_di" bpmnElement="Task_AnalystReviewEddDraft">
+        <dc:Bounds x="448" y="160" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_EddEnd_di" bpmnElement="EndEvent_EddEnd">
+        <dc:Bounds x="630" y="182" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_EddStartToAi_di" bpmnElement="Flow_EddStartToAi">
+        <di:waypoint x="216" y="200" />
+        <di:waypoint x="298" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_EddAiToReview_di" bpmnElement="Flow_EddAiToReview">
+        <di:waypoint x="398" y="200" />
+        <di:waypoint x="448" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_EddReviewToEnd_di" bpmnElement="Flow_EddReviewToEnd">
+        <di:waypoint x="548" y="200" />
+        <di:waypoint x="630" y="200" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -1,0 +1,873 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_Process06SanctionsGate" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.9.0">
+  <bpmn:process id="Process06SanctionsGateProcess" name="Phase 06 - Sanctions hit gateway and MLRO escalation" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_PhaseEntered" name="Sanctions gate entered">
+      <bpmn:outgoing>Flow_StartToG1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gateway_AnySanctionsHit" name="Any sanctions hit?" default="SequenceFlow_NoSanctionsHit">
+      <bpmn:incoming>Flow_StartToG1</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_NoSanctionsHit</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_SanctionsHit</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:parallelGateway id="ParallelGateway_Split_1" name="">
+      <bpmn:incoming>SequenceFlow_SanctionsHit</bpmn:incoming>
+      <bpmn:outgoing>Flow_Split1ToT2</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Split1ToT3</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Split1ToT4</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_SetClientCommsFreeze" name="Set client comms freeze">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="set-client-comms-freeze" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Split1ToT2</bpmn:incoming>
+      <bpmn:outgoing>Flow_T2ToJoin1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_PatchCaseEscalated" name="Escalate case in ClientVault" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.CLIENTVAULT_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="PATCH" target="method" />
+          <zeebe:input source="=&#34;https://api.clientvault.local/cdd-cases/&#34; + caseId" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ status: &#34;ESCALATED&#34; }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="errorExpression" value="=if response.status = 404 then bpmnError(&#34;CASE_NOT_FOUND&#34;, &#34;Case not found in ClientVault&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Split1ToT3</bpmn:incoming>
+      <bpmn:outgoing>Flow_T3ToJoin1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_SendRmEscalationAlert" name="Send RM escalation alert" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.NOTIFICATION_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://api.notification.local/notifications&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ template: &#34;RM_ESCALATION_ALERT&#34;, caseId: caseId, recipient: rmUsername, templateVars: { escalationType: &#34;SANCTIONS&#34; }, bypassCommsFreeze: true }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ rmEscalationNotificationId: body.notificationId, rmEscalationDeliveryStatus: body.deliveryStatus }" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Split1ToT4</bpmn:incoming>
+      <bpmn:outgoing>Flow_T4ToJoin1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="ParallelGateway_Join_1" name="">
+      <bpmn:incoming>Flow_T2ToJoin1</bpmn:incoming>
+      <bpmn:incoming>Flow_T3ToJoin1</bpmn:incoming>
+      <bpmn:incoming>Flow_T4ToJoin1</bpmn:incoming>
+      <bpmn:outgoing>Flow_Join1ToT5</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:userTask id="Task_MlroSanctionsDecision" name="Decide MLRO sanctions outcome">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-mlro-sanctions-decision" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Join1ToT5</bpmn:incoming>
+      <bpmn:outgoing>Flow_T5ToG2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:boundaryEvent id="BoundaryEvent_MlroAlertSla" name="1h SLA elapsed" cancelActivity="false" attachedToRef="Task_MlroSanctionsDecision">
+      <bpmn:outgoing>Flow_BoundarySlaToAlert</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="TimerEventDefinition_MlroAlertSla">
+        <bpmn:timeDuration>PT1H</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="BoundaryEvent_MlroSlaCycle" name="Hourly SLA reminder" cancelActivity="false" attachedToRef="Task_MlroSanctionsDecision">
+      <bpmn:outgoing>Flow_BoundaryCycleToReminder</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="TimerEventDefinition_MlroSlaCycle">
+        <bpmn:timeCycle>R/PT1H</bpmn:timeCycle>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_AlertDeputyMlro" name="Alert deputy MLRO" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.NOTIFICATION_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://api.notification.local/notifications&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ template: &#34;RM_ESCALATION_ALERT&#34;, caseId: caseId, recipient: &#34;deputy-mlro&#34;, templateVars: { escalationTier: 1, escalationType: &#34;SANCTIONS_SLA&#34; } }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ deputyMlroAlertNotificationId: body.notificationId }" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_BoundarySlaToAlert</bpmn:incoming>
+      <bpmn:outgoing>Flow_AlertDeputyMlroToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_SendSlaReminder" name="Send SLA breach reminder" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.NOTIFICATION_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://api.notification.local/notifications&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ template: &#34;RM_ESCALATION_ALERT&#34;, caseId: caseId, recipients: [&#34;mlro&#34;, &#34;deputy-mlro&#34;, &#34;head-of-compliance&#34;], templateVars: { escalationType: &#34;SANCTIONS_SLA_BREACH&#34; } }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ slaReminderNotificationId: body.notificationId }" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_BoundaryCycleToReminder</bpmn:incoming>
+      <bpmn:outgoing>Flow_SlaReminderToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndEvent_DeputyAlerted" name="Deputy MLRO alerted">
+      <bpmn:incoming>Flow_AlertDeputyMlroToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_SlaReminderSent" name="SLA reminder sent">
+      <bpmn:incoming>Flow_SlaReminderToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:exclusiveGateway id="Gateway_MlroDetermination" name="MLRO determination?" default="SequenceFlow_FalsePositiveDismiss">
+      <bpmn:incoming>Flow_T5ToG2</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_FalsePositiveDismiss</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_ConfirmedProceedWithEdd</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_Offboard</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_FreezeIndefinitely</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_EscalateToNcaSar</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:parallelGateway id="ParallelGateway_Split_2" name="">
+      <bpmn:incoming>SequenceFlow_FalsePositiveDismiss</bpmn:incoming>
+      <bpmn:outgoing>Flow_Split2ToT6</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Split2ToT7</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_DismissScreeningHit" name="Dismiss screening hit" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.SANCTIONGUARD_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://api.sanctionguard.local/screens/&#34; + screeningId + &#34;/dismiss&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ dismissalReason: dismissalReason, analystUsername: analystUsername }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="errorExpression" value="=if response.status = 404 then bpmnError(&#34;SCREENING_NOT_FOUND&#34;, &#34;Screening record not found in SanctionGuard&#34;) else if response.status = 422 then bpmnError(&#34;DISMISSAL_REASON_TOO_SHORT&#34;, &#34;Dismissal reason fails server-side validation&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Split2ToT6</bpmn:incoming>
+      <bpmn:outgoing>Flow_T6ToJoin2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_LiftCommsFreeze" name="Lift client comms freeze">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="lift-client-comms-freeze" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Split2ToT7</bpmn:incoming>
+      <bpmn:outgoing>Flow_T7ToJoin2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="ParallelGateway_Join_2" name="">
+      <bpmn:incoming>Flow_T6ToJoin2</bpmn:incoming>
+      <bpmn:incoming>Flow_T7ToJoin2</bpmn:incoming>
+      <bpmn:outgoing>Flow_Join2ToT7b</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_LogDismissAuditNote" name="Log dismiss audit note" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.CLIENTVAULT_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&#34;https://api.clientvault.local/cdd-cases/&#34; + caseId + &#34;/notes&#34;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ type: &#34;SYSTEM&#34;, event: &#34;MLRO_FALSE_POSITIVE_DISMISS&#34;, screeningId: screeningId, mlroUserId: mlroUserId, dismissalReason: dismissalReason, analystUsername: analystUsername, timestamp: now() }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ dismissAuditNoteId: body.noteId }" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_Join2ToT7b</bpmn:incoming>
+      <bpmn:outgoing>Flow_T7bToMerge</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="Gateway_MergeToPhase07" name="">
+      <bpmn:incoming>SequenceFlow_NoSanctionsHit</bpmn:incoming>
+      <bpmn:incoming>Flow_T7bToMerge</bpmn:incoming>
+      <bpmn:outgoing>Flow_MergeToPhase07End</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="Task_SetEddRequired" name="Set EDD required">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="set-edd-required" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>SequenceFlow_ConfirmedProceedWithEdd</bpmn:incoming>
+      <bpmn:outgoing>Flow_T8ToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndEvent_ContinueToPhase07" name="Continued to Phase 07">
+      <bpmn:incoming>Flow_MergeToPhase07End</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_EddRequired" name="EDD required">
+      <bpmn:incoming>Flow_T8ToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_OffboardingReferred" name="MLRO escalation - offboarding referred">
+      <bpmn:incoming>SequenceFlow_Offboard</bpmn:incoming>
+      <bpmn:terminateEventDefinition id="TerminateEventDefinition_Offboard" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_CaseFrozen" name="MLRO escalation - case frozen">
+      <bpmn:incoming>SequenceFlow_FreezeIndefinitely</bpmn:incoming>
+      <bpmn:terminateEventDefinition id="TerminateEventDefinition_Freeze" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_ReferredToNca" name="Referred to NCA">
+      <bpmn:incoming>SequenceFlow_EscalateToNcaSar</bpmn:incoming>
+      <bpmn:terminateEventDefinition id="TerminateEventDefinition_NcaSar" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_StartToG1" sourceRef="StartEvent_PhaseEntered" targetRef="Gateway_AnySanctionsHit" />
+    <bpmn:sequenceFlow id="SequenceFlow_NoSanctionsHit" name="No" sourceRef="Gateway_AnySanctionsHit" targetRef="Gateway_MergeToPhase07" />
+    <bpmn:sequenceFlow id="SequenceFlow_SanctionsHit" name="Yes" sourceRef="Gateway_AnySanctionsHit" targetRef="ParallelGateway_Split_1">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=some h in hits satisfies h.category = "SANCTIONS" and (h.status = "POTENTIAL_MATCH" or h.status = "CONFIRMED_MATCH")</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_Split1ToT2" sourceRef="ParallelGateway_Split_1" targetRef="Task_SetClientCommsFreeze" />
+    <bpmn:sequenceFlow id="Flow_Split1ToT3" sourceRef="ParallelGateway_Split_1" targetRef="Task_PatchCaseEscalated" />
+    <bpmn:sequenceFlow id="Flow_Split1ToT4" sourceRef="ParallelGateway_Split_1" targetRef="Task_SendRmEscalationAlert" />
+    <bpmn:sequenceFlow id="Flow_T2ToJoin1" sourceRef="Task_SetClientCommsFreeze" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_T3ToJoin1" sourceRef="Task_PatchCaseEscalated" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_T4ToJoin1" sourceRef="Task_SendRmEscalationAlert" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_Join1ToT5" sourceRef="ParallelGateway_Join_1" targetRef="Task_MlroSanctionsDecision" />
+    <bpmn:sequenceFlow id="Flow_T5ToG2" sourceRef="Task_MlroSanctionsDecision" targetRef="Gateway_MlroDetermination" />
+    <bpmn:sequenceFlow id="Flow_BoundarySlaToAlert" sourceRef="BoundaryEvent_MlroAlertSla" targetRef="Task_AlertDeputyMlro" />
+    <bpmn:sequenceFlow id="Flow_AlertDeputyMlroToEnd" sourceRef="Task_AlertDeputyMlro" targetRef="EndEvent_DeputyAlerted" />
+    <bpmn:sequenceFlow id="Flow_BoundaryCycleToReminder" sourceRef="BoundaryEvent_MlroSlaCycle" targetRef="Task_SendSlaReminder" />
+    <bpmn:sequenceFlow id="Flow_SlaReminderToEnd" sourceRef="Task_SendSlaReminder" targetRef="EndEvent_SlaReminderSent" />
+    <bpmn:sequenceFlow id="SequenceFlow_FalsePositiveDismiss" name="False positive - dismiss" sourceRef="Gateway_MlroDetermination" targetRef="ParallelGateway_Split_2" />
+    <bpmn:sequenceFlow id="SequenceFlow_ConfirmedProceedWithEdd" name="Confirmed - proceed with EDD" sourceRef="Gateway_MlroDetermination" targetRef="Task_SetEddRequired">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=mlroDetermination = "confirmed_proceed_with_edd"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SequenceFlow_Offboard" name="Offboard" sourceRef="Gateway_MlroDetermination" targetRef="EndEvent_OffboardingReferred">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=mlroDetermination = "offboard"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SequenceFlow_FreezeIndefinitely" name="Freeze indefinitely" sourceRef="Gateway_MlroDetermination" targetRef="EndEvent_CaseFrozen">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=mlroDetermination = "freeze_indefinitely"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SequenceFlow_EscalateToNcaSar" name="Escalate to NCA SAR" sourceRef="Gateway_MlroDetermination" targetRef="EndEvent_ReferredToNca">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=mlroDetermination = "escalate_to_NCA_SAR"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_Split2ToT6" sourceRef="ParallelGateway_Split_2" targetRef="Task_DismissScreeningHit" />
+    <bpmn:sequenceFlow id="Flow_Split2ToT7" sourceRef="ParallelGateway_Split_2" targetRef="Task_LiftCommsFreeze" />
+    <bpmn:sequenceFlow id="Flow_T6ToJoin2" sourceRef="Task_DismissScreeningHit" targetRef="ParallelGateway_Join_2" />
+    <bpmn:sequenceFlow id="Flow_T7ToJoin2" sourceRef="Task_LiftCommsFreeze" targetRef="ParallelGateway_Join_2" />
+    <bpmn:sequenceFlow id="Flow_Join2ToT7b" sourceRef="ParallelGateway_Join_2" targetRef="Task_LogDismissAuditNote" />
+    <bpmn:sequenceFlow id="Flow_T7bToMerge" sourceRef="Task_LogDismissAuditNote" targetRef="Gateway_MergeToPhase07" />
+    <bpmn:sequenceFlow id="Flow_MergeToPhase07End" sourceRef="Gateway_MergeToPhase07" targetRef="EndEvent_ContinueToPhase07" />
+    <bpmn:sequenceFlow id="Flow_T8ToEnd" sourceRef="Task_SetEddRequired" targetRef="EndEvent_EddRequired" />
+    <bpmn:textAnnotation id="TextAnnotation_StartEvent">
+      <bpmn:text>Triggered by: upstream Phase 05 (parallel screening) handing off after SanctionGuard returns hits</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_G1">
+      <bpmn:text>Evaluates: hits[*] where category == SANCTIONS and status in {POTENTIAL_MATCH, CONFIRMED_MATCH}</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T2">
+      <bpmn:text>Implementation: Camunda engine IO mapping - sets process variable clientCommsFreeze = true on sanctions-hit branch. No external API.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T3">
+      <bpmn:text>Implementation: ClientVault PATCH /cdd-cases/{caseId} with body {"status": "ESCALATED"}; X-API-Key auth via secrets.CLIENTVAULT_API_KEY. Error boundary CASE_NOT_FOUND (404) -&gt; technical incident; default Camunda retry on 5xx.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T4">
+      <bpmn:text>Implementation: Notification Service POST /notifications with template RM_ESCALATION_ALERT, templateVars { escalationType: "SANCTIONS" }; exempt from clientCommsFreeze. Auto-logs COMMUNICATION case note in ClientVault.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T5">
+      <bpmn:text>Implementation: Camunda Tasklist form; assignee = mlro group (or deputy-mlro during cover up to 12 weeks per JMLSG 3.19). Output mlroDetermination in {false_positive_dismiss, confirmed_proceed_with_edd, offboard, freeze_indefinitely, escalate_to_NCA_SAR}; minimum 20-char dismissalReason and analystUsername mandatory when false_positive_dismiss.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T5_Manual">
+      <bpmn:text>Manual: MLRO sanctions decision is non-delegable per MLR 2017 / JMLSG 3.19; AI may not make sanctions or risk-tier decisions (hard constraint #1).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_AlertDeputy">
+      <bpmn:text>Implementation: Notification Service POST /notifications with template RM_ESCALATION_ALERT, escalation tier = 1; reassigns task to deputy-mlro group via assignment listener. Non-interrupting - UserTask remains active.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_SlaReminder">
+      <bpmn:text>Implementation: Notification Service POST /notifications with template RM_ESCALATION_ALERT and tiered CC list (MLRO, Deputy MLRO, Head of Compliance); each call emits its own ClientVault COMMUNICATION audit note. Repeats hourly until UserTask completes (FCA Q4 2024 finding on missing sanctions records).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_G2">
+      <bpmn:text>Evaluates: mlroDetermination</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T6">
+      <bpmn:text>Implementation: SanctionGuard POST /screens/{screeningId}/dismiss with { dismissalReason, analystUsername }; X-API-Key auth. Error boundary SCREENING_NOT_FOUND (404) -&gt; manual investigation; DISMISSAL_REASON_TOO_SHORT (422) preempted by T5 form validation.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T7">
+      <bpmn:text>Implementation: Camunda engine IO mapping - sets process variable clientCommsFreeze = false. No external API.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T7b">
+      <bpmn:text>Implementation: ClientVault POST /cdd-cases/{caseId}/notes with type SYSTEM and body { event: "MLRO_FALSE_POSITIVE_DISMISS", screeningId, mlroUserId, dismissalReason, analystUsername, timestamp }. Durable audit anchor for 5-year MLR 2017 reg. 40 retention horizon.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_T8">
+      <bpmn:text>Implementation: Camunda engine IO mapping - sets process variable eddRequired = true; clientCommsFreeze stays true (only lifted on written MLRO clearance in Phase 08). Drives DMN routing into Phase 08 EDD branch.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndContinue">
+      <bpmn:text>Follow-up: re-enters main flow at Phase 07 (risk assessment) with clientCommsFreeze updated per branch.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndEdd">
+      <bpmn:text>Follow-up: Phase 08 EDD/MLRO branch picks up case; clientCommsFreeze stays true until written MLRO clearance.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndOffboard">
+      <bpmn:text>Follow-up: out-of-band MLRO offboarding workflow; case stays ESCALATED in ClientVault. No /close write at this terminal (hard constraint #9).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndFrozen">
+      <bpmn:text>Follow-up: out-of-band MLRO disposition; case stays ESCALATED indefinitely. No /close write (hard constraint #9).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndNca">
+      <bpmn:text>Follow-up: NCA SAR submission performed manually out-of-band (v1 scope gap; no NCA-Theme integration). Case stays ESCALATED in ClientVault.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndDeputyAlerted">
+      <bpmn:text>Follow-up: deputy MLRO now seeing the live task; original 1h SLA event recorded in audit log.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_EndSlaReminderSent">
+      <bpmn:text>Follow-up: incremented escalation tier counter; subsequent reminders escalate CC list (MLRO, Deputy MLRO, Head of Compliance).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_StartEvent" associationDirection="None" sourceRef="StartEvent_PhaseEntered" targetRef="TextAnnotation_StartEvent" />
+    <bpmn:association id="Association_G1" associationDirection="None" sourceRef="Gateway_AnySanctionsHit" targetRef="TextAnnotation_G1" />
+    <bpmn:association id="Association_T2" associationDirection="None" sourceRef="Task_SetClientCommsFreeze" targetRef="TextAnnotation_T2" />
+    <bpmn:association id="Association_T3" associationDirection="None" sourceRef="Task_PatchCaseEscalated" targetRef="TextAnnotation_T3" />
+    <bpmn:association id="Association_T4" associationDirection="None" sourceRef="Task_SendRmEscalationAlert" targetRef="TextAnnotation_T4" />
+    <bpmn:association id="Association_T5" associationDirection="None" sourceRef="Task_MlroSanctionsDecision" targetRef="TextAnnotation_T5" />
+    <bpmn:association id="Association_T5_Manual" associationDirection="None" sourceRef="Task_MlroSanctionsDecision" targetRef="TextAnnotation_T5_Manual" />
+    <bpmn:association id="Association_AlertDeputy" associationDirection="None" sourceRef="Task_AlertDeputyMlro" targetRef="TextAnnotation_AlertDeputy" />
+    <bpmn:association id="Association_SlaReminder" associationDirection="None" sourceRef="Task_SendSlaReminder" targetRef="TextAnnotation_SlaReminder" />
+    <bpmn:association id="Association_G2" associationDirection="None" sourceRef="Gateway_MlroDetermination" targetRef="TextAnnotation_G2" />
+    <bpmn:association id="Association_T6" associationDirection="None" sourceRef="Task_DismissScreeningHit" targetRef="TextAnnotation_T6" />
+    <bpmn:association id="Association_T7" associationDirection="None" sourceRef="Task_LiftCommsFreeze" targetRef="TextAnnotation_T7" />
+    <bpmn:association id="Association_T7b" associationDirection="None" sourceRef="Task_LogDismissAuditNote" targetRef="TextAnnotation_T7b" />
+    <bpmn:association id="Association_T8" associationDirection="None" sourceRef="Task_SetEddRequired" targetRef="TextAnnotation_T8" />
+    <bpmn:association id="Association_EndContinue" associationDirection="None" sourceRef="EndEvent_ContinueToPhase07" targetRef="TextAnnotation_EndContinue" />
+    <bpmn:association id="Association_EndEdd" associationDirection="None" sourceRef="EndEvent_EddRequired" targetRef="TextAnnotation_EndEdd" />
+    <bpmn:association id="Association_EndOffboard" associationDirection="None" sourceRef="EndEvent_OffboardingReferred" targetRef="TextAnnotation_EndOffboard" />
+    <bpmn:association id="Association_EndFrozen" associationDirection="None" sourceRef="EndEvent_CaseFrozen" targetRef="TextAnnotation_EndFrozen" />
+    <bpmn:association id="Association_EndNca" associationDirection="None" sourceRef="EndEvent_ReferredToNca" targetRef="TextAnnotation_EndNca" />
+    <bpmn:association id="Association_EndDeputyAlerted" associationDirection="None" sourceRef="EndEvent_DeputyAlerted" targetRef="TextAnnotation_EndDeputyAlerted" />
+    <bpmn:association id="Association_EndSlaReminderSent" associationDirection="None" sourceRef="EndEvent_SlaReminderSent" targetRef="TextAnnotation_EndSlaReminderSent" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process06SanctionsGateProcess">
+    <bpmndi:BPMNPlane id="BPMNPlane_Process06SanctionsGateProcess" bpmnElement="Process06SanctionsGateProcess">
+      <bpmndi:BPMNShape id="StartEvent_PhaseEntered_di" bpmnElement="StartEvent_PhaseEntered">
+        <dc:Bounds x="237" y="332" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="219" y="368" width="73" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_AnySanctionsHit_di" bpmnElement="Gateway_AnySanctionsHit" isMarkerVisible="true">
+        <dc:Bounds x="380" y="325" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="360" y="301" width="90" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Split_1_di" bpmnElement="ParallelGateway_Split_1">
+        <dc:Bounds x="530" y="465" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SetClientCommsFreeze_di" bpmnElement="Task_SetClientCommsFreeze">
+        <dc:Bounds x="655" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Join_1_di" bpmnElement="ParallelGateway_Join_1">
+        <dc:Bounds x="830" y="465" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_MlroSanctionsDecision_di" bpmnElement="Task_MlroSanctionsDecision">
+        <dc:Bounds x="955" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_MlroDetermination_di" bpmnElement="Gateway_MlroDetermination" isMarkerVisible="true">
+        <dc:Bounds x="1130" y="465" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1118" y="427.5" width="73" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Split_2_di" bpmnElement="ParallelGateway_Split_2">
+        <dc:Bounds x="1280" y="465" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_DismissScreeningHit_di" bpmnElement="Task_DismissScreeningHit">
+        <dc:Bounds x="1405" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Join_2_di" bpmnElement="ParallelGateway_Join_2">
+        <dc:Bounds x="1580" y="465" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_LogDismissAuditNote_di" bpmnElement="Task_LogDismissAuditNote">
+        <dc:Bounds x="1705" y="450" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_MergeToPhase07_di" bpmnElement="Gateway_MergeToPhase07" isMarkerVisible="true">
+        <dc:Bounds x="1880" y="325" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ContinueToPhase07_di" bpmnElement="EndEvent_ContinueToPhase07">
+        <dc:Bounds x="2037" y="332" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="2024" y="368" width="63" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendRmEscalationAlert_di" bpmnElement="Task_SendRmEscalationAlert">
+        <dc:Bounds x="655" y="730" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PatchCaseEscalated_di" bpmnElement="Task_PatchCaseEscalated">
+        <dc:Bounds x="655" y="590" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AlertDeputyMlro_di" bpmnElement="Task_AlertDeputyMlro">
+        <dc:Bounds x="1105" y="1430" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendSlaReminder_di" bpmnElement="Task_SendSlaReminder">
+        <dc:Bounds x="1105" y="1290" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_DeputyAlerted_di" bpmnElement="EndEvent_DeputyAlerted">
+        <dc:Bounds x="1287" y="1452" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1270" y="1488" width="70" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_SlaReminderSent_di" bpmnElement="EndEvent_SlaReminderSent">
+        <dc:Bounds x="1287" y="1312" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1272" y="1348" width="67" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_EddRequired_di" bpmnElement="EndEvent_EddRequired">
+        <dc:Bounds x="1437" y="752" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1422" y="788" width="67" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_OffboardingReferred_di" bpmnElement="EndEvent_OffboardingReferred">
+        <dc:Bounds x="1287" y="892" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1263" y="928" width="85" height="40" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_CaseFrozen_di" bpmnElement="EndEvent_CaseFrozen">
+        <dc:Bounds x="1287" y="1032" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1263" y="1068" width="85" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ReferredToNca_di" bpmnElement="EndEvent_ReferredToNca">
+        <dc:Bounds x="1287" y="1172" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1264" y="1208" width="82" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SetEddRequired_di" bpmnElement="Task_SetEddRequired">
+        <dc:Bounds x="1255" y="730" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_LiftCommsFreeze_di" bpmnElement="Task_LiftCommsFreeze">
+        <dc:Bounds x="1405" y="580" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_T3_di" bpmnElement="Association_T3">
+        <di:waypoint x="659" y="668" />
+        <di:waypoint x="524" y="781" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T4_di" bpmnElement="Association_T4">
+        <di:waypoint x="697" y="810" />
+        <di:waypoint x="685" y="870" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T2_di" bpmnElement="Association_T2">
+        <di:waypoint x="704" y="450" />
+        <di:waypoint x="701" y="328" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_G1_di" bpmnElement="Association_G1">
+        <di:waypoint x="414" y="334" />
+        <di:waypoint x="450" y="268" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T5_di" bpmnElement="Association_T5">
+        <di:waypoint x="996" y="450" />
+        <di:waypoint x="965" y="310" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T5_Manual_di" bpmnElement="Association_T5_Manual">
+        <di:waypoint x="1020" y="450" />
+        <di:waypoint x="1140" y="221" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_G2_di" bpmnElement="Association_G2">
+        <di:waypoint x="1181" y="490" />
+        <di:waypoint x="1131" y="420" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T6_di" bpmnElement="Association_T6">
+        <di:waypoint x="1455" y="450" />
+        <di:waypoint x="1455" y="310" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T7b_di" bpmnElement="Association_T7b">
+        <di:waypoint x="1750" y="450" />
+        <di:waypoint x="1736" y="325" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_AlertDeputy_di" bpmnElement="Association_AlertDeputy">
+        <di:waypoint x="1155" y="1510" />
+        <di:waypoint x="1155" y="1560" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndDeputyAlerted_di" bpmnElement="Association_EndDeputyAlerted">
+        <di:waypoint x="1323" y="1488" />
+        <di:waypoint x="1325" y="1538" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndSlaReminderSent_di" bpmnElement="Association_EndSlaReminderSent">
+        <di:waypoint x="1323" y="1348" />
+        <di:waypoint x="1385" y="1398" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndFrozen_di" bpmnElement="Association_EndFrozen">
+        <di:waypoint x="1323" y="1068" />
+        <di:waypoint x="1385" y="1118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndNca_di" bpmnElement="Association_EndNca">
+        <di:waypoint x="1323" y="1208" />
+        <di:waypoint x="1385" y="1258" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T7_di" bpmnElement="Association_T7">
+        <di:waypoint x="1505" y="642" />
+        <di:waypoint x="1550" y="663" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndEdd_di" bpmnElement="Association_EndEdd">
+        <di:waypoint x="1473" y="771" />
+        <di:waypoint x="1560" y="801" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_T8_di" bpmnElement="Association_T8">
+        <di:waypoint x="1355" y="784" />
+        <di:waypoint x="1580" y="917" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndOffboard_di" bpmnElement="Association_EndOffboard">
+        <di:waypoint x="1317" y="923" />
+        <di:waypoint x="1370" y="963" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_SlaReminder_di" bpmnElement="Association_SlaReminder">
+        <di:waypoint x="1105" y="1347" />
+        <di:waypoint x="970" y="1359" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_StartEvent_di" bpmnElement="TextAnnotation_StartEvent">
+        <dc:Bounds x="155" y="210" width="200" height="72" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndContinue_di" bpmnElement="TextAnnotation_EndContinue">
+        <dc:Bounds x="1955" y="196" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_MlroSlaCycle_di" bpmnElement="BoundaryEvent_MlroSlaCycle">
+        <dc:Bounds x="1009" y="512" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1032" y="556" width="56" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_MlroAlertSla_di" bpmnElement="BoundaryEvent_MlroAlertSla">
+        <dc:Bounds x="965" y="512" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="901" y="555" width="78" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_StartToG1_di" bpmnElement="Flow_StartToG1">
+        <di:waypoint x="273" y="350" />
+        <di:waypoint x="380" y="350" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_NoSanctionsHit_di" bpmnElement="SequenceFlow_NoSanctionsHit">
+        <di:waypoint x="430" y="350" />
+        <di:waypoint x="1880" y="350" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1148" y="325" width="15" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_SanctionsHit_di" bpmnElement="SequenceFlow_SanctionsHit">
+        <di:waypoint x="405" y="375" />
+        <di:waypoint x="405" y="490" />
+        <di:waypoint x="530" y="490" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="411" y="423" width="18" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Split1ToT2_di" bpmnElement="Flow_Split1ToT2">
+        <di:waypoint x="580" y="490" />
+        <di:waypoint x="655" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Split1ToT3_di" bpmnElement="Flow_Split1ToT3">
+        <di:waypoint x="555" y="515" />
+        <di:waypoint x="555" y="630" />
+        <di:waypoint x="655" y="630" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Split1ToT4_di" bpmnElement="Flow_Split1ToT4">
+        <di:waypoint x="555" y="515" />
+        <di:waypoint x="555" y="770" />
+        <di:waypoint x="655" y="770" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T2ToJoin1_di" bpmnElement="Flow_T2ToJoin1">
+        <di:waypoint x="755" y="490" />
+        <di:waypoint x="830" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T3ToJoin1_di" bpmnElement="Flow_T3ToJoin1">
+        <di:waypoint x="755" y="630" />
+        <di:waypoint x="855" y="630" />
+        <di:waypoint x="855" y="515" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T4ToJoin1_di" bpmnElement="Flow_T4ToJoin1">
+        <di:waypoint x="755" y="770" />
+        <di:waypoint x="855" y="770" />
+        <di:waypoint x="855" y="515" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Join1ToT5_di" bpmnElement="Flow_Join1ToT5">
+        <di:waypoint x="880" y="490" />
+        <di:waypoint x="955" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T5ToG2_di" bpmnElement="Flow_T5ToG2">
+        <di:waypoint x="1055" y="490" />
+        <di:waypoint x="1130" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_BoundarySlaToAlert_di" bpmnElement="Flow_BoundarySlaToAlert">
+        <di:waypoint x="988" y="547" />
+        <di:waypoint x="988.3333333333334" y="1470" />
+        <di:waypoint x="1105" y="1470" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_BoundaryCycleToReminder_di" bpmnElement="Flow_BoundaryCycleToReminder">
+        <di:waypoint x="1022" y="547" />
+        <di:waypoint x="1021.6666666666666" y="1330" />
+        <di:waypoint x="1105" y="1330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_FalsePositiveDismiss_di" bpmnElement="SequenceFlow_FalsePositiveDismiss">
+        <di:waypoint x="1180" y="490" />
+        <di:waypoint x="1280" y="490" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1196" y="456" width="68" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_ConfirmedProceedWithEdd_di" bpmnElement="SequenceFlow_ConfirmedProceedWithEdd">
+        <di:waypoint x="1155" y="515" />
+        <di:waypoint x="1155" y="770" />
+        <di:waypoint x="1255" y="770" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1160" y="720" width="80" height="40" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_Offboard_di" bpmnElement="SequenceFlow_Offboard">
+        <di:waypoint x="1155" y="515" />
+        <di:waypoint x="1155" y="910" />
+        <di:waypoint x="1287" y="910" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1168" y="883" width="43" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_FreezeIndefinitely_di" bpmnElement="SequenceFlow_FreezeIndefinitely">
+        <di:waypoint x="1155" y="515" />
+        <di:waypoint x="1155" y="1050" />
+        <di:waypoint x="1287" y="1050" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1165" y="1023" width="90" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_EscalateToNcaSar_di" bpmnElement="SequenceFlow_EscalateToNcaSar">
+        <di:waypoint x="1155" y="515" />
+        <di:waypoint x="1155" y="1190" />
+        <di:waypoint x="1287" y="1190" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1169" y="1156" width="81" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Split2ToT6_di" bpmnElement="Flow_Split2ToT6">
+        <di:waypoint x="1330" y="490" />
+        <di:waypoint x="1405" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Split2ToT7_di" bpmnElement="Flow_Split2ToT7">
+        <di:waypoint x="1330" y="490" />
+        <di:waypoint x="1380" y="490" />
+        <di:waypoint x="1380" y="620" />
+        <di:waypoint x="1405" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T6ToJoin2_di" bpmnElement="Flow_T6ToJoin2">
+        <di:waypoint x="1505" y="490" />
+        <di:waypoint x="1580" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T7ToJoin2_di" bpmnElement="Flow_T7ToJoin2">
+        <di:waypoint x="1505" y="620" />
+        <di:waypoint x="1605" y="620" />
+        <di:waypoint x="1605" y="515" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Join2ToT7b_di" bpmnElement="Flow_Join2ToT7b">
+        <di:waypoint x="1630" y="490" />
+        <di:waypoint x="1705" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T7bToMerge_di" bpmnElement="Flow_T7bToMerge">
+        <di:waypoint x="1805" y="490" />
+        <di:waypoint x="1905" y="490" />
+        <di:waypoint x="1905" y="375" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MergeToPhase07End_di" bpmnElement="Flow_MergeToPhase07End">
+        <di:waypoint x="1930" y="350" />
+        <di:waypoint x="2037" y="350" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_StartEvent_di" bpmnElement="Association_StartEvent">
+        <di:waypoint x="255" y="332" />
+        <di:waypoint x="255" y="282" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_EndContinue_di" bpmnElement="Association_EndContinue">
+        <di:waypoint x="2055" y="332" />
+        <di:waypoint x="2055" y="282" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_T3_di" bpmnElement="TextAnnotation_T3">
+        <dc:Bounds x="330" y="781" width="200" height="158" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T4_di" bpmnElement="TextAnnotation_T4">
+        <dc:Bounds x="570" y="870" width="200" height="158" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T2_di" bpmnElement="TextAnnotation_T2">
+        <dc:Bounds x="600" y="227" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_G1_di" bpmnElement="TextAnnotation_G1">
+        <dc:Bounds x="370" y="196" width="200" height="72" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T5_di" bpmnElement="TextAnnotation_T5">
+        <dc:Bounds x="840" y="80" width="200" height="230" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T5_Manual_di" bpmnElement="TextAnnotation_T5_Manual">
+        <dc:Bounds x="1070" y="120" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_G2_di" bpmnElement="TextAnnotation_G2">
+        <dc:Bounds x="1120" y="390" width="200" height="30" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T6_di" bpmnElement="TextAnnotation_T6">
+        <dc:Bounds x="1370" y="137" width="200" height="173" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T7b_di" bpmnElement="TextAnnotation_T7b">
+        <dc:Bounds x="1625" y="138" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_AlertDeputy_di" bpmnElement="TextAnnotation_AlertDeputy">
+        <dc:Bounds x="1055" y="1560" width="200" height="158" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndDeputyAlerted_di" bpmnElement="TextAnnotation_EndDeputyAlerted">
+        <dc:Bounds x="1325" y="1538" width="200" height="72" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndSlaReminderSent_di" bpmnElement="TextAnnotation_EndSlaReminderSent">
+        <dc:Bounds x="1385" y="1398" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndNca_di" bpmnElement="TextAnnotation_EndNca">
+        <dc:Bounds x="1385" y="1258" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndFrozen_di" bpmnElement="TextAnnotation_EndFrozen">
+        <dc:Bounds x="1385" y="1118" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_AlertDeputyMlroToEnd_di" bpmnElement="Flow_AlertDeputyMlroToEnd">
+        <di:waypoint x="1205" y="1470" />
+        <di:waypoint x="1287" y="1470" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SlaReminderToEnd_di" bpmnElement="Flow_SlaReminderToEnd">
+        <di:waypoint x="1205" y="1330" />
+        <di:waypoint x="1287" y="1330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_T8ToEnd_di" bpmnElement="Flow_T8ToEnd">
+        <di:waypoint x="1355" y="770" />
+        <di:waypoint x="1437" y="770" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_T7_di" bpmnElement="TextAnnotation_T7">
+        <dc:Bounds x="1550" y="660" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndEdd_di" bpmnElement="TextAnnotation_EndEdd">
+        <dc:Bounds x="1560" y="760" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_T8_di" bpmnElement="TextAnnotation_T8">
+        <dc:Bounds x="1580" y="870" width="200" height="144" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_EndOffboard_di" bpmnElement="TextAnnotation_EndOffboard">
+        <dc:Bounds x="1370" y="960" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_SlaReminder_di" bpmnElement="TextAnnotation_SlaReminder">
+        <dc:Bounds x="770" y="1312" width="200" height="187" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

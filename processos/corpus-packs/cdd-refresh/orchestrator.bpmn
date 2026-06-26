@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_CddRefresh"
+                  targetNamespace="http://bpmn.io/schema/bpmn">
+  <!--
+    Corporate CDD (AML/KYC) refresh orchestrator. Extracted/composed from the
+    process-os `cdd-refresh` example: 00-overview.bpmn declares nine phase call
+    activities but ships no `calledElement` wiring, so this orchestrator supplies
+    the wiring against the deployable phase processes in `phases/`. Phase 4
+    (document verification) is omitted because it routes on non-standard FEEL
+    list functions (`any(documents, function(d) ...)`) the engine does not
+    evaluate; the remaining eight phases route to completion on their gateway
+    defaults. Each call activity is inline-expanded into an embedded sub-process
+    at load time (ProcessDefinition::inline_call_activities).
+  -->
+  <bpmn:process id="CddRefreshOrchestrator" name="Corporate CDD Refresh" isExecutable="true">
+    <bpmn:startEvent id="Start_RefreshDue" name="Refresh due"/>
+    <bpmn:callActivity id="Phase1_Intake" name="Phase 1 — Case Intake and Duplicate Check" calledElement="Process01IntakeProcess"/>
+    <bpmn:callActivity id="Phase2_DocumentRequest" name="Phase 2 — Document Request" calledElement="Process02DocumentRequest"/>
+    <bpmn:callActivity id="Phase3_Reminders" name="Phase 3 — Reminders and Escalation" calledElement="Process03RemindersAndEscalationProcess"/>
+    <bpmn:callActivity id="Phase5_Screening" name="Phase 5 — Companies House and SanctionGuard Screening" calledElement="Process05ParallelScreeningProcess"/>
+    <bpmn:callActivity id="Phase6_SanctionsGate" name="Phase 6 — Sanctions Hit Gateway and MLRO Escalation" calledElement="Process06SanctionsGateProcess"/>
+    <bpmn:callActivity id="Phase7_RiskAssessment" name="Phase 7 — Risk Assessment" calledElement="Process07RiskAssessmentProcess"/>
+    <bpmn:callActivity id="Phase8_Approval" name="Phase 8 — Tiered Approval" calledElement="Process08ApprovalProcess"/>
+    <bpmn:callActivity id="Phase9_Closure" name="Phase 9 — Case Closure and Refresh Complete" calledElement="Process09Closure"/>
+    <bpmn:endEvent id="End_RefreshComplete" name="Refresh complete"/>
+
+    <bpmn:sequenceFlow id="o0" sourceRef="Start_RefreshDue" targetRef="Phase1_Intake"/>
+    <bpmn:sequenceFlow id="o1" sourceRef="Phase1_Intake" targetRef="Phase2_DocumentRequest"/>
+    <bpmn:sequenceFlow id="o2" sourceRef="Phase2_DocumentRequest" targetRef="Phase3_Reminders"/>
+    <bpmn:sequenceFlow id="o3" sourceRef="Phase3_Reminders" targetRef="Phase5_Screening"/>
+    <bpmn:sequenceFlow id="o4" sourceRef="Phase5_Screening" targetRef="Phase6_SanctionsGate"/>
+    <bpmn:sequenceFlow id="o5" sourceRef="Phase6_SanctionsGate" targetRef="Phase7_RiskAssessment"/>
+    <bpmn:sequenceFlow id="o6" sourceRef="Phase7_RiskAssessment" targetRef="Phase8_Approval"/>
+    <bpmn:sequenceFlow id="o7" sourceRef="Phase8_Approval" targetRef="Phase9_Closure"/>
+    <bpmn:sequenceFlow id="o8" sourceRef="Phase9_Closure" targetRef="End_RefreshComplete"/>
+  </bpmn:process>
+</bpmn:definitions>

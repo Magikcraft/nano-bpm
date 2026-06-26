@@ -1,0 +1,563 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.9.0">
+  <bpmn:process id="Process07RiskAssessmentProcess" name="Phase 7: DMN Risk Assessment" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_Phase07Triggered" name="Risk assessment requested">
+      <bpmn:outgoing>Flow_StartToSplit</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:parallelGateway id="ParallelGateway_Split_1" name="">
+      <bpmn:incoming>Flow_StartToSplit</bpmn:incoming>
+      <bpmn:outgoing>Flow_SplitToJurisdiction</bpmn:outgoing>
+      <bpmn:outgoing>Flow_SplitToSector</bpmn:outgoing>
+      <bpmn:outgoing>Flow_SplitToUbo</bpmn:outgoing>
+      <bpmn:outgoing>Flow_SplitToAdverseMedia</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_MapJurisdictionZone" name="Map jurisdiction zone">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="map-jurisdiction-zone" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToJurisdiction</bpmn:incoming>
+      <bpmn:outgoing>Flow_JurisdictionToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_MapSectorRisk" name="Map sector risk">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="map-sector-risk" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToSector</bpmn:incoming>
+      <bpmn:outgoing>Flow_SectorToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_ComputeUboComplexity" name="Compute UBO complexity">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="compute-ubo-complexity" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToUbo</bpmn:incoming>
+      <bpmn:outgoing>Flow_UboToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_ComputeAdverseMediaSeverity" name="Compute adverse media severity">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="compute-adverse-media-severity" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToAdverseMedia</bpmn:incoming>
+      <bpmn:outgoing>Flow_AdverseMediaToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="ParallelGateway_Join_1" name="">
+      <bpmn:incoming>Flow_JurisdictionToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_SectorToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_UboToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_AdverseMediaToJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_JoinToEdd</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_SetEddRequired" name="Set EDD required">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="set-edd-required" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_JoinToEdd</bpmn:incoming>
+      <bpmn:outgoing>Flow_EddToDmn</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:businessRuleTask id="Task_AssessCddRisk" name="Assess CDD risk">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="decision-assess-cdd-risk" resultVariable="assessCddRiskResult" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=jurisdictionZone" target="jurisdictionZone" />
+          <zeebe:input source="=sectorRisk" target="sectorRisk" />
+          <zeebe:input source="=uboComplexity" target="uboComplexity" />
+          <zeebe:input source="=adverseMediaSeverity" target="adverseMediaSeverity" />
+          <zeebe:input source="=screeningResult" target="screeningResult" />
+          <zeebe:input source="=eddRequired" target="eddRequired" />
+          <zeebe:input source="=priorRiskTier" target="priorRiskTier" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_EddToDmn</bpmn:incoming>
+      <bpmn:outgoing>Flow_DmnToOverrideGateway</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+    <bpmn:exclusiveGateway id="Gateway_OverrideRiskTier" name="Override risk tier?" default="SequenceFlow_OverrideNo">
+      <bpmn:incoming>Flow_DmnToOverrideGateway</bpmn:incoming>
+      <bpmn:outgoing>SequenceFlow_OverrideNo</bpmn:outgoing>
+      <bpmn:outgoing>SequenceFlow_OverrideYes</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_OverrideRiskTier" name="Override risk tier">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-override-risk-tier" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>SequenceFlow_OverrideYes</bpmn:incoming>
+      <bpmn:outgoing>Flow_OverrideToJoin</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:boundaryEvent id="BoundaryEvent_OverrideReminder24h" name="24h elapsed" cancelActivity="false" attachedToRef="Task_OverrideRiskTier">
+      <bpmn:outgoing>Flow_ReminderToNotify</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="TimerEventDefinition_24h">
+        <bpmn:timeDuration>PT24H</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="BoundaryEvent_OverrideEscalation72h" name="72h elapsed" attachedToRef="Task_OverrideRiskTier">
+      <bpmn:outgoing>Flow_EscalationToManual</bpmn:outgoing>
+      <bpmn:timerEventDefinition id="TimerEventDefinition_72h">
+        <bpmn:timeDuration>PT72H</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_NotifyAnalystOverdue" name="Notify analyst of pending override">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="notify-analyst-of-pending-override" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_ReminderToNotify</bpmn:incoming>
+      <bpmn:outgoing>Flow_NotifyToReminderEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndEvent_OverrideReminderSent" name="Override reminder sent">
+      <bpmn:incoming>Flow_NotifyToReminderEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:exclusiveGateway id="Gateway_OverrideJoin" name="">
+      <bpmn:incoming>SequenceFlow_OverrideNo</bpmn:incoming>
+      <bpmn:incoming>Flow_OverrideToJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_JoinToPersist</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="Task_PersistDmnResult" name="Persist DMN result" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="apiKey" target="authentication.type" />
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input source="=&#34;X-API-Key&#34;" target="authentication.name" />
+          <zeebe:input source="{{secrets.CLIENTVAULT_API_KEY}}" target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="PATCH" target="method" />
+          <zeebe:input source="=&#34;https://clientvault.meridian.local/cdd-cases/&#34; + caseId" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ newRiskTier: if analystOverrideRequested = true then manualRiskTier else newRiskTier, approvalLevel: approvalLevel, refreshCycleYears: refreshCycleYears, status: &#34;PENDING_APPROVAL&#34; }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ persistResponse: response.body }" />
+          <zeebe:header key="errorExpression" value="=if response.status = 404 then bpmnError(&#34;CASE_NOT_FOUND&#34;, &#34;Case not found in ClientVault&#34;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_JoinToPersist</bpmn:incoming>
+      <bpmn:outgoing>Flow_PersistToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="BoundaryEvent_CaseNotFound" name="Case not found" attachedToRef="Task_PersistDmnResult">
+      <bpmn:outgoing>Flow_CaseNotFoundToManual</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_CaseNotFound" errorRef="Error_CaseNotFound" />
+    </bpmn:boundaryEvent>
+    <bpmn:exclusiveGateway id="Gateway_ManualHandlingJoin" name="">
+      <bpmn:incoming>Flow_EscalationToManual</bpmn:incoming>
+      <bpmn:incoming>Flow_CaseNotFoundToManual</bpmn:incoming>
+      <bpmn:outgoing>Flow_JoinToManual</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_HandleManualException" name="Handle risk assessment exception">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-handle-manual-exception" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_JoinToManual</bpmn:incoming>
+      <bpmn:outgoing>Flow_ManualToEnd</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="EndEvent_RiskAssessmentCompleted" name="Risk assessment completed">
+      <bpmn:incoming>Flow_PersistToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_ManualHandlingRequired" name="Manual handling required">
+      <bpmn:incoming>Flow_ManualToEnd</bpmn:incoming>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_ManualHandling" errorRef="Error_ManualHandlingRequired" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_StartToSplit" sourceRef="StartEvent_Phase07Triggered" targetRef="ParallelGateway_Split_1" />
+    <bpmn:sequenceFlow id="Flow_SplitToJurisdiction" sourceRef="ParallelGateway_Split_1" targetRef="Task_MapJurisdictionZone" />
+    <bpmn:sequenceFlow id="Flow_SplitToSector" sourceRef="ParallelGateway_Split_1" targetRef="Task_MapSectorRisk" />
+    <bpmn:sequenceFlow id="Flow_SplitToUbo" sourceRef="ParallelGateway_Split_1" targetRef="Task_ComputeUboComplexity" />
+    <bpmn:sequenceFlow id="Flow_SplitToAdverseMedia" sourceRef="ParallelGateway_Split_1" targetRef="Task_ComputeAdverseMediaSeverity" />
+    <bpmn:sequenceFlow id="Flow_JurisdictionToJoin" sourceRef="Task_MapJurisdictionZone" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_SectorToJoin" sourceRef="Task_MapSectorRisk" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_UboToJoin" sourceRef="Task_ComputeUboComplexity" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_AdverseMediaToJoin" sourceRef="Task_ComputeAdverseMediaSeverity" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_JoinToEdd" sourceRef="ParallelGateway_Join_1" targetRef="Task_SetEddRequired" />
+    <bpmn:sequenceFlow id="Flow_EddToDmn" sourceRef="Task_SetEddRequired" targetRef="Task_AssessCddRisk" />
+    <bpmn:sequenceFlow id="Flow_DmnToOverrideGateway" sourceRef="Task_AssessCddRisk" targetRef="Gateway_OverrideRiskTier" />
+    <bpmn:sequenceFlow id="SequenceFlow_OverrideYes" name="Yes" sourceRef="Gateway_OverrideRiskTier" targetRef="Task_OverrideRiskTier">
+      <bpmn:conditionExpression xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="bpmn:tFormalExpression">=analystOverrideRequested = true</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="SequenceFlow_OverrideNo" name="No" sourceRef="Gateway_OverrideRiskTier" targetRef="Gateway_OverrideJoin" />
+    <bpmn:sequenceFlow id="Flow_OverrideToJoin" sourceRef="Task_OverrideRiskTier" targetRef="Gateway_OverrideJoin" />
+    <bpmn:sequenceFlow id="Flow_ReminderToNotify" sourceRef="BoundaryEvent_OverrideReminder24h" targetRef="Task_NotifyAnalystOverdue" />
+    <bpmn:sequenceFlow id="Flow_NotifyToReminderEnd" sourceRef="Task_NotifyAnalystOverdue" targetRef="EndEvent_OverrideReminderSent" />
+    <bpmn:sequenceFlow id="Flow_EscalationToManual" sourceRef="BoundaryEvent_OverrideEscalation72h" targetRef="Gateway_ManualHandlingJoin" />
+    <bpmn:sequenceFlow id="Flow_JoinToManual" sourceRef="Gateway_ManualHandlingJoin" targetRef="Task_HandleManualException" />
+    <bpmn:sequenceFlow id="Flow_JoinToPersist" sourceRef="Gateway_OverrideJoin" targetRef="Task_PersistDmnResult" />
+    <bpmn:sequenceFlow id="Flow_PersistToEnd" sourceRef="Task_PersistDmnResult" targetRef="EndEvent_RiskAssessmentCompleted" />
+    <bpmn:sequenceFlow id="Flow_CaseNotFoundToManual" sourceRef="BoundaryEvent_CaseNotFound" targetRef="Gateway_ManualHandlingJoin" />
+    <bpmn:sequenceFlow id="Flow_ManualToEnd" sourceRef="Task_HandleManualException" targetRef="EndEvent_ManualHandlingRequired" />
+    <bpmn:textAnnotation id="TextAnnotation_StartTriggered">
+      <bpmn:text>Triggered by: Phase 06 (case ready for risk assessment)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_MapJurisdictionZone">
+      <bpmn:text>Implementation: Camunda DMN engine FEEL evaluation against embedded `jurisdiction-zone` context table (MLR 2017 Schedule 3ZA / FATF). Inputs: client.jurisdictionISO, client.countryOfIncorporation. Output: jurisdictionZone. Fail-soft to HIGH on unmapped jurisdiction with dataGap ANALYST note.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_MapSectorRisk">
+      <bpmn:text>Implementation: Camunda DMN engine FEEL evaluation against `sector-risk` context table (HMT NRA 2020 sub-sector ratings). Inputs: client.sicCodes[]. Output: sectorRisk in {LOW, MEDIUM, HIGH}. Fail-soft to HIGH on missing/null SIC.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_ComputeUboComplexity">
+      <bpmn:text>Implementation: kyc-ubo-complexity-worker (Camunda Job Worker). Inputs: psc.kind[], psc.naturesOfControl[], pscResolution.status from Phase 05. Output: uboComplexity in {SIMPLE, CHAIN, TRUST_NOMINEE}. Fail-soft to TRUST_NOMINEE on missing PSC analysis (conservative routing).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_ComputeAdverseMediaSeverity">
+      <bpmn:text>Implementation: kyc-adverse-media-aggregator (Camunda Job Worker). Aggregates per-hit SanctionGuard severity arrays from Phase 05 across entity, active directors, UBOs at least 10%. Rule: max-per-subject, then worst-across-subjects. Output: adverseMediaSeverity in {NONE, LOW, MEDIUM, HIGH}.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_SetEddRequired">
+      <bpmn:text>Implementation: kyc-edd-trigger-worker (Camunda Job Worker). Inputs: screeningResult, jurisdictionZone (from 7.1), case attributes covering MLR 2017 reg. 33(1) seven mandatory EDD triggers. Output: eddRequired (boolean). Excluded from parallel-1 because it depends on jurisdictionZone.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_AssessCddRisk">
+      <bpmn:text>Implementation: Camunda 8.9 native DMN engine (`cdd-risk-assessment` decision). 7-input to 3-output decision table sourced from Meridian Risk Scoring Matrix (SharePoint Excel). Outputs: newRiskTier, approvalLevel, refreshCycleYears. Mandatory exhaustive default row returns HIGH/MLRO/1 with dataGap note. Hard Constraint #2: risk-tier logic must live in DMN. [GAP-A] open Reviewer Question.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_OverrideGateway">
+      <bpmn:text>Evaluates: analystOverrideRequested</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_OverrideRiskTier">
+      <bpmn:text>Implementation: kyc-analysts user group. Form pre-populates DMN inputs and outputs read-only; new structured overrideReasonCategory enum (JURISDICTION_RECLASS, UBO_RECLASS, ADVERSE_MEDIA_REWEIGHT, SECTOR_REWEIGHT, OTHER) plus mandatory free-text overrideRationale. ClientVault POST /cdd-cases/{caseId}/notes (noteType: ANALYST). When invoked: manualRiskTier replaces newRiskTier; approvalLevel uplifted to MLRO; refreshCycleYears re-derived.
+Manual: JMLSG section 4.50 requires documented human rationale for overriding automated risk scores; Hard Constraint #1 prohibits AI from making risk-tier decisions.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_NotifyAnalystOverdue">
+      <bpmn:text>Implementation: SLA reminder (non-interrupting at 24h). Notifies kyc-analysts that an override task is pending. Original UserTask continues executing.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_HandleManualException">
+      <bpmn:text>Implementation: Standard 4-outcome manual-handling user task (continue / escalate / reject_case / refer_offboarding). Catches both the 72h override timeout and the ClientVault CASE_NOT_FOUND (404) error.
+Manual: Exception triage requires human judgment; outcome dictates downstream routing.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_PersistDmnResult">
+      <bpmn:text>Implementation: clientvault-case-patch-worker invoking ClientVault PATCH /cdd-cases/{caseId} (REST + X-API-Key). Writes newRiskTier (or manualRiskTier), approvalLevel, refreshCycleYears; sets case.status: PENDING_APPROVAL. ClientVault is the audit system of record (Hard Constraint #12). Boundary: errorCode CASE_NOT_FOUND (404).</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_RiskAssessmentCompleted">
+      <bpmn:text>Follow-up: Phase 08 tiered approval consumes approvalLevel.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_ManualHandlingRequired">
+      <bpmn:text>Follow-up: Case routed to KYC ops manual queue; outcome determines whether process resumes, escalates to MLRO, rejects, or refers to offboarding.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_StartTriggered" associationDirection="None" sourceRef="StartEvent_Phase07Triggered" targetRef="TextAnnotation_StartTriggered" />
+    <bpmn:association id="Association_MapJurisdictionZone" associationDirection="None" sourceRef="Task_MapJurisdictionZone" targetRef="TextAnnotation_MapJurisdictionZone" />
+    <bpmn:association id="Association_MapSectorRisk" associationDirection="None" sourceRef="Task_MapSectorRisk" targetRef="TextAnnotation_MapSectorRisk" />
+    <bpmn:association id="Association_ComputeUboComplexity" associationDirection="None" sourceRef="Task_ComputeUboComplexity" targetRef="TextAnnotation_ComputeUboComplexity" />
+    <bpmn:association id="Association_ComputeAdverseMediaSeverity" associationDirection="None" sourceRef="Task_ComputeAdverseMediaSeverity" targetRef="TextAnnotation_ComputeAdverseMediaSeverity" />
+    <bpmn:association id="Association_SetEddRequired" associationDirection="None" sourceRef="Task_SetEddRequired" targetRef="TextAnnotation_SetEddRequired" />
+    <bpmn:association id="Association_AssessCddRisk" associationDirection="None" sourceRef="Task_AssessCddRisk" targetRef="TextAnnotation_AssessCddRisk" />
+    <bpmn:association id="Association_OverrideGateway" associationDirection="None" sourceRef="Gateway_OverrideRiskTier" targetRef="TextAnnotation_OverrideGateway" />
+    <bpmn:association id="Association_OverrideRiskTier" associationDirection="None" sourceRef="Task_OverrideRiskTier" targetRef="TextAnnotation_OverrideRiskTier" />
+    <bpmn:association id="Association_NotifyAnalystOverdue" associationDirection="None" sourceRef="Task_NotifyAnalystOverdue" targetRef="TextAnnotation_NotifyAnalystOverdue" />
+    <bpmn:association id="Association_HandleManualException" associationDirection="None" sourceRef="Task_HandleManualException" targetRef="TextAnnotation_HandleManualException" />
+    <bpmn:association id="Association_PersistDmnResult" associationDirection="None" sourceRef="Task_PersistDmnResult" targetRef="TextAnnotation_PersistDmnResult" />
+    <bpmn:association id="Association_RiskAssessmentCompleted" associationDirection="None" sourceRef="EndEvent_RiskAssessmentCompleted" targetRef="TextAnnotation_RiskAssessmentCompleted" />
+    <bpmn:association id="Association_ManualHandlingRequired" associationDirection="None" sourceRef="EndEvent_ManualHandlingRequired" targetRef="TextAnnotation_ManualHandlingRequired" />
+  </bpmn:process>
+  <bpmn:error id="Error_CaseNotFound" name="Case not found" errorCode="CASE_NOT_FOUND" />
+  <bpmn:error id="Error_ManualHandlingRequired" name="Manual handling required" errorCode="MANUAL_HANDLING_REQUIRED" />
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process07RiskAssessmentProcess">
+    <bpmndi:BPMNPlane id="BPMNPlane_Process07RiskAssessmentProcess" bpmnElement="Process07RiskAssessmentProcess">
+      <bpmndi:BPMNShape id="StartEvent_Phase07Triggered_di" bpmnElement="StartEvent_Phase07Triggered">
+        <dc:Bounds x="237" y="602" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="213" y="638" width="84" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Split_1_di" bpmnElement="ParallelGateway_Split_1">
+        <dc:Bounds x="380" y="595" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_MapJurisdictionZone_di" bpmnElement="Task_MapJurisdictionZone">
+        <dc:Bounds x="505" y="580" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Join_1_di" bpmnElement="ParallelGateway_Join_1">
+        <dc:Bounds x="680" y="595" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SetEddRequired_di" bpmnElement="Task_SetEddRequired">
+        <dc:Bounds x="805" y="580" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AssessCddRisk_di" bpmnElement="Task_AssessCddRisk">
+        <dc:Bounds x="955" y="580" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_OverrideRiskTier_di" bpmnElement="Gateway_OverrideRiskTier" isMarkerVisible="true">
+        <dc:Bounds x="1130" y="595" width="50" height="50" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1112" y="645" width="87" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_OverrideRiskTier_di" bpmnElement="Task_OverrideRiskTier">
+        <dc:Bounds x="1255" y="580" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_NotifyAnalystOverdue_di" bpmnElement="Task_NotifyAnalystOverdue">
+        <dc:Bounds x="1405" y="860" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_OverrideReminderSent_di" bpmnElement="EndEvent_OverrideReminderSent">
+        <dc:Bounds x="1587" y="882" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1561" y="918" width="89" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_OverrideJoin_di" bpmnElement="Gateway_OverrideJoin" isMarkerVisible="true">
+        <dc:Bounds x="1430" y="595" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PersistDmnResult_di" bpmnElement="Task_PersistDmnResult">
+        <dc:Bounds x="1555" y="580" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_ManualHandlingJoin_di" bpmnElement="Gateway_ManualHandlingJoin" isMarkerVisible="true">
+        <dc:Bounds x="1430" y="735" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_HandleManualException_di" bpmnElement="Task_HandleManualException">
+        <dc:Bounds x="1555" y="720" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_RiskAssessmentCompleted_di" bpmnElement="EndEvent_RiskAssessmentCompleted">
+        <dc:Bounds x="1737" y="602" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1713" y="638" width="84" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ManualHandlingRequired_di" bpmnElement="EndEvent_ManualHandlingRequired">
+        <dc:Bounds x="1737" y="742" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1715" y="778" width="81" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_MapSectorRisk_di" bpmnElement="Task_MapSectorRisk">
+        <dc:Bounds x="505" y="720" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ComputeUboComplexity_di" bpmnElement="Task_ComputeUboComplexity">
+        <dc:Bounds x="505" y="860" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ComputeAdverseMediaSeverity_di" bpmnElement="Task_ComputeAdverseMediaSeverity">
+        <dc:Bounds x="505" y="1000" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_MapSectorRisk_di" bpmnElement="Association_MapSectorRisk">
+        <di:waypoint x="605" y="762" />
+        <di:waypoint x="755" y="778" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_ComputeUboComplexity_di" bpmnElement="Association_ComputeUboComplexity">
+        <di:waypoint x="605" y="911" />
+        <di:waypoint x="755" y="943" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_ComputeAdverseMediaSeverity_di" bpmnElement="Association_ComputeAdverseMediaSeverity">
+        <di:waypoint x="605" y="1064" />
+        <di:waypoint x="755" y="1134" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_OverrideGateway_di" bpmnElement="Association_OverrideGateway">
+        <di:waypoint x="1142" y="632" />
+        <di:waypoint x="1120" y="680" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_ManualHandlingRequired_di" bpmnElement="Association_ManualHandlingRequired">
+        <di:waypoint x="1769" y="771" />
+        <di:waypoint x="1840" y="771" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_RiskAssessmentCompleted_di" bpmnElement="Association_RiskAssessmentCompleted">
+        <di:waypoint x="1773" y="619" />
+        <di:waypoint x="1820" y="590" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_HandleManualException_di" bpmnElement="Association_HandleManualException">
+        <di:waypoint x="1648" y="799" />
+        <di:waypoint x="1710" y="856" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_NotifyAnalystOverdue_di" bpmnElement="Association_NotifyAnalystOverdue">
+        <di:waypoint x="1455" y="940" />
+        <di:waypoint x="1455" y="970" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_StartTriggered_di" bpmnElement="TextAnnotation_StartTriggered">
+        <dc:Bounds x="155" y="509" width="200" height="43" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_MapJurisdictionZone_di" bpmnElement="TextAnnotation_MapJurisdictionZone">
+        <dc:Bounds x="455" y="343" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_SetEddRequired_di" bpmnElement="TextAnnotation_SetEddRequired">
+        <dc:Bounds x="755" y="343" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_AssessCddRisk_di" bpmnElement="TextAnnotation_AssessCddRisk">
+        <dc:Bounds x="1025" y="271" width="200" height="259" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_OverrideRiskTier_di" bpmnElement="TextAnnotation_OverrideRiskTier">
+        <dc:Bounds x="1265" y="79" width="200" height="403" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_PersistDmnResult_di" bpmnElement="TextAnnotation_PersistDmnResult">
+        <dc:Bounds x="1505" y="237" width="200" height="245" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_CaseNotFound_di" bpmnElement="BoundaryEvent_CaseNotFound">
+        <dc:Bounds x="1587" y="642" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1612" y="678" width="75" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_OverrideEscalation72h_di" bpmnElement="BoundaryEvent_OverrideEscalation72h">
+        <dc:Bounds x="1320" y="642" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1308" y="678" width="60" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_OverrideReminder24h_di" bpmnElement="BoundaryEvent_OverrideReminder24h">
+        <dc:Bounds x="1260" y="642" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1248" y="678" width="60" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_StartToSplit_di" bpmnElement="Flow_StartToSplit">
+        <di:waypoint x="273" y="620" />
+        <di:waypoint x="380" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToJurisdiction_di" bpmnElement="Flow_SplitToJurisdiction">
+        <di:waypoint x="430" y="620" />
+        <di:waypoint x="505" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToSector_di" bpmnElement="Flow_SplitToSector">
+        <di:waypoint x="405" y="645" />
+        <di:waypoint x="405" y="760" />
+        <di:waypoint x="505" y="760" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToUbo_di" bpmnElement="Flow_SplitToUbo">
+        <di:waypoint x="405" y="645" />
+        <di:waypoint x="405" y="900" />
+        <di:waypoint x="505" y="900" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToAdverseMedia_di" bpmnElement="Flow_SplitToAdverseMedia">
+        <di:waypoint x="405" y="645" />
+        <di:waypoint x="405" y="1040" />
+        <di:waypoint x="505" y="1040" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_JurisdictionToJoin_di" bpmnElement="Flow_JurisdictionToJoin">
+        <di:waypoint x="605" y="620" />
+        <di:waypoint x="680" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SectorToJoin_di" bpmnElement="Flow_SectorToJoin">
+        <di:waypoint x="605" y="760" />
+        <di:waypoint x="705" y="760" />
+        <di:waypoint x="705" y="645" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_UboToJoin_di" bpmnElement="Flow_UboToJoin">
+        <di:waypoint x="605" y="900" />
+        <di:waypoint x="705" y="900" />
+        <di:waypoint x="705" y="645" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_AdverseMediaToJoin_di" bpmnElement="Flow_AdverseMediaToJoin">
+        <di:waypoint x="605" y="1040" />
+        <di:waypoint x="705" y="1040" />
+        <di:waypoint x="705" y="645" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_JoinToEdd_di" bpmnElement="Flow_JoinToEdd">
+        <di:waypoint x="730" y="620" />
+        <di:waypoint x="805" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_EddToDmn_di" bpmnElement="Flow_EddToDmn">
+        <di:waypoint x="905" y="620" />
+        <di:waypoint x="955" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_DmnToOverrideGateway_di" bpmnElement="Flow_DmnToOverrideGateway">
+        <di:waypoint x="1055" y="620" />
+        <di:waypoint x="1130" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_OverrideYes_di" bpmnElement="SequenceFlow_OverrideYes">
+        <di:waypoint x="1180" y="620" />
+        <di:waypoint x="1255" y="620" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1209" y="595" width="18" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="SequenceFlow_OverrideNo_di" bpmnElement="SequenceFlow_OverrideNo">
+        <di:waypoint x="1155" y="595" />
+        <di:waypoint x="1155" y="540" />
+        <di:waypoint x="1455" y="540" />
+        <di:waypoint x="1455" y="595" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1298" y="515" width="15" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_OverrideToJoin_di" bpmnElement="Flow_OverrideToJoin">
+        <di:waypoint x="1355" y="620" />
+        <di:waypoint x="1430" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ReminderToNotify_di" bpmnElement="Flow_ReminderToNotify">
+        <di:waypoint x="1288.3333333333333" y="678" />
+        <di:waypoint x="1288.3333333333333" y="900" />
+        <di:waypoint x="1405" y="900" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_NotifyToReminderEnd_di" bpmnElement="Flow_NotifyToReminderEnd">
+        <di:waypoint x="1505" y="900" />
+        <di:waypoint x="1587" y="900" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_EscalationToManual_di" bpmnElement="Flow_EscalationToManual">
+        <di:waypoint x="1321.6666666666667" y="678" />
+        <di:waypoint x="1321.6666666666667" y="760" />
+        <di:waypoint x="1430" y="760" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_JoinToManual_di" bpmnElement="Flow_JoinToManual">
+        <di:waypoint x="1480" y="760" />
+        <di:waypoint x="1555" y="760" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_JoinToPersist_di" bpmnElement="Flow_JoinToPersist">
+        <di:waypoint x="1480" y="620" />
+        <di:waypoint x="1555" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PersistToEnd_di" bpmnElement="Flow_PersistToEnd">
+        <di:waypoint x="1655" y="620" />
+        <di:waypoint x="1737" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_CaseNotFoundToManual_di" bpmnElement="Flow_CaseNotFoundToManual">
+        <di:waypoint x="1605" y="678" />
+        <di:waypoint x="1605" y="710" />
+        <di:waypoint x="1455" y="710" />
+        <di:waypoint x="1455" y="735" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ManualToEnd_di" bpmnElement="Flow_ManualToEnd">
+        <di:waypoint x="1655" y="760" />
+        <di:waypoint x="1737" y="760" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_StartTriggered_di" bpmnElement="Association_StartTriggered">
+        <di:waypoint x="255" y="602" />
+        <di:waypoint x="255" y="552" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_MapJurisdictionZone_di" bpmnElement="Association_MapJurisdictionZone">
+        <di:waypoint x="555" y="580" />
+        <di:waypoint x="555" y="530" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_SetEddRequired_di" bpmnElement="Association_SetEddRequired">
+        <di:waypoint x="855" y="580" />
+        <di:waypoint x="855" y="530" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_AssessCddRisk_di" bpmnElement="Association_AssessCddRisk">
+        <di:waypoint x="1055" y="580" />
+        <di:waypoint x="1025" y="530" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_OverrideRiskTier_di" bpmnElement="Association_OverrideRiskTier">
+        <di:waypoint x="1355" y="580" />
+        <di:waypoint x="1305" y="482" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_PersistDmnResult_di" bpmnElement="Association_PersistDmnResult">
+        <di:waypoint x="1605" y="580" />
+        <di:waypoint x="1605" y="482" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="TextAnnotation_MapSectorRisk_di" bpmnElement="TextAnnotation_MapSectorRisk">
+        <dc:Bounds x="755" y="710" width="200" height="144" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_ComputeUboComplexity_di" bpmnElement="TextAnnotation_ComputeUboComplexity">
+        <dc:Bounds x="755" y="870" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_ComputeAdverseMediaSeverity_di" bpmnElement="TextAnnotation_ComputeAdverseMediaSeverity">
+        <dc:Bounds x="755" y="1080" width="200" height="202" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_OverrideGateway_di" bpmnElement="TextAnnotation_OverrideGateway">
+        <dc:Bounds x="1020" y="680" width="200" height="43" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_ManualHandlingRequired_di" bpmnElement="TextAnnotation_ManualHandlingRequired">
+        <dc:Bounds x="1840" y="731" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_RiskAssessmentCompleted_di" bpmnElement="TextAnnotation_RiskAssessmentCompleted">
+        <dc:Bounds x="1820" y="560" width="200" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_HandleManualException_di" bpmnElement="TextAnnotation_HandleManualException">
+        <dc:Bounds x="1710" y="850" width="200" height="187" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_NotifyAnalystOverdue_di" bpmnElement="TextAnnotation_NotifyAnalystOverdue">
+        <dc:Bounds x="1355" y="970" width="200" height="101" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

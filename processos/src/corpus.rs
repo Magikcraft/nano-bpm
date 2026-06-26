@@ -30,6 +30,7 @@ use serde_json::Value as Json;
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
     Command, ElementKind, Engine, JobState, ProcessDefinition, ProcessInstanceState, Value,
+    UserTaskState,
 };
 
 use crate::harness::{draw, min_workers_for_p99};
@@ -597,8 +598,23 @@ fn run_path(
                 )
             })
             .collect();
-        if pending.is_empty() {
+        // Human steps: a userTask on the taken path parks the token until a human
+        // completes it. The corpus auto-completes them (the "user" always acts) so
+        // multi-stage flows reach their end, but does NOT model them as worker-pool
+        // work — they carry no queue/service infra and so are not recorded as job
+        // steps (only service-task jobs are the levers the inference pulls).
+        let pending_user_tasks: Vec<u64> = engine
+            .state()
+            .user_tasks
+            .values()
+            .filter(|t| t.state == UserTaskState::Created)
+            .map(|t| t.key)
+            .collect();
+        if pending.is_empty() && pending_user_tasks.is_empty() {
             break;
+        }
+        for ut_key in pending_user_tasks {
+            let _ = engine.apply_command_at(Command::complete_user_task(ut_key), clock);
         }
         for (job_key, job_type, element_id, needs_activation) in pending {
             if needs_activation {
@@ -993,9 +1009,23 @@ fn classify_domain(job_types: &[String]) -> String {
     let has = |kw: &str| hay.contains(kw);
     if has("credit") || has("loan") || has("approve") {
         "loan-origination".into()
+    } else if has("cdd")
+        || has("sanction")
+        || has("screen")
+        || has("kyc")
+        || has("edd")
+        || has("ubo")
+        || has("mlro")
+        || has("jurisdiction")
+        || has("adverse-media")
+    {
+        // Corporate CDD / AML refresh: the screening/sanctions/EDD vocabulary is
+        // checked before the generic "case" heuristic below because tasks like
+        // `close-cdd-case` would otherwise be misread as case management.
+        "kyc-cdd-refresh".into()
     } else if has("salesforce") || has("case") || has("tracking") || has("delivery") {
         "delivery-exception-resolution".into()
-    } else if has("screen") || has("kyc") || has("sanction") || has("document") || has("cdd") {
+    } else if has("document") {
         "kyc-cdd-refresh".into()
     } else if has("classify") || has("summarize") {
         "document-processing".into()
@@ -1242,5 +1272,30 @@ pub(crate) mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn classify_domain_recognises_the_cdd_refresh_vocabulary() {
+        // The CDD/AML refresh job vocabulary classifies as kyc-cdd-refresh even
+        // though `close-cdd-case` contains "case" (which the generic
+        // case-management heuristic would otherwise claim).
+        let cdd = vec![
+            "io.camunda.agenticai:aiagent:1".to_string(),
+            "decision-aggregate-screening-result".to_string(),
+            "set-edd-required".to_string(),
+            "close-cdd-case".to_string(),
+        ];
+        assert_eq!(classify_domain(&cdd), "kyc-cdd-refresh");
+
+        // Sanctions/UBO signals also land in the CDD domain.
+        let sanctions = vec![
+            "lift-client-comms-freeze".to_string(),
+            "decision-apply-ubo-threshold".to_string(),
+        ];
+        assert_eq!(classify_domain(&sanctions), "kyc-cdd-refresh");
+
+        // The loan vocabulary is unaffected by the reordering.
+        let loan = vec!["credit-check".to_string(), "approve-loan".to_string()];
+        assert_eq!(classify_domain(&loan), "loan-origination");
     }
 }

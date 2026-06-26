@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_Process09" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1">
+  <bpmn:error id="Error_MissingDocs" name="MISSING_REQUIRED_DOCUMENTS" errorCode="MISSING_REQUIRED_DOCUMENTS" />
+  <bpmn:error id="Error_ApprovalNotComplete" name="APPROVAL_NOT_COMPLETE" errorCode="APPROVAL_NOT_COMPLETE" />
+  <bpmn:process id="Process09Closure" name="Phase 9: Case Closure and Refresh Complete Notification" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_Approved" name="Case approved">
+      <bpmn:outgoing>Flow_StartToCompute</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="Task_ComputeNextRefresh" name="Compute next refresh due date">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="compute-next-refresh-due-date" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_StartToCompute</bpmn:incoming>
+      <bpmn:outgoing>Flow_ComputeToPreflight</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="Gateway_PreflightMerge" name="">
+      <bpmn:incoming>Flow_ComputeToPreflight</bpmn:incoming>
+      <bpmn:incoming>Flow_DiagnosticToPreflight</bpmn:incoming>
+      <bpmn:outgoing>Flow_MergeToPreflight</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="Task_PreflightValidation" name="Pre-flight close validation">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="pre-flight-close-validation" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_MergeToPreflight</bpmn:incoming>
+      <bpmn:outgoing>Flow_PreflightToParallel</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="Gateway_ParallelSplit" name="">
+      <bpmn:incoming>Flow_PreflightToParallel</bpmn:incoming>
+      <bpmn:outgoing>Flow_ParallelToClose</bpmn:outgoing>
+      <bpmn:outgoing>Flow_ParallelToNotify</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_CloseCase" name="Close CDD case">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="close-cdd-case" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_ParallelToClose</bpmn:incoming>
+      <bpmn:outgoing>Flow_CloseToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Task_SendRefreshComplete" name="Send REFRESH_COMPLETE notification">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="send-refresh-complete-notification" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_ParallelToNotify</bpmn:incoming>
+      <bpmn:outgoing>Flow_NotifyToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="Gateway_ParallelJoin" name="">
+      <bpmn:incoming>Flow_CloseToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_NotifyToJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_JoinToEnd</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:endEvent id="EndEvent_RefreshComplete" name="Refresh complete">
+      <bpmn:incoming>Flow_JoinToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:boundaryEvent id="BoundaryEvent_MissingDocs" name="MISSING_REQUIRED_DOCUMENTS" attachedToRef="Task_CloseCase">
+      <bpmn:outgoing>Flow_MissingDocsToDiagnostic</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_MissingDocs" errorRef="Error_MissingDocs" />
+    </bpmn:boundaryEvent>
+    <bpmn:boundaryEvent id="BoundaryEvent_ApprovalNotComplete" name="APPROVAL_NOT_COMPLETE" attachedToRef="Task_CloseCase">
+      <bpmn:outgoing>Flow_ApprovalNotCompleteToDiagnostic</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_ApprovalNotComplete" errorRef="Error_ApprovalNotComplete" />
+    </bpmn:boundaryEvent>
+    <bpmn:exclusiveGateway id="Gateway_DiagnosticMerge" name="">
+      <bpmn:incoming>Flow_MissingDocsToDiagnostic</bpmn:incoming>
+      <bpmn:incoming>Flow_ApprovalNotCompleteToDiagnostic</bpmn:incoming>
+      <bpmn:outgoing>Flow_MergeToDiagnostic</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_AnalystDiagnostic" name="Resolve close-time precondition">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-analyst-diagnostic" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_MergeToDiagnostic</bpmn:incoming>
+      <bpmn:outgoing>Flow_DiagnosticToPreflight</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="Flow_StartToCompute" sourceRef="StartEvent_Approved" targetRef="Task_ComputeNextRefresh" />
+    <bpmn:sequenceFlow id="Flow_ComputeToPreflight" sourceRef="Task_ComputeNextRefresh" targetRef="Gateway_PreflightMerge" />
+    <bpmn:sequenceFlow id="Flow_MergeToPreflight" sourceRef="Gateway_PreflightMerge" targetRef="Task_PreflightValidation" />
+    <bpmn:sequenceFlow id="Flow_PreflightToParallel" sourceRef="Task_PreflightValidation" targetRef="Gateway_ParallelSplit" />
+    <bpmn:sequenceFlow id="Flow_ParallelToClose" sourceRef="Gateway_ParallelSplit" targetRef="Task_CloseCase" />
+    <bpmn:sequenceFlow id="Flow_ParallelToNotify" sourceRef="Gateway_ParallelSplit" targetRef="Task_SendRefreshComplete" />
+    <bpmn:sequenceFlow id="Flow_CloseToJoin" sourceRef="Task_CloseCase" targetRef="Gateway_ParallelJoin" />
+    <bpmn:sequenceFlow id="Flow_NotifyToJoin" sourceRef="Task_SendRefreshComplete" targetRef="Gateway_ParallelJoin" />
+    <bpmn:sequenceFlow id="Flow_JoinToEnd" sourceRef="Gateway_ParallelJoin" targetRef="EndEvent_RefreshComplete" />
+    <bpmn:sequenceFlow id="Flow_MissingDocsToDiagnostic" sourceRef="BoundaryEvent_MissingDocs" targetRef="Gateway_DiagnosticMerge" />
+    <bpmn:sequenceFlow id="Flow_ApprovalNotCompleteToDiagnostic" sourceRef="BoundaryEvent_ApprovalNotComplete" targetRef="Gateway_DiagnosticMerge" />
+    <bpmn:sequenceFlow id="Flow_MergeToDiagnostic" sourceRef="Gateway_DiagnosticMerge" targetRef="Task_AnalystDiagnostic" />
+    <bpmn:sequenceFlow id="Flow_DiagnosticToPreflight" sourceRef="Task_AnalystDiagnostic" targetRef="Gateway_PreflightMerge" />
+    <bpmn:textAnnotation id="Annotation_Triggered">
+      <bpmn:text>Triggered by: Phase 8 approval — case.status=APPROVED, approverUsername+approvalDate set</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_TriggeredStart" sourceRef="StartEvent_Approved" targetRef="Annotation_Triggered" />
+    <bpmn:textAnnotation id="Annotation_NextRefresh">
+      <bpmn:text>Implementation: nextRefreshDueDate = approvalDate + refreshCycleYears (DMN output)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_NextRefresh" sourceRef="Task_ComputeNextRefresh" targetRef="Annotation_NextRefresh" />
+    <bpmn:textAnnotation id="Annotation_Preflight">
+      <bpmn:text>Implementation: validates DocuSafe completeness + newRiskTier + approverUsername populated; raises blocking error if not. Closes FCA Q4 2024 finding on missing approver fields.</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Preflight" sourceRef="Task_PreflightValidation" targetRef="Annotation_Preflight" />
+    <bpmn:textAnnotation id="Annotation_Close">
+      <bpmn:text>Implementation: ClientVault POST /cdd-cases/{caseId}/close — outcome=REFRESH_COMPLETE, nextRefreshDueDate, closingNotes</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Close" sourceRef="Task_CloseCase" targetRef="Annotation_Close" />
+    <bpmn:textAnnotation id="Annotation_Notify">
+      <bpmn:text>Implementation: Notification Service POST /notifications template=REFRESH_COMPLETE — gated by clientCommsFreeze; auto-CC RM, auto-log to ClientVault</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Notify" sourceRef="Task_SendRefreshComplete" targetRef="Annotation_Notify" />
+    <bpmn:textAnnotation id="Annotation_Diagnostic">
+      <bpmn:text>Manual: analyst diagnoses which precondition failed (DocuSafe completeness vs newRiskTier vs approverUsername) and remediates; loops back to pre-flight</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_Diagnostic" sourceRef="Task_AnalystDiagnostic" targetRef="Annotation_Diagnostic" />
+    <bpmn:textAnnotation id="Annotation_End">
+      <bpmn:text>Follow-up: case.status=CLOSED with outcome REFRESH_COMPLETE; ClientVault audit trail closed (5y retention per MLR 2017 reg. 40); next batch trigger seeds at refreshDueDate-30d</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_End" sourceRef="EndEvent_RefreshComplete" targetRef="Annotation_End" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process09Closure">
+    <bpmndi:BPMNPlane id="BPMNPlane_Process09Closure" bpmnElement="Process09Closure">
+      <bpmndi:BPMNShape id="StartEvent_Approved_di" bpmnElement="StartEvent_Approved">
+        <dc:Bounds x="237" y="362" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="218" y="398" width="75" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ComputeNextRefresh_di" bpmnElement="Task_ComputeNextRefresh">
+        <dc:Bounds x="355" y="340" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_PreflightMerge_di" bpmnElement="Gateway_PreflightMerge" isMarkerVisible="true">
+        <dc:Bounds x="530" y="355" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PreflightValidation_di" bpmnElement="Task_PreflightValidation">
+        <dc:Bounds x="655" y="340" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_ParallelSplit_di" bpmnElement="Gateway_ParallelSplit">
+        <dc:Bounds x="830" y="355" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_CloseCase_di" bpmnElement="Task_CloseCase">
+        <dc:Bounds x="955" y="340" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_ParallelJoin_di" bpmnElement="Gateway_ParallelJoin">
+        <dc:Bounds x="1130" y="355" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_RefreshComplete_di" bpmnElement="EndEvent_RefreshComplete">
+        <dc:Bounds x="1287" y="362" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1262" y="398" width="87" height="14" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_DiagnosticMerge_di" bpmnElement="Gateway_DiagnosticMerge" isMarkerVisible="true">
+        <dc:Bounds x="1130" y="495" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_AnalystDiagnostic_di" bpmnElement="Task_AnalystDiagnostic">
+        <dc:Bounds x="1255" y="480" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendRefreshComplete_di" bpmnElement="Task_SendRefreshComplete">
+        <dc:Bounds x="955" y="207" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_TriggeredStart_di" bpmnElement="Association_TriggeredStart">
+        <di:waypoint x="255" y="362" />
+        <di:waypoint x="255" y="310" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Preflight_di" bpmnElement="Association_Preflight">
+        <di:waypoint x="705" y="340" />
+        <di:waypoint x="705" y="290" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Close_di" bpmnElement="Association_Close">
+        <di:waypoint x="955" y="405" />
+        <di:waypoint x="840" y="462" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_End_di" bpmnElement="Association_End">
+        <di:waypoint x="1311" y="363" />
+        <di:waypoint x="1328" y="312" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Diagnostic_di" bpmnElement="Association_Diagnostic">
+        <di:waypoint x="1324" y="560" />
+        <di:waypoint x="1352" y="620" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_Notify_di" bpmnElement="Association_Notify">
+        <di:waypoint x="1005" y="207" />
+        <di:waypoint x="1005" y="181" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_NextRefresh_di" bpmnElement="Association_NextRefresh">
+        <di:waypoint x="423" y="340" />
+        <di:waypoint x="451" y="276" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="BoundaryEvent_ApprovalNotComplete_di" bpmnElement="BoundaryEvent_ApprovalNotComplete">
+        <dc:Bounds x="1014" y="402" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="1039" y="438" width="82" height="27" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="BoundaryEvent_MissingDocs_di" bpmnElement="BoundaryEvent_MissingDocs">
+        <dc:Bounds x="960" y="402" width="36" height="36" />
+        <bpmndi:BPMNLabel>
+          <dc:Bounds x="899" y="450" width="82" height="40" />
+        </bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Triggered_di" bpmnElement="Annotation_Triggered">
+        <dc:Bounds x="155" y="224" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Preflight_di" bpmnElement="Annotation_Preflight">
+        <dc:Bounds x="605" y="160" width="200" height="130" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Notify_di" bpmnElement="Annotation_Notify">
+        <dc:Bounds x="905" y="80" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_End_di" bpmnElement="Annotation_End">
+        <dc:Bounds x="1250" y="182" width="200" height="130" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Close_di" bpmnElement="Annotation_Close">
+        <dc:Bounds x="640" y="460" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Annotation_Diagnostic_di" bpmnElement="Annotation_Diagnostic">
+        <dc:Bounds x="1280" y="620" width="200" height="115" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_StartToCompute_di" bpmnElement="Flow_StartToCompute">
+        <di:waypoint x="273" y="380" />
+        <di:waypoint x="355" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ComputeToPreflight_di" bpmnElement="Flow_ComputeToPreflight">
+        <di:waypoint x="455" y="380" />
+        <di:waypoint x="530" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_DiagnosticToPreflight_di" bpmnElement="Flow_DiagnosticToPreflight">
+        <di:waypoint x="1305" y="560" />
+        <di:waypoint x="1305" y="590" />
+        <di:waypoint x="555" y="590" />
+        <di:waypoint x="555" y="405" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MergeToPreflight_di" bpmnElement="Flow_MergeToPreflight">
+        <di:waypoint x="580" y="380" />
+        <di:waypoint x="655" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PreflightToParallel_di" bpmnElement="Flow_PreflightToParallel">
+        <di:waypoint x="755" y="380" />
+        <di:waypoint x="830" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ParallelToClose_di" bpmnElement="Flow_ParallelToClose">
+        <di:waypoint x="880" y="380" />
+        <di:waypoint x="955" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ParallelToNotify_di" bpmnElement="Flow_ParallelToNotify">
+        <di:waypoint x="855" y="355" />
+        <di:waypoint x="855" y="247" />
+        <di:waypoint x="955" y="247" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_CloseToJoin_di" bpmnElement="Flow_CloseToJoin">
+        <di:waypoint x="1055" y="380" />
+        <di:waypoint x="1130" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_NotifyToJoin_di" bpmnElement="Flow_NotifyToJoin">
+        <di:waypoint x="1055" y="247" />
+        <di:waypoint x="1155" y="247" />
+        <di:waypoint x="1155" y="355" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_JoinToEnd_di" bpmnElement="Flow_JoinToEnd">
+        <di:waypoint x="1180" y="380" />
+        <di:waypoint x="1287" y="380" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MissingDocsToDiagnostic_di" bpmnElement="Flow_MissingDocsToDiagnostic">
+        <di:waypoint x="988.3333333333334" y="438" />
+        <di:waypoint x="988.3333333333334" y="520" />
+        <di:waypoint x="1130" y="520" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ApprovalNotCompleteToDiagnostic_di" bpmnElement="Flow_ApprovalNotCompleteToDiagnostic">
+        <di:waypoint x="1033" y="438" />
+        <di:waypoint x="1033" y="480" />
+        <di:waypoint x="1155" y="480" />
+        <di:waypoint x="1155" y="495" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MergeToDiagnostic_di" bpmnElement="Flow_MergeToDiagnostic">
+        <di:waypoint x="1180" y="520" />
+        <di:waypoint x="1255" y="520" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape id="Annotation_NextRefresh_di" bpmnElement="Annotation_NextRefresh">
+        <dc:Bounds x="370" y="190" width="200" height="86" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

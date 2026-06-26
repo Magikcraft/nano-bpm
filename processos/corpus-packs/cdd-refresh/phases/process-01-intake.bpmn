@@ -1,0 +1,496 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.46.1" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.9.0">
+  <bpmn:message id="Message_RefreshBatch" name="RefreshBatchTriggered">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=clientId" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmn:error id="Error_ClientNotFound" name="CLIENT_NOT_FOUND" errorCode="CLIENT_NOT_FOUND" />
+  <bpmn:error id="Error_DuplicateOpenCase" name="DUPLICATE_OPEN_CASE" errorCode="DUPLICATE_OPEN_CASE" />
+  <bpmn:process id="Process01IntakeProcess" name="Phase 1: Case Intake and Duplicate Check" isExecutable="true">
+    <bpmn:startEvent id="StartEvent_RefreshBatch" name="Refresh batch received">
+      <bpmn:outgoing>Flow_RefreshBatchToMerge</bpmn:outgoing>
+      <bpmn:messageEventDefinition id="MessageEventDefinition_RefreshBatch" messageRef="Message_RefreshBatch" />
+    </bpmn:startEvent>
+    <bpmn:startEvent id="StartEvent_ManualIntake" name="Manual case intake submitted">
+      <bpmn:outgoing>Flow_ManualIntakeToMerge</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gateway_StartMerge" name="">
+      <bpmn:incoming>Flow_RefreshBatchToMerge</bpmn:incoming>
+      <bpmn:incoming>Flow_ManualIntakeToMerge</bpmn:incoming>
+      <bpmn:outgoing>Flow_MergeToGetProfile</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="Task_GetClientProfile" name="Get client profile" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="GET" target="method" />
+          <zeebe:input source="=&quot;https://clientvault.meridian.local/clients/&quot; + clientId" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ legalName: body.legalName, companiesHouseNumber: body.companiesHouseNumber, jurisdiction: body.jurisdiction, priorRiskTier: body.priorRiskTier, assignedRm: body.assignedRm, assignedAnalyst: body.assignedAnalyst, pepStatus: body.pepStatus }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode = 404 then bpmnError(&quot;CLIENT_NOT_FOUND&quot;, &quot;Client not found&quot;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_MergeToGetProfile</bpmn:incoming>
+      <bpmn:outgoing>Flow_GetProfileToOpenCase</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Boundary_ClientNotFound" name="Client not found" attachedToRef="Task_GetClientProfile">
+      <bpmn:outgoing>Flow_ClientNotFoundToEnd</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_ClientNotFound" errorRef="Error_ClientNotFound" />
+    </bpmn:boundaryEvent>
+    <bpmn:serviceTask id="Task_OpenCddCase" name="Open CDD case" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&quot;https://clientvault.meridian.local/clients/&quot; + clientId + &quot;/cdd-cases&quot;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ clientId: clientId, triggerType: triggerType, triggerReason: triggerReason }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+          <zeebe:header key="resultExpression" value="={ caseId: body.caseId, caseStatus: body.case.status }" />
+          <zeebe:header key="errorExpression" value="=if response.statusCode = 409 then bpmnError(&quot;DUPLICATE_OPEN_CASE&quot;, &quot;Duplicate open case&quot;) else null" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_GetProfileToOpenCase</bpmn:incoming>
+      <bpmn:outgoing>Flow_OpenCaseToSplit</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:boundaryEvent id="Boundary_DuplicateOpenCase" name="Duplicate open case" attachedToRef="Task_OpenCddCase">
+      <bpmn:outgoing>Flow_DuplicateToEnd</bpmn:outgoing>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_DuplicateOpenCase" errorRef="Error_DuplicateOpenCase" />
+    </bpmn:boundaryEvent>
+    <bpmn:parallelGateway id="ParallelGateway_Split_1" name="">
+      <bpmn:incoming>Flow_OpenCaseToSplit</bpmn:incoming>
+      <bpmn:outgoing>Flow_SplitToHeadsup</bpmn:outgoing>
+      <bpmn:outgoing>Flow_SplitToConfirmAnalyst</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_SendRmHeadsup" name="Send RM heads-up" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="POST" target="method" />
+          <zeebe:input source="=&quot;https://notification.meridian.local/notifications&quot;" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ template: &quot;RM_CDD_HEADSUP&quot;, caseId: caseId, clientLegalName: legalName, expectedDocumentRequestDate: expectedDocumentRequestDate, deadlineDays: 21, ccRm: assignedRm }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToHeadsup</bpmn:incoming>
+      <bpmn:outgoing>Flow_HeadsupToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:userTask id="Task_ConfirmAnalystAssignment" name="Confirm KYC analyst and conflict-of-interest declaration">
+      <bpmn:extensionElements>
+        <zeebe:userTask />
+        <zeebe:formDefinition formId="form-confirm-analyst-assignment" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_SplitToConfirmAnalyst</bpmn:incoming>
+      <bpmn:outgoing>Flow_ConfirmAnalystToPersist</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="Task_PersistAnalystAssignment" name="Persist analyst assignment" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="PATCH" target="method" />
+          <zeebe:input source="=&quot;https://clientvault.meridian.local/cdd-cases/&quot; + caseId" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ assignedAnalyst: assignedAnalyst }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_ConfirmAnalystToPersist</bpmn:incoming>
+      <bpmn:outgoing>Flow_PersistToJoin</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="ParallelGateway_Join_1" name="">
+      <bpmn:incoming>Flow_HeadsupToJoin</bpmn:incoming>
+      <bpmn:incoming>Flow_PersistToJoin</bpmn:incoming>
+      <bpmn:outgoing>Flow_JoinToTransition</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:serviceTask id="Task_TransitionStatusToPendingDocs" name="Transition status to pending documents" zeebe:modelerTemplate="io.camunda.connectors.HttpJson.v2" zeebe:modelerTemplateVersion="13" zeebe:modelerTemplateIcon="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTgiIGhlaWdodD0iMTgiIHZpZXdCb3g9IjAgMCAxOCAxOCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTE3LjAzMzUgOC45OTk5N0MxNy4wMzM1IDEzLjQ0NzUgMTMuNDI4MSAxNy4wNTI5IDguOTgwNjUgMTcuMDUyOUM0LjUzMzE2IDE3LjA1MjkgMC45Mjc3NjUgMTMuNDQ3NSAwLjkyNzc2NSA4Ljk5OTk3QzAuOTI3NzY1IDQuNTUyNDggNC41MzMxNiAwLjk0NzA4MyA4Ljk4MDY1IDAuOTQ3MDgzQzEzLjQyODEgMC45NDcwODMgMTcuMDMzNSA0LjU1MjQ4IDE3LjAzMzUgOC45OTk5N1oiIGZpbGw9IiM1MDU1NjIiLz4KPHBhdGggZD0iTTQuOTMxMjYgMTQuMTU3MUw2Ljc4MTA2IDMuNzE0NzFIMTAuMTM3NUMxMS4xOTE3IDMuNzE0NzEgMTEuOTgyNCAzLjk4MzIzIDEyLjUwOTUgNC41MjAyN0MxMy4wNDY1IDUuMDQ3MzYgMTMuMzE1IDUuNzMzNTggMTMuMzE1IDYuNTc4OTJDMTMuMzE1IDcuNDQ0MTQgMTMuMDcxNCA4LjE1NTIyIDEyLjU4NDEgOC43MTIxNUMxMi4xMDY3IDkuMjU5MTMgMTEuNDU1MyA5LjYzNzA1IDEwLjYyOTggOS44NDU5TDEyLjA2MTkgMTQuMTU3MUgxMC4zMzE1TDkuMDMzNjQgMTAuMDI0OUg3LjI0MzUxTDYuNTEyNTQgMTQuMTU3MUg0LjkzMTI2Wk03LjQ5NzExIDguNTkyODFIOS4yNDI0OEM5Ljk5ODMyIDguNTkyODEgMTAuNTkwMSA4LjQyMzc0IDExLjAxNzcgOC4wODU2MUMxMS40NTUzIDcuNzM3NTMgMTEuNjc0MSA3LjI2NTEzIDExLjY3NDEgNi42Njg0MkMxMS42NzQxIDYuMTkxMDYgMTEuNTI0OSA1LjgxODExIDExLjIyNjUgNS41NDk1OUMxMC45MjgyIDUuMjcxMTMgMTAuNDU1OCA1LjEzMTkgOS44MDkzNiA1LjEzMTlIOC4xMDg3NEw3LjQ5NzExIDguNTkyODFaIiBmaWxsPSJ3aGl0ZSIvPgo8L3N2Zz4K">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="io.camunda:http-json:1" />
+        <zeebe:ioMapping>
+          <zeebe:input source="headers" target="authentication.apiKeyLocation" />
+          <zeebe:input target="authentication.name" />
+          <zeebe:input target="authentication.value" />
+          <zeebe:input target="authentication.username" />
+          <zeebe:input target="authentication.password" />
+          <zeebe:input target="authentication.token" />
+          <zeebe:input target="authentication.oauthTokenEndpoint" />
+          <zeebe:input target="authentication.clientId" />
+          <zeebe:input target="authentication.clientSecret" />
+          <zeebe:input target="authentication.audience" />
+          <zeebe:input target="authentication.clientAuthentication" />
+          <zeebe:input target="authentication.scopes" />
+          <zeebe:input source="PATCH" target="method" />
+          <zeebe:input source="=&quot;https://clientvault.meridian.local/cdd-cases/&quot; + caseId" target="url" />
+          <zeebe:input target="headers" />
+          <zeebe:input target="queryParameters" />
+          <zeebe:input target="storeResponse" />
+          <zeebe:input target="skipEncoding" />
+          <zeebe:input target="followRedirects" />
+          <zeebe:input target="connectionTimeoutInSeconds" />
+          <zeebe:input target="readTimeoutInSeconds" />
+          <zeebe:input source="={ status: &quot;PENDING_DOCUMENTS&quot; }" target="body" />
+          <zeebe:input target="ignoreNullValues" />
+        </zeebe:ioMapping>
+        <zeebe:taskHeaders>
+          <zeebe:header key="elementTemplateVersion" value="13" />
+          <zeebe:header key="elementTemplateId" value="io.camunda.connectors.HttpJson.v2" />
+        </zeebe:taskHeaders>
+      </bpmn:extensionElements>
+      <bpmn:incoming>Flow_JoinToTransition</bpmn:incoming>
+      <bpmn:outgoing>Flow_TransitionToEnd</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="EndEvent_PendingDocuments" name="Case pending documents">
+      <bpmn:incoming>Flow_TransitionToEnd</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_ClientNotFound" name="Client not found">
+      <bpmn:incoming>Flow_ClientNotFoundToEnd</bpmn:incoming>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_ClientNotFoundEnd" errorRef="Error_ClientNotFound" />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="EndEvent_CaseDuplicateResumed" name="Duplicate case resumed">
+      <bpmn:incoming>Flow_DuplicateToEnd</bpmn:incoming>
+      <bpmn:errorEventDefinition id="ErrorEventDefinition_DuplicateEnd" errorRef="Error_DuplicateOpenCase" />
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_RefreshBatchToMerge" sourceRef="StartEvent_RefreshBatch" targetRef="Gateway_StartMerge" />
+    <bpmn:sequenceFlow id="Flow_ManualIntakeToMerge" sourceRef="StartEvent_ManualIntake" targetRef="Gateway_StartMerge" />
+    <bpmn:sequenceFlow id="Flow_MergeToGetProfile" sourceRef="Gateway_StartMerge" targetRef="Task_GetClientProfile" />
+    <bpmn:sequenceFlow id="Flow_GetProfileToOpenCase" sourceRef="Task_GetClientProfile" targetRef="Task_OpenCddCase" />
+    <bpmn:sequenceFlow id="Flow_ClientNotFoundToEnd" sourceRef="Boundary_ClientNotFound" targetRef="EndEvent_ClientNotFound" />
+    <bpmn:sequenceFlow id="Flow_OpenCaseToSplit" sourceRef="Task_OpenCddCase" targetRef="ParallelGateway_Split_1" />
+    <bpmn:sequenceFlow id="Flow_DuplicateToEnd" sourceRef="Boundary_DuplicateOpenCase" targetRef="EndEvent_CaseDuplicateResumed" />
+    <bpmn:sequenceFlow id="Flow_SplitToHeadsup" sourceRef="ParallelGateway_Split_1" targetRef="Task_SendRmHeadsup" />
+    <bpmn:sequenceFlow id="Flow_SplitToConfirmAnalyst" sourceRef="ParallelGateway_Split_1" targetRef="Task_ConfirmAnalystAssignment" />
+    <bpmn:sequenceFlow id="Flow_ConfirmAnalystToPersist" sourceRef="Task_ConfirmAnalystAssignment" targetRef="Task_PersistAnalystAssignment" />
+    <bpmn:sequenceFlow id="Flow_HeadsupToJoin" sourceRef="Task_SendRmHeadsup" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_PersistToJoin" sourceRef="Task_PersistAnalystAssignment" targetRef="ParallelGateway_Join_1" />
+    <bpmn:sequenceFlow id="Flow_JoinToTransition" sourceRef="ParallelGateway_Join_1" targetRef="Task_TransitionStatusToPendingDocs" />
+    <bpmn:sequenceFlow id="Flow_TransitionToEnd" sourceRef="Task_TransitionStatusToPendingDocs" targetRef="EndEvent_PendingDocuments" />
+    <bpmn:textAnnotation id="TextAnnotation_RefreshBatchStart">
+      <bpmn:text>Triggered by: ClientVault batch scheduler (per-client message with clientId, triggerType PERIODIC|EVENT_DRIVEN, optional triggerReason)</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_ManualIntakeStart">
+      <bpmn:text>Triggered by: KYC Analyst submitting Camunda Form for manual intake</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_GetClientProfile">
+      <bpmn:text>Implementation: ClientVault GET /clients/{clientId}; auth X-API-Key from secrets.CLIENTVAULT_API_KEY; returns legalName, companiesHouseNumber, jurisdiction, priorRiskTier, assignedRm, assignedAnalyst, pepStatus</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_OpenCddCase">
+      <bpmn:text>Implementation: ClientVault POST /clients/{clientId}/cdd-cases with clientId, triggerType, triggerReason; returns caseId and case.status DRAFT; HTTP 409 raises DUPLICATE_OPEN_CASE</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_SendRmHeadsup">
+      <bpmn:text>Implementation: Notification Service POST /notifications template RM_CDD_HEADSUP with caseId, clientLegalName, expectedDocumentRequestDate, deadlineDays 21; auto-CCs assigned RM</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_ConfirmAnalystAssignment">
+      <bpmn:text>Manual: Conflict-of-interest declaration is policy-only and has no API surface; KYC Team Lead must affirmatively attest analyst assignment for audit trail</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_PersistAnalystAssignment">
+      <bpmn:text>Implementation: ClientVault PATCH /cdd-cases/{caseId} with body assignedAnalyst; idempotent retryable write splits the audit log entry off the user task</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_TransitionStatus">
+      <bpmn:text>Implementation: ClientVault PATCH /cdd-cases/{caseId} with body status PENDING_DOCUMENTS; recorded as discrete audit-log entry per Hard Constraint 12</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_PendingDocumentsEnd">
+      <bpmn:text>Follow-up: Phase 2 document collection begins with caseId, clientId, assignedAnalyst, notificationId in scope</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_ClientNotFoundEnd">
+      <bpmn:text>Follow-up: Terminate intake; SYSTEM case note recorded; no downstream phase invoked</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:textAnnotation id="TextAnnotation_DuplicateResumedEnd">
+      <bpmn:text>Follow-up: Existing case resumed; SYSTEM case note "Duplicate intake — resumed {existingCaseId}"; no new phase instance</bpmn:text>
+    </bpmn:textAnnotation>
+    <bpmn:association id="Association_RefreshBatchStart" sourceRef="StartEvent_RefreshBatch" targetRef="TextAnnotation_RefreshBatchStart" />
+    <bpmn:association id="Association_ManualIntakeStart" sourceRef="StartEvent_ManualIntake" targetRef="TextAnnotation_ManualIntakeStart" />
+    <bpmn:association id="Association_GetClientProfile" sourceRef="Task_GetClientProfile" targetRef="TextAnnotation_GetClientProfile" />
+    <bpmn:association id="Association_OpenCddCase" sourceRef="Task_OpenCddCase" targetRef="TextAnnotation_OpenCddCase" />
+    <bpmn:association id="Association_SendRmHeadsup" sourceRef="Task_SendRmHeadsup" targetRef="TextAnnotation_SendRmHeadsup" />
+    <bpmn:association id="Association_ConfirmAnalystAssignment" sourceRef="Task_ConfirmAnalystAssignment" targetRef="TextAnnotation_ConfirmAnalystAssignment" />
+    <bpmn:association id="Association_PersistAnalystAssignment" sourceRef="Task_PersistAnalystAssignment" targetRef="TextAnnotation_PersistAnalystAssignment" />
+    <bpmn:association id="Association_TransitionStatus" sourceRef="Task_TransitionStatusToPendingDocs" targetRef="TextAnnotation_TransitionStatus" />
+    <bpmn:association id="Association_PendingDocumentsEnd" sourceRef="EndEvent_PendingDocuments" targetRef="TextAnnotation_PendingDocumentsEnd" />
+    <bpmn:association id="Association_ClientNotFoundEnd" sourceRef="EndEvent_ClientNotFound" targetRef="TextAnnotation_ClientNotFoundEnd" />
+    <bpmn:association id="Association_DuplicateResumedEnd" sourceRef="EndEvent_CaseDuplicateResumed" targetRef="TextAnnotation_DuplicateResumedEnd" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_Process01IntakeProcess">
+    <bpmndi:BPMNPlane id="BPMNPlane_Process01IntakeProcess" bpmnElement="Process01IntakeProcess">
+      <bpmndi:BPMNShape id="StartEvent_RefreshBatch_di" bpmnElement="StartEvent_RefreshBatch">
+        <dc:Bounds x="57" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gateway_StartMerge_di" bpmnElement="Gateway_StartMerge" isMarkerVisible="true">
+        <dc:Bounds x="200" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_GetClientProfile_di" bpmnElement="Task_GetClientProfile">
+        <dc:Bounds x="325" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_ClientNotFound_di" bpmnElement="Boundary_ClientNotFound">
+        <dc:Bounds x="357" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_OpenCddCase_di" bpmnElement="Task_OpenCddCase">
+        <dc:Bounds x="475" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_DuplicateOpenCase_di" bpmnElement="Boundary_DuplicateOpenCase">
+        <dc:Bounds x="507" y="92" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Split_1_di" bpmnElement="ParallelGateway_Split_1">
+        <dc:Bounds x="650" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_SendRmHeadsup_di" bpmnElement="Task_SendRmHeadsup">
+        <dc:Bounds x="775" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ParallelGateway_Join_1_di" bpmnElement="ParallelGateway_Join_1">
+        <dc:Bounds x="1100" y="45" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_TransitionStatusToPendingDocs_di" bpmnElement="Task_TransitionStatusToPendingDocs">
+        <dc:Bounds x="1225" y="30" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_PendingDocuments_di" bpmnElement="EndEvent_PendingDocuments">
+        <dc:Bounds x="1407" y="52" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_CaseDuplicateResumed_di" bpmnElement="EndEvent_CaseDuplicateResumed">
+        <dc:Bounds x="657" y="192" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_ConfirmAnalystAssignment_di" bpmnElement="Task_ConfirmAnalystAssignment">
+        <dc:Bounds x="775" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_PersistAnalystAssignment_di" bpmnElement="Task_PersistAnalystAssignment">
+        <dc:Bounds x="925" y="170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="StartEvent_ManualIntake_di" bpmnElement="StartEvent_ManualIntake">
+        <dc:Bounds x="57" y="332" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="EndEvent_ClientNotFound_di" bpmnElement="EndEvent_ClientNotFound">
+        <dc:Bounds x="507" y="332" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_RefreshBatchToMerge_di" bpmnElement="Flow_RefreshBatchToMerge">
+        <di:waypoint x="93" y="70" />
+        <di:waypoint x="200" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_MergeToGetProfile_di" bpmnElement="Flow_MergeToGetProfile">
+        <di:waypoint x="250" y="70" />
+        <di:waypoint x="325" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_GetProfileToOpenCase_di" bpmnElement="Flow_GetProfileToOpenCase">
+        <di:waypoint x="425" y="70" />
+        <di:waypoint x="475" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ClientNotFoundToEnd_di" bpmnElement="Flow_ClientNotFoundToEnd">
+        <di:waypoint x="375" y="128" />
+        <di:waypoint x="375" y="350" />
+        <di:waypoint x="507" y="350" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_OpenCaseToSplit_di" bpmnElement="Flow_OpenCaseToSplit">
+        <di:waypoint x="575" y="70" />
+        <di:waypoint x="650" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_DuplicateToEnd_di" bpmnElement="Flow_DuplicateToEnd">
+        <di:waypoint x="525" y="128" />
+        <di:waypoint x="525" y="210" />
+        <di:waypoint x="657" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToHeadsup_di" bpmnElement="Flow_SplitToHeadsup">
+        <di:waypoint x="700" y="70" />
+        <di:waypoint x="775" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_SplitToConfirmAnalyst_di" bpmnElement="Flow_SplitToConfirmAnalyst">
+        <di:waypoint x="700" y="70" />
+        <di:waypoint x="750" y="70" />
+        <di:waypoint x="750" y="140" />
+        <di:waypoint x="750" y="140" />
+        <di:waypoint x="750" y="210" />
+        <di:waypoint x="775" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_HeadsupToJoin_di" bpmnElement="Flow_HeadsupToJoin">
+        <di:waypoint x="875" y="70" />
+        <di:waypoint x="1100" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_JoinToTransition_di" bpmnElement="Flow_JoinToTransition">
+        <di:waypoint x="1150" y="70" />
+        <di:waypoint x="1225" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_TransitionToEnd_di" bpmnElement="Flow_TransitionToEnd">
+        <di:waypoint x="1325" y="70" />
+        <di:waypoint x="1407" y="70" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ConfirmAnalystToPersist_di" bpmnElement="Flow_ConfirmAnalystToPersist">
+        <di:waypoint x="875" y="210" />
+        <di:waypoint x="925" y="210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_PersistToJoin_di" bpmnElement="Flow_PersistToJoin">
+        <di:waypoint x="1025" y="210" />
+        <di:waypoint x="1125" y="210" />
+        <di:waypoint x="1125" y="95" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_ManualIntakeToMerge_di" bpmnElement="Flow_ManualIntakeToMerge">
+        <di:waypoint x="93" y="350" />
+        <di:waypoint x="225" y="350" />
+        <di:waypoint x="225" y="95" />
+      </bpmndi:BPMNEdge>
+          <bpmndi:BPMNShape id="TextAnnotation_RefreshBatchStart_di" bpmnElement="TextAnnotation_RefreshBatchStart">
+        <dc:Bounds x="-25" y="-99" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_ManualIntakeStart_di" bpmnElement="TextAnnotation_ManualIntakeStart">
+        <dc:Bounds x="-25" y="418" width="200" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_GetClientProfile_di" bpmnElement="TextAnnotation_GetClientProfile">
+        <dc:Bounds x="275" y="-164" width="200" height="144" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_OpenCddCase_di" bpmnElement="TextAnnotation_OpenCddCase">
+        <dc:Bounds x="545" y="-150" width="200" height="130" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_SendRmHeadsup_di" bpmnElement="TextAnnotation_SendRmHeadsup">
+        <dc:Bounds x="785" y="-135" width="200" height="115" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_ConfirmAnalystAssignment_di" bpmnElement="TextAnnotation_ConfirmAnalystAssignment">
+        <dc:Bounds x="725" y="386" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_PersistAnalystAssignment_di" bpmnElement="TextAnnotation_PersistAnalystAssignment">
+        <dc:Bounds x="995" y="300" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_TransitionStatus_di" bpmnElement="TextAnnotation_TransitionStatus">
+        <dc:Bounds x="1175" y="-121" width="200" height="101" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_PendingDocumentsEnd_di" bpmnElement="TextAnnotation_PendingDocumentsEnd">
+        <dc:Bounds x="1445" y="-84" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_ClientNotFoundEnd_di" bpmnElement="TextAnnotation_ClientNotFoundEnd">
+        <dc:Bounds x="425" y="418" width="200" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="TextAnnotation_DuplicateResumedEnd_di" bpmnElement="TextAnnotation_DuplicateResumedEnd">
+        <dc:Bounds x="575" y="280" width="200" height="86" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Association_RefreshBatchStart_di" bpmnElement="Association_RefreshBatchStart">
+        <di:waypoint x="75" y="52" />
+        <di:waypoint x="75" y="2" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_ManualIntakeStart_di" bpmnElement="Association_ManualIntakeStart">
+        <di:waypoint x="75" y="368" />
+        <di:waypoint x="75" y="418" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_GetClientProfile_di" bpmnElement="Association_GetClientProfile">
+        <di:waypoint x="375" y="30" />
+        <di:waypoint x="375" y="-20" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_OpenCddCase_di" bpmnElement="Association_OpenCddCase">
+        <di:waypoint x="575" y="30" />
+        <di:waypoint x="545" y="-20" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_SendRmHeadsup_di" bpmnElement="Association_SendRmHeadsup">
+        <di:waypoint x="875" y="30" />
+        <di:waypoint x="825" y="-20" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_ConfirmAnalystAssignment_di" bpmnElement="Association_ConfirmAnalystAssignment">
+        <di:waypoint x="825" y="250" />
+        <di:waypoint x="825" y="386" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_PersistAnalystAssignment_di" bpmnElement="Association_PersistAnalystAssignment">
+        <di:waypoint x="1025" y="250" />
+        <di:waypoint x="995" y="300" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_TransitionStatus_di" bpmnElement="Association_TransitionStatus">
+        <di:waypoint x="1275" y="30" />
+        <di:waypoint x="1275" y="-20" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_PendingDocumentsEnd_di" bpmnElement="Association_PendingDocumentsEnd">
+        <di:waypoint x="1443" y="52" />
+        <di:waypoint x="1445" y="2" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_ClientNotFoundEnd_di" bpmnElement="Association_ClientNotFoundEnd">
+        <di:waypoint x="525" y="368" />
+        <di:waypoint x="525" y="418" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Association_DuplicateResumedEnd_di" bpmnElement="Association_DuplicateResumedEnd">
+        <di:waypoint x="675" y="228" />
+        <di:waypoint x="675" y="280" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
