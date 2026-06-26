@@ -26,6 +26,7 @@ mod harness;
 mod investigate;
 mod llama;
 mod monitor;
+mod nano_instances;
 mod personas;
 mod pilot;
 mod pyrunner;
@@ -75,6 +76,10 @@ struct AppState {
     /// The client's production engine — the read-only analysis TARGET. Traces,
     /// metrics, and the baseline process definition are read from here; ProcessOS
     /// never runs its own meta-workloads on the client's engine.
+    ///
+    /// This is the boot-configured *fallback*. The live analysis target is resolved per
+    /// request from the active [`nano_instances`] selection via [`AppState::active_target`],
+    /// so the operator can switch instances from the Console without a restart.
     target: NanoClient,
     /// ProcessOS's OWN engine — where the `pilotSelfOptimize` loop runs and its
     /// workers are deployed. The cockpit creates/reads experiments and completes
@@ -96,6 +101,10 @@ struct AppState {
     /// Operator-editable settings (LLM connection + Python interpreter), persisted to the
     /// user's config dir and layered over the environment at request time.
     settings: settings::SettingsStore,
+    /// The configurable Nano instances the Console manages. The active selection resolves
+    /// the live analysis target (see [`AppState::active_target`]); seeded with the
+    /// boot-configured URL (default `http://localhost:8080`) on first run.
+    nano_instances: Arc<nano_instances::NanoInstanceStore>,
     /// Persisted interactive cockpit chat sessions — the full droid transcript per
     /// `(workspace, process)`, so a conversation resumes with memory across turns and
     /// restarts.
@@ -133,6 +142,19 @@ struct AppState {
     /// The supervised local llama.cpp `llama-server` sidecar (start/stop/status/logs). Optional at
     /// runtime — nothing runs until the operator presses Start for a `sidecar:true` profile.
     llama: llama::LlamaManager,
+}
+
+impl AppState {
+    /// Resolve the live analysis target: the active configured Nano instance if one is set,
+    /// otherwise the boot-configured fallback. Constructing a [`NanoClient`] is cheap, so
+    /// callers resolve it per request — letting the operator switch instances from the
+    /// Console without restarting the server.
+    fn active_target(&self) -> NanoClient {
+        match self.nano_instances.active_base_url() {
+            Some(url) if !url.trim().is_empty() => NanoClient::new(url),
+            _ => self.target.clone(),
+        }
+    }
 }
 
 /// An append-only buffer for one in-flight chat turn's SSE events, shared between the producing
@@ -349,6 +371,10 @@ async fn main() {
         pilot,
         workspaces: workspace::WorkspaceCatalog::open(workspace::root_from_env(&cfg.data_dir)),
         settings: settings::SettingsStore::open(),
+        nano_instances: Arc::new(nano_instances::NanoInstanceStore::open(
+            settings::config_dir().join("nano-instances.json"),
+            &cfg.target_url,
+        )),
         chat: Arc::new(chat::ChatStore::open(cfg.data_dir.join("chat"))),
         chat_prompts: Arc::new(chat_prompts::ChatPromptStore::open(
             settings::config_dir().join("chat-prompts.json"),
@@ -486,6 +512,22 @@ async fn main() {
         )
         .route("/api/personas", get(personas_list).post(personas_upsert))
         .route("/api/personas/{id}", axum::routing::delete(personas_delete))
+        .route(
+            "/api/nano/instances",
+            get(nano_instances_list).post(nano_instances_add),
+        )
+        .route(
+            "/api/nano/instances/{id}",
+            axum::routing::put(nano_instances_update).delete(nano_instances_delete),
+        )
+        .route(
+            "/api/nano/instances/{id}/select",
+            post(nano_instances_select),
+        )
+        .route(
+            "/api/nano/instances/{id}/health",
+            get(nano_instances_health),
+        )
         .route("/assets/bpmn/{file}", get(bpmn_asset))
         .route("/assets/settings.js", get(settings_js))
         .route("/api/settings", get(get_settings).put(put_settings))
@@ -642,19 +684,22 @@ struct InsightsQuery {
     sample: Option<usize>,
 }
 
-/// `GET /api/insights` — the folded performance report. On a Nano read failure we
-/// return 502 with the underlying error so the dashboard can show it plainly.
+/// `GET /api/insights` — the folded performance report from the **active** Nano instance.
+/// On a read failure we return 502 with the underlying error AND the instance's base URL,
+/// so the console can show an informative "no instance available at …" message rather than
+/// a bare error.
 async fn insights(
     State(state): State<AppState>,
     Query(q): Query<InsightsQuery>,
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match report::build(&state.target, limit, sample).await {
+    let target = state.active_target();
+    match report::build(&target, limit, sample).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": e })),
+            Json(serde_json::json!({ "error": e, "baseUrl": target.base_url(), "unreachable": true })),
         )
             .into_response(),
     }
@@ -709,7 +754,8 @@ async fn cockpit_overview(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match cockpit::overview(&state.target, &state.own, limit, sample).await {
+    let target = state.active_target();
+    match cockpit::overview(&target, &state.own, limit, sample).await {
         Ok(o) => Json(o).into_response(),
         Err(e) => bad_gateway(e),
     }
@@ -763,7 +809,7 @@ async fn cockpit_create(
 ) -> impl IntoResponse {
     let baseline = match req.baseline_model {
         Some(b) if !b.trim().is_empty() => b,
-        _ => match cockpit::latest_process_xml(&state.target, &req.process_id).await {
+        _ => match cockpit::latest_process_xml(&state.active_target(), &req.process_id).await {
             Ok(xml) => xml,
             Err(e) => return bad_gateway(e),
         },
@@ -2891,7 +2937,90 @@ async fn personas_delete(
     }
 }
 
-// --- The optimization harness (MVP, design §7) ----------------------------------
+// --- Nano instances (Console-managed connection targets) ------------------------
+
+/// Request body to add or update a Nano instance.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NanoInstanceBody {
+    #[serde(default)]
+    name: String,
+    #[serde(default, alias = "url")]
+    base_url: String,
+}
+
+/// `GET /api/nano/instances` — every configured Nano instance plus the active id.
+async fn nano_instances_list(State(state): State<AppState>) -> impl IntoResponse {
+    let (instances, active) = state.nano_instances.list();
+    Json(serde_json::json!({ "instances": instances, "active": active })).into_response()
+}
+
+/// `POST /api/nano/instances` — add a new instance (`{name, baseUrl}`).
+async fn nano_instances_add(
+    State(state): State<AppState>,
+    Json(body): Json<NanoInstanceBody>,
+) -> impl IntoResponse {
+    match state.nano_instances.add(&body.name, &body.base_url) {
+        Ok(inst) => (StatusCode::CREATED, Json(inst)).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `PUT /api/nano/instances/{id}` — edit an instance's name/base URL.
+async fn nano_instances_update(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<NanoInstanceBody>,
+) -> impl IntoResponse {
+    match state.nano_instances.update(&id, &body.name, &body.base_url) {
+        Ok(inst) => Json(inst).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `DELETE /api/nano/instances/{id}` — remove an instance.
+async fn nano_instances_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.nano_instances.remove(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/nano/instances/{id}/select` — make an instance the active analysis target.
+async fn nano_instances_select(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.nano_instances.select(&id) {
+        Ok(()) => {
+            let (instances, active) = state.nano_instances.list();
+            Json(serde_json::json!({ "instances": instances, "active": active })).into_response()
+        }
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `GET /api/nano/instances/{id}/health` — probe whether an instance is reachable, so the
+/// console can show a live reachability light. 404 for an unknown id.
+async fn nano_instances_health(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let Some(inst) = state.nano_instances.get(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("no such instance: {id}") })),
+        )
+            .into_response();
+    };
+    let ok = NanoClient::new(&inst.base_url).health_ok().await;
+    Json(serde_json::json!({ "id": id, "baseUrl": inst.base_url, "ok": ok })).into_response()
+}
+
+
 
 /// `GET /api/harness/example` — the bundled example scenario JSON, so callers have
 /// a ready template to copy and adapt.
@@ -3076,7 +3205,7 @@ async fn harness_replay(
 ) -> impl IntoResponse {
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.target.clone(),
+        _ => state.active_target(),
     };
     let trace = match client.trace(&req.instance_key).await {
         Ok(t) => t,
@@ -3159,7 +3288,7 @@ async fn harness_replay_batch(
 ) -> impl IntoResponse {
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.target.clone(),
+        _ => state.active_target(),
     };
     let defs = match parse_bpmn(&req.candidate_model) {
         Ok(d) if !d.is_empty() => d,
@@ -3311,7 +3440,7 @@ async fn harness_replay_rank(
     }
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.target.clone(),
+        _ => state.active_target(),
     };
     let limit = req.limit.unwrap_or(200);
     let summaries = match client.list_traces(limit).await {
@@ -3453,7 +3582,7 @@ async fn harness_evolve(
     // Fetch + distil the recorded dataset (this is the fitness data).
     let client = match &req.base_url {
         Some(url) if !url.is_empty() => NanoClient::new(url),
-        _ => state.target.clone(),
+        _ => state.active_target(),
     };
     let limit = req.limit.unwrap_or(200);
     let summaries = match client.list_traces(limit).await {
@@ -3678,7 +3807,7 @@ async fn harness_production(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match build_baseline(&state.target, q.process_id.as_deref(), limit, sample).await {
+    match build_baseline(&state.active_target(), q.process_id.as_deref(), limit, sample).await {
         Ok(baseline) => Json(baseline).into_response(),
         // A read-contract failure surfaces the underlying GET error; an empty or
         // unknown-process result is a request the caller can fix, so 422.
@@ -3709,7 +3838,7 @@ async fn harness_cluster(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match build_cluster_summary(&state.target, q.process_id.as_deref(), limit, sample).await {
+    match build_cluster_summary(&state.active_target(), q.process_id.as_deref(), limit, sample).await {
         Ok(summary) => match q.target_p99_ms {
             // Attach the staffing recommendation derived from the measured run.
             Some(target) => {
@@ -3764,7 +3893,7 @@ async fn harness_dashboard() -> Html<&'static str> {
 /// The cockpit single-file app (design §7.8 / §10), served at `/cockpit`.
 const COCKPIT_HTML: &str = include_str!("cockpit.html");
 
-const DASHBOARD_HTML: &str = r#"<!doctype html>
+const DASHBOARD_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
@@ -3800,6 +3929,32 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   .bottleneck { color: #fca5a5; }
   .err { color: #fca5a5; background: #2a0a0a; padding: 12px 16px; border-radius: 8px; }
   button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { background: #2f2f35; }
+  button.primary { background: #4f46e5; border-color: #6366f1; color: #fff; }
+  button.primary:hover { background: #4338ca; }
+  button.danger { color: #fca5a5; }
+  /* Nano instance manager */
+  .inst-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 12px; }
+  .inst { background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 14px; display: flex; gap: 12px; align-items: flex-start; }
+  .inst.active { border-color: #6366f1; box-shadow: 0 0 0 1px #4f46e5 inset; }
+  .inst .logo { flex: 0 0 auto; }
+  .inst .meta { min-width: 0; flex: 1; }
+  .inst .nm { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .inst .url { color: #a1a1aa; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+  .inst .acts { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .inst .acts button { padding: 3px 9px; font-size: 12px; }
+  .badge { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: #c7d2fe; background: #312e81; padding: 1px 6px; border-radius: 999px; }
+  .rdot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #52525b; flex: 0 0 auto; }
+  .rdot.up { background: #34d399; box-shadow: 0 0 6px #34d39988; }
+  .rdot.down { background: #f87171; }
+  .rdot.probing { background: #fbbf24; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .empty { background: #141417; border: 1px dashed #3f3f46; border-radius: 10px; padding: 22px; color: #a1a1aa; }
+  .empty .big { color: #e4e4e7; font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .inst-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0 4px; }
+  .inst-form input { background: #0c0c0e; border: 1px solid #3f3f46; color: #e4e4e7; border-radius: 6px; padding: 6px 9px; font-size: 13px; }
+  .inst-form input.nm { width: 160px; }
+  .inst-form input.url { width: 240px; font-family: ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -3819,24 +3974,130 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     <header>
       <h1>Live instance</h1>
       <span class="sub">&middot; <span id="nano"></span></span>
-      <button onclick="load()" style="margin-left:auto">Refresh</button>
+      <button onclick="refreshAll()" style="margin-left:auto">Refresh</button>
     </header>
-    <main id="out">Loading…</main>
+    <main>
+      <div id="instances">Loading instances…</div>
+      <div id="out"></div>
+    </main>
   </div>
 </div>
 <script>
 function ms(v){ return v==null ? '—' : (v>=1000 ? (v/1000).toFixed(2)+'s' : v+'ms'); }
-function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// A self-contained "Nano node" mark: a violet hexagonal nucleus with an orbiting electron.
+function nanoLogo(size){
+  const s = size||34;
+  return '<svg class="logo" width="'+s+'" height="'+s+'" viewBox="0 0 40 40" fill="none" aria-hidden="true">'
+    + '<defs><radialGradient id="ng" cx="50%" cy="40%" r="65%">'
+    + '<stop offset="0%" stop-color="#c7d2fe"/><stop offset="60%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/>'
+    + '</radialGradient></defs>'
+    + '<ellipse cx="20" cy="20" rx="17" ry="7" stroke="#4f46e5" stroke-width="1.4" opacity=".55" transform="rotate(35 20 20)"/>'
+    + '<ellipse cx="20" cy="20" rx="17" ry="7" stroke="#818cf8" stroke-width="1.4" opacity=".55" transform="rotate(-35 20 20)"/>'
+    + '<path d="M20 9 L29 14.5 L29 25.5 L20 31 L11 25.5 L11 14.5 Z" fill="url(#ng)"/>'
+    + '<circle cx="34" cy="13" r="2.4" fill="#a5b4fc"/>'
+    + '</svg>';
+}
+
+let INSTANCES = [];
+let ACTIVE = null;
+
+async function loadInstances(){
+  const wrap = document.getElementById('instances');
+  let r;
+  try { r = await fetch('/api/nano/instances'); }
+  catch(e){ wrap.innerHTML = '<div class="err">Cannot reach ProcessOS API: '+esc(e)+'</div>'; return; }
+  const d = await r.json();
+  INSTANCES = d.instances || [];
+  ACTIVE = d.active;
+  renderInstances();
+  for(const i of INSTANCES) probe(i.id);
+}
+
+function renderInstances(){
+  const wrap = document.getElementById('instances');
+  let h = '<h2>Nano instances</h2><div class="inst-grid">';
+  for(const i of INSTANCES){
+    const act = i.id===ACTIVE;
+    h += '<div class="inst'+(act?' active':'')+'" data-id="'+esc(i.id)+'">'
+       + nanoLogo(34)
+       + '<div class="meta">'
+       + '<div class="nm"><span class="rdot probing" id="rdot-'+esc(i.id)+'"></span>'+esc(i.name)
+       + (act?' <span class="badge">active</span>':'')+'</div>'
+       + '<div class="url">'+esc(i.baseUrl)+'</div>'
+       + '<div class="acts">'
+       + (act?'':'<button class="primary" onclick="selectInst(\''+esc(i.id)+'\')">Select</button>')
+       + '<button onclick="editInst(\''+esc(i.id)+'\')">Edit</button>'
+       + (INSTANCES.length>1?'<button class="danger" onclick="removeInst(\''+esc(i.id)+'\')">Delete</button>':'')
+       + '</div></div></div>';
+  }
+  h += '</div>';
+  h += '<div class="inst-form">'
+     + '<input class="nm" id="newName" placeholder="Name (e.g. Staging)" />'
+     + '<input class="url" id="newUrl" placeholder="http://localhost:8080" />'
+     + '<button class="primary" onclick="addInst()">Add instance</button>'
+     + '<span class="sub" id="instMsg"></span>'
+     + '</div>';
+  wrap.innerHTML = h;
+}
+
+async function probe(id){
+  const dot = document.getElementById('rdot-'+id);
+  if(dot) dot.className = 'rdot probing';
+  try {
+    const r = await fetch('/api/nano/instances/'+encodeURIComponent(id)+'/health');
+    const d = await r.json();
+    if(dot) dot.className = 'rdot ' + (d.ok ? 'up' : 'down');
+    if(dot) dot.title = d.ok ? 'reachable' : 'unreachable';
+  } catch(e){ if(dot){ dot.className = 'rdot down'; dot.title='unreachable'; } }
+}
+
+async function selectInst(id){
+  await fetch('/api/nano/instances/'+encodeURIComponent(id)+'/select', {method:'POST'});
+  await refreshAll();
+}
+async function removeInst(id){
+  if(!confirm('Delete this instance?')) return;
+  await fetch('/api/nano/instances/'+encodeURIComponent(id), {method:'DELETE'});
+  await refreshAll();
+}
+async function addInst(){
+  const name = document.getElementById('newName').value.trim();
+  const url = document.getElementById('newUrl').value.trim();
+  const msg = document.getElementById('instMsg');
+  if(!url){ if(msg) msg.textContent = 'A base URL is required.'; return; }
+  const r = await fetch('/api/nano/instances', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({name, baseUrl: url})});
+  if(!r.ok){ const e = await r.json().catch(()=>({})); if(msg) msg.textContent = e.error || ('Failed ('+r.status+')'); return; }
+  await refreshAll();
+}
+async function editInst(id){
+  const inst = INSTANCES.find(x=>x.id===id);
+  if(!inst) return;
+  const name = prompt('Instance name:', inst.name);
+  if(name===null) return;
+  const url = prompt('Base URL:', inst.baseUrl);
+  if(url===null) return;
+  const r = await fetch('/api/nano/instances/'+encodeURIComponent(id), {method:'PUT', headers:{'content-type':'application/json'}, body: JSON.stringify({name, baseUrl: url})});
+  if(!r.ok){ const e = await r.json().catch(()=>({})); alert(e.error || ('Failed ('+r.status+')')); return; }
+  await refreshAll();
+}
+
 async function load(){
   const out = document.getElementById('out');
-  out.textContent = 'Loading…';
+  out.innerHTML = '<p class="sub">Loading insights…</p>';
   let r;
-  try { r = await fetch('/api/insights'); } catch(e){ out.innerHTML = '<div class="err">Cannot reach ProcessOS API: '+esc(e)+'</div>'; return; }
+  try { r = await fetch('/api/insights'); }
+  catch(e){ renderEmpty(null, 'Cannot reach the ProcessOS API: '+esc(e)); return; }
   const d = await r.json();
-  if(!r.ok){ out.innerHTML = '<div class="err">Nano read failed: '+esc(d.error||r.status)+'</div>'; return; }
+  if(!r.ok){
+    if(d.unreachable){ renderEmpty(d.baseUrl, null); }
+    else { out.innerHTML = '<div class="err">Nano read failed: '+esc(d.error||r.status)+'</div>'; }
+    return;
+  }
   document.getElementById('nano').textContent = d.nanoBaseUrl;
   const t = d.totals, live = d.live || {};
-  let h = '<div class="cards">'
+  let h = '<h2>Insights</h2><div class="cards">'
     + card(t.instances, 'instances') + card(t.completed, 'completed')
     + card(t.active, 'active') + card(t.incidents, 'incidents')
     + card(d.sampledInstances, 'sampled')
@@ -3872,13 +4133,27 @@ async function load(){
   }
   out.innerHTML = h;
 }
+
+function renderEmpty(baseUrl, detail){
+  document.getElementById('nano').textContent = baseUrl || '—';
+  const where = baseUrl ? (' at <span class="pid">'+esc(baseUrl)+'</span>') : '';
+  document.getElementById('out').innerHTML = '<div class="empty">'
+    + nanoLogo(40)
+    + '<div class="big" style="margin-top:10px">No Nano instance available'+where+'</div>'
+    + '<div>Start your Nano server, or select / add another instance above. '
+    + 'The active instance is where ProcessOS reads traces and metrics from.</div>'
+    + (detail ? '<div class="sub" style="margin-top:8px">'+detail+'</div>' : '')
+    + '</div>';
+}
+
+async function refreshAll(){ await loadInstances(); await load(); }
 function card(n,l){ return '<div class="card"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'; }
-load();
+refreshAll();
 </script>
 <script src="/assets/settings.js"></script>
 </body>
 </html>
-"#;
+"##;
 
 /// The harness dashboard: runs the bundled example and renders the ranked
 /// candidates. Dependency-free; the richer UX is the console "Optimization" tab.
