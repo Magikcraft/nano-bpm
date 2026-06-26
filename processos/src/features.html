@@ -407,9 +407,77 @@
       <section class="feat lead">
         <div class="kicker">Flagship capability</div>
         <h2>
-          Speculative Execution of Variant Hypotheses
+          The cockpit: investigate with a droid
           <span class="pill live">Live</span>
         </h2>
+        <p class="lede">
+          You don&rsquo;t hand Process OS a job and wait for a verdict. You open a chat
+          over a bound trace dataset and <em>reason with a droid</em> that queries
+          production itself, forms hypotheses, and proves them on the engine &mdash; a
+          multi-turn conversation that remembers what it found.
+        </p>
+        <p>
+          Each workspace process binds to a trace corpus. The droid investigates it
+          directly with a small, disciplined toolset: read-only
+          <strong>SQL over a DuckDB view</strong> of the traces, an optional sandboxed
+          <strong>Python tier</strong> for heavier analysis, <code>discover_flow</code> to
+          recover the as-run topology, and <code>read_model</code> / <code>analyze_model</code>
+          to inspect the BPMN that drives the process. It narrates its reasoning and every
+          tool call as it goes, so you can follow &mdash; and challenge &mdash; how it
+          reached a conclusion.
+        </p>
+        <p>
+          When it proposes a fix, the droid doesn&rsquo;t hand you raw XML. It patches the
+          model with <strong>structured edits</strong> &mdash; set a task&rsquo;s job type,
+          insert a service task, add an error-boundary event, reroute a flow, set a guard
+          condition, add an exclusive gateway &mdash; then <code>validate_model</code>s the
+          result against the production parser before it ever <code>simulate</code>s.
+          Authored variants come back as human-readable, horizontally laid-out diagrams
+          with named gateways and labelled conditions that you can open and download.
+        </p>
+        <div class="grid">
+          <div class="card">
+            <h3>Swappable personas</h3>
+            <p>
+              Pick the standing brief that frames the conversation &mdash; Performance
+              Analyst, SRE / Incident Responder, Capacity Planner, Process Architect,
+              Conformance Miner, or Experiment Designer &mdash; each a different lens on
+              the same traces.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Local LLM sidecars</h3>
+            <p>
+              Supervises local <code>llama.cpp</code> servers from the cockpit: download
+              models in the background, start/stop them with live status lights, ports
+              auto-assigned, up to two at once. Model-agnostic and OpenAI-compatible &mdash;
+              nothing has to leave your machine.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Pair AI review</h3>
+            <p>
+              A second model &mdash; Skeptic, Synthesizer, or Refiner &mdash; critiques the
+              primary droid&rsquo;s answer in its own bubble, reasoning and all, so a
+              cross-check is built into the loop rather than bolted on after.
+            </p>
+          </div>
+          <div class="card">
+            <h3>Steerable, resumable sessions</h3>
+            <p>
+              Carry one model&rsquo;s conclusion into the next, switch the answering model
+              mid-investigation, steer or wrap up a turn, and reattach to an in-flight
+              investigation after a reload &mdash; each bubble keeps the model that produced
+              it.
+            </p>
+          </div>
+        </div>
+        <p style="color: var(--faint); font-size: 0.9rem">
+          Open the <a href="/cockpit">cockpit</a>, or stream a turn via
+          <code>POST /api/workspaces/{ws}/processes/{proc}/chat/stream</code>.
+        </p>
+      </section>
+
         <p class="lede">
           Ask a model for better ways to run a process — then prove every suggestion on
           the real engine before trusting it. The LLM proposes; the engine decides.
@@ -552,6 +620,24 @@
             An Erlang-C M/M/c model fitted from measured per-job-type arrival and service
             times recommends how many workers hold a target p99 queue-wait.
             <code>GET /api/harness/cluster?targetP99Ms=</code>.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Structured BPMN authoring &amp; validation</h3>
+          <p>
+            The droid edits the process model through verb-level operations and a
+            round-trippable engine model &mdash; never hand-rolled XML &mdash; and every
+            candidate is parsed by the production parser, with dangling references and
+            structural faults reported and fixed before simulation.
+          </p>
+        </div>
+        <div class="card">
+          <h3>Camunda 8 import</h3>
+          <p>
+            Fold a Camunda 8 / Zeebe record export (NDJSON, JSON array, or Elasticsearch
+            <code>_source</code>) into a Nano trace corpus &mdash; including tier-2 job
+            stimuli for faithful replay &mdash; so an existing C8 process can be optimized
+            in the cockpit. <code>processos import-camunda &lt;input&gt; &lt;out-dir&gt;</code>.
           </p>
         </div>
         <div class="card">
