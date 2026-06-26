@@ -68,6 +68,9 @@ pub struct LlmProfile {
     /// model's thinking unconstrained.
     #[serde(default)]
     pub thinking_level: Option<ThinkingLevel>,
+    /// Starred models float to the top of the cockpit sidecar card layout.
+    #[serde(default)]
+    pub starred: bool,
 }
 
 impl LlmProfile {
@@ -121,6 +124,9 @@ impl LlmProfile {
         if let Some(v) = patch.thinking_level {
             // Empty/unknown string clears the level (back to unconstrained thinking).
             self.thinking_level = ThinkingLevel::parse(&v);
+        }
+        if let Some(v) = patch.starred {
+            self.starred = v;
         }
     }
 
@@ -258,6 +264,7 @@ fn seeded() -> Settings {
             model_file: Some(model.to_string()),
             sidecar_args: Some("-ngl 99 -c 32768 --jinja".to_string()),
             thinking_level: None,
+            starred: false,
         }
     }
     Settings {
@@ -390,6 +397,7 @@ pub struct ProfilePatch {
     pub sidecar_args: Option<String>,
     /// Coarse reasoning budget label (`fast`/`medium`/`max`); empty/unknown clears it.
     pub thinking_level: Option<String>,
+    pub starred: Option<bool>,
 }
 
 /// Partial update for the global (non-profile) settings.
@@ -431,6 +439,7 @@ pub struct ProfileView {
     pub model_file: Option<String>,
     pub sidecar_args: Option<String>,
     pub thinking_level: Option<ThinkingLevel>,
+    pub starred: bool,
 }
 
 impl ProfileView {
@@ -448,6 +457,7 @@ impl ProfileView {
             model_file: p.model_file.clone(),
             sidecar_args: p.sidecar_args.clone(),
             thinking_level: p.thinking_level,
+            starred: p.starred,
         }
     }
 }
@@ -562,6 +572,7 @@ impl SettingsStore {
             model_file: None,
             sidecar_args: None,
             thinking_level: None,
+            starred: false,
         };
         profile.apply(ProfilePatch {
             name: None,
@@ -684,6 +695,7 @@ fn migrate(s: &str) -> Option<Settings> {
                 model_file: None,
                 sidecar_args: None,
                 thinking_level: None,
+                starred: false,
             });
             settings
                 .active_profile
@@ -788,6 +800,7 @@ mod tests {
             model_file: None,
             sidecar_args: None,
             thinking_level: None,
+            starred: false,
         };
         assert_eq!(p.preferred_port(), Some(9090));
     }

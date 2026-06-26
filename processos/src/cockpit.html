@@ -46,6 +46,9 @@
   .tile { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
   .tile:hover { border-color: #3f3f6a; transform: translateY(-1px); }
   .tile h3 { margin: 0 0 4px; font-size: 15px; font-family: ui-monospace, monospace; color: #c7d2fe; }
+  .sc-star { background: none; border: none; padding: 0 2px; cursor: pointer; font-size: 15px; line-height: 1; color: #6b7280; vertical-align: middle; }
+  .sc-star:hover { color: #fbbf24; }
+  .sc-star.on { color: #fbbf24; }
   .tile .meta { color: #8b8b93; font-size: 12px; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
   .pill.run { background: #0c2a4a; color: #93c5fd; }
@@ -732,7 +735,7 @@ async function renderSidecars(){
   let s, st;
   try { s = await api('/api/settings') || {}; } catch(e){ return fail(e); }
   try { st = await api('/api/llama/status'); } catch(e){ st = {running:false, sidecars:[], count:0, max:2}; }
-  const profiles = (s.profiles||[]).filter(p => p.sidecar);
+  const profiles = (s.profiles||[]).filter(p => p.sidecar).slice().sort((a,b) => (b.starred?1:0)-(a.starred?1:0));
   const active = s.activeProfile;
   const sidecars = st.sidecars || [];
   const max = st.max || 2;
@@ -823,7 +826,9 @@ async function renderSidecars(){
                 + '<button class="btn ghost" data-start="'+esc(p.id)+'" '+startDisabled+' title="Start now (downloads first, then serves)">Start</button>';
       }
       return '<div class="tile" style="cursor:default">'
-        + '<h3>'+esc(p.name||p.id)+' '+pills+'</h3>'
+        + '<h3>'+esc(p.name||p.id)+' '+pills
+        + ' <button class="sc-star'+(p.starred?' on':'')+'" data-star="'+esc(p.id)+'" data-starred="'+(p.starred?'1':'0')+'" title="'+(p.starred?'Unstar':'Star (pin to top)')+'">'+(p.starred?'\u2605':'\u2606')+'</button>'
+        + '</h3>'
         + '<div class="meta">'+esc(p.modelFile||p.model||'')+(runPort?(' · port '+esc(String(runPort))):'')+'</div>'
         + (pm && pm.detail?('<div class="meta" style="margin-top:4px;color:#93c5fd">'+esc(pm.detail)+'</div>'):'')
         + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
@@ -878,6 +883,14 @@ async function renderSidecars(){
   const cfgBtn = document.getElementById('llConfigProfiles'); if(cfgBtn) cfgBtn.onclick = () => openConfig(null);
   const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
   main.querySelectorAll('[data-config]').forEach(b => b.onclick = () => openConfig(b.dataset.config));
+  main.querySelectorAll('[data-star]').forEach(b => b.onclick = async () => {
+    const want = b.dataset.starred !== '1';
+    b.disabled = true;
+    try {
+      await api('/api/settings/profiles/'+encodeURIComponent(b.dataset.star), {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({starred:want})});
+    } catch(e){ window.alert('Could not update star: '+(e.message||e)); }
+    renderSidecars();
+  });
 
   // While any sidecar is still downloading/loading (not yet ready) OR a background model download
   // is active, re-render on a timer so the operator watches progress without manually refreshing.

@@ -796,6 +796,7 @@ mod tests {
             model_file: Some(model_file.into()),
             sidecar_args: args.map(String::from),
             thinking_level: None,
+            starred: false,
         }
     }
 

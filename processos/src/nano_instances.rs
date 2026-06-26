@@ -25,6 +25,9 @@ pub struct NanoInstance {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    /// Starred instances float to the top of the Console card layout.
+    #[serde(default)]
+    pub starred: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -58,6 +61,7 @@ impl NanoInstanceStore {
                 id: new_id(),
                 name: "Local Nano".to_string(),
                 base_url: normalize_url(default_url),
+                starred: false,
             };
             state.active = Some(inst.id.clone());
             state.instances.push(inst);
@@ -78,10 +82,13 @@ impl NanoInstanceStore {
         store
     }
 
-    /// Every configured instance plus the active id.
+    /// Every configured instance plus the active id. Starred instances are returned first
+    /// (stable within each group), so the Console card layout floats them to the top.
     pub fn list(&self) -> (Vec<NanoInstance>, Option<String>) {
         let g = self.state.read().expect("nano-instances lock poisoned");
-        (g.instances.clone(), g.active.clone())
+        let mut instances = g.instances.clone();
+        instances.sort_by_key(|i| !i.starred);
+        (instances, g.active.clone())
     }
 
     /// The base URL of the active instance, if any is configured.
@@ -104,6 +111,7 @@ impl NanoInstanceStore {
             id: new_id(),
             name: clean_name(name, &url),
             base_url: url,
+            starred: false,
         };
         {
             let mut g = self.state.write().expect("nano-instances lock poisoned");
@@ -152,6 +160,22 @@ impl NanoInstanceStore {
         }
         self.persist();
         Ok(())
+    }
+
+    /// Star or unstar an instance, so the Console floats it to the top of the card layout.
+    pub fn set_star(&self, id: &str, starred: bool) -> Result<NanoInstance, String> {
+        let out = {
+            let mut g = self.state.write().expect("nano-instances lock poisoned");
+            let inst = g
+                .instances
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| format!("no such instance: {id}"))?;
+            inst.starred = starred;
+            inst.clone()
+        };
+        self.persist();
+        Ok(out)
     }
 
     /// Make an instance the active analysis target.
@@ -277,6 +301,14 @@ mod tests {
         let edited = store.update(&staging.id, "Staging EU", "https://eu.example/").unwrap();
         assert_eq!(edited.name, "Staging EU");
         assert_eq!(edited.base_url, "https://eu.example");
+
+        // Starring floats the instance to the top of the listing, unstarring restores order.
+        store.set_star(&staging.id, true).unwrap();
+        assert_eq!(store.list().0[0].id, staging.id);
+        assert!(store.list().0[0].starred);
+        store.set_star(&staging.id, false).unwrap();
+        assert_eq!(store.list().0[0].id, seed);
+        assert!(store.set_star("nope", true).is_err());
 
         // Removing the active falls back to a remaining instance.
         store.remove(&staging.id).unwrap();

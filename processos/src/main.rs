@@ -525,6 +525,10 @@ async fn main() {
             post(nano_instances_select),
         )
         .route(
+            "/api/nano/instances/{id}/star",
+            post(nano_instances_star),
+        )
+        .route(
             "/api/nano/instances/{id}/health",
             get(nano_instances_health),
         )
@@ -2949,6 +2953,13 @@ struct NanoInstanceBody {
     base_url: String,
 }
 
+/// Request body to star/unstar a Nano instance.
+#[derive(Debug, Deserialize)]
+struct NanoStarBody {
+    #[serde(default)]
+    starred: bool,
+}
+
 /// `GET /api/nano/instances` — every configured Nano instance plus the active id.
 async fn nano_instances_list(State(state): State<AppState>) -> impl IntoResponse {
     let (instances, active) = state.nano_instances.list();
@@ -2996,6 +3007,22 @@ async fn nano_instances_select(
 ) -> impl IntoResponse {
     match state.nano_instances.select(&id) {
         Ok(()) => {
+            let (instances, active) = state.nano_instances.list();
+            Json(serde_json::json!({ "instances": instances, "active": active })).into_response()
+        }
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/nano/instances/{id}/star` — star/unstar an instance (`{starred: bool}`), so the
+/// Console floats it to the top of the card layout. Returns the refreshed list.
+async fn nano_instances_star(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<NanoStarBody>,
+) -> impl IntoResponse {
+    match state.nano_instances.set_star(&id, body.starred) {
+        Ok(_) => {
             let (instances, active) = state.nano_instances.list();
             Json(serde_json::json!({ "instances": instances, "active": active })).into_response()
         }
@@ -3937,9 +3964,14 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
   .inst-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 12px; }
   .inst { background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 14px; display: flex; gap: 12px; align-items: flex-start; }
   .inst.active { border-color: #6366f1; box-shadow: 0 0 0 1px #4f46e5 inset; }
+  .inst.starred { border-color: #b08900; }
+  .inst.active.starred { border-color: #6366f1; }
   .inst .logo { flex: 0 0 auto; }
   .inst .meta { min-width: 0; flex: 1; }
   .inst .nm { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .star { background: none; border: none; padding: 0 0 0 2px; margin-left: auto; cursor: pointer; font-size: 16px; line-height: 1; color: #71717a; }
+  .star:hover { color: #fbbf24; }
+  .star.on { color: #fbbf24; }
   .inst .url { color: #a1a1aa; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
   .inst .acts { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
   .inst .acts button { padding: 3px 9px; font-size: 12px; }
@@ -4020,11 +4052,13 @@ function renderInstances(){
   let h = '<h2>Nano instances</h2><div class="inst-grid">';
   for(const i of INSTANCES){
     const act = i.id===ACTIVE;
-    h += '<div class="inst'+(act?' active':'')+'" data-id="'+esc(i.id)+'">'
+    h += '<div class="inst'+(act?' active':'')+(i.starred?' starred':'')+'" data-id="'+esc(i.id)+'">'
        + nanoLogo(34)
        + '<div class="meta">'
        + '<div class="nm"><span class="rdot probing" id="rdot-'+esc(i.id)+'"></span>'+esc(i.name)
-       + (act?' <span class="badge">active</span>':'')+'</div>'
+       + (act?' <span class="badge">active</span>':'')
+       + '<button class="star'+(i.starred?' on':'')+'" title="'+(i.starred?'Unstar':'Star (pin to top)')+'" onclick="starInst(\''+esc(i.id)+'\','+(i.starred?'false':'true')+')">'+(i.starred?'★':'☆')+'</button>'
+       + '</div>'
        + '<div class="url">'+esc(i.baseUrl)+'</div>'
        + '<div class="acts">'
        + (act?'':'<button class="primary" onclick="selectInst(\''+esc(i.id)+'\')">Select</button>')
@@ -4056,6 +4090,10 @@ async function probe(id){
 async function selectInst(id){
   await fetch('/api/nano/instances/'+encodeURIComponent(id)+'/select', {method:'POST'});
   await refreshAll();
+}
+async function starInst(id, starred){
+  await fetch('/api/nano/instances/'+encodeURIComponent(id)+'/star', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({starred})});
+  await loadInstances();
 }
 async function removeInst(id){
   if(!confirm('Delete this instance?')) return;
