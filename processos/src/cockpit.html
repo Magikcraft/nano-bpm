@@ -11,9 +11,10 @@
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; }
   a { color: inherit; text-decoration: none; }
-  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
-  /* left rail */
-  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
+  .app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; }
+  /* left rail — pinned so it never scrolls out of view; #main is the scroll container */
+  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+  #main { height: 100vh; overflow-y: auto; }
   .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
   .brand .dot { color: #a5b4fc; }
   .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
@@ -334,6 +335,13 @@
   .model-modal .mm-body { flex: 1; position: relative; min-height: 0; }
   .model-modal .mm-diagram { position: absolute; inset: 0; background: #fafafa; }
   .model-modal pre.mm-xml { position: absolute; inset: 0; margin: 0; padding: 14px 16px; overflow: auto; white-space: pre; background: #0c0c0e; color: #c7d2fe; font: 12.5px/1.6 ui-monospace, monospace; }
+  /* Streaming sidecar log viewer — body-level so a #main re-render can't destroy it. */
+  .log-modal { position: fixed; inset: 0; background: rgba(0,0,0,.66); display: flex; align-items: center; justify-content: center; z-index: 70; }
+  .log-modal .lm-box { background: #0c0c0e; border: 1px solid #34343c; border-radius: 12px; width: 88vw; height: 82vh; max-width: 1100px; display: flex; flex-direction: column; overflow: hidden; }
+  .log-modal .lm-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #26262b; }
+  .log-modal .lm-title { font: 600 13px/1.3 ui-monospace, monospace; color: #c7d2fe; display: flex; align-items: center; gap: 8px; }
+  .log-modal .lm-actions { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
+  .log-modal pre.lm-body { flex: 1; margin: 0; padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: #0c0c0e; color: #c7d2fe; font: 11.5px/1.55 ui-monospace, monospace; }
 </style>
 </head>
 <body>
@@ -783,9 +791,6 @@ async function renderSidecars(){
     }).join('') + '</div>';
   }
 
-  // Optional logs panel target.
-  h += '<pre id="llLogsOut" hidden style="margin-top:16px;max-height:340px;overflow:auto;background:#0c0c0e;border:1px solid #26262b;border-radius:8px;padding:12px;font:11.5px/1.5 ui-monospace,monospace;color:#c7d2fe;white-space:pre-wrap"></pre>';
-
   main.innerHTML = h;
 
   const startBtn = (id) => api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId:id})});
@@ -805,13 +810,7 @@ async function renderSidecars(){
     } catch(e){ window.alert('Could not switch active model: '+(e.message||e)); }
     renderSidecars();
   });
-  const showLogs = async (id) => {
-    const out = document.getElementById('llLogsOut');
-    if(!out) return;
-    out.hidden = false; out.textContent = 'Loading logs…';
-    try { const r = await api('/api/llama/logs'+(id?('?profileId='+encodeURIComponent(id)):'')); out.textContent = (r.text||'').trim() || '(no output yet)'; out.scrollTop = out.scrollHeight; }
-    catch(e){ out.textContent = 'Could not load logs: '+(e.message||e); }
-  };
+  const showLogs = (id) => openLogStream(id || null);
   main.querySelectorAll('[data-logs]').forEach(b => b.onclick = () => showLogs(b.dataset.logs || null));
   const openConfig = (id) => {
     if(typeof window.processosOpenSettings === 'function') window.processosOpenSettings(id || undefined);
@@ -828,6 +827,74 @@ async function renderSidecars(){
   if(stillWarming){
     setTimeout(() => { if(STATE.view==='sidecars') renderSidecars(); }, 3000);
   }
+}
+
+// Streaming sidecar log viewer. A body-level fixed overlay (so a #main re-render can't destroy
+// it) that polls /api/llama/logs?profileId=…&since=N every second, appending only the new lines
+// and auto-scrolling. Polling stops when the overlay is closed or the process is no longer running.
+// `profileId` may be null to follow the single running sidecar.
+let LOG_STREAM_TIMER = null;
+function closeLogStream(){
+  if(LOG_STREAM_TIMER){ clearTimeout(LOG_STREAM_TIMER); LOG_STREAM_TIMER = null; }
+  const back = document.getElementById('logModalBack');
+  if(back) back.remove();
+}
+function openLogStream(profileId){
+  closeLogStream();
+  const qsId = profileId ? ('profileId='+encodeURIComponent(profileId)+'&') : '';
+  const back = document.createElement('div');
+  back.className = 'log-modal'; back.id = 'logModalBack';
+  back.innerHTML =
+    '<div class="lm-box">'
+    + '<div class="lm-head">'
+    +   '<span class="lm-title"><span id="lmDot" class="dot-status off" style="margin:0"></span> Logs · '+esc(profileId||'sidecar')+' <span id="lmPhase" class="muted" style="font-weight:400"></span></span>'
+    +   '<span class="lm-actions">'
+    +     '<button class="btn warn" id="lmStop" style="padding:3px 10px">Stop sidecar</button>'
+    +     '<button class="btn ghost" id="lmClose" style="padding:3px 10px">Close</button>'
+    +   '</span>'
+    + '</div>'
+    + '<pre class="lm-body" id="lmBody">Loading logs…</pre>'
+    + '</div>';
+  document.body.appendChild(back);
+  const body = back.querySelector('#lmBody');
+  const dot = back.querySelector('#lmDot');
+  const phaseEl = back.querySelector('#lmPhase');
+  back.addEventListener('mousedown', (e) => { if(e.target===back) closeLogStream(); });
+  back.querySelector('#lmClose').onclick = closeLogStream;
+  back.querySelector('#lmStop').onclick = async (e) => {
+    e.target.disabled = true; e.target.textContent = 'Stopping…';
+    try { await api('/api/llama/stop', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(profileId?{profileId}:{})}); } catch(err){}
+    refreshLlamaDot(); if(STATE.view==='sidecars') renderSidecars();
+  };
+  document.addEventListener('keydown', function esc(ev){ if(ev.key==='Escape'){ closeLogStream(); document.removeEventListener('keydown', esc); } });
+
+  let offset = 0, started = false;
+  const nearBottom = () => (body.scrollHeight - body.scrollTop - body.clientHeight) < 60;
+  const poll = async () => {
+    let r; try { r = await api('/api/llama/logs?'+qsId+'since='+offset); } catch(e){ r = null; }
+    if(!document.getElementById('logModalBack')) return; // closed mid-flight
+    if(r){
+      const lines = r.lines || [];
+      if(lines.length){
+        const stick = nearBottom();
+        if(!started){ body.textContent = ''; started = true; }
+        body.textContent += (body.textContent?'\n':'') + lines.join('\n');
+        if(stick) body.scrollTop = body.scrollHeight;
+      } else if(!started){
+        body.textContent = '(no output yet)';
+      }
+      if(typeof r.nextOffset === 'number') offset = r.nextOffset;
+      // Reflect the live phase in the header (downloading/loading/ready).
+      try {
+        const st = await api('/api/llama/status');
+        const sc = (st.sidecars||[]).find(s => !profileId || s.profileId===profileId);
+        if(sc){ dot.className = 'dot-status '+(sc.phase==='ready'?'on':'loading'); phaseEl.textContent = '· '+(sc.detail||sc.phase||''); }
+        else { dot.className = 'dot-status off'; phaseEl.textContent = '· stopped'; }
+      } catch(e){}
+    }
+    LOG_STREAM_TIMER = setTimeout(poll, 1000);
+  };
+  poll();
 }
 
 // ---- Prompts (authoring) ----
@@ -1398,9 +1465,50 @@ function setChatBusy(busy){
   if(STATE.ws && STATE.wsProc) drawSessions(STATE.ws, STATE.wsProc);
 }
 
+// While a needed local sidecar is starting/downloading/loading we DISABLE the Send button (the
+// existing .btn:disabled rule dims it) so the operator can't fire a message at a model that can't
+// answer yet, and label it so the wait is obvious. Reverts via labelSendButton() when off.
+function setChatWarming(on){
+  STATE.chatWarming = on;
+  const send = $('#chatSend'); const caret = $('#chatSendMenu');
+  if(send){ send.disabled = on; if(on) send.textContent = 'Starting model…'; else if(!STATE.chatBusy) labelSendButton(); }
+  if(caret){ caret.disabled = on; }
+}
+
+// ── Investigate warm-up bubble ───────────────────────────────────────────────
+// A live droid bubble shown while a needed sidecar warms up, so the operator gets real feedback
+// (Starting → downloading model… X GB → loading into memory…) instead of an apparently dead button.
+function warmupBubbleHtml(){
+  return '<div class="bub droid pending" id="chatWarmup">'
+    + '<div class="who">'+droidWhoHtml()+'</div>'
+    + '<div class="answer" id="warmStatus">Starting the local model…</div>'
+    + '<div class="muted" style="margin-top:6px;font-size:12px">The model has to download and load before it can answer — this can take a few minutes for large models. <a href="#" id="warmLogs">view logs</a></div>'
+    + '</div>';
+}
+function ensureWarmupBubble(msg){
+  const log = $('#chatLog'); if(!log) return;
+  if($('#chatWarmup')) return;
+  if(log.querySelector('.empty')) log.innerHTML = '';
+  if(typeof msg === 'string' && msg) log.insertAdjacentHTML('beforeend', chatBub({role:'user', text:msg}));
+  log.insertAdjacentHTML('beforeend', warmupBubbleHtml());
+  const ll = $('#warmLogs'); if(ll) ll.onclick = (e) => { e.preventDefault(); openLogStream(STATE.warmupLogsTarget || null); };
+  log.scrollTop = log.scrollHeight;
+}
+function updateWarmupBubble(text){
+  const el = $('#warmStatus'); if(el) el.textContent = text;
+  const log = $('#chatLog'); if(log && (log.scrollHeight - log.scrollTop - log.clientHeight) < 120) log.scrollTop = log.scrollHeight;
+}
+function removeWarmupBubble(){ const b = $('#chatWarmup'); if(b) b.remove(); }
+function failWarmupBubble(text){
+  const b = $('#chatWarmup'); if(!b) return;
+  b.classList.remove('pending');
+  if(text){ const el = $('#warmStatus'); if(el) el.textContent = text; }
+}
+
 // The Send button and Cmd/Ctrl+Enter route to steering while a turn is in flight,
 // and to a fresh investigation otherwise.
 function submitCompose(ws, proc){
+  if(STATE.chatWarming) return;   // a sidecar is still starting up — Send is disabled
   if(STATE.chatBusy) steerChat(ws, proc);
   else sendChat(ws, proc);
 }
@@ -2125,7 +2233,11 @@ async function refreshChatRoster(){
 // once to start the missing ones, then waits for each to finish loading. Returns true to proceed
 // with the send, false to abort (composer untouched). Any settings/status lookup failure is
 // non-blocking — we proceed and let the chat call surface its own error.
-async function ensureSidecarsReady(){
+// Ensure every needed sidecar (primary + any enabled pair/monitor partner that is a sidecar) is up
+// and its model has finished loading before we send. `onProgress(text, info)` (optional) is called
+// at each step — start, then every poll while downloading/loading — so the caller can show a live
+// warm-up bubble. Returns true to proceed with the send, false to abort (declined or failed start).
+async function ensureSidecarsReady(onProgress){
   let s; try { s = await api('/api/settings') || {}; } catch(e){ return true; }
   const byId = {}; (s.profiles||[]).forEach(p => byId[p.id]=p);
   const needed = new Map();   // id → profile
@@ -2136,37 +2248,41 @@ async function ensureSidecarsReady(){
   if(!needed.size) return true;   // nothing local to start
 
   let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return true; }
+  const ready = new Set((st.sidecars||[]).filter(x => x.phase==='ready').map(x => x.profileId));
+  if([...needed.keys()].every(id => ready.has(id))) return true;   // all already serving — no wait
+  // The first needed sidecar drives the warm-up bubble's "view logs" link.
+  STATE.warmupLogsTarget = [...needed.keys()][0] || null;
   const running = new Set((st.sidecars||[]).map(x => x.profileId));
   const missing = [...needed.values()].filter(p => !running.has(p.id));
   const hint = $('#chatHint');
-  const say = (t) => { if(hint) hint.textContent = t; };
+  const report = (t, info) => { if(hint) hint.textContent = t; if(typeof onProgress === 'function') onProgress(t, info); };
   if(missing.length){
     const names = missing.map(p => p.name||p.id).join(' + ');
     const word = missing.length>1 ? 'Sidecars' : 'Sidecar';
     if(!window.confirm(word+' not started: '+names+'. Start '+(missing.length>1?'them':'it')+' now?')){
-      say('Message not sent — '+(missing.length>1?'sidecars':'sidecar')+' not started.');
+      report('Message not sent — '+(missing.length>1?'sidecars':'sidecar')+' not started.', {aborted:true});
       return false;
     }
     for(const p of missing){
-      say('Starting sidecar '+(p.name||p.id)+'…');
+      report('Starting '+(p.name||p.id)+'…', {profileId:p.id, label:(p.name||p.id), phase:'starting'});
       try { await api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId: p.id})}); }
-      catch(e){ say(''); window.alert('Could not start '+(p.name||p.id)+': '+(e.message||e)); return false; }
+      catch(e){ report('Could not start '+(p.name||p.id)+': '+(e.message||e), {profileId:p.id, label:(p.name||p.id), failed:true}); return false; }
     }
     refreshLlamaDot();
   }
   // Wait for each needed sidecar's model to finish loading before sending. This can take a while
-  // for large models, so show ongoing status instead of leaving the operator staring at silence.
+  // for large models, so report ongoing status instead of leaving the operator staring at silence.
   for(const p of needed.values()){
     const label = p.name||p.id;
-    say('Waiting for '+label+'…');
+    report('Waiting for '+label+'…', {profileId:p.id, label, phase:'starting'});
     const ok = await waitForSidecarReady(undefined, p.id, (secs, info) => {
       const what = (info && info.detail) ? info.detail
                  : (info && info.phase==='loading') ? 'loading model into memory…'
                  : (info && info.phase==='downloading') ? 'downloading model…'
                  : 'starting llama-server…';
-      say(label+': '+what+' ('+secs+'s)');
+      report(label+': '+what+' ('+secs+'s)', {profileId:p.id, label, phase:(info&&info.phase), detail:(info&&info.detail)});
     });
-    if(!ok) say(label+' is taking longer than expected — sending anyway; it may report a load error.');
+    if(!ok) report(label+' is taking longer than expected — sending anyway; it may report a load error.', {profileId:p.id, label, slow:true});
   }
   refreshLlamaDot();
   return true;
@@ -2239,14 +2355,26 @@ async function sendChat(ws, proc){
     }
   } catch(e){ /* non-blocking */ }
   // If the primary or an enabled partner is a local sidecar that isn't up yet, offer to start it
-  // (both, when paired). If the operator declines, the message stays in the composer unsent.
-  if(!(await ensureSidecarsReady())) return;
+  // and show a live warm-up bubble (downloading/loading progress) with Send disabled meanwhile. If
+  // the operator declines, the message stays in the composer unsent.
+  let warmShown = false;
+  const onWarm = (text, info) => {
+    if(info && (info.aborted)) return;   // decline handled below; no bubble
+    if(!warmShown){ warmShown = true; ensureWarmupBubble(msg); setChatWarming(true); }
+    updateWarmupBubble(text);
+  };
+  const ready = await ensureSidecarsReady(onWarm);
+  if(!ready){
+    if(warmShown){ failWarmupBubble(); setChatWarming(false); }   // keep the last reported error text
+    return;
+  }
+  if(warmShown){ removeWarmupBubble(); setChatWarming(false); }
   const allowPython = $('#chatPy').checked && !$('#chatPy').disabled;
   pushPromptHistory(msg);
   box.value = '';
   const qs = STATE.sessionId ? ('?session='+encodeURIComponent(STATE.sessionId)) : '';
   await consumeLiveStream(ws, proc, {
-    userText: msg,
+    userText: warmShown ? '' : msg,   // the user bubble was already drawn during warm-up
     onErrorRestore: () => { box.value = msg; },
     fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
