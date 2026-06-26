@@ -664,7 +664,7 @@ async function decide(key, decision){
 
 // ---- LLM sidecars (first-class) ----
 // The supervised local llama.cpp sidecars: ProcessOS ships several sidecar-capable profiles and
-// runs up to TWO llama-server processes at once (each on its own port) — so an investigation can
+// runs up to TWO llama-server processes at once (each on an auto-assigned port) — so an investigation can
 // pair a primary model with a sparring-partner / loop-monitor model. This view lists the profiles,
 // shows which are active/running, and lets the operator start/stop/switch each — the same controls
 // the Settings cog exposes, promoted to a first-class nav surface with a live status dot.
@@ -704,27 +704,11 @@ async function renderSidecars(){
   const runById = {}; sidecars.forEach(r => { if(r.profileId) runById[r.profileId] = r; });
   const atCap = sidecars.length >= max;
 
-  // Detect sidecar-capable profiles that collide on a port (can't both run at once).
-  const ports = {};
-  profiles.forEach(p => { const m = (p.baseUrl||p.base_url||'').match(/:(\d+)/); const port = m?m[1]:null; if(port){ (ports[port]=ports[port]||[]).push(p.id); } });
-  const collisions = Object.entries(ports).filter(([,ids]) => ids.length>1);
-
   let h = '<h1>LLM sidecars</h1>'
     + '<p class="lede">Local models ProcessOS supervises itself via <code>llama-server</code> (llama.cpp). '
-    + 'Up to <b>'+max+'</b> run at once (each on its own port) — so an investigation can pair a primary '
+    + 'Up to <b>'+max+'</b> run at once (each on an auto-assigned port) — so an investigation can pair a primary '
     + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>'
     + '<div class="btnrow" style="margin:0 0 14px"><button class="btn ghost" id="llConfigProfiles">\u2699 Configure LLM profiles</button></div>';
-
-  // Port-collision warning: two sidecar profiles can't share a port if you want both running.
-  if(collisions.length){
-    h += '<div class="tile" style="cursor:default;border-color:#7c2d12">'
-      + '<h3 style="color:#fdba74">Port conflict</h3>'
-      + '<div class="meta">These sidecar profiles share a port, so they can\'t run side by side. '
-      + 'Give each a distinct port (edit its base URL in the Settings cog):</div>'
-      + '<ul class="meta" style="margin:6px 0 0 18px">'
-      + collisions.map(([port,ids]) => '<li>port '+esc(port)+': '+ids.map(esc).join(', ')+'</li>').join('')
-      + '</ul></div>';
-  }
 
   // Live status banner: one row per running sidecar.
   if(sidecars.length){
@@ -752,17 +736,16 @@ async function renderSidecars(){
       const isRunning = !!runById[p.id];
       const pills = (isActive?'<span class="pill run">active</span> ':'')
                   + (isRunning?'<span class="pill accept">running</span>':'');
-      // Start is disabled if this one runs, the pool is full, or its port clashes with a running one.
-      const myPort = (p.baseUrl||p.base_url||'').match(/:(\d+)/);
-      const portClash = myPort && sidecars.some(r => r.profileId!==p.id && String(r.port)===myPort[1]);
-      const startDisabled = (isRunning || atCap || portClash) ? 'disabled' : '';
+      // Start is disabled only if this one already runs or the pool is full — ports are
+      // auto-assigned at start, so there is never a pre-start port clash to guard against.
+      const startDisabled = (isRunning || atCap) ? 'disabled' : '';
       const startTitle = isRunning ? 'Already running'
-                       : portClash ? 'Its port is already in use by a running sidecar'
                        : atCap ? ('Already running '+max+' sidecars — stop one first')
                        : 'Start this sidecar';
+      const runPort = isRunning ? runById[p.id].port : null;
       return '<div class="tile" style="cursor:default">'
         + '<h3>'+esc(p.name||p.id)+' '+pills+'</h3>'
-        + '<div class="meta">'+esc(p.modelFile||p.model||'')+(myPort?(' · port '+esc(myPort[1])):'')+'</div>'
+        + '<div class="meta">'+esc(p.modelFile||p.model||'')+(runPort?(' · port '+esc(String(runPort))):'')+'</div>'
         + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
         + (isRunning
