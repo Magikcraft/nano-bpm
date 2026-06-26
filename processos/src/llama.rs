@@ -55,6 +55,7 @@ impl LaunchPlan {
         profile: &LlmProfile,
         models_dir: &Path,
         llama_bin: Option<&str>,
+        port: u16,
     ) -> Result<Self, String> {
         let model = profile
             .model_file
@@ -69,7 +70,6 @@ impl LaunchPlan {
                 )
             })?
             .to_string();
-        let port = profile.sidecar_port();
         let bin = llama_bin
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -125,6 +125,31 @@ impl LaunchPlan {
         }
         s
     }
+}
+
+/// The managed port range ProcessOS draws sidecar ports from when a profile has no usable
+/// preferred port (or it is taken). Chosen high enough to avoid common service ports.
+const PORT_BASE: u16 = 18080;
+const PORT_RANGE: u16 = 512;
+
+/// Whether `port` can currently be bound on loopback (i.e. nothing else is listening on it).
+/// Best-effort: there is a tiny TOCTOU window before `llama-server` binds it, but with at most
+/// [`MAX_SIDECARS`] local sidecars and a re-check at start that is acceptable.
+fn port_bindable(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Pick a free TCP port for a new sidecar, so the operator never configures one. Reuses
+/// `preferred` (the profile's last-assigned port) when it is free, otherwise scans the managed
+/// range. `exclude` is the set of ports already held by running sidecars.
+fn pick_free_port(preferred: Option<u16>, exclude: &[u16]) -> Option<u16> {
+    if let Some(p) = preferred {
+        if p != 0 && !exclude.contains(&p) && port_bindable(p) {
+            return Some(p);
+        }
+    }
+    (PORT_BASE..PORT_BASE.saturating_add(PORT_RANGE))
+        .find(|p| !exclude.contains(p) && port_bindable(*p))
 }
 
 /// Split a free-text args string into argv on whitespace, honouring simple single/double quotes
@@ -291,6 +316,38 @@ impl LlamaManager {
             .clone()
     }
 
+    /// Start `llama-server` for sidecar `profile`, auto-assigning a free TCP port so the operator
+    /// never has to configure one. Honours the profile's previously-assigned port when it is still
+    /// free (keeping `base_url` stable across restarts), otherwise picks the next free port. The
+    /// chosen port is returned on the status so the caller can persist it into the profile's
+    /// `base_url` (the model client talks to that port). Errors if the profile is already running,
+    /// the pool is full, no port is free, or the model/spawn fails.
+    pub fn start_profile(
+        &self,
+        profile: &LlmProfile,
+        models_dir: &Path,
+        llama_bin: Option<&str>,
+    ) -> Result<LlamaStatus, String> {
+        self.reap();
+        let excluded: Vec<u16> = {
+            let g = self.inner.lock().unwrap();
+            if g.running.iter().any(|r| r.profile_id == profile.id) {
+                return Err(format!("sidecar '{}' is already running", profile.id));
+            }
+            if g.running.len() >= MAX_SIDECARS {
+                return Err(format!(
+                    "already running {MAX_SIDECARS} sidecars (the maximum); stop one first"
+                ));
+            }
+            g.running.iter().map(|r| r.port).collect()
+        };
+        let port = pick_free_port(profile.preferred_port(), &excluded).ok_or_else(|| {
+            "no free TCP port available for the sidecar; stop another server and retry".to_string()
+        })?;
+        let plan = LaunchPlan::build(profile, models_dir, llama_bin, port)?;
+        self.start(plan)
+    }
+
     /// Start `llama-server` for `plan`. Errors if that profile is already running, another sidecar
     /// already holds the port, the pool is full, or the spawn fails.
     pub fn start(&self, plan: LaunchPlan) -> Result<LlamaStatus, String> {
@@ -302,8 +359,7 @@ impl LlamaManager {
             }
             if let Some(other) = g.running.iter().find(|r| r.port == plan.port) {
                 return Err(format!(
-                    "port {} is already in use by sidecar '{}'; give this profile a different port \
-                     in its base URL so the two can run side by side",
+                    "port {} is already in use by sidecar '{}'; retry to get a different port",
                     plan.port, other.profile_id
                 ));
             }
@@ -533,13 +589,13 @@ mod tests {
     }
 
     #[test]
-    fn builds_hf_launch_with_port_from_base_url() {
+    fn builds_hf_launch_with_port() {
         let p = profile(
             "unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M",
             "http://127.0.0.1:8888/v1",
             Some("-ngl 99 -c 32768"),
         );
-        let plan = LaunchPlan::build(&p, Path::new("/models"), None).unwrap();
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8888).unwrap();
         assert_eq!(plan.bin, "llama-server");
         assert_eq!(plan.port, 8888);
         assert_eq!(
@@ -565,7 +621,8 @@ mod tests {
     #[test]
     fn builds_local_gguf_launch_resolving_against_models_dir() {
         let p = profile("loan.gguf", "http://127.0.0.1:9001/v1", None);
-        let plan = LaunchPlan::build(&p, Path::new("/models"), Some("/opt/llama-server")).unwrap();
+        let plan =
+            LaunchPlan::build(&p, Path::new("/models"), Some("/opt/llama-server"), 9001).unwrap();
         assert_eq!(plan.bin, "/opt/llama-server");
         assert_eq!(plan.args[0], "-m");
         assert_eq!(plan.args[1], "/models/loan.gguf");
@@ -575,7 +632,7 @@ mod tests {
     #[test]
     fn absolute_gguf_path_is_left_untouched() {
         let p = profile("/data/m.gguf", "http://127.0.0.1:8080/v1", None);
-        let plan = LaunchPlan::build(&p, Path::new("/models"), None).unwrap();
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080).unwrap();
         assert_eq!(plan.args[1], "/data/m.gguf");
     }
 
@@ -653,10 +710,26 @@ mod tests {
             .start(sleep_plan("a", 9109))
             .unwrap_err()
             .contains("already running"));
-        // Different profile but the same port → collision with a clear hint.
+        // Different profile but the same port → collision safety-net (auto-assignment normally
+        // prevents this, but the low-level start() still rejects it).
         let err = mgr.start(sleep_plan("b", 9101)).unwrap_err();
-        assert!(err.contains("port 9101") && err.contains("different port"));
+        assert!(err.contains("port 9101") && err.contains("already in use"));
         mgr.stop(None).await;
+    }
+
+    #[test]
+    fn pick_free_port_reuses_preferred_else_scans_range() {
+        // A reachable free port is honoured verbatim (stable base_url across restarts).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = listener.local_addr().unwrap().port();
+        // When the preferred port is excluded (already held by another sidecar), allocation falls
+        // back into the managed range and never reuses it.
+        let chosen = pick_free_port(Some(taken), &[taken]).unwrap();
+        assert_ne!(chosen, taken);
+        assert!((PORT_BASE..PORT_BASE + PORT_RANGE).contains(&chosen));
+        // With no preference, a port from the managed range is returned.
+        let any = pick_free_port(None, &[]).unwrap();
+        assert!((PORT_BASE..PORT_BASE + PORT_RANGE).contains(&any));
     }
 
     #[tokio::test]

@@ -138,22 +138,22 @@ separately-run llama.cpp) and an optional **llama-server binary** path (otherwis
 `PATH`).
 
 **Start sidecar / Stop** spawn and kill the process; sidecars are also stopped on graceful
-shutdown. The port set on the Managed-sidecar form is woven into the profile's Base URL
-(`http://127.0.0.1:<port>/v1`), so the profile both *launches* and *talks to* the same
-endpoint. **Logs** opens a streaming viewer that tails the process
+shutdown. **ProcessOS manages the port automatically** — it assigns a free local port when you
+start a sidecar (reusing the previous one when it is still free) and writes it into the profile's
+Base URL (`http://127.0.0.1:<port>/v1`), so the profile both *launches* and *talks to* the same
+endpoint with nothing to configure. **Logs** opens a streaming viewer that tails the process
 output and shows the **equivalent terminal command** (including `LLAMA_CACHE=…`) so you can
 run it yourself instead. Fresh installs ship ten sidecar profiles covering a size spread for
 two model families — **Gemma 4** (E2B ~4 GB, E4B ~8 GB, 12B ~16 GB, 26B-A4B ~48 GB, 31B ~64 GB)
 and **Qwen** (Qwen3 4B ~8 GB, 8B ~16 GB, 32B ~48 GB, **Coder 30B-A3B** ~24 GB, and Qwen 3.6
 35B-A3B ~64 GB) — so you can match the model to the machine. The tiny **E2B** suits a cheap loop
-**monitor**, and the **Coder** variant helps with BPMN/XML authoring. Each is on its **own port**
-(`8888`–`8897`) so two can run at once.
+**monitor**, and the **Coder** variant helps with BPMN/XML authoring.
 
 **Up to two sidecars run at once.** An investigation can drive a **primary** model plus, optionally,
 one **partner** — a sparring partner (Pair AI) or a loop **monitor** — and both can be local. The
-supervisor runs at most **two** `llama-server` children, each on a distinct port; starting a third,
-re-starting one already up, or starting two that share a port is rejected with a clear message
-(give each sidecar profile its own port in its Base URL). See the [llama endpoints](#endpoints).
+supervisor runs at most **two** `llama-server` children, each auto-assigned a distinct free port;
+starting a third or re-starting one already up is rejected with a clear message. See the
+[llama endpoints](#endpoints).
 
 **Wrap-up / loop monitor and reasoning control.** When the loop monitor decides a turn is
 spinning (or the operator hits **wrap it up**), ProcessOS ends the model's *current reasoning
@@ -723,7 +723,7 @@ for it automatically.
 | `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id; each entry includes its `contextWindow` when the endpoint reports one |
 | `GET` | `/api/llama/status` | Local llama.cpp sidecar pool: `{running, count, max, sidecars[], error}` where each entry has `profileId`, `model`, `port`, `pid`, `command`, `startedAt`. `running` is true when ≥1 is up |
 | `GET` | `/api/llama/ready?profileId=…` | Whether a sidecar is answering its `/health` probe (model loaded). Returns `{running, ready, profileId}`; polled by the cockpit's just-in-time start before sending a queued message |
-| `POST` | `/api/llama/start` | Start a sidecar for a profile (`{profileId}`; must have `sidecar:true`). Up to **two** run at once, each on a distinct port. Returns the new status |
+| `POST` | `/api/llama/start` | Start a sidecar for a profile (`{profileId}`; must have `sidecar:true`). ProcessOS auto-assigns a free port and records it in the profile's Base URL. Up to **two** run at once. Returns the new status |
 | `POST` | `/api/llama/stop` | Stop one sidecar (`{profileId}`) or **all** of them (empty body). Returns the resulting pool state |
 | `GET` | `/api/llama/logs?profileId=…&since=N` | Tail a sidecar's combined stdout/stderr from offset `N`; returns `{lines, text, nextOffset, running}` for incremental polling |
 | `GET` | `/api/llama/reasoning-control?profileId=…` | Probe whether the active (or named) profile's endpoint exposes the optional reasoning-control surface (`/v1/chat/completions/control`). Returns `{supported, ready, baseUrl}`; wrap-up/monitor use it for a mid-thinking halt when present, else fall back to the round-boundary cancel |

@@ -124,13 +124,11 @@ impl LlmProfile {
         }
     }
 
-    /// The TCP port the sidecar should serve on, parsed from [`base_url`] (e.g.
-    /// `http://127.0.0.1:8888/v1` → 8888). Falls back to llama-server's default 8080.
-    pub fn sidecar_port(&self) -> u16 {
-        self.base_url
-            .as_deref()
-            .and_then(parse_port)
-            .unwrap_or(8080)
+    /// The operator's *previously assigned* sidecar port, if any. `None` means "no preference"
+    /// (a fresh sidecar profile), in which case ProcessOS picks any free port. Used so a restart
+    /// reuses the same port when it is still free, keeping `base_url` stable between runs.
+    pub fn preferred_port(&self) -> Option<u16> {
+        self.base_url.as_deref().and_then(parse_port)
     }
 }
 
@@ -773,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_sidecar_port_from_base_url() {
+    fn parses_preferred_port_from_base_url() {
         assert_eq!(parse_port("http://127.0.0.1:8888/v1"), Some(8888));
         assert_eq!(parse_port("http://localhost:1234"), Some(1234));
         assert_eq!(parse_port("http://localhost/v1"), None);
@@ -791,7 +789,7 @@ mod tests {
             sidecar_args: None,
             thinking_level: None,
         };
-        assert_eq!(p.sidecar_port(), 9090);
+        assert_eq!(p.preferred_port(), Some(9090));
     }
 
     #[test]

@@ -1329,9 +1329,10 @@ struct LlamaStartRequest {
     profile_id: String,
 }
 
-/// `POST /api/llama/start` — launch `llama-server` for the named `sidecar:true` profile, serving
-/// it at the profile's base-URL port. Up to [`llama::MAX_SIDECARS`] run at once (each must use a
-/// distinct port). The models directory is exported as `LLAMA_CACHE`.
+/// `POST /api/llama/start` — launch `llama-server` for the named `sidecar:true` profile. ProcessOS
+/// auto-assigns a free TCP port (the operator never configures one); the assigned port is written
+/// back into the profile's `base_url` so the model client talks to it. Up to [`llama::MAX_SIDECARS`]
+/// run at once. The models directory is exported as `LLAMA_CACHE`.
 async fn llama_start(
     State(state): State<AppState>,
     Json(req): Json<LlamaStartRequest>,
@@ -1348,14 +1349,26 @@ async fn llama_start(
         ));
     }
     let models_dir = snap.effective_models_dir();
-    let plan = match llama::LaunchPlan::build(&profile, &models_dir, snap.llama_bin.as_deref()) {
-        Ok(p) => p,
+    let status = match state
+        .llama
+        .start_profile(&profile, &models_dir, snap.llama_bin.as_deref())
+    {
+        Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
-    match state.llama.start(plan) {
-        Ok(status) => Json(status).into_response(),
-        Err(e) => unprocessable(e),
+    // Persist the auto-assigned port into the profile's base URL so the model client (resolve_llm /
+    // as_llm_override) and the reasoning-control probe all reach the actual running endpoint.
+    if let Some(port) = status.port {
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+        if profile.base_url.as_deref() != Some(base_url.as_str()) {
+            let patch = settings::ProfilePatch {
+                base_url: Some(base_url),
+                ..Default::default()
+            };
+            let _ = state.settings.update_profile(&profile.id, patch);
+        }
     }
+    Json(status).into_response()
 }
 
 /// Request body for stopping a sidecar: an optional profile id (omit to stop all).

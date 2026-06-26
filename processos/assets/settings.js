@@ -76,7 +76,7 @@
       '<div id="s-fields-sidecar" class="s-typefields">' +
         '<div class="hint">ProcessOS launches <code>llama-server</code> for this model and talks to it locally.</div>' +
         '<label>Model file / HF spec <input id="s-modelFile" placeholder="unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL or /path/model.gguf"></label>' +
-        '<label>Port <input id="s-port" type="number" min="1" max="65535" placeholder="8888" title="Local port llama-server listens on. Give each sidecar a unique port so two can run at once."></label>' +
+        '<div class="hint">ProcessOS assigns a free local port automatically when you start the sidecar — no port to configure.</div>' +
         '<label>Startup args <input id="s-sidecarArgs" placeholder="-ngl 99 -c 32768 --jinja"></label>' +
         '<div class="hint">A <code>:quant</code> HF spec is downloaded into the models directory; a <code>.gguf</code> path is resolved against it. Browse GGUF models on <a href="https://huggingface.co/models?library=gguf&sort=trending" target="_blank" rel="noopener noreferrer">HuggingFace</a>.</div>' +
       '</div>' +
@@ -177,13 +177,6 @@
     return $('s-type-sidecar').checked ? 'sidecar' : 'external';
   }
 
-  // Pull the port out of a base URL like http://127.0.0.1:8888/v1 -> 8888.
-  function portFromUrl(url) {
-    if (!url) return '';
-    var m = String(url).match(/:(\d{2,5})(?:\/|$)/);
-    return m ? m[1] : '';
-  }
-
   // Show only the fields for the selected profile type; the sidecar runtime controls
   // (Start/Stop/Logs) and the highlighted radio follow suit.
   function applyTypeUI() {
@@ -198,7 +191,7 @@
   function fillFields() {
     var p = currentProfile();
     if (!p) {
-      ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp', 's-modelFile', 's-port', 's-sidecarArgs'].forEach(function (i) { $(i).value = ''; });
+      ['s-name', 's-baseUrl', 's-model', 's-maxTokens', 's-temp', 's-modelFile', 's-sidecarArgs'].forEach(function (i) { $(i).value = ''; });
       $('s-provider').value = ''; $('s-apiKey').value = '';
       $('s-thinking').value = '';
       $('s-type-external').checked = true;
@@ -214,7 +207,6 @@
     $('s-maxTokens').value = p.maxTokens != null ? p.maxTokens : '';
     $('s-temp').value = p.temperature != null ? p.temperature : '';
     $('s-modelFile').value = p.modelFile || '';
-    $('s-port').value = portFromUrl(p.baseUrl);
     $('s-sidecarArgs').value = p.sidecarArgs || '';
     $('s-thinking').value = p.thinkingLevel || '';
     if (p.sidecar) $('s-type-sidecar').checked = true; else $('s-type-external').checked = true;
@@ -265,12 +257,12 @@
       sidecar: type === 'sidecar'
     };
     if (type === 'sidecar') {
-      var port = $('s-port').value ? Number($('s-port').value) : 0;
       var modelFile = $('s-modelFile').value;
       patch.modelFile = modelFile;
       patch.sidecarArgs = $('s-sidecarArgs').value;
       patch.provider = 'openai';
-      patch.baseUrl = port ? ('http://127.0.0.1:' + port + '/v1') : '';
+      // Port/base URL are managed by ProcessOS (assigned on start); leave baseUrl untouched so the
+      // running endpoint is preserved across edits.
       patch.model = modelFile; // llama-server serves under the loaded model name
     } else {
       patch.provider = $('s-provider').value;
