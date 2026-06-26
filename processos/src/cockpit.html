@@ -65,6 +65,15 @@
   .btn.primary:hover { background: #4f46e5; }
   .btn.ghost { background: transparent; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
+  /* Inline LLM profile editor (LLMs view) */
+  #llmEditor label { display: block; font-size: 12px; color: #a1a1aa; margin: 10px 0 4px; }
+  #llmEditor input, #llmEditor select { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; box-sizing: border-box; }
+  .le-types { display: flex; gap: 10px; margin: 10px 0 2px; }
+  .le-rd { flex: 1; display: flex; align-items: center; gap: 7px; background: #0c0c0e; border: 1px solid #34343c; border-radius: 8px; padding: 8px 10px; font-size: 13px; color: #e4e4e7; cursor: pointer; margin: 0; }
+  .le-rd.sel { border-color: #6366f1; background: #1e1b3a; }
+  .le-rd input { width: auto; }
+  .le-fields[hidden] { display: none; }
+  .le-hint { font-size: 11px; color: #71717a; }
   .err { color: #fca5a5; background: #1f0a0a; border: 1px solid #3a1414; padding: 12px 16px; border-radius: 8px; }
   .muted { color: #71717a; }
   /* stepper */
@@ -736,6 +745,132 @@ function startLlamaDotPoll(){
   LLAMA_DOT_TIMER = setInterval(refreshLlamaDot, 4000);
 }
 
+// Inline profile editor state: {open, id} — id=null means "add new". Lives at module
+// scope so it survives the view's re-renders; the warming auto-refresh is suppressed
+// while it's open so typed input isn't wiped.
+let LLM_EDITOR = { open:false, id:null, type:null };
+
+// Build the inline add/edit profile form (string) for the current LLM_EDITOR state.
+// `profiles` is the full settings.profiles list; `active` is the active profile id.
+function llmEditorBlock(profiles, active){
+  const editing = LLM_EDITOR.id != null;
+  const p = editing ? (profiles.find(x => x.id === LLM_EDITOR.id) || null) : null;
+  if(editing && !p){ LLM_EDITOR.open = false; return ''; }
+  const type = LLM_EDITOR.type || (p ? (p.sidecar ? 'sidecar' : 'remote') : 'remote');
+  const isSidecar = type === 'sidecar';
+  const keyPh = (p && p.apiKeySet) ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '(unset)';
+  const val = (x) => esc(x==null ? '' : String(x));
+  return '<div class="tile" id="llmEditor" style="cursor:default;border-color:#4f46e5;margin:0 0 16px">'
+    + '<h3>'+(editing ? 'Edit profile' : 'Add LLM profile')+'</h3>'
+    + '<label>Name</label><input id="le-name" placeholder="e.g. Local (llama.cpp)" value="'+val(p&&p.name)+'">'
+    + '<div class="le-types">'
+    +   '<label class="le-rd'+(isSidecar?' sel':'')+'"><input type="radio" name="le-type" value="sidecar" '+(isSidecar?'checked':'')+'> Managed sidecar</label>'
+    +   '<label class="le-rd'+(!isSidecar?' sel':'')+'"><input type="radio" name="le-type" value="remote" '+(!isSidecar?'checked':'')+'> Remote endpoint</label>'
+    + '</div>'
+    + '<div id="le-fields-sidecar" class="le-fields"'+(isSidecar?'':' hidden')+'>'
+    +   '<label>Model file / HF spec</label><input id="le-modelFile" placeholder="unsloth/Qwen3-4B-GGUF:UD-Q4_K_XL or /path/model.gguf" value="'+val(p&&p.modelFile)+'">'
+    +   '<label>Startup args</label><input id="le-sidecarArgs" placeholder="-ngl 99 -c 32768 --jinja" value="'+val(p&&p.sidecarArgs)+'">'
+    +   '<div class="le-hint" style="margin-top:6px">ProcessOS launches <code>llama-server</code> for this model and assigns a free local port on start.</div>'
+    + '</div>'
+    + '<div id="le-fields-remote" class="le-fields"'+(!isSidecar?'':' hidden')+'>'
+    +   '<label>Provider</label><select id="le-provider"><option value="">(env default)</option><option value="openai">openai / local</option><option value="anthropic">anthropic</option></select>'
+    +   '<label>Base URL</label><input id="le-baseUrl" placeholder="e.g. https://api.openai.com/v1" value="'+val(p&&p.baseUrl)+'">'
+    +   '<label>Model</label><div style="display:flex;gap:8px"><input id="le-model" list="le-modellist" placeholder="model id" value="'+val(p&&p.model)+'" style="flex:1;min-width:0"><button class="btn ghost" id="le-fetch" style="flex:0 0 auto" title="Query the endpoint for its models">Fetch</button></div><datalist id="le-modellist"></datalist>'
+    +   '<label>API key</label><input id="le-apiKey" type="password" placeholder="'+esc(keyPh)+'">'
+    + '</div>'
+    + '<div style="display:flex;gap:8px;margin-top:4px">'
+    +   '<div style="flex:1"><label>Max tokens</label><input id="le-maxTokens" type="number" min="1" placeholder="2048" value="'+(p&&p.maxTokens!=null?p.maxTokens:'')+'"></div>'
+    +   '<div style="flex:1"><label>Temperature</label><input id="le-temp" type="number" step="0.05" min="0" placeholder="0.2" value="'+(p&&p.temperature!=null?p.temperature:'')+'"></div>'
+    +   '<div style="flex:1"><label>Thinking level</label><select id="le-thinking"><option value="">Default</option><option value="fast">Fast (20%)</option><option value="medium">Medium (50%)</option><option value="max">Max (100%)</option></select></div>'
+    + '</div>'
+    + '<div id="le-status" class="le-hint" style="min-height:16px;margin-top:8px"></div>'
+    + '<div class="btnrow" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">'
+    +   '<button class="btn primary" id="le-save">'+(editing?'Save changes':'Add profile')+'</button>'
+    +   ((editing && p && p.id!==active) ? '<button class="btn ghost" id="le-active">Make active</button>' : '')
+    +   (editing ? '<button class="btn warn" id="le-delete">Delete</button>' : '')
+    +   '<button class="btn ghost" id="le-cancel">Cancel</button>'
+    + '</div></div>';
+}
+
+// Wire the inline editor's controls (called after the view's innerHTML is set).
+function wireLlmEditor(profiles, active){
+  const ed = document.getElementById('llmEditor');
+  if(!ed) return;
+  const editing = LLM_EDITOR.id != null;
+  const p = editing ? (profiles.find(x => x.id === LLM_EDITOR.id) || null) : null;
+  const g = (id) => document.getElementById(id);
+  const setStatus = (m) => { const s = g('le-status'); if(s) s.textContent = m || ''; };
+  // Initial select values (can't be set reliably via attribute in the string build).
+  if(g('le-provider')) g('le-provider').value = (p && p.provider) || '';
+  if(g('le-thinking')) g('le-thinking').value = (p && p.thinkingLevel) || '';
+  // Type radios toggle which field group shows — done in JS so typed input survives.
+  ed.querySelectorAll('input[name="le-type"]').forEach(r => r.onchange = () => {
+    const t = ed.querySelector('input[name="le-type"]:checked').value;
+    g('le-fields-sidecar').hidden = t !== 'sidecar';
+    g('le-fields-remote').hidden = t !== 'remote';
+    ed.querySelectorAll('.le-rd').forEach(l => l.classList.toggle('sel', l.querySelector('input').value === t));
+  });
+  const patch = () => {
+    const t = ed.querySelector('input[name="le-type"]:checked').value;
+    const o = {
+      name: g('le-name').value.trim(),
+      maxTokens: g('le-maxTokens').value ? Number(g('le-maxTokens').value) : 0,
+      temperature: g('le-temp').value !== '' ? Number(g('le-temp').value) : -1,
+      thinkingLevel: g('le-thinking').value || '',
+      sidecar: t === 'sidecar'
+    };
+    if(t === 'sidecar'){
+      const mf = g('le-modelFile').value.trim();
+      o.modelFile = mf; o.sidecarArgs = g('le-sidecarArgs').value; o.provider = 'openai'; o.model = mf;
+    } else {
+      o.provider = g('le-provider').value; o.baseUrl = g('le-baseUrl').value.trim();
+      o.model = g('le-model').value.trim(); o.modelFile = ''; o.sidecarArgs = '';
+      const key = g('le-apiKey').value; if(key) o.apiKey = key;
+    }
+    return o;
+  };
+  const close = () => { LLM_EDITOR = { open:false, id:null, type:null }; renderSidecars(); };
+  const fetchBtn = g('le-fetch');
+  if(fetchBtn) fetchBtn.onclick = async () => {
+    setStatus('Fetching models\u2026');
+    const body = { provider: g('le-provider').value, baseUrl: g('le-baseUrl').value.trim() };
+    if(editing && p) body.profileId = p.id;
+    if(g('le-apiKey').value) body.apiKey = g('le-apiKey').value;
+    try {
+      const d = await api('/api/settings/models', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+      const dl = g('le-modellist'); dl.innerHTML = '';
+      (d.models||[]).forEach(m => { const id = typeof m==='string'?m:m.id; const o=document.createElement('option'); o.value=id; dl.appendChild(o); });
+      if(!g('le-model').value && (d.models||[]).length===1){ g('le-model').value = typeof d.models[0]==='string'?d.models[0]:d.models[0].id; }
+      setStatus('Found '+((d.models||[]).length)+' model(s) \u2014 pick one from the field');
+    } catch(e){ setStatus('fetch failed: '+(e.message||e)); }
+  };
+  g('le-save').onclick = async () => {
+    const body = patch();
+    if(!body.name){ setStatus('Name is required'); return; }
+    setStatus('Saving\u2026');
+    try {
+      if(editing){ await api('/api/settings/profiles/'+encodeURIComponent(p.id), {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+      else { await api('/api/settings/profiles', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+      try { window.dispatchEvent(new CustomEvent('processos:settings-changed')); } catch(_){}
+      close();
+    } catch(e){ setStatus('error: '+(e.message||e)); }
+  };
+  const activeBtn = g('le-active');
+  if(activeBtn) activeBtn.onclick = async () => {
+    try { await api('/api/settings', {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({activeProfile:p.id})}); try{window.dispatchEvent(new CustomEvent('processos:settings-changed'));}catch(_){} }
+    catch(e){ setStatus('error: '+(e.message||e)); return; }
+    close();
+  };
+  const delBtn = g('le-delete');
+  if(delBtn) delBtn.onclick = async () => {
+    if(!window.confirm('Delete profile "'+(p.name||p.id)+'"?')) return;
+    try { await api('/api/settings/profiles/'+encodeURIComponent(p.id), {method:'DELETE'}); try{window.dispatchEvent(new CustomEvent('processos:settings-changed'));}catch(_){} }
+    catch(e){ setStatus('error: '+(e.message||e)); return; }
+    close();
+  };
+  g('le-cancel').onclick = () => close();
+}
+
 async function renderSidecars(){
   STATE.view='sidecars'; setActive(); main.innerHTML='Loading…';
   let s, st;
@@ -773,7 +908,10 @@ async function renderSidecars(){
     + '<code>llama-server</code> (llama.cpp), and <b>remote profiles</b> pointing at OpenAI-compatible endpoints. '
     + 'Up to <b>'+max+'</b> sidecars run at once (each on an auto-assigned port) — so an investigation can pair a primary '
     + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>'
-    + '<div class="btnrow" style="margin:0 0 14px"><button class="btn ghost" id="llConfigProfiles">\u2699 Configure LLM profiles</button></div>';
+    + '<div class="btnrow" style="margin:0 0 14px"><button class="btn primary" id="llAddProfileBtn">+ Add LLM profile</button></div>';
+
+  // The inline add/edit editor sits at the top of the view when open.
+  if(LLM_EDITOR.open){ h += llmEditorBlock(s.profiles||[], active); }
 
   // Live status banner: one row per running sidecar.
   if(sidecars.length){
@@ -799,7 +937,7 @@ async function renderSidecars(){
 
   h += '<h2>Sidecar profiles ('+profiles.length+')</h2>';
   if(!profiles.length){
-    h += '<p class="muted">No sidecar-capable profiles. <a href="#" id="llAddProfile">Add one in the LLM config</a> (choose the "Managed sidecar" type).</p>';
+    h += '<p class="muted">No sidecar-capable profiles. <a href="#" id="llAddProfile">Add a managed sidecar</a> (a local <code>llama-server</code> model).</p>';
   } else {
     h += '<div class="grid">' + profiles.map(p => {
       const isActive = p.id===active;
@@ -858,7 +996,7 @@ async function renderSidecars(){
   // tile only offers Make active / Edit / Star. Starred first, then active.
   h += '<h2>Remote profiles ('+remoteProfiles.length+')</h2>';
   if(!remoteProfiles.length){
-    h += '<p class="muted">No remote profiles. <a href="#" id="llAddRemote">Add one in the LLM config</a> (an OpenAI-compatible endpoint — base URL, model, API key).</p>';
+    h += '<p class="muted">No remote profiles. <a href="#" id="llAddRemote">Add a remote endpoint</a> (OpenAI-compatible — base URL, model, API key).</p>';
   } else {
     const rrank = (p) => (p.starred?0:2) + (p.id===active?-1:0);
     remoteProfiles.sort((a,b) => rrank(a)-rrank(b));
@@ -914,14 +1052,12 @@ async function renderSidecars(){
   });
   const showLogs = (id) => openLogStream(id || null);
   main.querySelectorAll('[data-logs]').forEach(b => b.onclick = () => showLogs(b.dataset.logs || null));
-  const openConfig = (id) => {
-    if(typeof window.processosOpenSettings === 'function') window.processosOpenSettings(id || undefined);
-    else { const cog = document.getElementById('cog'); if(cog) cog.click(); }
-  };
-  const cfgBtn = document.getElementById('llConfigProfiles'); if(cfgBtn) cfgBtn.onclick = () => openConfig(null);
-  const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
-  const addRemoteBtn = document.getElementById('llAddRemote'); if(addRemoteBtn) addRemoteBtn.onclick = (e) => { e.preventDefault(); openConfig(null); };
-  main.querySelectorAll('[data-config]').forEach(b => b.onclick = () => openConfig(b.dataset.config));
+  // Inline editor: opening sets LLM_EDITOR and re-renders so the form mounts in-view.
+  const openEditor = (id, type) => { LLM_EDITOR = { open:true, id:id||null, type:type||null }; renderSidecars(); };
+  const addBtnTop = document.getElementById('llAddProfileBtn'); if(addBtnTop) addBtnTop.onclick = () => openEditor(null, null);
+  const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openEditor(null, 'sidecar'); };
+  const addRemoteBtn = document.getElementById('llAddRemote'); if(addRemoteBtn) addRemoteBtn.onclick = (e) => { e.preventDefault(); openEditor(null, 'remote'); };
+  main.querySelectorAll('[data-config]').forEach(b => b.onclick = () => openEditor(b.dataset.config, null));
   main.querySelectorAll('[data-star]').forEach(b => b.onclick = async () => {
     const want = b.dataset.starred !== '1';
     b.disabled = true;
@@ -931,12 +1067,20 @@ async function renderSidecars(){
     renderSidecars();
   });
 
+  // Mount + scroll the inline editor when open.
+  if(LLM_EDITOR.open){
+    wireLlmEditor(s.profiles||[], active);
+    const ed = document.getElementById('llmEditor');
+    if(ed){ ed.scrollIntoView({block:'nearest'}); const n = document.getElementById('le-name'); if(n) n.focus(); }
+  }
+
   // While any sidecar is still downloading/loading (not yet ready) OR a background model download
   // is active, re-render on a timer so the operator watches progress without manually refreshing.
-  // Guarded so it stops once the view changes or everything is settled.
+  // Guarded so it stops once the view changes or everything is settled — and suppressed while the
+  // inline editor is open so a timed re-render can't wipe half-typed input.
   const stillWarming = sidecars.some(r => r.phase && r.phase!=='ready');
   const anyDownloading = (st.downloads||[]).length > 0;
-  if(stillWarming || anyDownloading){
+  if((stillWarming || anyDownloading) && !LLM_EDITOR.open){
     setTimeout(() => { if(STATE.view==='sidecars') renderSidecars(); }, 3000);
   }
 }
