@@ -773,7 +773,143 @@ pub fn render_view_full(
     turns
 }
 
-/// Extend `stamps` so it aligns with the rendered turns of `messages`: a newly-appeared user
+/// Render a chat session's turns into a downloadable transcript. `markdown` chooses Markdown
+/// vs plain text; `verbose` (the "debug" export) includes each turn's reasoning timeline and
+/// tool calls (arguments + results), while the clean "chat" export keeps just the prose.
+pub fn export_transcript(
+    name: &str,
+    turns: &[ChatTurnView],
+    markdown: bool,
+    verbose: bool,
+) -> String {
+    let mut out = String::new();
+    let title = if name.trim().is_empty() {
+        "Investigation".to_string()
+    } else {
+        format!("Investigation — {name}")
+    };
+    let kind = if verbose { "debug" } else { "chat" };
+    if markdown {
+        out.push_str(&format!("# {title}\n\n"));
+        out.push_str(&format!(
+            "_Exported from Nano ProcessOS · {kind} transcript · {} turns_\n",
+            turns.len()
+        ));
+    } else {
+        out.push_str(&format!("{title}\n"));
+        out.push_str(&"=".repeat(title.chars().count().min(80)));
+        out.push('\n');
+        out.push_str(&format!(
+            "Exported from Nano ProcessOS · {kind} transcript · {} turns\n",
+            turns.len()
+        ));
+    }
+
+    for (i, t) in turns.iter().enumerate() {
+        let who = match t.role.as_str() {
+            "user" => "You".to_string(),
+            "pair" => format!("Pair · {}", t.name.as_deref().unwrap_or("reviewer")),
+            _ => match t.model.as_deref() {
+                Some(m) if !m.is_empty() => format!("Droid ({m})"),
+                _ => "Droid".to_string(),
+            },
+        };
+        let heading = format!("{} · {}", i + 1, who);
+        if markdown {
+            out.push_str(&format!("\n## {heading}\n\n"));
+        } else {
+            out.push_str(&format!("\n----- {heading} -----\n\n"));
+        }
+
+        // The debug export walks the interleaved reasoning + tool-call timeline before the answer.
+        if verbose {
+            for item in &t.thought {
+                match item {
+                    ThoughtItem::Reasoning { text } => {
+                        let text = text.trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if markdown {
+                            out.push_str("_Reasoning:_\n\n");
+                            for line in text.lines() {
+                                out.push_str(&format!("> {line}\n"));
+                            }
+                            out.push('\n');
+                        } else {
+                            out.push_str("[Reasoning]\n");
+                            out.push_str(text);
+                            out.push_str("\n\n");
+                        }
+                    }
+                    ThoughtItem::Tool {
+                        tool,
+                        arguments,
+                        result,
+                    } => {
+                        let args = compact_json(arguments);
+                        if markdown {
+                            out.push_str(&format!("**Tool · `{tool}`**\n\n"));
+                            out.push_str(&format!("```json\n{args}\n```\n\n"));
+                            if !result.trim().is_empty() {
+                                out.push_str(&format!("```\n{}\n```\n\n", result.trim_end()));
+                            }
+                        } else {
+                            out.push_str(&format!("[Tool: {tool}]\n"));
+                            out.push_str(&format!("  args: {args}\n"));
+                            if !result.trim().is_empty() {
+                                out.push_str(&format!("  result: {}\n", result.trim_end()));
+                            }
+                            out.push('\n');
+                        }
+                    }
+                }
+            }
+            // Older turns may only carry the flat `steps` list (no interleaved timeline).
+            if t.thought.is_empty() {
+                for s in &t.steps {
+                    let args = compact_json(&s.arguments);
+                    if markdown {
+                        out.push_str(&format!("**Tool · `{}`**\n\n", s.tool));
+                        out.push_str(&format!("```json\n{args}\n```\n\n"));
+                        if !s.result.trim().is_empty() {
+                            out.push_str(&format!("```\n{}\n```\n\n", s.result.trim_end()));
+                        }
+                    } else {
+                        out.push_str(&format!("[Tool: {}]\n", s.tool));
+                        out.push_str(&format!("  args: {args}\n"));
+                        if !s.result.trim().is_empty() {
+                            out.push_str(&format!("  result: {}\n", s.result.trim_end()));
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+
+        let answer = t.text.trim();
+        if !answer.is_empty() {
+            out.push_str(answer);
+            out.push('\n');
+        }
+    }
+
+    out.push('\n');
+    out
+}
+
+/// Pretty-print small JSON inline, falling back to the compact form for large blobs so a tool
+/// export stays legible without ballooning.
+fn compact_json(v: &serde_json::Value) -> String {
+    let pretty = serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string());
+    if pretty.len() <= 2000 {
+        pretty
+    } else {
+        v.to_string()
+    }
+}
+
+
 /// turn is stamped `user_ts` and newly-appeared droid turns `droid_ts`. Existing stamps are
 /// preserved; the result is truncated to the turn count.
 pub fn extend_stamps(
@@ -1052,6 +1188,50 @@ mod tests {
         assert_eq!(view[1].steps.len(), 1);
         assert_eq!(view[1].steps[0].tool, "query_traces");
         assert_eq!(view[1].steps[0].result, "1");
+    }
+
+    #[test]
+    fn export_transcript_chat_vs_debug() {
+        let transcript = vec![
+            Msg::System("sys".into()),
+            Msg::User("why slow?".into()),
+            Msg::Assistant {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "query_traces".into(),
+                    arguments: json!({"sql": "SELECT 1"}),
+                }],
+            },
+            Msg::Tool {
+                call_id: "c1".into(),
+                content: "1".into(),
+            },
+            Msg::Assistant {
+                text: Some("It's the credit-check job.".into()),
+                tool_calls: vec![],
+            },
+        ];
+        let turns = render_view(&transcript);
+
+        // Clean chat export: prose only, no tool dump.
+        let chat_md = export_transcript("North Wind", &turns, true, false);
+        assert!(chat_md.contains("# Investigation — North Wind"));
+        assert!(chat_md.contains("## 1 · You"));
+        assert!(chat_md.contains("why slow?"));
+        assert!(chat_md.contains("It's the credit-check job."));
+        assert!(!chat_md.contains("query_traces"));
+
+        // Debug export: includes the tool call + result.
+        let debug_md = export_transcript("North Wind", &turns, true, true);
+        assert!(debug_md.contains("Tool · `query_traces`"));
+        assert!(debug_md.contains("SELECT 1"));
+        assert!(debug_md.contains("It's the credit-check job."));
+
+        // Plain-text variant has no markdown headers.
+        let chat_txt = export_transcript("North Wind", &turns, false, false);
+        assert!(chat_txt.contains("----- 1 · You -----"));
+        assert!(!chat_txt.contains("# Investigation"));
     }
 
     #[test]

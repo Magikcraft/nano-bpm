@@ -163,6 +163,12 @@
   .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: #8b8b93; cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
   .chat-tabs .ctab:hover { color: #c7d2fe; }
   .chat-tabs .ctab.active { color: #e4e4e7; background: #11142a; border-color: #28306a; }
+  .chat-export { position: relative; margin-left: auto; }
+  .export-menu { position: absolute; right: 0; top: calc(100% + 2px); z-index: 30; background: #14141a; border: 1px solid #2a2a33; border-radius: 8px; padding: 4px; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  .export-menu[hidden] { display: none; }
+  .export-menu .em-group { color: #8b8b93; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px 2px; }
+  .export-menu button { display: block; width: 100%; text-align: left; background: none; border: none; color: #d4d4d8; cursor: pointer; padding: 6px 8px; border-radius: 6px; font: 500 12px/1.2 inherit; }
+  .export-menu button:hover { background: #1d1d28; color: #c7d2fe; }
   .chatdebug { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 160px; }
   .chatdebug .empty { color: #71717a; font-size: 13px; margin: 30px auto; text-align: center; max-width: 460px; }
   .dbg-round { border: 1px solid #26262b; border-radius: 10px; background: #0b0b14; margin-bottom: 10px; }
@@ -735,7 +741,7 @@ async function renderSidecars(){
   let s, st;
   try { s = await api('/api/settings') || {}; } catch(e){ return fail(e); }
   try { st = await api('/api/llama/status'); } catch(e){ st = {running:false, sidecars:[], count:0, max:2}; }
-  const profiles = (s.profiles||[]).filter(p => p.sidecar).slice().sort((a,b) => (b.starred?1:0)-(a.starred?1:0));
+  const profiles = (s.profiles||[]).filter(p => p.sidecar).slice();
   const active = s.activeProfile;
   const sidecars = st.sidecars || [];
   const max = st.max || 2;
@@ -745,6 +751,10 @@ async function renderSidecars(){
   const dlById = {}; (st.downloads||[]).forEach(d => { if(d.profileId) dlById[d.profileId] = d; });
   const fmtGB = (b) => (b==null) ? '' : (b/1073741824).toFixed(1)+' GB';
   const atCap = sidecars.length >= max;
+  // Card order: starred first, then ready-to-use models (running or already downloaded) ahead of
+  // ones that still need a download — so the operator's pinned and usable models float to the top.
+  const rank = (p) => (p.starred?0:4) + ((runById[p.id]||downloadedById[p.id])?0:2) + (dlById[p.id]?-1:0);
+  profiles.sort((a,b) => rank(a)-rank(b));
   // Map a running sidecar's lifecycle phase to a pill + a human one-liner. A spawned llama-server
   // is NOT immediately usable: it downloads the model, then loads it into memory, then serves.
   const phaseMeta = (r) => {
@@ -1217,6 +1227,17 @@ async function renderWorkspace(ws, proc){
           <button class="ctab active" id="tabChat" data-tab="chat">Chat</button>
           <button class="ctab" id="tabSims" data-tab="sims" title="The Alternate Reality Engine runs the droid forked this session — each variant and its fidelity scorecard">Simulations</button>
           <button class="ctab" id="tabDebug" data-tab="debug" title="See exactly what was sent to the model this session">Debug</button>
+          <span class="chat-export" id="chatExportWrap">
+            <button class="ctab" id="chatExport" title="Download this investigation as Markdown or text">Export \u25BE</button>
+            <div class="export-menu" id="chatExportMenu" hidden>
+              <div class="em-group">Chat transcript</div>
+              <button data-mode="chat" data-format="md">Markdown (.md)</button>
+              <button data-mode="chat" data-format="txt">Plain text (.txt)</button>
+              <div class="em-group">Debug (reasoning + tools)</div>
+              <button data-mode="debug" data-format="md">Markdown (.md)</button>
+              <button data-mode="debug" data-format="txt">Plain text (.txt)</button>
+            </div>
+          </span>
         </div>
         <div id="chatLog" class="chatlog"><div class="empty">Loading conversation…</div></div>
         <div id="chatSims" class="chatsims" style="display:none"><div class="empty">No simulations yet. In the Experiment Designer persona, the droid forks the model and replays it against the dataset; each run appears here with its variant and scorecard.</div></div>
@@ -1282,6 +1303,7 @@ async function renderWorkspace(ws, proc){
   $('#tabChat').onclick = () => switchChatTab('chat', ws, proc);
   $('#tabSims').onclick = () => switchChatTab('sims', ws, proc);
   $('#tabDebug').onclick = () => switchChatTab('debug', ws, proc);
+  wireExportMenu(ws, proc);
   $('#chatSend').onclick = () => submitCompose(ws, proc);
   $('#chatSendMenu').onclick = (e) => { e.stopPropagation(); toggleProfileMenu(); };
   $('#chatWrapup').onclick = () => wrapUpChat(ws, proc);
@@ -1322,6 +1344,35 @@ function bumpChatFont(dir){
   const px = Math.min(24, Math.max(11, applyChatFont() + dir*1));
   localStorage.setItem('processos.chatFont', String(px));
   applyChatFont();
+}
+
+// ── Export the investigation transcript ──────────────────────────────────────
+function wireExportMenu(ws, proc){
+  const btn = $('#chatExport'), menu = $('#chatExportMenu');
+  if(!btn || !menu) return;
+  btn.onclick = (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; };
+  menu.querySelectorAll('button[data-mode]').forEach(b => {
+    b.onclick = (e) => { e.stopPropagation(); menu.hidden = true; exportInvestigation(ws, proc, b.dataset.mode, b.dataset.format); };
+  });
+  document.addEventListener('click', () => { menu.hidden = true; });
+}
+async function exportInvestigation(ws, proc, mode, format){
+  const sid = STATE.sessionId;
+  if(!sid){ window.alert('No chat session to export yet.'); return; }
+  const url = '/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)
+    + '/chat/sessions/'+encodeURIComponent(sid)+'/export?mode='+encodeURIComponent(mode)+'&format='+encodeURIComponent(format);
+  try {
+    const r = await fetch(url);
+    if(!r.ok){ window.alert('Export failed ('+r.status+')'); return; }
+    const blob = await r.blob();
+    const cd = r.headers.get('content-disposition') || '';
+    const m = /filename="?([^"]+)"?/.exec(cd);
+    const name = m ? m[1] : ('investigation-'+mode+'.'+(format==='txt'?'txt':'md'));
+    const a = document.createElement('a');
+    const href = URL.createObjectURL(blob);
+    a.href = href; a.download = name; document.body.appendChild(a); a.click();
+    a.remove(); setTimeout(() => URL.revokeObjectURL(href), 1000);
+  } catch(e){ window.alert('Export failed: '+(e.message||e)); }
 }
 
 // ── Chat / Simulations / Debug tab switcher ──────────────────────────────────

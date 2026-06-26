@@ -482,6 +482,10 @@ async fn main() {
             get(cockpit_chat_session_simulations),
         )
         .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/export",
+            get(cockpit_chat_session_export),
+        )
+        .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/stream",
             post(cockpit_chat_stream),
         )
@@ -2047,6 +2051,15 @@ struct SessionQuery {
     session: Option<String>,
 }
 
+/// Query for the transcript export: `mode` (`chat`|`debug`) and `format` (`md`|`txt`).
+#[derive(Debug, Default, Deserialize)]
+struct ExportQuery {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
 /// Per-session wrap-up flag key, so an in-flight turn in one session can be wrapped up
 /// without touching another session of the same dataset.
 fn chat_cancel_key(key: &str, session_id: &str) -> String {
@@ -2200,6 +2213,75 @@ async fn cockpit_chat_session_simulations(
         .map(|s| chat::extract_simulations(&s.messages))
         .unwrap_or_default();
     Json(serde_json::json!({ "sessionId": id, "runs": runs }))
+}
+/// `GET .../chat/sessions/{id}/export` — download this session's transcript as Markdown or
+/// plain text. `mode=chat` (default) is the clean conversation; `mode=debug` adds each turn's
+/// reasoning timeline and tool calls (arguments + results). `format=md` (default) or `txt`.
+async fn cockpit_chat_session_export(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+    Query(q): Query<ExportQuery>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let Some(s) = state.chat.get(&key, &id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such chat session" })),
+        )
+            .into_response();
+    };
+    let verbose = q.mode.as_deref() == Some("debug");
+    let markdown = !matches!(q.format.as_deref(), Some("txt") | Some("text") | Some("plain"));
+    let turns = chat::render_view_full(&s.messages, &s.stamps, &s.turn_models);
+    let body = chat::export_transcript(&s.name, &turns, markdown, verbose);
+    let ext = if markdown { "md" } else { "txt" };
+    let ctype = if markdown {
+        "text/markdown; charset=utf-8"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    let kind = if verbose { "debug" } else { "chat" };
+    let slug = slugify(&s.name, &id);
+    let base = slug.strip_prefix("investigation-").unwrap_or(&slug);
+    let filename = format!("investigation-{base}-{kind}.{ext}");
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, ctype.to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE.to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A filesystem-safe slug for an export filename, falling back to the session id.
+fn slugify(name: &str, fallback_id: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    let collapsed = s
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        fallback_id.to_string()
+    } else {
+        collapsed.chars().take(60).collect()
+    }
 }
 
 /// `DELETE .../chat/sessions/{id}` — delete a chat session.
