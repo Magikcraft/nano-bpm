@@ -71,6 +71,10 @@ pub struct ChatSession {
     /// fixed thereafter (the system prompt is baked into the transcript). Empty until then.
     #[serde(default)]
     pub persona: String,
+    /// The distinct LLM model labels that have driven a turn in this session (insertion order).
+    /// Recorded per send so the operator can see which model(s) produced a conversation.
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// Lightweight session descriptor for the tab list (no transcript).
@@ -85,6 +89,9 @@ pub struct SessionMeta {
     /// The persona (standing system prompt) bound to this session, if its first turn has run.
     #[serde(default)]
     pub persona: String,
+    /// Distinct LLM model labels that have driven a turn in this session (insertion order).
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 /// On-disk shape: all sessions for one `(workspace, process)` key in a single file.
@@ -142,6 +149,7 @@ impl ChatStore {
                             updated: s.updated,
                             turns: render_view(&s.messages).len(),
                             persona: s.persona.clone(),
+                            models: s.models.clone(),
                         })
                         .collect()
                 })
@@ -166,6 +174,7 @@ impl ChatStore {
             messages: Vec::new(),
             stamps: Vec::new(),
             persona: String::new(),
+            models: Vec::new(),
         };
         sessions.push(session.clone());
         let snapshot = sessions.clone();
@@ -204,7 +213,42 @@ impl ChatStore {
                 messages,
                 stamps,
                 persona: String::new(),
+                models: Vec::new(),
             });
+        }
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+    }
+
+    /// Record that `model` drove a turn in a session (deduplicated, insertion-ordered). Creates
+    /// the session if the id is unknown so the first turn's model is never lost.
+    pub fn record_model(&self, key: &str, session_id: &str, model: &str) {
+        let model = model.trim();
+        if model.is_empty() {
+            return;
+        }
+        self.ensure_loaded(key);
+        let now = now_ms();
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let sessions = guard.entry(key.to_string()).or_default();
+        match sessions.iter_mut().find(|s| s.id == session_id) {
+            Some(s) => {
+                if s.models.iter().any(|m| m == model) {
+                    return; // already recorded — nothing to persist
+                }
+                s.models.push(model.to_string());
+            }
+            None => sessions.push(ChatSession {
+                id: session_id.to_string(),
+                name: default_name(sessions.len() + 1),
+                created: now,
+                updated: now,
+                messages: Vec::new(),
+                stamps: Vec::new(),
+                persona: String::new(),
+                models: vec![model.to_string()],
+            }),
         }
         let snapshot = sessions.clone();
         drop(guard);
@@ -259,6 +303,7 @@ impl ChatStore {
                 messages: Vec::new(),
                 stamps: Vec::new(),
                 persona: persona.to_string(),
+                models: Vec::new(),
             }),
         }
         let snapshot = sessions.clone();
@@ -333,6 +378,7 @@ impl ChatStore {
             messages: legacy.messages,
             stamps: Vec::new(),
             persona: String::new(),
+            models: Vec::new(),
         }])
     }
 
@@ -723,6 +769,32 @@ mod tests {
         assert_eq!(store.list(&key).len(), 1);
         assert!(store.delete(&key, &id));
         assert!(store.get(&key, &id).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_model_dedupes_preserves_order_and_persists() {
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        let id;
+        {
+            let store = ChatStore::open(&dir);
+            let s = store.create(&key, None);
+            id = s.id.clone();
+            store.record_model(&key, &id, "qwen3-8b");
+            store.record_model(&key, &id, "qwen3-8b"); // dupe — ignored
+            store.record_model(&key, &id, "  "); // blank — ignored
+            store.record_model(&key, &id, "gemma-3-4b");
+            // A transcript save must not clobber the recorded models.
+            store.save(&key, &id, vec![Msg::User("hi".into())], vec![0]);
+        }
+        let store = ChatStore::open(&dir);
+        let loaded = store.get(&key, &id).expect("session present after reopen");
+        assert_eq!(loaded.models, vec!["qwen3-8b", "gemma-3-4b"]);
+        assert_eq!(store.list(&key)[0].models, vec!["qwen3-8b", "gemma-3-4b"]);
+        // record_model on an unknown id creates the session so the first turn's model is kept.
+        store.record_model(&key, "ghost-id", "phi-4");
+        assert_eq!(store.get(&key, "ghost-id").unwrap().models, vec!["phi-4"]);
         let _ = fs::remove_dir_all(&dir);
     }
 

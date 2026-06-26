@@ -2015,6 +2015,7 @@ fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::S
                 updated: s.updated,
                 turns: 0,
                 persona: s.persona,
+                models: s.models,
             };
         }
     }
@@ -2030,6 +2031,7 @@ fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::S
         updated: s.updated,
         turns: 0,
         persona: s.persona,
+        models: s.models,
     }
 }
 
@@ -2345,6 +2347,7 @@ async fn cockpit_chat_send(
     if prior.is_empty() {
         state.chat.set_persona(&key, &sid, &persona_id);
     }
+    state.chat.record_model(&key, &sid, &cfg.model);
     let user_ts = chat_now_ms();
     let pairs = match build_pair_stages(&state, &req) {
         Ok(p) => p,
@@ -2472,6 +2475,7 @@ async fn cockpit_chat_stream(
     if prior.is_empty() {
         state.chat.set_persona(&key, &sid, &persona_id);
     }
+    state.chat.record_model(&key, &sid, &cfg.model);
     let user_ts = chat_now_ms();
     let pairs = match build_pair_stages(&state, &req) {
         Ok(p) => p,

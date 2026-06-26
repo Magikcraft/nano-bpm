@@ -135,11 +135,11 @@
   .cs-head .btn { font-size: 12px; padding: 3px 8px; }
   .cs-list { overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
   .cs-empty { color: #71717a; font-size: 12px; padding: 10px; text-align: center; }
-  .cs-tab { display: flex; align-items: center; gap: 4px; border: 1px solid transparent; border-radius: 8px; padding: 7px 8px; cursor: pointer; }
+  .cs-tab { display: flex; align-items: center; gap: 4px; border: 1px solid transparent; border-radius: 8px; padding: 7px 8px; cursor: pointer; flex-wrap: wrap; }
   .cs-tab:hover { background: #131318; }
   .cs-tab.on { background: #11142a; border-color: #28306a; }
   .cs-main { flex: 1; min-width: 0; }
-  .cs-name { font-size: 13px; color: #e4e4e7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cs-name { font-size: 15px; font-weight: 600; color: #e4e4e7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .cs-tab.on .cs-name { color: #c7d2fe; }
   .cs-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid #3b3b52; border-top-color: #818cf8; border-radius: 50%; animation: cs-spin 0.7s linear infinite; }
   @keyframes cs-spin { to { transform: rotate(360deg); } }
@@ -148,6 +148,13 @@
   .cs-tab:hover .cs-actions, .cs-tab.on .cs-actions { opacity: 1; }
   .cs-btn { background: none; border: 0; color: #71717a; cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 11px; line-height: 1; }
   .cs-btn:hover { background: #1f1f27; color: #e5e7eb; }
+  .cs-caret { background: none; border: 0; color: #71717a; cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 10px; line-height: 1; transition: transform .12s; }
+  .cs-caret:hover { color: #c7d2fe; }
+  .cs-caret.open { transform: rotate(180deg); color: #c7d2fe; }
+  .cs-models { flex-basis: 100%; margin: 4px 2px 2px; padding: 6px 8px; border-top: 1px dashed #26262b; font-size: 11px; color: #9ca3af; display: flex; flex-direction: column; gap: 3px; }
+  .cs-models .csm-lbl { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; font-weight: 700; }
+  .cs-models .csm-item { font-family: ui-monospace, monospace; color: #c7d2fe; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cs-models .csm-none { color: #6b7280; font-style: italic; }
   .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; height: 64vh; --chat-font: 15px; }
   .chat-tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid #1c1c22; }
   .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: #8b8b93; cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
@@ -355,6 +362,7 @@
     <div class="tag">the cockpit</div>
     <nav class="nav">
       <a href="/workspace">Workspaces</a>
+      <a data-view="cockpit">Cockpit</a>
       <a data-view="console">Console</a>
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
@@ -362,7 +370,7 @@
       <a data-view="sidecars" class="with-dot">LLM sidecars <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
   </aside>
-  <main id="main">Loading…</main>
+  <main id="main"><div id="viewHost">Loading…</div><div id="cockpitHost" style="display:none"></div></main>
 </div>
 
 <dialog id="newDlg">
@@ -384,7 +392,13 @@
 <script src="/assets/bpmn/bpmn-auto-layout.js"></script>
 <script>
 const $ = s => document.querySelector(s);
-const main = $('#main');
+// #main hosts two panes: #viewHost for the console/processes/prompts/etc renderers (which clobber
+// their innerHTML freely) and a persistent #cockpitHost for the investigation surface. The cockpit
+// is only ever hidden (display:none), never destroyed, so navigating away and back retains its
+// view, the selected chat/tab, and any text typed in the compose box. `main` aliases the view pane
+// so the existing renderers keep working unchanged.
+const main = $('#viewHost');
+const cockpitHost = () => $('#cockpitHost');
 let STATE = { view: 'console', proc: null, exp: null };
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -1154,13 +1168,16 @@ function fail(e){ main.innerHTML = '<div class="err">'+esc(e.message||e)+'</div>
 // ---- Workspace process investigation (?workspace=&process=) ----
 // Reason with the droid over a workspace process and its bound trace dataset.
 async function renderWorkspace(ws, proc){
-  STATE.view='workspace'; setActive();
-  main.innerHTML = 'Loading…';
+  STATE.view='cockpit'; setActive();
+  // The cockpit lives in its own persistent pane; reveal it and hide the view pane.
+  const host = cockpitHost();
+  $('#viewHost').style.display='none'; host.style.display='';
+  host.innerHTML = 'Loading…';
   let p;
   try { p = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)); }
-  catch(e){ return fail(e); }
+  catch(e){ host.innerHTML = '<div class="err">'+esc(e.message||e)+'</div>'; return; }
   const binding = p.binding==='dataset' ? '<span class="pill accept">dataset</span>' : '<span class="pill run">'+esc(p.binding||'unbound')+'</span>';
-  main.innerHTML = `
+  host.innerHTML = `
     <div class="muted" style="font-size:12px">
       <a href="/workspace#/c/${encodeURIComponent(ws)}/p/${encodeURIComponent(proc)}" style="color:#a5b4fc">← back to workspace</a>
       · ${esc(ws)} / ${esc(proc)}
@@ -1234,6 +1251,11 @@ async function renderWorkspace(ws, proc){
       </div>
     </div>`;
   if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
+  // Mark the cockpit pane ready & remember this process so the rail's Cockpit item can reopen it
+  // (after a reload) and so re-selecting Cockpit just reveals the preserved DOM.
+  cockpitHost().dataset.ready = '1';
+  cockpitHost().dataset.key = ws+'\u0000'+proc;
+  try { localStorage.setItem('processos.lastCockpit', JSON.stringify({ws, proc})); } catch(e){}
   STATE.ws = ws; STATE.wsProc = proc; STATE.prompts = []; STATE.sessionId = null;
   STATE.chatTab = 'chat';
   applyChatFont();
@@ -2060,26 +2082,43 @@ function drawSessions(ws, proc){
   const list = $('#chatTabs'); if(!list) return;
   const ss = STATE.sessions || [];
   if(!ss.length){ list.innerHTML = '<div class="cs-empty">No chats yet.</div>'; return; }
+  const open = STATE.csModelsOpen || (STATE.csModelsOpen = new Set());
   list.innerHTML = ss.map(s => {
     const on = s.id===STATE.sessionId ? ' on' : '';
     const when = s.updated ? fmtTime(s.updated) : '';
     // Spinner next to whichever session is actively investigating (the in-flight turn always
     // belongs to the selected session); cleared on done/error via the setChatBusy redraw.
     const spin = (STATE.chatBusy && s.id===STATE.sessionId) ? '<span class="cs-spin" title="Investigating…"></span>' : '';
+    const models = Array.isArray(s.models) ? s.models : [];
+    const isOpen = open.has(s.id);
+    const modelsPanel = isOpen ? (
+      '<div class="cs-models">'+
+        '<span class="csm-lbl">Model'+(models.length===1?'':'s')+' used</span>'+
+        (models.length
+          ? models.map(m => '<span class="csm-item" title="'+esc(m)+'">'+esc(m)+'</span>').join('')
+          : '<span class="csm-none">No model recorded yet</span>')+
+      '</div>') : '';
     return '<div class="cs-tab'+on+'" data-id="'+esc(s.id)+'">'+
       '<div class="cs-main">'+
         '<div class="cs-name" title="'+esc(s.name)+'">'+spin+esc(s.name)+'</div>'+
         '<div class="cs-meta">'+esc(when)+(s.turns?(' · '+s.turns+' msg'+(s.turns===1?'':'s')):'')+'</div>'+
       '</div>'+
       '<div class="cs-actions">'+
+        '<button class="cs-caret'+(isOpen?' open':'')+'" title="Show the model(s) used in this chat">▾</button>'+
         '<button class="cs-btn cs-ren" title="Rename">✎</button>'+
         '<button class="cs-btn cs-del" title="Delete">✕</button>'+
       '</div>'+
+      modelsPanel+
     '</div>';
   }).join('');
   list.querySelectorAll('.cs-tab').forEach(el => {
     const id = el.dataset.id;
     el.querySelector('.cs-main').onclick = () => selectSession(ws, proc, id);
+    el.querySelector('.cs-caret').onclick = (e) => {
+      e.stopPropagation();
+      if(open.has(id)) open.delete(id); else open.add(id);
+      drawSessions(ws, proc);
+    };
     el.querySelector('.cs-ren').onclick = (e) => { e.stopPropagation(); renameSession(ws, proc, id); };
     el.querySelector('.cs-del').onclick = (e) => { e.stopPropagation(); deleteSession(ws, proc, id); };
   });
@@ -2709,22 +2748,42 @@ async function renderWsModel(url){
   } catch(e){ el.innerHTML = '<p class="err" style="padding:12px">could not render model: '+esc(e.message||e)+'</p>'; }
 }
 
-document.querySelectorAll('.nav a[data-view]').forEach(a => a.onclick = () => {
-  const v = a.dataset.view;
-  if(v==='console') renderConsole();
-  else if(v==='processes') renderProcesses();
-  else if(v==='prompts') renderPrompts();
-  else if(v==='experiments') renderExperiments();
-  else if(v==='sidecars') renderSidecars();
-});
+// Reveal the persistent cockpit pane. It is never destroyed — only hidden — so the chat view,
+// selected session/tab, and any half-typed prompt are retained across navigation. If it has never
+// been opened this session, reopen the last process used (persisted) or invite the operator to pick.
+function showCockpit(){
+  STATE.view='cockpit'; setActive();
+  const host = cockpitHost();
+  $('#viewHost').style.display='none'; host.style.display='';
+  if(host.dataset.ready==='1') return; // already rendered — just reveal, state intact
+  let last=null; try { last = JSON.parse(localStorage.getItem('processos.lastCockpit')||'null'); } catch(e){}
+  if(last && last.ws && last.proc) return renderWorkspace(last.ws, last.proc);
+  host.innerHTML = '<h1>Cockpit</h1>'+
+    '<p class="lede">The investigation surface for a process — chat with the droid about its traces, fork what-if variants, and prove them on the recorded dataset.</p>'+
+    '<p class="muted">Open a process to begin: pick one from <a onclick="showView(\'processes\')" style="color:#a5b4fc;cursor:pointer">Processes</a>.</p>';
+}
 
-// Map a ?view= param (used by other pages linking into the cockpit) to its renderer.
-function renderView(v){
+// Show a non-cockpit view: hide the cockpit pane, reveal the view pane, then run its renderer.
+function showView(v){
+  $('#cockpitHost').style.display='none';
+  $('#viewHost').style.display='';
   if(v==='processes') return renderProcesses();
   if(v==='prompts') return renderPrompts();
   if(v==='experiments') return renderExperiments();
   if(v==='sidecars') return renderSidecars();
   return renderConsole();
+}
+
+document.querySelectorAll('.nav a[data-view]').forEach(a => a.onclick = () => {
+  const v = a.dataset.view;
+  if(v==='cockpit') return showCockpit();
+  showView(v);
+});
+
+// Map a ?view= param (used by other pages linking into the cockpit) to its renderer.
+function renderView(v){
+  if(v==='cockpit') return showCockpit();
+  return showView(v);
 }
 
 // Boot: a workspace-process deep-link (?workspace=&process=) opens the
