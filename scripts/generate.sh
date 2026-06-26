@@ -44,6 +44,17 @@ if ! command -v java >/dev/null 2>&1; then
   exit 1
 fi
 
+# Run the Python helpers through uv (which provisions a locked environment with
+# PyYAML from pyproject.toml). Fall back to the system python3 if uv is absent —
+# in that case PyYAML must already be importable. Run `make setup` to provision.
+if command -v uv >/dev/null 2>&1; then
+  PY=(uv run --project "${PROJECT_ROOT}" python)
+else
+  echo "warning: 'uv' not found; falling back to system python3 (needs PyYAML installed)." >&2
+  echo "         Run 'make setup' to provision the build environment with uv." >&2
+  PY=(python3)
+fi
+
 # Fetch the generator JAR once, into the build cache.
 if [[ ! -f "${JAR}" ]]; then
   echo "Downloading openapi-generator-cli ${OPENAPI_GENERATOR_VERSION} into build/tools"
@@ -60,7 +71,7 @@ if [[ ! -f "${JAR}" ]]; then
 fi
 
 echo "Sanitizing spec into ${SANITIZED_SPEC_DIR_REL}"
-python3 "${SCRIPT_DIR}/preprocess-spec.py" \
+"${PY[@]}" "${SCRIPT_DIR}/preprocess-spec.py" \
   "${PROJECT_ROOT}/${SPEC_DIR_REL}" \
   "${PROJECT_ROOT}/${SANITIZED_SPEC_DIR_REL}" \
   "${PROJECT_ROOT}/${PATCHES_REL}"
@@ -80,10 +91,10 @@ java -jar "${JAR}" generate \
   --skip-validate-spec
 
 echo "Post-processing generated code to fix known rust-axum generator bugs"
-python3 "${SCRIPT_DIR}/postprocess-generated.py" "${PROJECT_ROOT}/${OUTPUT_REL}"
+"${PY[@]}" "${SCRIPT_DIR}/postprocess-generated.py" "${PROJECT_ROOT}/${OUTPUT_REL}"
 
 echo "Generating stub trait implementations for the server"
-python3 "${SCRIPT_DIR}/gen-stub-server.py" \
+"${PY[@]}" "${SCRIPT_DIR}/gen-stub-server.py" \
   "${PROJECT_ROOT}/${OUTPUT_REL}/src/apis" \
   "${PROJECT_ROOT}/server/src/stub_impls.rs"
 

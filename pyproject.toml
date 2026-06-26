@@ -1,0 +1,19 @@
+# Build-time Python tooling for nanobpmn.
+#
+# The code-generation pipeline (scripts/generate.sh, invoked by `make generate`)
+# runs three Python helpers; only spec preprocessing needs a third-party package
+# (PyYAML). This project is not published — it exists purely to give `uv` a
+# lockfile-backed environment for those build scripts. Run `make setup` to sync.
+
+[project]
+name = "nanobpmn-codegen"
+version = "0.0.0"
+description = "Build-time tooling for nanobpmn: OpenAPI spec preprocessing and Rust stub generation."
+requires-python = ">=3.9"
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+# Treat this as an environment for the helper scripts, not an installable package.
+package = false

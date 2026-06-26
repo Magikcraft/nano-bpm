@@ -1,5 +1,11 @@
 # nanobpmn — Orchestration Cluster REST layer code generation (Rust / rust-axum).
 #
+# Quick start:
+#   make setup   — check the toolchain (rust, uv, java) and provision the Python
+#                  build env via `uv sync`.
+#   make all     — build nano top-to-bottom: generate the REST stubs, then
+#                  compile the gateway (server) and ProcessOS.
+#
 # `make generate` produces the Rust REST layer + server stubs from spec/; the
 # output under generated/ and server/src/stub_impls.rs is git-ignored.
 
@@ -9,8 +15,48 @@ GENERATED_DIR := $(PROJECT_ROOT)/generated
 STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
 ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
+PROCESSOS_DIR := $(PROJECT_ROOT)/processos
+UV := uv
 
 .DEFAULT_GOAL := build
+
+.PHONY: setup
+setup: check-deps ## Verify the toolchain and provision the Python build env (uv sync) — run this first
+	$(UV) sync
+	@echo
+	@echo "Setup complete. Build everything with: make all"
+
+.PHONY: check-deps
+check-deps: ## Check that the required toolchain is installed (rust, uv, java) and report optional tools
+	@missing=0; \
+	chk() { \
+	  if command -v "$$1" >/dev/null 2>&1; then \
+	    printf '  \033[32m✓\033[0m %-10s %s\n' "$$1" "$$($$2 2>&1 | head -n1)"; \
+	  else \
+	    printf '  \033[31m✗\033[0m %-10s MISSING — %s\n' "$$1" "$$3"; \
+	    [ "$$4" = required ] && missing=1 || true; \
+	  fi; \
+	}; \
+	echo "Required:"; \
+	chk cargo "cargo --version" "install Rust via https://rustup.rs" required; \
+	chk uv "uv --version" "install uv: https://docs.astral.sh/uv/getting-started/installation/" required; \
+	chk java "java -version" "install a JRE/JDK 11+ for the OpenAPI generator" required; \
+	echo "Optional (web console / wasm):"; \
+	chk node "node --version" "install Node.js to build the console SPA" optional; \
+	chk npm "npm --version" "bundled with Node.js" optional; \
+	chk wasm-pack "wasm-pack --version" "cargo install wasm-pack (else committed wasm artifacts are used)" optional; \
+	if [ "$$missing" -ne 0 ]; then \
+	  echo; echo "error: required tools are missing (see ✗ above). Install them and re-run 'make setup'."; \
+	  exit 1; \
+	fi
+
+.PHONY: all
+all: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build nano top-to-bottom: generate REST stubs, then compile the gateway (nano) and ProcessOS
+	cd $(GENERATED_DIR) && cargo build
+	cd $(PROJECT_ROOT)/server && cargo build
+	cd $(PROCESSOS_DIR) && cargo build
+	@echo
+	@echo "Built nano top-to-bottom: generated REST crate + gateway (server) + ProcessOS."
 
 .PHONY: generate
 generate: ## Generate the Rust REST layer + server stub impls from spec/ (needs local Java)

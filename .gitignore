@@ -18,6 +18,10 @@ server/src/stub_impls.rs
 # processos Python venv for the optional run_python analysis tool (machine-local).
 processos/.venv/
 
+# uv-managed Python environment for the build-time codegen helpers (see
+# pyproject.toml). The lockfile (uv.lock) IS committed for reproducibility.
+.venv/
+
 # Console workspace (NANOBPMN_WORKSPACE_DIR: authoring source of truth — BPMN
 # models + worker code). User content, not committed.
 nanobpm-workspace/
