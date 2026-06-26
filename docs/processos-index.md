@@ -34,6 +34,7 @@ worker internals, and the physical resources/deployment at the bottom.
 | Document | What it covers |
 |----------|----------------|
 | [`processos-camunda-import.md`](./processos-camunda-import.md) | **Implemented.** The `import-camunda` transformer: fold a **Camunda 8 / Zeebe** record export (Elasticsearch/Opensearch/debug-log JSON) into a Nano `traces.json` dataset, so a customer's existing C8 history loads into a workspace `DatasetSource` with no Nano engine and no Java. Includes the record→trace mapping, fidelity tiers, and the path to an in-engine Zeebe exporter. |
+| [`processos-vs-process-os-comparison.md`](./processos-vs-process-os-comparison.md) | **Comparison.** Nano ProcessOS vs **camunda/process-os** (the Claude Code plugin): form factor, feature-set side-by-side, and a deep-dive on the **eval approach** of each (replay-as-fitness-function vs Inspect-AI outcome evals + CPT deploy-and-test). Motivates ADR [`0004`](./adr/0004-investigator-outcome-eval-harness.md). |
 
 ## The mental model that unifies them
 
