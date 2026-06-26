@@ -9,12 +9,16 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; overflow: hidden; }
   a { color: inherit; text-decoration: none; }
-  .app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; }
+  /* The shell fills the viewport exactly and never scrolls itself; only #main scrolls. The grid
+     items get min-height/min-width:0 so a tall/wide #main can't stretch the row past 100vh and
+     drag the page (and the rail) into the document scroll. */
+  .app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; overflow: hidden; }
   /* left rail — pinned so it never scrolls out of view; #main is the scroll container */
-  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
-  #main { height: 100vh; overflow-y: auto; }
+  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; height: 100vh; overflow-y: auto; min-height: 0; }
+  #main { height: 100vh; overflow-y: auto; min-height: 0; min-width: 0; }
   .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
   .brand .dot { color: #a5b4fc; }
   .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
