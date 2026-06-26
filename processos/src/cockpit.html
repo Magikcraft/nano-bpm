@@ -1751,9 +1751,11 @@ function chatBub(t){
 }
 
 // ── Suggested-model cards ───────────────────────────────────────────────────
-// The Experiment Designer proposes BPMN variants by passing them as the `model`
-// argument of simulate / compare_variants. Surface every distinct candidate as a
-// tabbed (diagram / XML) card the operator can expand and download.
+// The Experiment Designer proposes BPMN variants two ways: by passing them as the `model`
+// argument of simulate / compare_variants, OR by AUTHORING them with edit_model (whose RESULT
+// carries the new `model` XML). Surface every distinct candidate from either source as a tabbed
+// (diagram / XML) card the operator can expand and download — otherwise an authored variant that
+// was never simulated would leave no downloadable artefact.
 function extractSuggestedModels(items){
   const out = [], seen = new Set();
   const add = (name, xml) => {
@@ -1763,10 +1765,25 @@ function extractSuggestedModels(items){
     seen.add(x);
     out.push({ name: (name && String(name).trim()) || ('variant '+(out.length+1)), xml: x });
   };
+  // A tool result may be a JSON string (persisted timeline) or an already-parsed object (live).
+  const asObj = (r) => {
+    if(r && typeof r === 'object') return r;
+    if(typeof r === 'string'){ try { return JSON.parse(r); } catch(_){ return null; } }
+    return null;
+  };
   (items||[]).forEach(it => {
     if(it.kind !== 'tool') return;
     let a = it.arguments;
-    if(typeof a === 'string'){ try { a = JSON.parse(a); } catch(_){ return; } }
+    if(typeof a === 'string'){ try { a = JSON.parse(a); } catch(_){ a = null; } }
+    // Authored variants: edit_model returns { ok, model, appliedOps, ... }.
+    if(it.tool === 'edit_model'){
+      const r = asObj(it.result);
+      if(r && typeof r.model === 'string'){
+        const ops = Array.isArray(r.appliedOps) ? r.appliedOps : [];
+        const name = (a && a.name) || (ops.length ? ('edited: '+ops[0]) : 'edited variant');
+        add(name, r.model);
+      }
+    }
     if(!a || typeof a !== 'object') return;
     if(it.tool === 'simulate') add(a.name, a.model);
     else if(it.tool === 'compare_variants' && Array.isArray(a.candidates)){
