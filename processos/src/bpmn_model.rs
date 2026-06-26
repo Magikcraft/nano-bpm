@@ -1559,15 +1559,24 @@ pub fn definition_to_xml_labeled(
     for src in sources {
         for flow in &def.elements[src].outgoing {
             n += 1;
+            // Label a guarded branch with its condition so a person can read WHY each branch is
+            // taken — bpmn.js renders a flow's `name`, not its conditionExpression, so without this
+            // the diagram shows bare arrows and the guards look "lost".
+            let label = flow.condition.as_ref().map(|c| flow_label(&c.expression));
             flows.push(FlowEdge {
                 id: format!("Flow_{n}"),
                 src: src.clone(),
                 to: flow.to.clone(),
+                label: label.clone(),
             });
+            let name_attr = label
+                .as_deref()
+                .map(|l| format!(" name=\"{}\"", xml_escape(l)))
+                .unwrap_or_default();
             match &flow.condition {
                 Some(cond) => {
                     out.push_str(&format!(
-                        "    <bpmn:sequenceFlow id=\"Flow_{n}\" sourceRef=\"{}\" targetRef=\"{}\">\n",
+                        "    <bpmn:sequenceFlow id=\"Flow_{n}\"{name_attr} sourceRef=\"{}\" targetRef=\"{}\">\n",
                         xml_escape(src),
                         xml_escape(&flow.to)
                     ));
@@ -1579,7 +1588,7 @@ pub fn definition_to_xml_labeled(
                 }
                 None => {
                     out.push_str(&format!(
-                        "    <bpmn:sequenceFlow id=\"Flow_{n}\" sourceRef=\"{}\" targetRef=\"{}\"/>\n",
+                        "    <bpmn:sequenceFlow id=\"Flow_{n}\"{name_attr} sourceRef=\"{}\" targetRef=\"{}\"/>\n",
                         xml_escape(src),
                         xml_escape(&flow.to)
                     ));
@@ -1596,10 +1605,27 @@ pub fn definition_to_xml_labeled(
 
 /// A resolved sequence flow: a synthesized id plus its endpoints, shared between the process body
 /// (`<bpmn:sequenceFlow>`) and the diagram-interchange (`<bpmndi:BPMNEdge>`) so both agree on ids.
+/// `label` is the human-readable edge caption (a guarded branch's condition), rendered as a
+/// `<bpmndi:BPMNLabel>` so the guard is visible on the diagram.
 struct FlowEdge {
     id: String,
     src: String,
     to: String,
+    label: Option<String>,
+}
+
+/// Turn a flow's FEEL guard into a short edge caption: drop a leading `=`, collapse whitespace,
+/// and cap the length so a long expression doesn't dominate the diagram.
+fn flow_label(expr: &str) -> String {
+    let s = expr.trim().strip_prefix('=').unwrap_or(expr).trim();
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 40 {
+        let mut out: String = collapsed.chars().take(39).collect();
+        out.push('…');
+        out
+    } else {
+        collapsed
+    }
 }
 
 /// A laid-out shape rectangle (top-left origin), in diagram coordinates.
@@ -1655,27 +1681,136 @@ fn desired_row(
     }
 }
 
-/// Orthogonal waypoints from `s` to `t`. A boundary-event source leaves from its bottom; otherwise
-/// the edge leaves the source's right and enters the target's left, with an elbow when the two
-/// sit on different rows.
-fn route(s: &Rect, t: &Rect, from_boundary: bool) -> Vec<(f64, f64)> {
+/// True if the axis-aligned segment a→b passes through `r` (inflated by `pad`). Only horizontal and
+/// vertical segments are produced by the router, so a diagonal is treated as a miss.
+fn seg_hits_rect(a: (f64, f64), b: (f64, f64), r: &Rect, pad: f64) -> bool {
+    let (rx0, ry0, rx1, ry1) = (r.x - pad, r.y - pad, r.x + r.w + pad, r.y + r.h + pad);
+    if (a.1 - b.1).abs() < 0.5 {
+        let y = a.1;
+        if y <= ry0 || y >= ry1 {
+            return false;
+        }
+        let (xa, xb) = if a.0 < b.0 { (a.0, b.0) } else { (b.0, a.0) };
+        xa < rx1 && xb > rx0
+    } else if (a.0 - b.0).abs() < 0.5 {
+        let x = a.0;
+        if x <= rx0 || x >= rx1 {
+            return false;
+        }
+        let (ya, yb) = if a.1 < b.1 { (a.1, b.1) } else { (b.1, a.1) };
+        ya < ry1 && yb > ry0
+    } else {
+        false
+    }
+}
+
+/// Whether any segment of `path` clips any obstacle (inflated by `pad`).
+fn path_hits(path: &[(f64, f64)], obstacles: &[Rect], pad: f64) -> bool {
+    path.windows(2)
+        .any(|w| obstacles.iter().any(|r| seg_hits_rect(w[0], w[1], r, pad)))
+}
+
+/// The point to anchor an edge label: the middle of the path's longest horizontal run (so the
+/// caption sits on a clear stretch), falling back to the geometric midpoint.
+fn edge_label_anchor(path: &[(f64, f64)]) -> (f64, f64) {
+    let mut best: Option<((f64, f64), f64)> = None;
+    for w in path.windows(2) {
+        if (w[0].1 - w[1].1).abs() < 0.5 {
+            let len = (w[0].0 - w[1].0).abs();
+            let mid = ((w[0].0 + w[1].0) / 2.0, w[0].1);
+            if best.as_ref().is_none_or(|(_, l)| len > *l) {
+                best = Some((mid, len));
+            }
+        }
+    }
+    if let Some((p, _)) = best {
+        return p;
+    }
+    let mid = path.len() / 2;
+    path.get(mid).copied().unwrap_or((0.0, 0.0))
+}
+
+/// Orthogonal waypoints from `s` to `t` that try to avoid every node box in `obstacles`. Candidate
+/// Manhattan routes are tried in order of visual preference (straight, then a single elbow tucked
+/// against the source or target, then a detour through a clear lane below the diagram); the first
+/// that clips nothing wins. A boundary-event edge always drops into the bottom lane first so it
+/// can't cut back across its own host. `idx` staggers the bottom-lane detours so parallel edges
+/// don't overlap. The last candidate is returned even if it still clips (better a drawn edge than
+/// none).
+fn route_avoiding(
+    s: &Rect,
+    t: &Rect,
+    from_boundary: bool,
+    obstacles: &[Rect],
+    bottom_lane: f64,
+    idx: usize,
+) -> Vec<(f64, f64)> {
+    const PAD: f64 = 6.0;
+    const G: f64 = 18.0;
+    let stagger = (idx % 5) as f64 * 14.0;
+
     if from_boundary {
+        // Leave the host's bottom and reach the target without cutting back across the host or the
+        // nodes stacked directly below it. The boundary sits in a thin clear band just under its
+        // host, so escape horizontally along that band to a gutter beside the target, then run
+        // vertically in the (clear) gutter into the target. Fall back to the lane beneath the whole
+        // diagram if that band is blocked.
         let sx = s.cx();
         let sy = s.y + s.h;
-        let ty = t.cy();
         let tx = t.x;
-        return vec![(sx, sy), (sx, ty), (tx, ty)];
+        let ty = t.cy();
+        let tb = t.y + t.h;
+        let ly = bottom_lane + stagger;
+        let candidates: Vec<Vec<(f64, f64)>> = vec![
+            // Horizontal along the sub-host band to the target's left gutter, then vertical in.
+            vec![(sx, sy), (tx - G, sy), (tx - G, ty), (tx, ty)],
+            // Drop into the bottom lane, across, up into the target's left.
+            vec![(sx, sy), (sx, ly), (tx - G, ly), (tx - G, ty), (tx, ty)],
+            // Drop into the bottom lane, across, up into the target's bottom.
+            vec![(sx, sy), (sx, ly), (t.cx(), ly), (t.cx(), tb)],
+        ];
+        for c in &candidates {
+            if !path_hits(c, obstacles, PAD) {
+                return c.clone();
+            }
+        }
+        return candidates.into_iter().last().unwrap();
     }
+
     let sx = s.x + s.w;
     let sy = s.cy();
     let tx = t.x;
     let ty = t.cy();
+
+    let mut candidates: Vec<Vec<(f64, f64)>> = Vec::new();
+    // 1) Straight shot when the two share a row.
     if (sy - ty).abs() < 0.5 {
-        vec![(sx, sy), (tx, ty)]
-    } else {
-        let mx = (sx + tx) / 2.0;
-        vec![(sx, sy), (mx, sy), (mx, ty), (tx, ty)]
+        candidates.push(vec![(sx, sy), (tx, ty)]);
     }
+    // 2) Elbow tucked just left of the target (vertical leg in the gutter before the target column).
+    candidates.push(vec![(sx, sy), (tx - G, sy), (tx - G, ty), (tx, ty)]);
+    // 3) Elbow just right of the source (vertical leg in the gutter after the source column).
+    candidates.push(vec![(sx, sy), (sx + G, sy), (sx + G, ty), (tx, ty)]);
+    // 4) Mid-gutter elbow.
+    let mx = (sx + tx) / 2.0;
+    candidates.push(vec![(sx, sy), (mx, sy), (mx, ty), (tx, ty)]);
+    // 5) Detour through the clear lane below everything (last resort, but collision-free).
+    let ly = bottom_lane + stagger;
+    candidates.push(vec![
+        (sx, sy),
+        (sx + G, sy),
+        (sx + G, ly),
+        (tx - G, ly),
+        (tx - G, ty),
+        (tx, ty),
+    ]);
+
+    for c in &candidates {
+        if !path_hits(c, obstacles, PAD) {
+            return c.clone();
+        }
+    }
+    candidates.pop().unwrap()
 }
 
 /// Append a generated, left-to-right `<bpmndi:BPMNDiagram>` for `def` so the model renders and
@@ -1796,6 +1931,9 @@ fn append_diagram(def: &ProcessDefinition, flows: &[FlowEdge], out: &mut String)
 
     let fmt = |v: f64| (v.round() as i64).to_string();
 
+    // Diagram extent, so obstacle-avoiding routes can escape into a clear lane below every node.
+    let bottom_lane = rects.values().map(|r| r.y + r.h).fold(0.0_f64, f64::max) + 40.0;
+
     out.push_str("  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n");
     out.push_str(&format!(
         "    <bpmndi:BPMNPlane id=\"BPMNPlane_1\" bpmnElement=\"{}\">\n",
@@ -1803,32 +1941,60 @@ fn append_diagram(def: &ProcessDefinition, flows: &[FlowEdge], out: &mut String)
     ));
     for id in &ids {
         if let Some(b) = rects.get(id) {
+            // An exclusive gateway only shows its X marker when the shape opts in; without this it
+            // renders as an empty diamond indistinguishable from a parallel gateway.
+            let marker = if matches!(def.elements[id].kind, ElementKind::ExclusiveGateway) {
+                " isMarkerVisible=\"true\""
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "      <bpmndi:BPMNShape id=\"{0}_di\" bpmnElement=\"{0}\">\n\
+                "      <bpmndi:BPMNShape id=\"{0}_di\" bpmnElement=\"{0}\"{5}>\n\
                  \x20       <dc:Bounds x=\"{1}\" y=\"{2}\" width=\"{3}\" height=\"{4}\"/>\n\
                  \x20     </bpmndi:BPMNShape>\n",
                 xml_escape(id),
                 fmt(b.x),
                 fmt(b.y),
                 fmt(b.w),
-                fmt(b.h)
+                fmt(b.h),
+                marker
             ));
         }
     }
-    for f in flows {
+    for (idx, f) in flows.iter().enumerate() {
         let (Some(sb), Some(tb)) = (rects.get(&f.src), rects.get(&f.to)) else {
             continue;
         };
         let from_boundary = is_boundary(&def.elements[&f.src].kind);
+        // Obstacles: every node box except this edge's own endpoints.
+        let obstacles: Vec<Rect> = ids
+            .iter()
+            .filter(|id| id.as_str() != f.src && id.as_str() != f.to)
+            .filter_map(|id| rects.get(id).copied())
+            .collect();
+        let path = route_avoiding(sb, tb, from_boundary, &obstacles, bottom_lane, idx);
         out.push_str(&format!(
             "      <bpmndi:BPMNEdge id=\"{0}_di\" bpmnElement=\"{0}\">\n",
             xml_escape(&f.id)
         ));
-        for (x, y) in route(sb, tb, from_boundary) {
+        for (x, y) in &path {
             out.push_str(&format!(
                 "        <di:waypoint x=\"{}\" y=\"{}\"/>\n",
-                fmt(x),
-                fmt(y)
+                fmt(*x),
+                fmt(*y)
+            ));
+        }
+        // Caption a guarded branch at the edge's midpoint so the condition is legible.
+        if let Some(label) = &f.label {
+            let (lx, ly) = edge_label_anchor(&path);
+            let w = (label.chars().count() as f64 * 6.0 + 12.0).min(160.0);
+            out.push_str(&format!(
+                "        <bpmndi:BPMNLabel>\n\
+                 \x20         <dc:Bounds x=\"{}\" y=\"{}\" width=\"{}\" height=\"14\"/>\n\
+                 \x20       </bpmndi:BPMNLabel>\n",
+                fmt(lx - w / 2.0),
+                fmt(ly - 16.0),
+                fmt(w)
             ));
         }
         out.push_str("      </bpmndi:BPMNEdge>\n");
@@ -2774,7 +2940,7 @@ mod tests {
 
     /// Pull the `x` coordinate of a node's `<bpmndi:BPMNShape>` Bounds from serialized XML.
     fn shape_x(xml: &str, id: &str) -> i64 {
-        let marker = format!("bpmnElement=\"{id}\">");
+        let marker = format!("bpmnElement=\"{id}\"");
         let after = xml
             .split(&marker)
             .nth(1)
@@ -2881,5 +3047,28 @@ mod tests {
         let ops = vec![json!({"op":"set_name","node":"Nope","name":"x"})];
         let err = edit_model(LOAN_BPMN, &ops).expect_err("should fail");
         assert!(err.contains("Nope"), "names the missing node: {err}");
+    }
+
+    #[test]
+    fn definition_to_xml_marks_exclusive_gateways_and_labels_guards() {
+        // The Investigation-4 shape: a guarded XOR split. The serializer must (a) flag the gateway
+        // shape isMarkerVisible so its X renders, and (b) name each guarded branch with its
+        // condition so the guard is legible (bpmn.js draws the name, not the conditionExpression).
+        let (def, _) = first_def(LOAN_BPMN).expect("parse loan");
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("bpmnElement=\"Decision\" isMarkerVisible=\"true\""),
+            "exclusive gateway opts into the X marker: {xml}"
+        );
+        // The LOAN model guards Decision->Approve with `creditScore >= 700`.
+        assert!(
+            xml.contains("<bpmn:sequenceFlow")
+                && xml.contains("name=\"creditScore &gt;= 700\""),
+            "guarded branch carries its condition as a name: {xml}"
+        );
+        assert!(
+            xml.contains("<bpmndi:BPMNLabel>"),
+            "guarded edge carries a label shape: {xml}"
+        );
     }
 }
