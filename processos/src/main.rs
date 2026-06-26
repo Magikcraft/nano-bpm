@@ -2082,7 +2082,7 @@ async fn cockpit_chat_session_load(
         Some(s) => Json(serde_json::json!({
             "id": s.id,
             "name": s.name,
-            "turns": chat::render_view_stamped(&s.messages, &s.stamps),
+            "turns": chat::render_view_full(&s.messages, &s.stamps, &s.turn_models),
         }))
         .into_response(),
         None => (
@@ -2191,7 +2191,7 @@ async fn cockpit_chat_load(
     });
     Json(serde_json::json!({
         "sessionId": meta.id,
-        "turns": chat::render_view_stamped(&session.messages, &session.stamps),
+        "turns": chat::render_view_full(&session.messages, &session.stamps, &session.turn_models),
         "inflight": inflight,
     }))
     .into_response()
@@ -2341,6 +2341,10 @@ async fn cockpit_chat_send(
     let session = state.chat.get(&key, &sid).unwrap_or_default();
     let prior = session.messages;
     let prior_stamps = session.stamps;
+    let prior_turn_models = session.turn_models;
+    // The model label that will answer this turn — persisted per turn so a historical bubble keeps
+    // the answering model's name regardless of what's selected later.
+    let model_label = cfg.model.clone();
     // Resolve the persona (standing system prompt). It only takes effect on the first turn;
     // record the resolved id on the session so the cockpit can show/lock it thereafter.
     let (persona_id, persona_system) = state.personas.resolve(req.persona_id.as_deref());
@@ -2411,15 +2415,18 @@ async fn cockpit_chat_send(
         Ok(Ok(result)) => {
             let stamps =
                 chat::extend_stamps(&result.messages, prior_stamps, user_ts, chat_now_ms());
+            let turn_models =
+                chat::extend_turn_models(&result.messages, prior_turn_models, &model_label);
             state
                 .chat
                 .save(&key, &sid, result.messages.clone(), stamps.clone());
+            state.chat.set_turn_models(&key, &sid, turn_models.clone());
             Json(serde_json::json!({
                 "sessionId": sid,
                 "answer": result.answer,
                 "rounds": result.rounds,
                 "dataset": result.dataset,
-                "turns": chat::render_view_stamped(&result.messages, &stamps),
+                "turns": chat::render_view_full(&result.messages, &stamps, &turn_models),
             }))
             .into_response()
         }
@@ -2470,6 +2477,9 @@ async fn cockpit_chat_stream(
     let session = state.chat.get(&key, &sid).unwrap_or_default();
     let prior = session.messages;
     let prior_stamps = session.stamps;
+    let prior_turn_models = session.turn_models;
+    // The model label answering this turn — persisted per turn so historical bubbles keep it.
+    let model_label = cfg.model.clone();
     // Resolve the persona; it only takes effect on the first turn. Record it on the session.
     let (persona_id, persona_system) = state.personas.resolve(req.persona_id.as_deref());
     if prior.is_empty() {
@@ -2564,6 +2574,8 @@ async fn cockpit_chat_stream(
         let cp_key = task_key.clone();
         let cp_sid = task_sid.clone();
         let cp_prior_stamps = prior_stamps.clone();
+        let cp_prior_turn_models = prior_turn_models.clone();
+        let cp_model = model_label.clone();
         let cp_user_ts = user_ts;
         // Start "stale" so the first checkpoint (which carries the operator's message) saves at once.
         let mut last_save = std::time::Instant::now() - std::time::Duration::from_secs(3600);
@@ -2575,7 +2587,10 @@ async fn cockpit_chat_stream(
             last_save = now;
             let stamps =
                 chat::extend_stamps(msgs, cp_prior_stamps.clone(), cp_user_ts, chat_now_ms());
+            let turn_models =
+                chat::extend_turn_models(msgs, cp_prior_turn_models.clone(), &cp_model);
             cp_chat.save(&cp_key, &cp_sid, msgs.to_vec(), stamps);
+            cp_chat.set_turn_models(&cp_key, &cp_sid, turn_models);
         };
         // Accumulate this turn's exact request payloads for the session's Debug tab while also
         // forwarding each over the wire so the tab can update live.
@@ -2646,16 +2661,21 @@ async fn cockpit_chat_stream(
         match result {
             Ok(r) => {
                 let stamps = chat::extend_stamps(&r.messages, prior_stamps, user_ts, chat_now_ms());
+                let turn_models =
+                    chat::extend_turn_models(&r.messages, prior_turn_models, &model_label);
                 task_state
                     .chat
                     .save(&task_key, &task_sid, r.messages.clone(), stamps.clone());
+                task_state
+                    .chat
+                    .set_turn_models(&task_key, &task_sid, turn_models.clone());
                 task_live.emit(serde_json::json!({
                     "type": "done",
                     "sessionId": task_sid,
                     "answer": r.answer,
                     "rounds": r.rounds,
                     "dataset": r.dataset,
-                    "turns": chat::render_view_stamped(&r.messages, &stamps),
+                    "turns": chat::render_view_full(&r.messages, &stamps, &turn_models),
                 }));
             }
             Err(e) => {

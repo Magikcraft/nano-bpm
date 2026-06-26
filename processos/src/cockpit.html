@@ -1742,9 +1742,13 @@ function chatErrorHtml(msg){
   return '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div>'+body+'</div>';
 }
 
-// The droid's bubble title: the active profile name, with the model id in a smaller, dimmer
-// parenthetical — e.g. "Remote Qwen 3.6 (UNSLOTH/QWEN3.6-35B-A3B-GGUF:UD-Q6_K)".
-function droidWhoHtml(){
+// The droid's bubble title. For a HISTORICAL turn we use the model that actually answered it
+// (persisted server-side as t.model), so the byline doesn't re-label when the operator switches
+// models later. For live/in-flight bubbles (no turnModel) we fall back to the active profile.
+function droidWhoHtml(turnModel){
+  if(turnModel){
+    return esc('Droid') + ' <span class="who-model">('+esc(turnModel)+')</span>';
+  }
   const name = STATE.profileName || 'Droid';
   const model = STATE.modelName || '';
   return esc(name) + (model ? ' <span class="who-model">('+esc(model)+')</span>' : '');
@@ -1785,7 +1789,7 @@ function chatBub(t){
     return '<div class="bub droid pair"><div class="who">'+who+copyBtn+carryBtn+time+'</div>'+thinkHtml+
       '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div>'+modelsHtml+'</div>';
   }
-  return '<div class="bub droid"><div class="who">'+droidWhoHtml()+copyBtn+carryBtn+time+'</div>'+thinkHtml+
+  return '<div class="bub droid"><div class="who">'+droidWhoHtml(t.model)+copyBtn+carryBtn+time+'</div>'+thinkHtml+
     '<div class="answer md">'+(answer ? mdToHtml(answer) : (inner ? '' : '(no answer)'))+'</div>'+modelsHtml+'</div>';
 }
 

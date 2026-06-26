@@ -75,6 +75,11 @@ pub struct ChatSession {
     /// Recorded per send so the operator can see which model(s) produced a conversation.
     #[serde(default)]
     pub models: Vec<String>,
+    /// The model label that produced each rendered turn, aligned by index to [`render_view`]
+    /// (empty string for operator/user turns). Lets historical droid bubbles keep the name of
+    /// the model that actually answered, rather than re-labelling with the current selection.
+    #[serde(default)]
+    pub turn_models: Vec<String>,
 }
 
 /// Lightweight session descriptor for the tab list (no transcript).
@@ -175,6 +180,7 @@ impl ChatStore {
             stamps: Vec::new(),
             persona: String::new(),
             models: Vec::new(),
+            turn_models: Vec::new(),
         };
         sessions.push(session.clone());
         let snapshot = sessions.clone();
@@ -214,6 +220,7 @@ impl ChatStore {
                 stamps,
                 persona: String::new(),
                 models: Vec::new(),
+                turn_models: Vec::new(),
             });
         }
         let snapshot = sessions.clone();
@@ -248,8 +255,30 @@ impl ChatStore {
                 stamps: Vec::new(),
                 persona: String::new(),
                 models: vec![model.to_string()],
+                turn_models: Vec::new(),
             }),
         }
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+    }
+
+    /// Persist the per-turn model attribution for a session (aligned by index to the rendered
+    /// turns). No-op if the id is unknown. Kept separate from [`save`] so the existing save call
+    /// sites are untouched; callers compute it with [`extend_turn_models`] after saving.
+    pub fn set_turn_models(&self, key: &str, session_id: &str, turn_models: Vec<String>) {
+        self.ensure_loaded(key);
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let Some(sessions) = guard.get_mut(key) else {
+            return;
+        };
+        let Some(s) = sessions.iter_mut().find(|s| s.id == session_id) else {
+            return;
+        };
+        if s.turn_models == turn_models {
+            return; // unchanged — skip the disk write
+        }
+        s.turn_models = turn_models;
         let snapshot = sessions.clone();
         drop(guard);
         self.persist(key, &snapshot);
@@ -304,6 +333,7 @@ impl ChatStore {
                 stamps: Vec::new(),
                 persona: persona.to_string(),
                 models: Vec::new(),
+                turn_models: Vec::new(),
             }),
         }
         let snapshot = sessions.clone();
@@ -379,6 +409,7 @@ impl ChatStore {
             stamps: Vec::new(),
             persona: String::new(),
             models: Vec::new(),
+            turn_models: Vec::new(),
         }])
     }
 
@@ -493,6 +524,10 @@ pub struct ChatTurnView {
     /// Epoch-ms timestamp of this turn, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts: Option<u64>,
+    /// For droid turns, the model label that produced this answer (persisted at send time), so a
+    /// historical bubble keeps the answering model's name regardless of the current selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Find `needle` (ASCII) in `hay` case-insensitively from byte offset `from`, returning a byte
@@ -620,6 +655,7 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                     steps: Vec::new(),
                     thought: Vec::new(),
                     ts: None,
+                    model: None,
                 });
             }
             Msg::Assistant { text, tool_calls } => {
@@ -647,6 +683,7 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                         steps: Vec::new(),
                         thought: Vec::new(),
                         ts: None,
+                        model: None,
                     });
                 } else {
                     // A final answer: split off its reasoning, then drain the timeline.
@@ -663,6 +700,7 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                         steps: std::mem::take(&mut steps),
                         thought: std::mem::take(&mut thought),
                         ts: None,
+                        model: None,
                     });
                     pending.clear();
                 }
@@ -708,6 +746,25 @@ pub fn render_view_stamped(messages: &[Msg], stamps: &[u64]) -> Vec<ChatTurnView
     turns
 }
 
+/// Like [`render_view_stamped`], but also attaches the model that produced each turn from
+/// `turn_models` (aligned by index; blank entries are skipped). The cockpit uses `model` to keep
+/// a historical droid bubble labelled with the model that actually answered it.
+pub fn render_view_full(
+    messages: &[Msg],
+    stamps: &[u64],
+    turn_models: &[String],
+) -> Vec<ChatTurnView> {
+    let mut turns = render_view_stamped(messages, stamps);
+    for (i, t) in turns.iter_mut().enumerate() {
+        if let Some(m) = turn_models.get(i) {
+            if !m.is_empty() {
+                t.model = Some(m.clone());
+            }
+        }
+    }
+    turns
+}
+
 /// Extend `stamps` so it aligns with the rendered turns of `messages`: a newly-appeared user
 /// turn is stamped `user_ts` and newly-appeared droid turns `droid_ts`. Existing stamps are
 /// preserved; the result is truncated to the turn count.
@@ -729,6 +786,29 @@ pub fn extend_stamps(
     }
     stamps.truncate(view.len());
     stamps
+}
+
+/// Extend `turn_models` to align with the rendered turns of `messages`: each newly-appeared
+/// non-user turn (droid/pair) is attributed to `model`; user turns get an empty label. Existing
+/// entries are preserved (so earlier turns keep the model that actually produced them); the result
+/// is truncated to the turn count.
+pub fn extend_turn_models(
+    messages: &[Msg],
+    mut turn_models: Vec<String>,
+    model: &str,
+) -> Vec<String> {
+    let view = render_view(messages);
+    while turn_models.len() < view.len() {
+        let i = turn_models.len();
+        let label = if view[i].role == "user" {
+            String::new()
+        } else {
+            model.to_string()
+        };
+        turn_models.push(label);
+    }
+    turn_models.truncate(view.len());
+    turn_models
 }
 
 #[cfg(test)]
@@ -871,6 +951,66 @@ mod tests {
         let view = render_view_stamped(&transcript, &stamps);
         assert_eq!(view[0].ts, Some(100));
         assert_eq!(view[1].ts, Some(200));
+    }
+
+    #[test]
+    fn turn_models_persist_per_turn_across_model_switch() {
+        // Turn 1: model A answers.
+        let mut transcript = vec![
+            Msg::System("s".into()),
+            Msg::User("q1".into()),
+            Msg::Assistant {
+                text: Some("a1".into()),
+                tool_calls: vec![],
+            },
+        ];
+        let tm = extend_turn_models(&transcript, vec![], "model-a");
+        assert_eq!(tm, vec!["".to_string(), "model-a".to_string()]);
+
+        // Turn 2: operator switches to model B, which answers.
+        transcript.push(Msg::User("q2".into()));
+        transcript.push(Msg::Assistant {
+            text: Some("a2".into()),
+            tool_calls: vec![],
+        });
+        let tm = extend_turn_models(&transcript, tm, "model-b");
+        // The first droid turn keeps model-a; the new one is model-b.
+        assert_eq!(
+            tm,
+            vec![
+                "".to_string(),
+                "model-a".to_string(),
+                "".to_string(),
+                "model-b".to_string()
+            ]
+        );
+
+        // render_view_full surfaces the per-turn model on droid turns and none on user turns.
+        let stamps = extend_stamps(&transcript, vec![], 1, 2);
+        let view = render_view_full(&transcript, &stamps, &tm);
+        assert_eq!(view[0].model, None); // user
+        assert_eq!(view[1].model, Some("model-a".to_string()));
+        assert_eq!(view[2].model, None); // user
+        assert_eq!(view[3].model, Some("model-b".to_string()));
+    }
+
+    #[test]
+    fn set_turn_models_persists_and_survives_reopen() {
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        let id;
+        {
+            let store = ChatStore::open(&dir);
+            let s = store.create(&key, Some("probe".into()));
+            id = s.id.clone();
+            store.set_turn_models(&key, &id, vec!["".into(), "qwen3".into()]);
+        }
+        {
+            let store = ChatStore::open(&dir);
+            let s = store.get(&key, &id).unwrap();
+            assert_eq!(s.turn_models, vec!["".to_string(), "qwen3".to_string()]);
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
