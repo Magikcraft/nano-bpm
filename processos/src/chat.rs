@@ -674,14 +674,22 @@ pub fn render_view(messages: &[Msg]) -> Vec<ChatTurnView> {
                     }
                 } else if let Some((name, answer)) = text.as_deref().and_then(unmark_pair) {
                     // A Pair AI reviewer's contribution: its own attributed turn. Its tool work
-                    // ran in a separate sub-conversation, so it carries no steps/thought here.
-                    let (_, clean) = split_thinking(&answer);
+                    // ran in a separate sub-conversation (so no steps here), but its own reasoning
+                    // is embedded as <think> in the answer — surface it as a collapsible Thinking
+                    // section, exactly like the primary droid turn.
+                    let (think, clean) = split_thinking(&answer);
+                    let mut pair_thought = Vec::new();
+                    if !think.trim().is_empty() {
+                        pair_thought.push(ThoughtItem::Reasoning {
+                            text: think.trim().to_string(),
+                        });
+                    }
                     turns.push(ChatTurnView {
                         role: "pair".into(),
                         name: Some(name),
-                        text: if clean.is_empty() { answer } else { clean },
+                        text: clean,
                         steps: Vec::new(),
-                        thought: Vec::new(),
+                        thought: pair_thought,
                         ts: None,
                         model: None,
                     });
@@ -1158,6 +1166,12 @@ mod tests {
         assert_eq!(view[2].name.as_deref(), Some("Skeptic / Red-Team"));
         // The reviewer's <think> is stripped from the visible answer.
         assert_eq!(view[2].text, "Actually check identity-check too.");
+        // …but preserved as a collapsible Thinking item, just like the primary droid turn.
+        assert_eq!(view[2].thought.len(), 1);
+        match &view[2].thought[0] {
+            ThoughtItem::Reasoning { text } => assert_eq!(text, "hmm"),
+            other => panic!("expected reasoning, got {other:?}"),
+        }
     }
 
     #[test]
