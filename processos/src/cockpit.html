@@ -313,6 +313,7 @@
   .split .menu button.on { color: #c7d2fe; }
   .split .menu .mi-model { font-size: 11px; color: #6b7280; word-break: break-all; }
   .split .menu .mi-on { margin-left: auto; color: #818cf8; }
+  .split .menu .mi-dot { margin: 0; align-self: center; flex: none; }
   .split .menu .mi-empty { padding: 8px 9px; color: #8b8b93; font-size: 12px; }
   .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
   .modal { background: #111118; border: 1px solid #34343c; border-radius: 12px; padding: 20px 22px; max-width: 560px; width: 90%; max-height: 80vh; overflow: auto; }
@@ -1649,22 +1650,40 @@ async function toggleProfileMenu(){
   try { s = await api('/api/settings'); }
   catch(e){ $('#chatHint').textContent = 'could not load profiles: '+(e.message||e); return; }
   // A sidecar profile is only a usable option once its model is actually on disk. Pull the
-  // download/run state so configured-but-not-downloaded sidecars are hidden from the menu.
+  // download/run state so configured-but-not-downloaded sidecars are hidden from the menu, and
+  // so each listed sidecar can show a status light (green = running/ready, blue = starting).
   let avail = null;
+  let phaseById = {};
   try {
     const st = await api('/api/llama/status') || {};
     avail = new Set();
     (st.models||[]).forEach(m => { if(m && m.profileId && m.downloaded) avail.add(m.profileId); });
-    (st.sidecars||[]).forEach(x => { if(x && x.profileId && x.phase==='ready') avail.add(x.profileId); });
+    (st.sidecars||[]).forEach(x => {
+      if(!x || !x.profileId) return;
+      if(x.phase==='ready') avail.add(x.profileId);
+      phaseById[x.profileId] = x.phase || '';
+    });
   } catch(e){ avail = null; }   // status unavailable → don't hide anything
   // Keep remote profiles (no local download) and any sidecar whose model is downloaded/ready.
   const profiles = (s.profiles||[]).filter(p => !p.sidecar || !avail || avail.has(p.id));
   // The model already acting as the partner (pair/monitor) can't also be the primary you send to.
   const partners = partnerProfileIds();
+  // Map a sidecar's phase to one of the shared status-dot classes; running sidecars get the
+  // green "on" light the operator asked for. Non-running sidecars (downloaded but stopped) and
+  // remote profiles get no light.
+  const dotFor = (p) => {
+    if(!p.sidecar) return '';
+    const ph = phaseById[p.id];
+    if(ph==='ready') return '<span class="dot-status on mi-dot" title="sidecar running"></span>';
+    if(ph==='starting' || ph==='loading' || ph==='downloading')
+      return '<span class="dot-status loading mi-dot" title="sidecar '+esc(ph)+'…"></span>';
+    return '<span class="dot-status off mi-dot" title="sidecar stopped"></span>';
+  };
   menu.innerHTML = profiles.length ? profiles.map(p => {
     const active = p.id===s.activeProfile;
     const isPartner = partners.has(p.id) && !active;
     return '<button data-id="'+esc(p.id)+'"'+(active?' class="on"':'')+(isPartner?' disabled title="In use as this investigation\'s partner"':'')+'>'+
+      dotFor(p)+
       '<span class="mi-name">'+esc(p.name||p.id)+'</span>'+
       (p.model?' <span class="mi-model">'+esc(p.model)+'</span>':'')+
       (active?' <span class="mi-on">✓</span>':'')+
