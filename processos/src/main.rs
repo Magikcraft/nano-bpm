@@ -1278,11 +1278,99 @@ async fn post_models(
     }
 }
 
+/// Bytes downloaded so far if `model`'s GGUF is mid-download in the Hugging Face cache under
+/// `models_dir` (llama.cpp writes `models--org--repo/blobs/<sha>.downloadInProgress` while a
+/// `-hf` model is still being fetched). Returns the largest such partial file's size, or `None`
+/// when nothing is downloading. This is how we tell "the model is still downloading" apart from
+/// "the server is up" — a `-hf` sidecar downloads the whole GGUF before it ever binds its port.
+fn download_in_progress(models_dir: &std::path::Path, model: &str) -> Option<u64> {
+    let repo = model.split(':').next().unwrap_or(model);
+    let folder = format!("models--{}", repo.replace('/', "--"));
+    let blobs = models_dir.join(folder).join("blobs");
+    let mut best: Option<u64> = None;
+    if let Ok(entries) = std::fs::read_dir(&blobs) {
+        for e in entries.flatten() {
+            if e.file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".downloadInProgress"))
+            {
+                if let Ok(m) = e.metadata() {
+                    let sz = m.len();
+                    best = Some(best.map_or(sz, |b| b.max(sz)));
+                }
+            }
+        }
+    }
+    best
+}
+
+/// The real, operator-facing lifecycle phase of a sidecar — beyond the binary "the process is
+/// running" flag, which is misleading because a freshly-spawned `llama-server` is NOT usable for
+/// minutes: it first downloads the model (no port yet), then loads it into memory (`/health` 503),
+/// and only then serves chat (`/health` 200). Returns `(phase, human-detail)`:
+///   down · starting · downloading · loading · ready
+async fn sidecar_phase(status: &llama::LlamaStatus) -> (String, Option<String>) {
+    if !status.running {
+        return ("down".into(), None);
+    }
+    if let Some(port) = status.port {
+        let url = format!("http://127.0.0.1:{port}/health");
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+        {
+            match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => return ("ready".into(), None),
+                // The HTTP server is up but the model is still loading into memory (llama-server
+                // answers /health with 503 until the weights are mapped and warmed).
+                Ok(_) => return ("loading".into(), Some("loading model into memory…".into())),
+                // Connection refused / unreachable: the process is alive but hasn't bound its
+                // port — almost always because it is still downloading the model.
+                Err(_) => {}
+            }
+        }
+    }
+    if let (Some(dir), Some(model)) = (status.models_dir.as_deref(), status.model.as_deref()) {
+        if let Some(bytes) = download_in_progress(std::path::Path::new(dir), model) {
+            let gb = bytes as f64 / 1_073_741_824.0;
+            return (
+                "downloading".into(),
+                Some(format!("downloading model… {gb:.1} GB fetched so far")),
+            );
+        }
+    }
+    ("starting".into(), Some("starting llama-server…".into()))
+}
+
 /// `GET /api/llama/status` — the local sidecar pool: every running `llama-server` (model, port,
 /// pid, the equivalent terminal command) plus the capacity, so the UI knows whether another may
-/// be started.
+/// be started. Each sidecar also carries its real lifecycle `phase`/`detail` (downloading vs
+/// loading vs ready) so the UI never reports a still-downloading model as usable, and `anyReady`
+/// is true only when at least one sidecar can actually serve a chat.
 async fn llama_status(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.llama.statuses())
+    let list = state.llama.statuses();
+    let mut sidecars = Vec::with_capacity(list.sidecars.len());
+    let mut any_ready = false;
+    for s in &list.sidecars {
+        let (phase, detail) = sidecar_phase(s).await;
+        if phase == "ready" {
+            any_ready = true;
+        }
+        let mut v = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("phase".into(), serde_json::json!(phase));
+            obj.insert("detail".into(), serde_json::json!(detail));
+        }
+        sidecars.push(v);
+    }
+    Json(serde_json::json!({
+        "running": list.running,
+        "anyReady": any_ready,
+        "count": list.count,
+        "max": list.max,
+        "sidecars": sidecars,
+        "error": list.error,
+    }))
 }
 
 /// `GET /api/llama/ready?profileId=…` — whether a sidecar is not just spawned but actually
@@ -1304,21 +1392,12 @@ async fn llama_ready(
             .next()
             .unwrap_or_else(|| state.llama.status_of("")),
     };
-    let Some(port) = status.port.filter(|_| status.running) else {
-        return Json(serde_json::json!({
-            "running": false, "ready": false, "profileId": status.profile_id,
-        }));
-    };
-    let url = format!("http://127.0.0.1:{port}/health");
-    let ready = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
-        Ok(client) => matches!(client.get(&url).send().await, Ok(r) if r.status().is_success()),
-        Err(_) => false,
-    };
+    let (phase, detail) = sidecar_phase(&status).await;
+    let ready = phase == "ready";
     Json(serde_json::json!({
-        "running": true, "ready": ready, "profileId": status.profile_id,
+        "running": status.running, "ready": ready,
+        "phase": phase, "detail": detail,
+        "profileId": status.profile_id,
     }))
 }
 
@@ -3736,5 +3815,37 @@ mod config_tests {
         );
         assert_eq!(t, "http://base:8080");
         assert_eq!(o, "http://own:8081");
+    }
+}
+
+#[cfg(test)]
+mod sidecar_phase_tests {
+    use super::download_in_progress;
+    use std::fs;
+
+    #[test]
+    fn detects_an_in_progress_hf_download_and_reports_its_size() {
+        let dir = std::env::temp_dir().join(format!("se-dl-{}", std::process::id()));
+        let blobs = dir
+            .join("models--unsloth--Qwen3-Coder-30B-A3B-Instruct-GGUF")
+            .join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join("abc123.downloadInProgress"), vec![0u8; 4096]).unwrap();
+        // A completed blob (no suffix) must NOT be mistaken for a download.
+        fs::write(blobs.join("def456"), vec![0u8; 8192]).unwrap();
+
+        let model = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL";
+        assert_eq!(download_in_progress(&dir, model), Some(4096));
+
+        // Once the partial file is gone, nothing is downloading.
+        fs::remove_file(blobs.join("abc123.downloadInProgress")).unwrap();
+        assert_eq!(download_in_progress(&dir, model), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_download_for_an_unknown_model_dir() {
+        let dir = std::env::temp_dir().join("se-dl-absent");
+        assert_eq!(download_in_progress(&dir, "org/repo:tag"), None);
     }
 }
