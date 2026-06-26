@@ -446,10 +446,13 @@ BPMN XML (that is exactly what goes wrong: a misspelled element like `<errorBoun
 `zeebe:taskDefinition` written as an attribute silently breaks the model, and you waste turns \
 thrashing on syntax you cannot see is wrong). edit_model applies VALIDATED structured operations \
 (set_task_job_type, insert_service_task_after, add_error_boundary, reroute_flow, remove_node, \
-add_exclusive_gateway, set_flow_condition) to the current model and OWNS the XML correctness for \
+add_exclusive_gateway, set_flow_condition, set_name) to the current model and OWNS the XML correctness for \
 you — it returns engine-validated `model` XML you pass straight to simulate. A structural change: \
 parallelise independent tasks, drop or reorder a step, swap a task's job type, add a boundary/retry \
-— each is one edit_model op. Act in the SAME turn: the moment you \
+— each is one edit_model op. GIVE EVERY NODE A HUMAN-READABLE NAME the operator can read in the \
+rendered diagram: pass `name` when you insert a task and use `set_name {node, name}` to label any \
+node whose id is cryptic — plain language like \"Run fraud screen\", never a bare id or a blank \
+node. A variant a person can't read is a variant they won't trust. Act in the SAME turn: the moment you \
 have a variant in mind, emit the edit_model call, then simulate the `model` it returns — never end \
 your turn by \
 saying you 'will now' or 'next' author or run something. If your message names a next step, you have \

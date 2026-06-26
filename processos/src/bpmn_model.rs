@@ -998,6 +998,131 @@ fn id_fragment(s: &str) -> String {
     }
 }
 
+/// Minimal XML entity un-escaping for the five predefined entities, so a `name="…&amp;…"` read
+/// from a base model round-trips cleanly when re-escaped on emit.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Read one attribute value (`key="…"` or `key='…'`) from the inside of a start tag, honouring
+/// word boundaries so `name=` doesn't match e.g. `messageName=`. Returns the un-escaped value.
+fn tag_attr(tag: &str, key: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(rel) = tag[from..].find(key) {
+        let pos = from + rel;
+        let before_ok = pos == 0
+            || tag.as_bytes()[pos - 1].is_ascii_whitespace()
+            || tag.as_bytes()[pos - 1] == b'<';
+        let after = tag[pos + key.len()..].trim_start();
+        if before_ok && after.starts_with('=') {
+            let rest = after[1..].trim_start();
+            let q = rest.chars().next()?;
+            if q == '"' || q == '\'' {
+                let body = &rest[1..];
+                let end = body.find(q)?;
+                return Some(xml_unescape(&body[..end]));
+            }
+        }
+        from = pos + key.len();
+    }
+    None
+}
+
+/// Harvest a map of `element id -> human label` from a BPMN document by scanning every start tag
+/// that carries both `id=` and a non-empty `name=`. The engine model drops names (it is purely
+/// semantic), so `edit_model` re-reads them here to preserve operator-facing labels across an edit.
+fn parse_element_names(xml: &str) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let mut i = 0usize;
+    while let Some(rel) = xml[i..].find('<') {
+        let start = i + rel;
+        let Some(grel) = xml[start..].find('>') else {
+            break;
+        };
+        let end = start + grel;
+        let tag = &xml[start + 1..end];
+        i = end + 1;
+        if tag.starts_with('/') || tag.starts_with('!') || tag.starts_with('?') {
+            continue;
+        }
+        if let (Some(id), Some(name)) = (tag_attr(tag, "id"), tag_attr(tag, "name")) {
+            if !name.trim().is_empty() {
+                names.entry(id).or_insert(name);
+            }
+        }
+    }
+    names
+}
+
+/// Turn a machine id into a readable label: strip a leading kind prefix (`Task_`, `Gateway_`,
+/// `Event_`, `Activity_`, `Flow_`…), then split camelCase / snake_case / kebab-case / digit runs
+/// into Title-Cased words. `CreditCheck` -> "Credit Check", `verify_kyc` -> "Verify Kyc",
+/// `Task_FraudScreen` -> "Fraud Screen". Returns the original id if nothing readable remains.
+fn humanize_id(id: &str) -> String {
+    let mut s = id;
+    for p in [
+        "Task_",
+        "Activity_",
+        "Gateway_",
+        "Event_",
+        "StartEvent_",
+        "EndEvent_",
+        "Flow_",
+        "BoundaryEvent_",
+    ] {
+        if let Some(rest) = s.strip_prefix(p) {
+            if !rest.is_empty() {
+                s = rest;
+            }
+            break;
+        }
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut prev: Option<char> = None;
+    for c in s.chars() {
+        if c == '_' || c == '-' || c == '.' || c == ' ' {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev = None;
+            continue;
+        }
+        // Boundary on a lower/digit -> upper transition (camelCase).
+        if let Some(p) = prev {
+            let split = (p.is_lowercase() || p.is_ascii_digit()) && c.is_uppercase();
+            if split && !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c);
+        prev = Some(c);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let titled: Vec<String> = words
+        .into_iter()
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut ch = w.chars();
+            match ch.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + ch.as_str(),
+                None => w,
+            }
+        })
+        .collect();
+    if titled.is_empty() {
+        id.to_string()
+    } else {
+        titled.join(" ")
+    }
+}
+
 /// Render a duration in milliseconds as an ISO-8601 duration the engine parser accepts
 /// (`P[nD]T[nH][nM][nS]`). Sub-second precision is not representable in that grammar, so the
 /// value is floored to whole seconds; authoring timers at second granularity round-trips.
@@ -1107,25 +1232,30 @@ fn emit_element(
     errors: &BTreeMap<String, String>,
     messages: &HashMap<(String, Option<String>), String>,
     children_by_parent: &HashMap<String, Vec<String>>,
+    labels: &HashMap<String, String>,
     out: &mut String,
 ) {
     let el = &def.elements[id];
     let eid = xml_escape(id);
+    // Every node carries a human label (operator-set name preserved across the edit, else a
+    // readable label derived from the id) so the rendered diagram and the downloaded .bpmn are
+    // legible rather than a wall of machine ids.
+    let na = format!(" name=\"{}\"", xml_escape(labels.get(id).map(String::as_str).unwrap_or(id)));
     match &el.kind {
         ElementKind::StartEvent => {
-            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"/>\n"));
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
         }
         ElementKind::EndEvent => {
-            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"/>\n"));
+            out.push_str(&format!("    <bpmn:endEvent id=\"{eid}\"{na}/>\n"));
         }
         ElementKind::ExclusiveGateway => {
-            out.push_str(&format!("    <bpmn:exclusiveGateway id=\"{eid}\"/>\n"));
+            out.push_str(&format!("    <bpmn:exclusiveGateway id=\"{eid}\"{na}/>\n"));
         }
         ElementKind::ParallelGateway => {
-            out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"/>\n"));
+            out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
         }
         ElementKind::ServiceTask { job_type, priority } => {
-            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
             out.push_str(&format!(
                 "        <zeebe:taskDefinition type=\"{}\"/>\n",
@@ -1141,7 +1271,7 @@ fn emit_element(
             out.push_str("    </bpmn:serviceTask>\n");
         }
         ElementKind::UserTask(props) => {
-            out.push_str(&format!("    <bpmn:userTask id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:userTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
             if props.assignee.is_some()
                 || props.candidate_groups.is_some()
@@ -1187,7 +1317,7 @@ fn emit_element(
                 .cloned()
                 .unwrap_or_else(|| format!("Error_{}", id_fragment(error_code)));
             out.push_str(&format!(
-                "    <bpmn:boundaryEvent id=\"{eid}\" attachedToRef=\"{}\">\n",
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\">\n",
                 xml_escape(attached_to)
             ));
             out.push_str(&format!(
@@ -1208,7 +1338,7 @@ fn emit_element(
                 " cancelActivity=\"false\""
             };
             out.push_str(&format!(
-                "    <bpmn:boundaryEvent id=\"{eid}\" attachedToRef=\"{}\"{cancel}>\n",
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
             out.push_str("      <bpmn:timerEventDefinition>\n");
@@ -1242,7 +1372,7 @@ fn emit_element(
                 " cancelActivity=\"false\""
             };
             out.push_str(&format!(
-                "    <bpmn:boundaryEvent id=\"{eid}\" attachedToRef=\"{}\"{cancel}>\n",
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
                 xml_escape(attached_to)
             ));
             out.push_str(&format!(
@@ -1252,7 +1382,7 @@ fn emit_element(
             out.push_str("    </bpmn:boundaryEvent>\n");
         }
         ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
-            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:timerEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
@@ -1269,7 +1399,7 @@ fn emit_element(
                 .get(&(message_name.clone(), Some(correlation_key.clone())))
                 .cloned()
                 .unwrap_or_default();
-            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"));
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -1281,7 +1411,7 @@ fn emit_element(
                 .get(&(message_name.clone(), None))
                 .cloned()
                 .unwrap_or_default();
-            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -1292,7 +1422,7 @@ fn emit_element(
             interval_millis,
             repeating,
         } => {
-            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:timerEventDefinition>\n");
             if *repeating {
                 out.push_str(&format!(
@@ -1309,12 +1439,12 @@ fn emit_element(
             out.push_str("    </bpmn:startEvent>\n");
         }
         ElementKind::SubProcess { .. } => {
-            out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\">\n"));
+            out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
             if let Some(kids) = children_by_parent.get(id) {
                 for child in kids {
                     // Children are emitted at the same indentation; the engine parser keys
                     // containment off the scope stack, not indentation, so this is faithful.
-                    emit_element(def, child, errors, messages, children_by_parent, out);
+                    emit_element(def, child, errors, messages, children_by_parent, labels, out);
                 }
             }
             out.push_str("    </bpmn:subProcess>\n");
@@ -1326,12 +1456,28 @@ fn emit_element(
 /// (start event, every node kind, sequence flows with conditions, and the definitions-level
 /// `<bpmn:error>` / `<bpmn:message>` declarations boundary and message events reference).
 ///
-/// Diagram-interchange (`<bpmndi>`) is intentionally omitted — these are *candidate* models for
-/// simulation, and the cockpit renders DI-less variants. The contract this guarantees is the one
-/// that matters for authoring: `parse_bpmn(definition_to_xml(def))` reproduces `def`'s structure.
-pub fn definition_to_xml(def: &ProcessDefinition) -> String {
+/// Each node is emitted with a human `name=` and the document carries a generated, left-to-right
+/// `<bpmndi:BPMNDiagram>` so the model renders and downloads legibly. `overrides` supplies
+/// operator-set labels (`id -> name`) to preserve across an edit; any id not in `overrides` falls
+/// back to a humanized form of the id. `parse_bpmn(definition_to_xml_labeled(def, …))` still
+/// reproduces `def`'s structure (the engine ignores both `name=` and the DI).
+pub fn definition_to_xml_labeled(
+    def: &ProcessDefinition,
+    overrides: &HashMap<String, String>,
+) -> String {
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
+
+    // Resolve a human label for every element: an operator-set name wins, else a readable label
+    // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
+    let mut labels: HashMap<String, String> = HashMap::new();
+    for id in def.elements.keys() {
+        let label = overrides
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| humanize_id(id));
+        labels.insert(id.clone(), label);
+    }
 
     // Group sub-process children by parent so a container emits its contents inline.
     let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
@@ -1352,6 +1498,9 @@ pub fn definition_to_xml(def: &ProcessDefinition) -> String {
     out.push_str(
         "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
          xmlns:zeebe=\"http://camunda.org/schema/zeebe/1.0\" \
+         xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" \
+         xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" \
+         xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" \
          targetNamespace=\"http://bpmn.io/schema/bpmn\">\n",
     );
     for (code, eid) in &errors {
@@ -1397,22 +1546,28 @@ pub fn definition_to_xml(def: &ProcessDefinition) -> String {
         .collect();
     top.sort();
     for id in top {
-        emit_element(def, id, &errors, &msg_lookup, &children_by_parent, &mut out);
+        emit_element(def, id, &errors, &msg_lookup, &children_by_parent, &labels, &mut out);
     }
 
-    // Emit every sequence flow flat with a synthesized id. The engine parser builds flows purely
-    // from sourceRef/targetRef, so flat emission (scope-independent) is faithful.
+    // Synthesize a stable flow id for every sequence flow once, so the process body and the DI
+    // edges reference the same ids. The engine parser builds flows purely from sourceRef/targetRef,
+    // so flat emission (scope-independent) is faithful.
     let mut sources: Vec<&String> = def.elements.keys().collect();
     sources.sort();
+    let mut flows: Vec<FlowEdge> = Vec::new();
     let mut n = 0usize;
     for src in sources {
         for flow in &def.elements[src].outgoing {
             n += 1;
-            let fid = format!("Flow_{n}");
+            flows.push(FlowEdge {
+                id: format!("Flow_{n}"),
+                src: src.clone(),
+                to: flow.to.clone(),
+            });
             match &flow.condition {
                 Some(cond) => {
                     out.push_str(&format!(
-                        "    <bpmn:sequenceFlow id=\"{fid}\" sourceRef=\"{}\" targetRef=\"{}\">\n",
+                        "    <bpmn:sequenceFlow id=\"Flow_{n}\" sourceRef=\"{}\" targetRef=\"{}\">\n",
                         xml_escape(src),
                         xml_escape(&flow.to)
                     ));
@@ -1424,7 +1579,7 @@ pub fn definition_to_xml(def: &ProcessDefinition) -> String {
                 }
                 None => {
                     out.push_str(&format!(
-                        "    <bpmn:sequenceFlow id=\"{fid}\" sourceRef=\"{}\" targetRef=\"{}\"/>\n",
+                        "    <bpmn:sequenceFlow id=\"Flow_{n}\" sourceRef=\"{}\" targetRef=\"{}\"/>\n",
                         xml_escape(src),
                         xml_escape(&flow.to)
                     ));
@@ -1434,8 +1589,251 @@ pub fn definition_to_xml(def: &ProcessDefinition) -> String {
     }
 
     out.push_str("  </bpmn:process>\n");
+    append_diagram(def, &flows, &mut out);
     out.push_str("</bpmn:definitions>\n");
     out
+}
+
+/// A resolved sequence flow: a synthesized id plus its endpoints, shared between the process body
+/// (`<bpmn:sequenceFlow>`) and the diagram-interchange (`<bpmndi:BPMNEdge>`) so both agree on ids.
+struct FlowEdge {
+    id: String,
+    src: String,
+    to: String,
+}
+
+/// A laid-out shape rectangle (top-left origin), in diagram coordinates.
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+impl Rect {
+    fn cx(&self) -> f64 {
+        self.x + self.w / 2.0
+    }
+    fn cy(&self) -> f64 {
+        self.y + self.h / 2.0
+    }
+}
+
+/// Diagram footprint (width, height) for a node kind: tasks/sub-processes are boxes, gateways are
+/// diamonds, everything else (events) is a small circle.
+fn node_dims(kind: &ElementKind) -> (f64, f64) {
+    match kind {
+        ElementKind::ServiceTask { .. }
+        | ElementKind::UserTask(_)
+        | ElementKind::SubProcess { .. } => (110.0, 80.0),
+        ElementKind::ExclusiveGateway | ElementKind::ParallelGateway => (50.0, 50.0),
+        _ => (36.0, 36.0),
+    }
+}
+
+/// Mean assigned row of a node's already-placed (main-flow) predecessors, or 0 when it has none —
+/// the target row the node "wants" so a flow tends to run straight left-to-right.
+fn desired_row(
+    id: &str,
+    preds: &HashMap<String, Vec<String>>,
+    row_of: &HashMap<String, f64>,
+) -> f64 {
+    let mut sum = 0.0;
+    let mut cnt = 0.0;
+    if let Some(ps) = preds.get(id) {
+        for p in ps {
+            if let Some(&r) = row_of.get(p) {
+                sum += r;
+                cnt += 1.0;
+            }
+        }
+    }
+    if cnt > 0.0 {
+        sum / cnt
+    } else {
+        0.0
+    }
+}
+
+/// Orthogonal waypoints from `s` to `t`. A boundary-event source leaves from its bottom; otherwise
+/// the edge leaves the source's right and enters the target's left, with an elbow when the two
+/// sit on different rows.
+fn route(s: &Rect, t: &Rect, from_boundary: bool) -> Vec<(f64, f64)> {
+    if from_boundary {
+        let sx = s.cx();
+        let sy = s.y + s.h;
+        let ty = t.cy();
+        let tx = t.x;
+        return vec![(sx, sy), (sx, ty), (tx, ty)];
+    }
+    let sx = s.x + s.w;
+    let sy = s.cy();
+    let tx = t.x;
+    let ty = t.cy();
+    if (sy - ty).abs() < 0.5 {
+        vec![(sx, sy), (tx, ty)]
+    } else {
+        let mx = (sx + tx) / 2.0;
+        vec![(sx, sy), (mx, sy), (mx, ty), (tx, ty)]
+    }
+}
+
+/// Append a generated, left-to-right `<bpmndi:BPMNDiagram>` for `def` so the model renders and
+/// downloads with a real (horizontal) layout instead of relying on client-side auto-layout.
+///
+/// Layout is a simple layered ("Sugiyama-lite") pass: each node's column is its longest-path
+/// distance from a source (a back-edge in a loop just caps the rank); within a column, rows are
+/// assigned to follow predecessors and resolve collisions downward. Boundary events ride on their
+/// host's bottom edge. It is not optimal, but it reads as a normal horizontal BPMN flow.
+fn append_diagram(def: &ProcessDefinition, flows: &[FlowEdge], out: &mut String) {
+    let mut ids: Vec<String> = def.elements.keys().cloned().collect();
+    ids.sort();
+    let n = ids.len();
+
+    // --- Column (rank) per node: longest path from any source, boundary pinned to its host. ---
+    let mut rank: HashMap<String, usize> = ids.iter().map(|s| (s.clone(), 0usize)).collect();
+    for _ in 0..(n + 2) {
+        for id in &ids {
+            if let Some(host) = attached_to(&def.elements[id].kind) {
+                if let Some(&hr) = rank.get(host) {
+                    rank.insert(id.clone(), hr);
+                }
+            }
+        }
+        for f in flows {
+            let sr = *rank.get(&f.src).unwrap_or(&0);
+            let nr = (sr + 1).min(n);
+            if rank.get(&f.to).is_none_or(|&r| r < nr) {
+                rank.insert(f.to.clone(), nr);
+            }
+        }
+    }
+
+    // --- Row per (non-boundary) node, biased toward the mean of its main-flow predecessors. ---
+    let mut preds: HashMap<String, Vec<String>> = HashMap::new();
+    for f in flows {
+        if !is_boundary(&def.elements[&f.src].kind) {
+            preds.entry(f.to.clone()).or_default().push(f.src.clone());
+        }
+    }
+    let grid_ids: Vec<&String> = ids
+        .iter()
+        .filter(|id| !is_boundary(&def.elements[*id].kind))
+        .collect();
+    let max_rank = grid_ids.iter().map(|id| rank[*id]).max().unwrap_or(0);
+    let mut row_of: HashMap<String, f64> = HashMap::new();
+    for r in 0..=max_rank {
+        let mut here: Vec<String> = grid_ids
+            .iter()
+            .filter(|id| rank[**id] == r)
+            .map(|id| (*id).clone())
+            .collect();
+        here.sort_by(|a, b| {
+            let da = desired_row(a, &preds, &row_of);
+            let db = desired_row(b, &preds, &row_of);
+            da.partial_cmp(&db)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+        let mut used: Vec<i64> = Vec::new();
+        for id in &here {
+            let mut row = desired_row(id, &preds, &row_of).round() as i64;
+            if row < 0 {
+                row = 0;
+            }
+            while used.contains(&row) {
+                row += 1;
+            }
+            used.push(row);
+            row_of.insert(id.clone(), row as f64);
+        }
+    }
+
+    // --- Coordinates. ---
+    const OX: f64 = 160.0;
+    const OY: f64 = 100.0;
+    const COL: f64 = 190.0;
+    const ROW: f64 = 110.0;
+    let mut rects: HashMap<String, Rect> = HashMap::new();
+    for id in &ids {
+        let kind = &def.elements[id].kind;
+        if is_boundary(kind) {
+            continue;
+        }
+        let (w, h) = node_dims(kind);
+        let cx = OX + rank[id] as f64 * COL;
+        let cy = OY + row_of.get(id).copied().unwrap_or(0.0) * ROW;
+        rects.insert(
+            id.clone(),
+            Rect {
+                x: cx - w / 2.0,
+                y: cy - h / 2.0,
+                w,
+                h,
+            },
+        );
+    }
+    // Boundary events straddle the bottom edge of their host (3/4 along its width).
+    for id in &ids {
+        let kind = &def.elements[id].kind;
+        if let Some(host) = attached_to(kind) {
+            if let Some(hb) = rects.get(host).copied() {
+                let (w, h) = node_dims(kind);
+                let cx = hb.x + hb.w * 0.75;
+                let cy = hb.y + hb.h;
+                rects.insert(
+                    id.clone(),
+                    Rect {
+                        x: cx - w / 2.0,
+                        y: cy - h / 2.0,
+                        w,
+                        h,
+                    },
+                );
+            }
+        }
+    }
+
+    let fmt = |v: f64| (v.round() as i64).to_string();
+
+    out.push_str("  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n");
+    out.push_str(&format!(
+        "    <bpmndi:BPMNPlane id=\"BPMNPlane_1\" bpmnElement=\"{}\">\n",
+        xml_escape(&def.id)
+    ));
+    for id in &ids {
+        if let Some(b) = rects.get(id) {
+            out.push_str(&format!(
+                "      <bpmndi:BPMNShape id=\"{0}_di\" bpmnElement=\"{0}\">\n\
+                 \x20       <dc:Bounds x=\"{1}\" y=\"{2}\" width=\"{3}\" height=\"{4}\"/>\n\
+                 \x20     </bpmndi:BPMNShape>\n",
+                xml_escape(id),
+                fmt(b.x),
+                fmt(b.y),
+                fmt(b.w),
+                fmt(b.h)
+            ));
+        }
+    }
+    for f in flows {
+        let (Some(sb), Some(tb)) = (rects.get(&f.src), rects.get(&f.to)) else {
+            continue;
+        };
+        let from_boundary = is_boundary(&def.elements[&f.src].kind);
+        out.push_str(&format!(
+            "      <bpmndi:BPMNEdge id=\"{0}_di\" bpmnElement=\"{0}\">\n",
+            xml_escape(&f.id)
+        ));
+        for (x, y) in route(sb, tb, from_boundary) {
+            out.push_str(&format!(
+                "        <di:waypoint x=\"{}\" y=\"{}\"/>\n",
+                fmt(x),
+                fmt(y)
+            ));
+        }
+        out.push_str("      </bpmndi:BPMNEdge>\n");
+    }
+    out.push_str("    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n");
 }
 
 /// Build a sequence-flow condition from an optional expression string. An empty/whitespace
@@ -1459,12 +1857,27 @@ fn req_str<'a>(op: &'a Value, field: &str, op_name: &str) -> Result<&'a str, Str
 /// describing what changed. Each op fully owns the XML-level correctness of its change; an op that
 /// references a missing node or would duplicate an id fails with an actionable message so the model
 /// can correct the *operation* rather than re-typing raw XML.
-fn apply_edit_op(def: &mut ProcessDefinition, op: &Value) -> Result<String, String> {
+fn apply_edit_op(
+    def: &mut ProcessDefinition,
+    names: &mut HashMap<String, String>,
+    op: &Value,
+) -> Result<String, String> {
     let op_name = op
         .get("op")
         .and_then(|v| v.as_str())
         .ok_or("each edit op needs a string 'op' field")?;
+    // Optional human label carried by an authoring op (insert ops, or the dedicated set_name op).
+    let op_name_label = op.get("name").and_then(|v| v.as_str()).map(str::to_string);
     match op_name {
+        "set_name" => {
+            let node = req_str(op, "node", op_name)?;
+            let label = req_str(op, "name", op_name)?;
+            if !def.elements.contains_key(node) {
+                return Err(format!("set_name: no node '{node}' in the model"));
+            }
+            names.insert(node.to_string(), label.to_string());
+            Ok(format!("Set label of '{node}' to \"{label}\"."))
+        }
         "set_task_job_type" => {
             let task = req_str(op, "task", op_name)?;
             let job_type = req_str(op, "jobType", op_name)?;
@@ -1532,6 +1945,9 @@ fn apply_edit_op(def: &mut ProcessDefinition, op: &Value) -> Result<String, Stri
                     parent,
                 },
             );
+            if let Some(label) = &op_name_label {
+                names.insert(id.to_string(), label.clone());
+            }
             Ok(format!(
                 "Inserted serviceTask '{id}' (jobType '{job_type}') immediately after '{after}'."
             ))
@@ -1578,6 +1994,9 @@ fn apply_edit_op(def: &mut ProcessDefinition, op: &Value) -> Result<String, Stri
                     parent: None,
                 },
             );
+            if let Some(label) = &op_name_label {
+                names.insert(id.clone(), label.clone());
+            }
             Ok(format!(
                 "Added an error boundary '{id}' (errorCode '{error_code}') on '{task}', routing to '{target}'."
             ))
@@ -1648,7 +2067,9 @@ fn apply_edit_op(def: &mut ProcessDefinition, op: &Value) -> Result<String, Stri
                 .collect();
             for bid in &orphaned {
                 def.elements.remove(bid);
+                names.remove(bid);
             }
+            names.remove(id);
             Ok(format!(
                 "Removed node '{id}', reconnecting its predecessors to its successors{}.",
                 if orphaned.is_empty() {
@@ -1734,7 +2155,7 @@ fn apply_edit_op(def: &mut ProcessDefinition, op: &Value) -> Result<String, Stri
         other => Err(format!(
             "unknown edit op '{other}'. Supported: set_task_job_type, set_flow_condition, \
              insert_service_task_after, add_error_boundary, reroute_flow, remove_node, \
-             add_exclusive_gateway."
+             add_exclusive_gateway, set_name."
         )),
     }
 }
@@ -1752,6 +2173,9 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
     }
     let (healed, heal_notes) = normalize_authoring(base_xml);
     let (wrapped, _) = ensure_definitions(&healed);
+    // Preserve the operator-facing labels the base already carries (the engine model drops them),
+    // so an edit doesn't strip every node's name; ops may add/override entries.
+    let mut names = parse_element_names(&wrapped);
     let mut def = parse_bpmn(&wrapped)
         .map_err(|e| {
             let err = format!("{e:?}");
@@ -1766,11 +2190,12 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
 
     let mut applied: Vec<String> = heal_notes;
     for (i, op) in ops.iter().enumerate() {
-        let note = apply_edit_op(&mut def, op).map_err(|e| format!("op {} failed: {e}", i + 1))?;
+        let note = apply_edit_op(&mut def, &mut names, op)
+            .map_err(|e| format!("op {} failed: {e}", i + 1))?;
         applied.push(note);
     }
 
-    let xml = definition_to_xml(&def);
+    let xml = definition_to_xml_labeled(&def, &names);
     // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
     // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.
     if let Err(e) = parse_bpmn(&xml) {
@@ -2132,6 +2557,11 @@ mod tests {
         assert_eq!(a.elements, b.elements, "elements");
     }
 
+    /// Serialize with no operator label overrides (humanized fallbacks only).
+    fn definition_to_xml(def: &ProcessDefinition) -> String {
+        definition_to_xml_labeled(def, &HashMap::new())
+    }
+
     #[test]
     fn definition_to_xml_round_trips_the_loan_model() {
         // serialize -> re-parse must reproduce the exact structure (nodes, kinds, job types,
@@ -2337,6 +2767,119 @@ mod tests {
         let ops = vec![json!({"op":"set_task_job_type","task":"Nope","jobType":"x"})];
         let err = edit_model(LOAN_BPMN, &ops).expect_err("should fail");
         assert!(err.contains("op 1 failed"), "got: {err}");
+        assert!(err.contains("Nope"), "names the missing node: {err}");
+    }
+
+    // ── Human-readable output: labels + diagram interchange ──────────────────────────────────
+
+    /// Pull the `x` coordinate of a node's `<bpmndi:BPMNShape>` Bounds from serialized XML.
+    fn shape_x(xml: &str, id: &str) -> i64 {
+        let marker = format!("bpmnElement=\"{id}\">");
+        let after = xml
+            .split(&marker)
+            .nth(1)
+            .unwrap_or_else(|| panic!("no shape for {id}"));
+        let x_attr = after.split("x=\"").nth(1).expect("bounds x");
+        x_attr
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("x is an int")
+    }
+
+    #[test]
+    fn definition_to_xml_emits_di_and_humanized_labels() {
+        // Serializing a label-less model gives every node a readable name (humanized from its id)
+        // and a generated diagram, so the authored variant renders and downloads legibly.
+        let (orig, _) = first_def(LOAN_BPMN).expect("parse loan");
+        let xml = definition_to_xml(&orig);
+        assert!(xml.contains("<bpmndi:BPMNDiagram"), "carries a diagram");
+        assert!(xml.contains("<bpmndi:BPMNShape"), "carries shapes");
+        assert!(
+            xml.contains("name=\"Credit Check\""),
+            "humanizes CreditCheck -> 'Credit Check': {xml}"
+        );
+        // The DI must round-trip back through the engine parser without disturbing structure.
+        let reparsed = parse_bpmn(&xml).expect("DI-bearing model re-parses");
+        assert_same_structure(&orig, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_lays_the_model_out_left_to_right() {
+        // A horizontal layout: each node sits to the right of its predecessor, so the start is
+        // left of the tasks which are left of the end events.
+        let (orig, _) = first_def(LOAN_BPMN).expect("parse loan");
+        let xml = definition_to_xml(&orig);
+        let start = shape_x(&xml, "Start");
+        let credit = shape_x(&xml, "CreditCheck");
+        let decision = shape_x(&xml, "Decision");
+        let end = shape_x(&xml, "EndApproved");
+        assert!(start < credit, "Start left of CreditCheck");
+        assert!(credit < decision, "CreditCheck left of Decision");
+        assert!(decision < end, "Decision left of the end event");
+    }
+
+    #[test]
+    fn edit_model_preserves_existing_human_names() {
+        // A base model that already carries operator names keeps them through an unrelated edit.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" targetNamespace="t">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="S" name="Application received"/>
+    <bpmn:serviceTask id="Credit" name="Pull credit bureau"><bpmn:extensionElements><zeebe:taskDefinition type="credit-check"/></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="Done" name="Decision made"/>
+    <bpmn:sequenceFlow id="a" sourceRef="S" targetRef="Credit"/>
+    <bpmn:sequenceFlow id="b" sourceRef="Credit" targetRef="Done"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let ops = vec![json!({"op":"set_task_job_type","task":"Credit","jobType":"bureau-pull"})];
+        let v = edit_model(base, &ops).expect("edit");
+        let xml = v["model"].as_str().unwrap();
+        assert!(
+            xml.contains("name=\"Application received\""),
+            "keeps the start label: {xml}"
+        );
+        assert!(
+            xml.contains("name=\"Pull credit bureau\""),
+            "keeps the task label: {xml}"
+        );
+        assert!(
+            xml.contains("name=\"Decision made\""),
+            "keeps the end label: {xml}"
+        );
+    }
+
+    #[test]
+    fn edit_model_set_name_relabels_a_node() {
+        let ops = vec![json!({"op":"set_name","node":"CreditCheck","name":"Run fraud screen"})];
+        let v = edit_model(LOAN_BPMN, &ops).expect("edit");
+        assert_eq!(v["ok"], true);
+        let xml = v["model"].as_str().unwrap();
+        assert!(
+            xml.contains("name=\"Run fraud screen\""),
+            "applies the new label: {xml}"
+        );
+    }
+
+    #[test]
+    fn edit_model_insert_honors_a_supplied_name() {
+        let ops = vec![json!({
+            "op":"insert_service_task_after","after":"CreditCheck","id":"FraudCheck",
+            "jobType":"fraud-check","name":"Screen for fraud"
+        })];
+        let v = edit_model(LOAN_BPMN, &ops).expect("edit");
+        let xml = v["model"].as_str().unwrap();
+        assert!(
+            xml.contains("name=\"Screen for fraud\""),
+            "labels the inserted task: {xml}"
+        );
+    }
+
+    #[test]
+    fn edit_model_set_name_rejects_a_missing_node() {
+        let ops = vec![json!({"op":"set_name","node":"Nope","name":"x"})];
+        let err = edit_model(LOAN_BPMN, &ops).expect_err("should fail");
         assert!(err.contains("Nope"), "names the missing node: {err}");
     }
 }

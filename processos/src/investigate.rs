@@ -222,15 +222,23 @@ impl ToolBox for AnalysisTools {
                     engine's parser, applies your ops to the model, and re-emits engine-validated \
                     XML, returning the new full `model` (ready to pass straight to simulate / \
                     compare_variants), the `appliedOps` notes, and the post-edit analyze_model \
-                    findings. PREFER THIS over typing BPMN by hand. Args: ops (array, applied in \
+                    findings. PREFER THIS over typing BPMN by hand. The serializer also gives the \
+                    authored model a generated left-to-right diagram and a human `name=` on every \
+                    node, so name your nodes well (see set_name / the optional `name` on insert ops) \
+                    — that label is what a person reads when the variant is rendered or downloaded. \
+                    Args: ops (array, applied in \
                     order), base (optional BPMN XML to edit; omit to edit the current process \
                     model). Each op is an object with an `op` field:\n\
                     • set_task_job_type {task, jobType} — change a serviceTask's job type.\n\
+                    • set_name {node, name} — set a node's human-readable label (the text shown in \
+                    the diagram). Use plain language, e.g. \"Run fraud screen\", not the id.\n\
                     • set_flow_condition {from, to, condition} — set/replace (empty clears) the \
                     FEEL guard on the flow from->to.\n\
-                    • insert_service_task_after {after, id, jobType} — splice a new serviceTask \
-                    onto `after`'s outgoing edge (after -> NEW -> original targets).\n\
-                    • add_error_boundary {task, errorCode, target, id?} — attach an error boundary \
+                    • insert_service_task_after {after, id, jobType, name?} — splice a new \
+                    serviceTask onto `after`'s outgoing edge (after -> NEW -> original targets); \
+                    pass `name` to label it readably.\n\
+                    • add_error_boundary {task, errorCode, target, id?, name?} — attach an error \
+                    boundary \
                     to a serviceTask routing to `target` (synthesizes the <bpmn:error> + errorRef \
                     for you — the exact thing models get wrong by hand).\n\
                     • reroute_flow {from, to, newTo} — repoint the flow from->to at newTo.\n\
