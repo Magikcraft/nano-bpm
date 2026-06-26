@@ -83,6 +83,10 @@ pub enum Delta {
     Reasoning(String),
     /// A chunk of the model's user-facing answer (`content`).
     Answer(String),
+    /// The OpenAI completion id (`chatcmpl-…`) for this streamed turn, surfaced once as soon as
+    /// the first chunk carrying it arrives — so the caller can target the live turn with the
+    /// reasoning-control endpoint (end its thinking mid-generation).
+    Completion(String),
 }
 
 /// An event emitted by the streaming agent loop, for live cockpit feedback.
@@ -103,6 +107,9 @@ pub enum AgentEvent {
     Reasoning(String),
     /// A chunk of the droid's answer prose.
     Answer(String),
+    /// The OpenAI completion id (`chatcmpl-…`) of the in-flight turn, so the host can target it
+    /// with the reasoning-control endpoint (wrap-up / loop monitor). Emitted once per turn.
+    Completion { id: String },
     /// The droid asked to run a tool (emitted before execution).
     ToolCall { tool: String, arguments: Value },
     /// A tool finished; `result` is the raw string fed back to the model.
@@ -285,6 +292,7 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                     sink(AgentEvent::Reasoning(t));
                 }
                 Delta::Answer(t) => sink(AgentEvent::Answer(t)),
+                Delta::Completion(id) => sink(AgentEvent::Completion { id }),
             };
             model
                 .step_streaming(msgs, &specs, &mut on_delta, cancel)
@@ -458,6 +466,8 @@ async fn wrap_up<M: AgentStep>(
         let mut on_delta = |d: Delta| match d {
             Delta::Reasoning(t) => sink(AgentEvent::Reasoning(t)),
             Delta::Answer(t) => sink(AgentEvent::Answer(t)),
+            // The wrap-up summary turn is already terminal; no need to surface its completion id.
+            Delta::Completion(_) => {}
         };
         // Pass no cancel: wrap-up is the *consequence* of an interrupt/budget stop, so the
         // summary generation must be allowed to run even though `cancel` is (often) still set.
@@ -523,6 +533,10 @@ impl OpenAiAgent {
             "tools": tool_defs,
             "stream": stream,
             "messages": wire_messages(msgs),
+            // Arm the reasoning-control budget sampler so the loop monitor / "wrap it up" can end
+            // this turn's thinking mid-generation via POST /v1/chat/completions/control. Servers
+            // without the feature (older llama.cpp) ignore the unknown field — harmless.
+            "reasoning_control": true,
         });
         crate::harness::llm::apply_thinking_budget(&mut body, &self.cfg);
         body
@@ -616,6 +630,9 @@ impl AgentStep for OpenAiAgent {
         let mut reasoning = String::new();
         let mut tool_accum: Vec<ToolCallAccum> = Vec::new();
         let mut buf = String::new();
+        // Surface the OpenAI completion id (`chatcmpl-…`) the first time a chunk carries it, so the
+        // host can target THIS live turn with the reasoning-control endpoint.
+        let mut emitted_cmpl_id = false;
         // Mid-stream circuit-breaker: a small local model can fall into a repetition
         // attractor and emit the same line forever until it exhausts the (now larger)
         // token budget — the operator watches a wall of identical text. Once a channel's
@@ -649,6 +666,14 @@ impl AgentStep for OpenAiAgent {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                if !emitted_cmpl_id {
+                    if let Some(id) = v["id"].as_str() {
+                        if !id.is_empty() {
+                            emitted_cmpl_id = true;
+                            on_delta(Delta::Completion(id.to_string()));
+                        }
+                    }
+                }
                 let delta = &v["choices"][0]["delta"];
                 if let Some(r) = delta["reasoning_content"].as_str() {
                     if !r.is_empty() {
@@ -1415,6 +1440,60 @@ mod tests {
                 .any(|m| matches!(m, Msg::User(t) if t == "focus on credit-check")),
             "steer must be injected as a user turn: {msgs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_completion_id_delta_is_forwarded_to_the_sink() {
+        // A model whose streaming step surfaces the OpenAI completion id (as the real transport
+        // does from the first SSE chunk). run_agent_streaming must forward it as
+        // AgentEvent::Completion so the host can target the live turn with reasoning control.
+        struct IdModel;
+        impl AgentStep for IdModel {
+            async fn step(&self, _m: &[Msg], _t: &[ToolSpec]) -> Result<Turn, String> {
+                Ok(Turn::Final("done".into()))
+            }
+            async fn step_streaming(
+                &self,
+                _m: &[Msg],
+                _t: &[ToolSpec],
+                on_delta: &mut dyn FnMut(Delta),
+                _c: Option<&std::sync::atomic::AtomicBool>,
+            ) -> Result<Turn, String> {
+                on_delta(Delta::Completion("chatcmpl-xyz".into()));
+                on_delta(Delta::Answer("done".into()));
+                Ok(Turn::Final("done".into()))
+            }
+        }
+        let mut msgs = vec![Msg::System("sys".into()), Msg::User("go".into())];
+        let mut seen: Vec<String> = Vec::new();
+        let mut sink = |ev: AgentEvent| {
+            if let AgentEvent::Completion { id } = ev {
+                seen.push(id);
+            }
+        };
+        run_agent_streaming(&IdModel, &EchoTools, &mut msgs, 3, None, None, &mut sink, None)
+            .await
+            .unwrap();
+        assert_eq!(seen, vec!["chatcmpl-xyz".to_string()]);
+    }
+
+    #[test]
+    fn the_request_body_arms_reasoning_control() {
+        // The agent's generation request must carry reasoning_control:true so the loop monitor /
+        // wrap-up can end the turn's thinking mid-generation via the control endpoint.
+        let cfg = LlmConfig {
+            provider: crate::harness::llm::Provider::Openai,
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            max_tokens: 256,
+            temperature: 0.2,
+            frequency_penalty: 0.0,
+            thinking_level: None,
+        };
+        let agent = OpenAiAgent { cfg };
+        let body = agent.request_body(&[Msg::User("hi".into())], &[], true);
+        assert_eq!(body["reasoning_control"], serde_json::json!(true));
     }
 
     #[tokio::test]

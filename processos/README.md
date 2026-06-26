@@ -156,13 +156,16 @@ re-starting one already up, or starting two that share a port is rejected with a
 (give each sidecar profile its own port in its Base URL). See the [llama endpoints](#endpoints).
 
 **Wrap-up / loop monitor and reasoning control.** When the loop monitor decides a turn is
-spinning (or the operator hits **wrap it up**), ProcessOS sets the per-session cancel flag that
-stops the agent at its next round boundary. If the target endpoint also exposes the optional
-reasoning-control surface (`POST /v1/chat/completions/control` with `{"reasoning_control":true}`),
-ProcessOS additionally issues a best-effort *mid-thinking* halt so the model stops sooner; builds
-without that surface (including the currently-shipping llama.cpp) simply fall back to the
-round-boundary cancel with no change in behaviour. `GET /api/llama/reasoning-control` probes
-whether the active (or a named) profile's endpoint supports it.
+spinning (or the operator hits **wrap it up**), ProcessOS ends the model's *current reasoning
+block mid-generation* so it stops circling and produces its answer now, rather than only stopping
+at the next round boundary. This rides llama.cpp's reasoning-control surface
+([PR #23971](https://github.com/ggml-org/llama.cpp/pull/23971), present in build ≥ b9780): the
+agent arms each turn by sending `reasoning_control: true` on the completion request, then issues
+`POST /v1/chat/completions/control` `{ "id": "<chatcmpl-id>", "action": "reasoning_end" }` keyed on
+the in-flight completion id. When the endpoint is absent (older build) or the turn has no
+completion id yet, ProcessOS falls back to the per-session cancel flag (round-boundary stop) with
+no change in behaviour. `GET /api/llama/reasoning-control` probes whether the active (or a named)
+profile's endpoint supports it.
 
 **First-class `LLM sidecars` nav surface.** The left rail — the principal navigation menu shown
 on every page after the landing page (cockpit and workspaces share it) — carries a first-class

@@ -1,25 +1,41 @@
-//! Optional **reasoning-control surface** probe + best-effort interrupt.
+//! **Reasoning-control surface** (llama.cpp PR #23971, present in build b9780): probe support +
+//! best-effort *mid-generation* reasoning interruption.
 //!
-//! Newer llama.cpp builds may expose a `POST /v1/chat/completions/control` endpoint that, with
-//! `{"reasoning_control": true, ...}`, can halt or steer an in-flight generation **mid-thinking**
-//! (server-side) rather than only at our agent loop's round boundary. When that surface exists we
-//! prefer it for the loop monitor's wrap-up and the operator's "wrap it up" command; when it does
-//! not (the currently-installed build does not), callers gracefully fall back to the existing
-//! cancel/steer mechanism, which only takes effect at a round boundary.
+//! The server exposes `POST /v1/chat/completions/control` which, given the OpenAI completion id
+//! of a live turn, can force the model to **end its current reasoning block** and move on to the
+//! final answer (`action: "reasoning_end"`) — without aborting the turn. This is exactly the
+//! primitive the loop monitor and the operator's "wrap it up" command want when a model is
+//! burning tokens going in circles in its thinking.
 //!
-//! This module never *replaces* the runtime cancel/steer path — it layers on top of it as a
-//! best-effort enhancement, so behaviour is unchanged on builds without the control endpoint.
+//! Two halves of the contract:
+//! 1. **Arm** — the original `POST /v1/chat/completions` must carry `reasoning_control: true` so
+//!    the server creates the on-demand budget sampler for that turn ([`crate::agent`]'s
+//!    `request_body` sets it). Without it the control call returns "reasoning control not enabled".
+//! 2. **Interrupt** — `POST /v1/chat/completions/control` `{ "id": <chatcmpl-id>, "action":
+//!    "reasoning_end" }`, keyed on the completion id (never a slot index — a finished completion
+//!    simply matches nothing, avoiding a TOCTOU).
+//!
+//! Callers always retain the existing cancel/steer path as a fallback: when the endpoint is
+//! absent (older build) or no live completion id is known, behaviour is unchanged.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Map an HTTP status from a control-surface probe to "is this surface supported?".
+/// The only control action the server currently understands: end the reasoning block now.
+pub const ACTION_END_REASONING: &str = "reasoning_end";
+
+/// Does this HTTP status mean the control **route exists** (i.e. the surface is supported)?
 ///
-/// A 2xx means the endpoint exists and accepted the control request. Anything else — most
-/// commonly `404 Not Found` / `405 Method Not Allowed` / `501 Not Implemented` on builds without
-/// the feature, but also any other 4xx/5xx — is treated as unsupported so callers fall back.
-pub fn classify_probe(status: u16) -> bool {
+/// The route is present unless the server 404s / 405s / 501s it. A `400` ("missing completion
+/// id" / "unknown control action") from a deliberately-incomplete probe still proves the route
+/// is wired, so anything outside the "absent" set counts as supported.
+pub fn endpoint_exists(status: u16) -> bool {
+    !matches!(status, 404 | 405 | 501)
+}
+
+/// Did the control endpoint **accept** a real interrupt request? Only a 2xx counts.
+pub fn accepted(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
@@ -29,7 +45,7 @@ fn control_url(base_url: &str) -> String {
     format!("{}/chat/completions/control", base_url.trim_end_matches('/'))
 }
 
-/// Per-`base_url` cache of the probe result, so we pay the round-trip at most once per endpoint.
+/// Per-`base_url` cache of the support probe, so we pay the round-trip at most once per endpoint.
 /// Only **definitive HTTP responses** are cached; transport errors (server not up yet) are not,
 /// so a sidecar that starts later can still be detected on a subsequent call.
 fn cache() -> &'static Mutex<HashMap<String, bool>> {
@@ -55,7 +71,10 @@ fn client() -> Option<reqwest::Client> {
 }
 
 /// Probe whether `base_url` exposes the reasoning-control surface. Cached per endpoint. Returns
-/// `false` on any non-2xx response or transport error (the safe default — callers fall back).
+/// `false` on a 404/405/501 or transport error (the safe default — callers fall back to cancel).
+///
+/// The probe deliberately omits the completion id, so a *supporting* server replies `400
+/// missing completion id` (route exists → supported) while an *older* server replies `404`.
 pub async fn supports_control(base_url: &str) -> bool {
     if base_url.trim().is_empty() {
         return false;
@@ -66,11 +85,10 @@ pub async fn supports_control(base_url: &str) -> bool {
     let Some(client) = client() else {
         return false;
     };
-    // A minimal, side-effect-free probe: ask the surface to acknowledge reasoning control.
-    let body = serde_json::json!({ "reasoning_control": true });
+    let body = serde_json::json!({ "action": ACTION_END_REASONING });
     match client.post(control_url(base_url)).json(&body).send().await {
         Ok(resp) => {
-            let supported = classify_probe(resp.status().as_u16());
+            let supported = endpoint_exists(resp.status().as_u16());
             remember(base_url, supported);
             supported
         }
@@ -79,27 +97,25 @@ pub async fn supports_control(base_url: &str) -> bool {
     }
 }
 
-/// Best-effort mid-generation interrupt via the control surface. `action` is a short verb the
-/// surface understands (e.g. `"wrapup"` to stop thinking and conclude, `"steer"` to redirect).
-/// Returns `true` only if the surface exists *and* accepted the request; on `false` the caller
-/// must fall back to the runtime cancel/steer path.
-pub async fn interrupt(base_url: &str, model: &str, action: &str, note: Option<&str>) -> bool {
-    if !supports_control(base_url).await {
+/// Best-effort *end the reasoning block* of the live completion `completion_id` on `base_url`,
+/// via the control surface. Returns `true` only if the surface exists **and** accepted the
+/// request; on `false` the caller must fall back to the runtime cancel/steer path.
+///
+/// `completion_id` is the `id` (`chatcmpl-…`) from the in-flight streamed response; the original
+/// turn must have been sent with `reasoning_control: true` (see the module docs).
+pub async fn end_reasoning(base_url: &str, completion_id: &str) -> bool {
+    if completion_id.trim().is_empty() || !supports_control(base_url).await {
         return false;
     }
     let Some(client) = client() else {
         return false;
     };
-    let mut body = serde_json::json!({
-        "reasoning_control": true,
-        "model": model,
-        "action": action,
+    let body = serde_json::json!({
+        "id": completion_id,
+        "action": ACTION_END_REASONING,
     });
-    if let (Some(obj), Some(note)) = (body.as_object_mut(), note) {
-        obj.insert("note".into(), serde_json::json!(note));
-    }
     match client.post(control_url(base_url)).json(&body).send().await {
-        Ok(resp) => classify_probe(resp.status().as_u16()),
+        Ok(resp) => accepted(resp.status().as_u16()),
         Err(_) => false,
     }
 }
@@ -109,12 +125,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_probe_accepts_only_2xx() {
-        assert!(classify_probe(200));
-        assert!(classify_probe(202));
-        assert!(classify_probe(299));
-        for s in [301, 400, 404, 405, 500, 501, 503] {
-            assert!(!classify_probe(s), "status {s} should be unsupported");
+    fn endpoint_exists_treats_only_404_405_501_as_absent() {
+        // Present: 2xx, and 4xx that the route itself returns (missing id / unknown action).
+        for s in [200, 202, 400, 401, 403, 422, 500, 503] {
+            assert!(endpoint_exists(s), "status {s} should mean the route exists");
+        }
+        // Absent: the router has no such route / method / it's unimplemented.
+        for s in [404, 405, 501] {
+            assert!(!endpoint_exists(s), "status {s} should mean the route is absent");
+        }
+    }
+
+    #[test]
+    fn accepted_is_2xx_only() {
+        assert!(accepted(200));
+        assert!(accepted(299));
+        for s in [199, 300, 400, 404, 500] {
+            assert!(!accepted(s), "status {s} should not count as accepted");
         }
     }
 
@@ -124,7 +151,6 @@ mod tests {
             control_url("http://127.0.0.1:8080/v1"),
             "http://127.0.0.1:8080/v1/chat/completions/control"
         );
-        // Trailing slash is tolerated (no double slash).
         assert_eq!(
             control_url("http://127.0.0.1:8080/v1/"),
             "http://127.0.0.1:8080/v1/chat/completions/control"
@@ -134,5 +160,10 @@ mod tests {
     #[tokio::test]
     async fn empty_base_url_is_never_supported() {
         assert!(!supports_control("   ").await);
+    }
+
+    #[tokio::test]
+    async fn end_reasoning_without_a_completion_id_is_a_noop() {
+        assert!(!end_reasoning("http://127.0.0.1:1/v1", "  ").await);
     }
 }

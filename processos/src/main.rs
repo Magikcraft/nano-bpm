@@ -65,6 +65,11 @@ use nanobpmn_engine_core::bpmn::parse_bpmn;
 type SteerQueues =
     std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Vec<String>>>>>;
 
+/// Per-session live completion ids (`chatcmpl-…`): the in-flight turn's id, used to target it
+/// with the reasoning-control endpoint (end its thinking mid-generation).
+type CompletionIds =
+    std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<Option<String>>>>>;
+
 #[derive(Clone)]
 struct AppState {
     /// The client's production engine — the read-only analysis TARGET. Traces,
@@ -110,6 +115,11 @@ struct AppState {
     /// control appends an operator instruction; the agent loop drains it at the next round
     /// boundary and injects it as a user turn, redirecting an investigation without restarting it.
     chat_steers: Arc<SteerQueues>,
+    /// Live OpenAI completion ids (`chatcmpl-…`) for in-flight chat turns, keyed by session. The
+    /// streaming agent sets the inner cell as soon as the first chunk carries the id; the wrap-up
+    /// handler and the loop monitor read it to target the live turn with the reasoning-control
+    /// endpoint (end its thinking mid-generation). Cleared once the turn ends.
+    chat_cmpl_ids: Arc<CompletionIds>,
     /// The exact model request bodies sent during each session's most recent turn, keyed by
     /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
     /// (not persisted) — it shows what was last sent and is cleared on restart.
@@ -348,6 +358,7 @@ async fn main() {
         )),
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_cmpl_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         llama: llama::LlamaManager::new(),
@@ -1574,8 +1585,16 @@ async fn run_loop_monitor(
     cancel: Arc<std::sync::atomic::AtomicBool>,
     live: LiveTurn,
     done: Arc<std::sync::atomic::AtomicBool>,
+    // Endpoint of the PRIMARY model this monitor governs (for the reasoning-control call).
+    primary_base_url: String,
+    // The primary turn's live completion id (`chatcmpl-…`), set once it starts replying.
+    primary_cmpl_id: Arc<std::sync::Mutex<Option<String>>>,
 ) {
     use std::sync::atomic::Ordering;
+    // Read the primary's current live completion id, if it has started replying.
+    let live_cmpl = |cell: &Arc<std::sync::Mutex<Option<String>>>| -> Option<String> {
+        cell.lock().ok().and_then(|c| c.clone())
+    };
     let mut policy = monitor::MonitorPolicy::new(MONITOR_MAX_STEERS);
     let mut last_window = String::new();
     loop {
@@ -1602,6 +1621,11 @@ async fn run_loop_monitor(
                 if let Ok(mut q) = steer.lock() {
                     q.push(format!("[loop monitor] {text}"));
                 }
+                // If the primary supports reasoning control, end its current (circling) thinking
+                // now so the steer lands sooner instead of waiting out the whole think budget.
+                if let Some(id) = live_cmpl(&primary_cmpl_id) {
+                    let _ = crate::reasoning::end_reasoning(&primary_base_url, &id).await;
+                }
                 live.emit(serde_json::json!({
                     "type": "monitor",
                     "action": "steer",
@@ -1611,16 +1635,11 @@ async fn run_loop_monitor(
             }
             monitor::MonitorAction::WrapUp(reason) => {
                 cancel.store(true, Ordering::Relaxed);
-                // Best-effort mid-thinking halt via the reasoning-control surface when present;
-                // the cancel flag remains the round-boundary fallback on builds without it.
-                if cfg.is_ready() {
-                    let _ = crate::reasoning::interrupt(
-                        &cfg.base_url,
-                        &cfg.model,
-                        "wrapup",
-                        Some("loop monitor requested wrap-up"),
-                    )
-                    .await;
+                // Prefer a mid-thinking halt via the reasoning-control surface (ends the live
+                // turn's reasoning so it answers now); the cancel flag is the round-boundary
+                // fallback on builds without the surface or before the turn has a completion id.
+                if let Some(id) = live_cmpl(&primary_cmpl_id) {
+                    let _ = crate::reasoning::end_reasoning(&primary_base_url, &id).await;
                 }
                 live.emit(serde_json::json!({
                     "type": "monitor",
@@ -2203,6 +2222,12 @@ async fn cockpit_chat_stream(
     if let Ok(mut m) = state.chat_steers.lock() {
         m.insert(cancel_key.clone(), steer.clone());
     }
+    // Register a cell for this turn's live completion id (`chatcmpl-…`), set by the streaming sink
+    // once the model starts replying, so wrap-up / the monitor can end its thinking mid-generation.
+    let cmpl_id = Arc::new(std::sync::Mutex::new(None::<String>));
+    if let Ok(mut m) = state.chat_cmpl_ids.lock() {
+        m.insert(cancel_key.clone(), cmpl_id.clone());
+    }
 
     // Register a live event buffer so the streaming response — and any later reattach after a
     // page reload — can replay this turn's events. The agent task pushes here regardless of
@@ -2229,6 +2254,10 @@ async fn cockpit_chat_stream(
             cancel.clone(),
             live.clone(),
             monitor_done.clone(),
+            // The monitor controls the PRIMARY turn: it must target the primary endpoint + the
+            // primary's live completion id for the reasoning-control "end thinking" call.
+            cfg.base_url.clone(),
+            cmpl_id.clone(),
         ));
     }
 
@@ -2240,6 +2269,7 @@ async fn cockpit_chat_stream(
     let task_cancel_key = cancel_key.clone();
     let task_live = live.clone();
     let task_monitor_done = monitor_done.clone();
+    let task_cmpl_id = cmpl_id.clone();
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2281,9 +2311,18 @@ async fn cockpit_chat_stream(
         // forwarding each over the wire so the tab can update live.
         let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let dbg_for_sink = dbg.clone();
+        let cmpl_for_sink = task_cmpl_id.clone();
         let mut sink = move |ev: agent::AgentEvent| {
             let v = match ev {
                 agent::AgentEvent::Round(n) => serde_json::json!({ "type": "round", "n": n }),
+                agent::AgentEvent::Completion { id } => {
+                    // Stash the live completion id so wrap-up / the monitor can target this turn
+                    // with the reasoning-control endpoint. Not forwarded to the cockpit (internal).
+                    if let Ok(mut c) = cmpl_for_sink.lock() {
+                        *c = Some(id);
+                    }
+                    return;
+                }
                 agent::AgentEvent::Request { round, body } => {
                     let ts = chat_now_ms();
                     if let Ok(mut d) = dbg_for_sink.lock() {
@@ -2359,6 +2398,9 @@ async fn cockpit_chat_stream(
         if let Ok(mut m) = task_state.chat_steers.lock() {
             m.remove(&task_cancel_key);
         }
+        if let Ok(mut m) = task_state.chat_cmpl_ids.lock() {
+            m.remove(&task_cancel_key);
+        }
         // Drop the live buffer last: any consumers still attached hold their own Arc clones and
         // already saw the terminal event, so this only stops *new* reattachers (which then fall
         // back to the now-complete persisted transcript).
@@ -2405,18 +2447,21 @@ async fn cockpit_chat_wrapup(
     match flagged {
         Some(flag) => {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            // Best-effort: if the active sidecar exposes the reasoning-control surface, also halt
-            // it mid-thinking now instead of only at the next round boundary. Unsupported builds
-            // (the common case today) no-op and the cancel flag above remains the guarantee.
-            let cfg = resolve_llm(&state, None);
-            if cfg.is_ready() {
-                let _ = reasoning::interrupt(
-                    &cfg.base_url,
-                    &cfg.model,
-                    "wrapup",
-                    Some("operator requested wrap-up"),
-                )
-                .await;
+            // Prefer a mid-thinking halt via the reasoning-control surface: end the live turn's
+            // reasoning now (it answers immediately) rather than only stopping at the next round
+            // boundary. Falls back to the cancel flag above when there's no live completion id yet
+            // or the endpoint is an older build without the surface.
+            let cmpl = state
+                .chat_cmpl_ids
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&cancel_key).cloned())
+                .and_then(|c| c.lock().ok().and_then(|v| v.clone()));
+            if let Some(id) = cmpl {
+                let cfg = resolve_llm(&state, None);
+                if cfg.is_ready() {
+                    let _ = reasoning::end_reasoning(&cfg.base_url, &id).await;
+                }
             }
             StatusCode::ACCEPTED.into_response()
         }
