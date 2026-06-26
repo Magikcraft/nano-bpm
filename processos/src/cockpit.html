@@ -2101,30 +2101,47 @@ async function ensureSidecarsReady(){
   let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return true; }
   const running = new Set((st.sidecars||[]).map(x => x.profileId));
   const missing = [...needed.values()].filter(p => !running.has(p.id));
+  const hint = $('#chatHint');
+  const say = (t) => { if(hint) hint.textContent = t; };
   if(missing.length){
     const names = missing.map(p => p.name||p.id).join(' + ');
     const word = missing.length>1 ? 'Sidecars' : 'Sidecar';
-    if(!window.confirm(word+' not started: '+names+'. Start '+(missing.length>1?'them':'it')+' now?')) return false;
+    if(!window.confirm(word+' not started: '+names+'. Start '+(missing.length>1?'them':'it')+' now?')){
+      say('Message not sent — '+(missing.length>1?'sidecars':'sidecar')+' not started.');
+      return false;
+    }
     for(const p of missing){
+      say('Starting sidecar '+(p.name||p.id)+'…');
       try { await api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId: p.id})}); }
-      catch(e){ window.alert('Could not start '+(p.name||p.id)+': '+(e.message||e)); return false; }
+      catch(e){ say(''); window.alert('Could not start '+(p.name||p.id)+': '+(e.message||e)); return false; }
     }
     refreshLlamaDot();
   }
-  // Wait for each needed sidecar's model to finish loading before sending.
-  for(const p of needed.values()){ await waitForSidecarReady(undefined, p.id); }
+  // Wait for each needed sidecar's model to finish loading before sending. This can take a while
+  // for large models, so show ongoing status instead of leaving the operator staring at silence.
+  for(const p of needed.values()){
+    const label = p.name||p.id;
+    say('Waiting for '+label+' to load its model… (large models can take a minute or two)');
+    const ok = await waitForSidecarReady(undefined, p.id, (secs) => {
+      say('Waiting for '+label+' to load its model… '+secs+'s (large models can take a minute or two)');
+    });
+    if(!ok) say(label+' is taking longer than expected — sending anyway; it may report a load error.');
+  }
   refreshLlamaDot();
   return true;
 }
 // Poll /api/llama/ready until a sidecar answers its health probe (model loaded), or a timeout.
-// `profileId` targets a specific sidecar. Returns true once ready; false on timeout (the caller
-// proceeds anyway so the chat call can report a precise error if it's still not up).
-async function waitForSidecarReady(timeoutMs, profileId){
-  const deadline = Date.now() + (timeoutMs || 120000);
+// `profileId` targets a specific sidecar. `onTick(elapsedSeconds)` (optional) is called each poll so
+// the caller can surface progress. Returns true once ready; false on timeout (the caller proceeds
+// anyway so the chat call can report a precise error if it's still not up).
+async function waitForSidecarReady(timeoutMs, profileId, onTick){
+  const start = Date.now();
+  const deadline = start + (timeoutMs || 120000);
   const qs = profileId ? ('?profileId='+encodeURIComponent(profileId)) : '';
   while(Date.now() < deadline){
     let r; try { r = await api('/api/llama/ready'+qs); } catch(e){ r = null; }
     if(r && r.ready) return true;
+    if(typeof onTick === 'function') onTick(Math.round((Date.now()-start)/1000));
     await new Promise(res => setTimeout(res, 1500));
   }
   return false;
