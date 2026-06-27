@@ -295,6 +295,30 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     }
                                 }
                             }
+                            // An ad-hoc sub-process — notably the Camunda 8 agentic
+                            // AI agent (`io.camunda.agenticai:aiagent-job-worker`),
+                            // which carries its own zeebe:taskDefinition. At the
+                            // parent token-flow level it behaves as a single
+                            // job-bearing activity: the ad-hoc worker activates, runs
+                            // and its outgoing flow fires on completion. The
+                            // contained "tool" activities are invoked out-of-band by
+                            // the worker (dynamically, not by token flow), so they are
+                            // parsed into the ad-hoc scope and pruned at build time —
+                            // leaving the ad-hoc itself as one Service job (type from
+                            // its taskDefinition, else its id). Push its scope so any
+                            // contained elements are tagged for pruning.
+                            "adHocSubProcess" => {
+                                let idx = acc.add_node(attrs, NodeKind::Service);
+                                if let Some(i) = idx {
+                                    acc.nodes[i].is_adhoc = true;
+                                }
+                                if !self_closing {
+                                    cur_service_task = idx;
+                                    if let Some(id) = attr(attrs, "id") {
+                                        acc.scope_stack.push(id.to_string());
+                                    }
+                                }
+                            }
                             "boundaryEvent" => {
                                 // Buffered until end: kept only if it carries an
                                 // errorEventDefinition (error boundary), a
@@ -457,6 +481,12 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         acc.scope_stack.pop();
                     }
                 }
+                "adHocSubProcess" => {
+                    if let Some(acc) = current.as_mut() {
+                        acc.scope_stack.pop();
+                    }
+                    cur_service_task = None;
+                }
                 "startEvent" => cur_start = None,
                 "message" => cur_message = None,
                 "boundaryEvent" => {
@@ -567,6 +597,9 @@ struct NodeAcc {
     /// For user tasks: the raw assignment/scheduling/priority expressions parsed
     /// from the Zeebe extension elements.
     user_task: crate::model::UserTaskProps,
+    /// True for an `adHocSubProcess`: kept as a single Service job activity while
+    /// its contained elements are pruned at build (see `build`).
+    is_adhoc: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -651,6 +684,7 @@ impl ProcessAcc {
             timer_repeating: None,
             parent: self.scope_stack.last().cloned(),
             user_task: crate::model::UserTaskProps::default(),
+            is_adhoc: false,
         });
         Some(self.nodes.len() - 1)
     }
@@ -676,6 +710,54 @@ impl ProcessAcc {
         errors: &HashMap<String, String>,
         messages: &HashMap<String, MessageDecl>,
     ) -> Result<ProcessDefinition, ParseError> {
+        // Ad-hoc sub-processes are kept as a single Service job activity; the
+        // elements they contain (agent "tools", invoked out-of-band rather than by
+        // token flow) are pruned, along with any sequence flows or boundary events
+        // that reference them. A node is pruned when its parent chain reaches an
+        // ad-hoc node, so nesting at any depth is handled.
+        let adhoc_ids: std::collections::HashSet<String> = self
+            .nodes
+            .iter()
+            .filter(|n| n.is_adhoc)
+            .map(|n| n.id.clone())
+            .collect();
+        if !adhoc_ids.is_empty() {
+            let parent_of: HashMap<&str, &str> = self
+                .nodes
+                .iter()
+                .filter_map(|n| n.parent.as_deref().map(|p| (n.id.as_str(), p)))
+                .collect();
+            let inside_adhoc = |id: &str| -> bool {
+                let mut cur = parent_of.get(id).copied();
+                while let Some(p) = cur {
+                    if adhoc_ids.contains(p) {
+                        return true;
+                    }
+                    cur = parent_of.get(p).copied();
+                }
+                false
+            };
+            let pruned: std::collections::HashSet<String> = self
+                .nodes
+                .iter()
+                .filter(|n| inside_adhoc(&n.id))
+                .map(|n| n.id.clone())
+                .collect();
+            if !pruned.is_empty() {
+                self.nodes.retain(|n| !pruned.contains(&n.id));
+                self.flows.retain(|f| {
+                    let keep = |o: &Option<String>| o.as_ref().map(|s| !pruned.contains(s)).unwrap_or(true);
+                    keep(&f.source) && keep(&f.target)
+                });
+                self.boundaries.retain(|b| {
+                    b.attached_to
+                        .as_ref()
+                        .map(|a| !pruned.contains(a))
+                        .unwrap_or(true)
+                });
+            }
+        }
+
         // A process may declare more than one start event (e.g. a "refresh batch"
         // and a "manual intake" start that merge downstream). The engine begins an
         // instance at a single process-level start event, so designate one — a
@@ -1273,6 +1355,55 @@ mod tests {
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
+    }
+
+    #[test]
+    fn should_parse_an_adhoc_subprocess_as_a_single_job_and_prune_its_tools() {
+        // given: the Camunda 8 agentic AI-agent shape — an <adHocSubProcess> that
+        // carries its own zeebe:taskDefinition and contains "tool" activities the
+        // worker invokes out-of-band (not by token flow).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:adHocSubProcess id="agent" name="Agentic investigation">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="io.camunda.agenticai:aiagent-job-worker:1" />
+                </bpmn:extensionElements>
+                <bpmn:serviceTask id="tool_issue_credit">
+                  <bpmn:extensionElements>
+                    <zeebe:taskDefinition type="io.camunda:http-json:1" />
+                  </bpmn:extensionElements>
+                </bpmn:serviceTask>
+                <bpmn:userTask id="tool_review" />
+                <bpmn:exclusiveGateway id="tool_gw" />
+                <bpmn:sequenceFlow id="t1" sourceRef="tool_review" targetRef="tool_gw" />
+              </bpmn:adHocSubProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the ad-hoc sub-process is one Service job (type from its own
+        // taskDefinition), wired into the parent flow s -> agent -> e.
+        assert_eq!(
+            def.element("agent").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "io.camunda.agenticai:aiagent-job-worker:1".to_string(),
+                priority: None,
+            }
+        );
+        assert_eq!(def.element("s").unwrap().outgoing[0].to, "agent");
+        assert_eq!(def.element("agent").unwrap().outgoing[0].to, "e");
+        // and: the contained tool activities (and their internal flow) are pruned.
+        assert!(def.element("tool_issue_credit").is_none());
+        assert!(def.element("tool_review").is_none());
+        assert!(def.element("tool_gw").is_none());
     }
 
     #[test]
