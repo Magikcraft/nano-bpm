@@ -65,12 +65,40 @@ jobs:
           cache: npm
           cache-dependency-path: console/package-lock.json
 
+      # Needed to regenerate the in-browser μ-nano test-run engine from source
+      # (engine-wasm -> console/src/wasm) so the distribution ships a freshly
+      # release-built wasm rather than whatever artifact happens to be committed.
+      - name: Install Rust toolchain (wasm32)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: console-wasm
+          workspaces: engine-wasm
+
+      - name: Install wasm-pack
+        shell: bash
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
       - name: Generate REST layer + stubs
         shell: bash
         run: |
           set -euo pipefail
           uv sync
           make generate
+
+      # Rebuild μ-nano (wasm-pack --release) BEFORE the SPA build so the fresh
+      # wasm is bundled into console/dist. `make console-wasm` fails the job if
+      # wasm-pack is missing rather than silently falling back to the committed
+      # artifact, because here we always want a freshly built release wasm.
+      - name: Rebuild μ-nano wasm (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v wasm-pack >/dev/null || { echo "wasm-pack not found" >&2; exit 1; }
+          make console-wasm
 
       - name: Build web console
         shell: bash
