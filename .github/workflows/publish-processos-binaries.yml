@@ -1,0 +1,149 @@
+# Cross-compiles ProcessOS for all five targets and attaches them to the GitHub
+# Release for the pushed tag IN THIS (private) repo — so ProcessOS binaries are
+# distributed to people with access to jwulf/nano-bpm and are NEVER exposed on
+# the public plugin repo (jwulf/c8ctl-plugin-nano) the gateway publishes to.
+#
+# Why a separate workflow from publish-c8ctl-binaries.yml
+# -------------------------------------------------------
+# * Different artifact (`processos`, not the gateway server) and different
+#   destination (this private repo's releases, not the public plugin repo).
+# * ProcessOS needs no codegen/console `prepare` step: it depends only on the
+#   in-tree `engine-core` path crate and single-sources its User Guide from its
+#   own committed `processos/USERGUIDE.md` at build time. So the matrix legs
+#   only need Rust (plus a C/C++ cross toolchain for the bundled DuckDB).
+#
+# Why a C++ cross toolchain
+# -------------------------
+# ProcessOS embeds DuckDB with the `bundled` feature, which compiles DuckDB's
+# C++ amalgamation. Native legs use the host compiler; the linux arm64 cross leg
+# needs `g++-aarch64-linux-gnu` and links through it so libstdc++ resolves.
+#
+# Auth: uses the default GITHUB_TOKEN (contents: write on this repo) — no PAT.
+
+name: Publish ProcessOS binaries
+
+on:
+  push:
+    tags: ['v*']          # cut ProcessOS binaries on each tagged nanobpmn release
+  workflow_dispatch:
+
+concurrency:
+  group: publish-processos-binaries
+  cancel-in-progress: false
+
+permissions:
+  contents: write          # create/upload releases on this private repo
+
+env:
+  BIN_NAME: processos
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            asset: processos-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            asset: processos-darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            asset: processos-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            asset: processos-linux-arm64
+            apt: g++-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-g++
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            asset: processos-win32-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: processos
+
+      - name: Install cross C/C++ toolchain (linux arm64)
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build ProcessOS (release, cross-target)
+        shell: bash
+        working-directory: processos
+        env:
+          # Link through the matching cross g++ so the bundled DuckDB's C++
+          # runtime (libstdc++) resolves; ignored when unset (native legs).
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: |
+          set -euo pipefail
+          cargo build --release --target "${{ matrix.target }}" --bin "$BIN_NAME"
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="processos/target/${{ matrix.target }}/release/${BIN_NAME}"
+          if [ -f "${src}.exe" ]; then
+            src="${src}.exe"
+          fi
+          mkdir -p dist
+          cp "$src" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          retention-days: 1
+
+  publish:
+    name: Attach binaries to the release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: processos-*
+          merge-multiple: true
+
+      # Attach to the release for the pushed tag (created if absent) in THIS
+      # private repo. A manual `workflow_dispatch` run (no tag) falls back to a
+      # rolling `processos-binaries` prerelease so the build is still useful.
+      - name: Upload assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            rel="${GITHUB_REF_NAME}"
+            gh release view "$rel" >/dev/null 2>&1 || \
+              gh release create "$rel" \
+                --title "$rel" \
+                --notes "ProcessOS binaries for $rel (private — Nano BPM access only)." \
+                --verify-tag
+          else
+            rel="processos-binaries"
+            gh release view "$rel" >/dev/null 2>&1 || \
+              gh release create "$rel" \
+                --title "ProcessOS binaries (rolling)" \
+                --notes "Prebuilt ProcessOS binaries from manual runs. Auto-updated." \
+                --latest=false \
+                --prerelease
+          fi
+          gh release upload "$rel" dist/* --clobber
