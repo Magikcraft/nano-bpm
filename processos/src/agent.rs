@@ -951,17 +951,45 @@ fn parse_leaked_tool_calls(content: &str) -> Vec<ToolCall> {
 /// Recover Hermes/Qwen-style XML tool calls leaked into `content`:
 /// `<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>`.
 /// Also accepts a JSON body (`<tool_call>{"name":…,"arguments":{…}}</tool_call>`).
+///
+/// Qwen3-Coder-30B intermittently drops the opening `<tool_call>` wrapper, emitting a
+/// bare `<function=NAME>…</function>` (often trailed by a stray `</tool_call>`). So the
+/// XML form is anchored directly on `<function=` rather than on the wrapper, which makes
+/// recovery robust to a missing (or duplicated) `<tool_call>` tag.
 fn parse_hermes_tool_calls(content: &str) -> Vec<ToolCall> {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
+    const FN_OPEN: &str = "<function=";
+    const FN_CLOSE: &str = "</function>";
     let mut calls = Vec::new();
-    let mut rest = content;
     let mut idx = 0usize;
+
+    // 1) JSON-body calls wrapped in <tool_call>{…}</tool_call>. (XML-body calls are
+    //    handled by the <function=-anchored pass below, so only JSON segments here.)
+    let mut rest = content;
     while let Some(start) = rest.find(OPEN) {
         let after_open = &rest[start + OPEN.len()..];
         let (segment, consumed) = match after_open.find(CLOSE) {
             Some(end) => (&after_open[..end], start + OPEN.len() + end + CLOSE.len()),
             None => (after_open, rest.len()),
+        };
+        let seg = segment.trim();
+        if seg.starts_with('{') {
+            if let Some(call) = parse_hermes_segment(seg, idx) {
+                calls.push(call);
+                idx += 1;
+            }
+        }
+        rest = &rest[consumed..];
+    }
+
+    // 2) XML `<function=NAME>…</function>` blocks, with or without the <tool_call> wrapper.
+    let mut rest = content;
+    while let Some(start) = rest.find(FN_OPEN) {
+        let region = &rest[start..];
+        let (segment, consumed) = match region.find(FN_CLOSE) {
+            Some(end) => (&region[..end + FN_CLOSE.len()], start + end + FN_CLOSE.len()),
+            None => (region, rest.len()),
         };
         if let Some(call) = parse_hermes_segment(segment.trim(), idx) {
             calls.push(call);
@@ -969,6 +997,7 @@ fn parse_hermes_tool_calls(content: &str) -> Vec<ToolCall> {
         }
         rest = &rest[consumed..];
     }
+
     calls
 }
 
@@ -1032,8 +1061,9 @@ fn parse_hermes_segment(segment: &str, idx: usize) -> Option<ToolCall> {
     })
 }
 
-/// Remove any leaked tool-call markup spans (both the `<|tool_call>…<tool_call|>` template form
-/// and the Hermes `<tool_call>…</tool_call>` XML form) from a final answer, returning the trimmed
+/// Remove any leaked tool-call markup spans (the `<|tool_call>…<tool_call|>` template form,
+/// the Hermes `<tool_call>…</tool_call>` XML form, and bare `<function=…></function>` blocks
+/// that Qwen3-Coder leaks without the wrapper) from a final answer, returning the trimmed
 /// remainder. Used to keep a forced wrap-up from ending on a wall of raw markup when the model
 /// emits a tool call despite being told to answer in prose.
 fn strip_leaked_tool_markup(s: &str) -> String {
@@ -1042,7 +1072,8 @@ fn strip_leaked_tool_markup(s: &str) -> String {
     loop {
         let tmpl = rest.find("<|tool_call>");
         let hermes = rest.find("<tool_call>");
-        let Some(start) = [tmpl, hermes].into_iter().flatten().min() else {
+        let bare_fn = rest.find("<function=");
+        let Some(start) = [tmpl, hermes, bare_fn].into_iter().flatten().min() else {
             out.push_str(rest);
             break;
         };
@@ -1052,10 +1083,22 @@ fn strip_leaked_tool_markup(s: &str) -> String {
             tail.find("<tool_call|>")
                 .map(|e| e + "<tool_call|>".len())
                 .unwrap_or(tail.len())
-        } else {
+        } else if tail.starts_with("<tool_call>") {
             tail.find("</tool_call>")
                 .map(|e| e + "</tool_call>".len())
                 .unwrap_or(tail.len())
+        } else {
+            // Bare `<function=…></function>` (no wrapper). Consume through the closing
+            // `</function>`, then also swallow a trailing stray `</tool_call>` if present.
+            let mut end = tail
+                .find("</function>")
+                .map(|e| e + "</function>".len())
+                .unwrap_or(tail.len());
+            let after = tail[end..].trim_start();
+            if let Some(stray) = after.strip_prefix("</tool_call>") {
+                end = tail.len() - stray.len();
+            }
+            end
         };
         rest = &tail[consumed..];
     }
@@ -1665,6 +1708,41 @@ mod tests {
     }
 
     #[test]
+    fn recovers_a_bare_function_call_without_the_tool_call_wrapper() {
+        // Verbatim shape observed from Qwen3-Coder-30B in Investigation 2: the model dropped the
+        // opening `<tool_call>` tag and emitted a bare `<function=…></function>` (with a stray
+        // closing `</tool_call>`). Earlier this leaked as content and the loop stalled, so the
+        // operator saw the model "unable to use the tools".
+        let leaked = "I'll try again to read the model structure.\n\n<function=read_model>\n</function>\n</tool_call>";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_model");
+        assert!(calls[0].arguments.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovers_a_bare_function_call_with_parameters() {
+        let leaked =
+            "<function=simulate>\n<parameter=limit>\n25\n</parameter>\n<parameter=name>\nbaseline\n</parameter>\n</function>";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "simulate");
+        assert_eq!(calls[0].arguments["limit"], 25);
+        assert_eq!(calls[0].arguments["name"], "baseline");
+    }
+
+    #[test]
+    fn does_not_double_count_a_wrapped_xml_call() {
+        // A properly wrapped XML call must still yield exactly one call (the JSON pass skips it,
+        // the <function=-anchored pass claims it once).
+        let leaked =
+            "<tool_call><function=read_model></function></tool_call>";
+        let calls = parse_leaked_tool_calls(leaked);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_model");
+    }
+
+    #[test]
     fn strip_leaked_tool_markup_clears_a_hermes_block_but_keeps_prose() {
         let answer = "Here is my conclusion.\n<tool_call>\n<function=simulate>\n<parameter=limit>\n25\n</parameter>\n</function>\n</tool_call>";
         assert_eq!(strip_leaked_tool_markup(answer), "Here is my conclusion.");
@@ -1672,6 +1750,9 @@ mod tests {
         let only =
             "<tool_call><function=simulate><parameter=limit>25</parameter></function></tool_call>";
         assert_eq!(strip_leaked_tool_markup(only), "");
+        // The bare (wrapper-less) Qwen3-Coder form is also stripped, stray </tool_call> included.
+        let bare = "Done.\n<function=read_model>\n</function>\n</tool_call>";
+        assert_eq!(strip_leaked_tool_markup(bare), "Done.");
         // Plain prose is untouched.
         assert_eq!(strip_leaked_tool_markup("just prose"), "just prose");
     }
