@@ -61,7 +61,10 @@
   },
 
   "inputs": [
-    { "weight": 1.0, "vars": {}, "expectedOutcome": "completed" }
+    { "weight": 0.55, "vars": { "chStatusDisposition": "continue", "approvalLevel": "ANALYST" }, "expectedOutcome": "completed" },
+    { "weight": 0.20, "vars": { "chStatusDisposition": "continue", "approvalLevel": "SENIOR_MANAGER" }, "expectedOutcome": "completed" },
+    { "weight": 0.15, "vars": { "chStatusDisposition": "continue", "approvalLevel": "SENIOR_MANAGER", "newRiskTier": "HIGH" }, "expectedOutcome": "completed" },
+    { "weight": 0.10, "vars": { "chStatusDisposition": "continue", "approvalLevel": "MLRO" }, "expectedOutcome": "completed" }
   ],
 
   "plantedFault": {
