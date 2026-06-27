@@ -868,8 +868,6 @@ fn guide_shell(page: &GuidePage) -> String {
     </nav>
     <main class="content">
       {body}
-      <p class="source-note">Generated from <code>processos/README.md</code> at build time.
-        <a href="{repo}README.md">Edit on GitHub →</a></p>
     </main>
   </div>
 </body>
@@ -878,7 +876,6 @@ fn guide_shell(page: &GuidePage) -> String {
         subtitle = subtitle,
         nav = guide_nav(page.slug),
         body = page.body,
-        repo = "https://github.com/jwulf/nano-bpm/blob/main/processos/",
     )
 }
 
