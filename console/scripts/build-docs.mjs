@@ -174,6 +174,10 @@ function shell(page) {
       .nbpm-bar .dot { width: 0.6rem; height: 0.6rem; border-radius: 9999px;
         background: linear-gradient(135deg, #34d399, #38bdf8); }
       .nbpm-bar .sub { color: var(--muted); font-size: 0.85rem; }
+      .nbpm-bar .badge { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.1em;
+        text-transform: uppercase; color: var(--accent); padding: 0.15rem 0.5rem;
+        border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 9999px;
+        background: color-mix(in srgb, var(--accent) 10%, transparent); white-space: nowrap; }
       .nbpm-bar .spacer { flex: 1; }
       .nbpm-bar a.x { color: var(--accent); text-decoration: none; font-size: 0.85rem; }
       .nbpm-bar a.x:hover { text-decoration: underline; }
@@ -223,6 +227,7 @@ function shell(page) {
   <body>
     <div class="nbpm-bar">
       <a class="brand" href="/"><span class="dot"></span><strong>Nano BPM</strong></a>
+      <span class="badge">Advanced Research Prototype</span>
       <span class="sub">${subtitle}</span>
       <span class="spacer"></span>
       <a class="x" href="/swagger">REST API</a>

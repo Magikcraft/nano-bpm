@@ -27,6 +27,9 @@ export default function App() {
           <a href="/" className="block no-underline">
             <div className="text-lg font-semibold tracking-tight text-zinc-100">nano BPM</div>
             <div className="text-xs text-zinc-500">single-node console</div>
+            <div className="mt-2 inline-block rounded-full border border-violet-400/40 bg-violet-400/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-violet-300">
+              Advanced Research Prototype
+            </div>
           </a>
         </div>
         <nav className="flex flex-col gap-1 px-3">
