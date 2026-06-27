@@ -1444,7 +1444,7 @@ async function renderWorkspace(ws, proc){
             </span>
             <button class="btn ghost" id="chatReset" title="Forget this conversation" style="margin-left:auto">Reset</button>
           </div>
-          <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…"></textarea>
+          <textarea id="chatBox" placeholder="Ask the droid to investigate this dataset…  (Enter to send · Shift+Enter for a new line)"></textarea>
           <div class="compose-actions">
             <span class="split">
               <button class="btn primary" id="chatSend">Investigate with the droid →</button>
@@ -1484,6 +1484,8 @@ async function renderWorkspace(ws, proc){
   $('#wsObjSave').onclick = () => saveObjective(ws, proc, p);
   $('#chatBox').addEventListener('keydown', e => {
     if((e.metaKey||e.ctrlKey) && e.key==='Enter'){ e.preventDefault(); submitCompose(ws, proc); return; }
+    // Plain Enter sends; Shift+Enter inserts a newline (falls through to default).
+    if(e.key==='Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey){ e.preventDefault(); submitCompose(ws, proc); return; }
     const box = e.target;
     // Shell-style history: Up recalls earlier prompts only when the caret is on the
     // first line; Down moves forward only when it's on the last line. A plain caret
