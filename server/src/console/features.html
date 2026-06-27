@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Nano BPM · Features &amp; comparison</title>
+    <title>Nano BPM · A Rust BPMN research engine</title>
     <style>
       :root {
         --emerald: #34d399;
@@ -330,10 +330,14 @@
     <div class="hero">
       <h1>Why Nano BPM</h1>
       <p>
-        A from-first-principles BPMN engine in a single Rust binary: orders of
-        magnitude lighter than a JVM stack, a Camunda-compatible API and
-        execution superset, and an auto-scaling distributed architecture that
-        doesn&rsquo;t collapse under client over-provisioning.
+        Nano BPM is an advanced research prototype &mdash; a BPMN orchestration
+        engine written from first principles in Rust to explore what becomes
+        possible without the JVM stack: how fast execution can get, how small
+        the footprint can be (it even compiles to WASM and runs in a browser),
+        and how a process engine can auto-scale without collapsing under load.
+        It speaks a Camunda-compatible API so it can reuse the existing tooling
+        ecosystem and be measured against a mature engine. It is a research
+        prototype &mdash; a place to explore ideas, not a production system.
       </p>
     </div>
 
@@ -345,7 +349,7 @@
             <a href="#low-resource">Extremely low resource</a>
             <ul>
               <li><a href="#wasm">Runs in the browser &amp; on phones</a></li>
-              <li><a href="#binary-size">Binary size vs Camunda</a></li>
+              <li><a href="#binary-size">Binary size</a></li>
               <li><a href="#memory">Memory footprint</a></li>
             </ul>
           </li>
@@ -353,7 +357,7 @@
             <a href="#performance">High performance &amp; durable</a>
             <ul>
               <li><a href="#clustering">HA / FT clustering</a></li>
-              <li><a href="#throughput">Throughput &amp; latency vs Camunda</a></li>
+              <li><a href="#throughput">Throughput &amp; latency</a></li>
               <li><a href="#durability">Durability model</a></li>
             </ul>
           </li>
@@ -365,7 +369,7 @@
             </ul>
           </li>
           <li>
-            <a href="#dropin">Drop-in replacement for Camunda</a>
+            <a href="#dropin">Camunda-compatible API surface</a>
           </li>
           <li>
             <a href="#more">More that&rsquo;s built in</a>
@@ -409,7 +413,7 @@
             the edge, not just in a data centre.
           </p>
 
-          <h3 id="binary-size">Binary size vs Camunda</h3>
+          <h3 id="binary-size">Binary size &mdash; the whole platform</h3>
           <table>
             <thead>
               <tr><th>Footprint</th><th class="nano">Nano BPM</th><th>Camunda 8 (self-managed)</th></tr>
@@ -478,7 +482,7 @@
             <li><strong>Any node is a gateway</strong> &mdash; a client connected to one node addresses the whole cluster (create placement, by-key mutations, cross-node job aggregation, reads all forward to the owning leader).</li>
           </ul>
 
-          <h3 id="throughput">Performance comparison with Camunda &mdash; throughput &amp; latency</h3>
+          <h3 id="throughput">Throughput &amp; latency &mdash; exploring the performance ceiling</h3>
           <div class="stats">
             <div class="stat"><div class="n">~27,800</div><div class="l">instances/s, single node (p99 191 ms)</div></div>
             <div class="stat"><div class="n">77 ms</div><div class="l">best p99 tail (@ ~9k inst/s)</div></div>
@@ -608,10 +612,13 @@
 
         <!-- ============================================================ -->
         <section class="feat" id="dropin">
-          <h2>Drop-in replacement for Camunda</h2>
+          <h2>Camunda-compatible API surface</h2>
           <p class="lede">
-            Nano BPM implements an API and execution-semantic <em>superset</em>
-            of Camunda. Existing applications keep their code.
+            Nano implements the Camunda Orchestration Cluster REST API and the
+            command-stream protocol. That compatibility is a research lever: it
+            lets Nano reuse the existing SDKs and tooling, and be evaluated
+            head-to-head against a mature engine &mdash; without re-inventing a
+            client ecosystem.
           </p>
           <ul class="bullets">
             <li>
@@ -620,27 +627,29 @@
               in the built-in <a href="/swagger">Swagger UI</a>).
             </li>
             <li>
-              <strong>Same enhanced SDKs</strong> &mdash; applications already
-              using the Camunda enhanced SDKs simply bump the dependency version
-              and point at a Nano BPM cluster.
+              <strong>Existing SDKs work against it</strong> &mdash; applications
+              using the Camunda enhanced SDKs can point at a Nano cluster, which
+              makes it easy to drive the engine with real client code while
+              experimenting.
             </li>
             <li>
-              <strong>Auto-scaling for free</strong> &mdash; because those SDKs
-              speak the command stream, those existing applications immediately
-              start auto-scaling across the cluster via the job stream &mdash;
-              no application changes, no re-architecture.
+              <strong>Speaks the command stream</strong> &mdash; because those
+              SDKs use the command stream, they exercise Nano&rsquo;s auto-scaling
+              job-stream path directly &mdash; a convenient way to study that
+              architecture under realistic load.
             </li>
             <li>
-              <strong>Execution superset</strong> &mdash; Nano matches Camunda
-              execution semantics and adds capabilities on top (e.g. embedded
+              <strong>Execution semantics</strong> &mdash; Nano follows Camunda
+              execution semantics and explores capabilities on top (e.g. embedded
               workers, idempotent deployment, in-engine BPMN XML retention).
             </li>
           </ul>
           <div class="card">
-            <strong>The migration is a config change.</strong> Update the SDK
-            dependency, point the endpoint at the Nano BPM cluster, deploy your
-            existing models &mdash; and your workload starts auto-scaling on a
-            fraction of the infrastructure.
+            <strong>A research vehicle, not a migration target.</strong> Because
+            the API and protocol match, you can point existing Camunda SDKs and
+            models at a Nano cluster to experiment with the engine &mdash; a
+            low-friction way to explore what it does, not a recommendation to run
+            production workloads on a research prototype.
           </div>
         </section>
 
