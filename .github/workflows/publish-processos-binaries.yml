@@ -86,6 +86,9 @@ jobs:
           # Link through the matching cross g++ so the bundled DuckDB's C++
           # runtime (libstdc++) resolves; ignored when unset (native legs).
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          # Stamp the binary's reported version from the tag (build.rs strips the
+          # leading `v`). Empty on manual runs -> build.rs falls back to git/Cargo.
+          PROCESSOS_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           set -euo pipefail
           cargo build --release --target "${{ matrix.target }}" --bin "$BIN_NAME"

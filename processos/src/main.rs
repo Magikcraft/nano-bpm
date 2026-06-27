@@ -2752,7 +2752,7 @@ async fn cockpit_chat_session_trace_export(
 
     let manifest = trace::TraceManifest {
         schema: trace::SCHEMA.to_string(),
-        processos_version: env!("CARGO_PKG_VERSION").to_string(),
+        processos_version: env!("PROCESSOS_VERSION").to_string(),
         exported_at: chat_now_ms(),
         workspace: workspace.clone(),
         process: process.clone(),

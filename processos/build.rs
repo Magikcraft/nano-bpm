@@ -35,8 +35,44 @@ struct Page {
     markdown: String,
 }
 
+/// Resolve the version the built binary reports. Release CI exports
+/// `PROCESSOS_VERSION` from the pushed tag (the single source of truth for a
+/// release); locally we fall back to `git describe`, then the crate version in
+/// `Cargo.toml`. A leading `v` is stripped so `v1.2.3` -> `1.2.3`.
+fn resolve_version(manifest: &str) -> String {
+    if let Ok(v) = env::var("PROCESSOS_VERSION") {
+        let v = v.trim().trim_start_matches('v');
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .current_dir(manifest)
+        .output()
+    {
+        if out.status.success() {
+            let v = String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .trim_start_matches('v')
+                .to_string();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
+}
+
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+
+    // Stamp the reported version (see `resolve_version`). Declared as an env
+    // dependency so a changed tag forces build.rs to rerun in CI.
+    println!("cargo:rerun-if-env-changed=PROCESSOS_VERSION");
+    let version = resolve_version(&manifest);
+    println!("cargo:rustc-env=PROCESSOS_VERSION={version}");
+
     let readme_path = Path::new(&manifest).join("USERGUIDE.md");
     println!("cargo:rerun-if-changed=USERGUIDE.md");
 
