@@ -8,7 +8,7 @@
 //
 // The README is the source; the generated HTML is git-ignored. Re-run via
 // `npm run build` (or directly) to refresh it.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import MarkdownIt from "markdown-it";
 
@@ -236,6 +236,9 @@ function shell(page) {
 }
 
 // --- 5. Emit -----------------------------------------------------------------
+// Wipe any previously generated pages so renamed/removed README sections don't
+// leave orphaned, stale HTML behind (the whole dir is regenerated each build).
+rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 for (const page of pages) {
   writeFileSync(join(outDir, `${page.slug}.html`), shell(page));

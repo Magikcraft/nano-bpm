@@ -1,15 +1,112 @@
-# nanobpmn
+# Nano BPM
 
-**A Rust research engine exploring high-performance BPMN execution and Camunda 8 compatibility.**
+**A Rust research engine exploring high-performance BPMN execution and Camunda 8
+compatibility.**
 
-A self-contained Rust code-generation project for the Camunda 8 Orchestration
-Cluster REST API. It bundles a copy of the OpenAPI specification and generates a
-Rust REST layer (models + `axum` router + service traits) from it, plus a
-runnable stub server.
+Nano BPM (`nanobpmn`) is a single self-contained binary that runs BPMN processes
+behind a **Camunda 8-compatible v2 REST API**. It embeds a deterministic,
+event-sourced BPMN engine (`engine-core`), an append-only journal for crash
+durability, an SQLite-backed read model, optional multi-node Raft replication,
+and a built-in web console — all in one executable with no runtime dependencies.
 
-No backend services are wired into *most* of the REST layer: operations respond
-with `501 Not Implemented`. A few operations are now backed by the embedded
-**`engine-core`** BPMN engine as a proof of the REST → engine path:
+It is an advanced research prototype: a place to explore what a faster, smaller,
+faster-to-iterate-on process engine can do, while staying API-compatible with
+existing Camunda 8 clients and tooling.
+
+> Looking to **build from source** or understand the code-generation pipeline?
+> See [DEVELOPMENT.md](DEVELOPMENT.md). This README is for running and operating
+> the distributed binary.
+
+## Quick start with c8ctl
+
+The easiest way to run and manage Nano BPM — single node or a whole cluster — is
+the [**c8ctl**](https://github.com/camunda/c8ctl) CLI with the
+[`c8ctl-plugin-nano`](https://github.com/jwulf/c8ctl-plugin-nano) plugin. The
+plugin ships a prebuilt Nano BPM binary for your platform (installed
+automatically as an npm `optionalDependency`), so there is nothing to compile.
+
+```bash
+# Load the plugin (installs the matching prebuilt binary for your OS/arch)
+c8ctl load plugin c8ctl-plugin-nano
+
+# Start a single-node cluster on port 8080
+c8ctl nano start
+
+# Start a 3-node cluster (ports 8080, 8081, 8082)
+c8ctl nano start 3
+
+# Start a 3-node Raft-replicated cluster (RF=3 enables Raft automatically)
+c8ctl nano start 3 --rf 3
+
+# Show cluster status and per-node health (queries each node's /v2/topology)
+c8ctl nano status
+
+# Tail a node's log
+c8ctl nano logs 1 --follow
+
+# Simulate a node failing and recovering
+c8ctl nano pause 1
+c8ctl nano resume 1
+
+# Stop the cluster (engine data retained); add --purge to delete engine data
+c8ctl nano stop
+```
+
+`c8ctl nano` keeps your **authoring assets** (BPMN models and worker code) in a
+shared workspace that survives `stop`/`clean`, separate from the ephemeral
+per-node engine data. It also wires every node's environment for you (ports,
+node ids, partitions, replication, data dirs). See the
+[plugin README](https://github.com/jwulf/c8ctl-plugin-nano) for the full command
+and flag reference, including [trace capture](#trace-capture) (`--capture`).
+
+Once a cluster is up, point any Camunda 8 v2 REST client (or the
+[`@nanobpmn/sdk`](#nodetypescript-sdk) command-stream client) at
+`http://127.0.0.1:8080/v2`, and open the console at
+`http://127.0.0.1:8080/console`.
+
+## Running the binary
+
+You can also run the binary directly (the same one the plugin installs),
+configuring it entirely through environment variables:
+
+```bash
+NANOBPMN_DATA_DIR=/var/lib/nanobpmn PORT=8080 \
+  ./nanobpm-gateway-rest-server
+```
+
+When started, the gateway prints the human-facing URLs:
+
+```text
+Nano BPM is up:
+  Landing page   http://127.0.0.1:8080/
+  Web console    http://127.0.0.1:8080/console
+  API reference  http://127.0.0.1:8080/swagger
+  REST API       http://127.0.0.1:8080/v2
+  Metrics        http://127.0.0.1:8080/metrics
+```
+
+Common configuration:
+
+| Variable | Effect |
+| --- | --- |
+| `PORT=<n>` | HTTP listen port (default `8080`). |
+| `NANOBPMN_DATA_DIR=<dir>` | Durable event-log + read-model directory. Without it the server runs fully in-memory (ephemeral). |
+| `DEBUG_REST=1` | Log every REST request/response (method, URI, status, latency, body preview). Leave off in production. |
+
+```text
+INFO rest: --> POST /v2/process-instances [53 bytes] {"processDefinitionId":"demo","tenantId":"<default>"}
+INFO rest: <-- POST /v2/process-instances 200 OK (39.7ms) [180 bytes] {"processInstanceKey":"3", …}
+```
+
+The full set of tuning variables (durability, memory, partitions, clustering) is
+documented in the sections below.
+
+## REST API
+
+Nano BPM serves the Camunda 8 Orchestration Cluster **v2 REST API**. The whole
+API surface is routable; operations not yet wired into the engine respond with
+`501 Not Implemented`. The following are backed by the embedded `engine-core`
+BPMN engine:
 
 - `POST /v2/deployments` (`createDeployment`) parses the uploaded BPMN 2.0 XML
   resources and deploys them, assigning each process a key and a per-id version.
@@ -131,7 +228,9 @@ pre-deployed at server startup, but you can also deploy your own `.bpmn` files
 through the deployment endpoint. Engine and parse errors map to real status
 codes (`400`/`404`/`409`); everything else is still `501`.
 
-### Durability (event-log replay)
+## Durability and recovery
+
+### Event-log replay
 
 The engine is in-memory but event-sourced: every command returns the complete,
 ordered list of events it produced, and replaying those events over a fresh
@@ -144,16 +243,20 @@ assigned so post-recovery commands never collide with replayed ones. Without the
 env var the server runs purely in memory (ephemeral).
 
 ```bash
-NANOBPMN_JOURNAL=./nanobpmn.journal PORT=8099 cargo run
+NANOBPMN_JOURNAL=./nanobpmn.journal PORT=8099 ./nanobpm-gateway-rest-server
 ```
 
 Job **activation locks are intentionally not journaled** — they are volatile
 lease state. A restart forfeits every lock, returning uncompleted jobs to the
 activatable pool, so a worker simply re-activates after recovery. Everything
 durable (deployments, instances, element progress, jobs, incidents, variables,
-completion, **armed timers**) survives. The `serde` (de)serialization lives
-behind an off-by-default `serde` feature on `engine-core`, so the engine stays
-dependency-free for mobile/wasm embedders that don't need persistence.
+completion, **armed timers**) survives.
+
+| Variable | Effect |
+| --- | --- |
+| `NANOBPMN_DATA_DIR=<dir>` | Co-locates both under one directory: `<dir>/journal.jsonl` + `<dir>/read-model.sqlite` (created if absent). |
+| `NANOBPMN_JOURNAL=<file>` | Back-compat: selects the journal file; the database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`. |
+| *(neither set)* | Fully in-memory: an ephemeral journal and a `:memory:` read store. Nothing is persisted. |
 
 ### Background tick (timers and lock expiry)
 
@@ -169,7 +272,7 @@ downstream work, so the tick wakes any long-polling `activateJobs`. A timer
 parked before a restart is recovered by replay and fired by the first due tick
 afterwards.
 
-### Concurrency (read/write lock)
+### Write path: concurrency, group-commit, and fsync
 
 The server runs on a multi-threaded Tokio runtime (one worker per core), so
 connection handling, HTTP parsing and JSON (de)serialization already spread
@@ -184,8 +287,6 @@ then releases the lock and `.await`s durability outside it, so disk I/O no longe
 serializes behind the engine lock; read-heavy load scales with the number of
 cores.
 
-### Durability (group-commit + fsync)
-
 The journal is owned by a dedicated `nanobpmn-journal-writer` thread. Each
 mutating command serializes its events and hands them to the writer over an
 ordered channel, receiving a `Commit` handle. The writer batches every queued
@@ -195,18 +296,9 @@ acks each batched command — amortizing the fsync cost across concurrent writes
 `Commit` resolves, i.e. after the events are durably on disk, so a `200`/`204`
 means "persisted and will survive a crash". If a journal write ever fails the
 writer aborts the process rather than serve state that outran the durable log;
-on restart the log replays to re-derive consistent state. Fire-and-forget
-internal writes (the background timer tick, startup seeding) drop the `Commit`,
-since replay re-derives their effects.
+on restart the log replays to re-derive consistent state.
 
-> [!NOTE]
-> This uses `std::sync::RwLock`, whose fairness is platform-dependent and can
-> favour readers. If sustained read saturation ever starves writers (including
-> the background tick) in your deployment, switch to a writer-fair lock such as
-> `parking_lot::RwLock`, or publish a periodic read snapshot so reads never
-> contend with the writer at all.
-
-### Read model (CQRS, eventual consistency)
+## Read model and consistency
 
 The engine's hot state holds only what execution needs. If every completed
 process instance, job and incident stayed there forever, resident memory would
@@ -218,15 +310,13 @@ follows the Camunda 8 / Operate split — a **command side** and a separate
   writer. Once an instance's history is durably recorded in the read model, the
   engine **evicts** the completed instance and everything it owns (jobs, timers,
   subscriptions, incidents) from hot state, so the footprint tracks *in-flight*
-  work rather than all history. (Eviction is opt-in: `engine-core` keeps
-  completed instances by default so embedders' audit/query code keeps working.)
+  work rather than all history.
 - **Read side** — an embedded **SQLite read store**. A background
   `nanobpmn-exporter` thread streams the journal's event log into it (in command
-  order, via the same under-the-write-lock hand-off the journal writer uses),
-  projecting events into denormalized `process_definitions` / `process_instances`
-  / `jobs` / `incidents` / `variables` tables. **Every `search*`/`get*` query is
-  served from SQLite**, never from hot engine state — which is what makes eviction
-  possible.
+  order), projecting events into denormalized `process_definitions` /
+  `process_instances` / `jobs` / `incidents` / `variables` tables. **Every
+  `search*`/`get*` query is served from SQLite**, never from hot engine state —
+  which is what makes eviction possible.
 
 The read model is a pure **derived projection** of the journal, so it needs no
 durability of its own: on boot the server replays any journal events the store
@@ -238,58 +328,40 @@ Because the exporter is asynchronous, reads are **eventually consistent**: a
 `search`/`get` issued in the instant after a write may briefly not observe it
 (typically sub-millisecond). This mirrors Camunda 8's Operate read channel.
 
-> [!NOTE]
-> Activation locks are volatile and **not journaled**, so `activateJobs` /
-> lock-expiry never reach the read store. A `searchJobs` result therefore
-> reflects durable state: an activated job shows as `CREATED` without a worker
-> or deadline. This is deliberate — the read model reports what survives a crash.
+> Activation locks are volatile and **not journaled**, so a `searchJobs` result
+> reflects durable state: an activated job shows as `CREATED` without a worker or
+> deadline. This is deliberate — the read model reports what survives a crash.
 
-**Configuration.** Reads and writes share a data layout resolved from the
-environment:
-
-| Variable | Effect |
-| --- | --- |
-| `NANOBPMN_DATA_DIR=<dir>` | Co-locates both under one directory: `<dir>/journal.jsonl` + `<dir>/read-model.sqlite` (created if absent). |
-| `NANOBPMN_JOURNAL=<file>` | Back-compat: selects the journal file; the database is `NANOBPMN_READ_DB` if set, else a sibling `read-model.sqlite`. |
-| *(neither set)* | Fully in-memory: an ephemeral journal and a `:memory:` read store. Nothing is persisted. |
-
-### Memory footprint (allocator + idle reclamation)
+## Memory management
 
 Load arrives in bursts: a flood of `createProcessInstance`s grows the hot-state
 maps and 50 KB-class variable payloads, which are then freed as instances
-complete and are evicted. Two things keep that freed memory from coming back:
+complete and are evicted. Nano BPM keeps that freed memory from being pinned, and
+bounds the live peak of large backlogs.
 
-- **Rust maps never shrink on removal.** Eviction removes the entries but leaves
-  the `instances` / `jobs` / index maps at *peak* bucket capacity.
-- **The default system allocator hoards freed pages.** macOS libmalloc (and Linux
-  glibc) keep freed allocations in their own free lists rather than returning them
-  to the OS, so an idle server pins its peak resident footprint long after the
-  work is gone.
+### Allocator and idle reclamation
 
-nanobpmn addresses both:
+Rust maps never shrink on removal, and the default system allocator hoards freed
+pages, so an idle server would otherwise pin its peak resident footprint long
+after the work is gone. Nano BPM addresses both:
 
 - It uses **jemalloc** as the global allocator (vendored, built from source — the
   binary stays self-contained). jemalloc returns unused pages to the OS on a
-  **decay** schedule, driven by a background thread on Linux.
+  **decay** schedule, driven by a background thread on Linux. (On Windows/MSVC the
+  system allocator is used instead.)
 - An **idle-purge tick** closes the gap on platforms with no jemalloc background
   thread (macOS) and makes reclamation prompt everywhere: when the engine goes
-  quiescent after a burst (no command exported and no create in flight for the
-  quiescence window), it `shrink_to_fit`s the hot-state maps and forces jemalloc
-  to purge every arena, returning the freed memory to the OS **immediately**. It
-  fires once per active→idle transition, never while work is flowing, so it adds
-  no steady-state cost. (In a local run, a 4 000-instance create+complete burst's
-  idle tick logged `returned 156.9 MiB to the OS (214.4 -> 57.5 MiB resident)`.)
-
-This is distinct from the **variable-spill** tier (below), which bounds the
-*live* peak of a large *active* backlog by moving cold parked instances' variables
-to disk; the allocator/idle-purge work bounds *idle* footprint after a backlog has
-drained. Together: low idle memory, bounded live memory, full in-RAM speed for the
-working set.
+  quiescent after a burst, it `shrink_to_fit`s the hot-state maps and forces
+  jemalloc to purge every arena, returning the freed memory to the OS
+  **immediately**. It fires once per active→idle transition, never while work is
+  flowing, so it adds no steady-state cost. (In a local run, a 4 000-instance
+  create+complete burst's idle tick logged `returned 156.9 MiB to the OS
+  (214.4 -> 57.5 MiB resident)`.)
 
 | Variable | Effect |
 | --- | --- |
 | `NANOBPMN_IDLE_PURGE_MS=<n>` | Quiescence (ms) the server must be idle before it compacts hot state and returns freed memory to the OS. Default `5000`; `0` disables the idle-purge tick. |
-| `NANOBPMN_HISTORY_MAX_INSTANCES=<n>` | Caps how many *completed/terminated* instances the read model retains (with their variables, jobs and incidents); the oldest beyond the cap are evicted continuously on the exporter thread. Active instances are never evicted. Default `0` = unbounded history. Set it to bound read-model memory to the working set: the in-memory read store retains every completed instance forever otherwise, so idle footprint climbs with cumulative throughput even with no active processes. |
+| `NANOBPMN_HISTORY_MAX_INSTANCES=<n>` | Caps how many *completed/terminated* instances the read model retains (with their variables, jobs and incidents); the oldest beyond the cap are evicted continuously on the exporter thread. Active instances are never evicted. Default `0` = unbounded history. Set it to bound read-model memory to the working set. |
 
 ### Tiered hot state: variable spill and cold spill
 
@@ -308,20 +380,15 @@ lost spill blob is reconstructable, so the store runs `synchronous=NORMAL`.
   leaves the small control-state maps resident. It deliberately skips instances
   holding a timer or open message subscription, since those resume without an
   activation seam.
-
 - **Cold spill** evicts whole *dormant* instances — control state, jobs, timers,
   subscriptions, variables — when resident RAM crosses a high-water mark, keeping only
   a slim resident **routing index** (job keys, message correlation keys, timer
   due-times) so an off-heap instance can still be found. It rehydrates an instance the
   instant an event targets it: a worker poll for its job type, a command addressing it
-  by key, a correlating message, or its timer falling due. It targets the
-  many-long-lived-parked-instances case and includes the timer/message-parked
-  instances variable spill leaves resident. Eviction shrinks the hot-state maps and
-  purges the allocator, so cold RAM is returned to the OS, not just freed internally.
+  by key, a correlating message, or its timer falling due.
 
 Both tiers are **on by default in persistent mode** (a data directory is configured)
-and off for fully in-memory runs, where spilling to an in-memory SQLite would only
-double the footprint.
+and off for fully in-memory runs.
 
 | Variable | Effect |
 | --- | --- |
@@ -342,14 +409,12 @@ keeping every command serialized within its partition.
   `1, 2, 3, …`.
 - Set `NANOBPMN_PARTITIONS=<n>` to run `n` partitions (0-based ids `0…n-1`).
   Keys embed their owning partition in their high bits, so a command targeting an
-  existing key (complete/cancel/…) routes to exactly one partition, while a fresh
+  existing key routes to exactly one partition, while a fresh
   `createProcessInstance` is balanced **round-robin** across partitions. An
   instance lives on its creating partition for life.
 - **Queries, `awaitCompletion`, and the read model are global** — answered from a
   single shared projection fed by all partitions, so multi-partition is
   transparent to clients.
-- Each partition gets its own journal file: `journal.partition-<p>.jsonl`.
-  Deployments are journaled on partition 0 and replicated in-memory to the rest.
 
 | Variable | Effect |
 | --- | --- |
@@ -358,12 +423,16 @@ keeping every command serialized within its partition.
 ## Clustering, replication, and availability
 
 A deployment is one or more **nodes** (processes). Every node is both a **broker**
-(owning a subset of partitions — an engine actor + journal each) and a **gateway**
-(accepts client connections for the *whole* cluster, forwarding operations it does
-not own to the node that does). Partition→node placement is deterministic
-(`partition_id % num_nodes`), so every node computes the same ownership map from
-static config with no coordinator. Single-node (the default, `NANOBPMN_NODES`
-unset) is byte-for-byte the historical behaviour.
+(owning a subset of partitions) and a **gateway** (accepts client connections for
+the *whole* cluster, forwarding operations it does not own to the node that does).
+Partition→node placement is deterministic (`partition_id % num_nodes`), so every
+node computes the same ownership map from static config with no coordinator.
+Single-node (the default, `NANOBPMN_NODES` unset) is byte-for-byte the historical
+behaviour.
+
+> The [c8ctl plugin](https://github.com/jwulf/c8ctl-plugin-nano) wires all of the
+> variables below for you — `c8ctl nano start 3 --rf 3` brings up a 3-node,
+> Raft-replicated cluster on localhost with no manual env-var configuration.
 
 Two independent axes:
 
@@ -393,10 +462,8 @@ is **3** (quorum 2, tolerates 1).
 > ⚠️ **Two-node clusters are a trap.** A 2-node `RF=2` group has quorum 2 — *both*
 > nodes are required to commit — so it tolerates **zero** faults, the *same* as a
 > single node, while *doubling* the number of machines whose failure halts all
-> writes. It buys **durability only** (every commit on two disks), **not
-> availability**. A network partition between the two halts writes on *both* sides
-> (neither has quorum). Use 3+ for fault tolerance; `RF=2`/2-node is a stepping
-> stone, not a resilient deployment.
+> writes. It buys **durability only**, **not availability**. Use 3+ for fault
+> tolerance.
 
 ### What happens when a node is lost
 
@@ -406,42 +473,23 @@ loss**, ever. Behaviour depends on which side of the cut you are on:
 
 - **Majority side (e.g. lose 1 of 3, `RF=3`).** The survivors hold quorum (2/3),
   **re-elect a new leader for the lost node's partitions within the election
-  timeout (~sub-second)**, and keep serving. In-flight writes that were forwarded
-  to the now-dead leader fail fast and retry on the new leader (see *Failover
-  write path* below). Measured: throughput through a node loss holds at ~98% of
-  baseline with a sub-second p99 blip, then full recovery on rejoin — no data loss.
-- **Minority side (e.g. a single node taken off the network — "laptop leaves the
-  office").** That node can reach no quorum for *any* partition, so it becomes
-  **write-unavailable**: every create/complete/activate fails fast (the orphaned
-  leader steps down within ~one election timeout rather than hanging). Reads are
-  still served from its **local applied state — consistent but frozen/stale** (no
-  new writes land). Workers connected to it stay connected (same machine) but get
-  errors/zero jobs; if that node is their only gateway address they are stuck until
-  it rejoins. **No writes it attempted while isolated are ever acknowledged or
-  retained.**
-- **RF=1 (no replication, the default).** There is no quorum concept; each partition
-  is single-homed. Losing a node keeps the **survivor fully serving its own
-  partitions** (partition-level fault isolation), but the **dead node's partitions
-  go offline** until it returns and its recent writes are not replicated anywhere.
-
-### Rejoin
+  timeout (~sub-second)**, and keep serving. In-flight writes forwarded to the
+  now-dead leader fail fast and retry on the new leader. Measured: throughput
+  through a node loss holds at ~98% of baseline with a sub-second p99 blip, then
+  full recovery on rejoin — no data loss.
+- **Minority side (a single node taken off the network).** That node can reach no
+  quorum for *any* partition, so it becomes **write-unavailable**: every
+  create/complete/activate fails fast. Reads are still served from its **local
+  applied state — consistent but frozen/stale**. **No writes it attempted while
+  isolated are ever acknowledged or retained.**
+- **RF=1 (no replication, the default).** Each partition is single-homed. Losing a
+  node keeps the **survivor fully serving its own partitions** (partition-level
+  fault isolation), but the **dead node's partitions go offline** until it returns.
 
 A returning node reconnects, catches up via Raft `AppendEntries` (or an
-`InstallSnapshot` if it fell more than `NANOBPMN_RAFT_SNAPSHOT_LOGS` behind),
-**discards any uncommitted entries it proposed while isolated** (overwritten by the
-higher-term majority log), and resumes as a follower. Membership is not changed on
+`InstallSnapshot` if it fell far behind), **discards any uncommitted entries it
+proposed while isolated**, and resumes as a follower. Membership is not changed on
 a transient outage, so no operator action is needed.
-
-### Failover write path
-
-So a single leader failure does not stall a closed-loop client, fast non-await peer
-forwards (job complete/fail/throw, activation pulls, by-key reads/mutations, and
-non-await create) use a **short per-attempt deadline** (default 2500 ms, just above
-the election ceiling) instead of the 30 s general peer timeout; a forward racing a
-leader failure fails fast and the create path **re-resolves the new leader and
-retries** within a budget (default 5000 ms) before surfacing a retryable `503`.
-`awaitCompletion` creates keep the long timeout (they legitimately block until the
-instance finishes).
 
 ### Cluster configuration
 
@@ -451,36 +499,23 @@ instance finishes).
 | `NANOBPMN_NODE_ID=<i>` | This node's id (index into `NANOBPMN_NODES`). Default `0`. |
 | `NANOBPMN_RAFT=on` | Enable per-partition Raft replication. Off ⇒ the single-homed, byte-identical path. |
 | `NANOBPMN_RF=<k>` | Replication factor: nodes per partition. Default `1`. Clamped to `[1, num_nodes]`. Use an odd node count with `RF=num_nodes` for fault tolerance. |
-| `NANOBPMN_REPLICATE_ACTIVATION=<mode>` | How the job-activation lock is handled under Raft (RF>1). Default/absent ⇒ **replicated**: `ActivateJobs` + lock-expiry go through the log, so every replica holds the lease (3 quorum commits/job; the lease survives failover exactly). `0`/`false`/`off` ⇒ **leader-local**: the lock lives only in the leader's RAM (2 commits/job, ~3× throughput, no collapse under worker over-provisioning), but a new leader redelivers in-flight jobs *immediately* on failover. `digest` ⇒ leader-local **plus** a best-effort soft lease digest: the leader fire-and-forget broadcasts its held leases to followers each tick, and a freshly-promoted leader honours each reported deadline before redelivering — narrowing the failover redelivery window with no per-job quorum cost. All three modes are at-least-once. No effect on a single node / RF=1. See [`docs/adr/0002-leader-local-activation-and-lease-digest.md`](docs/adr/0002-leader-local-activation-and-lease-digest.md). |
-| `NANOBPMN_REPLICATION=<tier>` | Replication durability tier for the partition log under Raft (RF>1) — the sibling of `NANOBPMN_DURABILITY` but on the *replication* axis (Kafka `acks=all` vs `acks=1`). Default/absent ⇒ **quorum**: a write acks only after a majority of voters commits + applies it, so it survives node loss with zero data loss. `leader-durable` (also `acks=1`) ⇒ each led group is formed with the **leader as the sole voter** and the other replicas as **learners**: the leader acks after its own local durable append+apply (no follower round-trip — the biggest latency win at low concurrency) and ships the log to learners asynchronously. Trade-off: a tail acked but not yet shipped is lost if that leader is lost. A sole-voter group cannot self-elect, so automatic failover is supplied by an **app-driven promotion supervisor**: the deterministic surviving successor rebuilds the group as a fresh sole-voter group seeded from its replica engine, fenced by a monotonic promotion epoch with a deterministic lowest-node-id tiebreak (a strictly-higher epoch wins; a symmetric split that produces equal-epoch promotions reconverges to the lowest-id leader ⇒ bounded loss, never permanent divergence or a stuck double-leader). At-least-once either way. No effect on a single node / RF=1. See [`docs/adr/0003-write-path-durability-tiers.md`](docs/adr/0003-write-path-durability-tiers.md). |
-| `NANOBPMN_LEADER_DURABLE_GRACE_TICKS=<n>` | Leader-durable auto-recovery sensitivity: number of consecutive 500 ms supervisor passes a partition must be observed leaderless before the deterministic successor self-promotes. Default `3` (floor `1`). Only consulted in `leader-durable` mode. |
-| `NANOBPMN_RAFT_HEARTBEAT_MS=<ms>` | Leader heartbeat interval. Default `250`. |
-| `NANOBPMN_RAFT_ELECTION_MIN_MS` / `_MAX_MS` | Randomized election timeout window. Defaults `500` / `1000`. |
-| `NANOBPMN_RAFT_SNAPSHOT_LOGS=<n>` | Snapshot every `n` applied entries (log compaction; also the catch-up→snapshot threshold). Default `5000`. |
-| `NANOBPMN_PEER_TIMEOUT_MS=<ms>` | General peer-forward timeout (await-create, deploy, message publish). Default `30000`. |
-| `NANOBPMN_WRITE_FORWARD_TIMEOUT_MS=<ms>` | Per-attempt deadline for fast non-await write forwards. Default `2500`. |
-| `NANOBPMN_WRITE_FORWARD_RETRY_MS=<ms>` | Total leader-re-resolution retry budget for a forwarded create. Default `5000`. |
-| `NANOBPMN_ACTIVATION_FAIRNESS=1\|2` | Fairness-aware job-activation routing across cluster nodes. **Off by default** (strict local-first, then peers in fixed id order — highest aggregate throughput, but a node a worker connects to can starve peers' partitions, skewing the e2e-latency distribution). `1` (Stage 1): a worker's lease budget is rotated and quota-split across `{local, peers}` so a fat local backlog cannot monopolise a worker while peers back up. `2` (Stage 2): caps each source proportional to its live backlog (local read directly, peers piggybacked on activation responses — no extra round-trip), so the genuinely-deepest node drains faster; collapses to Stage 1 when backlogs are balanced. No effect on a single node. See [`docs/adr/0001-cluster-job-activation-fairness.md`](docs/adr/0001-cluster-job-activation-fairness.md). |
+| `NANOBPMN_REPLICATE_ACTIVATION=<mode>` | How the job-activation lock is handled under Raft (RF>1). Default ⇒ **replicated** (every replica holds the lease; survives failover exactly). `0`/`off` ⇒ **leader-local** (lease in the leader's RAM only; ~3× throughput, immediate redelivery on failover). `digest` ⇒ leader-local **plus** a best-effort lease broadcast that narrows the failover redelivery window. All modes are at-least-once. See [`docs/adr/0002-leader-local-activation-and-lease-digest.md`](docs/adr/0002-leader-local-activation-and-lease-digest.md). |
+| `NANOBPMN_REPLICATION=<tier>` | Replication durability tier under Raft (RF>1). Default ⇒ **quorum** (acks after a majority commits + applies; zero data loss on node loss). `leader-durable` (`acks=1`) ⇒ the leader acks after its own local durable append+apply and ships to learners asynchronously (lowest latency; a just-acked tail can be lost on ungraceful leader loss, bounded — never divergent). See [`docs/adr/0003-write-path-durability-tiers.md`](docs/adr/0003-write-path-durability-tiers.md). |
+| `NANOBPMN_RAFT_HEARTBEAT_MS` / `_ELECTION_MIN_MS` / `_ELECTION_MAX_MS` | Leader heartbeat (default `250`) and randomized election window (defaults `500`/`1000`). |
+| `NANOBPMN_RAFT_SNAPSHOT_LOGS=<n>` | Snapshot every `n` applied entries (log compaction). Default `5000`. |
+| `NANOBPMN_ACTIVATION_FAIRNESS=1\|2` | Fairness-aware job-activation routing across nodes. **Off by default** (strict local-first). `1` rotates+quota-splits a worker's lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog. See [`docs/adr/0001-cluster-job-activation-fairness.md`](docs/adr/0001-cluster-job-activation-fairness.md). |
 
 See [`docs/distributed-scaling-design.md`](docs/distributed-scaling-design.md) for
 the full design rationale.
-
-> **Roadmap:** beyond the Camunda-compatible engine, see
-> [`docs/process-optimization-design.md`](docs/process-optimization-design.md) for
-> the closed-loop **runtime process optimization** direction — execution trace
-> export, deterministic recorded-input replay, WASM-powered simulation, a cost/SLA
-> model, canary experiments, and an LLM-in-the-loop reasoning plane built on the
-> engine's event-sourced core.
 
 ## Command stream (WebSocket)
 
 Alongside the REST API, the server exposes a single **bidirectional WebSocket**
 at `GET /command-stream` that multiplexes the whole client lifecycle — process
 creation *and* the full job lifecycle — onto one persistent, credit-coordinated
-socket. It funnels to the same engine command path as the REST handlers (the
-engine core is untouched), so it is purely a more efficient ingress: no
-per-request connection setup, no long-poll for jobs, and flow control by
-**credits** instead of `429`/`503` + client retry.
+socket. It funnels to the same engine command path as the REST handlers, so it is
+purely a more efficient ingress: no per-request connection setup, no long-poll for
+jobs, and flow control by **credits** instead of `429`/`503` + client retry.
 
 Connect with an optional `worker` query parameter
 (`/command-stream?worker=my-worker`). Frames are **JSON text frames**, each a
@@ -492,97 +527,70 @@ The stream carries **two credit lanes** over the one engine thread:
 
 - **Job push (demand/pull).** A client `subscribe`s to a job type with a credit
   count; a single server-side dispatcher leases jobs **round-robin across all
-  subscribers** (reusing the REST activation + off-thread variable encoding) and
-  pushes `job` frames while credits remain, topping demand back up via
-  `jobCredits`. A pushed job carries the same shape as a REST `ActivatedJobResult`.
-  **Lease expiry is the at-least-once guarantee:** a job pushed to a worker that
-  never completes it is reclaimed by the existing periodic lock-expiry tick, so a
-  dropped socket needs no special handling — the job is simply re-dispatched.
+  subscribers** and pushes `job` frames while credits remain, topping demand back
+  up via `jobCredits`. **Lease expiry is the at-least-once guarantee:** a job
+  pushed to a worker that never completes it is reclaimed by the periodic
+  lock-expiry tick, so a dropped socket needs no special handling.
 - **Submission (request/response).** `createInstance` is metered by a
-  **submission-credit window** fed from the engine's processing headroom via the
-  backpressure controller: under saturation the server simply **withholds
-  credits** and the client stalls intake — no `503`, no retry storm, no thundering
-  herd. When pressure clears, a top-up `submissionCredits` frame resumes the
-  client. Job completions (`completeJob` / `failJob` / `throwError`) flow
-  **unmetered** — draining backlog must never be throttled. A coarse, edge-
-  triggered `pressure` frame (`level: "red"`/`"green"`) is broadcast on each
-  transition so workers can coordinate without polling.
+  **submission-credit window** fed from the engine's processing headroom: under
+  saturation the server simply **withholds credits** and the client stalls intake
+  — no `503`, no retry storm. Job completions (`completeJob` / `failJob` /
+  `throwError`) flow **unmetered** — draining backlog must never be throttled.
 
 Client → server frames: `subscribe`, `jobCredits`, `createInstance`,
 `completeJob`, `failJob`, `throwError`, `awaitInstance`, `heartbeat`.
-Server → client frames: `welcome`, `job`, `commandResult` (`corr`-correlated
-ack/result for every write), `instanceCompleted`, `submissionCredits`,
-`pressure`, `heartbeat`.
+Server → client frames: `welcome`, `job`, `commandResult`, `instanceCompleted`,
+`submissionCredits`, `pressure`, `heartbeat`.
 
 **Await-completion and recovery.** `createInstance` may set
 `awaitCompletion: true`; rather than holding the request, the server returns the
 `commandResult` (with the `processInstanceKey`) immediately and later emits an
-async `instanceCompleted` frame, correlated by the create's `corr`, when the
-instance reaches a terminal state. If the socket drops before that arrives, the
-client recovers by sending an **`awaitInstance`** frame on the new connection
-with the `processInstanceKey` it persisted from the create ack. Because the read
-model is durable history, an already-terminal (even evicted) instance resolves
+async `instanceCompleted` frame, correlated by the create's `corr`. If the socket
+drops before that arrives, the client recovers by sending an **`awaitInstance`**
+frame on the new connection with the persisted `processInstanceKey`. Because the
+read model is durable history, an already-terminal instance resolves
 **immediately**, so `awaitInstance` doubles as a completion poll.
 
 > **Per-connection ordering vs. throughput.** A single connection's frames are
 > processed in arrival order, each engine command awaited inline — so successive
 > `createInstance`s on *one* socket serialize at journal fsync latency. Throughput
 > comes from **concurrency across connections**: the group-commit journal writer
-> batches many connections' appends into a single fsync. An application should
-> therefore spread submission load over multiple sockets rather than pipelining
-> one (see the recommended worker topology below).
+> batches many connections' appends into a single fsync. Spread submission load
+> over multiple sockets rather than pipelining one.
 
 **Recommended worker topology.** Because ordering is per-socket and throughput
-scales with concurrent sockets, an application should **not** funnel everything
-through one stream:
+scales with concurrent sockets:
 
-- **One stream per job-type worker.** Open a dedicated socket for each worker
-  (i.e. each `subscribe` job type), as a Zeebe/Camunda client does with its job
-  workers. Each gets its own demand-credit lane and its own reader task, so job
-  delivery for different types proceeds in parallel.
-- **Separate creation from work.** Use a distinct socket (or a small pool) for
-  `createInstance` submission, kept apart from the job-worker sockets, so a burst
-  of creates can't head-of-line-block job completions and vice versa. For high
-  create rates, fan out across a **pool** of submission sockets — that is what
-  lets the group-commit writer batch their appends and is where throughput comes
-  from.
+- **One stream per job-type worker** — each gets its own demand-credit lane and
+  reader task, so delivery for different types proceeds in parallel.
+- **Separate creation from work** — use a distinct socket (or a small pool) for
+  `createInstance` submission so a burst of creates can't head-of-line-block job
+  completions. For high create rates, fan out across a **pool** of submission
+  sockets — that is what lets the group-commit writer batch their appends.
 - **Rule of thumb for 10 job types:** ~10 worker sockets (one per type) **plus** a
-  small submission pool (e.g. 2–8 sockets sized to your create rate) — not a
-  single shared socket for everything.
+  small submission pool (e.g. 2–8 sockets sized to your create rate).
 
 | Variable | Effect |
 | --- | --- |
-| `NANOBPMN_STREAM_SUBMISSION_WINDOW=<n>` | Per-connection create-submission window (default `256`): how many `createInstance`s a client may have outstanding before it must wait for the server to replenish credits. |
+| `NANOBPMN_STREAM_SUBMISSION_WINDOW=<n>` | Per-connection create-submission window (default `256`). |
 
-**Stream durability: ack-before-fsync pipelining.** To maximize throughput on the
-command stream, job lifecycle commands (`completeJob` / `failJob` / `throwError`)
-use **pipelined commits**: the server applies the command to the engine (which
-writes to the journal and establishes order), then **replies `200` immediately**
-while fsync completes asynchronously in a detached task (~5ms later). This lets
-multiple connections' completions batch into a single group-commit fsync, measured
-at **4× higher throughput** (2280 vs 572 writes/s) than awaiting fsync inline.
-
-The trade-off: if the server crashes in the ~5ms window after replying but before
-fsync finishes, the completion is lost from disk and the job **re-activates** after
-restart (its lock expires). This **preserves at-least-once semantics** — handlers
-must already be idempotent (standard BPMN worker contract) — and the durability
-window (~5ms) is negligible compared to typical job lock timeouts (30–60s). The
-REST API `/jobs/{key}/completion` endpoint still awaits fsync before replying; only
-the command stream pipelines. Analogous to Kafka `acks=1` or RabbitMQ async
-confirms.
-
-> **Multi-node durability:** With `NANOBPMN_RAFT=on` and `NANOBPMN_RF>1` (see
-> [Clustering, replication, and availability](#clustering-replication-and-availability)),
-> a partition's writes commit through Raft — replicated to a quorum of replicas
-> before they are durable cluster-wide — instead of the single-node ack-before-fsync
-> window described here. The stream's at-least-once contract is unchanged.
+**Stream durability: ack-before-fsync pipelining.** To maximize throughput, job
+lifecycle commands (`completeJob` / `failJob` / `throwError`) use **pipelined
+commits**: the server applies the command to the engine (establishing order),
+then **replies `200` immediately** while fsync completes asynchronously (~5 ms
+later). This batches many connections' completions into one group-commit fsync,
+measured at **4× higher throughput** (2280 vs 572 writes/s) than awaiting fsync
+inline. The trade-off: a crash in the ~5 ms window re-activates the job after
+restart (its lock expires) — preserving **at-least-once** semantics (handlers must
+be idempotent, the standard BPMN worker contract). The REST API
+`/jobs/{key}/completion` endpoint still awaits fsync before replying; only the
+command stream pipelines.
 
 See [`docs/command-stream-design.md`](docs/command-stream-design.md) for the full
 design rationale,
 [`docs/command-stream.asyncapi.yaml`](docs/command-stream.asyncapi.yaml) for the
-AsyncAPI 3.1 description of every client/server frame, and
-`server/tests/command_stream_e2e.rs` for runnable examples of every frame
-exchange.
+AsyncAPI 3.1 description of every frame, and
+`server/tests/command_stream_e2e.rs` for runnable examples.
 
 ### Node/TypeScript SDK
 
@@ -593,236 +601,37 @@ backend: it uses the command stream against nanobpmn and **falls back to Camunda
 REST polling** against a Camunda gateway, so the same handler code serves both.
 See [`clients/node-stream/README.md`](clients/node-stream/README.md).
 
-
-## Two crates
-
-
-nanobpmn is deliberately split so the execution engine stays embeddable
-(including on mobile via FFI and in the browser via wasm) while the REST layer
-remains a server-only concern:
-
-| Crate | What it is | Runs where |
-| --- | --- | --- |
-| **`engine-core/`** | The BPMN engine: a deterministic single-writer `command → event → applier` state machine. **Zero dependencies, `std`-only.** | Server, iOS/Android (FFI, e.g. UniFFI), `wasm32` |
-| **`server/`** + `generated/` | The Camunda 8 v2 REST API generated from `spec/`, with a stub server. | Server only |
-
-You would **not** run the HTTP server on a phone; there you embed `engine-core`
-directly and call it through generated bindings. See
-[`engine-core/README.md`](engine-core/README.md) for the architecture and the
-rationale for following the Camunda 8 (Zeebe) model rather than the Camunda 7 PVM.
-
-## Approach
-
-The REST layer is generated with [OpenAPI Generator](https://openapi-generator.tech)
-using its [`rust-axum`](https://openapi-generator.tech/docs/generators/rust-axum)
-server generator (run from the version-pinned `openapi-generator-cli` JAR via
-the local Java runtime — no Docker required). It produces a self-contained
-library crate (`nanobpm-gateway-rest`) with:
-
-- **`src/models.rs`** — serde structs for every schema in the spec.
-- **`src/apis/`** — one trait per API tag, with one async method per operation.
-- **`src/server/mod.rs`** — an `axum` router (`server::new(api_impl)`) that
-  extracts requests, dispatches to the trait implementation, and serializes
-  responses.
-
-## Layout
-
-```
-nanobpmn/
-├── Makefile                       # generate / build / run / fmt / clippy / clean
-├── openapi-generator-config.yaml  # generator configuration
-├── spec/                          # bundled OpenAPI spec (upstream, source of truth)
-│   ├── rest-api.yaml              # entrypoint ($refs the sibling files)
-│   └── *.yaml
-├── spec-patches/                  # local overlays applied to the build copy
-│   └── patches.yaml               # project-specific spec additions (spec/ stays pristine)
-├── scripts/
-│   ├── generate.sh                # end-to-end generation pipeline
-│   ├── preprocess-spec.py         # sanitizes + overlays a temp copy of the spec
-│   ├── postprocess-generated.py   # patches known rust-axum generator bugs
-│   └── gen-stub-server.py         # generates the server's stub trait impls
-├── server/                        # runnable stub server (binary crate)
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs                # ServerImpl, auth/error glue, bootstrap
-│       └── stub_impls.rs          # generated trait impls (git-ignored)
-├── build/                         # temp sanitized spec + cached generator JAR (git-ignored)
-└── generated/                     # generated library crate (git-ignored)
-```
-
-The engine-core crate sits alongside these:
-
-```
-nanobpmn/
-└── engine-core/                   # embeddable BPMN engine (zero-dep, std-only)
-    ├── Cargo.toml
-    ├── src/
-    │   ├── lib.rs                 # crate docs + public API
-    │   ├── model.rs               # ProcessDefinition / Element + ProcessBuilder
-    │   ├── command.rs             # Command enum (engine inputs)
-    │   ├── event.rs               # Event enum (engine facts)
-    │   ├── state.rs               # State + apply() — the sole mutator
-    │   ├── state.rs               # State + apply() — the sole mutator
-    │   ├── engine.rs              # single-writer loop + processor
-    │   └── ffi.rs                 # coarse C-ABI surface (feature "ffi")
-    ├── scripts/verify-wasm-ffi.mjs # asserts the wasm FFI exports + a round-trip
-    └── tests/public_api.rs
-```
-
-The `generated/` crate, `build/`, and `server/src/stub_impls.rs` are **build
-artifacts** and are git-ignored. Regenerate them on demand with `make generate`.
-The `spec/` tree is the committed source of truth.
-
-## Requirements
-
-- A Java runtime (JRE/JDK 11+) — runs the pinned `openapi-generator-cli` JAR,
-  which is downloaded once into `build/tools/` (no Docker, no global install)
-- A Rust toolchain (`cargo`, `rustfmt`)
-- Python 3 with PyYAML (for the spec pre-processing step)
-- `curl` or `wget` (to fetch the generator JAR on first run)
-
-## Usage
-
-```bash
-# Generate the Rust REST layer + server stubs from spec/
-make generate
-
-# Generate if needed, then compile both crates
-make build
-
-# Build the optimized production server binary
-make release
-# -> server/target/release/nanobpm-gateway-rest-server
-
-# Run the stub server (defaults to port 8080; override with PORT)
-make run
-PORT=18080 make run
-
-# Lint / format
-make clippy
-make fmt
-
-# Remove all generated artifacts
-make clean
-```
-
-`make release` produces a single self-contained binary at
-`server/target/release/nanobpm-gateway-rest-server`. Run it directly,
-configuring it through the environment — `PORT` for the listen port,
-`NANOBPMN_DATA_DIR` for the durable event-log + read-model directory (see
-[Durability](#durability-event-log-replay) and
-[Read model](#read-model-cqrs-eventual-consistency)), and `DEBUG_REST` to log
-requests:
-
-```bash
-NANOBPMN_DATA_DIR=/var/lib/nanobpmn PORT=8080 \
-  ./server/target/release/nanobpm-gateway-rest-server
-```
-
-Set `DEBUG_REST=1` (or `true`/`yes`/`on`) to log every REST request and
-response — method, URI, status, latency, and a preview of both bodies — which
-is handy when inspecting what a client is sending:
-
-```text
-INFO rest: --> POST /v2/process-instances [53 bytes] {"processDefinitionId":"demo","tenantId":"<default>"}
-INFO rest: <-- POST /v2/process-instances 200 OK (39.7ms) [180 bytes] {"processInstanceKey":"3", …}
-```
-
-> The bodies are buffered to be logged, so leave `DEBUG_REST` off in
-> production; it is unset (silent) by default.
-
-
-> The generated REST layer under `generated/` is a build dependency, so
-> `make release` runs `make generate` first if needed (which downloads and runs
-> the `openapi-generator-cli` JAR with local Java — no Docker).
-> Once generated, the binary itself has no run-time external dependencies. (At
-> build time the vendored jemalloc allocator is compiled from source, so a C
-> compiler — `cc`/`clang`, already present on macOS and most Linux toolchains —
-> is required; the resulting binary is still self-contained.)
-
 ## Web console
 
-A built-in web console for the self-contained single-node distribution is
-available behind the **`console`** Cargo feature. It serves a single-page app at
-`/console` and a JSON API under `/console/api/*`, both **additive and
-feature-gated** — the default gateway build does not include them and is
-unaffected.
-
-```bash
-# 1. Build the frontend bundle (also vendors Swagger UI + bundles the spec).
-#    Required before any console build — the gateway embeds ../console/dist.
-cd console && npm install && npm run build && cd ..
-
-# 2a. Debug: rust-embed reads ../console/dist from disk at runtime, so frontend
-#     rebuilds are picked up live without recompiling the gateway.
-cargo build --features console --bin nanobpm-gateway-rest-server
-NANOBPMN_DATA_DIR=./nanobpm.data PORT=8080 \
-  ./server/target/debug/nanobpm-gateway-rest-server
-
-# 2b. Release: `make release` builds the frontend and the console-enabled,
-#     optimized single-file binary in the right order (it also forces a
-#     re-embed so a rebuilt frontend is baked in). Equivalent to `make console`.
-make release
-NANOBPMN_DATA_DIR=./nanobpm.data PORT=8080 \
-  ./server/target/release/nanobpm-gateway-rest-server
-
-# open http://localhost:8080/console
-```
-
-> **Note:** the `console` feature is required. `make release` includes it; a
-> plain `cargo build --release` (or `make release-gateway`) produces the default
-> API-only gateway, which serves no console, landing page, or Swagger UI —
-> `/console` returns 404.
-
-When started with the `console` feature, the gateway prints the human-facing
-URLs at startup:
-
-```text
-Nano BPM is up:
-  Landing page   http://127.0.0.1:8080/
-  Web console    http://127.0.0.1:8080/console
-  API reference  http://127.0.0.1:8080/swagger
-  REST API       http://127.0.0.1:8080/v2
-  Metrics        http://127.0.0.1:8080/metrics
-```
-
-The root path `/` serves a small self-contained landing page (an inline canvas
-particle effect, no external assets) linking to the console and the API
-reference. `/swagger` serves an **offline** Swagger UI: the multi-file OpenAPI
-spec under `spec/` is bundled into a single `openapi.json` at frontend-build
-time and embedded alongside the UI, so nothing is fetched from a CDN. (These
-root routes are part of the `console` feature; the default gateway build serves
-neither and keeps its original startup output.)
+The distributed binary includes a built-in **web console** (behind the `console`
+Cargo feature, which the c8ctl-shipped binaries enable). Start a cluster and open
+`http://127.0.0.1:8080/console`. It serves a single-page app at `/console` and a
+JSON API under `/console/api/*`. The root `/` serves a small self-contained
+landing page, and `/swagger` serves an **offline** Swagger UI with the OpenAPI
+spec bundled in (nothing fetched from a CDN).
 
 The console has five tabs:
 
 - **Topology** — cluster/partition/Raft overview with **live per-node health**:
-  each peer's always-on `GET /v2/topology` is probed (concurrently, on a 5 s
-  cadence) to show whether it's reachable right now, its gateway version, and
-  the round-trip latency — so a down or lagging node is visible at a glance.
+  each peer's `GET /v2/topology` is probed (concurrently, on a 5 s cadence) to
+  show reachability, gateway version, and round-trip latency.
 - **Metrics** — a live performance dashboard (process starts/s, jobs/s, active
-  processes, connected clients, commit pipeline depth, journal/fsync/commit-wait
-  means, writer duty cycle, resident memory) with inline sparklines. Throughput
-  rates are derived client-side from the gateway's Prometheus surface
-  (`/metrics`); active-process count is read on demand only while the dashboard
-  is open, so it never perturbs a running load test. In a multi-node cluster it
-  also shows a **per-node breakdown** (active/created/completed/clients/memory)
-  plus a reachable-node aggregate, by probing each peer's
-  `GET /console/api/metrics`. Handy for performance demos and debugging.
+  processes, connected clients, commit pipeline depth, journal/fsync means, writer
+  duty cycle, resident memory) with inline sparklines, derived client-side from
+  the gateway's Prometheus surface (`/metrics`). In a multi-node cluster it also
+  shows a **per-node breakdown** by probing each peer's `GET /console/api/metrics`.
 - **Modeler** — a bpmn-js editor backed by a workspace model library. Create,
   edit, deploy (idempotent), pull a deployed model back from the engine, and
-  duplicate. Each model shows its deploy status relative to the engine
-  (*not deployed* / *deployed & in sync* / *modified*). **Test run** executes a
-  model entirely in the browser — the engine is compiled to WebAssembly
-  (`engine-wasm`) — so you can start an instance, complete or fail its jobs with
-  mock variables, fast-forward timers on a virtual clock, and watch tokens move
-  on the diagram before deploying anything (no gateway round-trip, fully offline).
+  duplicate. **Test run** executes a model entirely in the browser — the engine is
+  compiled to WebAssembly — so you can start an instance, complete or fail its
+  jobs with mock variables, fast-forward timers on a virtual clock, and watch
+  tokens move on the diagram before deploying anything (fully offline).
 - **Explorer** — a live process-instance explorer (variables, jobs, incidents)
   with BPMN XML.
 - **Workers** — author TypeScript job workers in the browser and run them as
-  sandboxed **Deno** subprocesses over the command stream, with a live
-  "Running" fleet view (status, throughput, completed/failed, uptime, restarts)
-  and streamed logs.
+  sandboxed **Deno** subprocesses over the command stream, with a live "Running"
+  fleet view (status, throughput, completed/failed, uptime, restarts) and streamed
+  logs.
 
 ### Workspace vs cluster data
 
@@ -834,8 +643,8 @@ cluster data leaves your models and workers intact.
 <workspace>/
 ├── models/<name>.bpmn          # BPMN models (Modeler)
 ├── workers/<name>/             # one directory per worker (worker.ts, deno.json, …)
-├── .nanobpm/worker-sdk.ts       # embedded Deno worker SDK (auto-written)
-└── .deno-cache/                 # DENO_DIR for worker dependency caching
+├── .nanobpm/worker-sdk.ts      # embedded Deno worker SDK (auto-written)
+└── .deno-cache/                # DENO_DIR for worker dependency caching
 ```
 
 | Variable | Meaning |
@@ -863,129 +672,10 @@ defineWorker({
 });
 ```
 
-The supervisor runs one sandboxed `deno run` subprocess per enabled worker
-(`--allow-net`, read-only access to the workspace, writes confined to the Deno
-cache) that speaks the command stream directly. **Deno is optional**: if it is
-not installed the Workers tab still authors code but starting a worker reports
-the runtime as unavailable.
-
-## Engine (`engine-core`)
-
-The embeddable BPMN engine builds and tests with plain `cargo` — no Docker, no
-code generation:
-
-```bash
-make engine-test    # unit + integration + doc tests
-make engine-build   # debug build
-make engine-wasm    # prove it compiles for wasm32 (needs the wasm32 target)
-make engine-wasm-ffi # build the FFI cdylib for wasm32 + verify exports & a round-trip (needs node)
-```
-
-See [`engine-core/README.md`](engine-core/README.md) for the architecture. The
-engine also exposes a coarse C-ABI (`src/ffi.rs`, behind the `ffi` feature) for
-embedding via UniFFI on mobile or as wasm exports in a browser; `make
-engine-wasm-ffi` proves that wasm/FFI build end to end.
-
-## Stub server
-
-The `server/` crate wires the generated REST layer into a runnable `axum` server.
-Most operations return `Err(())`, which the server's `ErrorHandler` maps to a
-`501 Not Implemented` response, so the whole API surface is routable end to end.
-A few operations are backed by the embedded `engine-core` engine (see above):
-
-```console
-$ PORT=18080 make run
-... listening on http://0.0.0.0:18080/v2
-
-# Engine-backed: deploy a BPMN file -> process is parsed and versioned
-$ curl -s -X POST localhost:18080/v2/deployments \
-    -H 'Authorization: Bearer x' -F 'resources=@order.bpmn'
-{"deploymentKey":"3","tenantId":"<default>","deployments":[{"processDefinition":
-  {"processDefinitionId":"shipping","processDefinitionVersion":1,
-   "resourceName":"order.bpmn","processDefinitionKey":"4",...},...}]}
-
-# Engine-backed: start an instance of the just-deployed process
-$ curl -s -X POST localhost:18080/v2/process-instances \
-    -H 'Authorization: Bearer x' -H 'Content-Type: application/json' \
-    -d '{"processDefinitionId":"shipping"}'
-{"processDefinitionId":"shipping",...,"processInstanceKey":"5",...}
-
-# Engine-backed: activate the job parked on the service task -> locked to "w1"
-$ curl -s -X POST localhost:18080/v2/jobs/activation \
-    -H 'Authorization: Bearer x' -H 'Content-Type: application/json' \
-    -d '{"type":"ship","worker":"w1","timeout":60000,"maxJobsToActivate":10}'
-{"jobs":[{"type":"ship",...,"jobKey":"8","deadline":...,...}]}
-
-# Engine-backed: complete the activated job -> 204, token resumes, instance ends
-$ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:18080/v2/jobs/8/completion \
-    -H 'Authorization: Bearer x' -H 'Content-Type: application/json' -d '{}'
-204
-
-# Still a stub:
-$ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:18080/v2/process-instances/search \
-    -H 'Authorization: Bearer x' -H 'Content-Type: application/json' -d '{}'
-501
-```
-
-The `ServerImpl` type (which owns the embedded engine), authentication, error
-glue, and the engine-backed handlers live in `server/src/main.rs` (committed).
-The per-tag trait impls are generated into `server/src/stub_impls.rs` by
-`gen-stub-server.py`, which routes the wired operations to the handlers via its
-`OVERRIDES` table and stubs everything else.
-
-## Generation pipeline
-
-`scripts/generate.sh` runs four stages:
-
-1. **Preprocess** (`preprocess-spec.py`) — the bundled spec in `spec/` is never
-   edited. It is copied into `build/spec/`, where a few constructs that the beta
-   `rust-axum` generator cannot handle are sanitized (currently: schema-less
-   request bodies such as `content: { application/json: {} }`), and any local
-   overlays from `spec-patches/patches.yaml` are applied (see
-   [Local spec overlays](#local-spec-overlays)). Files that need no change are
-   copied verbatim to keep the transform minimal.
-2. **Generate** — the version-pinned `openapi-generator-cli` JAR (downloaded once
-   into `build/tools/` and run with local Java — no Docker) emits the crate into
-   `generated/`.
-3. **Post-process** (`postprocess-generated.py`) — deterministically patches
-   known `rust-axum` code-generation bugs so the crate compiles and behaves
-   correctly (an invalid `oneOf` date-time enum variant, discriminator helpers
-   for optional `type` fields, and `#[serde(deny_unknown_fields)]` on the four
-   pagination structs so the untagged `SearchQueryPageRequest` can disambiguate
-   limit/offset/forward-cursor/backward-cursor requests instead of always
-   collapsing to limit pagination).
-4. **Stub impls** (`gen-stub-server.py`) — parses the generated trait
-   definitions and emits `server/src/stub_impls.rs`.
-
-## Updating the spec
-
-`spec/` is a copy of the Camunda v2 OpenAPI spec
-(`zeebe/gateway-protocol/src/main/proto/v2` in `camunda/camunda`). To refresh it,
-replace the files under `spec/` and run `make generate`.
-
-## Local spec overlays
-
-`spec/` is kept byte-for-byte identical to the upstream Camunda release so it can
-be refreshed by simply replacing files. Project-specific additions to the API
-contract live separately in `spec-patches/patches.yaml` and are applied to the
-build copy (`build/spec/`) during preprocessing — `spec/` is never mutated.
-
-Each overlay entry names a `file` (relative to `spec/`) and a dotted `target`
-path inside it, then either deep-`merge`s a mapping or `append`s items to a list:
-
-```yaml
-- file: process-instances.yaml
-  target: components.schemas.CreateProcessInstanceResult.properties
-  merge:
-    processCompleted: { type: boolean, description: "…" }
-- file: process-instances.yaml
-  target: components.schemas.CreateProcessInstanceResult.required
-  append: [processCompleted]
-```
-
-This is how nanobpmn adds the `processCompleted` flag to
-`CreateProcessInstanceResult` (it reports whether the returned variables are the
-authoritative final result) without forking the upstream spec.
+The supervisor runs one sandboxed `deno run` subprocess per enabled worker that
+speaks the command stream directly. **Deno is optional**: if it is not installed
+the Workers tab still authors code but starting a worker reports the runtime as
+unavailable.
 
 ## Cluster tuning
 
@@ -999,19 +689,14 @@ deliberately orthogonal — pick each axis independently for your workload.
 - **Partitions ≥ nodes, always.** Each partition is owned by exactly one node
   (`owner = partition % num_nodes`), and a clustered node that owns *zero*
   partitions aborts on startup. The clean, balanced choice is **one partition led
-  per node**: `NANOBPMN_PARTITIONS = NANOBPMN_NODES` count (e.g. 6 nodes → 6
-  partitions). Use a higher multiple (`2×`, `3×` nodes) only if you want finer
-  rebalancing granularity or headroom to add nodes without a data-dir reset —
-  `NANOBPMN_PARTITIONS` cannot be changed in place (the journal layout differs).
+  per node**. Use a higher multiple only if you want finer rebalancing granularity
+  — `NANOBPMN_PARTITIONS` cannot be changed in place (the journal layout differs).
 - **`NANOBPMN_RF=3` for fault tolerance.** RF is the number of copies per
-  partition; `RF=1` (default) is no replication. `RF=3` survives one node loss with
-  a majority still live. Keep `RF` ≤ node count. With `quorum` replication you want
-  an **odd** voter count per group so a majority always exists; `RF=3` over any node
-  count ≥ 3 gives each partition a 3-replica group.
-- **Throughput scales with partitions, not nodes alone.** Each partition is a single
-  writer (one fsync + apply loop), so aggregate write throughput tracks the number
-  of *led* partitions. More nodes with the same partition count mostly buys
-  durability and read/activation fan-out, not raw create throughput.
+  partition; `RF=1` (default) is no replication. `RF=3` survives one node loss.
+  Keep `RF` ≤ node count; use an **odd** voter count per group.
+- **Throughput scales with partitions, not nodes alone.** Each partition is a
+  single writer (one fsync + apply loop), so aggregate write throughput tracks the
+  number of *led* partitions.
 
 ### What to tune, by situation
 
@@ -1019,11 +704,10 @@ deliberately orthogonal — pick each axis independently for your workload.
 | --- | --- | --- |
 | **Lowest write latency** (small/medium concurrency) | `NANOBPMN_DURABILITY=async` + `NANOBPMN_REPLICATION=leader-durable` | Ack on the leader's local durable append+apply — no fsync-before-ack wait and no follower round-trip. Cost: a just-acked tail can be lost on an ungraceful leader loss (bounded, never divergent). |
 | **Zero-data-loss durability** (the default) | leave `NANOBPMN_DURABILITY=sync`, `NANOBPMN_REPLICATION=quorum` | `200`/`204` means fsync'd locally **and** majority-committed. Strongest guarantee; highest per-write latency. |
-| **High throughput under worker over-provisioning** | `NANOBPMN_REPLICATE_ACTIVATION=0` (leader-local) or `=digest` | Keep the activation lease off the Raft log (~3× activation throughput, no collapse when far more workers than jobs poll). `digest` adds a best-effort lease broadcast so failover redelivery is narrowed. All modes stay at-least-once. |
-| **Even job drain / e2e-latency across nodes** | `NANOBPMN_ACTIVATION_FAIRNESS=1` or `=2` | The default (Off) drains a worker's *local* partition first, then pulls from peers in fixed node-id order — which skews the per-node latency distribution and can cap aggregate throughput. `1` rotates+quota-splits the lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog so the deepest node drains fastest. |
-| **A producer that outpaces the workers** | leave backpressure on (default **Adaptive**), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | Adaptive (AIMD) sizes the in-flight-instance watermark from measured latency and sheds excess creates with `503 RESOURCE_EXHAUSTED`, so the producer converges to the drain rate instead of growing an unbounded backlog. Set `0`/`off` only to measure raw ingest with no shedding. A fixed `<n>` gives a deterministic, host-independent watermark for A/B runs. |
-| **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS` (default `5000`), `NANOBPMN_HISTORY_MAX_INSTANCES`, `NANOBPMN_VAR_SPILL*` | Idle-purge compacts hot state and returns freed arenas to the OS after the quiescence window (`0` disables). Cap retained completed instances to bound read-model growth. Variable spill pages cold parked-instance variables to disk (on by default when a data dir is set). |
-| **Faster failover detection** (leader-durable) | `NANOBPMN_LEADER_DURABLE_GRACE_TICKS` (default `3` × 500 ms) | Lower it (floor `1`) to promote a successor sooner after a leader is observed gone; raise it to avoid promoting during transient blips. |
+| **High throughput under worker over-provisioning** | `NANOBPMN_REPLICATE_ACTIVATION=0` (leader-local) or `=digest` | Keep the activation lease off the Raft log (~3× activation throughput). `digest` adds a best-effort lease broadcast so failover redelivery is narrowed. All modes stay at-least-once. |
+| **Even job drain across nodes** | `NANOBPMN_ACTIVATION_FAIRNESS=1` or `=2` | `1` rotates+quota-splits the lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog so the deepest node drains fastest. |
+| **A producer that outpaces the workers** | leave backpressure on (default **Adaptive**), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | Adaptive (AIMD) sizes the in-flight watermark from measured latency and sheds excess creates with `503 RESOURCE_EXHAUSTED`, so the producer converges to the drain rate. |
+| **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS`, `NANOBPMN_HISTORY_MAX_INSTANCES`, `NANOBPMN_VAR_SPILL*` | Idle-purge compacts hot state and returns freed arenas to the OS. Cap retained completed instances to bound read-model growth. |
 
 ### Recommended profiles
 
@@ -1032,14 +716,51 @@ deliberately orthogonal — pick each axis independently for your workload.
   fsync'd and quorum-committed. Pair with a persistent `NANOBPMN_DATA_DIR` per node.
 - **Low latency (interactive workflows, modest concurrency):** `RF=3`,
   `NANOBPMN_DURABILITY=async`, `NANOBPMN_REPLICATION=leader-durable`,
-  `NANOBPMN_REPLICATE_ACTIVATION=digest`. Bounded-loss, self-healing failover via
-  the promotion supervisor; narrowest practical latency.
+  `NANOBPMN_REPLICATE_ACTIVATION=digest`. Bounded-loss, self-healing failover.
 - **Max throughput / benchmarking:** one partition led per node,
-  `NANOBPMN_REPLICATE_ACTIVATION=0`, `NANOBPMN_ACTIVATION_FAIRNESS=2`, and decide
-  backpressure explicitly (`Adaptive` for a realistic ceiling, `off` to measure
-  raw ingest). Always benchmark the **release** binary
-  (`server/target/release/nanobpm-gateway-rest-server`).
+  `NANOBPMN_REPLICATE_ACTIVATION=0`, `NANOBPMN_ACTIVATION_FAIRNESS=2`. Always
+  benchmark the **release** binary.
 
 > Durability/replication tiers are chosen at startup from the on-disk log; switching
 > tiers on an existing data directory is unsupported. Start each reconfigured cluster
 > from a fresh `NANOBPMN_DATA_DIR`.
+
+## Trace capture
+
+Nano BPM can record every instance's inputs so runs can be **replayed and analysed
+later** (the basis for the runtime process-optimization research direction below).
+With the c8ctl plugin:
+
+```bash
+c8ctl nano start 3 --capture
+c8ctl nano status            # shows "trace capture: on"
+```
+
+`--capture` sets `NANOBPMN_TRACE_STIMULI=1` on **every** node, enabling the Tier 2
+recorded-input (stimuli) log and auto-enabling Tier 1 variable capture. Read a
+trace back from any node:
+
+```text
+GET /console/api/traces/{instanceKey}
+  → { creationVariables, stimuli[], <per-incident variables> }
+```
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `NANOBPMN_TRACE_STIMULI=1` | off | Enable Tier 2 recorded-input replay (also enables Tier 1). |
+| `NANOBPMN_TRACE_VARIABLES_MAX_BYTES` | 16384 | Max captured variable payload bytes. |
+| `NANOBPMN_TRACE_STIMULI_MAX` | 1024 | Max recorded stimuli per instance. |
+| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained. |
+
+> **Roadmap:** beyond the Camunda-compatible engine, see
+> [`docs/process-optimization-design.md`](docs/process-optimization-design.md) for
+> the closed-loop **runtime process optimization** direction — execution trace
+> export, deterministic recorded-input replay, WASM-powered simulation, a cost/SLA
+> model, canary experiments, and an LLM-in-the-loop reasoning plane built on the
+> engine's event-sourced core.
+
+## Building from source
+
+End users do not need to build anything — the [c8ctl plugin](#quick-start-with-c8ctl)
+ships a prebuilt binary. To build from source, run the engine tests, or work on
+the code-generation pipeline, see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
