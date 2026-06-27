@@ -148,9 +148,254 @@ fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
         ElementKind::SubProcess { start_event } => {
             m.insert("innerStartEvent".into(), json!(start_event));
         }
+        ElementKind::CallActivity { called_process_id } => {
+            m.insert("calledElement".into(), json!(called_process_id));
+        }
         _ => {}
     }
     m
+}
+
+/// Parse every `<bpmn:process>` in `xml` and index them by id — the call-activity
+/// resolution library a multi-stage orchestrator needs to inline its phases.
+fn definition_library(
+    xml: &str,
+) -> Result<(Vec<ProcessDefinition>, HashMap<String, ProcessDefinition>), String> {
+    let defs = parse_bpmn(xml).map_err(|e| format!("model failed to parse: {e:?}"))?;
+    if defs.is_empty() {
+        return Err("model contained no process definitions".to_string());
+    }
+    let library: HashMap<String, ProcessDefinition> =
+        defs.iter().map(|d| (d.id.clone(), d.clone())).collect();
+    Ok((defs, library))
+}
+
+/// Inline a multi-definition model: every `<process>` forms the call-activity
+/// library and `process_id` (default: the first/orchestrator definition) is
+/// returned with its call activities expanded inline. Inlined node ids are the
+/// `Parent$Child` keys the trace tables carry, so the structural view lines up
+/// with `jobs.element_id` / `incidents.element_id`.
+pub fn inline_definition(
+    xml: &str,
+    process_id: Option<&str>,
+) -> Result<ProcessDefinition, String> {
+    let (defs, library) = definition_library(xml)?;
+    let root = match process_id {
+        Some(pid) => library
+            .get(pid)
+            .cloned()
+            .ok_or_else(|| format!("no process '{pid}' in the model"))?,
+        None => defs[0].clone(),
+    };
+    root.inline_call_activities(&library)
+}
+
+/// True when any definition in the model uses a call activity (i.e. the model is
+/// a multi-stage orchestrator whose phases can be inlined / read individually).
+fn has_call_activities(defs: &[ProcessDefinition]) -> bool {
+    defs.iter()
+        .flat_map(|d| d.elements.values())
+        .any(|e| matches!(e.kind, ElementKind::CallActivity { .. }))
+}
+
+/// True when the raw model XML uses any call activity — a cheap textual probe for
+/// callers (e.g. seeding) that don't want to pull in the engine element types.
+pub fn references_call_activities(xml: &str) -> bool {
+    match parse_bpmn(xml) {
+        Ok(defs) => has_call_activities(&defs),
+        Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight, dependency-free XML element splicing.
+//
+// These primitives let the model tools work with MULTI-DEFINITION BPMN (a
+// multi-stage orchestrator whose called phases travel in the same file): read a
+// single phase's raw XML, edit one definition while preserving the others (and
+// the orchestrator's authored diagram), and merge phase files into one
+// self-contained model at seed time. BPMN root elements (`process`, `message`,
+// `error`, `definitions`) never nest within themselves, so a non-recursive
+// open→matching-close scan is faithful.
+// ---------------------------------------------------------------------------
+
+/// The full tag name (including any namespace prefix) of the start tag at `lt`.
+fn tag_name_at(xml: &str, lt: usize) -> &str {
+    let rest = &xml[lt + 1..];
+    let end = rest
+        .find([' ', '\t', '\n', '\r', '>', '/'])
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Byte offset of the first `<[ns:]local` *start* tag at or after `from`, where
+/// the local name matches exactly (so `error` never matches `errorEventDefinition`).
+fn find_tag_open(xml: &str, local: &str, from: usize) -> Option<usize> {
+    let mut i = from.min(xml.len());
+    while let Some(rel) = xml[i..].find('<') {
+        let lt = i + rel;
+        let after = &xml[lt + 1..];
+        match after.chars().next() {
+            Some('/') | Some('!') | Some('?') => {
+                i = lt + 1;
+                continue;
+            }
+            _ => {}
+        }
+        let name = tag_name_at(xml, lt);
+        let local_name = name.rsplit(':').next().unwrap_or(name);
+        if local_name == local {
+            return Some(lt);
+        }
+        i = lt + 1;
+    }
+    None
+}
+
+/// The byte span `[start, end)` of the first `<[ns:]local …>…</[ns:]local>` (or
+/// self-closing) element at or after `from`.
+fn element_span(xml: &str, local: &str, from: usize) -> Option<(usize, usize)> {
+    let start = find_tag_open(xml, local, from)?;
+    let name = tag_name_at(xml, start);
+    let open_gt = start + xml[start..].find('>')?;
+    if xml[start..=open_gt].trim_end().ends_with("/>") {
+        return Some((start, open_gt + 1));
+    }
+    let close = format!("</{name}>");
+    let close_at = xml[open_gt..].find(&close)? + open_gt + close.len();
+    Some((start, close_at))
+}
+
+/// The value of attribute `attr` in `s` (the `attr` must be preceded by whitespace,
+/// so `id` doesn't match `processId`).
+fn attr_value_in(s: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(&needle) {
+        let at = from + rel;
+        let preceded_by_ws = s[..at].chars().last().is_some_and(|c| c.is_whitespace());
+        if preceded_by_ws {
+            let vstart = at + needle.len();
+            let vend = s[vstart..].find('"')? + vstart;
+            return Some(s[vstart..vend].to_string());
+        }
+        from = at + needle.len();
+    }
+    None
+}
+
+/// The raw `<process id="process_id">…</process>` block from a (multi-definition)
+/// document, or `None` if no such process exists.
+fn process_block(xml: &str, process_id: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some((s, e)) = element_span(xml, "process", from) {
+        if attr_value_in(&xml[s..e], "id").as_deref() == Some(process_id) {
+            return Some(xml[s..e].to_string());
+        }
+        from = e;
+    }
+    None
+}
+
+/// The inner body of the first `<definitions>` element, with any `<bpmndi:BPMNDiagram>`
+/// blocks stripped — i.e. the root declarations (messages/errors) and process(es),
+/// verbatim, ready to splice into another document. Diagrams are dropped so a merged
+/// file keeps a single (the primary's) diagram.
+fn definitions_inner_no_di(xml: &str) -> Option<String> {
+    let start = find_tag_open(xml, "definitions", 0)?;
+    let name = tag_name_at(xml, start);
+    let open_gt = start + xml[start..].find('>')? + 1;
+    let close = format!("</{name}>");
+    let close_at = xml[open_gt..].find(&close)? + open_gt;
+    let mut inner = xml[open_gt..close_at].to_string();
+    while let Some((ds, de)) = element_span(&inner, "BPMNDiagram", 0) {
+        inner.replace_range(ds..de, "");
+    }
+    Some(inner.trim_matches(['\n', ' ', '\t']).to_string())
+}
+
+/// Splice the body of each `extra` definitions document into `primary`, just
+/// before `primary`'s diagram (so all root elements precede the BPMNDI, keeping
+/// the document schema-ordered) — or before its closing tag when it has no
+/// diagram. The extras' own diagrams are dropped; `primary`'s is preserved.
+pub fn merge_definitions(primary: &str, extras: &[&str]) -> String {
+    let mut injected = String::new();
+    for x in extras {
+        if let Some(inner) = definitions_inner_no_di(x) {
+            if !inner.is_empty() {
+                injected.push_str("  ");
+                injected.push_str(inner.trim());
+                injected.push('\n');
+            }
+        }
+    }
+    if injected.is_empty() {
+        return primary.to_string();
+    }
+    let insert_at = find_tag_open(primary, "BPMNDiagram", 0)
+        .map(|di| primary[..di].rfind('\n').map(|n| n + 1).unwrap_or(di))
+        .or_else(|| {
+            let start = find_tag_open(primary, "definitions", 0)?;
+            let name = tag_name_at(primary, start);
+            primary.rfind(&format!("</{name}>"))
+        });
+    match insert_at {
+        Some(at) => {
+            let mut out = String::with_capacity(primary.len() + injected.len());
+            out.push_str(&primary[..at]);
+            out.push_str(&injected);
+            out.push_str(&primary[at..]);
+            out
+        }
+        None => primary.to_string(),
+    }
+}
+
+/// Return the raw BPMN XML of the model, or of one named phase within it. `target`
+/// may be a `<process>` id OR a callActivity node id (resolved to its calledElement),
+/// letting the droid inspect the exact XML behind an opaque orchestrator phase.
+pub fn read_model_xml(xml: &str, target: Option<&str>) -> Result<Value, String> {
+    let (defs, _library) = definition_library(xml)?;
+    match target {
+        None => Ok(json!({
+            "scope": "full",
+            "definitionCount": defs.len(),
+            "processIds": defs.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
+            "xml": xml,
+            "note": "The full BPMN document (orchestrator + any called phase processes). Pass \
+                     process:\"<id>\" — a process id or a callActivity node id — to isolate one \
+                     phase's raw XML, then edit it with edit_model process:\"<id>\".",
+        })),
+        Some(t) => {
+            // Resolve a callActivity node id to the process it calls; else treat t as a process id.
+            let mut process_id = t.to_string();
+            for d in &defs {
+                if let Some(ElementKind::CallActivity { called_process_id }) =
+                    d.elements.get(t).map(|e| &e.kind)
+                {
+                    process_id = called_process_id.clone();
+                    break;
+                }
+            }
+            let block = process_block(xml, &process_id).ok_or_else(|| {
+                format!(
+                    "no <process id=\"{process_id}\"> in the model (and '{t}' is not a callActivity \
+                     node). Known process ids: {}",
+                    defs.iter()
+                        .map(|d| d.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+            Ok(json!({
+                "scope": "process",
+                "processId": process_id,
+                "xml": block,
+                "note": "Raw BPMN for this phase. Reason over it, then patch it with edit_model \
+                         process:\"<id>\" (NOT by hand) so XML correctness is guaranteed.",
+            }))
+        }
+    }
 }
 
 /// Structural edges used for reachability and loop detection: outgoing sequence flows,
@@ -411,8 +656,60 @@ pub(crate) fn model_task_graph(xml: &str) -> Result<ModelTaskGraph, String> {
 /// targets (flagged conditional), reachability, and gateway split/join role.
 pub fn read_model(xml: &str) -> Result<Value, String> {
     let (def, def_count) = first_def(xml)?;
-    let adj = adjacency(&def);
-    let reachable = reachable_from_start(&def, &adj);
+    let (counts, nodes) = node_view(&def);
+    let defs = parse_bpmn(xml).map_err(|e| format!("model failed to parse: {e:?}"))?;
+    let expandable = has_call_activities(&defs);
+    let note = if expandable {
+        "Node ids and serviceTask jobTypes are the same keys the trace tables use \
+         (jobs.element_id / jobs.job_type, incidents.element_id) — join structure to runtime \
+         with query_traces. This model is a multi-stage ORCHESTRATOR: callActivity nodes are \
+         opaque here (see each node's calledElement). The trace tables address the inner tasks \
+         with Parent$Child ids (e.g. Phase2_DocumentRequest$Task_SendRefreshRequest). Call \
+         read_model with expand:true to inline every phase into one Parent$Child graph that \
+         matches those ids, or read_model_xml {process} to see a phase's raw BPMN."
+    } else {
+        "Node ids and serviceTask jobTypes are the same keys the trace tables use \
+         (jobs.element_id / jobs.job_type, incidents.element_id) — join structure to runtime \
+         with query_traces."
+    };
+    Ok(json!({
+        "processId": def.id,
+        "startEvent": def.start_event,
+        "definitionCount": def_count,
+        "expandable": expandable,
+        "counts": counts,
+        "nodes": nodes,
+        "note": note,
+    }))
+}
+
+/// The inlined (expanded) structural view: every call activity is spliced in so
+/// the node ids are the `Parent$Child` keys the trace tables carry — letting the
+/// droid join a slow/incident-prone `element_id` straight to a node it can see.
+pub fn read_model_expanded(xml: &str) -> Result<Value, String> {
+    let def_count = parse_bpmn(xml)
+        .map_err(|e| format!("model failed to parse: {e:?}"))?
+        .len();
+    let def = inline_definition(xml, None)?;
+    let (counts, nodes) = node_view(&def);
+    Ok(json!({
+        "processId": def.id,
+        "startEvent": def.start_event,
+        "definitionCount": def_count,
+        "expanded": true,
+        "counts": counts,
+        "nodes": nodes,
+        "note": "EXPANDED view: call activities are inlined, so node ids are the Parent$Child \
+                 keys the trace tables use (jobs.element_id / incidents.element_id). Join any \
+                 slow or incident-prone element_id directly to a node here, then fix it with \
+                 edit_model (use process:\"<calledElement>\" to edit inside a phase).",
+    }))
+}
+
+/// Build the per-kind counts and the node list for a (possibly inlined) definition.
+fn node_view(def: &ProcessDefinition) -> (BTreeMap<&'static str, usize>, Vec<Value>) {
+    let adj = adjacency(def);
+    let reachable = reachable_from_start(def, &adj);
 
     let mut ids: Vec<&String> = def.elements.keys().collect();
     ids.sort();
@@ -451,17 +748,7 @@ pub fn read_model(xml: &str) -> Result<Value, String> {
         }
         nodes.push(node);
     }
-
-    Ok(json!({
-        "processId": def.id,
-        "startEvent": def.start_event,
-        "definitionCount": def_count,
-        "counts": counts,
-        "nodes": nodes,
-        "note": "Node ids and serviceTask jobTypes are the same keys the trace tables use \
-                 (jobs.element_id / jobs.job_type, incidents.element_id) — join structure to \
-                 runtime with query_traces.",
-    }))
+    (counts, nodes)
 }
 
 fn finding(severity: &str, code: &str, element: Option<&str>, message: String) -> Value {
@@ -2354,6 +2641,19 @@ fn apply_edit_op(
 /// to guarantee the result deploys. Returns the new XML, the per-op change notes, and the
 /// post-edit [`analyze_model`] structural findings so the model sees the consequences immediately.
 pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
+    edit_model_in(base_xml, ops, None)
+}
+
+/// Like [`edit_model`], but `process` selects WHICH definition to edit in a
+/// multi-stage model: the orchestrator (default / first) or a named called phase.
+/// The other definitions and the orchestrator's authored diagram are preserved, so
+/// editing inside a phase (where the bottleneck usually lives) doesn't flatten the
+/// overview. Node ids are LOCAL to the selected process.
+pub fn edit_model_in(
+    base_xml: &str,
+    ops: &[Value],
+    process: Option<&str>,
+) -> Result<Value, String> {
     if ops.is_empty() {
         return Err("edit_model needs at least one operation in 'ops'".to_string());
     }
@@ -2362,26 +2662,56 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
     // Preserve the operator-facing labels the base already carries (the engine model drops them),
     // so an edit doesn't strip every node's name; ops may add/override entries.
     let mut names = parse_element_names(&wrapped);
-    let mut def = parse_bpmn(&wrapped)
-        .map_err(|e| {
-            let err = format!("{e:?}");
-            match deploy_fix_hint(&err) {
-                Some(h) => format!("base model failed to parse: {err}\nFix: {h}"),
-                None => format!("base model failed to parse: {err}"),
-            }
-        })?
-        .into_iter()
-        .next()
-        .ok_or("base model contained no process definitions")?;
-
-    let mut applied: Vec<String> = heal_notes;
-    for (i, op) in ops.iter().enumerate() {
-        let note = apply_edit_op(&mut def, &mut names, op)
-            .map_err(|e| format!("op {} failed: {e}", i + 1))?;
-        applied.push(note);
+    let mut defs = parse_bpmn(&wrapped).map_err(|e| {
+        let err = format!("{e:?}");
+        match deploy_fix_hint(&err) {
+            Some(h) => format!("base model failed to parse: {err}\nFix: {h}"),
+            None => format!("base model failed to parse: {err}"),
+        }
+    })?;
+    if defs.is_empty() {
+        return Err("base model contained no process definitions".to_string());
     }
 
-    let xml = definition_to_xml_labeled(&def, &names);
+    let target_idx = match process {
+        Some(pid) => defs.iter().position(|d| d.id == pid).ok_or_else(|| {
+            format!(
+                "no process '{pid}' to edit. Known process ids: {}. Omit `process` to edit the \
+                 orchestrator; pass a callActivity's calledElement to edit a phase.",
+                defs.iter()
+                    .map(|d| d.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?,
+        None => 0,
+    };
+
+    let mut applied: Vec<String> = heal_notes;
+    {
+        let def = &mut defs[target_idx];
+        for (i, op) in ops.iter().enumerate() {
+            let note = apply_edit_op(def, &mut names, op)
+                .map_err(|e| format!("op {} failed: {e}", i + 1))?;
+            applied.push(note);
+        }
+    }
+
+    // Serialize. Single-definition models round-trip exactly as before. For a multi-stage model
+    // we re-emit the orchestrator (with a fresh diagram) and splice the remaining phase
+    // definitions back in, so the file stays self-contained and the overview survives.
+    let xml = if defs.len() == 1 {
+        definition_to_xml_labeled(&defs[0], &names)
+    } else {
+        let primary = definition_to_xml_labeled(&defs[0], &names);
+        let extras: Vec<String> = defs[1..]
+            .iter()
+            .map(|d| definition_to_xml_labeled(d, &names))
+            .collect();
+        let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
+        merge_definitions(&primary, &extra_refs)
+    };
+
     // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
     // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.
     if let Err(e) = parse_bpmn(&xml) {
@@ -2393,10 +2723,14 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
             hint.map(|h| format!("\nFix: {h}")).unwrap_or_default()
         ));
     }
-    let analysis = analyze_model(&xml).unwrap_or_else(|_| json!({}));
+    // Findings are reported for the definition we actually edited (the orchestrator by default,
+    // or the selected phase), not just the first process.
+    let edited_xml = definition_to_xml_labeled(&defs[target_idx], &names);
+    let analysis = analyze_model(&edited_xml).unwrap_or_else(|_| json!({}));
 
     Ok(json!({
         "ok": true,
+        "editedProcess": defs[target_idx].id,
         "model": xml,
         "appliedOps": applied,
         "findings": analysis.get("findings").cloned().unwrap_or(json!([])),
@@ -3090,5 +3424,114 @@ mod tests {
             xml.contains("<bpmndi:BPMNLabel>"),
             "guarded edge carries a label shape: {xml}"
         );
+    }
+
+    // ---- Multi-stage orchestrator: merge / expand / raw-XML / nested edit ----
+
+    const CDD_ORCH: &str = include_str!("../corpus-packs/cdd-refresh/orchestrator.bpmn");
+    const CDD_PHASE2: &str =
+        include_str!("../corpus-packs/cdd-refresh/phases/process-02-document-request.bpmn");
+    const CDD_PHASE5: &str =
+        include_str!("../corpus-packs/cdd-refresh/phases/process-05-parallel-screening.bpmn");
+    const CDD_PHASES: [&str; 8] = [
+        include_str!("../corpus-packs/cdd-refresh/phases/process-01-intake.bpmn"),
+        CDD_PHASE2,
+        include_str!("../corpus-packs/cdd-refresh/phases/process-03-reminders-and-escalation.bpmn"),
+        CDD_PHASE5,
+        include_str!("../corpus-packs/cdd-refresh/phases/process-06-sanctions-gate.bpmn"),
+        include_str!("../corpus-packs/cdd-refresh/phases/process-07-risk-assessment.bpmn"),
+        include_str!("../corpus-packs/cdd-refresh/phases/process-08-approval.bpmn"),
+        include_str!("../corpus-packs/cdd-refresh/phases/process-09-closure.bpmn"),
+    ];
+
+    fn merged_cdd() -> String {
+        merge_definitions(CDD_ORCH, &CDD_PHASES)
+    }
+
+    #[test]
+    fn merge_definitions_produces_one_self_contained_parseable_document() {
+        let merged = merged_cdd();
+        let defs = parse_bpmn(&merged).expect("merged model parses");
+        // Orchestrator + the two phases we merged.
+        let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&"Process02DocumentRequest"), "phase 2 present: {ids:?}");
+        assert!(ids.contains(&"Process05ParallelScreeningProcess"), "phase 5 present: {ids:?}");
+        // Exactly one diagram survives (the orchestrator's).
+        assert_eq!(merged.matches("<bpmndi:BPMNDiagram").count(), 1, "single diagram");
+    }
+
+    #[test]
+    fn read_model_overview_flags_expandable_and_exposes_called_element() {
+        let v = read_model(&merged_cdd()).expect("read");
+        assert_eq!(v["expandable"], json!(true));
+        let nodes = v["nodes"].as_array().unwrap();
+        let call = nodes
+            .iter()
+            .find(|n| n["id"] == "Phase2_DocumentRequest")
+            .expect("phase 2 call activity present");
+        assert_eq!(call["calledElement"], json!("Process02DocumentRequest"));
+    }
+
+    #[test]
+    fn read_model_expanded_uses_parent_child_trace_ids() {
+        let v = read_model_expanded(&merged_cdd()).expect("expand");
+        assert_eq!(v["expanded"], json!(true));
+        let ids: Vec<String> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        // The inner task the trace tables address as Parent$Child is now a visible node.
+        assert!(
+            ids.iter().any(|i| i == "Phase2_DocumentRequest$Task_SendRefreshRequest"),
+            "expanded view exposes the inlined trace id: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn read_model_xml_resolves_a_call_activity_to_its_phase() {
+        let merged = merged_cdd();
+        // By callActivity node id (resolved to calledElement).
+        let v = read_model_xml(&merged, Some("Phase2_DocumentRequest")).expect("xml by node");
+        assert_eq!(v["processId"], json!("Process02DocumentRequest"));
+        let block = v["xml"].as_str().unwrap();
+        assert!(block.contains("Task_SendRefreshRequest"), "phase 2 body: {block}");
+        assert!(!block.contains("Process05"), "only phase 2, not other phases");
+        // By process id directly.
+        let v2 = read_model_xml(&merged, Some("Process05ParallelScreeningProcess")).expect("xml");
+        assert_eq!(v2["processId"], json!("Process05ParallelScreeningProcess"));
+        // Whole document.
+        let full = read_model_xml(&merged, None).expect("full");
+        assert_eq!(full["scope"], json!("full"));
+        assert!(full["processIds"].as_array().unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn edit_model_in_edits_a_phase_and_preserves_the_other_definitions() {
+        let merged = merged_cdd();
+        // Rename a task INSIDE phase 2; the orchestrator and phase 5 must survive.
+        let ops = vec![json!({
+            "op": "set_name",
+            "node": "Task_SendRefreshRequest",
+            "name": "Send the refresh request packet"
+        })];
+        let v = edit_model_in(&merged, &ops, Some("Process02DocumentRequest")).expect("edit phase");
+        assert_eq!(v["editedProcess"], json!("Process02DocumentRequest"));
+        let model = v["model"].as_str().unwrap();
+        let defs = parse_bpmn(model).expect("edited model still parses");
+        let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&"Process05ParallelScreeningProcess"), "phase 5 preserved: {ids:?}");
+        assert!(ids.contains(&"CddRefreshOrchestrator"), "orchestrator preserved: {ids:?}");
+        // The edit can still be inlined for replay.
+        let inlined = inline_definition(model, None).expect("inline edited model");
+        assert!(inlined.elements.keys().any(|k| k.contains('$')), "still inlines to Parent$Child");
+    }
+
+    #[test]
+    fn edit_model_in_rejects_an_unknown_phase_with_the_known_ids() {
+        let ops = vec![json!({"op":"set_name","node":"X","name":"Y"})];
+        let err = edit_model_in(&merged_cdd(), &ops, Some("NoSuchPhase")).expect_err("should fail");
+        assert!(err.contains("Process02DocumentRequest"), "lists known ids: {err}");
     }
 }

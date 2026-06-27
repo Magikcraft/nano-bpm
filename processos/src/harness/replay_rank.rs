@@ -18,6 +18,8 @@
 //! fewer required new workers. Every candidate keeps its full [`ReplayReport`]
 //! scorecard for drill-down, so the operator decides — the harness only ranks.
 
+use std::collections::HashMap;
+
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::ProcessDefinition;
 use serde::Serialize;
@@ -217,7 +219,19 @@ fn score_candidate(
             let process_id = default_process_id
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| defs[0].id.clone());
-            let report = replay_dataset_with_mocks(&defs, &process_id, dataset, &c.mock_workers);
+            // Inline call activities before replay: the engine has no first-class call-activity
+            // executor (it expands them into sub-process scopes), so a multi-stage orchestrator —
+            // or a variant the droid authored by editing a single called phase — only runs once
+            // its phases are spliced in. With no call activities this is a faithful identity.
+            let library: HashMap<String, ProcessDefinition> =
+                defs.iter().map(|d| (d.id.clone(), d.clone())).collect();
+            let run_defs: Vec<ProcessDefinition> = library
+                .get(&process_id)
+                .and_then(|root| root.inline_call_activities(&library).ok())
+                .map(|inlined| vec![inlined])
+                .unwrap_or_else(|| defs.clone());
+            let report =
+                replay_dataset_with_mocks(&run_defs, &process_id, dataset, &c.mock_workers);
             let tier = classify_tier(true, &report);
             RankedCandidate {
                 name: c.name.clone(),
@@ -393,6 +407,59 @@ mod tests {
             )
         };
         vec![mk("S1"), mk("S2"), mk("S3")]
+    }
+
+    // A multi-stage orchestrator P → CallPhase(calledElement="Phase") → End, where the
+    // called phase runs classify → summarize. The engine has no call-activity executor, so
+    // this only replays if score_candidate inlines the phase first.
+    const CALL_ACTIVITY: &str = r#"<?xml version="1.0"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="D">
+  <bpmn:process id="P" isExecutable="true">
+    <bpmn:startEvent id="S"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="S" targetRef="CallPhase"/>
+    <bpmn:callActivity id="CallPhase" name="Run phase" calledElement="Phase">
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:callActivity>
+    <bpmn:sequenceFlow id="f2" sourceRef="CallPhase" targetRef="E"/>
+    <bpmn:endEvent id="E"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+  <bpmn:process id="Phase" isExecutable="true">
+    <bpmn:startEvent id="PS"><bpmn:outgoing>p1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="p1" sourceRef="PS" targetRef="C"/>
+    <bpmn:serviceTask id="C" name="Classify">
+      <bpmn:extensionElements><zeebe:taskDefinition type="classify"/></bpmn:extensionElements>
+      <bpmn:incoming>p1</bpmn:incoming><bpmn:outgoing>p2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="p2" sourceRef="C" targetRef="U"/>
+    <bpmn:serviceTask id="U" name="Summarize">
+      <bpmn:extensionElements><zeebe:taskDefinition type="summarize"/></bpmn:extensionElements>
+      <bpmn:incoming>p2</bpmn:incoming><bpmn:outgoing>p3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="p3" sourceRef="U" targetRef="PE"/>
+    <bpmn:endEvent id="PE"><bpmn:incoming>p3</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn a_call_activity_candidate_is_inlined_before_replay_and_conserves() {
+        let ds = dataset();
+        let cands = vec![CandidateModel {
+            name: "orchestrated".into(),
+            rationale: None,
+            model: CALL_ACTIVITY.into(),
+            ..Default::default()
+        }];
+        let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
+        let c = &ranking.candidates[0];
+        assert!(c.feasible && c.report.error.is_none(), "deploys: {:?}", c.report.error);
+        // The inlined phase fires classify then summarize, conserving against the recorded runs.
+        assert!(
+            (c.report.conserved_rate - 1.0).abs() < 1e-9,
+            "call-activity model conserves once inlined: {:?}",
+            c.report
+        );
+        assert_eq!(ranking.best.as_deref(), Some("orchestrated"));
     }
 
     #[test]

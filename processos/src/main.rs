@@ -1444,7 +1444,24 @@ fn seed_demo(
         .find(|f| f.rel == dataset.model_rel)
         .map(|f| f.contents)
         .ok_or_else(|| format!("model file '{}' missing from dataset", dataset.model_rel))?;
-    workspaces.write_model(&ws.slug, &proc.slug, model_xml)?;
+    // For a multi-stage orchestrator, make the persisted model SELF-CONTAINED: merge the called
+    // phase definitions into the one file so the cockpit tools (read_model expand / read_model_xml
+    // / edit_model process:) and replay can see and address the inner tasks — the `Parent$Child`
+    // ids the trace tables carry. Single-file models (no call activities) are written unchanged.
+    let merged;
+    let model_to_write: &str = if crate::bpmn_model::references_call_activities(model_xml) {
+        let phases: Vec<&str> = dataset
+            .files
+            .iter()
+            .filter(|f| f.rel != dataset.model_rel && f.rel.ends_with(".bpmn"))
+            .map(|f| f.contents)
+            .collect();
+        merged = crate::bpmn_model::merge_definitions(model_xml, &phases);
+        &merged
+    } else {
+        model_xml
+    };
+    workspaces.write_model(&ws.slug, &proc.slug, model_to_write)?;
     let _ = std::fs::remove_dir_all(&tmp);
 
     Ok(serde_json::json!({

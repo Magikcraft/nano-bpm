@@ -162,14 +162,55 @@ impl ToolBox for AnalysisTools {
                 description: "Return the structural view of this process's BPMN MODEL \
                     (independent of runtime): the start event, per-kind counts, and every \
                     node with its kind, key attributes (serviceTask jobType, boundary \
-                    attachment, timer/message details), incoming count, outgoing targets \
-                    (conditional flagged), reachability and gateway split/join role. Node \
-                    ids and serviceTask jobTypes are the SAME keys the trace tables use \
-                    (jobs.element_id / jobs.job_type, incidents.element_id) — use this to \
-                    reason about structure and then join to runtime with query_traces. Takes \
-                    no arguments."
+                    attachment, timer/message details, callActivity calledElement), incoming \
+                    count, outgoing targets (conditional flagged), reachability and gateway \
+                    split/join role. Node ids and serviceTask jobTypes are the SAME keys the \
+                    trace tables use (jobs.element_id / jobs.job_type, incidents.element_id) — \
+                    use this to reason about structure and then join to runtime with \
+                    query_traces. If the model is a multi-stage ORCHESTRATOR (it has \
+                    callActivity nodes, flagged by `expandable:true`), the default view shows \
+                    the phases as OPAQUE boxes; the trace tables address the inner tasks with \
+                    `Parent$Child` ids (e.g. Phase2_DocumentRequest$Task_SendRefreshRequest). \
+                    Pass expand:true to INLINE every phase into one Parent$Child graph that \
+                    matches those ids (use read_model_xml to see a phase's raw BPMN). \
+                    Args: expand (boolean, default false)."
                     .into(),
-                parameters: json!({ "type": "object", "properties": {} }),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "expand": {
+                            "type": "boolean",
+                            "description": "Inline call activities so node ids are the \
+                                Parent$Child keys the trace tables use. Default false (opaque \
+                                phases / orchestrator overview)."
+                        }
+                    }
+                }),
+            });
+            specs.push(ToolSpec {
+                name: "read_model_xml".into(),
+                description: "Return the RAW BPMN XML of the model — the ground-truth source the \
+                    distilled read_model view is derived from. Use it when read_model isn't \
+                    enough: to inspect a service task's full extensionElements, a flow's exact \
+                    FEEL conditionExpression, multi-instance / boundary-event details, or — for a \
+                    multi-stage ORCHESTRATOR — the internals of a called phase. With no argument \
+                    it returns the whole document (and the list of process ids inside it). Pass \
+                    process:\"<id>\" — either a `<process>` id OR a callActivity node id (resolved \
+                    to its calledElement) — to isolate ONE phase's raw XML. Once you can see it, \
+                    change it with edit_model process:\"<id>\" rather than hand-writing XML. \
+                    Args: process (optional process id or callActivity node id)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "process": {
+                            "type": "string",
+                            "description": "A process id, or a callActivity node id (resolved to \
+                                its calledElement), to isolate that phase's raw XML. Omit for the \
+                                whole document."
+                        }
+                    }
+                }),
             });
             specs.push(ToolSpec {
                 name: "analyze_model".into(),
@@ -246,7 +287,13 @@ impl ToolBox for AnalysisTools {
                     successors (and drop any boundary events attached to it).\n\
                     • add_exclusive_gateway {id, after, branches:[{to, condition?}]} — splice an \
                     XOR gateway after a node; `after`'s original target(s) are kept as the default \
-                    branch."
+                    branch.\n\
+                    For a multi-stage ORCHESTRATOR, node ids live INSIDE a called phase, not in \
+                    the orchestrator. Pass `process:\"<id>\"` (a callActivity's calledElement, \
+                    e.g. from read_model's calledElement or read_model_xml) to edit that phase; \
+                    its node ids are then the LOCAL ones (the part after `$` in a Parent$Child \
+                    trace id). Omit `process` to edit the orchestrator itself. The other phases \
+                    and the overview diagram are preserved."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -262,6 +309,12 @@ impl ToolBox for AnalysisTools {
                             "type": "string",
                             "description": "BPMN XML to edit. Omit to edit the current process \
                                 model. Pass a previous edit_model `model` to chain edits."
+                        },
+                        "process": {
+                            "type": "string",
+                            "description": "For a multi-stage model: the called phase (process id / \
+                                callActivity calledElement) whose LOCAL node ids the ops address. \
+                                Omit to edit the orchestrator."
                         }
                     },
                     "required": ["ops"]
@@ -441,8 +494,25 @@ impl ToolBox for AnalysisTools {
                     .model
                     .as_ref()
                     .ok_or("read_model is not available: this process has no BPMN model")?;
-                let v = crate::bpmn_model::read_model(xml)?;
+                let expand = args
+                    .get("expand")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let v = if expand {
+                    crate::bpmn_model::read_model_expanded(xml)?
+                } else {
+                    crate::bpmn_model::read_model(xml)?
+                };
                 serde_json::to_string(&v).map_err(|e| format!("serialise model: {e}"))
+            }
+            "read_model_xml" => {
+                let xml = self
+                    .model
+                    .as_ref()
+                    .ok_or("read_model_xml is not available: this process has no BPMN model")?;
+                let target = args.get("process").and_then(|v| v.as_str());
+                let v = crate::bpmn_model::read_model_xml(xml, target)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise model xml: {e}"))
             }
             "analyze_model" => {
                 let xml = self
@@ -475,7 +545,11 @@ impl ToolBox for AnalysisTools {
                          edit",
                     )?,
                 };
-                let v = crate::bpmn_model::edit_model(base, ops)?;
+                let process = args.get("process").and_then(|v| v.as_str());
+                let v = match process {
+                    Some(p) => crate::bpmn_model::edit_model_in(base, ops, Some(p))?,
+                    None => crate::bpmn_model::edit_model(base, ops)?,
+                };
                 serde_json::to_string(&v).map_err(|e| format!("serialise edit: {e}"))
             }
             "conformance_check" => {
