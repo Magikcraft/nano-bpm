@@ -1471,6 +1471,56 @@
     }
 
     #[test]
+    fn should_take_default_flow_even_when_listed_before_the_conditional() {
+        // Regression: an exclusive gateway's explicit default flow must be a
+        // fallback only — never selected by document order. Here the default
+        // (g -> rejected) is connected BEFORE the conditional (g -> approved),
+        // the order Camunda often serialises.
+        let process = ProcessBuilder::new("approval")
+            .start_event("s")
+            .exclusive_gateway("g")
+            .end_event("approved")
+            .end_event("rejected")
+            .connect("s", "g")
+            .connect_default("g", "rejected")
+            .connect_when("g", "approved", r#"decision = "yes""#)
+            .build()
+            .unwrap();
+
+        // decision == yes -> the conditional flow wins despite appearing last.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process.clone()))
+            .unwrap();
+        let vars = HashMap::from([("decision".to_string(), Value::Str("yes".into()))]);
+        let events = engine
+            .apply_command(Command::create_instance_with("approval", vars))
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "approved"
+        )));
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "rejected"
+        )));
+
+        // decision != yes -> the default flow is the fallback.
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process))
+            .unwrap();
+        let vars = HashMap::from([("decision".to_string(), Value::Str("no".into()))]);
+        let events = engine
+            .apply_command(Command::create_instance_with("approval", vars))
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "rejected"
+        )));
+    }
+
+    #[test]
     fn should_route_exclusive_gateway_on_a_numeric_feel_comparison() {
         // A richer FEEL condition than equality: amount > 100 -> big ; else small.
         let def = ProcessBuilder::new("amounts")

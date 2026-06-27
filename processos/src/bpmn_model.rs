@@ -2111,6 +2111,7 @@ fn apply_edit_op(
             anchor.outgoing.push(SequenceFlow {
                 to: id.to_string(),
                 condition: None,
+                is_default: false,
             });
             let parent = anchor.parent.clone();
             def.elements.insert(
@@ -2170,6 +2171,7 @@ fn apply_edit_op(
                     outgoing: vec![SequenceFlow {
                         to: target.to_string(),
                         condition: None,
+                        is_default: false,
                     }],
                     parent: None,
                 },
@@ -2224,6 +2226,7 @@ fn apply_edit_op(
                             rewired.push(SequenceFlow {
                                 to: succ.to.clone(),
                                 condition: flow.condition.clone(),
+                                is_default: flow.is_default,
                             });
                         }
                     } else {
@@ -2296,6 +2299,7 @@ fn apply_edit_op(
                 outgoing.push(SequenceFlow {
                     to: to.to_string(),
                     condition: condition_from(b.get("condition").and_then(|v| v.as_str())),
+                    is_default: false,
                 });
             }
             // Splice the gateway onto the anchor's single outgoing edge: after -> G, and G fans out
@@ -2309,6 +2313,7 @@ fn apply_edit_op(
             anchor.outgoing.push(SequenceFlow {
                 to: id.to_string(),
                 condition: None,
+                is_default: false,
             });
             let parent = anchor.parent.clone();
             for f in original {
@@ -2316,6 +2321,7 @@ fn apply_edit_op(
                 outgoing.push(SequenceFlow {
                     to: f.to,
                     condition: None,
+                    is_default: false,
                 });
             }
             def.elements.insert(

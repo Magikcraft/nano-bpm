@@ -218,7 +218,12 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 acc.add_node(attrs, NodeKind::End);
                             }
                             "exclusiveGateway" => {
-                                acc.add_node(attrs, NodeKind::Exclusive);
+                                let idx = acc.add_node(attrs, NodeKind::Exclusive);
+                                // Capture the `default` flow id so it is selected
+                                // only as a fallback (not by document order).
+                                if let (Some(i), Some(d)) = (idx, attr(attrs, "default")) {
+                                    acc.nodes[i].default_flow = Some(d.to_string());
+                                }
                             }
                             "parallelGateway" => {
                                 acc.add_node(attrs, NodeKind::Parallel);
@@ -600,6 +605,10 @@ struct NodeAcc {
     /// True for an `adHocSubProcess`: kept as a single Service job activity while
     /// its contained elements are pruned at build (see `build`).
     is_adhoc: bool,
+    /// For an exclusive gateway: the id of its `default="..."` sequence flow, if
+    /// declared. That flow becomes the gateway's fallback (taken only when no
+    /// other outgoing condition matches), regardless of document order.
+    default_flow: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -619,6 +628,7 @@ enum NodeKind {
 
 /// A sequence flow collected while scanning.
 struct FlowAcc {
+    id: Option<String>,
     source: Option<String>,
     target: Option<String>,
     condition: Option<String>,
@@ -685,6 +695,7 @@ impl ProcessAcc {
             parent: self.scope_stack.last().cloned(),
             user_task: crate::model::UserTaskProps::default(),
             is_adhoc: false,
+            default_flow: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -692,6 +703,7 @@ impl ProcessAcc {
     /// Adds a sequence flow; returns its index.
     fn add_flow(&mut self, attrs: &[(String, String)]) -> Option<usize> {
         self.flows.push(FlowAcc {
+            id: attr(attrs, "id").map(str::to_string),
             source: attr(attrs, "sourceRef").map(str::to_string),
             target: attr(attrs, "targetRef").map(str::to_string),
             condition: None,
@@ -807,9 +819,15 @@ impl ProcessAcc {
             .filter(|n| matches!(n.kind, NodeKind::Start))
             .filter_map(|n| n.parent.clone().map(|p| (p, n.id.clone())))
             .collect();
+        // Ids of sequence flows declared as a gateway `default` flow.
+        let mut default_flow_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for node in self.nodes {
             let node_id = node.id.clone();
             let parent = node.parent.clone();
+            if let Some(d) = node.default_flow.clone() {
+                default_flow_ids.insert(d);
+            }
             builder = match node.kind {
                 NodeKind::Start => {
                     // A messageRef makes it a message start; a timer_repeating
@@ -990,9 +1008,14 @@ impl ProcessAcc {
                     })
                 }
             };
-            builder = match flow.condition {
-                Some(expression) => builder.connect_when(source, target, expression),
-                None => builder.connect(source, target),
+            let is_default = flow
+                .id
+                .as_deref()
+                .is_some_and(|id| default_flow_ids.contains(id));
+            builder = match (is_default, flow.condition) {
+                (true, _) => builder.connect_default(source, target),
+                (false, Some(expression)) => builder.connect_when(source, target, expression),
+                (false, None) => builder.connect(source, target),
             };
         }
         builder.build().map_err(|e| ParseError::InvalidProcess {
@@ -1404,6 +1427,39 @@ mod tests {
         assert!(def.element("tool_issue_credit").is_none());
         assert!(def.element("tool_review").is_none());
         assert!(def.element("tool_gw").is_none());
+    }
+
+    #[test]
+    fn should_mark_the_gateway_default_flow_regardless_of_document_order() {
+        // given: an exclusive gateway whose `default` flow is listed FIRST, with
+        // the conditional flow second — the order Camunda often serialises.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:exclusiveGateway id="gw" default="to_default" />
+              <bpmn:endEvent id="default_task" />
+              <bpmn:endEvent id="cond_task" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="gw" />
+              <bpmn:sequenceFlow id="to_default" sourceRef="gw" targetRef="default_task" />
+              <bpmn:sequenceFlow id="to_cond" sourceRef="gw" targetRef="cond_task">
+                <bpmn:conditionExpression>=isDuplicate</bpmn:conditionExpression>
+              </bpmn:sequenceFlow>
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the gateway's outgoing flows carry the right is_default markers —
+        // the default flow is flagged even though it appears first in the document.
+        let gw = def.element("gw").unwrap();
+        let default = gw.outgoing.iter().find(|f| f.to == "default_task").unwrap();
+        let cond = gw.outgoing.iter().find(|f| f.to == "cond_task").unwrap();
+        assert!(default.is_default, "default flow should be flagged");
+        assert!(default.condition.is_none());
+        assert!(!cond.is_default, "conditional flow should not be default");
+        assert!(cond.condition.is_some());
     }
 
     #[test]

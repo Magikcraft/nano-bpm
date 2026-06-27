@@ -124,6 +124,12 @@ pub struct SequenceFlow {
     /// `None` means an unconditional flow. On an exclusive gateway an
     /// unconditional flow acts as the default (place it last).
     pub condition: Option<Condition>,
+    /// True when this is the exclusive gateway's explicit **default** flow (the
+    /// gateway's `default="..."` attribute). A default flow is selected only as a
+    /// fallback — after every non-default flow's condition has evaluated false —
+    /// regardless of its document order among the outgoing flows.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_default: bool,
 }
 
 /// The (raw, un-evaluated) assignment, scheduling and priority expressions
@@ -453,6 +459,7 @@ fn splice_call_activities(
             .map(|f| SequenceFlow {
                 to: pfx(&f.to),
                 condition: f.condition.clone(),
+                is_default: f.is_default,
             })
             .collect();
         if let ElementKind::CallActivity { called_process_id } = &el.kind {
@@ -920,6 +927,23 @@ impl ProcessBuilder {
             SequenceFlow {
                 to: to.into(),
                 condition: None,
+                is_default: false,
+            },
+        ));
+        self
+    }
+
+    /// Adds an exclusive gateway's explicit **default** sequence flow from `from`
+    /// to `to`. It carries no condition and is taken only as a fallback (when no
+    /// non-default flow's condition is satisfied), irrespective of its position
+    /// in the outgoing-flow order.
+    pub fn connect_default(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.edges.push((
+            from.into(),
+            SequenceFlow {
+                to: to.into(),
+                condition: None,
+                is_default: true,
             },
         ));
         self
@@ -938,6 +962,7 @@ impl ProcessBuilder {
             SequenceFlow {
                 to: to.into(),
                 condition: Some(Condition::new(expression)),
+                is_default: false,
             },
         ));
         self

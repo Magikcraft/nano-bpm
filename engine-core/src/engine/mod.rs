@@ -2035,8 +2035,16 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         let variables = self.variables(instance_key);
         let mut selected = None;
+        let mut default_flow = None;
         let mut eval_error: Option<String> = None;
         for flow in self.outgoing(instance_key, &element_id) {
+            // The explicit `default` flow is a fallback only: it is never taken
+            // by document order, but kept aside in case no conditional flow
+            // matches.
+            if flow.is_default {
+                default_flow = Some(flow);
+                continue;
+            }
             match &flow.condition {
                 None => {
                     selected = Some(flow);
@@ -2058,6 +2066,10 @@ impl Engine {
                     }
                 },
             }
+        }
+        // Fall back to the explicit default flow when no conditional flow matched.
+        if selected.is_none() && eval_error.is_none() {
+            selected = default_flow;
         }
 
         if let Some(reason) = eval_error {
