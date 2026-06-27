@@ -47,6 +47,11 @@
   .dialog { background: #141417; border: 1px solid #2a2a30; border-radius: 10px; padding: 16px; margin: 14px 0; max-width: 560px; }
   .dialog label { display: block; font-size: 12px; color: #a1a1aa; margin: 10px 0 3px; }
   .dialog input, .dialog textarea, .dialog select { width: 100%; }
+  .demo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 10px; margin-top: 6px; }
+  .demo-card { background: #18181c; border: 1px solid #2a2a30; border-radius: 9px; padding: 12px 14px; display: flex; flex-direction: column; }
+  .demo-card h4 { margin: 0 0 6px; font-size: 13px; color: #c7d2fe; }
+  .demo-card p { margin: 0 0 10px; font-size: 12px; line-height: 1.4; flex: 1; }
+  .demo-card button { align-self: flex-start; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
   .card { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 12px 16px; min-width: 110px; }
   .card .n { font-size: 22px; font-weight: 650; }
@@ -119,25 +124,52 @@ async function viewWorkspaces() {
     </div>
     <div id="dlg"></div>
     <h2>Workspaces</h2>
-    <div class="grid">${tiles || '<p class="muted">No workspaces yet — create one, or load the demo dataset to begin.</p>'}</div>`;
+    <div class="grid">${tiles || '<p class="muted">No workspaces yet — create one, or load a demo dataset to begin.</p>'}</div>`;
 
   app.querySelectorAll('.tile[data-c]').forEach(t =>
     t.onclick = () => location.hash = '#/c/' + t.dataset.c);
   document.getElementById('newC').onclick = () => showNewWorkspace();
-  document.getElementById('seed').onclick = (e) => seedDemo(e.target);
+  document.getElementById('seed').onclick = () => showDemoPicker();
 }
 
-async function seedDemo(btn) {
+async function showDemoPicker() {
+  const dlg = document.getElementById('dlg');
+  dlg.innerHTML = '<div class="dialog">Loading demo datasets…</div>';
+  let data;
+  try { data = await api('/api/workspaces/demo-datasets'); }
+  catch (e) { dlg.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+  const cards = (data.datasets || []).map(d => `
+    <div class="demo-card" data-id="${esc(d.id)}">
+      <h4>${esc(d.workspace)} · ${esc(d.process)}</h4>
+      <p class="muted">${esc(d.description || '')}</p>
+      <button class="primary demo-load" data-id="${esc(d.id)}">Load</button>
+    </div>`).join('');
+
+  const el = $(`<div class="dialog">
+    <label>Choose a demo scenario to generate and explore</label>
+    <div class="demo-grid">${cards || '<p class="muted">No demo datasets bundled.</p>'}</div>
+    <div class="row" style="margin-top:12px"><button id="democancel">Cancel</button></div>
+    <div class="err" id="demoerr"></div></div>`);
+  dlg.innerHTML = '';
+  dlg.appendChild(el);
+  el.querySelector('#democancel').onclick = () => dlg.innerHTML = '';
+  el.querySelectorAll('.demo-load').forEach(b =>
+    b.onclick = () => seedDemo(b, b.dataset.id));
+}
+
+async function seedDemo(btn, dataset) {
   btn.disabled = true; const label = btn.textContent; btn.textContent = 'Generating demo corpus…';
   try {
     const r = await api('/api/workspaces/seed-demo', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}'
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dataset })
     });
     location.hash = '#/c/' + r.workspace + '/p/' + r.process;
   } catch (e) {
     btn.disabled = false; btn.textContent = label;
-    const dlg = document.getElementById('dlg');
-    if (dlg) dlg.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    const err = document.getElementById('demoerr') || document.getElementById('dlg');
+    if (err) err.textContent = e.message;
   }
 }
 

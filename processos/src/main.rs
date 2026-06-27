@@ -436,6 +436,10 @@ async fn main() {
             get(ws_workspaces).post(ws_create_workspace),
         )
         .route("/api/workspaces/{workspace}", get(ws_workspace))
+        .route(
+            "/api/workspaces/demo-datasets",
+            get(ws_demo_datasets),
+        )
         .route("/api/workspaces/seed-demo", post(ws_seed_demo))
         .route(
             "/api/workspaces/{workspace}/processes",
@@ -980,10 +984,150 @@ const BPMN_DIAGRAM_CSS: &str = include_str!("../assets/bpmn/diagram-js.css");
 const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css");
 const SETTINGS_JS: &str = include_str!("../assets/settings.js");
 
-/// The bundled loan-approval demo pack + model, embedded so `seed-demo` works from
-/// any working directory.
-const LOAN_PACK_JSON: &str = include_str!("../corpus-packs/loan-approval/pack.json");
-const LOAN_MODEL_BPMN: &str = include_str!("../corpus-packs/loan-approval/loan-approval.bpmn");
+/// A single embedded file belonging to a demo dataset, addressed by its path
+/// relative to the pack directory (so `bpmn_library` directory references and the
+/// `bpmn` field resolve exactly as they do on disk).
+struct DemoFile {
+    rel: &'static str,
+    contents: &'static str,
+}
+
+/// A bundled corpus pack, embedded so the demo datasets seed from any working
+/// directory. Each becomes a selectable workspace+process scenario.
+struct DemoDataset {
+    /// URL-safe selector used by `POST /api/workspaces/seed-demo {dataset}`.
+    id: &'static str,
+    /// Default workspace display name.
+    workspace: &'static str,
+    /// Default process display name.
+    process: &'static str,
+    /// Objective stamped onto the seeded process.
+    objective: &'static str,
+    /// One-line scenario blurb shown in the demo picker.
+    description: &'static str,
+    /// The `pack.json` entry within `files`.
+    pack_rel: &'static str,
+    /// The primary BPMN entry within `files` (written as the process model).
+    model_rel: &'static str,
+    /// Every file to materialise before loading the pack.
+    files: &'static [DemoFile],
+}
+
+/// The bundled demo datasets, embedded so `seed-demo` works from any working
+/// directory. The first entry is the default when no `dataset` is requested.
+const DEMO_DATASETS: &[DemoDataset] = &[
+    DemoDataset {
+        id: "loan-approval",
+        workspace: "Northwind Bank",
+        process: "Loan Approval",
+        objective: "keep loan approvals fast and reliable as volume grows",
+        description: "Loan origination with a credit-check bottleneck under weekday-morning peaks.",
+        pack_rel: "pack.json",
+        model_rel: "loan-approval.bpmn",
+        files: &[
+            DemoFile {
+                rel: "pack.json",
+                contents: include_str!("../corpus-packs/loan-approval/pack.json"),
+            },
+            DemoFile {
+                rel: "loan-approval.bpmn",
+                contents: include_str!("../corpus-packs/loan-approval/loan-approval.bpmn"),
+            },
+        ],
+    },
+    DemoDataset {
+        id: "cdd-refresh",
+        workspace: "Meridian Trust",
+        process: "CDD Refresh",
+        objective: "complete periodic KYC/CDD refreshes within SLA without overloading analysts",
+        description:
+            "Multi-phase KYC/CDD refresh orchestrator with an agentic AI investigation stage.",
+        pack_rel: "pack.json",
+        model_rel: "orchestrator.bpmn",
+        files: &[
+            DemoFile {
+                rel: "pack.json",
+                contents: include_str!("../corpus-packs/cdd-refresh/pack.json"),
+            },
+            DemoFile {
+                rel: "orchestrator.bpmn",
+                contents: include_str!("../corpus-packs/cdd-refresh/orchestrator.bpmn"),
+            },
+            DemoFile {
+                rel: "phases/process-01-intake.bpmn",
+                contents: include_str!("../corpus-packs/cdd-refresh/phases/process-01-intake.bpmn"),
+            },
+            DemoFile {
+                rel: "phases/process-02-document-request.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-02-document-request.bpmn"
+                ),
+            },
+            DemoFile {
+                rel: "phases/process-03-reminders-and-escalation.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-03-reminders-and-escalation.bpmn"
+                ),
+            },
+            DemoFile {
+                rel: "phases/process-05-parallel-screening.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-05-parallel-screening.bpmn"
+                ),
+            },
+            DemoFile {
+                rel: "phases/process-06-sanctions-gate.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-06-sanctions-gate.bpmn"
+                ),
+            },
+            DemoFile {
+                rel: "phases/process-07-risk-assessment.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-07-risk-assessment.bpmn"
+                ),
+            },
+            DemoFile {
+                rel: "phases/process-08-approval.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-08-approval.bpmn"
+                ),
+            },
+            DemoFile {
+                rel: "phases/process-09-closure.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/cdd-refresh/phases/process-09-closure.bpmn"
+                ),
+            },
+        ],
+    },
+    DemoDataset {
+        id: "amazing-retail",
+        workspace: "Amazing Retail",
+        process: "Delivery Exception Resolution",
+        objective: "resolve delivery exceptions quickly while controlling AI agent cost",
+        description:
+            "Delivery-exception triage with an under-provisioned AI agent and duplicate-case routing.",
+        pack_rel: "pack.json",
+        model_rel: "delivery-exception-resolution.bpmn",
+        files: &[
+            DemoFile {
+                rel: "pack.json",
+                contents: include_str!("../corpus-packs/amazing-retail/pack.json"),
+            },
+            DemoFile {
+                rel: "delivery-exception-resolution.bpmn",
+                contents: include_str!(
+                    "../corpus-packs/amazing-retail/delivery-exception-resolution.bpmn"
+                ),
+            },
+        ],
+    },
+];
+
+fn demo_dataset(id: &str) -> Option<&'static DemoDataset> {
+    DEMO_DATASETS.iter().find(|d| d.id == id)
+}
 
 /// `GET /workspace` — browse workspaces, drill into a process, view its Insights.
 async fn workspace_page() -> Html<&'static str> {
@@ -1184,35 +1328,66 @@ async fn ws_set_process_model(
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SeedDemoBody {
-    /// Workspace display name (default "Northwind Bank").
+    /// Which bundled dataset to seed (default: the first registered, loan-approval).
+    #[serde(default)]
+    dataset: Option<String>,
+    /// Workspace display name (default: the dataset's own).
     #[serde(default)]
     workspace: Option<String>,
-    /// Process display name (default "Loan Approval").
+    /// Process display name (default: the dataset's own).
     #[serde(default)]
     process: Option<String>,
 }
 
-/// `POST /api/workspaces/seed-demo` — materialise the bundled loan-approval demo: a
-/// workspace + a process bound to a freshly generated trace dataset + its BPMN model.
-/// Idempotent on the derived slugs. Returns the created `{workspace, process}` slugs.
+/// `GET /api/workspaces/demo-datasets` — the bundled scenarios the operator can
+/// seed, so the UI can present a picker.
+async fn ws_demo_datasets() -> impl IntoResponse {
+    let items: Vec<serde_json::Value> = DEMO_DATASETS
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "workspace": d.workspace,
+                "process": d.process,
+                "objective": d.objective,
+                "description": d.description,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "datasets": items }))
+}
+
+/// `POST /api/workspaces/seed-demo` — materialise a bundled demo dataset: a
+/// workspace + a process bound to a freshly generated trace dataset + its BPMN
+/// model. Idempotent on the derived slugs. Returns the created `{workspace,
+/// process}` slugs.
 async fn ws_seed_demo(
     State(state): State<AppState>,
     Json(body): Json<SeedDemoBody>,
 ) -> impl IntoResponse {
+    let dataset_id = body
+        .dataset
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEMO_DATASETS[0].id.to_string());
+    let Some(dataset) = demo_dataset(&dataset_id) else {
+        return unprocessable(format!("unknown demo dataset '{dataset_id}'"));
+    };
+
     let ws_name = body
         .workspace
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "Northwind Bank".to_string());
+        .unwrap_or_else(|| dataset.workspace.to_string());
     let proc_name = body
         .process
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "Loan Approval".to_string());
+        .unwrap_or_else(|| dataset.process.to_string());
 
     // Run the (blocking) corpus generation off the async runtime.
     let workspaces = state.workspaces.clone();
-    let result = tokio::task::spawn_blocking(move || seed_demo(&workspaces, &ws_name, &proc_name))
-        .await
-        .map_err(|e| format!("seed task failed: {e}"));
+    let result =
+        tokio::task::spawn_blocking(move || seed_demo(&workspaces, dataset, &ws_name, &proc_name))
+            .await
+            .map_err(|e| format!("seed task failed: {e}"));
 
     match result {
         Ok(Ok(slugs)) => (StatusCode::CREATED, Json(slugs)).into_response(),
@@ -1225,21 +1400,23 @@ async fn ws_seed_demo(
 /// drop the BPMN model beside it. Returns the slugs.
 fn seed_demo(
     workspaces: &workspace::WorkspaceCatalog,
+    dataset: &DemoDataset,
     ws_name: &str,
     proc_name: &str,
 ) -> Result<serde_json::Value, String> {
     let ws = workspaces.create_workspace(
         ws_name,
-        Some("Demo engagement (bundled loan-approval corpus)".into()),
+        Some(format!("Demo engagement (bundled {} corpus)", dataset.id)),
     )?;
     let proc_cfg = workspace::ProcessConfig {
         display_name: proc_name.to_string(),
-        objective: Some("keep loan approvals fast and reliable as volume grows".into()),
+        objective: Some(dataset.objective.to_string()),
         ..Default::default()
     };
     let proc = workspaces.create_process(&ws.slug, proc_name, proc_cfg)?;
 
-    // Write the embedded pack + bpmn to a temp dir, then load + generate.
+    // Materialise the embedded pack files (preserving relative paths so the
+    // `bpmn`/`bpmn_library` references resolve), then load + generate.
     let tmp = std::env::temp_dir().join(format!(
         "processos-seed-{}-{}",
         std::process::id(),
@@ -1249,15 +1426,25 @@ fn seed_demo(
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("seed tmp: {e}"))?;
-    std::fs::write(tmp.join("pack.json"), LOAN_PACK_JSON)
-        .map_err(|e| format!("write pack: {e}"))?;
-    std::fs::write(tmp.join("loan-approval.bpmn"), LOAN_MODEL_BPMN)
-        .map_err(|e| format!("write bpmn: {e}"))?;
+    for file in dataset.files {
+        let dest = tmp.join(file.rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("seed tmp dir: {e}"))?;
+        }
+        std::fs::write(&dest, file.contents)
+            .map_err(|e| format!("write {}: {e}", file.rel))?;
+    }
 
-    let (pack, def) = corpus::load_pack(&tmp.join("pack.json"))?;
+    let (pack, def) = corpus::load_pack(&tmp.join(dataset.pack_rel))?;
     let traces_dir = workspaces.process_traces_dir(&ws.slug, &proc.slug)?;
     let summary = corpus::generate(&pack, &def, &traces_dir)?;
-    workspaces.write_model(&ws.slug, &proc.slug, LOAN_MODEL_BPMN)?;
+    let model_xml = dataset
+        .files
+        .iter()
+        .find(|f| f.rel == dataset.model_rel)
+        .map(|f| f.contents)
+        .ok_or_else(|| format!("model file '{}' missing from dataset", dataset.model_rel))?;
+    workspaces.write_model(&ws.slug, &proc.slug, model_xml)?;
     let _ = std::fs::remove_dir_all(&tmp);
 
     Ok(serde_json::json!({
