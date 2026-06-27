@@ -18,6 +18,12 @@ use crate::dataset::TraceSource;
 pub struct Insights {
     pub generated_at_ms: u64,
     pub nano_base_url: String,
+    /// True size of the underlying dataset when known (an in-memory captured
+    /// dataset); `None` for a live gateway whose total isn't known up front.
+    /// When present this is the authoritative instance count — `totals.instances`
+    /// is the number actually *analyzed* for this report (== `datasetTotal` once
+    /// the whole population fits the analysis window).
+    pub dataset_total: Option<usize>,
     /// Number of trace details sampled to build the per-element aggregates.
     pub sampled_instances: usize,
     pub totals: Totals,
@@ -110,6 +116,7 @@ pub async fn build_over(
     Ok(Insights {
         generated_at_ms: now_ms(),
         nano_base_url: src.label(),
+        dataset_total: src.total(),
         sampled_instances: details.len(),
         totals,
         live,

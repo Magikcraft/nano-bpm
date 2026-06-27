@@ -142,6 +142,7 @@ mod tests {
         Insights {
             generated_at_ms: 0,
             nano_base_url: "http://nano".into(),
+            dataset_total: None,
             sampled_instances: processes.iter().map(|p| p.instances).sum(),
             totals: Totals::default(),
             live: None,

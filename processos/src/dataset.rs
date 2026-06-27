@@ -11,6 +11,7 @@
 //! `&TraceSource` and is agnostic to whether the bytes came from a live gateway or
 //! a directory on disk.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -26,6 +27,9 @@ pub struct DatasetSource {
     path: PathBuf,
     traces: Vec<InstanceTrace>,
     summaries: Vec<TraceSummary>,
+    /// `instance_key` -> index into `traces`, so per-key reads are O(1) even on
+    /// full-population folds over large captured datasets.
+    by_key: HashMap<String, usize>,
     metrics: Option<Metrics>,
 }
 
@@ -73,6 +77,11 @@ impl DatasetSource {
         traces.dedup_by(|a, b| a.instance_key == b.instance_key);
 
         let summaries = traces.iter().map(summary_of).collect();
+        let by_key = traces
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.instance_key.clone(), i))
+            .collect();
 
         let metrics = {
             let m = dir.join("metrics.json");
@@ -85,6 +94,7 @@ impl DatasetSource {
             path: dir.to_path_buf(),
             traces,
             summaries,
+            by_key,
             metrics,
         })
     }
@@ -93,7 +103,6 @@ impl DatasetSource {
         &self.path
     }
 
-    #[allow(dead_code)] // used in tests + a useful public accessor
     pub fn len(&self) -> usize {
         self.traces.len()
     }
@@ -108,9 +117,9 @@ impl DatasetSource {
     }
 
     fn trace(&self, instance_key: &str) -> Option<InstanceTrace> {
-        self.traces
-            .iter()
-            .find(|t| t.instance_key == instance_key)
+        self.by_key
+            .get(instance_key)
+            .and_then(|&i| self.traces.get(i))
             .cloned()
     }
 }
@@ -200,6 +209,16 @@ impl TraceSource {
         match self {
             TraceSource::Live(c) => c.base_url().to_string(),
             TraceSource::Dataset(d) => format!("dataset:{}", d.path().display()),
+        }
+    }
+
+    /// The true population size when it is known up front — i.e. for an in-memory
+    /// dataset, where every trace is already loaded. `None` for a live gateway,
+    /// whose total is only discoverable by paging the trace list.
+    pub fn total(&self) -> Option<usize> {
+        match self {
+            TraceSource::Live(_) => None,
+            TraceSource::Dataset(d) => Some(d.len()),
         }
     }
 }

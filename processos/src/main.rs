@@ -1461,11 +1461,24 @@ async fn ws_process_insights(
     Path((workspace, process)): Path<(String, String)>,
     Query(q): Query<InsightsQuery>,
 ) -> impl IntoResponse {
-    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    let sample = q.sample.unwrap_or(50).clamp(1, 500);
     let src = match state.workspaces.resolve_source(&workspace, &process) {
         Ok(s) => s,
         Err(e) => return unprocessable(e),
+    };
+    // An in-memory captured dataset costs nothing per-read, so analyze the whole
+    // population (up to a sane ceiling) rather than a small sampled window — the
+    // report then reflects the real dataset, not an arbitrary 200/50 slice. A
+    // live gateway pays a request per detail, so it keeps the bounded defaults.
+    const FULL_ANALYSIS_CAP: usize = 50_000;
+    let (limit, sample) = match src.total() {
+        Some(total) => {
+            let n = total.clamp(1, FULL_ANALYSIS_CAP);
+            (n, n)
+        }
+        None => (
+            q.limit.unwrap_or(200).clamp(1, 1000),
+            q.sample.unwrap_or(50).clamp(1, 500),
+        ),
     };
     match report::build_over(&src, limit, sample).await {
         Ok(report) => Json(report).into_response(),

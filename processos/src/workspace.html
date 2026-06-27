@@ -302,8 +302,20 @@ async function loadInsights(base) {
   catch (e) { ins.innerHTML = `<h2>Insights</h2><div class="err">${esc(e.message)}</div>`; return; }
 
   const t = r.totals;
+  // Honest scope line: distinguish the true dataset size from how much of it was
+  // analyzed for this report (full population for in-memory datasets; a bounded
+  // most-recent window for a live gateway).
+  let scope;
+  if (r.datasetTotal != null) {
+    scope = (r.sampledInstances >= r.datasetTotal)
+      ? `${r.datasetTotal.toLocaleString()} instances · analyzed in full`
+      : `${r.datasetTotal.toLocaleString()} instances · analyzed ${r.sampledInstances.toLocaleString()} (capped)`;
+  } else {
+    scope = `${t.instances.toLocaleString()} most-recent analyzed · element timing sampled from ${r.sampledInstances.toLocaleString()}`;
+  }
+
   const cards = `<div class="cards">
-    <div class="card"><div class="n">${t.instances}</div><div class="l">instances</div></div>
+    <div class="card"><div class="n">${(r.datasetTotal ?? t.instances).toLocaleString()}</div><div class="l">${r.datasetTotal != null ? 'dataset instances' : 'instances'}</div></div>
     <div class="card"><div class="n">${t.completed}</div><div class="l">completed</div></div>
     <div class="card"><div class="n">${t.active}</div><div class="l">active</div></div>
     <div class="card"><div class="n">${t.terminated}</div><div class="l">terminated</div></div>
@@ -318,7 +330,8 @@ async function loadInsights(base) {
         <td>${pr.bottleneck ? esc(pr.bottleneck.elementId) : '<span class="muted">—</span>'}</td></tr>`).join('');
 
   ins.innerHTML = `
-    <h2>Insights — <code>${esc(r.nanoBaseUrl)}</code> · sampled ${r.sampledInstances} instances</h2>
+    <h2>Insights — <code>${esc(r.nanoBaseUrl)}</code></h2>
+    <p class="muted" style="margin:-4px 0 10px">${scope}</p>
     ${cards}
     <table><thead><tr><th>process</th><th>instances</th><th>avg ms</th><th>p95 ms</th><th>bottleneck</th></tr></thead>
     <tbody>${procRows || '<tr><td colspan="5" class="muted">no detail sampled</td></tr>'}</tbody></table>`;
