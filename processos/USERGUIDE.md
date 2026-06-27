@@ -248,6 +248,51 @@ A *persona* and an *LLM profile* are different things: the persona is *what the
 droid is told to do*; the profile is *which model does the thinking*. You can mix
 and match them freely.
 
+## Pair the droid with a second model
+
+A single model can talk itself into a corner. ProcessOS lets you put a **second
+model alongside the droid** in one of two supporting roles. Both are **off by
+default** and switched on from the controls above the compose box. For best
+results, give the partner a **different model family** than the primary, so their
+mistakes don't correlate.
+
+A given model profile can hold only one role at a time — the primary you send to,
+the Pair AI reviewer, or the Monitor — so the pickers won't let you double-book a
+model. (If you run local models, ProcessOS can keep two sidecars up at once, so a
+local primary plus a local partner works.)
+
+### Pair AI — a reviewer on every turn
+
+Tick **Pair AI** to have a second model review the droid's answer *each turn*,
+using the same data and model tools. Pick the reviewer's **model** and its
+**persona** (its reviewing style). The reviewer's reply appears as a distinct
+🤝 **Pair AI** bubble right after the droid's answer, so you see both the original
+and the second opinion.
+
+The persona sets the *pairing mode* — how the reviewer engages:
+
+| Pairing mode | What the reviewer does |
+|---|---|
+| **Skeptic / Red-Team** (default) | Challenges the droid's conclusion — re-checks the numbers, hunts for an overlooked confound, and validates any proposed model change. |
+| **Synthesizer** | Reconciles the droid's findings into one decisive answer, keeping what the data supports and dropping what it doesn't. |
+| **Refiner** | Improves the answer — deepens the analysis and fills the gaps — rather than tearing it down. |
+
+### Monitor — a loop-breaker that watches the whole investigation
+
+Tick **Monitor** to have a second model watch the investigation's live transcript
+and **step in when the droid starts going in circles** — rephrasing dead-ends,
+oscillating between hypotheses, or re-attacking an unreachable path. It nudges the
+droid toward the one concrete next action, and forces a graceful wrap-up when
+needed. Its interventions appear inline in the conversation.
+
+The default monitor persona is **Loop Breaker**. The monitor defaults to your
+local sidecar model so it's cheap to leave watching in the background. Pick its
+model and persona next to the **Monitor** toggle.
+
+> **Pair AI vs Monitor.** Pair AI critiques *each answer*; the Monitor watches the
+> *whole arc* of the investigation and intervenes only when it detects the droid
+> looping. You can run either, both, or neither.
+
 ## Configure AI models
 
 Open the **Settings cog** (lower-left in the cockpit or console) to manage your
