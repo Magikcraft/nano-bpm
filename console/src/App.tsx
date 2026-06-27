@@ -24,8 +24,10 @@ export default function App() {
     <div className="flex h-full bg-zinc-950 text-zinc-100">
       <aside className="flex w-56 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900">
         <div className="px-5 py-4">
-          <div className="text-lg font-semibold tracking-tight">nano BPM</div>
-          <div className="text-xs text-zinc-500">single-node console</div>
+          <a href="/" className="block no-underline">
+            <div className="text-lg font-semibold tracking-tight text-zinc-100">nano BPM</div>
+            <div className="text-xs text-zinc-500">single-node console</div>
+          </a>
         </div>
         <nav className="flex flex-col gap-1 px-3">
           {navItems.map((item) => (

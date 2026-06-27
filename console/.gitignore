@@ -12,3 +12,7 @@ public/swagger/openapi.json
 # Command Stream Protocol (AsyncAPI) docs, generated at build time from
 # docs/command-stream.asyncapi.yaml (see scripts/copy-asyncapi.mjs).
 public/asyncapi/index.html
+
+# Documentation website, generated at build time from ../README.md
+# (see scripts/build-docs.mjs).
+public/docs/

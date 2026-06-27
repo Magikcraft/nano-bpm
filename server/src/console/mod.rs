@@ -67,6 +67,9 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/asyncapi", get(asyncapi_index))
         .route("/asyncapi/", get(asyncapi_index))
         .route("/asyncapi/{*path}", get(asyncapi_asset))
+        .route("/docs", get(docs_index))
+        .route("/docs/", get(docs_index))
+        .route("/docs/{*path}", get(docs_asset))
         .route("/console/api/topology", get(topology))
         .route("/console/api/cluster/health", get(cluster_health))
         .route("/console/api/metrics", get(metrics_snapshot))
@@ -213,6 +216,30 @@ async fn asyncapi_index() -> Response {
 async fn asyncapi_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
     let path = path.trim_start_matches('/');
     serve_embedded(&format!("asyncapi/{path}"))
+}
+
+/// Serves the bundled documentation website at `/docs`. The pages are generated
+/// at build time from `README.md` (see `console/scripts/build-docs.mjs`) into
+/// `dist/docs/*.html`, one page per README H2 section.
+async fn docs_index() -> Response {
+    serve_embedded("docs/index.html")
+}
+
+/// Serves a documentation page (or asset) under `/docs/`. Page links are
+/// extensionless (`/docs/usage`), so a trailing `.html` is added when the path
+/// carries no file extension; explicit asset paths pass through unchanged.
+async fn docs_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    if path.is_empty() {
+        return serve_embedded("docs/index.html");
+    }
+    let last = path.rsplit('/').next().unwrap_or(path);
+    let key = if last.contains('.') {
+        format!("docs/{path}")
+    } else {
+        format!("docs/{path}.html")
+    };
+    serve_embedded(&key)
 }
 
 

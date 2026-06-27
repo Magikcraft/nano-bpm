@@ -9,6 +9,11 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import yaml from "js-yaml";
+import MarkdownIt from "markdown-it";
+
+// Descriptions/summaries in the spec are authored in Markdown (bold, inline
+// code, bullet lists). Render them to HTML instead of dumping the literals.
+const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
 const root = process.cwd();
 const specPath = join(root, "..", "docs", "command-stream.asyncapi.yaml");
@@ -36,8 +41,12 @@ const esc = (s) =>
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
-// Collapse a folded/multi-line YAML description into clean prose.
-const prose = (s) => esc(String(s ?? "").replace(/\s*\n\s*/g, " ").trim());
+// Render a Markdown description as a full HTML block (paragraphs, lists, code).
+const mdBlock = (s) => md.render(String(s ?? "").trim());
+
+// Render a short Markdown description inline (no wrapping <p>), collapsing the
+// folded-YAML line breaks of single-paragraph descriptions into spaces.
+const prose = (s) => md.renderInline(String(s ?? "").replace(/\s*\n\s*/g, " ").trim());
 
 // --- render one payload schema as a property table --------------------------
 function schemaType(p) {
@@ -152,6 +161,11 @@ const html = `<!doctype html>
       h1 { font-size: 1.6rem; margin: 0.8rem 0 0.3rem; }
       .ver { color: var(--muted); font-size: 0.85rem; }
       .lead { color: #3f3f46; }
+      .lead p { margin: 0.5rem 0; }
+      .lead ul { margin: 0.5rem 0; padding-left: 1.2rem; }
+      .lead li { margin: 0.2rem 0; }
+      .lead code, .pdesc code, .op-desc code, .desc code, .summary code {
+        background: #f4f4f5; border: 1px solid var(--line); border-radius: 4px; padding: 0.05rem 0.3rem; }
       h2 { font-size: 1.15rem; margin: 1.4rem 0 0.4rem; }
       .servers { list-style: none; padding: 0; margin: 0.5rem 0 1.5rem; }
       .servers li { padding: 0.25rem 0; border-bottom: 1px dashed var(--line); font-size: 0.9rem; }
@@ -193,13 +207,14 @@ const html = `<!doctype html>
       <span class="muted" style="font-size: 0.85rem">Command Stream Protocol</span>
       <span class="spacer"></span>
       <a href="/">Home</a>
+      <a href="/docs">Docs</a>
       <a href="/swagger">REST API</a>
       <a href="/console">Web console</a>
     </div>
     <div class="wrap">
       <h1>${esc(info.title ?? "Command Stream")}</h1>
       <div class="ver">AsyncAPI ${esc(doc.asyncapi ?? "")} · version ${esc(info.version ?? "")}</div>
-      <p class="lead">${prose(info.description)}</p>
+      <div class="lead">${mdBlock(info.description)}</div>
       <div class="note">
         Generated from <code>docs/command-stream.asyncapi.yaml</code> at build time.
         The command stream is a WebSocket protocol (it cannot be modelled by OpenAPI);
