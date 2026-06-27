@@ -1315,6 +1315,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "crc32fast",
  "flate2",
  "futures-util",
  "headers",

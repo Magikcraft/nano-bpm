@@ -36,6 +36,11 @@ function slugify(text) {
     .replace(/\s+/g, "-");
 }
 
+// H2 sections that belong in the GitHub README for contributors but NOT in the
+// shipped, end-user docs website (the binary distribution can't build from
+// source). Matched against the H2 heading text, case-insensitively.
+const DOCS_EXCLUDE = new Set(["building from source"]);
+
 const markdown = readFileSync(readmePath, "utf8");
 const lines = markdown.split("\n");
 
@@ -55,8 +60,14 @@ for (const line of lines) {
 }
 if (current.lines.join("").trim() || current.heading) sections.push(current);
 
+// Drop sections that are contributor-only (e.g. building from source) from the
+// shipped User Guide; they remain in the GitHub README.
+const visibleSections = sections.filter(
+  (s) => !(s.heading && DOCS_EXCLUDE.has(s.heading.toLowerCase())),
+);
+
 // First section is the preamble (H1 + intro) -> the Overview / home page.
-const preamble = sections.shift();
+const preamble = visibleSections.shift();
 const h1 = /^# (.+)$/m.exec(preamble.lines.join("\n"));
 const pages = [
   {
@@ -66,7 +77,7 @@ const pages = [
     markdown: preamble.lines.join("\n"),
     href: "/docs",
   },
-  ...sections.map((s) => {
+  ...visibleSections.map((s) => {
     const slug = slugify(s.heading);
     return {
       slug,

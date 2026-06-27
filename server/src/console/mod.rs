@@ -34,6 +34,7 @@ use tokio::sync::broadcast;
 use crate::ServerImpl;
 
 pub mod trace;
+pub mod worker_export;
 pub mod workers;
 pub mod workspace;
 
@@ -89,6 +90,7 @@ pub fn router(server: ServerImpl) -> Router {
             get(model_get).put(model_save).delete(model_delete),
         )
         .route("/console/api/workers", get(workers_list).post(worker_create))
+        .route("/console/api/export-workers-app", axum::routing::post(workers_export))
         .route(
             "/console/api/workers/{name}",
             get(worker_get).delete(worker_delete),
@@ -1367,9 +1369,41 @@ async fn worker_create(Json(body): Json<CreateWorkerBody>) -> Response {
     }
 }
 
+/// Body for `POST /console/api/export-workers-app`.
+#[derive(Deserialize)]
+struct ExportWorkersBody {
+    /// The worker names to bundle into the standalone application.
+    #[serde(default)]
+    workers: Vec<String>,
+}
+
+/// `POST /console/api/export-workers-app` — bundle the selected workers into a
+/// standalone, runnable Deno application, returned as a downloadable `.zip`
+/// (see [`worker_export`]).
+async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
+    match worker_export::build_app(&body.workers) {
+        Ok(zip) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        worker_export::zip_filename()
+                    ),
+                ),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            zip,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 /// `GET /console/api/workers/{name}` — one worker's files and runtime status.
-async fn worker_get(Path(name): Path<String>) -> Response {
-    match worker_summary(&name).await {
+async fn worker_get(Path(name): Path<String>) -> Response {    match worker_summary(&name).await {
         Some(s) => Json(s).into_response(),
         None => (StatusCode::NOT_FOUND, "no such worker").into_response(),
     }

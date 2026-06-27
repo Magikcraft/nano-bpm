@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   api,
+  exportWorkersApp,
   type WorkerLogLine,
   type WorkerPhase,
   type WorkerSummary,
@@ -41,6 +42,8 @@ export default function Workers() {
   const [selected, setSelected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  // Standalone-app export: which workers to bundle (modal is open when non-null).
+  const [exportSel, setExportSel] = useState<Set<string> | null>(null);
 
   // Poll worker runtime while the page is open so status/metrics stay live.
   const { data } = useQuery({
@@ -116,6 +119,35 @@ export default function Workers() {
     }
   }
 
+  function openExport() {
+    // Default the selection to every worker.
+    setExportSel(new Set(workers.map((w) => w.name)));
+  }
+
+  function toggleExport(name: string) {
+    setExportSel((prev) => {
+      const next = new Set(prev ?? []);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  async function doExport() {
+    if (!exportSel || exportSel.size === 0) return;
+    const names = workers.map((w) => w.name).filter((n) => exportSel.has(n));
+    setBusy(true);
+    try {
+      await exportWorkersApp(names);
+      setExportSel(null);
+      flash("ok", `Exported ${names.length} worker${names.length === 1 ? "" : "s"} as a standalone app.`);
+    } catch (e) {
+      flash("err", e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
@@ -169,13 +201,23 @@ export default function Workers() {
               <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
                 Workers
               </span>
-              <button
-                onClick={newWorker}
-                disabled={busy}
-                className="rounded bg-zinc-700 px-2 py-0.5 text-xs hover:bg-zinc-600 disabled:opacity-50"
-              >
-                + New
-              </button>
+              <div className="flex gap-1">
+                <button
+                  onClick={openExport}
+                  disabled={busy || workers.length === 0}
+                  title="Export selected workers as a standalone Deno application"
+                  className="rounded bg-zinc-700 px-2 py-0.5 text-xs hover:bg-zinc-600 disabled:opacity-50"
+                >
+                  Export app
+                </button>
+                <button
+                  onClick={newWorker}
+                  disabled={busy}
+                  className="rounded bg-zinc-700 px-2 py-0.5 text-xs hover:bg-zinc-600 disabled:opacity-50"
+                >
+                  + New
+                </button>
+              </div>
             </div>
             <ul className="min-h-0 flex-1 overflow-auto">
               {workers.length === 0 && (
@@ -218,6 +260,59 @@ export default function Workers() {
                 Select a worker, or create one to start authoring.
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {exportSel && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setExportSel(null)}
+        >
+          <div
+            className="w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-zinc-800 px-5 py-3">
+              <h2 className="text-sm font-semibold">Export workers as an application</h2>
+              <p className="mt-1 text-xs text-zinc-500">
+                Bundle the selected workers into a self-contained Deno app. The downloaded
+                zip deploys every model in its <code>resources/</code> folder on startup,
+                then runs the workers. Requires Deno to run.
+              </p>
+            </div>
+            <ul className="max-h-64 overflow-auto px-5 py-3">
+              {workers.map((w) => (
+                <li key={w.name}>
+                  <label className="flex cursor-pointer items-center gap-2 py-1 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={exportSel.has(w.name)}
+                      onChange={() => toggleExport(w.name)}
+                    />
+                    <span className="truncate">{w.name}</span>
+                  </label>
+                </li>
+              ))}
+            </ul>
+            <div className="flex items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3">
+              <span className="text-xs text-zinc-500">{exportSel.size} selected</span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setExportSel(null)}
+                  className="rounded bg-zinc-700 px-3 py-1 text-xs hover:bg-zinc-600"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={doExport}
+                  disabled={busy || exportSel.size === 0}
+                  className="rounded bg-emerald-700 px-3 py-1 text-xs hover:bg-emerald-600 disabled:opacity-50"
+                >
+                  Download zip
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

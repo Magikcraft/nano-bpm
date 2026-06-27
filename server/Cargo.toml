@@ -49,6 +49,10 @@ hyper = { version = "1", features = ["client", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 flate2 = "1.1.9"
+# CRC-32 for the console's "export workers as an application" zip writer (a tiny
+# self-contained STORED-archive builder, see console/worker_export.rs). Already
+# in the lock as a transitive flate2 dep, so promoting it is offline-safe.
+crc32fast = "1"
 base64 = "0.22.1"
 
 # jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,

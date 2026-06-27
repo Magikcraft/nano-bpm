@@ -412,6 +412,36 @@ export const api = {
     send<WorkerRuntime>("POST", `/workers/${encodeURIComponent(name)}/stop`),
 };
 
+/// Bundles the named workers into a standalone, runnable Deno application and
+/// triggers a browser download of the returned `.zip`. The zip ships every
+/// worker's source, the embedded worker SDK, a `main.ts` that deploys all
+/// `resources/*.bpmn` models on startup before running the workers, a
+/// `deno.json` start task, and a README. Throws with the server's error text on
+/// failure (e.g. no workers selected).
+export async function exportWorkersApp(workers: string[]): Promise<void> {
+  const res = await fetch("/console/api/export-workers-app", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workers }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `export → HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("content-disposition") || "";
+  const match = /filename="?([^"]+)"?/.exec(disposition);
+  const filename = match ? match[1] : "nano-workers-app.zip";
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /// Deploys BPMN XML to the engine through the standard Camunda deployment
 /// endpoint (not a console API). Resolves on success; throws with the server's
 /// problem detail otherwise. Deployment is idempotent, so deploying an unchanged

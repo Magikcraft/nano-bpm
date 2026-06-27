@@ -610,28 +610,59 @@ JSON API under `/console/api/*`. The root `/` serves a small self-contained
 landing page, and `/swagger` serves an **offline** Swagger UI with the OpenAPI
 spec bundled in (nothing fetched from a CDN).
 
-The console has five tabs:
+The console has five tabs, each described below.
 
-- **Topology** — cluster/partition/Raft overview with **live per-node health**:
-  each peer's `GET /v2/topology` is probed (concurrently, on a 5 s cadence) to
-  show reachability, gateway version, and round-trip latency.
-- **Metrics** — a live performance dashboard (process starts/s, jobs/s, active
-  processes, connected clients, commit pipeline depth, journal/fsync means, writer
-  duty cycle, resident memory) with inline sparklines, derived client-side from
-  the gateway's Prometheus surface (`/metrics`). In a multi-node cluster it also
-  shows a **per-node breakdown** by probing each peer's `GET /console/api/metrics`.
-- **Modeler** — a bpmn-js editor backed by a workspace model library. Create,
-  edit, deploy (idempotent), pull a deployed model back from the engine, and
-  duplicate. **Test run** executes a model entirely in the browser — the engine is
-  compiled to WebAssembly — so you can start an instance, complete or fail its
-  jobs with mock variables, fast-forward timers on a virtual clock, and watch
-  tokens move on the diagram before deploying anything (fully offline).
-- **Explorer** — a live process-instance explorer (variables, jobs, incidents)
-  with BPMN XML.
-- **Workers** — author TypeScript job workers in the browser and run them as
-  sandboxed **Deno** subprocesses over the command stream, with a live "Running"
-  fleet view (status, throughput, completed/failed, uptime, restarts) and streamed
-  logs.
+### Topology
+
+Cluster/partition/Raft overview with **live per-node health**: each peer's
+`GET /v2/topology` is probed (concurrently, on a 5 s cadence) to show
+reachability, gateway version, and round-trip latency.
+
+### Metrics
+
+A live performance dashboard (process starts/s, jobs/s, active processes,
+connected clients, commit pipeline depth, journal/fsync means, writer duty cycle,
+resident memory) with inline sparklines, derived client-side from the gateway's
+Prometheus surface (`/metrics`). In a multi-node cluster it also shows a
+**per-node breakdown** by probing each peer's `GET /console/api/metrics`.
+
+### Modeler
+
+A bpmn-js editor backed by a workspace model library. Create, edit, deploy
+(idempotent), pull a deployed model back from the engine, and duplicate.
+
+**Test run** executes a model entirely in the browser, with no cluster round-trip
+and fully offline. The Test mode is powered by **μ-nano** ("micro-nano") — a
+sub-500 KB WebAssembly build of the very same Rust `engine-core` that the cluster
+runs, compiled for `wasm32` and loaded straight into the page. Because it is the
+production engine (not a re-implementation), token flow, gateways, timers, and
+FEEL expressions behave exactly as they will on the server.
+
+To run a test and inspect the trace:
+
+1. Open a model in the Modeler and click **Test run**.
+2. Start an instance (optionally supplying initial variables as JSON).
+3. As each job activates, **complete** it with mock result variables, **fail** it,
+   or throw a BPMN **error** — μ-nano advances the tokens accordingly.
+4. **Fast-forward** the virtual clock to fire timers without waiting in real time.
+5. Watch tokens move on the diagram, and read the **execution trace** — the
+   ordered list of elements visited, jobs created/completed, and variable
+   snapshots — to confirm the model behaves as intended before deploying anything.
+
+### Explorer
+
+A live process-instance explorer (variables, jobs, incidents) with BPMN XML for
+each running or completed instance.
+
+### Workers
+
+Author TypeScript job workers in the browser and run them as sandboxed **Deno**
+subprocesses over the command stream, with a live "Running" fleet view (status,
+throughput, completed/failed, uptime, restarts) and streamed logs. **Running
+workers requires [Deno](https://deno.com) installed on the host** (see below); the
+tab still authors code without it. Selected workers can also be **exported as a
+standalone application** you run yourself — see
+[Exporting workers as an application](#exporting-workers-as-an-application).
 
 ### Workspace vs cluster data
 
@@ -673,9 +704,43 @@ defineWorker({
 ```
 
 The supervisor runs one sandboxed `deno run` subprocess per enabled worker that
-speaks the command stream directly. **Deno is optional**: if it is not installed
-the Workers tab still authors code but starting a worker reports the runtime as
-unavailable.
+speaks the command stream directly. **Deno is required to *run* workers** (in the
+console or as an exported app): install it from <https://deno.com> so the `deno`
+binary is on `PATH`, or point `NANOBPMN_DENO_BIN` at it. If Deno is not installed
+the Workers tab still authors and exports code, but starting a worker reports the
+runtime as unavailable.
+
+### Exporting workers as an application
+
+Workers don't have to run inside the console. From the **Workers** tab, click
+**Export app**, tick the workers you want (all are selected by default), and
+**Download zip** to get a self-contained, runnable application — handy for
+shipping a worker fleet to another machine or running it outside Nano.
+
+The downloaded `nano-workers-app.zip` unpacks to:
+
+```text
+nano-workers-app/
+├── main.ts                 # entrypoint: deploys models, then starts the workers
+├── deno.json               # import map (@nanobpm/worker) + `deno task start`
+├── README.md               # how to configure and run it
+├── sdk/worker-sdk.ts       # the embedded worker SDK (same source as the console)
+├── workers/<name>/…        # each selected worker's source
+└── resources/              # drop your .bpmn models here (auto-deployed on startup)
+```
+
+On startup the app **deploys every `.bpmn` file in `resources/`** to the target
+engine, then runs the bundled workers. Add your own models by dropping their
+`.bpmn` files into `resources/` before starting. Run it with Deno:
+
+```bash
+cd nano-workers-app
+# Point at your Nano gateway (defaults to http://127.0.0.1:8080):
+export NANOBPMN_BASE_URL=http://127.0.0.1:8080
+deno task start            # runs with --allow-net --allow-read --allow-env
+```
+
+The bundled `README.md` documents the same steps and the required permissions.
 
 ## Cluster tuning
 
