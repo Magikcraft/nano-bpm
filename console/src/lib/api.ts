@@ -410,6 +410,22 @@ export const api = {
     send<WorkerRuntime>("POST", `/workers/${encodeURIComponent(name)}/start`),
   stopWorker: (name: string) =>
     send<WorkerRuntime>("POST", `/workers/${encodeURIComponent(name)}/stop`),
+  // Shared library — reusable TS/JS modules under `@lib/…`, usable from every
+  // worker. CRUD mirrors the per-worker file API.
+  libFiles: () => send<{ files: string[] }>("GET", "/lib"),
+  libFile: (path: string) =>
+    getText(`/lib/file?path=${encodeURIComponent(path)}`),
+  saveLibFile: (path: string, content: string) =>
+    send<void>(
+      "PUT",
+      `/lib/file?path=${encodeURIComponent(path)}`,
+      content,
+      "text/plain",
+    ),
+  createLibFile: (path: string) =>
+    send<void>("POST", "/lib/file", JSON.stringify({ path }), "application/json"),
+  deleteLibFile: (path: string) =>
+    send<void>("DELETE", `/lib/file?path=${encodeURIComponent(path)}`),
 };
 
 /// Bundles the named workers into a standalone, runnable Deno application and

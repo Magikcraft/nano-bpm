@@ -83,9 +83,26 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
         valid_names.push(name.clone());
     }
 
+    // Bundle the shared library (`<workspace>/lib/`) so workers that `import
+    // "@lib/…"` keep working in the exported app. Scanned for npm packages too,
+    // since a shared module may pull in its own dependencies.
+    let lib_files = workspace::list_lib_files().unwrap_or_default();
+    let has_lib = !lib_files.is_empty();
+    for file in &lib_files {
+        let Some(path) = workspace::lib_file_path(file) else {
+            continue;
+        };
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("could not read lib/{file}: {e}"))?;
+        if is_source_file(file) && let Ok(text) = std::str::from_utf8(&bytes) {
+            collect_packages(text, &mut packages);
+        }
+        entries.push((at(&format!("lib/{file}")), bytes));
+    }
+
     // Generated app scaffolding.
     entries.push((at("sdk/worker-sdk.ts"), WORKER_SDK_TS.as_bytes().to_vec()));
-    entries.push((at("deno.json"), deno_json(&packages).into_bytes()));
+    entries.push((at("deno.json"), deno_json(&packages, has_lib).into_bytes()));
     entries.push((at("main.ts"), main_ts(&valid_names).into_bytes()));
     entries.push((at("README.md"), readme_md(&valid_names).into_bytes()));
     entries.push((
@@ -118,8 +135,12 @@ const DENO_JSON_HEAD: &str = "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./
 /// form for subpath imports) so Deno resolves bare imports without edits. Also
 /// declares the `start` task with the network + file-read permissions the app
 /// needs to deploy models and run workers.
-fn deno_json(packages: &BTreeSet<String>) -> String {
+fn deno_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
     let mut s = String::from(DENO_JSON_HEAD);
+    if has_lib {
+        s.push_str(",\n    ");
+        s.push_str(&format!("{}: {}", json_string("@lib/"), json_string("./lib/")));
+    }
     for pkg in packages {
         let key = json_string(pkg);
         let val = json_string(&format!("npm:{pkg}"));
@@ -245,6 +266,10 @@ fn npm_package_name(spec: &str) -> Option<String> {
         }
     }
     if s == "@nanobpm/worker" {
+        return None;
+    }
+    // `@lib/…` is the shared-library alias (mapped to ./lib/), not an npm package.
+    if s == "@lib" || s.starts_with("@lib/") {
         return None;
     }
     let base = if let Some(rest) = s.strip_prefix('@') {
@@ -403,6 +428,7 @@ alongside their own `console.log` output. Press **Ctrl+C** to stop.
 main.ts              entrypoint (deploy models, then run workers)
 deno.json            import map + `start` task (network + file permissions)
 sdk/worker-sdk.ts    the embedded Nano worker SDK
+lib/                 shared library modules (imported as `@lib/…`, if any)
 workers/<name>/      one folder per worker (worker.ts + any helpers)
 resources/           drop your .bpmn models here
 ```
@@ -564,6 +590,7 @@ mod tests {
             import "side-effect-pkg";
             const x = await import("@scope/dyn/sub");
             import rel from "./helper.ts";
+            import shared from "@lib/money.ts";
             import url from "https://deno.land/std/x.ts";
             import sub from "lodash/fp";
         "#;
@@ -595,6 +622,9 @@ mod tests {
         assert_eq!(npm_package_name("./local").as_deref(), None);
         assert_eq!(npm_package_name("node:fs").as_deref(), None);
         assert_eq!(npm_package_name("@nanobpm/worker").as_deref(), None);
+        // The shared-library alias is local, not an npm package.
+        assert_eq!(npm_package_name("@lib/money.ts").as_deref(), None);
+        assert_eq!(npm_package_name("@lib").as_deref(), None);
     }
 
     #[test]
@@ -602,21 +632,31 @@ mod tests {
         let mut pkgs = BTreeSet::new();
         pkgs.insert("@camunda8/sdk".to_string());
         pkgs.insert("lodash".to_string());
-        let json = deno_json(&pkgs);
+        let json = deno_json(&pkgs, false);
         // SDK alias is always present.
         assert!(json.contains("\"@nanobpm/worker\": \"./sdk/worker-sdk.ts\""));
         // Each package maps to its npm: specifier, plus a subpath form.
         assert!(json.contains("\"@camunda8/sdk\": \"npm:@camunda8/sdk\""));
         assert!(json.contains("\"@camunda8/sdk/\": \"npm:/@camunda8/sdk/\""));
         assert!(json.contains("\"lodash\": \"npm:lodash\""));
+        // No shared library here, so no @lib/ alias.
+        assert!(!json.contains("@lib/"));
         // Valid JSON.
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
     }
 
     #[test]
     fn deno_json_without_packages_is_valid() {
-        let json = deno_json(&BTreeSet::new());
+        let json = deno_json(&BTreeSet::new(), false);
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
         assert!(json.contains("--allow-net"));
+    }
+
+    #[test]
+    fn deno_json_maps_shared_library_when_present() {
+        let json = deno_json(&BTreeSet::new(), true);
+        // The @lib/ alias points at the bundled lib/ folder.
+        assert!(json.contains("\"@lib/\": \"./lib/\""));
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
     }
 }

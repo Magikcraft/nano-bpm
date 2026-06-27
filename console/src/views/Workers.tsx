@@ -8,6 +8,7 @@ import {
   type WorkerSummary,
 } from "../lib/api";
 import { languageForFile } from "../lib/editorLang";
+import type { ExtraModel } from "../components/CodeEditor";
 
 // Monaco is multi-MB; load it as a separate chunk only when an editor is shown
 // so the initial console bundle stays lean.
@@ -40,6 +41,8 @@ export default function Workers() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<"editor" | "running">("editor");
   const [selected, setSelected] = useState<string | null>(null);
+  // When true, the editor pane shows the shared `@lib/` library instead of a worker.
+  const [showLib, setShowLib] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   // Standalone-app export: which workers to bundle (modal is open when non-null).
@@ -228,9 +231,12 @@ export default function Workers() {
                 return (
                   <li key={w.name}>
                     <button
-                      onClick={() => setSelected(w.name)}
+                      onClick={() => {
+                        setSelected(w.name);
+                        setShowLib(false);
+                      }}
                       className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
-                        selected === w.name ? "bg-zinc-800" : "hover:bg-zinc-800/50"
+                        selected === w.name && !showLib ? "bg-zinc-800" : "hover:bg-zinc-800/50"
                       }`}
                     >
                       <span className={`h-2 w-2 shrink-0 rounded-full ${b.dot}`} />
@@ -240,11 +246,26 @@ export default function Workers() {
                 );
               })}
             </ul>
+            {/* Shared library — author once, import from any worker via `@lib/…`. */}
+            <div className="border-t border-zinc-800">
+              <button
+                onClick={() => setShowLib(true)}
+                className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
+                  showLib ? "bg-zinc-800" : "hover:bg-zinc-800/50"
+                }`}
+              >
+                <span className="text-zinc-500">📚</span>
+                <span className="min-w-0 flex-1 truncate">Shared library</span>
+                <span className="font-mono text-[10px] text-zinc-600">@lib/</span>
+              </button>
+            </div>
           </aside>
 
           {/* Editor pane */}
           <div className="flex min-w-0 flex-1 flex-col">
-            {current ? (
+            {showLib ? (
+              <LibraryEditor flash={flash} />
+            ) : current ? (
               <WorkerEditor
                 key={current.name}
                 worker={current}
@@ -433,6 +454,49 @@ function WorkerEditor({
   const [content, setContent] = useState<string>("");
   const [loadedFile, setLoadedFile] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  // Sibling worker files + shared `@lib/` modules, fetched so the editor can
+  // resolve `import "./helper.ts"` and `import "@lib/…"` with full IntelliSense.
+  const [extraModels, setExtraModels] = useState<ExtraModel[]>([]);
+
+  const filesKey = worker.files.join(",");
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const models: ExtraModel[] = [];
+      // Sibling files in this worker.
+      await Promise.all(
+        worker.files.map(async (f) => {
+          try {
+            const text = await api.workerFile(worker.name, f);
+            models.push({ path: `file:///workers/${worker.name}/${f}`, content: text });
+          } catch {
+            /* ignore unreadable sibling */
+          }
+        }),
+      );
+      // Shared library modules (importable as `@lib/<file>`).
+      try {
+        const { files } = await api.libFiles();
+        await Promise.all(
+          files.map(async (f) => {
+            try {
+              const text = await api.libFile(f);
+              models.push({ path: `file:///lib/${f}`, content: text });
+            } catch {
+              /* ignore */
+            }
+          }),
+        );
+      } catch {
+        /* library unavailable — sibling resolution still works */
+      }
+      if (!cancelled) setExtraModels(models);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [worker.name, filesKey]);
 
   // Load the selected file's content whenever the file selection changes.
   useEffect(() => {
@@ -572,6 +636,7 @@ function WorkerEditor({
             value={loadedFile === file ? content : ""}
             language={languageForFile(file)}
             path={`file:///workers/${worker.name}/${file}`}
+            extraModels={extraModels}
             readOnly={loadedFile !== file}
             onChange={(v) => {
               setContent(v);
@@ -585,6 +650,190 @@ function WorkerEditor({
       </div>
 
       <LogPanel worker={worker.name} />
+    </>
+  );
+}
+
+// Shared library editor — CRUD for reusable `@lib/…` modules that every worker
+// can import. Mirrors the worker file editor but without runtime controls.
+function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) => void }) {
+  const [files, setFiles] = useState<string[]>([]);
+  const [file, setFile] = useState<string | null>(null);
+  const [content, setContent] = useState<string>("");
+  const [loadedFile, setLoadedFile] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [extraModels, setExtraModels] = useState<ExtraModel[]>([]);
+
+  async function loadList(select?: string) {
+    try {
+      const { files } = await api.libFiles();
+      setFiles(files);
+      // Background models for cross-module IntelliSense within the library.
+      const models: ExtraModel[] = [];
+      await Promise.all(
+        files.map(async (f) => {
+          try {
+            models.push({ path: `file:///lib/${f}`, content: await api.libFile(f) });
+          } catch {
+            /* ignore */
+          }
+        }),
+      );
+      setExtraModels(models);
+      if (select) setFile(select);
+      else if (files.length && !files.includes(file ?? "")) setFile(files[0]);
+      else if (!files.length) setFile(null);
+    } catch (e) {
+      flash("err", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  useEffect(() => {
+    void loadList();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!file) {
+      setContent("");
+      setLoadedFile(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadedFile(null);
+    api
+      .libFile(file)
+      .then((text) => {
+        if (!cancelled) {
+          setContent(text);
+          setLoadedFile(file);
+          setDirty(false);
+        }
+      })
+      .catch((e) => !cancelled && flash("err", e instanceof Error ? e.message : String(e)));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file]);
+
+  async function save() {
+    if (!file) return;
+    try {
+      await api.saveLibFile(file, content);
+      setDirty(false);
+      flash("ok", `Saved @lib/${file}.`);
+      void loadList(file);
+    } catch (e) {
+      flash("err", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function newFile() {
+    const path = prompt("New library file name (e.g. money.ts):")?.trim();
+    if (!path) return;
+    try {
+      await api.createLibFile(path);
+      await loadList(path);
+      flash("ok", `Created @lib/${path}.`);
+    } catch (e) {
+      flash("err", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function deleteFile() {
+    if (!file) return;
+    if (!confirm(`Delete shared library file '@lib/${file}'?`)) return;
+    try {
+      await api.deleteLibFile(file);
+      flash("ok", `Deleted @lib/${file}.`);
+      setFile(null);
+      await loadList();
+    } catch (e) {
+      flash("err", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800 px-4 py-2">
+        <span className="font-medium">Shared library</span>
+        <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-400">
+          import … from "@lib/…"
+        </span>
+        <div className="flex-1" />
+        <span className="text-xs text-zinc-500">Reusable across every worker.</span>
+      </div>
+
+      <div className="flex items-center gap-1 border-b border-zinc-800 px-3 py-1.5 text-xs">
+        {files.map((f) => (
+          <button
+            key={f}
+            onClick={() => setFile(f)}
+            className={`rounded px-2 py-1 font-mono ${
+              file === f ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-800"
+            }`}
+          >
+            {f}
+          </button>
+        ))}
+        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-zinc-500 hover:text-zinc-200">
+          + file
+        </button>
+        <div className="flex-1" />
+        {file && (
+          <button
+            onClick={deleteFile}
+            className="rounded px-2 py-1 text-zinc-500 hover:text-red-300"
+          >
+            delete file
+          </button>
+        )}
+        <button
+          onClick={save}
+          disabled={!dirty || !file}
+          className="rounded bg-sky-700 px-3 py-1 text-white hover:bg-sky-600 disabled:opacity-40"
+        >
+          Save{dirty ? " •" : ""}
+        </button>
+      </div>
+
+      <div className="min-h-0 flex-1 bg-[#1e1e1e]">
+        {file ? (
+          <Suspense
+            fallback={<div className="p-4 text-sm text-zinc-500">Loading editor…</div>}
+          >
+            <CodeEditor
+              value={loadedFile === file ? content : ""}
+              language={languageForFile(file)}
+              path={`file:///lib/${file}`}
+              extraModels={extraModels}
+              readOnly={loadedFile !== file}
+              onChange={(v) => {
+                setContent(v);
+                setDirty(true);
+              }}
+              onSave={() => {
+                if (dirty) void save();
+              }}
+            />
+          </Suspense>
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-zinc-600">
+            <p>No shared library files yet.</p>
+            <button
+              onClick={newFile}
+              className="rounded bg-zinc-700 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-600"
+            >
+              + New library file
+            </button>
+            <p className="max-w-sm text-center text-xs text-zinc-700">
+              Drop a module here and import it from any worker with{" "}
+              <span className="font-mono">import {"{ … }"} from "@lib/your-file.ts"</span>.
+            </p>
+          </div>
+        )}
+      </div>
     </>
   );
 }

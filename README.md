@@ -690,6 +690,17 @@ handler body. That ethos drives the code intelligence:
   progressive enhancement: it needs network access, and degrades silently to
   SDK-only IntelliSense when offline. The TypeScript compiler is loaded lazily,
   only the first time you edit a worker file, so the editor stays lightweight.
+- **Cross-file IntelliSense — sibling helpers and a shared library.** Reusable
+  logic doesn't have to live in one file. Split a worker into multiple files and
+  `import { helper } from "./helper.ts"`; the editor resolves siblings with full
+  types. For logic shared across *every* worker, drop a module into the
+  workspace **Shared library** (the `📚 Shared library` entry below the worker
+  list) and import it from anywhere with the `@lib/` alias —
+  `import { fmtMoney } from "@lib/money.ts"`. In keeping with the invisible-wiring
+  ethos, there is nothing to configure: the `@lib/` import map alias is injected
+  into every worker's `deno.json` automatically, so the same import resolves in
+  the editor (IntelliSense), at runtime (the Deno supervisor), and in an exported
+  app (the bundled `lib/` folder).
 
 ### Workspace vs cluster data
 
@@ -701,6 +712,7 @@ cluster data leaves your models and workers intact.
 <workspace>/
 ├── models/<name>.bpmn          # BPMN models (Modeler)
 ├── workers/<name>/             # one directory per worker (worker.ts, deno.json, …)
+├── lib/                        # shared library modules, importable as `@lib/…`
 ├── .nanobpm/worker-sdk.ts      # embedded Deno worker SDK (auto-written)
 └── .deno-cache/                # DENO_DIR for worker dependency caching
 ```

@@ -91,6 +91,14 @@ pub fn router(server: ServerImpl) -> Router {
         )
         .route("/console/api/workers", get(workers_list).post(worker_create))
         .route("/console/api/worker-sdk", get(worker_sdk_source))
+        .route(
+            "/console/api/lib",
+            get(lib_list).post(lib_file_create),
+        )
+        .route(
+            "/console/api/lib/file",
+            get(lib_file_get).put(lib_file_save).delete(lib_file_delete),
+        )
         .route("/console/api/export-workers-app", axum::routing::post(workers_export))
         .route(
             "/console/api/workers/{name}",
@@ -1331,10 +1339,14 @@ defineWorker({{
     )
 }
 
-/// `deno.json` mapping the `@nanobpm/worker` specifier to the embedded SDK.
+/// `deno.json` mapping the `@nanobpm/worker` specifier to the embedded SDK and
+/// the `@lib/` alias to the shared workspace library, so a worker can both
+/// `import { defineWorker } from "@nanobpm/worker"` and reuse shared logic with
+/// `import { fmt } from "@lib/money.ts"`.
 const WORKER_DENO_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/worker": "../../.nanobpm/worker-sdk.ts"
+    "@nanobpm/worker": "../../.nanobpm/worker-sdk.ts",
+    "@lib/": "../../lib/"
   }
 }
 "#;
@@ -1596,6 +1608,93 @@ async fn worker_start(Path(name): Path<String>) -> Response {
     match sup.start(&name).await {
         Ok(()) => Json(sup.runtime(&name).await).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared library API — reusable TS/JS files under `<workspace>/lib/`, importable
+// from every worker via the `@lib/` import-map alias. Mirrors the worker file
+// CRUD; the library has no runtime of its own (it is only ever imported).
+// ---------------------------------------------------------------------------
+
+/// `GET /console/api/lib` — list the shared library files.
+async fn lib_list() -> Response {
+    match workspace::list_lib_files() {
+        Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read library: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /console/api/lib/file?path=money.ts` — read a shared library file.
+async fn lib_file_get(Query(q): Query<FilePathQuery>) -> Response {
+    let Some(path) = workspace::lib_file_path(&q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text.into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
+    }
+}
+
+/// `PUT /console/api/lib/file?path=money.ts` — save (create or overwrite) a
+/// shared library file. Body is the raw file content.
+async fn lib_file_save(Query(q): Query<FilePathQuery>, body: String) -> Response {
+    let Ok(_) = workspace::ensure_lib_dir() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not create library dir").into_response();
+    };
+    let Some(path) = workspace::lib_file_path(&q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::write(&path, &body) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save file: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /console/api/lib/file` — create a new empty shared library file.
+async fn lib_file_create(Json(body): Json<CreateFileBody>) -> Response {
+    let Ok(_) = workspace::ensure_lib_dir() else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "could not create library dir").into_response();
+    };
+    let Some(path) = workspace::lib_file_path(&body.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    if path.exists() {
+        return (StatusCode::CONFLICT, "a file with that name already exists").into_response();
+    }
+    match std::fs::write(&path, "") {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create file: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /console/api/lib/file?path=...` — remove a shared library file.
+async fn lib_file_delete(Query(q): Query<FilePathQuery>) -> Response {
+    let Some(path) = workspace::lib_file_path(&q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "no such file").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not delete file: {e}"),
+        )
+            .into_response(),
     }
 }
 

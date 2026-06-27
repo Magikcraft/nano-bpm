@@ -37,6 +37,11 @@ monaco.languages.typescript.typescriptDefaults.setCompilerOptions({
   allowSyntheticDefaultImports: true,
   noEmit: true,
   lib: ["esnext", "dom"],
+  // Mirror the worker `deno.json` import map's `@lib/` alias so that
+  // `import { fmt } from "@lib/money.ts"` resolves to the shared-library models
+  // registered at `file:///lib/*` (see `registerModels`).
+  baseUrl: "file:///",
+  paths: { "@lib/*": ["lib/*"] },
 });
 monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
   diagnosticCodesToIgnore: [
@@ -120,11 +125,35 @@ export function languageForFile(file: string): string {
   return "typescript";
 }
 
+// --- Cross-file IntelliSense: sibling + shared-library models --------------
+// A worker is a folder of files, and shared logic lives under `@lib/…`. For the
+// TS service to resolve `import "./helper.ts"` or `import "@lib/money.ts"`, the
+// *imported* files must exist as Monaco models — not just the one in the active
+// tab. We register each as a background model at its `file:///…` URI (creating
+// it, or updating its text if it already exists). The active editing model is
+// owned by <Editor> via its `path`; we never touch or dispose that one.
+export type ExtraModel = { path: string; content: string };
+
+function registerModels(models: ExtraModel[], activePath?: string): void {
+  for (const m of models) {
+    if (m.path === activePath) continue;
+    const uri = monaco.Uri.parse(m.path);
+    const existing = monaco.editor.getModel(uri);
+    if (existing) {
+      if (existing.getValue() !== m.content) existing.setValue(m.content);
+    } else {
+      const file = m.path.split("/").pop() ?? m.path;
+      monaco.editor.createModel(m.content, languageForFile(file), uri);
+    }
+  }
+}
+
 export default function CodeEditor({
   value,
   language,
   path,
   readOnly,
+  extraModels,
   onChange,
   onSave,
 }: {
@@ -134,6 +163,10 @@ export default function CodeEditor({
    * acquired npm types resolve from the editing model. */
   path?: string;
   readOnly?: boolean;
+  /** Other files visible to module resolution (sibling worker files + shared
+   * `@lib/` modules), registered as background Monaco models so cross-file and
+   * `@lib/…` imports type-check and complete. */
+  extraModels?: ExtraModel[];
   onChange: (value: string) => void;
   onSave?: () => void;
 }) {
@@ -150,6 +183,14 @@ export default function CodeEditor({
     clearTimeout(ataTimer.current);
     ataTimer.current = setTimeout(() => acquireTypes(code), 600);
   };
+
+  // Keep sibling/library models in sync so cross-file resolution sees current
+  // text. Serialized so the effect re-runs whenever any imported file changes.
+  const extraKey = JSON.stringify(extraModels ?? []);
+  useEffect(() => {
+    if (extraModels?.length) registerModels(extraModels, path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extraKey, path]);
 
   useEffect(() => {
     void ensureSdkLib();

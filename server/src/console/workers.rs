@@ -185,6 +185,31 @@ fn ensure_sdk_written() -> std::io::Result<()> {
     std::fs::write(workspace::sdk_path(), WORKER_SDK_TS)
 }
 
+/// Backfills the `@lib/` import-map alias into a worker's `deno.json` so workers
+/// scaffolded before shared-library support can still `import "@lib/…"`. Only
+/// adds the missing alias; never disturbs other user-defined imports. Best
+/// effort — a malformed or missing `deno.json` is left untouched.
+fn ensure_lib_alias(dir: &std::path::Path) {
+    let path = dir.join("deno.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let imports = json
+        .as_object_mut()
+        .and_then(|o| o.entry("imports").or_insert_with(|| serde_json::json!({})).as_object_mut());
+    let Some(imports) = imports else { return };
+    if imports.contains_key("@lib/") {
+        return;
+    }
+    imports.insert("@lib/".to_string(), serde_json::json!("../../lib/"));
+    if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+        let _ = std::fs::write(&path, format!("{pretty}\n"));
+    }
+}
+
 /// Locates the Deno binary: `NANOBPMN_DENO_BIN`, then `PATH`, then `~/.deno/bin`.
 fn find_deno() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("NANOBPMN_DENO_BIN")
@@ -264,6 +289,10 @@ impl WorkerSupervisor {
         }
         // Refresh the on-disk SDK so worker code imports the current version.
         let _ = ensure_sdk_written();
+        // Backfill the @lib/ alias for workers created before shared-lib support.
+        ensure_lib_alias(&dir);
+        // The shared library dir must exist for `../../lib/` to resolve.
+        let _ = workspace::ensure_lib_dir();
 
         let entrypoint = dir.join("worker.ts");
         if !entrypoint.is_file() {

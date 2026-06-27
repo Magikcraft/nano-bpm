@@ -185,6 +185,52 @@ pub fn sdk_path() -> PathBuf {
     sdk_dir().join("worker-sdk.ts")
 }
 
+// ---------------------------------------------------------------------------
+// Shared library — reusable TS/JS files under `lib/`, importable from every
+// worker via the `@lib/` import-map alias (`workers/<name>/deno.json`).
+// ---------------------------------------------------------------------------
+
+/// Directory holding shared library source files (`<workspace>/lib/`). Workers
+/// reach it through the `@lib/` import-map alias, so logic can be authored once
+/// and reused across workers.
+pub fn lib_dir() -> PathBuf {
+    workspace_dir().join("lib")
+}
+
+/// Ensures the shared library directory exists and returns it.
+pub fn ensure_lib_dir() -> std::io::Result<PathBuf> {
+    let dir = lib_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The on-disk path for shared library `file` (`<lib>/<file>`), or `None` when
+/// the file name is unsafe (flat, no separators or `..` — same rule as workers).
+pub fn lib_file_path(file: &str) -> Option<PathBuf> {
+    is_safe_worker_file(file).then(|| lib_dir().join(file))
+}
+
+/// Lists the flat source files in the shared library directory (sorted),
+/// excluding hidden and nested entries. Returns an empty list (not an error)
+/// when the directory is freshly created and empty.
+pub fn list_lib_files() -> std::io::Result<Vec<String>> {
+    let dir = ensure_lib_dir()?;
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if let Some(f) = entry.file_name().to_str()
+            && is_safe_worker_file(f)
+        {
+            files.push(f.to_string());
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 /// The Deno dependency cache directory (`DENO_DIR`) for sandboxed workers.
 pub fn deno_cache_dir() -> PathBuf {
     workspace_dir().join(".deno-cache")
@@ -225,5 +271,16 @@ mod tests {
         assert!(worker_file_path("w", "../../etc/passwd").is_none());
         assert!(worker_file_path("w", "sub/dir.ts").is_none());
         assert!(worker_file_path("../w", "worker.ts").is_none());
+    }
+
+    #[test]
+    fn lib_paths_are_contained() {
+        // Shared library files reuse the worker file-name safety rule.
+        assert!(lib_file_path("util.ts").is_some());
+        assert!(lib_file_path("format-money.ts").is_some());
+        assert!(lib_file_path("../../etc/passwd").is_none());
+        assert!(lib_file_path("sub/dir.ts").is_none());
+        assert!(lib_file_path("..").is_none());
+        assert!(lib_dir().ends_with("lib"));
     }
 }
