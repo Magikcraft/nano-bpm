@@ -104,6 +104,64 @@ loaded, open the process and start investigating.
 > workspace and process in the same place, and everything in this guide applies
 > unchanged.
 
+## Import your Camunda 8 history
+
+You can analyse a **real Camunda 8 / Zeebe deployment's existing history** in
+ProcessOS — no live engine required. ProcessOS folds a record export from Camunda
+into the same trace dataset shape the demos use, so once imported it investigates
+exactly like a demo.
+
+### 1. Export the records from Camunda 8
+
+Get a JSON export of Camunda/Zeebe records (the `Record` stream the
+Elasticsearch / OpenSearch / debug-log exporters persist). The importer accepts
+the common dump layouts:
+
+- **NDJSON** — one record JSON object per line (debug-log / file exports).
+- **JSON array** — `[ {record}, … ]`.
+- **Elasticsearch / OpenSearch search response** — `{ "hits": { "hits": [ { "_source": {record} } ] } }` (a raw `_search`/scroll dump works).
+- **A directory** of any of the above — every `*.json` / `*.ndjson` file is folded together.
+
+### 2. Transform it into a dataset
+
+Run the ProcessOS binary's `import-camunda` subcommand to turn the export into a
+loadable dataset folder:
+
+```sh
+processos import-camunda <records.json|dir> <out-dir>
+```
+
+This writes `<out-dir>/traces.json` and prints a summary so you can confirm what
+came through — records read, traces produced, how many **completed / terminated /
+active**, and how many carried **incidents**, **creation variables**, and
+recorded **stimuli**, plus the process ids it found.
+
+How much of each instance is reconstructed depends on what the export contains:
+
+- **Always:** the instance, its per-element durations, jobs, and incidents.
+- **When present:** each instance's **creation variables**.
+- **By default:** an ordered **job-completion stimulus log**, which makes traces
+  *recorded-input replayable* — so the droid's simulations can replay them. Pass
+  `--no-tier2` to skip this if you only need the timings and structure.
+
+> **What isn't captured.** Inputs other than job completions — incoming messages,
+> timers, user-task actions — aren't recorded, so a model that consumes them is
+> only *partially* replayable. The import summary flags where stimuli were
+> truncated.
+
+### 3. Load it as a process
+
+Point a ProcessOS process at the imported folder:
+
+1. Go to **Workspaces** and open an existing workspace (or **+ New workspace**).
+2. Click **+ New process**, give it a **Display name**, and put the import's
+   `<out-dir>` path in the **Trace dataset folder** field. Click **Create**.
+3. Open the process and investigate it — the droid, its tools, simulations, and
+   pairing all work on your imported data exactly as they do on a demo.
+
+(Leave the **Live target URL** blank — that field is for pointing at a running
+Nano engine instead of a captured dataset. A process binds to one or the other.)
+
 ## Investigate a process
 
 The **Cockpit** is where you and the droid work a process together. Open a
