@@ -80,6 +80,14 @@ pub struct ChatSession {
     /// the model that actually answered, rather than re-labelling with the current selection.
     #[serde(default)]
     pub turn_models: Vec<String>,
+    /// Provenance marker. Empty for a native investigation; `"imported"` for a session
+    /// reconstructed from a shared psychological-trace zip (rendered with a special icon).
+    #[serde(default)]
+    pub origin: String,
+    /// Human-readable provenance summary for an imported session (e.g. the original
+    /// dataset/model and processos version), shown as the icon's tooltip. `None` when native.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
 }
 
 /// Lightweight session descriptor for the tab list (no transcript).
@@ -97,6 +105,12 @@ pub struct SessionMeta {
     /// Distinct LLM model labels that have driven a turn in this session (insertion order).
     #[serde(default)]
     pub models: Vec<String>,
+    /// Provenance marker (`""` native, `"imported"` for a shared psychological trace).
+    #[serde(default)]
+    pub origin: String,
+    /// Human-readable provenance summary for an imported session (icon tooltip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
 }
 
 /// On-disk shape: all sessions for one `(workspace, process)` key in a single file.
@@ -155,6 +169,8 @@ impl ChatStore {
                             turns: render_view(&s.messages).len(),
                             persona: s.persona.clone(),
                             models: s.models.clone(),
+                            origin: s.origin.clone(),
+                            imported_from: s.imported_from.clone(),
                         })
                         .collect()
                 })
@@ -181,6 +197,54 @@ impl ChatStore {
             persona: String::new(),
             models: Vec::new(),
             turn_models: Vec::new(),
+            origin: String::new(),
+            imported_from: None,
+        };
+        sessions.push(session.clone());
+        let snapshot = sessions.clone();
+        drop(guard);
+        self.persist(key, &snapshot);
+        session
+    }
+
+    /// Reconstruct a shared psychological trace as a fresh, `"imported"`-origin session under
+    /// `key`. Assigns a new id (avoiding collisions with the recipient's own sessions), keeps the
+    /// original transcript/stamps/persona/models for faithful replay, and records a provenance
+    /// summary for the icon tooltip. Returns the stored session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_session(
+        &self,
+        key: &str,
+        name: &str,
+        messages: Vec<Msg>,
+        stamps: Vec<u64>,
+        persona: String,
+        models: Vec<String>,
+        turn_models: Vec<String>,
+        imported_from: Option<String>,
+    ) -> ChatSession {
+        self.ensure_loaded(key);
+        let now = now_ms();
+        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let sessions = guard.entry(key.to_string()).or_default();
+        let name = name.trim();
+        let name = if name.is_empty() {
+            default_name(sessions.len() + 1)
+        } else {
+            name.to_string()
+        };
+        let session = ChatSession {
+            id: new_session_id(),
+            name,
+            created: now,
+            updated: now,
+            messages,
+            stamps,
+            persona,
+            models,
+            turn_models,
+            origin: "imported".to_string(),
+            imported_from,
         };
         sessions.push(session.clone());
         let snapshot = sessions.clone();
@@ -190,8 +254,7 @@ impl ChatStore {
     }
 
     /// Load a session by id (its full transcript + stamps).
-    pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {
-        self.ensure_loaded(key);
+    pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {        self.ensure_loaded(key);
         self.mem.read().ok().and_then(|m| {
             m.get(key)
                 .and_then(|s| s.iter().find(|s| s.id == session_id).cloned())
@@ -221,6 +284,8 @@ impl ChatStore {
                 persona: String::new(),
                 models: Vec::new(),
                 turn_models: Vec::new(),
+                origin: String::new(),
+                imported_from: None,
             });
         }
         let snapshot = sessions.clone();
@@ -256,6 +321,8 @@ impl ChatStore {
                 persona: String::new(),
                 models: vec![model.to_string()],
                 turn_models: Vec::new(),
+                origin: String::new(),
+                imported_from: None,
             }),
         }
         let snapshot = sessions.clone();
@@ -334,6 +401,8 @@ impl ChatStore {
                 persona: persona.to_string(),
                 models: Vec::new(),
                 turn_models: Vec::new(),
+                origin: String::new(),
+                imported_from: None,
             }),
         }
         let snapshot = sessions.clone();
@@ -410,6 +479,8 @@ impl ChatStore {
             persona: String::new(),
             models: Vec::new(),
             turn_models: Vec::new(),
+            origin: String::new(),
+            imported_from: None,
         }])
     }
 

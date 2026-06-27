@@ -35,6 +35,10 @@ nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 # the trace corpus). `bundled` compiles DuckDB from source (one-time C++ build)
 # so the binary is self-contained with no system DuckDB needed.
 duckdb = { version = "1", features = ["bundled"] }
+# Psychological-trace export/import: bundle the investigation transcript, the LLM
+# profiles used (api keys redacted), and a manifest into a single shareable zip.
+# Pinned to the already-locked offline build; `deflate` keeps the archive compact.
+zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = "s"

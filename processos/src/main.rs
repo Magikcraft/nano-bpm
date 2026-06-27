@@ -34,6 +34,7 @@ mod reasoning;
 mod report;
 mod settings;
 mod supervisor;
+mod trace;
 mod workspace;
 
 use std::net::SocketAddr;
@@ -488,6 +489,15 @@ async fn main() {
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/export",
             get(cockpit_chat_session_export),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/trace",
+            get(cockpit_chat_session_trace_export),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/traces/import",
+            post(cockpit_chat_trace_import)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/stream",
@@ -2298,6 +2308,8 @@ fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::S
                 turns: 0,
                 persona: s.persona,
                 models: s.models,
+                origin: s.origin,
+                imported_from: s.imported_from,
             };
         }
     }
@@ -2314,6 +2326,8 @@ fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::S
         turns: 0,
         persona: s.persona,
         models: s.models,
+        origin: s.origin,
+        imported_from: s.imported_from,
     }
 }
 
@@ -2501,6 +2515,167 @@ fn slugify(name: &str, fallback_id: &str) -> String {
     } else {
         collapsed.chars().take(60).collect()
     }
+}
+
+/// `GET .../chat/sessions/{id}/trace` — export a **psychological trace**: a single shareable zip
+/// bundling the investigation transcript, the LLM profiles that drove it (API keys redacted), the
+/// persona, and a manifest naming the dataset + model. A Forward-Deployed Engineer can download
+/// this and Slack it back for remote replay/debugging (see [`crate::trace`]).
+async fn cockpit_chat_session_trace_export(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let key = chat::session_key(&workspace, &process);
+    let Some(s) = state.chat.get(&key, &id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no such chat session" })),
+        )
+            .into_response();
+    };
+
+    // Resolve (and redact) the LLM profiles that drove this session — matched by the model label
+    // recorded per turn against each profile's model / name / id.
+    let snapshot = state.settings.snapshot();
+    let llm_profiles: Vec<serde_json::Value> = snapshot
+        .profiles
+        .iter()
+        .filter(|p| {
+            let model = p.model.as_deref();
+            s.models
+                .iter()
+                .any(|lbl| Some(lbl.as_str()) == model || lbl == &p.name || lbl == &p.id)
+        })
+        .map(trace::redact_profile)
+        .collect();
+
+    let persona_prompt = state
+        .personas
+        .get(&s.persona)
+        .map(|p| p.system)
+        .unwrap_or_default();
+    let turns = chat::render_view_full(&s.messages, &s.stamps, &s.turn_models);
+    let transcript = chat::export_transcript(&s.name, &turns, true, true);
+    let debug_requests = state
+        .chat_debug
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&chat_cancel_key(&key, &id)).cloned())
+        .unwrap_or_default();
+
+    let manifest = trace::TraceManifest {
+        schema: trace::SCHEMA.to_string(),
+        processos_version: env!("CARGO_PKG_VERSION").to_string(),
+        exported_at: chat_now_ms(),
+        workspace: workspace.clone(),
+        process: process.clone(),
+        session_id: s.id.clone(),
+        session_name: s.name.clone(),
+        persona: s.persona.clone(),
+        models: s.models.clone(),
+        turns: turns.len(),
+        debug_rounds: debug_requests.len(),
+        llm_profiles,
+    };
+
+    let zip = match trace::build_zip(
+        &manifest,
+        &s,
+        &transcript,
+        &persona_prompt,
+        &serde_json::Value::Array(debug_requests),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("build trace: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let slug = slugify(&s.name, &id);
+    let base = slug.strip_prefix("investigation-").unwrap_or(&slug);
+    let filename = format!("psych-trace-{base}.zip");
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/zip".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE.to_string()),
+        ],
+        zip,
+    )
+        .into_response()
+}
+
+/// `POST .../traces/import` — import a shared psychological-trace zip (raw request body) as a new
+/// `"imported"`-origin investigation under the **currently viewed** `(workspace, process)`, so it
+/// surfaces immediately in the recipient's session list (with the imported icon). The original
+/// dataset/model/version from the manifest are kept as a provenance tooltip.
+async fn cockpit_chat_trace_import(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let (manifest, session) = match trace::parse_zip(body.to_vec()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid trace: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let provenance = {
+        let mut s = format!("{} / {}", manifest.workspace, manifest.process);
+        if !manifest.models.is_empty() {
+            s.push_str(" · ");
+            s.push_str(&manifest.models.join(", "));
+        }
+        s.push_str(&format!(" · ProcessOS {}", manifest.processos_version));
+        s
+    };
+    let name = if manifest.session_name.trim().is_empty() {
+        "Imported investigation".to_string()
+    } else {
+        manifest.session_name.clone()
+    };
+
+    let key = chat::session_key(&workspace, &process);
+    let stored = state.chat.import_session(
+        &key,
+        &name,
+        session.messages,
+        session.stamps,
+        session.persona,
+        session.models,
+        session.turn_models,
+        Some(provenance.clone()),
+    );
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "sessionId": stored.id,
+            "name": stored.name,
+            "workspace": workspace,
+            "process": process,
+            "source": provenance,
+            "origin": manifest,
+        })),
+    )
+        .into_response()
 }
 
 /// `DELETE .../chat/sessions/{id}` — delete a chat session.
