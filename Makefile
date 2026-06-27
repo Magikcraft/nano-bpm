@@ -1,10 +1,12 @@
 # nanobpmn — Orchestration Cluster REST layer code generation (Rust / rust-axum).
 #
 # Quick start:
-#   make setup   — check the toolchain (rust, uv, java) and provision the Python
-#                  build env via `uv sync`.
-#   make all     — build nano top-to-bottom: generate the REST stubs, then
-#                  compile the gateway (server) and ProcessOS.
+#   make setup       — check the toolchain (rust, uv, java), provision the Python
+#                      build env via `uv sync`, then generate the REST stubs.
+#   make all         — build nano top-to-bottom: generate the REST stubs, then
+#                      compile the gateway (server) and ProcessOS (debug).
+#   make all-release — same, but build optimized release binaries of the gateway
+#                      (nano) and ProcessOS.
 #
 # `make generate` produces the Rust REST layer + server stubs from spec/; the
 # output under generated/ and server/src/stub_impls.rs is git-ignored.
@@ -21,8 +23,9 @@ UV := uv
 .DEFAULT_GOAL := build
 
 .PHONY: setup
-setup: check-deps ## Verify the toolchain and provision the Python build env (uv sync) — run this first
+setup: check-deps ## Verify the toolchain, provision the Python build env (uv sync), then generate the REST stubs — run this first
 	$(UV) sync
+	$(MAKE) generate
 	@echo
 	@echo "Setup complete. Build everything with: make all"
 
@@ -57,6 +60,16 @@ all: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build nano top-to-bottom: gene
 	cd $(PROCESSOS_DIR) && cargo build
 	@echo
 	@echo "Built nano top-to-bottom: generated REST crate + gateway (server) + ProcessOS."
+
+.PHONY: all-release
+all-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build optimized release binaries of nano (gateway) and ProcessOS top-to-bottom
+	cd $(GENERATED_DIR) && cargo build --release
+	cd $(PROJECT_ROOT)/server && cargo build --release
+	cd $(PROCESSOS_DIR) && cargo build --release
+	@echo
+	@echo "Built release binaries:"
+	@echo "  gateway (nano): $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
+	@echo "  ProcessOS:      $(PROCESSOS_DIR)/target/release/processos"
 
 .PHONY: generate
 generate: ## Generate the Rust REST layer + server stub impls from spec/ (needs local Java)
