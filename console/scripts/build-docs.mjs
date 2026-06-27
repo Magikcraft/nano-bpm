@@ -1,19 +1,22 @@
-// Builds the bundled documentation website from the repository README.
+// Builds the bundled documentation website from the repository USERGUIDE.md.
 //
-// The single source of truth is ../README.md: it is chunked on its H2 (`##`)
-// headings into one page per section (the preamble before the first H2 becomes
-// the "Overview" home page), rendered to HTML with markdown-it, and wrapped in
-// a branded shell with a persistent sidebar. Output lands in public/docs/, which
-// Vite ships into dist/ and the gateway embeds, so /docs works fully offline.
+// The single source of truth is ../USERGUIDE.md (the task-oriented end-user
+// manual, deliberately separate from README.md which is the project/operating
+// reference and DEVELOPMENT.md which is source-focused): it is chunked on its H2
+// (`##`) headings into one page per section (the preamble before the first H2
+// becomes the "Overview" home page), rendered to HTML with markdown-it, and
+// wrapped in a branded shell with a persistent sidebar. Output lands in
+// public/docs/, which Vite ships into dist/ and the gateway embeds, so /docs
+// works fully offline.
 //
-// The README is the source; the generated HTML is git-ignored. Re-run via
+// USERGUIDE.md is the source; the generated HTML is git-ignored. Re-run via
 // `npm run build` (or directly) to refresh it.
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import MarkdownIt from "markdown-it";
 
 const root = process.cwd();
-const readmePath = join(root, "..", "README.md");
+const readmePath = join(root, "..", "USERGUIDE.md");
 const outDir = join(root, "public", "docs");
 
 // Repo links in the README are relative to the repo root; rewrite them to GitHub
@@ -241,10 +244,6 @@ function shell(page) {
       </nav>
       <main class="content">
         ${body}
-        <p class="source-note">
-          Generated from <code>README.md</code> at build time.
-          <a href="${REPO_BLOB}README.md">Edit on GitHub →</a>
-        </p>
       </main>
     </div>
   </body>
