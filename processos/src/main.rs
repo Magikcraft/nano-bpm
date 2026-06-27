@@ -398,6 +398,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(landing))
         .route("/features", get(features))
+        .route("/guide", get(guide_index))
+        .route("/guide/{slug}", get(guide_section))
         .route("/console", get(dashboard))
         .route("/cockpit", get(cockpit_page))
         .route("/health", get(health))
@@ -745,6 +747,172 @@ async fn landing() -> Html<&'static str> {
 /// `GET /features` — what Process OS does.
 async fn features() -> Html<&'static str> {
     Html(FEATURES_HTML)
+}
+
+/// One page of the User Guide, single-sourced from `README.md` at build time.
+/// See `build.rs`; the generated array below is embedded with `include!`.
+pub struct GuidePage {
+    pub slug: &'static str,
+    pub title: &'static str,
+    pub body: &'static str,
+}
+include!(concat!(env!("OUT_DIR"), "/userguide.rs"));
+
+/// Sidebar nav for the guide shell — one link per generated page, the active one
+/// highlighted.
+fn guide_nav(active: &str) -> String {
+    USERGUIDE_PAGES
+        .iter()
+        .map(|p| {
+            let href = if p.slug == "index" {
+                "/guide".to_string()
+            } else {
+                format!("/guide/{}", p.slug)
+            };
+            let cls = if p.slug == active {
+                "g-link active"
+            } else {
+                "g-link"
+            };
+            format!(
+                "<a class=\"{cls}\" href=\"{href}\">{}</a>",
+                html_escape(p.title)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Wrap a rendered guide page in the branded, dark ProcessOS shell with a sticky
+/// sidebar. Self-contained (inline CSS) so `/guide` works fully offline.
+fn guide_shell(page: &GuidePage) -> String {
+    let subtitle = if page.slug == "index" {
+        "User Guide".to_string()
+    } else {
+        html_escape(page.title)
+    };
+    format!(
+        r###"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nano ProcessOS · {title}</title>
+<style>
+  :root {{ --bg:#08080a; --panel:#0e0e12; --ink:#e4e4e7; --muted:#a1a1aa; --line:#26262b;
+    --violet:#a78bfa; --sky:#38bdf8; --code:#141417; }}
+  * {{ box-sizing:border-box; }}
+  html {{ scroll-behavior:smooth; }}
+  body {{ margin:0; background:var(--bg); color:var(--ink);
+    font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; line-height:1.65; }}
+  a {{ color:var(--sky); }}
+  code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.86em; }}
+  .g-bar {{ display:flex; align-items:center; gap:.7rem; padding:.6rem 1.1rem; background:#0b0b0f;
+    border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }}
+  .g-bar a.brand {{ display:flex; align-items:center; gap:.5rem; text-decoration:none; color:var(--ink); font-weight:600; }}
+  .g-bar .dot {{ width:.6rem; height:.6rem; border-radius:9999px; background:linear-gradient(135deg,var(--violet),var(--sky)); }}
+  .g-bar .sub {{ color:var(--muted); font-size:.85rem; }}
+  .g-bar .spacer {{ flex:1; }}
+  .g-bar a.x {{ color:var(--sky); text-decoration:none; font-size:.85rem; margin-left:1rem; }}
+  .g-bar a.x:hover {{ text-decoration:underline; }}
+  .layout {{ display:flex; align-items:flex-start; max-width:1180px; margin:0 auto; }}
+  .sidebar {{ width:255px; flex:0 0 255px; position:sticky; top:50px; align-self:flex-start;
+    max-height:calc(100vh - 50px); overflow-y:auto; padding:1.25rem .75rem 3rem; border-right:1px solid var(--line); }}
+  .nav-title {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+    font-weight:700; padding:0 .6rem; margin-bottom:.5rem; }}
+  .g-link {{ display:block; padding:.34rem .6rem; border-radius:6px; text-decoration:none; color:#c7c7cf; font-size:.9rem; }}
+  .g-link:hover {{ background:#17171c; color:#fff; }}
+  .g-link.active {{ background:#1d1b34; color:#c4b5fd; font-weight:600; }}
+  .content {{ min-width:0; flex:1; padding:1.6rem 2.2rem 5rem; }}
+  .content h1 {{ font-size:1.9rem; margin:.2rem 0 1rem; }}
+  .content h2 {{ font-size:1.4rem; margin:2rem 0 .6rem; padding-bottom:.3rem; border-bottom:1px solid var(--line); }}
+  .content h3 {{ font-size:1.12rem; margin:1.5rem 0 .4rem; color:#ddd6fe; }}
+  .content h4 {{ font-size:1rem; margin:1.1rem 0 .3rem; }}
+  .content p, .content li {{ color:#d4d4d8; }}
+  .content a {{ text-decoration:none; }}
+  .content a:hover {{ text-decoration:underline; }}
+  .content ul, .content ol {{ padding-left:1.4rem; }}
+  .content li {{ margin:.25rem 0; }}
+  .content :not(pre) > code {{ background:var(--code); border:1px solid var(--line); border-radius:4px;
+    padding:.05rem .32rem; color:#e9d5ff; }}
+  .content pre {{ background:#050507; color:#e4e4e7; padding:.9rem 1rem; border-radius:8px; overflow-x:auto;
+    font-size:.84rem; line-height:1.5; border:1px solid var(--line); }}
+  .content pre code {{ background:none; border:0; padding:0; color:inherit; }}
+  .content blockquote {{ margin:1rem 0; padding:.3rem 1rem; border-left:3px solid var(--violet); background:#101019; color:#c7c7cf; }}
+  .content table {{ border-collapse:collapse; width:100%; margin:1rem 0; font-size:.9rem; display:block; overflow-x:auto; }}
+  .content th, .content td {{ border:1px solid var(--line); padding:.4rem .6rem; text-align:left; vertical-align:top; }}
+  .content th {{ background:#141417; }}
+  .content img {{ max-width:100%; }}
+  .content hr {{ border:0; border-top:1px solid var(--line); margin:2rem 0; }}
+  .source-note {{ margin-top:3rem; padding-top:1rem; border-top:1px solid var(--line); color:var(--muted); font-size:.82rem; }}
+  @media (max-width:800px) {{
+    .layout {{ flex-direction:column; }}
+    .sidebar {{ position:static; width:100%; max-height:none; border-right:0; border-bottom:1px solid var(--line); }}
+    .content {{ padding:1.25rem; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="g-bar">
+    <a class="brand" href="/"><span class="dot"></span>Nano ProcessOS</a>
+    <span class="sub">{subtitle}</span>
+    <span class="spacer"></span>
+    <a class="x" href="/features">Features</a>
+    <a class="x" href="/workspace">Workspaces</a>
+    <a class="x" href="/cockpit">Cockpit</a>
+  </div>
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="nav-title">User Guide</div>
+      {nav}
+    </nav>
+    <main class="content">
+      {body}
+      <p class="source-note">Generated from <code>processos/README.md</code> at build time.
+        <a href="{repo}README.md">Edit on GitHub →</a></p>
+    </main>
+  </div>
+</body>
+</html>"###,
+        title = html_escape(page.title),
+        subtitle = subtitle,
+        nav = guide_nav(page.slug),
+        body = page.body,
+        repo = "https://github.com/jwulf/nano-bpm/blob/main/processos/",
+    )
+}
+
+/// `GET /guide` — the User Guide home (Overview), single-sourced from the README.
+async fn guide_index() -> impl IntoResponse {
+    serve_guide("index")
+}
+
+/// `GET /guide/{slug}` — a single User Guide section.
+async fn guide_section(Path(slug): Path<String>) -> impl IntoResponse {
+    serve_guide(&slug)
+}
+
+fn serve_guide(slug: &str) -> axum::response::Response {
+    match USERGUIDE_PAGES.iter().find(|p| p.slug == slug) {
+        Some(p) => Html(guide_shell(p)).into_response(),
+        None => {
+            // Unknown section — fall back to the Overview so a stale link still lands
+            // somewhere useful, with a 404 status for correctness.
+            let overview = USERGUIDE_PAGES
+                .iter()
+                .find(|p| p.slug == "index")
+                .expect("overview page");
+            (StatusCode::NOT_FOUND, Html(guide_shell(overview))).into_response()
+        }
+    }
+}
+
+/// Minimal HTML escape for text interpolated into the guide shell (titles).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// A dependency-free single-file dashboard that fetches `/api/insights` and renders

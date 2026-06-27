@@ -40,6 +40,13 @@ duckdb = { version = "1", features = ["bundled"] }
 # Pinned to the already-locked offline build; `deflate` keeps the archive compact.
 zip = { version = "6", default-features = false, features = ["deflate"] }
 
+# Build-time docs processor: the User Guide site at `/guide` is generated from
+# the repository `README.md` (single source of truth) by `build.rs`, which chunks
+# it on H2 headings and renders each section to HTML. Pinned to the offline-cached
+# release; `html` is the only feature we need (no getopts/simd).
+[build-dependencies]
+pulldown-cmark = { version = "=0.13.3", default-features = false, features = ["html"] }
+
 [profile.release]
 opt-level = "s"
 lto = true
