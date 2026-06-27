@@ -1,0 +1,101 @@
+{
+  "processId": "delivery-exception-resolution",
+  "bpmn": "delivery-exception-resolution.bpmn",
+  "domain": "retail-delivery-exception",
+
+  "seed": 23,
+  "horizonDays": 14,
+
+  "baseArrivalsPerHour": 14.0,
+  "peak": {
+    "pattern": "weekday-morning",
+    "multiplier": 8.0,
+    "startHour": 9,
+    "endHour": 12
+  },
+
+  "jobs": {
+    "check-for-duplicate-case": {
+      "serviceMsMean": 800,
+      "serviceMsSigma": 0.25,
+      "cost": 0.01,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "fetch-tracking-data": {
+      "serviceMsMean": 1500,
+      "serviceMsSigma": 0.3,
+      "cost": 0.02,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "delivery-exception-classification": {
+      "serviceMsMean": 600,
+      "serviceMsSigma": 0.2,
+      "cost": 0.01,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "create-new-case": {
+      "serviceMsMean": 2500,
+      "serviceMsSigma": 0.3,
+      "cost": 0.04,
+      "failureRate": 0.0,
+      "poolCapacity": 16
+    },
+    "update-existing-case": {
+      "serviceMsMean": 2500,
+      "serviceMsSigma": 0.3,
+      "cost": 0.04,
+      "failureRate": 0.0,
+      "poolCapacity": 16
+    },
+    "update-salesforce-case": {
+      "serviceMsMean": 2000,
+      "serviceMsSigma": 0.3,
+      "cost": 0.03,
+      "failureRate": 0.0,
+      "poolCapacity": 16
+    },
+    "close-salesforce-case": {
+      "serviceMsMean": 2000,
+      "serviceMsSigma": 0.25,
+      "cost": 0.03,
+      "failureRate": 0.0,
+      "poolCapacity": 16
+    },
+    "Task_DraftEmail": {
+      "serviceMsMean": 500,
+      "serviceMsSigma": 0.2,
+      "cost": 0.01,
+      "failureRate": 0.0,
+      "poolCapacity": 24
+    },
+    "io.camunda:email:1": {
+      "serviceMsMean": 1800,
+      "serviceMsSigma": 0.3,
+      "cost": 0.02,
+      "failureRate": 0.0,
+      "poolCapacity": 16
+    },
+    "io.camunda.agenticai:aiagent-job-worker:1": {
+      "serviceMsMean": 95000,
+      "serviceMsSigma": 0.45,
+      "cost": 0.85,
+      "failureRate": 0.0,
+      "poolCapacity": 2
+    }
+  },
+
+  "inputs": [
+    { "weight": 0.55, "vars": { "isDuplicate": false, "classificationResult": "unclear" }, "expectedOutcome": "completed" },
+    { "weight": 0.30, "vars": { "isDuplicate": false, "classificationResult": "deterministic-reject" }, "expectedOutcome": "completed" },
+    { "weight": 0.15, "vars": { "isDuplicate": true, "classificationResult": "unclear" }, "expectedOutcome": "completed" }
+  ],
+
+  "plantedFault": {
+    "jobType": "io.camunda.agenticai:aiagent-job-worker:1",
+    "kind": "under-provisioned",
+    "window": "weekday-morning"
+  }
+}
