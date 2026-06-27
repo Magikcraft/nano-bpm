@@ -1,0 +1,233 @@
+# Cross-compiles the gateway server for all five targets, uploads them as assets
+# on the rolling `binaries` release of the PUBLIC plugin repo
+# (jwulf/c8ctl-plugin-nano), and then bumps a marker file in the plugin repo so
+# semantic-release cuts a new npm version that ships the fresh binaries.
+# This repo's name never appears in the plugin repo; only the assets do.
+#
+# Prerequisites
+# -------------
+# 1. Secret C8CTL_PLUGIN_REPO_TOKEN: a fine-grained PAT (or GitHub App token)
+#    with "Contents: read & write" on jwulf/c8ctl-plugin-nano ONLY.
+# 2. Codegen needs Java (JDK 17) + uv (Python); the web console needs Node.
+#    Both run ONCE in the `prepare` job (Linux) and are shared with every build
+#    leg as an artifact, so the cross-compile legs only need Rust.
+#
+# Why the binaries are built with `--features console`
+# ----------------------------------------------------
+# The c8ctl plugin reads recorded traces back via `GET /console/api/traces/{key}`
+# and surfaces the embedded web console, both of which only exist when the server
+# is compiled with the `console` feature. A console-less binary would ship a
+# plugin missing its documented trace-readback surface, so the feature is on.
+
+name: Publish c8ctl binaries
+
+on:
+  push:
+    tags: ['v*']          # cut binaries on each tagged nanobpmn release
+  workflow_dispatch:
+
+concurrency:
+  group: publish-c8ctl-binaries
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_REPO: jwulf/c8ctl-plugin-nano
+  BIN_NAME: nanobpm-gateway-rest-server
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Produce the codegen output (generated/ + server/src/stub_impls.rs) and the
+  # built web console (console/dist) ONCE. These are platform-independent — the
+  # generated Rust is identical for every target and the embedded console assets
+  # are architecture-agnostic — so the matrix build legs just consume them and
+  # never need Java/uv/Node/make. This also keeps the codegen off the Windows
+  # runner (which has no reliable `make`/bash codegen toolchain).
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Generate REST layer + build console
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+
+      - name: Generate REST layer + stubs
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync
+          make generate
+
+      - name: Build web console
+        shell: bash
+        working-directory: console
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Upload prebuilt sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-sources
+          include-hidden-files: true
+          retention-days: 1
+          path: |
+            generated/
+            server/src/stub_impls.rs
+            console/dist/
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            asset: nanobpm-gateway-rest-server-darwin-arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            asset: nanobpm-gateway-rest-server-darwin-x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            asset: nanobpm-gateway-rest-server-linux-x64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            asset: nanobpm-gateway-rest-server-linux-arm64
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            asset: nanobpm-gateway-rest-server-win32-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      # Restore generated/, server/src/stub_impls.rs and console/dist into the
+      # workspace (all git-ignored, so no conflict with the checkout).
+      - name: Download prebuilt sources
+        uses: actions/download-artifact@v4
+        with:
+          name: prebuilt-sources
+          path: .
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: server
+
+      - name: Install cross linker (linux arm64)
+        if: matrix.apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build gateway (release, cross-target)
+        shell: bash
+        working-directory: server
+        env:
+          # Linker for the linux arm64 cross target (ignored when unset). The
+          # `cc` crate auto-selects the matching `aarch64-linux-gnu-gcc` for the
+          # bundled C deps (rusqlite, jemalloc-sys) from the target triple.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: |
+          set -euo pipefail
+          cargo build --release --target "${{ matrix.target }}" \
+            --features console --bin "$BIN_NAME"
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="server/target/${{ matrix.target }}/release/${BIN_NAME}"
+          if [ -f "${src}.exe" ]; then
+            src="${src}.exe"
+          fi
+          mkdir -p dist
+          cp "$src" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          retention-days: 1
+
+  publish:
+    name: Upload binaries + trigger plugin release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download built binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: nanobpm-gateway-rest-server-*
+          merge-multiple: true
+
+      - name: Upload assets to the `binaries` release
+        env:
+          GH_TOKEN: ${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          gh release view binaries --repo "$PLUGIN_REPO" >/dev/null 2>&1 || \
+            gh release create binaries \
+              --repo "$PLUGIN_REPO" \
+              --title "nanobpmn binaries (rolling)" \
+              --notes "Prebuilt gateway binaries consumed by the release workflow. Auto-updated." \
+              --latest=false \
+              --prerelease
+          gh release upload binaries dist/* --repo "$PLUGIN_REPO" --clobber
+
+      # Bump the bundled-binary marker in the plugin repo. Because the plugin's
+      # npm version is decoupled from the nanobpmn version, this `fix:` commit on
+      # main is what makes semantic-release cut a patch release that ships the
+      # binaries just uploaded above. No-ops (skips the push) if unchanged.
+      - name: Bump bundled-binary marker (triggers npm release)
+        env:
+          GH_TOKEN: ${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME:-$(git rev-parse --short HEAD)}"
+          ver="${ver#v}"
+          sha="$(git rev-parse --short HEAD)"
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          tmp="$(mktemp -d)"
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/${PLUGIN_REPO}.git" "$tmp"
+          cat > "$tmp/nanobpmn-binary.json" <<JSON
+          {
+            "version": "${ver}",
+            "commit": "${sha}",
+            "updated": "${now}"
+          }
+          JSON
+          cd "$tmp"
+          if git diff --quiet -- nanobpmn-binary.json; then
+            echo "marker unchanged; nothing to release."
+            exit 0
+          fi
+          git config user.name "nanobpmn-ci"
+          git config user.email "nanobpmn-ci@users.noreply.github.com"
+          git add nanobpmn-binary.json
+          git commit -m "fix(binary): bundle nanobpmn ${ver} (${sha})"
+          git push origin HEAD:main
