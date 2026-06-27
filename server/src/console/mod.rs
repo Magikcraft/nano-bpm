@@ -64,6 +64,9 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/swagger", get(swagger_index))
         .route("/swagger/", get(swagger_index))
         .route("/swagger/{*path}", get(swagger_asset))
+        .route("/asyncapi", get(asyncapi_index))
+        .route("/asyncapi/", get(asyncapi_index))
+        .route("/asyncapi/{*path}", get(asyncapi_asset))
         .route("/console/api/topology", get(topology))
         .route("/console/api/cluster/health", get(cluster_health))
         .route("/console/api/metrics", get(metrics_snapshot))
@@ -195,6 +198,21 @@ async fn swagger_index() -> Response {
 async fn swagger_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
     let path = path.trim_start_matches('/');
     serve_embedded(&format!("swagger/{path}"))
+}
+
+/// Serves the Command Stream Protocol reference (AsyncAPI) at `/asyncapi`. The
+/// page is generated at build time from `docs/command-stream.asyncapi.yaml`
+/// (see `console/scripts/copy-asyncapi.mjs`) into `dist/asyncapi/index.html`.
+async fn asyncapi_index() -> Response {
+    serve_embedded("asyncapi/index.html")
+}
+
+/// Serves any further assets under `/asyncapi/` (the page is currently a single
+/// self-contained `index.html`, but this keeps the route shape parallel to
+/// `/swagger/`).
+async fn asyncapi_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+    let path = path.trim_start_matches('/');
+    serve_embedded(&format!("asyncapi/{path}"))
 }
 
 

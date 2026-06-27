@@ -2358,3 +2358,133 @@ mod fair_plan_weighted_tests {
         assert_eq!(got[0], 5, "drained the shallow-but-believed-deep source");
     }
 }
+
+/// Drift guard: the public command-stream protocol is hand-documented in
+/// `docs/command-stream.asyncapi.yaml` (a WebSocket protocol can't be modelled
+/// by OpenAPI, so it is not code-generated). These tests pin the spec to the
+/// `ClientFrame` / `ServerFrame` enums it claims to mirror, so the spec — and
+/// the `/asyncapi` docs generated from it — cannot silently drift out of sync.
+#[cfg(test)]
+mod asyncapi_spec_guard {
+    use super::{ClientFrame, ServerFrame};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    /// The spec, embedded at compile time (repo `docs/`, two levels up from
+    /// `server/src/`). If this path breaks, the spec moved and the docs pipeline
+    /// (`console/scripts/copy-asyncapi.mjs`) needs the same update.
+    const SPEC: &str = include_str!("../../docs/command-stream.asyncapi.yaml");
+
+    /// The public client→server frames. The many intra-cluster `ClientFrame`
+    /// variants (deploy, raft, forwardCreate, getByKey, …) are deliberately NOT
+    /// part of the public protocol and are intentionally absent from the spec.
+    const PUBLIC_CLIENT: &[&str] = &[
+        "subscribe",
+        "jobCredits",
+        "createInstance",
+        "completeJob",
+        "failJob",
+        "throwError",
+        "awaitInstance",
+        "heartbeat",
+    ];
+
+    /// Every server→client frame — `ServerFrame` has no internal-only variants,
+    /// so this is the full enum and the guard below derives it from the type.
+    const PUBLIC_SERVER: &[&str] = &[
+        "welcome",
+        "job",
+        "commandResult",
+        "instanceCompleted",
+        "submissionCredits",
+        "pressure",
+        "heartbeat",
+    ];
+
+    /// Collect every message discriminator the spec documents, i.e. each
+    /// `const: <x>` declared on a `type` property in the schemas section.
+    fn documented_discriminators() -> BTreeSet<String> {
+        SPEC.lines()
+            .filter_map(|l| l.trim().strip_prefix("const:"))
+            .map(|c| c.trim().trim_matches('"').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn spec_documents_exactly_the_public_protocol() {
+        let documented = documented_discriminators();
+        let expected: BTreeSet<String> = PUBLIC_CLIENT
+            .iter()
+            .chain(PUBLIC_SERVER)
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            documented, expected,
+            "command-stream.asyncapi.yaml documents a different frame set than the public \
+             protocol contract — update the spec (and PUBLIC_CLIENT/PUBLIC_SERVER if the \
+             public protocol genuinely changed)."
+        );
+    }
+
+    #[test]
+    fn server_frame_type_tags_match_the_spec() {
+        // Construct every ServerFrame variant so the set of `type` tags is derived
+        // straight from the enum: add a variant and this fails until it is documented.
+        let all = [
+            ServerFrame::Welcome {
+                submission_credits: 1,
+                heartbeat_ms: 1,
+            },
+            ServerFrame::Job { job: json!({}) },
+            ServerFrame::CommandResult {
+                corr: 1,
+                status: 200,
+                body: None,
+            },
+            ServerFrame::InstanceCompleted {
+                corr: 1,
+                process_instance_key: "1".into(),
+                process_completed: true,
+                variables: json!({}),
+            },
+            ServerFrame::SubmissionCredits { n: 1 },
+            ServerFrame::Pressure {
+                level: "ok".into(),
+                retry_after_ms: None,
+            },
+            ServerFrame::Heartbeat,
+        ];
+        let tags: BTreeSet<String> = all
+            .iter()
+            .map(|f| serde_json::to_value(f).unwrap()["type"].as_str().unwrap().to_string())
+            .collect();
+        let expected: BTreeSet<String> = PUBLIC_SERVER.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            tags, expected,
+            "ServerFrame's serialized `type` tags drifted from the documented server frames."
+        );
+    }
+
+    #[test]
+    fn public_client_frames_deserialize_under_their_documented_type() {
+        // A minimal valid frame for each documented client `type` must decode into
+        // a ClientFrame — proving the discriminator the spec advertises is real.
+        let minimal = |t: &str| match t {
+            "subscribe" => json!({"type":"subscribe","jobType":"x"}),
+            "jobCredits" => json!({"type":"jobCredits","jobType":"x","n":1}),
+            "createInstance" => json!({"type":"createInstance","corr":1}),
+            "completeJob" => json!({"type":"completeJob","corr":1,"jobKey":"1"}),
+            "failJob" => json!({"type":"failJob","corr":1,"jobKey":"1"}),
+            "throwError" => json!({"type":"throwError","corr":1,"jobKey":"1","errorCode":"E"}),
+            "awaitInstance" => json!({"type":"awaitInstance","corr":1,"processInstanceKey":"1"}),
+            "heartbeat" => json!({"type":"heartbeat"}),
+            other => panic!("no minimal frame for documented client type {other:?}"),
+        };
+        for &t in PUBLIC_CLIENT {
+            let frame: ClientFrame = serde_json::from_value(minimal(t))
+                .unwrap_or_else(|e| panic!("documented client type {t:?} no longer decodes: {e}"));
+            let got = serde_json::to_value(&frame).unwrap()["type"].as_str().unwrap().to_string();
+            assert_eq!(got, t, "client type {t:?} round-trips to a different tag");
+        }
+    }
+}

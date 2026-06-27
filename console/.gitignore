@@ -8,3 +8,7 @@ dist/
 public/swagger/swagger-ui.css
 public/swagger/swagger-ui-bundle.js
 public/swagger/openapi.json
+
+# Command Stream Protocol (AsyncAPI) docs, generated at build time from
+# docs/command-stream.asyncapi.yaml (see scripts/copy-asyncapi.mjs).
+public/asyncapi/index.html
