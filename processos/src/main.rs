@@ -21,6 +21,7 @@ mod contracts;
 mod conversation;
 mod corpus;
 mod dataset;
+mod deps;
 mod experiment;
 mod harness;
 mod investigate;
@@ -567,6 +568,7 @@ async fn main() {
         .route("/api/llama/stop", post(llama_stop))
         .route("/api/llama/logs", get(llama_logs))
         .route("/api/llama/reasoning-control", get(reasoning_control_status))
+        .route("/api/system/dependencies", get(system_dependencies))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
@@ -1703,6 +1705,26 @@ async fn sidecar_phase(status: &llama::LlamaStatus) -> (String, Option<String>) 
         }
     }
     ("starting".into(), Some("starting llama-server…".into()))
+}
+
+/// `GET /api/system/dependencies` — preflight the external CLI tools ProcessOS
+/// shells out to (Deno for embedded Nano workers; llama.cpp's `llama-server` for
+/// local LLM sidecars). Reports each tool's presence, resolved binary, version,
+/// purpose, and — when missing — an actionable hint plus an OS-aware install URL,
+/// so the Console can warn the operator instead of failing later with a cryptic
+/// spawn error.
+async fn system_dependencies(State(state): State<AppState>) -> impl IntoResponse {
+    let llama_bin = state.settings.snapshot().llama_bin.clone();
+    // The probes spawn short-lived child processes; run them off the async runtime.
+    let deps = tokio::task::spawn_blocking(move || deps::check(llama_bin.as_deref()))
+        .await
+        .unwrap_or_default();
+    let missing: Vec<&str> = deps.iter().filter(|d| !d.present).map(|d| d.id).collect();
+    Json(serde_json::json!({
+        "dependencies": deps,
+        "allPresent": missing.is_empty(),
+        "missing": missing,
+    }))
 }
 
 /// `GET /api/llama/status` — the local sidecar pool: every running `llama-server` (model, port,

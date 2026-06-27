@@ -323,6 +323,15 @@
   .pylink { color: #a5b4fc; cursor: pointer; text-decoration: underline; }
   .btn.warn { background: #3a1d1d; border: 1px solid #7f1d1d; color: #fca5a5; }
   .btn.warn:hover { background: #4a2424; }
+  /* Missing-dependency banner (Deno / llama-server preflight). */
+  #depBanner { display: flex; flex-direction: column; gap: 8px; }
+  #depBanner:not(:empty) { margin: 12px 18px 0; }
+  .dep-warn { display: flex; align-items: flex-start; gap: 10px; background: #3a2e07; border: 1px solid #7f5f1d; border-radius: 10px; padding: 10px 12px; color: #fde68a; font-size: 13px; line-height: 1.5; }
+  .dep-warn-body { flex: 1; }
+  .dep-warn .dep-purpose { color: #fcd34d; }
+  .dep-warn a { color: #fbbf24; font-weight: 600; white-space: nowrap; }
+  .dep-x { background: transparent; border: none; color: #fcd34d; font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
+  .dep-x:hover { color: #fff; }
   /* split Send button: primary action + a caret that opens the profile picker */
   .split { position: relative; display: inline-flex; }
   .split #chatSend { border-top-right-radius: 0; border-bottom-right-radius: 0; }
@@ -391,7 +400,7 @@
       <a data-view="sidecars" class="with-dot">LLMs <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
   </aside>
-  <main id="main"><div id="viewHost">Loading…</div><div id="cockpitHost" style="display:none"></div></main>
+  <main id="main"><div id="depBanner"></div><div id="viewHost">Loading…</div><div id="cockpitHost" style="display:none"></div></main>
 </div>
 
 <dialog id="newDlg">
@@ -746,6 +755,39 @@ function startLlamaDotPoll(){
   if(LLAMA_DOT_TIMER) return;
   refreshLlamaDot();
   LLAMA_DOT_TIMER = setInterval(refreshLlamaDot, 4000);
+}
+
+// External-tool preflight banner. ProcessOS shells out to Deno (embedded Nano
+// workers) and llama.cpp's llama-server (local LLM sidecars); when either is
+// missing we surface a clear, dismissible banner naming the tool, why it's
+// needed, and a link to OS-aware install instructions — rather than letting it
+// fail later with a cryptic spawn error. Re-checks on a slow timer so installing
+// the tool clears the banner without a reload.
+let DEPS_DISMISSED = {};
+async function refreshDeps(){
+  const host = document.getElementById('depBanner');
+  if(!host) return;
+  let st; try { st = await api('/api/system/dependencies'); } catch(e){ host.innerHTML=''; return; }
+  const missing = ((st && st.dependencies) || []).filter(d => !d.present && !DEPS_DISMISSED[d.id]);
+  if(!missing.length){ host.innerHTML=''; return; }
+  host.innerHTML = missing.map(d =>
+    '<div class="dep-warn" data-dep="'+esc(d.id)+'">'
+    + '<div class="dep-warn-body">'
+    + '<b>'+esc(d.name)+' is not installed.</b> '
+    + '<span class="dep-purpose">'+esc(d.purpose)+'</span> '
+    + esc(d.hint)
+    + ' <a href="'+esc(d.installUrl)+'" target="_blank" rel="noopener">Install instructions →</a>'
+    + '</div>'
+    + '<button class="dep-x" data-dismiss="'+esc(d.id)+'" title="Dismiss">×</button>'
+    + '</div>'
+  ).join('');
+  host.querySelectorAll('[data-dismiss]').forEach(b => b.addEventListener('click', () => {
+    DEPS_DISMISSED[b.getAttribute('data-dismiss')] = true; refreshDeps();
+  }));
+}
+function startDepsPoll(){
+  refreshDeps();
+  setInterval(refreshDeps, 30000);
 }
 
 // Inline profile editor state: {open, id} — id=null means "add new". Lives at module
@@ -3251,6 +3293,7 @@ function renderView(v){
 // default console. The rail's sidecar status dot polls regardless of the view.
 (function(){
   startLlamaDotPoll();
+  startDepsPoll();
   const q = new URLSearchParams(location.search);
   const ws = q.get('workspace'), proc = q.get('process');
   if(ws && proc) renderWorkspace(ws, proc);

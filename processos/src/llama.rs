@@ -448,7 +448,16 @@ impl LlamaManager {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            let msg = format!("failed to start {}: {e}", plan.bin);
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "{} not found — llama.cpp is not installed (or not on PATH). \
+                     Install it: https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md \
+                     (or set the llama binary path in Settings).",
+                    plan.bin
+                )
+            } else {
+                format!("failed to start {}: {e}", plan.bin)
+            };
             self.set_error(&msg);
             logs.push(msg.clone());
             msg
