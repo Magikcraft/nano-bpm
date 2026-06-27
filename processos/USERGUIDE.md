@@ -130,6 +130,106 @@ process from Workspaces (or click through after loading a demo) to get there.
 Because ProcessOS is suggest-only, replays and forks never touch your live
 process. They're experiments you can keep, discard, or hand to someone else.
 
+## What the droid can do (its tools)
+
+The droid doesn't just chat — it works your data with a toolkit of purpose-built
+instruments. You never call these yourself; the droid decides which to use, and
+you'll see each call (and its result) in the conversation and the **Debug** view.
+Knowing what's in the kit helps you read what it's doing and ask for the right
+thing.
+
+**Looking at the recorded history**
+
+- **`query_traces`** — runs read-only SQL queries over the recorded trace data
+  (powered by DuckDB). This is how the droid pulls counts, durations, and
+  breakdowns out of the history.
+- **`discover_flow`** — reconstructs the path instances *actually* took from the
+  traces, independent of the diagram.
+- **`conformance_check`** — compares what really happened against the BPMN model
+  and reports where they diverge.
+- **`run_python`** — runs a short Python script over the dataset for deeper
+  statistics. This appears only when Python is available; see
+  [Set up Python for data-science analysis](#set-up-python-for-data-science-analysis).
+
+**Reading the process model**
+
+- **`read_model`** — a structured, summarized view of the BPMN model.
+- **`read_model_xml`** — the raw BPMN XML (optionally for one called sub-process).
+- **`analyze_model`** — static structural checks and advisories on the diagram.
+
+**Proposing and checking changes**
+
+- **`edit_model`** — makes targeted, structured edits to the model — for example
+  setting a task's job type, renaming a node, setting a flow condition, inserting
+  a service task, adding an error-boundary event, rerouting or removing a node, or
+  adding an exclusive gateway. The droid patches the model rather than rewriting
+  raw XML, so edits stay valid.
+- **`validate_model`** — parses and lints a candidate model *before* simulating
+  it, catching mistakes early and cheaply.
+
+**Testing changes against reality**
+
+- **`simulate`** — replays one candidate variant against the recorded instances
+  and returns a fidelity scorecard.
+- **`compare_variants`** — replays and ranks several candidates against the same
+  recorded data, best-first.
+
+See the next section for how the simulation tools turn into reviewable
+suggestions.
+
+## Suggest and test model changes
+
+ProcessOS's most powerful move is proposing a change to your process and
+**proving it on your own history** before you ever touch production. This is the
+job of the **Experiment Designer** persona.
+
+**How it works**
+
+1. **Pick the Experiment Designer persona** and tell the droid what you're trying
+   to improve (e.g. "reduce end-to-end time for high-value loans").
+2. **The droid forks the model and proposes a *variant*.** A variant is just a
+   candidate version of your BPMN model with a change applied.
+3. **It replays the variant against recorded traces.** Replay feeds each
+   candidate the *real recorded inputs* — the original creation data and the
+   ordered sequence of events from history — and measures what would have
+   happened. Each run appears in the **Simulations** tab with its variant and a
+   **scorecard**.
+4. **It ranks candidates, best-first.** When several variants are in play, the
+   droid scores them together so the strongest rises to the top.
+
+**Reading a scorecard**
+
+Each candidate is scored on how faithfully it reproduces the real outcome, and at
+what cost. A scorecard typically shows:
+
+- a **fidelity tier** — how trustworthy the result is (a measured replay is never
+  presented as if it were a rougher speculative estimate);
+- the **conserved rate** — how much of the real production outcome the variant
+  preserves (the headline number);
+- **end-to-end latency** (average and p99);
+- **requires new workers** — whether the change would need task implementations
+  that don't exist yet;
+- **divergence hints** — where the variant's behaviour drifted from history.
+
+**Test cheaply, then commit to a full run**
+
+Replaying the whole dataset can take a while, so the droid (and you) can cap the
+sample size: it typically starts with a **1-instance smoke test**, moves to a
+**~25-instance sample** to see if a change looks promising, and only then does a
+**full replay** for a trustworthy score. If you're directing the droid, you can
+ask it to "try this on a small sample first."
+
+**You decide — it's suggest-only**
+
+Nothing is ever applied to your live process automatically. In the experiment
+detail pane you have the final call:
+
+- **Accept** — take the current result.
+- **Ask droid to iterate** — send it back for another round of improvement.
+- **Stop loop** — end the exploration.
+
+The result is a vetted suggestion you can adopt on your own terms, or set aside.
+
 ## Choose an AI model
 
 Every investigation turn is answered by an **AI model** (an *LLM profile* in
@@ -200,6 +300,49 @@ required.
 > cached), and a **Python interpreter** used by some analysis tools. Defaults
 > work for most setups; change these only if ProcessOS can't find a tool or you
 > want models stored elsewhere.
+
+## Set up Python for data-science analysis
+
+The droid's **`run_python`** tool lets it run real statistical analysis over your
+dataset — the kind of pandas/DuckDB work a data scientist would do by hand. It
+works in two modes, and a one-time setup unlocks the powerful one.
+
+**Stdlib-only (works out of the box).** If ProcessOS just finds a plain `python3`,
+`run_python` still runs, but the droid only gets the data as basic CSV rows from
+Python's standard library. This is enough for simple counting and filtering.
+
+**Rich data-science path (recommended).** If Python has the data-science packages
+installed, `run_python` hands the droid the dataset as ready-to-use **pandas**
+DataFrames (`jobs`, `instances`, `incidents`) plus a live **DuckDB** connection
+(`con`) — so it can do joins, aggregations, percentiles, and statistical tests
+quickly and accurately.
+
+### Enable the rich path
+
+Do this once on the machine running ProcessOS:
+
+1. **Create a virtual environment** (in a folder of your choice):
+
+   ```sh
+   python3 -m venv .venv
+   ```
+
+2. **Install the data-science packages:**
+
+   ```sh
+   .venv/bin/pip install duckdb pandas numpy scipy
+   ```
+
+3. **Point ProcessOS at that interpreter**, using either method:
+   - Open the **Settings cog → Python (analysis escape hatch)**, set the
+     **Interpreter** field to the venv's Python (e.g. `.venv/bin/python`, or its
+     full path), and click **Save interpreter**; or
+   - Set the environment variable before launching ProcessOS:
+     `PROCESSOS_PYTHON=/full/path/to/.venv/bin/python`.
+
+That's it — the next time the droid reaches for `run_python`, it gets pandas and
+DuckDB instead of the stdlib fallback. If Python is missing entirely, ProcessOS
+tells you, and the data-science tool simply isn't offered until it's available.
 
 ## Export a psychological trace for debugging
 
