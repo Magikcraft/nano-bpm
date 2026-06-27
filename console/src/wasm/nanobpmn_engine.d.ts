@@ -60,21 +60,19 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_testengine_free: (a: number, b: number) => void;
-    readonly testengine_advanceTime: (a: number, b: number) => [number, number, number, number];
-    readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
-    readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
-    readonly testengine_deploy: (a: number, b: number, c: number) => [number, number, number, number];
-    readonly testengine_events: (a: number) => [number, number, number, number];
-    readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly testengine_advanceTime: (a: number, b: number, c: number) => void;
+    readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_events: (a: number, b: number) => void;
+    readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
-    readonly testengine_snapshot: (a: number) => [number, number, number, number];
-    readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_start: () => void;
+    readonly testengine_snapshot: (a: number, b: number) => void;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly __wbindgen_export: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_export2: (a: number, b: number) => number;
+    readonly __wbindgen_export3: (a: number, b: number, c: number, d: number) => number;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;

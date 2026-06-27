@@ -16,7 +16,7 @@
 use axum::{
     Router,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{StatusCode, HeaderMap, header},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
@@ -123,32 +123,59 @@ pub fn router(server: ServerImpl) -> Router {
 // ---------------------------------------------------------------------------
 
 /// Serves `index.html` for the SPA entry points (`/console`, `/console/`).
-async fn spa_index() -> Response {
-    serve_embedded("index.html")
+async fn spa_index(headers: HeaderMap) -> Response {
+    serve_embedded("index.html", accepts_gzip(&headers))
 }
 
 /// Serves a built asset by path under `/console/`. Unknown paths that are not
 /// API routes fall back to `index.html` so client-side routing (deep links like
 /// `/console/explorer`) works on a full-page load.
-async fn spa_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+async fn spa_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let path = path.trim_start_matches('/');
+    let gz = accepts_gzip(&headers);
     if Assets::get(path).is_some() {
-        serve_embedded(path)
+        serve_embedded(path, gz)
     } else {
         // SPA fallback: let the client router resolve the route.
-        serve_embedded("index.html")
+        serve_embedded("index.html", gz)
     }
 }
 
 /// Looks an asset up in the embedded bundle and returns it with a guessed
-/// content type. Returns a helpful 404 when the frontend has not been built.
-fn serve_embedded(path: &str) -> Response {
+/// content type, gzip-compressing the body when the client accepts it and the
+/// payload is worth compressing (text/JS/JSON/wasm/SVG above a small floor).
+/// `flate2` is already a dependency (used by the Raft wire), so this adds no new
+/// crate; the wasm bundle (~0.5 MB) drops to ~0.2 MB on the wire.
+fn serve_embedded(path: &str, accept_gzip: bool) -> Response {
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let mime_str = mime.as_ref().to_string();
+            let bytes = content.data.into_owned();
+            if accept_gzip
+                && is_compressible(&mime_str)
+                && bytes.len() >= 1024
+                && let Some(gz) = gzip(&bytes)
+            {
+                return (
+                    [
+                        (header::CONTENT_TYPE, mime_str),
+                        (header::CONTENT_ENCODING, "gzip".to_string()),
+                        (header::VARY, "Accept-Encoding".to_string()),
+                    ],
+                    gz,
+                )
+                    .into_response();
+            }
             (
-                [(header::CONTENT_TYPE, mime.as_ref().to_string())],
-                content.data.into_owned(),
+                [
+                    (header::CONTENT_TYPE, mime_str),
+                    (header::VARY, "Accept-Encoding".to_string()),
+                ],
+                bytes,
             )
                 .into_response()
         }
@@ -159,6 +186,37 @@ fn serve_embedded(path: &str) -> Response {
         )
             .into_response(),
     }
+}
+
+/// True when the client's `Accept-Encoding` lists gzip.
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|e| e.trim().split(';').next() == Some("gzip")))
+}
+
+/// Whether a MIME type benefits from gzip (text-like, JS/JSON, wasm, SVG).
+/// Already-compressed binaries (png/woff2/…) are left untouched.
+fn is_compressible(mime: &str) -> bool {
+    mime.starts_with("text/")
+        || matches!(
+            mime,
+            "application/javascript"
+                | "application/json"
+                | "application/wasm"
+                | "image/svg+xml"
+        )
+}
+
+/// Gzip a byte slice; returns `None` on the (unexpected) encoder failure so the
+/// caller transparently falls back to the uncompressed body.
+fn gzip(bytes: &[u8]) -> Option<Vec<u8>> {
+    use flate2::{Compression, write::GzEncoder};
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(bytes).ok()?;
+    enc.finish().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -194,47 +252,57 @@ async fn optimization() -> Response {
 }
 
 /// Serves the Swagger UI shell at `/swagger`.
-async fn swagger_index() -> Response {
-    serve_embedded("swagger/index.html")
+async fn swagger_index(headers: HeaderMap) -> Response {
+    serve_embedded("swagger/index.html", accepts_gzip(&headers))
 }
 
 /// Serves Swagger UI assets and the bundled OpenAPI spec under `/swagger/`. All
 /// files (the UI assets and `openapi.json`) are built into the frontend bundle
 /// under `dist/swagger/`.
-async fn swagger_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+async fn swagger_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let path = path.trim_start_matches('/');
-    serve_embedded(&format!("swagger/{path}"))
+    serve_embedded(&format!("swagger/{path}"), accepts_gzip(&headers))
 }
 
 /// Serves the Command Stream Protocol reference (AsyncAPI) at `/asyncapi`. The
 /// page is generated at build time from `docs/command-stream.asyncapi.yaml`
 /// (see `console/scripts/copy-asyncapi.mjs`) into `dist/asyncapi/index.html`.
-async fn asyncapi_index() -> Response {
-    serve_embedded("asyncapi/index.html")
+async fn asyncapi_index(headers: HeaderMap) -> Response {
+    serve_embedded("asyncapi/index.html", accepts_gzip(&headers))
 }
 
 /// Serves any further assets under `/asyncapi/` (the page is currently a single
 /// self-contained `index.html`, but this keeps the route shape parallel to
 /// `/swagger/`).
-async fn asyncapi_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+async fn asyncapi_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let path = path.trim_start_matches('/');
-    serve_embedded(&format!("asyncapi/{path}"))
+    serve_embedded(&format!("asyncapi/{path}"), accepts_gzip(&headers))
 }
 
 /// Serves the bundled documentation website at `/docs`. The pages are generated
 /// at build time from `README.md` (see `console/scripts/build-docs.mjs`) into
 /// `dist/docs/*.html`, one page per README H2 section.
-async fn docs_index() -> Response {
-    serve_embedded("docs/index.html")
+async fn docs_index(headers: HeaderMap) -> Response {
+    serve_embedded("docs/index.html", accepts_gzip(&headers))
 }
 
 /// Serves a documentation page (or asset) under `/docs/`. Page links are
 /// extensionless (`/docs/usage`), so a trailing `.html` is added when the path
 /// carries no file extension; explicit asset paths pass through unchanged.
-async fn docs_asset(axum::extract::Path(path): axum::extract::Path<String>) -> Response {
+async fn docs_asset(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let path = path.trim_start_matches('/').trim_end_matches('/');
+    let gz = accepts_gzip(&headers);
     if path.is_empty() {
-        return serve_embedded("docs/index.html");
+        return serve_embedded("docs/index.html", gz);
     }
     let last = path.rsplit('/').next().unwrap_or(path);
     let key = if last.contains('.') {
@@ -242,7 +310,7 @@ async fn docs_asset(axum::extract::Path(path): axum::extract::Path<String>) -> R
     } else {
         format!("docs/{path}.html")
     };
-    serve_embedded(&key)
+    serve_embedded(&key, gz)
 }
 
 

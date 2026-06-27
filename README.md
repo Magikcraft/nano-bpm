@@ -633,10 +633,13 @@ A bpmn-js editor backed by a workspace model library. Create, edit, deploy
 
 **Test run** executes a model entirely in the browser, with no cluster round-trip
 and fully offline. The Test mode is powered by **μ-nano** ("micro-nano") — a
-sub-500 KB WebAssembly build of the very same Rust `engine-core` that the cluster
-runs, compiled for `wasm32` and loaded straight into the page. Because it is the
-production engine (not a re-implementation), token flow, gateways, timers, and
-FEEL expressions behave exactly as they will on the server.
+compact WebAssembly build of the very same Rust `engine-core` that the cluster
+runs, aggressively size-optimized (`opt-level="z"`, fat LTO, single codegen unit,
+`panic="abort"`, `wasm-opt -Oz`) to about **0.5 MB**, and served gzip-compressed
+so it lands in **~0.2 MB** over the wire. It is compiled for `wasm32` and loaded
+straight into the page. Because it is the production engine (not a
+re-implementation), token flow, gateways, timers, and FEEL expressions behave
+exactly as they will on the server.
 
 To run a test and inspect the trace:
 
