@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
                   id="Definitions_CddRefresh"
                   targetNamespace="http://bpmn.io/schema/bpmn">
   <!--
@@ -36,4 +39,75 @@
     <bpmn:sequenceFlow id="o7" sourceRef="Phase8_Approval" targetRef="Phase9_Closure"/>
     <bpmn:sequenceFlow id="o8" sourceRef="Phase9_Closure" targetRef="End_RefreshComplete"/>
   </bpmn:process>
+
+  <bpmndi:BPMNDiagram id="BPMNDiagram_elk">
+      <bpmndi:BPMNPlane id="BPMNPlane_elk" bpmnElement="CddRefreshOrchestrator">
+        <bpmndi:BPMNShape id="Start_RefreshDue_di" bpmnElement="Start_RefreshDue">
+          <dc:Bounds x="12" y="34" width="36" height="36" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase1_Intake_di" bpmnElement="Phase1_Intake">
+          <dc:Bounds x="118" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase2_DocumentRequest_di" bpmnElement="Phase2_DocumentRequest">
+          <dc:Bounds x="288" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase3_Reminders_di" bpmnElement="Phase3_Reminders">
+          <dc:Bounds x="458" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase5_Screening_di" bpmnElement="Phase5_Screening">
+          <dc:Bounds x="628" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase6_SanctionsGate_di" bpmnElement="Phase6_SanctionsGate">
+          <dc:Bounds x="798" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase7_RiskAssessment_di" bpmnElement="Phase7_RiskAssessment">
+          <dc:Bounds x="968" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase8_Approval_di" bpmnElement="Phase8_Approval">
+          <dc:Bounds x="1138" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="Phase9_Closure_di" bpmnElement="Phase9_Closure">
+          <dc:Bounds x="1308" y="12" width="100" height="80" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNShape id="End_RefreshComplete_di" bpmnElement="End_RefreshComplete">
+          <dc:Bounds x="1478" y="34" width="36" height="36" />
+        </bpmndi:BPMNShape>
+        <bpmndi:BPMNEdge id="o0_di" bpmnElement="o0">
+          <di:waypoint x="48" y="52" />
+          <di:waypoint x="118" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o1_di" bpmnElement="o1">
+          <di:waypoint x="218" y="52" />
+          <di:waypoint x="288" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o2_di" bpmnElement="o2">
+          <di:waypoint x="388" y="52" />
+          <di:waypoint x="458" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o3_di" bpmnElement="o3">
+          <di:waypoint x="558" y="52" />
+          <di:waypoint x="628" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o4_di" bpmnElement="o4">
+          <di:waypoint x="728" y="52" />
+          <di:waypoint x="798" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o5_di" bpmnElement="o5">
+          <di:waypoint x="898" y="52" />
+          <di:waypoint x="968" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o6_di" bpmnElement="o6">
+          <di:waypoint x="1068" y="52" />
+          <di:waypoint x="1138" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o7_di" bpmnElement="o7">
+          <di:waypoint x="1238" y="52" />
+          <di:waypoint x="1308" y="52" />
+        </bpmndi:BPMNEdge>
+        <bpmndi:BPMNEdge id="o8_di" bpmnElement="o8">
+          <di:waypoint x="1408" y="52" />
+          <di:waypoint x="1478" y="52" />
+        </bpmndi:BPMNEdge>
+      </bpmndi:BPMNPlane>
+    </bpmndi:BPMNDiagram>
 </bpmn:definitions>
