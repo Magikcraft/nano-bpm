@@ -30,7 +30,8 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    Command, Engine, JobState, ProcessDefinition, ProcessInstanceState, TimerState, Value,
+    Command, Engine, JobState, MessageSubscriptionState, ProcessDefinition, ProcessInstanceState,
+    TimerState, UserTaskState, Value,
 };
 use serde_json::Value as Json;
 
@@ -406,6 +407,33 @@ pub struct ReplayResult {
     pub conserved: bool,
 }
 
+/// One recorded non-job input (message / native user task / signal / timer)
+/// awaiting delivery during replay. `reference` is the catch element id when the
+/// source recorded it; `at` is the real timestamp; `vars` the payload delta.
+struct PendingInput {
+    reference: Option<String>,
+    at: u64,
+    vars: HashMap<String, Value>,
+}
+
+/// Pop the first queued input whose `reference` matches `element_id` (exact catch
+/// element); falls back to the front when the source recorded no element id.
+fn take_input_for(
+    q: &mut std::collections::VecDeque<PendingInput>,
+    element_id: &str,
+) -> Option<PendingInput> {
+    if let Some(pos) = q
+        .iter()
+        .position(|i| i.reference.as_deref() == Some(element_id))
+    {
+        return q.remove(pos);
+    }
+    if matches!(q.front(), Some(i) if i.reference.is_none()) {
+        return q.pop_front();
+    }
+    None
+}
+
 /// Replay one recorded instance against a candidate model. `defs` is the parsed
 /// candidate (via `engine_core::bpmn::parse_bpmn`); `process_id` is the process to
 /// start (the recorded instance's process id is the natural choice).
@@ -438,6 +466,16 @@ pub fn replay_instance_with_mocks(
     let mut job_outputs: HashMap<String, std::collections::VecDeque<HashMap<String, Json>>> =
         HashMap::new();
     let mut recorded_counts: HashMap<String, u32> = HashMap::new();
+    // Non-job recorded inputs (messages, native user tasks, signals, timer
+    // fires), drained in `seq` order. Each carries the catch element id (when
+    // recorded), the real timestamp, and the payload delta it merged.
+    let mut msg_inputs: std::collections::VecDeque<PendingInput> = std::collections::VecDeque::new();
+    let mut usertask_inputs: std::collections::VecDeque<PendingInput> =
+        std::collections::VecDeque::new();
+    let mut signal_inputs: std::collections::VecDeque<PendingInput> =
+        std::collections::VecDeque::new();
+    let mut timer_inputs: std::collections::VecDeque<PendingInput> =
+        std::collections::VecDeque::new();
     for s in &rec.stimuli {
         if s.kind == "jobCompleted" {
             if let Some(job_type) = &s.reference {
@@ -447,6 +485,24 @@ pub fn replay_instance_with_mocks(
                     .push_back(s.variables.clone().unwrap_or_default());
                 *recorded_counts.entry(job_type.clone()).or_insert(0) += 1;
             }
+            continue;
+        }
+        let vars: HashMap<String, Value> = s
+            .variables
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
+            .unwrap_or_default();
+        let input = PendingInput {
+            reference: s.reference.clone(),
+            at: s.at,
+            vars,
+        };
+        match s.kind.as_str() {
+            "message" => msg_inputs.push_back(input),
+            "userTaskCompleted" => usertask_inputs.push_back(input),
+            "signal" => signal_inputs.push_back(input),
+            "timer" => timer_inputs.push_back(input),
+            _ => {}
         }
     }
 
@@ -500,25 +556,99 @@ pub fn replay_instance_with_mocks(
             .collect();
 
         if pending.is_empty() {
-            // No runnable jobs: advance to the earliest armed timer, if any.
-            let next_due = engine
+            // No runnable jobs. Try to deliver the next recorded external input to
+            // a token parked on a message catch or a native user task; otherwise
+            // fire an armed timer (honouring the recorded fire time when we have
+            // it). The message name / correlation key come from the engine's own
+            // open subscription, so we never re-evaluate a correlation expression.
+
+            // 1. Correlate a recorded message into an open subscription.
+            if !msg_inputs.is_empty() {
+                let target = {
+                    let st = engine.state();
+                    let front_ref = msg_inputs.front().and_then(|i| i.reference.clone());
+                    st.message_subscriptions
+                        .values()
+                        .filter(|s| s.state == MessageSubscriptionState::Open)
+                        .find(|s| front_ref.as_deref().is_none_or(|r| s.element_id == r))
+                        .or_else(|| {
+                            st.message_subscriptions
+                                .values()
+                                .find(|s| s.state == MessageSubscriptionState::Open)
+                        })
+                        .map(|s| (s.message_name.clone(), s.correlation_key.clone()))
+                };
+                if let Some((message_name, correlation_key)) = target {
+                    let input = msg_inputs.pop_front().unwrap();
+                    clock = clock.max(input.at);
+                    last_consumed_at = input.at;
+                    let _ = engine.apply_command_at(
+                        Command::CorrelateMessage {
+                            message_name,
+                            correlation_key,
+                            variables: input.vars,
+                        },
+                        clock,
+                    );
+                    continue;
+                }
+            }
+
+            // 2. Complete a native (Zeebe) user task waiting on a human action.
+            if !usertask_inputs.is_empty() {
+                let target = {
+                    let st = engine.state();
+                    let front_ref = usertask_inputs.front().and_then(|i| i.reference.clone());
+                    st.user_tasks
+                        .values()
+                        .filter(|u| u.state == UserTaskState::Created)
+                        .find(|u| front_ref.as_deref().is_none_or(|r| u.element_id == r))
+                        .or_else(|| {
+                            st.user_tasks
+                                .values()
+                                .find(|u| u.state == UserTaskState::Created)
+                        })
+                        .map(|u| u.key)
+                };
+                if let Some(user_task_key) = target {
+                    let input = usertask_inputs.pop_front().unwrap();
+                    clock = clock.max(input.at);
+                    last_consumed_at = input.at;
+                    let _ = engine.apply_command_at(
+                        Command::CompleteUserTask {
+                            user_task_key,
+                            variables: input.vars,
+                        },
+                        clock,
+                    );
+                    continue;
+                }
+            }
+
+            // 3. Fire the earliest armed timer. Prefer the recorded fire time for
+            // that element (so latency tracks history); fall back to the model's
+            // nominal due time when history recorded no fire.
+            let next_timer = engine
                 .state()
                 .timers
                 .values()
                 .filter(|t| t.state == TimerState::Created)
-                .map(|t| t.due_at)
-                .min();
-            match next_due {
-                Some(due) => {
-                    clock = clock.max(due);
-                    let _ = engine.apply_command_at(Command::TriggerTimers { now: clock }, clock);
-                    let _ = engine.apply_command_at(Command::ExpireJobs { now: clock }, clock);
-                    continue;
+                .map(|t| (t.element_id.clone(), t.due_at))
+                .min_by_key(|(_, due)| *due);
+            if let Some((element_id, due)) = next_timer {
+                let recorded = take_input_for(&mut timer_inputs, &element_id).map(|i| i.at);
+                let at = recorded.unwrap_or(due);
+                clock = clock.max(at);
+                if recorded.is_some() {
+                    last_consumed_at = at;
                 }
-                // Settled: completed, terminated, or parked waiting on an input
-                // (e.g. a message) the recorded history never supplied.
-                None => break,
+                let _ = engine.apply_command_at(Command::TriggerTimers { now: clock }, clock);
+                let _ = engine.apply_command_at(Command::ExpireJobs { now: clock }, clock);
+                continue;
             }
+            // Settled: completed, terminated, or parked waiting on an input the
+            // recorded history never supplied.
+            break;
         }
 
         for (job_key, job_type, needs_activation) in pending {
@@ -1559,5 +1689,113 @@ mod tests {
         let report = replay_dataset(&two, "Nope", &dataset);
         assert_eq!(report.valid, 0);
         assert!(report.error.is_some());
+    }
+
+    // --- Non-job recorded inputs: message / user task / timer -----------------
+    use nanobpmn_engine_core::ProcessBuilder;
+
+    fn input(seq: u32, at: u64, kind: &str, reference: Option<&str>, vars: Option<&[(&str, Json)]>) -> RecordedStimulus {
+        RecordedStimulus {
+            seq,
+            at,
+            kind: kind.to_string(),
+            reference: reference.map(|s| s.to_string()),
+            variables: vars.map(map),
+        }
+    }
+
+    fn rec_for(process_id: &str, creation: &[(&str, Json)], stimuli: Vec<RecordedStimulus>) -> RecordedInstance {
+        RecordedInstance {
+            instance_key: "1".to_string(),
+            process_id: process_id.to_string(),
+            started_at: 1000,
+            creation_variables: map(creation),
+            stimuli,
+        }
+    }
+
+    #[test]
+    fn replays_a_correlated_message_into_an_open_catch() {
+        // start → prep (job) → await (message catch) → end.
+        let def = ProcessBuilder::new("M")
+            .start_event("start")
+            .service_task("prep", "prep-job")
+            .message_intermediate_catch_event("await", "payment", "orderId")
+            .end_event("end")
+            .connect("start", "prep")
+            .connect("prep", "await")
+            .connect("await", "end")
+            .build()
+            .unwrap();
+
+        let r = rec_for(
+            "M",
+            &[("orderId", json!("o1"))],
+            vec![
+                job(1, 1100, "prep-job", None),
+                input(2, 1500, "message", Some("await"), Some(&[("paid", json!(true))])),
+            ],
+        );
+        let res = replay_instance(&[def], "M", &r);
+        assert!(res.valid && res.completed, "{:?}", res.error);
+        assert!(res.conserved, "divergences: {:?}", res.divergences);
+        assert_eq!(res.e2e_latency_ms, 500); // 1500 - 1000
+    }
+
+    #[test]
+    fn replays_a_native_user_task_completion() {
+        // start → review (user task) → end.
+        let def = ProcessBuilder::new("U")
+            .start_event("start")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .unwrap();
+
+        let r = rec_for(
+            "U",
+            &[],
+            vec![input(
+                1,
+                1400,
+                "userTaskCompleted",
+                Some("review"),
+                Some(&[("decision", json!("approve"))]),
+            )],
+        );
+        let res = replay_instance(&[def], "U", &r);
+        assert!(res.valid && res.completed, "{:?}", res.error);
+        assert_eq!(
+            res.divergences, vec![],
+            "user-task output should be conserved"
+        );
+        assert_eq!(res.e2e_latency_ms, 400);
+    }
+
+    #[test]
+    fn honours_recorded_timer_fire_time_over_model_due() {
+        // start → wait (10 minute timer) → end. The model's nominal due is
+        // 1000 + 600_000; history shows it actually fired much later.
+        let def = ProcessBuilder::new("T")
+            .start_event("start")
+            .timer_intermediate_catch_event("wait", 600_000)
+            .end_event("end")
+            .connect("start", "wait")
+            .connect("wait", "end")
+            .build()
+            .unwrap();
+
+        let recorded_fire = 1000 + 900_000;
+        let r = rec_for(
+            "T",
+            &[],
+            vec![input(1, recorded_fire, "timer", Some("wait"), None)],
+        );
+        let res = replay_instance(&[def], "T", &r);
+        assert!(res.valid && res.completed, "{:?}", res.error);
+        // Latency tracks the recorded fire, not the model's 600s nominal due.
+        assert_eq!(res.e2e_latency_ms, 900_000);
     }
 }

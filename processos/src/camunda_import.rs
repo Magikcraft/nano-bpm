@@ -172,6 +172,10 @@ pub struct ImportSummary {
     pub with_incidents: usize,
     pub with_creation_variables: usize,
     pub with_stimuli: usize,
+    /// Instances whose recorded-input log is known to be incomplete (an external
+    /// input was consumed that Tier-2 could not capture/attribute) — replayable
+    /// only partially (the `stimuliTruncated` flag is set on the trace).
+    pub partially_replayable: usize,
     pub processes: Vec<String>,
     pub out_dir: String,
 }
@@ -214,6 +218,9 @@ struct InstAcc {
     creation_vars: Option<Json>,
     stimuli: Vec<StimulusOut>,
     stim_seq: u32,
+    /// Set when an external input was consumed that we could not turn into a
+    /// captured stimulus — the log is then incomplete (partial replay).
+    stimuli_truncated: bool,
 }
 
 impl InstAcc {
@@ -234,6 +241,28 @@ impl InstAcc {
             );
         }
         self.elems.get_mut(&key).unwrap()
+    }
+
+    /// Append one recorded external input to the Tier-2 log, assigning the next
+    /// sequence number. `reference` is the job type (jobs) or the catch element
+    /// id (messages/timers/signals); `variables` is the input's payload delta.
+    fn push_stimulus(&mut self, at: u64, kind: &str, reference: Option<String>, variables: Option<Json>) {
+        // A message/timer/signal input with no catch element cannot be routed to
+        // a token during replay, so the recorded log is incomplete (partial).
+        // (`userTaskCompleted` legitimately has no reference — replay completes
+        // the single waiting user task — and `jobCompleted` is keyed by type.)
+        if reference.is_none() && matches!(kind, "message" | "timer" | "signal") {
+            self.stimuli_truncated = true;
+        }
+        self.stim_seq += 1;
+        let seq = self.stim_seq;
+        self.stimuli.push(StimulusOut {
+            seq,
+            at,
+            kind: kind.to_string(),
+            reference,
+            variables: variables.map(VariablesOut::of),
+        });
     }
 }
 
@@ -285,6 +314,10 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     // jobKey → processInstanceKey, so a JOB_BATCH ACTIVATED (which spans
     // instances and carries no processInstanceKey) can route activation back.
     let mut job_to_inst: HashMap<i64, i64> = HashMap::new();
+    // elementInstanceKey → processInstanceKey, so a SIGNAL_SUBSCRIPTION
+    // correlation (which is keyed by its catch-event instance, not the process
+    // instance) can route back to the instance that consumed the signal.
+    let mut eik_to_inst: HashMap<i64, i64> = HashMap::new();
 
     let touch = |insts: &mut HashMap<i64, InstAcc>, inst_order: &mut Vec<i64>, pik: i64| {
         insts.entry(pik).or_insert_with(|| {
@@ -310,6 +343,11 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                     continue;
                 };
                 touch(&mut insts, &mut inst_order, pik);
+                // Map this element instance to its process instance (the record
+                // key is the element-instance key) for later signal routing.
+                if r.key != 0 {
+                    eik_to_inst.insert(r.key, pik);
+                }
                 let inst = insts.get_mut(&pik).unwrap();
                 let element_id = vstr(v, "elementId").unwrap_or("").to_string();
                 let bpmn_type = vstr(v, "bpmnElementType").unwrap_or("").to_string();
@@ -427,16 +465,8 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                         let inst = insts.get_mut(&pik).unwrap();
                         inst.jobs.get_mut(&job_key).unwrap().completed_at = Some(ts);
                         if tier2 {
-                            let vars = variables_of(v).map(VariablesOut::of);
-                            inst.stim_seq += 1;
-                            let seq = inst.stim_seq;
-                            inst.stimuli.push(StimulusOut {
-                                seq,
-                                at: ts,
-                                kind: "jobCompleted".into(),
-                                reference: Some(job_type.clone()),
-                                variables: vars,
-                            });
+                            let vars = variables_of(v);
+                            inst.push_stimulus(ts, "jobCompleted", Some(job_type.clone()), vars);
                         }
                     }
                     "FAILED" | "ERROR_THROWN" => {
@@ -492,6 +522,78 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 if let Some(el) = inst.elems.get_mut(&eik) {
                     el.incidents += 1;
                 }
+            }
+
+            // --- Tier-2 external inputs (message / user-task / timer / signal) ---
+            // A native (Zeebe) user task completing is an external input carrying
+            // its output variables — the analog of a job completion.
+            "USER_TASK" if tier2 && intent == "COMPLETED" => {
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
+                touch(&mut insts, &mut inst_order, pik);
+                let element_id = vstr(v, "elementId").map(|s| s.to_string());
+                let vars = variables_of(v);
+                insts
+                    .get_mut(&pik)
+                    .unwrap()
+                    .push_stimulus(ts, "userTaskCompleted", element_id, vars);
+            }
+
+            // A message correlated to one of the instance's open subscriptions
+            // (intermediate catch / receive task / boundary). The per-instance
+            // `PROCESS_MESSAGE_SUBSCRIPTION` carries the element and payload.
+            "PROCESS_MESSAGE_SUBSCRIPTION" if tier2 && intent == "CORRELATED" => {
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
+                touch(&mut insts, &mut inst_order, pik);
+                let element_id = vstr(v, "elementId").map(|s| s.to_string());
+                let vars = variables_of(v);
+                insts
+                    .get_mut(&pik)
+                    .unwrap()
+                    .push_stimulus(ts, "message", element_id, vars);
+            }
+
+            // A timer firing carries no payload, but its occurrence and *real*
+            // fire time are part of the recorded input ordering — so replay can
+            // honour history's latency rather than the model's nominal due time.
+            "TIMER" if tier2 && intent == "TRIGGERED" => {
+                let Some(pik) = vi64(v, "processInstanceKey") else {
+                    continue;
+                };
+                touch(&mut insts, &mut inst_order, pik);
+                let element_id = vstr(v, "targetElementId")
+                    .or_else(|| vstr(v, "elementId"))
+                    .map(|s| s.to_string());
+                insts
+                    .get_mut(&pik)
+                    .unwrap()
+                    .push_stimulus(ts, "timer", element_id, None);
+            }
+
+            // A broadcast signal correlated to one of the instance's signal catch
+            // events. The subscription record is keyed by its catch-event
+            // instance, so route back to the owning process instance.
+            "SIGNAL_SUBSCRIPTION" if tier2 && intent == "CORRELATED" => {
+                let pik = vi64(v, "processInstanceKey").or_else(|| {
+                    vi64(v, "catchEventInstanceKey")
+                        .or_else(|| vi64(v, "elementInstanceKey"))
+                        .and_then(|eik| eik_to_inst.get(&eik).copied())
+                });
+                let Some(pik) = pik else {
+                    continue;
+                };
+                touch(&mut insts, &mut inst_order, pik);
+                let element_id = vstr(v, "catchEventId")
+                    .or_else(|| vstr(v, "elementId"))
+                    .map(|s| s.to_string());
+                let vars = variables_of(v);
+                insts
+                    .get_mut(&pik)
+                    .unwrap()
+                    .push_stimulus(ts, "signal", element_id, vars);
             }
 
             _ => {}
@@ -570,10 +672,9 @@ fn finish(pik: i64, mut inst: InstAcc, tier2: bool) -> TraceOut {
         elements,
         incidents: inst.incidents,
         creation_variables,
-        // Tier-2 only captures job/user outputs; if the model also consumes
-        // messages/timers those inputs are absent — flag the log as partial so
-        // replay treats it as not-safe-to-replay rather than silently lossy.
-        stimuli_truncated: false,
+        // Honest partial-replay flag: set when an external input was consumed
+        // that we could not turn into a stimulus (so the log is incomplete).
+        stimuli_truncated: tier2 && inst.stimuli_truncated,
         stimuli,
     }
 }
@@ -723,6 +824,7 @@ pub fn import(input: &Path, out_dir: &Path, tier2: bool) -> Result<ImportSummary
             .filter(|t| t.creation_variables.is_some())
             .count(),
         with_stimuli: traces.iter().filter(|t| t.stimuli.is_some()).count(),
+        partially_replayable: traces.iter().filter(|t| t.stimuli_truncated).count(),
         processes,
         out_dir: out_dir.display().to_string(),
     })
@@ -1057,5 +1159,152 @@ mod tests {
         let mut out2 = Vec::new();
         parse_blob(arr, &mut out2);
         assert_eq!(out2.len(), 1);
+    }
+
+    #[test]
+    fn folds_message_user_task_and_timer_inputs_as_stimuli() {
+        let pik = 42;
+        let recs = vec![
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p",
+                       "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+            // A native user task completes with output.
+            rec(
+                "USER_TASK",
+                "COMPLETED",
+                500,
+                10,
+                2,
+                json!({"processInstanceKey": pik, "elementId": "review",
+                       "variables": {"decision": "ok"}}),
+            ),
+            // A message correlates into a catch event with a payload.
+            rec(
+                "PROCESS_MESSAGE_SUBSCRIPTION",
+                "CORRELATED",
+                600,
+                20,
+                3,
+                json!({"processInstanceKey": pik, "elementId": "await-payment",
+                       "messageName": "payment", "variables": {"paid": true}}),
+            ),
+            // A timer fires (no payload).
+            rec(
+                "TIMER",
+                "TRIGGERED",
+                700,
+                30,
+                4,
+                json!({"processInstanceKey": pik, "targetElementId": "escalate"}),
+            ),
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_COMPLETED",
+                pik,
+                40,
+                5,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p",
+                       "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+        ];
+        let t = &transform(&recs, true)[0];
+        let st = t.stimuli.as_ref().expect("stimuli");
+        assert_eq!(st.len(), 3, "{st:?}");
+
+        assert_eq!(st[0].kind, "userTaskCompleted");
+        assert_eq!(st[0].reference.as_deref(), Some("review"));
+        assert_eq!(
+            st[0].variables.as_ref().unwrap().values,
+            json!({"decision": "ok"})
+        );
+
+        assert_eq!(st[1].kind, "message");
+        assert_eq!(st[1].reference.as_deref(), Some("await-payment"));
+        assert_eq!(
+            st[1].variables.as_ref().unwrap().values,
+            json!({"paid": true})
+        );
+
+        assert_eq!(st[2].kind, "timer");
+        assert_eq!(st[2].reference.as_deref(), Some("escalate"));
+        assert!(st[2].variables.is_none());
+
+        // Every input had a usable element/type — the log is complete.
+        assert!(!t.stimuli_truncated);
+    }
+
+    #[test]
+    fn signal_subscription_routes_via_element_instance_key() {
+        let pik = 77;
+        let catch_eik = 78;
+        let recs = vec![
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p",
+                       "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+            // The signal catch element instance (so eik → instance is known).
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                catch_eik,
+                5,
+                2,
+                json!({"processInstanceKey": pik, "elementId": "await-signal",
+                       "bpmnElementType": "INTERMEDIATE_CATCH_EVENT"}),
+            ),
+            // A signal subscription correlates, keyed only by its catch instance.
+            rec(
+                "SIGNAL_SUBSCRIPTION",
+                "CORRELATED",
+                900,
+                15,
+                3,
+                json!({"catchEventInstanceKey": catch_eik, "catchEventId": "await-signal",
+                       "signalName": "go"}),
+            ),
+        ];
+        let t = &transform(&recs, true)[0];
+        let st = t.stimuli.as_ref().expect("stimuli");
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].kind, "signal");
+        assert_eq!(st[0].reference.as_deref(), Some("await-signal"));
+    }
+
+    #[test]
+    fn referenceless_catch_input_flags_partial_replay() {
+        let pik = 5;
+        let recs = vec![
+            rec(
+                "PROCESS_INSTANCE",
+                "ELEMENT_ACTIVATED",
+                pik,
+                0,
+                1,
+                json!({"processInstanceKey": pik, "bpmnProcessId": "p",
+                       "elementId": "p", "bpmnElementType": "PROCESS"}),
+            ),
+            // A message correlation with no element id — cannot be routed in replay.
+            rec(
+                "PROCESS_MESSAGE_SUBSCRIPTION",
+                "CORRELATED",
+                600,
+                10,
+                2,
+                json!({"processInstanceKey": pik, "messageName": "m"}),
+            ),
+        ];
+        let t = &transform(&recs, true)[0];
+        assert!(t.stimuli_truncated, "referenceless message should flag partial");
     }
 }
