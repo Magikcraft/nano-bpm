@@ -290,6 +290,30 @@ fn resolve_nano_urls(
     (target_url, own_url)
 }
 
+/// Help / usage text for the CLI, reused by `--help` and the unknown-subcommand
+/// error. The version is stamped at build time (see build.rs).
+fn usage() -> String {
+    format!(
+        "processos {ver}\n\
+         The Nano BPM process-optimization plane.\n\
+         Advanced Research Prototype.\n\n\
+         USAGE:\n  \
+         processos [SUBCOMMAND]\n\n\
+         With no subcommand, starts the optimization-plane server (configured via\n\
+         environment variables).\n\n\
+         SUBCOMMANDS:\n  \
+         gen <pack.json> <out-dir>                  Generate a synthetic dataset\n  \
+         infer <dataset-dir> [target-p99-wait-ms]   Infer insights from a dataset\n  \
+         import-camunda <records.json|dir> <out-dir> [--no-tier2]\n  \
+         {pad}Import a Camunda 8 record export\n\n\
+         OPTIONS:\n  \
+         -h, --help       Print this help\n  \
+         -V, --version    Print version\n",
+        ver = env!("PROCESSOS_VERSION"),
+        pad = "                                           ",
+    )
+}
+
 #[tokio::main]
 async fn main() {
     // CLI subcommands run a one-shot task and exit before the server boots. This keeps
@@ -297,6 +321,14 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 {
         match args[1].as_str() {
+            "-h" | "--help" | "help" => {
+                print!("{}", usage());
+                return;
+            }
+            "-V" | "--version" | "version" => {
+                println!("processos {}", env!("PROCESSOS_VERSION"));
+                return;
+            }
             "gen" | "generate" => {
                 run_cli_generate(&args[2..]);
                 return;
@@ -310,10 +342,8 @@ async fn main() {
                 return;
             }
             other => {
-                eprintln!("unknown subcommand '{other}'. usage:");
-                eprintln!("  processos gen <pack.json> <out-dir>");
-                eprintln!("  processos infer <dataset-dir> [target-p99-wait-ms]");
-                eprintln!("  processos import-camunda <records.json|dir> <out-dir> [--no-tier2]");
+                eprintln!("unknown subcommand '{other}'.\n");
+                eprint!("{}", usage());
                 std::process::exit(2);
             }
         }

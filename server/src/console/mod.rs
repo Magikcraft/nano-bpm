@@ -400,7 +400,7 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
         num_partitions,
         replication_factor: topology.effective_rf(),
         raft_enabled: raft_on,
-        gateway_version: env!("CARGO_PKG_VERSION").to_string(),
+        gateway_version: env!("NANOBPM_VERSION").to_string(),
         nodes,
         partitions,
     })
@@ -449,7 +449,7 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 async fn cluster_health(State(server): State<ServerImpl>) -> Json<ClusterHealthDto> {
     let topology = server.engine.topology();
     let self_id = topology.node_id;
-    let self_version = env!("CARGO_PKG_VERSION").to_string();
+    let self_version = env!("NANOBPM_VERSION").to_string();
     let num_nodes = topology.num_nodes();
 
     let probes = (0..num_nodes).map(|node| {

@@ -2082,7 +2082,7 @@ impl ServerImpl {
     async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
-        let version = env!("CARGO_PKG_VERSION").to_string();
+        let version = env!("NANOBPM_VERSION").to_string();
         let topology = self.engine.topology();
         let num_nodes = topology.num_nodes();
         let num_partitions = topology.num_partitions;
@@ -7706,8 +7706,55 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
+/// Reported binary name for `--version` / `--help`.
+const GATEWAY_NAME: &str = "nanobpm-gateway-rest-server";
+
+/// Intercept `--version`/`-V` and `--help`/`-h` before the async runtime spins
+/// up the server. Unknown args are ignored — the server is configured via
+/// environment variables, not positional CLI arguments.
+fn handle_cli_flags() {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!("{GATEWAY_NAME} {}", env!("NANOBPM_VERSION"));
+                std::process::exit(0);
+            }
+            "-h" | "--help" => {
+                print!("{}", gateway_usage());
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Help text. The gateway is a long-running server configured entirely through
+/// environment variables; this lists the most common ones and points at the
+/// docs for the full set.
+fn gateway_usage() -> String {
+    format!(
+        "{name} {ver}\n\
+         Nano BPM gateway — a BPMN orchestration engine with a REST API.\n\
+         Advanced Research Prototype.\n\n\
+         USAGE:\n  \
+         {name} [OPTIONS]\n\n\
+         Starts the gateway server. Configuration is via environment variables.\n\n\
+         OPTIONS:\n  \
+         -h, --help       Print this help\n  \
+         -V, --version    Print version\n\n\
+         COMMON ENVIRONMENT VARIABLES:\n  \
+         PORT                  TCP port to listen on (default 8080)\n  \
+         NANOBPMN_DATA_DIR     Directory for the journal + read-model database\n  \
+         NANOBPMN_PARTITIONS   Partition count for the engine\n  \
+         NANOBPMN_IDLE_PURGE_MS  Idle memory-purge interval ms (0 = off)\n",
+        name = GATEWAY_NAME,
+        ver = env!("NANOBPM_VERSION"),
+    )
+}
+
 #[tokio::main]
 async fn main() {
+    handle_cli_flags();
     tracing_subscriber::fmt().init();
     // Enable jemalloc's background page-decay thread where supported (Linux), so
     // freed memory returns to the OS automatically; on macOS the idle-purge tick

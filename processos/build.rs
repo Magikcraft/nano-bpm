@@ -46,20 +46,21 @@ fn resolve_version(manifest: &str) -> String {
             return v.to_string();
         }
     }
-    if let Ok(out) = std::process::Command::new("git")
+    let git = std::process::Command::new("git")
         .args(["describe", "--tags", "--always", "--dirty"])
         .current_dir(manifest)
         .output()
-    {
-        if out.status.success() {
-            let v = String::from_utf8_lossy(&out.stdout)
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
                 .trim()
                 .trim_start_matches('v')
-                .to_string();
-            if !v.is_empty() {
-                return v;
-            }
-        }
+                .to_string()
+        })
+        .filter(|v| !v.is_empty());
+    if let Some(v) = git {
+        return v;
     }
     env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
 }
