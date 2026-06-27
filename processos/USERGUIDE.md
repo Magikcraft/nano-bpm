@@ -140,14 +140,16 @@ How much of each instance is reconstructed depends on what the export contains:
 
 - **Always:** the instance, its per-element durations, jobs, and incidents.
 - **When present:** each instance's **creation variables**.
-- **By default:** an ordered **job-completion stimulus log**, which makes traces
-  *recorded-input replayable* — so the droid's simulations can replay them. Pass
-  `--no-tier2` to skip this if you only need the timings and structure.
+- **By default:** an ordered **stimulus log** — job completions plus, when the
+  export records them, **message correlations**, **timer fires**, **user-task
+  completions**, and **signal broadcasts** — which makes traces *recorded-input
+  replayable*, so the droid's simulations can replay them. Pass `--no-tier2` to
+  skip this if you only need the timings and structure.
 
-> **What isn't captured.** Inputs other than job completions — incoming messages,
-> timers, user-task actions — aren't recorded, so a model that consumes them is
-> only *partially* replayable. The import summary flags where stimuli were
-> truncated.
+> **What isn't captured.** A stimulus the export doesn't record — or a catch event
+> with no resolvable element reference — can't be replayed, so a model that
+> consumes it is only *partially* replayable. The import summary flags where
+> stimuli were truncated and counts the partially-replayable instances.
 
 ### 3. Load it as a process
 

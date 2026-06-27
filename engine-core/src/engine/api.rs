@@ -202,6 +202,28 @@ impl Engine {
         .expect("CorrelateMessage never fails")
     }
 
+    /// Broadcasts a signal, correlating it to **every** open subscription whose
+    /// signal name matches (name-only correlation). The host drives this; the
+    /// engine never reads a clock. Returns the events produced — the heading
+    /// [`Event::SignalBroadcast`] (always) plus an [`Event::SignalCorrelated`]
+    /// per correlated subscription. Mirrors applying a
+    /// [`Command::BroadcastSignal`].
+    pub fn broadcast_signal(
+        &mut self,
+        signal_name: impl Into<String>,
+        variables: HashMap<String, Value>,
+        now: u64,
+    ) -> Vec<Event> {
+        self.apply_command_at(
+            Command::BroadcastSignal {
+                signal_name: signal_name.into(),
+                variables,
+            },
+            now,
+        )
+        .expect("BroadcastSignal never fails")
+    }
+
     /// All open and settled message subscriptions (correlated/cancelled ones are
     /// retained). Filter by [`state::MessageSubscription::state`] for only-open
     /// subscriptions.
@@ -212,6 +234,13 @@ impl Engine {
     /// Looks up a message subscription by key, whether open or settled.
     pub fn message_subscription(&self, key: Key) -> Option<&state::MessageSubscription> {
         self.state.message_subscriptions.get(&key)
+    }
+
+    /// All open and settled signal subscriptions (correlated/cancelled ones are
+    /// retained). Filter by [`state::SignalSubscription::state`] for only-open
+    /// subscriptions.
+    pub fn signal_subscriptions(&self) -> Vec<&state::SignalSubscription> {
+        self.state.signal_subscriptions.values().collect()
     }
 
     /// Activates jobs of `job_type` and dispatches each to `handler` — the

@@ -130,6 +130,17 @@ pub enum Command {
         correlation_key: String,
         variables: HashMap<String, Value>,
     },
+    /// Broadcast a signal and correlate it to **every** open subscription whose
+    /// signal name matches, across all instances. A signal intermediate catch
+    /// event resumes its parked token; an interrupting signal boundary event
+    /// interrupts its activity. Signals correlate by **name only** (no
+    /// correlation key) and are **not buffered**: a broadcast with no matching
+    /// open subscription is simply dropped. The `variables` are merged into each
+    /// correlated instance before its token advances.
+    BroadcastSignal {
+        signal_name: String,
+        variables: HashMap<String, Value>,
+    },
     /// Open the **canonical** record for a message subscription on the partition
     /// that owns its correlation key (`hash(correlation_key)`). Routed by the host
     /// to the message partition after the instance partition emitted a

@@ -321,6 +321,28 @@ impl Engine {
                 });
             }
         }
+        for (boundary_id, signal_name, interrupting) in
+            self.attached_signal_boundaries(instance_key, element_id)
+        {
+            let subscription_key = self.mint_key();
+            let kind = if interrupting {
+                state::MessageSubscriptionKind::InterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            } else {
+                state::MessageSubscriptionKind::NonInterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            };
+            events.push(Event::SignalSubscriptionCreated {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                signal_name,
+                kind,
+            });
+        }
         events
     }
 
@@ -379,6 +401,9 @@ impl Engine {
             self.emit(log, event);
         }
         for event in self.cancel_boundary_message_subscriptions_on(element_instance_key) {
+            self.emit(log, event);
+        }
+        for event in self.cancel_boundary_signal_subscriptions_on(element_instance_key) {
             self.emit(log, event);
         }
     }
@@ -503,6 +528,66 @@ impl Engine {
         subs.sort_by_key(|s| s.key);
         subs.into_iter()
             .map(Self::disarm_subscription_event)
+            .collect()
+    }
+
+    /// All signal boundary events attached to `activity_id`, as
+    /// `(boundary_id, signal_name, interrupting)` sorted by boundary id.
+    pub(crate) fn attached_signal_boundaries(
+        &self,
+        instance_key: Key,
+        activity_id: &str,
+    ) -> Vec<(ElementId, String, bool)> {
+        let Some(process) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(ElementId, String, bool)> = process
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                ElementKind::SignalBoundaryEvent {
+                    attached_to,
+                    signal_name,
+                    interrupting,
+                } if attached_to == activity_id => {
+                    Some((e.id.clone(), signal_name.clone(), *interrupting))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Cancels every open boundary signal subscription resting on
+    /// `element_instance_key`, returning the `SignalSubscriptionCanceled` events.
+    /// Mirrors [`Self::cancel_boundary_message_subscriptions_on`].
+    pub(crate) fn cancel_boundary_signal_subscriptions_on(
+        &self,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
+        let mut subs: Vec<&state::SignalSubscription> = self
+            .state
+            .signal_subscriptions
+            .values()
+            .filter(|s| {
+                s.element_instance_key == element_instance_key
+                    && s.state == state::MessageSubscriptionState::Open
+                    && matches!(
+                        s.kind,
+                        state::MessageSubscriptionKind::InterruptingBoundary { .. }
+                            | state::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                    )
+            })
+            .collect();
+        subs.sort_by_key(|s| s.key);
+        subs.into_iter()
+            .map(|s| Event::SignalSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            })
             .collect()
     }
 }

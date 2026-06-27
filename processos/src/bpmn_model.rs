@@ -52,6 +52,8 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
         ElementKind::CallActivity { .. } => "callActivity",
+        ElementKind::SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
+        ElementKind::SignalBoundaryEvent { .. } => "signalBoundaryEvent",
     }
 }
 
@@ -60,6 +62,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
     match kind {
         ElementKind::ErrorBoundaryEvent { attached_to, .. }
         | ElementKind::TimerBoundaryEvent { attached_to, .. }
+        | ElementKind::SignalBoundaryEvent { attached_to, .. }
         | ElementKind::MessageBoundaryEvent { attached_to, .. } => Some(attached_to.as_str()),
         _ => None,
     }
@@ -1512,14 +1515,35 @@ fn collect_messages(def: &ProcessDefinition) -> MessageCollection {
     (decls, lookup)
 }
 
+/// Collect the `<bpmn:signal>` declarations a model needs, as a lookup from signal name to a
+/// synthesized declaration id. Signals correlate by name only, so one declaration per name.
+fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    for el in def.elements.values() {
+        let name = match &el.kind {
+            ElementKind::SignalIntermediateCatchEvent { signal_name }
+            | ElementKind::SignalBoundaryEvent { signal_name, .. } => Some(signal_name),
+            _ => None,
+        };
+        if let Some(name) = name {
+            names
+                .entry(name.clone())
+                .or_insert_with(|| format!("Signal_{}", id_fragment(name)));
+        }
+    }
+    names
+}
+
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
 /// flows are emitted separately and flat, so this only renders the node and its event/extension
-/// definitions. `errors`/`messages` provide the synthesized declaration ids to reference.
+/// definitions. `errors`/`messages`/`signals` provide the synthesized declaration ids to reference.
+#[allow(clippy::too_many_arguments)]
 fn emit_element(
     def: &ProcessDefinition,
     id: &str,
     errors: &BTreeMap<String, String>,
     messages: &HashMap<(String, Option<String>), String>,
+    signals: &BTreeMap<String, String>,
     children_by_parent: &HashMap<String, Vec<String>>,
     labels: &HashMap<String, String>,
     out: &mut String,
@@ -1738,13 +1762,45 @@ fn emit_element(
             out.push_str("      </bpmn:timerEventDefinition>\n");
             out.push_str("    </bpmn:startEvent>\n");
         }
+        ElementKind::SignalIntermediateCatchEvent { signal_name } => {
+            let sref = signals.get(signal_name).cloned().unwrap_or_default();
+            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"));
+            out.push_str(&format!(
+                "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
+                xml_escape(&sref)
+            ));
+            out.push_str("    </bpmn:intermediateCatchEvent>\n");
+        }
+        ElementKind::SignalBoundaryEvent {
+            attached_to,
+            signal_name,
+            interrupting,
+        } => {
+            let sref = signals.get(signal_name).cloned().unwrap_or_default();
+            let cancel = if *interrupting {
+                ""
+            } else {
+                " cancelActivity=\"false\""
+            };
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
+                xml_escape(attached_to)
+            ));
+            out.push_str(&format!(
+                "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
+                xml_escape(&sref)
+            ));
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
             if let Some(kids) = children_by_parent.get(id) {
                 for child in kids {
                     // Children are emitted at the same indentation; the engine parser keys
                     // containment off the scope stack, not indentation, so this is faithful.
-                    emit_element(def, child, errors, messages, children_by_parent, labels, out);
+                    emit_element(
+                        def, child, errors, messages, signals, children_by_parent, labels, out,
+                    );
                 }
             }
             out.push_str("    </bpmn:subProcess>\n");
@@ -1767,6 +1823,7 @@ pub fn definition_to_xml_labeled(
 ) -> String {
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
+    let signals = collect_signals(def);
 
     // Resolve a human label for every element: an operator-set name wins, else a readable label
     // derived from the id (so an authored node like `FraudScreen` shows as "Fraud Screen").
@@ -1832,11 +1889,17 @@ pub fn definition_to_xml_labeled(
             ));
         }
     }
+    for (name, sid) in &signals {
+        out.push_str(&format!(
+            "  <bpmn:signal id=\"{}\" name=\"{}\"/>\n",
+            xml_escape(sid),
+            xml_escape(name)
+        ));
+    }
     out.push_str(&format!(
         "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
         xml_escape(&def.id)
     ));
-
     // Emit top-level nodes (parent == None) in a stable order; sub-processes recurse.
     let mut top: Vec<&String> = def
         .elements
@@ -1846,7 +1909,7 @@ pub fn definition_to_xml_labeled(
         .collect();
     top.sort();
     for id in top {
-        emit_element(def, id, &errors, &msg_lookup, &children_by_parent, &labels, &mut out);
+        emit_element(def, id, &errors, &msg_lookup, &signals, &children_by_parent, &labels, &mut out);
     }
 
     // Synthesize a stable flow id for every sequence flow once, so the process body and the DI
@@ -3108,6 +3171,31 @@ mod tests {
         assert!(xml.contains("<bpmn:error "), "emits an error declaration");
         let reparsed = parse_bpmn(&xml).expect("re-parses");
         assert_same_structure(&orig, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_signal_events() {
+        // A signal intermediate catch and an interrupting signal boundary on a task must
+        // round-trip: the serializer synthesizes the <bpmn:signal> declaration + signalRef,
+        // and the re-parse reproduces the exact structure.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Sig")
+            .start_event("Start")
+            .signal_intermediate_catch_event("Await", "all-clear")
+            .service_task("Work", "do-work")
+            .signal_boundary_event("Abort", "Work", "kill-switch")
+            .end_event("Done")
+            .end_event("Aborted")
+            .connect("Start", "Await")
+            .connect("Await", "Work")
+            .connect("Work", "Done")
+            .connect("Abort", "Aborted")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(xml.contains("<bpmn:signal "), "emits a signal declaration");
+        assert!(xml.contains("signalEventDefinition"), "emits signalRef defs");
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
     }
 
     #[test]

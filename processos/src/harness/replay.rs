@@ -625,7 +625,40 @@ pub fn replay_instance_with_mocks(
                 }
             }
 
-            // 3. Fire the earliest armed timer. Prefer the recorded fire time for
+            // 3. Broadcast a recorded signal to its open subscription. Signals
+            // correlate by name only; read the name from the engine's own open
+            // subscription, preferring one matching the recorded element ref.
+            if !signal_inputs.is_empty() {
+                let target = {
+                    let st = engine.state();
+                    let front_ref = signal_inputs.front().and_then(|i| i.reference.clone());
+                    st.signal_subscriptions
+                        .values()
+                        .filter(|s| s.state == MessageSubscriptionState::Open)
+                        .find(|s| front_ref.as_deref().is_none_or(|r| s.element_id == r))
+                        .or_else(|| {
+                            st.signal_subscriptions
+                                .values()
+                                .find(|s| s.state == MessageSubscriptionState::Open)
+                        })
+                        .map(|s| s.signal_name.clone())
+                };
+                if let Some(signal_name) = target {
+                    let input = signal_inputs.pop_front().unwrap();
+                    clock = clock.max(input.at);
+                    last_consumed_at = input.at;
+                    let _ = engine.apply_command_at(
+                        Command::BroadcastSignal {
+                            signal_name,
+                            variables: input.vars,
+                        },
+                        clock,
+                    );
+                    continue;
+                }
+            }
+
+            // 4. Fire the earliest armed timer. Prefer the recorded fire time for
             // that element (so latency tracks history); fall back to the model's
             // nominal due time when history recorded no fire.
             let next_timer = engine
@@ -1737,6 +1770,34 @@ mod tests {
             ],
         );
         let res = replay_instance(&[def], "M", &r);
+        assert!(res.valid && res.completed, "{:?}", res.error);
+        assert!(res.conserved, "divergences: {:?}", res.divergences);
+        assert_eq!(res.e2e_latency_ms, 500); // 1500 - 1000
+    }
+
+    #[test]
+    fn replays_a_broadcast_signal_into_an_open_catch() {
+        // start → prep (job) → await (signal catch) → end.
+        let def = ProcessBuilder::new("S")
+            .start_event("start")
+            .service_task("prep", "prep-job")
+            .signal_intermediate_catch_event("await", "all-clear")
+            .end_event("end")
+            .connect("start", "prep")
+            .connect("prep", "await")
+            .connect("await", "end")
+            .build()
+            .unwrap();
+
+        let r = rec_for(
+            "S",
+            &[],
+            vec![
+                job(1, 1100, "prep-job", None),
+                input(2, 1500, "signal", Some("await"), Some(&[("ok", json!(true))])),
+            ],
+        );
+        let res = replay_instance(&[def], "S", &r);
         assert!(res.valid && res.completed, "{:?}", res.error);
         assert!(res.conserved, "divergences: {:?}", res.divergences);
         assert_eq!(res.e2e_latency_ms, 500); // 1500 - 1000

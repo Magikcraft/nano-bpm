@@ -1048,6 +1048,9 @@ impl Engine {
                         for event in self.cancel_boundary_message_subscriptions_on(caught_eik) {
                             self.emit(&mut log, event);
                         }
+                        for event in self.cancel_boundary_signal_subscriptions_on(caught_eik) {
+                            self.emit(&mut log, event);
+                        }
                         queue.push_back(Step::Activate {
                             instance_key,
                             element_id: boundary_id,
@@ -1308,8 +1311,62 @@ impl Engine {
                 }
             }
 
-            // --- Cross-partition message-subscription protocol -----------------
-            //
+            Command::BroadcastSignal {
+                signal_name,
+                variables,
+            } => {
+                // Mint a signal key (returned to the host; carried on the
+                // SignalBroadcast event it restores the key generator on replay).
+                let signal_key = self.mint_key();
+                self.emit(
+                    &mut log,
+                    Event::SignalBroadcast {
+                        signal_key,
+                        signal_name: signal_name.clone(),
+                    },
+                );
+
+                // Correlate to every matching open subscription, deterministic by
+                // subscription key. Signals are not buffered: with no match the
+                // signal is simply dropped.
+                let mut matched: Vec<Key> = self
+                    .state
+                    .signal_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.state == state::MessageSubscriptionState::Open
+                            && s.signal_name == signal_name
+                    })
+                    .map(|s| s.key)
+                    .collect();
+                matched.sort_unstable();
+
+                for subscription_key in matched {
+                    // An earlier boundary correlation in this batch may have
+                    // interrupted an activity that cancelled this subscription;
+                    // re-check it is still open.
+                    let subscription = match self.state.signal_subscriptions.get(&subscription_key) {
+                        Some(s) if s.state == state::MessageSubscriptionState::Open => s,
+                        _ => continue,
+                    };
+                    let instance_key = subscription.instance_key;
+                    let element_instance_key = subscription.element_instance_key;
+                    let element_id = subscription.element_id.clone();
+                    let kind = subscription.kind.clone();
+                    self.advance_signal_correlated_token(
+                        &mut log,
+                        &mut queue,
+                        subscription_key,
+                        signal_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind,
+                        &variables,
+                    );
+                }
+            }
+
             // These three commands are routed by the host between the instance
             // partition (where a token waits) and the message partition
             // (`hash(correlation_key)`, where the canonical subscription lives and
@@ -1483,6 +1540,26 @@ impl Engine {
                 let sub_cancels: Vec<Event> =
                     subs.iter().map(|s| Self::disarm_subscription_event(s)).collect();
 
+                let mut sig_subs: Vec<&state::SignalSubscription> = self
+                    .state
+                    .signal_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.instance_key == instance_key
+                            && s.state == state::MessageSubscriptionState::Open
+                    })
+                    .collect();
+                sig_subs.sort_unstable_by_key(|s| s.key);
+                let sig_sub_cancels: Vec<Event> = sig_subs
+                    .iter()
+                    .map(|s| Event::SignalSubscriptionCanceled {
+                        subscription_key: s.key,
+                        instance_key,
+                        element_instance_key: s.element_instance_key,
+                        element_id: s.element_id.clone(),
+                    })
+                    .collect();
+
                 let mut user_tasks: Vec<&state::UserTask> = self
                     .state
                     .user_tasks
@@ -1508,6 +1585,9 @@ impl Engine {
                     self.emit(&mut log, event);
                 }
                 for event in sub_cancels {
+                    self.emit(&mut log, event);
+                }
+                for event in sig_sub_cancels {
                     self.emit(&mut log, event);
                 }
                 for event in user_task_cancels {
@@ -1656,6 +1736,79 @@ impl Engine {
         }
     }
 
+    /// Advances a token whose signal subscription just correlated, mirroring
+    /// [`Self::advance_correlated_token`] but for signals (name-only, always
+    /// local). Emits [`Event::SignalCorrelated`] + variable merge, then queues
+    /// the catch completion or boundary interrupt/spawn.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_signal_correlated_token(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        subscription_key: Key,
+        signal_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        kind: state::MessageSubscriptionKind,
+        variables: &HashMap<String, Value>,
+    ) {
+        self.emit(
+            log,
+            Event::SignalCorrelated {
+                subscription_key,
+                signal_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+            },
+        );
+        if !variables.is_empty() {
+            self.emit(
+                log,
+                Event::VariablesUpdated {
+                    instance_key,
+                    variables: variables.clone(),
+                },
+            );
+        }
+
+        match kind {
+            state::MessageSubscriptionKind::IntermediateCatch => {
+                queue.push_back(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
+            }
+            state::MessageSubscriptionKind::InterruptingBoundary {
+                boundary_element_id,
+            } => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.interrupt_activity_via_boundary(
+                    log,
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                );
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: boundary_element_id,
+                    scope,
+                });
+            }
+            state::MessageSubscriptionKind::NonInterruptingBoundary {
+                boundary_element_id,
+            } => {
+                queue.push_back(Step::Activate {
+                    instance_key,
+                    element_id: boundary_element_id,
+                    scope: self.scope_of(instance_key, element_instance_key),
+                });
+            }
+        }
+    }
+
     /// Completes every active sub-process element instance whose inner token
     /// scope has drained (no remaining child element instances), emitting its
     /// completion events and returning the follow-up activations for its outgoing
@@ -1722,6 +1875,9 @@ impl Engine {
                 self.emit(log, event);
             }
             for event in self.cancel_boundary_message_subscriptions_on(eik) {
+                self.emit(log, event);
+            }
+            for event in self.cancel_boundary_signal_subscriptions_on(eik) {
                 self.emit(log, event);
             }
             for flow in self.outgoing(instance_key, &element_id) {
@@ -1908,6 +2064,20 @@ impl Engine {
                     });
                 }
             }
+            // A signal intermediate catch event opens a signal subscription
+            // (name-only, no correlation key) and parks the token; a matching
+            // BroadcastSignal releases it.
+            Some(ElementKind::SignalIntermediateCatchEvent { signal_name }) => {
+                let subscription_key = self.mint_key();
+                events.push(Event::SignalSubscriptionCreated {
+                    subscription_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    signal_name,
+                    kind: state::MessageSubscriptionKind::IntermediateCatch,
+                });
+            }
             // An embedded sub-process opens a token scope: it activates its inner
             // start event inside its own scope (this element instance) and rests
             // while the inner flow runs. It completes once the scope drains (see
@@ -1974,6 +2144,7 @@ impl Engine {
         // completing it normally disarms them (and any boundary message subs).
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
+        events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
         let mut followups = Vec::new();
         let scope = self.scope_of(instance_key, element_instance_key);
         for flow in self.outgoing(instance_key, &element_id) {
@@ -2264,6 +2435,11 @@ impl OwnedByInstance for state::Timer {
     }
 }
 impl OwnedByInstance for state::MessageSubscription {
+    fn instance_key(&self) -> Key {
+        self.instance_key
+    }
+}
+impl OwnedByInstance for state::SignalSubscription {
     fn instance_key(&self) -> Key {
         self.instance_key
     }

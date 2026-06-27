@@ -365,6 +365,47 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+
+    /// A signal was broadcast. Signals are not buffered, so this records no
+    /// durable state; it carries the minted `signal_key` (returned to the host
+    /// and used to restore the key generator on replay) and heads the
+    /// [`Event::SignalCorrelated`] events the same command produced.
+    SignalBroadcast {
+        signal_key: Key,
+        signal_name: String,
+    },
+    /// A signal subscription was opened: on a signal intermediate catch event
+    /// (the token rests on it) or as a signal boundary on an activity. Signals
+    /// correlate by **name only**, so there is no correlation key.
+    SignalSubscriptionCreated {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        signal_name: String,
+        kind: MessageSubscriptionKind,
+    },
+    /// A broadcast signal correlated to an open subscription. For an intermediate
+    /// catch its token is released along the event's outgoing flow; for an
+    /// interrupting boundary the attached activity is interrupted and the
+    /// boundary's outgoing flow runs. `signal_key` ties it back to the
+    /// [`Event::SignalBroadcast`] that produced it.
+    SignalCorrelated {
+        subscription_key: Key,
+        signal_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
+    /// An open signal subscription was cancelled before correlating because the
+    /// element it guarded left the flow first (mirrors
+    /// [`Event::MessageSubscriptionCanceled`]).
+    SignalSubscriptionCanceled {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
     /// The **instance** partition tore down a cross-partition parked
     /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],
     /// recorded by [`Event::MessageSubscriptionOpening`]) because the element it
@@ -474,11 +515,15 @@ impl Event {
             | Event::MessageCorrelated { instance_key, .. }
             | Event::RemoteMessageCorrelation { instance_key, .. }
             | Event::MessageSubscriptionCanceled { instance_key, .. }
+            | Event::SignalSubscriptionCreated { instance_key, .. }
+            | Event::SignalCorrelated { instance_key, .. }
+            | Event::SignalSubscriptionCanceled { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::MessagePublished { .. }
+            | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
@@ -571,6 +616,28 @@ impl Event {
                 ..
             } => m = m.max(*timer_key).max(*element_instance_key),
             Event::MessagePublished { message_key, .. } => m = m.max(*message_key),
+            Event::SignalBroadcast { signal_key, .. } => m = m.max(*signal_key),
+            Event::SignalSubscriptionCreated {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Event::SignalSubscriptionCanceled {
+                subscription_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*subscription_key).max(*element_instance_key),
+            Event::SignalCorrelated {
+                subscription_key,
+                signal_key,
+                element_instance_key,
+                ..
+            } => {
+                m = m
+                    .max(*subscription_key)
+                    .max(*signal_key)
+                    .max(*element_instance_key)
+            }
             Event::MessageSubscriptionCreated {
                 subscription_key,
                 element_instance_key,

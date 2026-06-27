@@ -331,6 +331,33 @@ pub enum ElementKind {
         /// process definition.
         called_process_id: String,
     },
+    /// A signal intermediate catch event. On activation it opens a signal
+    /// subscription keyed by `signal_name` and the token rests on it; the token
+    /// resumes along the event's outgoing flow once a
+    /// [`crate::Command::BroadcastSignal`] with a matching name is broadcast.
+    /// Signals correlate by **name only** (there is no correlation key), and a
+    /// single broadcast fans out to every matching open subscription.
+    SignalIntermediateCatchEvent {
+        /// The BPMN signal name this event subscribes to.
+        signal_name: String,
+    },
+    /// A signal boundary event attached to an activity. It has no incoming
+    /// sequence flow; instead a signal subscription is opened when the activity
+    /// activates. An `interrupting` boundary, when a matching signal is
+    /// broadcast, interrupts the activity (its token and any job cancelled) and
+    /// runs the token along this event's outgoing flow; a non-interrupting one
+    /// (`interrupting == false`) leaves the activity running and spawns a new
+    /// parallel token along the outgoing flow for every matching signal.
+    SignalBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// The BPMN signal name this event subscribes to.
+        signal_name: String,
+        /// Whether firing interrupts the activity (`true`, the default) or spawns
+        /// a parallel token and leaves it running.
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+        interrupting: bool,
+    },
 }
 
 impl ElementKind {
@@ -547,6 +574,15 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
             attached_to: pfx(attached_to),
             message_name: message_name.clone(),
             correlation_key: correlation_key.clone(),
+            interrupting: *interrupting,
+        },
+        ElementKind::SignalBoundaryEvent {
+            attached_to,
+            signal_name,
+            interrupting,
+        } => ElementKind::SignalBoundaryEvent {
+            attached_to: pfx(attached_to),
+            signal_name: signal_name.clone(),
             interrupting: *interrupting,
         },
         other => other.clone(),
@@ -915,6 +951,62 @@ impl ProcessBuilder {
                 attached_to: attached_to.into(),
                 message_name: message_name.into(),
                 correlation_key: correlation_key.into(),
+                interrupting: false,
+            },
+        )
+    }
+
+    /// Adds a signal intermediate catch event named `signal_name`. The token
+    /// rests on it until a [`crate::Command::BroadcastSignal`] with a matching
+    /// name is broadcast, then resumes along its outgoing flow.
+    pub fn signal_intermediate_catch_event(
+        self,
+        id: impl Into<String>,
+        signal_name: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::SignalIntermediateCatchEvent {
+                signal_name: signal_name.into(),
+            },
+        )
+    }
+
+    /// Adds an interrupting signal boundary event attached to `attached_to`,
+    /// subscribing to `signal_name`. A subscription is opened when the activity
+    /// activates; when a matching signal is broadcast the activity is interrupted
+    /// and the token runs along this event's outgoing flow.
+    pub fn signal_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        signal_name: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::SignalBoundaryEvent {
+                attached_to: attached_to.into(),
+                signal_name: signal_name.into(),
+                interrupting: true,
+            },
+        )
+    }
+
+    /// Adds a non-interrupting signal boundary event attached to `attached_to`,
+    /// subscribing to `signal_name`. A subscription is opened when the activity
+    /// activates; for every matching signal broadcast the activity keeps running
+    /// and a new parallel token is spawned along this event's outgoing flow.
+    pub fn non_interrupting_signal_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        signal_name: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::SignalBoundaryEvent {
+                attached_to: attached_to.into(),
+                signal_name: signal_name.into(),
                 interrupting: false,
             },
         )

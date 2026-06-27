@@ -632,6 +632,102 @@
             .collect()
     }
 
+    fn process_with_signal_catch() -> ProcessDefinition {
+        ProcessBuilder::new("await-signal")
+            .start_event("start")
+            .signal_intermediate_catch_event("await", "all-clear")
+            .end_event("end")
+            .connect("start", "await")
+            .connect("await", "end")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn should_park_on_signal_catch_then_broadcast() {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_signal_catch()))
+            .unwrap();
+
+        // Two instances both park on the signal catch.
+        let a = engine
+            .apply_command(Command::create_instance("await-signal"))
+            .unwrap();
+        let a_key = a.iter().find_map(|e| e.instance_key()).unwrap();
+        let b = engine
+            .apply_command(Command::create_instance("await-signal"))
+            .unwrap();
+        let b_key = b.iter().find_map(|e| e.instance_key()).unwrap();
+
+        assert!(!engine.is_completed(a_key));
+        assert!(!engine.is_completed(b_key));
+        assert_eq!(engine.signal_subscriptions().len(), 2);
+
+        // A non-matching signal correlates nothing.
+        let fired = engine.broadcast_signal("other", HashMap::new(), 0);
+        assert!(!fired
+            .iter()
+            .any(|e| matches!(e, Event::SignalCorrelated { .. })));
+        assert!(!engine.is_completed(a_key));
+
+        // The matching broadcast fans out to BOTH instances, completing them.
+        let fired = engine.broadcast_signal("all-clear", HashMap::new(), 0);
+        assert_eq!(
+            fired
+                .iter()
+                .filter(|e| matches!(e, Event::SignalCorrelated { .. }))
+                .count(),
+            2
+        );
+        assert!(engine.is_completed(a_key));
+        assert!(engine.is_completed(b_key));
+
+        // A repeat broadcast never re-correlates a settled subscription.
+        let fired = engine.broadcast_signal("all-clear", HashMap::new(), 0);
+        assert!(!fired
+            .iter()
+            .any(|e| matches!(e, Event::SignalCorrelated { .. })));
+    }
+
+    #[test]
+    fn should_interrupt_an_activity_via_a_signal_boundary() {
+        let def = ProcessBuilder::new("guarded")
+            .start_event("start")
+            .service_task("work", "do-work")
+            .signal_boundary_event("abort", "work", "kill-switch")
+            .end_event("done")
+            .end_event("aborted")
+            .connect("start", "work")
+            .connect("work", "done")
+            .connect("abort", "aborted")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(def))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance("guarded"))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // The task parks on a job, with a boundary signal subscription open.
+        assert!(!engine.is_completed(instance_key));
+        assert_eq!(engine.signal_subscriptions().len(), 1);
+
+        // Broadcasting the signal interrupts the task (cancels its job) and routes
+        // along the boundary's outgoing flow, completing the instance.
+        let fired = engine.broadcast_signal("kill-switch", HashMap::new(), 0);
+        assert!(fired
+            .iter()
+            .any(|e| matches!(e, Event::SignalCorrelated { .. })));
+        assert!(fired
+            .iter()
+            .any(|e| matches!(e, Event::JobCanceled { .. })));
+        assert!(engine.is_completed(instance_key));
+    }
+
     #[test]
     fn should_park_on_message_catch_then_correlate() {
         let mut engine = Engine::new();

@@ -156,6 +156,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut messages: HashMap<String, MessageDecl> = HashMap::new();
     // Id of the `<message>` currently being read (to attach its subscription).
     let mut cur_message: Option<String> = None;
+    // Definitions-level `<signal id=… name=…>` declarations: id -> name.
+    let mut signals: HashMap<String, String> = HashMap::new();
 
     for token in &tokens {
         match token {
@@ -192,6 +194,16 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             if !self_closing {
                                 cur_message = Some(id.to_string());
                             }
+                        }
+                    }
+                    // Definitions-level signal declarations live outside
+                    // <process>; signals correlate by name only.
+                    "signal" => {
+                        if let Some(id) = attr(attrs, "id") {
+                            signals.insert(
+                                id.to_string(),
+                                attr(attrs, "name").unwrap_or(id).to_string(),
+                            );
                         }
                     }
                     // zeebe:subscription correlationKey, nested in the current
@@ -342,6 +354,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         message_ref: None,
                                         interrupting: attr(attrs, "cancelActivity")
                                             != Some("false"),
+                                        signal_ref: None,
                                     });
                                 }
                             }
@@ -363,6 +376,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     boundary.message_ref = Some(message_ref);
                                 } else if let Some(idx) = cur_start {
                                     acc.nodes[idx].message_ref = Some(message_ref);
+                                }
+                            }
+                            "signalEventDefinition" => {
+                                // On an intermediate catch event or a boundary
+                                // event, marks it a signal event referencing a
+                                // definitions-level <signal>.
+                                let signal_ref =
+                                    attr(attrs, "signalRef").unwrap_or("").to_string();
+                                if let Some(idx) = cur_intermediate {
+                                    acc.nodes[idx].signal_ref = Some(signal_ref);
+                                } else if let Some(boundary) = cur_boundary.as_mut() {
+                                    boundary.signal_ref = Some(signal_ref);
                                 }
                             }
                             "taskDefinition" => {
@@ -502,6 +527,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         if boundary.error_ref.is_some()
                             || boundary.timer_duration_millis.is_some()
                             || boundary.message_ref.is_some()
+                            || boundary.signal_ref.is_some()
                         {
                             acc.boundaries.push(boundary);
                         }
@@ -561,7 +587,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
 
     processes
         .into_iter()
-        .map(|acc| acc.build(&errors, &messages))
+        .map(|acc| acc.build(&errors, &messages, &signals))
         // Retain the verbatim source XML on each parsed definition so it can be
         // served back (getProcessDefinitionXML / console diagram). Every process
         // in one resource shares that resource's XML.
@@ -593,6 +619,9 @@ struct NodeAcc {
     /// For message intermediate catch events: the `messageRef` of a nested
     /// `messageEventDefinition`, resolved to a name/correlation key at build.
     message_ref: Option<String>,
+    /// For signal intermediate catch events: the `signalRef` of a nested
+    /// `signalEventDefinition`, resolved to a signal name at build.
+    signal_ref: Option<String>,
     /// For timer start events: whether the timer recurs (a `timeCycle`) or is
     /// one-shot (a `timeDuration`). `None` on a plain none start event.
     timer_repeating: Option<bool>,
@@ -648,6 +677,7 @@ struct PendingBoundary {
     timer_duration_millis: Option<u64>,
     timer_repeating: bool,
     message_ref: Option<String>,
+    signal_ref: Option<String>,
     interrupting: bool,
 }
 
@@ -691,6 +721,7 @@ impl ProcessAcc {
             job_priority: None,
             duration_millis: None,
             message_ref: None,
+            signal_ref: None,
             timer_repeating: None,
             parent: self.scope_stack.last().cloned(),
             user_task: crate::model::UserTaskProps::default(),
@@ -721,6 +752,7 @@ impl ProcessAcc {
         mut self,
         errors: &HashMap<String, String>,
         messages: &HashMap<String, MessageDecl>,
+        signals: &HashMap<String, String>,
     ) -> Result<ProcessDefinition, ParseError> {
         // Ad-hoc sub-processes are kept as a single Service job activity; the
         // elements they contain (agent "tools", invoked out-of-band rather than by
@@ -890,6 +922,17 @@ impl ProcessAcc {
                             decl.name.clone(),
                             correlation_key,
                         )
+                    } else if let Some(signal_ref) = node.signal_ref {
+                        let name = signals.get(&signal_ref).cloned().ok_or_else(|| {
+                            ParseError::InvalidProcess {
+                                process_id: self.id.clone(),
+                                reason: format!(
+                                    "intermediate catch event {} references unknown signal '{signal_ref}'",
+                                    node.id
+                                ),
+                            }
+                        })?;
+                        builder.signal_intermediate_catch_event(node.id, name)
                     } else {
                         let duration_millis = node.duration_millis.unwrap_or(0);
                         builder.timer_intermediate_catch_event(node.id, duration_millis)
@@ -983,6 +1026,25 @@ impl ProcessAcc {
                         attached_to,
                         decl.name.clone(),
                         correlation_key,
+                    )
+                };
+            } else if let Some(signal_ref) = boundary.signal_ref {
+                let name = signals.get(&signal_ref).cloned().ok_or_else(|| {
+                    ParseError::InvalidBoundaryEvent {
+                        process_id: self.id.clone(),
+                        reason: format!(
+                            "boundary event {} references unknown signal '{signal_ref}'",
+                            boundary.id
+                        ),
+                    }
+                })?;
+                builder = if boundary.interrupting {
+                    builder.signal_boundary_event(boundary.id, attached_to, name)
+                } else {
+                    builder.non_interrupting_signal_boundary_event(
+                        boundary.id,
+                        attached_to,
+                        name,
                     )
                 };
             } else {
@@ -1802,6 +1864,58 @@ mod tests {
 
         // then
         assert!(matches!(err, ParseError::InvalidBoundaryEvent { .. }));
+    }
+
+    #[test]
+    fn should_parse_signal_intermediate_catch_and_boundary_events() {
+        // given: a signal intermediate catch and a signal boundary on a task,
+        // both referencing a definitions-level <signal>.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:intermediateCatchEvent id="await">
+                <bpmn:signalEventDefinition signalRef="Signal_1" />
+              </bpmn:intermediateCatchEvent>
+              <bpmn:serviceTask id="work" />
+              <bpmn:endEvent id="e" />
+              <bpmn:boundaryEvent id="abort" attachedToRef="work">
+                <bpmn:signalEventDefinition signalRef="Signal_1" />
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="aborted" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="await" />
+              <bpmn:sequenceFlow id="f1" sourceRef="await" targetRef="work" />
+              <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="abort" targetRef="aborted" />
+            </bpmn:process>
+            <bpmn:signal id="Signal_1" name="all-clear" />
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("await").unwrap().kind,
+            ElementKind::SignalIntermediateCatchEvent {
+                signal_name: "all-clear".to_string(),
+            }
+        );
+        assert_eq!(
+            def.element("abort").unwrap().kind,
+            ElementKind::SignalBoundaryEvent {
+                attached_to: "work".to_string(),
+                signal_name: "all-clear".to_string(),
+                interrupting: true,
+            }
+        );
+        assert!(def
+            .element("abort")
+            .unwrap()
+            .outgoing
+            .iter()
+            .any(|f| f.to == "aborted"));
     }
 
     #[test]

@@ -168,6 +168,7 @@ impl Engine {
         self.state.jobs.shrink_to_fit();
         self.state.timers.shrink_to_fit();
         self.state.message_subscriptions.shrink_to_fit();
+        self.state.signal_subscriptions.shrink_to_fit();
         self.state.incidents.shrink_to_fit();
         self.state.activatable_jobs.shrink_to_fit();
         self.state.activated_jobs.shrink_to_fit();
@@ -411,6 +412,7 @@ impl Engine {
 
         let timers = drain_owned(&mut self.state.timers, key);
         let message_subscriptions = drain_owned(&mut self.state.message_subscriptions, key);
+        let signal_subscriptions = drain_owned(&mut self.state.signal_subscriptions, key);
         let user_tasks = drain_owned(&mut self.state.user_tasks, key);
         let incidents = drain_owned(&mut self.state.incidents, key);
 
@@ -420,6 +422,7 @@ impl Engine {
             jobs,
             timers,
             message_subscriptions,
+            signal_subscriptions,
             user_tasks,
             incidents,
         })
@@ -435,6 +438,7 @@ impl Engine {
             jobs,
             timers,
             message_subscriptions,
+            signal_subscriptions,
             user_tasks,
             incidents,
         } = snapshot;
@@ -455,6 +459,9 @@ impl Engine {
         }
         for sub in message_subscriptions {
             self.state.message_subscriptions.insert(sub.key, sub);
+        }
+        for sub in signal_subscriptions {
+            self.state.signal_subscriptions.insert(sub.key, sub);
         }
         for task in user_tasks {
             self.state.user_tasks.insert(task.key, task);

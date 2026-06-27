@@ -487,6 +487,33 @@ pub struct MessageSubscription {
     pub kind: MessageSubscriptionKind,
 }
 
+/// An open **signal** subscription holding a token on a signal catch element (or
+/// guarding an activity via a signal boundary) until a matching signal is
+/// broadcast. Unlike a [`MessageSubscription`], a signal correlates by **name
+/// only** (there is no correlation key): a [`crate::Command::BroadcastSignal`]
+/// whose `signal_name` matches an open subscription releases its token (an
+/// intermediate catch) or interrupts its activity (an interrupting boundary).
+/// A broadcast fans out to **every** matching open subscription across all
+/// instances. The `kind` reuses [`MessageSubscriptionKind`] (the token-advance
+/// semantics are identical to messages).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SignalSubscription {
+    pub key: Key,
+    pub instance_key: Key,
+    /// The element instance the token rests on while waiting: the catch event
+    /// itself for an intermediate subscription, or the attached activity for a
+    /// boundary subscription.
+    pub element_instance_key: Key,
+    pub element_id: ElementId,
+    /// The BPMN signal name this subscription waits for.
+    pub signal_name: String,
+    pub state: MessageSubscriptionState,
+    /// What the subscription guards, and so what correlating it does. Reuses the
+    /// message subscription kind — the outcomes are identical.
+    pub kind: MessageSubscriptionKind,
+}
+
 /// A process-level subscription on a **message start event**: a correlating
 /// message whose name matches creates a new instance of `process_id` (starting
 /// at `start_element_id`). Unlike a [`MessageSubscription`] it is not bound to an
@@ -565,6 +592,10 @@ pub struct State {
     /// [`MessageSubscriptionState::Correlated`]) so a later message never
     /// correlates it twice.
     pub message_subscriptions: HashMap<Key, MessageSubscription>,
+    /// Open and settled **signal** subscriptions, keyed by subscription key. A
+    /// correlated subscription is retained (transitioned to
+    /// [`MessageSubscriptionState::Correlated`]) as an audit trail.
+    pub signal_subscriptions: HashMap<Key, SignalSubscription>,
     /// Process-level message start subscriptions, keyed by message name. A
     /// correlating message whose name matches creates a new instance.
     pub message_start_subscriptions: HashMap<String, MessageStartSubscription>,
@@ -620,6 +651,8 @@ pub struct InstanceSnapshot {
     pub jobs: Vec<Job>,
     pub timers: Vec<Timer>,
     pub message_subscriptions: Vec<MessageSubscription>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub signal_subscriptions: Vec<SignalSubscription>,
     pub user_tasks: Vec<UserTask>,
     pub incidents: Vec<Incident>,
 }
@@ -1208,6 +1241,61 @@ pub fn apply(state: &mut State, event: &Event) {
                 subscription.state = MessageSubscriptionState::Canceled;
             }
         }
+
+        // A signal subscription was opened on a signal intermediate catch event
+        // (the token rests on it) or as a signal boundary on an activity.
+        Event::SignalSubscriptionCreated {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            signal_name,
+            kind,
+        } => {
+            state.signal_subscriptions.insert(
+                *subscription_key,
+                SignalSubscription {
+                    key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    signal_name: signal_name.clone(),
+                    state: MessageSubscriptionState::Open,
+                    kind: kind.clone(),
+                },
+            );
+        }
+
+        // A broadcast signal correlated to an open subscription. Settles it
+        // (unless it is a non-interrupting boundary, which stays open so every
+        // broadcast spawns another token), exactly like `MessageCorrelated`.
+        Event::SignalCorrelated {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.signal_subscriptions.get_mut(subscription_key) {
+                if !matches!(
+                    subscription.kind,
+                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                ) {
+                    subscription.state = MessageSubscriptionState::Correlated;
+                }
+            }
+        }
+
+        // An open signal subscription was cancelled because the element it
+        // guarded left the flow first (mirrors `MessageSubscriptionCanceled`).
+        Event::SignalSubscriptionCanceled {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.signal_subscriptions.get_mut(subscription_key) {
+                subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
+        // A signal was broadcast: records no durable state (signals are not
+        // buffered); carries the minted `signal_key` to restore the key
+        // generator on replay, exactly like `MessagePublished`.
+        Event::SignalBroadcast { .. } => {}
 
         // The instance partition tearing down a cross-partition parked
         // placeholder: mark it cancelled locally exactly like
