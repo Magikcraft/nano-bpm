@@ -96,8 +96,8 @@ export function defineWorker(opts: WorkerOptions): void {
   let lastTick = startedAt;
   let connected = false;
 
-  let heartbeat: number | undefined;
-  let metricTimer: number | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let metricTimer: ReturnType<typeof setInterval> | undefined;
   let ws: WebSocket;
 
   const acted = new Set<string>();

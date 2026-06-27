@@ -571,6 +571,7 @@ function WorkerEditor({
           <CodeEditor
             value={loadedFile === file ? content : ""}
             language={languageForFile(file)}
+            path={`file:///workers/${worker.name}/${file}`}
             readOnly={loadedFile !== file}
             onChange={(v) => {
               setContent(v);

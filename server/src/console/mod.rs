@@ -90,6 +90,7 @@ pub fn router(server: ServerImpl) -> Router {
             get(model_get).put(model_save).delete(model_delete),
         )
         .route("/console/api/workers", get(workers_list).post(worker_create))
+        .route("/console/api/worker-sdk", get(worker_sdk_source))
         .route("/console/api/export-workers-app", axum::routing::post(workers_export))
         .route(
             "/console/api/workers/{name}",
@@ -1367,6 +1368,18 @@ async fn worker_create(Json(body): Json<CreateWorkerBody>) -> Response {
         Some(s) => (StatusCode::CREATED, Json(s)).into_response(),
         None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// `GET /console/api/worker-sdk` — the embedded worker SDK TypeScript source,
+/// served so the console editor can register it as a Monaco extra-lib and offer
+/// full IntelliSense for `@nanobpm/worker` (types, JSDoc, signatures).
+async fn worker_sdk_source() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        worker_export::worker_sdk_source(),
+    )
+        .into_response()
 }
 
 /// Body for `POST /console/api/export-workers-app`.

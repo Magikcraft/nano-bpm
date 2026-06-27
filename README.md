@@ -664,6 +664,30 @@ tab still authors code without it. Selected workers can also be **exported as a
 standalone application** you run yourself — see
 [Exporting workers as an application](#exporting-workers-as-an-application).
 
+#### A 90s IDE, on purpose
+
+The worker editor is deliberately styled after the **integrated development
+environments of the early-to-mid 1990s** — Borland Delphi, Microsoft Visual
+Basic — where the wiring was invisible and you focused only on what *can't* be
+automatically connected. The BPMN model is the form; the engine binds tasks to
+job workers by type; the runtime, the command-stream transport, the retry/timeout
+plumbing, and dependency resolution are all handled for you. You write only the
+handler body. That ethos drives the code intelligence:
+
+- **Full IntelliSense for the worker SDK, offline.** The embedded
+  `@nanobpm/worker` SDK is registered with the editor's TypeScript language
+  service as a local library, so `defineWorker`, the `job` object
+  (`job.variables`, `job.complete`, `job.fail`, `job.error`, `job.jobKey`,
+  `job.processInstanceKey`, …) and every option auto-complete and type-check with
+  no network access whatsoever.
+- **Automatic Type Acquisition (ATA) for any npm package.** Import *any* package
+  — `import _ from "lodash"`, `import { ... } from "@camunda8/orchestration-cluster-api"`
+  — and the editor fetches its type definitions on the fly (from the jsdelivr
+  CDN) and lights up completion, hovers, and signature help for it. This is a
+  progressive enhancement: it needs network access, and degrades silently to
+  SDK-only IntelliSense when offline. The TypeScript compiler is loaded lazily,
+  only the first time you edit a worker file, so the editor stays lightweight.
+
 ### Workspace vs cluster data
 
 The console keeps the user's **authoring source of truth** in a *workspace*
@@ -741,6 +765,13 @@ deno task start            # runs with --allow-net --allow-read --allow-env
 ```
 
 The bundled `README.md` documents the same steps and the required permissions.
+
+**Dependencies travel with the app.** The exporter scans the selected workers'
+source for `import`/`import(...)` specifiers, resolves each to its npm package
+(handling scoped names, subpath imports, and `npm:` specifiers), and writes a
+dependency manifest into the app's `deno.json` import map. So a worker that
+imports `lodash` or `@camunda8/orchestration-cluster-api` produces an export
+whose `npm:` resolution works out of the box — no manual dependency wrangling.
 
 ## Cluster tuning
 

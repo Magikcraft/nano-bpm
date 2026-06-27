@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import * as monaco from "monaco-editor";
 import { Editor, loader } from "@monaco-editor/react";
 
@@ -31,6 +31,10 @@ monaco.languages.typescript.typescriptDefaults.setCompilerOptions({
   moduleResolution: monaco.languages.typescript.ModuleResolutionKind.NodeJs,
   allowNonTsExtensions: true,
   allowJs: true,
+  // Match Deno/modern bundler semantics so default imports of CommonJS-typed
+  // npm packages (e.g. `import _ from "lodash"`) resolve to their members.
+  esModuleInterop: true,
+  allowSyntheticDefaultImports: true,
   noEmit: true,
   lib: ["esnext", "dom"],
 });
@@ -40,6 +44,74 @@ monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
     2792, // Cannot find module — consider moduleResolution
   ],
 });
+
+// --- IntelliSense: the @nanobpm/worker SDK ---------------------------------
+// Fetch the embedded SDK source once and register it under a node_modules path
+// so a bare `import { defineWorker } from "@nanobpm/worker"` resolves with full
+// types, signatures, and JSDoc. Fully offline (served by the gateway).
+let sdkLibRegistered = false;
+async function ensureSdkLib(): Promise<void> {
+  if (sdkLibRegistered) return;
+  sdkLibRegistered = true;
+  try {
+    const res = await fetch("/console/api/worker-sdk");
+    if (!res.ok) {
+      sdkLibRegistered = false;
+      return;
+    }
+    const src = await res.text();
+    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+      src,
+      "file:///node_modules/@nanobpm/worker/index.ts",
+    );
+  } catch {
+    sdkLibRegistered = false; // let a later mount retry
+  }
+}
+
+// --- IntelliSense: Automatic Type Acquisition (npm packages) ---------------
+// Scan the edited source for imported packages and fetch their .d.ts from the
+// jsdelivr CDN, registering each as a Monaco extra-lib — so importing e.g.
+// `@camunda8/orchestration-cluster-api` (or any npm package) lights up with
+// full IntelliSense. This is a *progressive enhancement*: it needs network
+// access from the browser. The editor and the SDK types above stay offline.
+type AtaRun = (code: string) => void;
+let ataPromise: Promise<AtaRun | null> | null = null;
+function ensureAta(): Promise<AtaRun | null> {
+  if (!ataPromise) {
+    ataPromise = (async () => {
+      try {
+        // typescript is multi-MB; load it (and ATA) in their own async chunk,
+        // only the first time a TS/JS file is edited.
+        const [ata, tsmod] = await Promise.all([
+          import("@typescript/ata"),
+          import("typescript"),
+        ]);
+        const ts = (tsmod as unknown as { default?: unknown }).default ?? tsmod;
+        return ata.setupTypeAcquisition({
+          projectName: "nano-workers",
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          typescript: ts as any,
+          delegate: {
+            receivedFile: (code: string, path: string) => {
+              monaco.languages.typescript.typescriptDefaults.addExtraLib(
+                code,
+                `file://${path}`,
+              );
+            },
+          },
+        });
+      } catch {
+        return null; // offline or load failure — editor still works
+      }
+    })();
+  }
+  return ataPromise;
+}
+
+function acquireTypes(code: string): void {
+  void ensureAta().then((run) => run?.(code));
+}
 
 export function languageForFile(file: string): string {
   if (file.endsWith(".json") || file.endsWith(".lock")) return "json";
@@ -51,12 +123,16 @@ export function languageForFile(file: string): string {
 export default function CodeEditor({
   value,
   language,
+  path,
   readOnly,
   onChange,
   onSave,
 }: {
   value: string;
   language: string;
+  /** Virtual file path (a `file:///…` URI) so module resolution + the SDK and
+   * acquired npm types resolve from the editing model. */
+  path?: string;
   readOnly?: boolean;
   onChange: (value: string) => void;
   onSave?: () => void;
@@ -66,12 +142,33 @@ export default function CodeEditor({
   const saveRef = useRef(onSave);
   saveRef.current = onSave;
 
+  // Debounce type acquisition so we don't refetch on every keystroke.
+  const ataTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const isCode = language === "typescript" || language === "javascript";
+  const scheduleAta = (code: string) => {
+    if (!isCode) return;
+    clearTimeout(ataTimer.current);
+    ataTimer.current = setTimeout(() => acquireTypes(code), 600);
+  };
+
+  useEffect(() => {
+    void ensureSdkLib();
+    if (isCode) acquireTypes(value);
+    return () => clearTimeout(ataTimer.current);
+    // Re-run when switching to a different file/value.
+  }, [path, isCode, value]);
+
   return (
     <Editor
       value={value}
       language={language}
+      path={path}
       theme="vs-dark"
-      onChange={(v) => onChange(v ?? "")}
+      onChange={(v) => {
+        const next = v ?? "";
+        onChange(next);
+        scheduleAta(next);
+      }}
       onMount={(editor) => {
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current?.());
       }}

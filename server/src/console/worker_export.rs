@@ -22,6 +22,7 @@
 //! builder so the server needs no zip crate — the bundled files are small text.
 
 use super::workspace;
+use std::collections::BTreeSet;
 
 /// The worker SDK source, baked into the binary (the same file the supervisor
 /// materialises to disk). Shipped verbatim into the exported app's `sdk/` so it
@@ -40,6 +41,10 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
 
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let at = |path: &str| format!("{APP_ROOT}/{path}");
+
+    // npm packages the selected workers import, gathered for the generated
+    // dependency manifest (deno.json import map).
+    let mut packages: BTreeSet<String> = BTreeSet::new();
 
     // Validate + collect each worker's source files (skip its deno.json — the app
     // uses a single root import map instead).
@@ -66,6 +71,10 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
             if file == "worker.ts" {
                 copied_entrypoint = true;
             }
+            // Scan TS/JS sources for imported npm packages.
+            if is_source_file(&file) && let Ok(text) = std::str::from_utf8(&bytes) {
+                collect_packages(text, &mut packages);
+            }
             entries.push((at(&format!("workers/{name}/{file}")), bytes));
         }
         if !copied_entrypoint {
@@ -76,7 +85,7 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
 
     // Generated app scaffolding.
     entries.push((at("sdk/worker-sdk.ts"), WORKER_SDK_TS.as_bytes().to_vec()));
-    entries.push((at("deno.json"), DENO_JSON.as_bytes().to_vec()));
+    entries.push((at("deno.json"), deno_json(&packages).into_bytes()));
     entries.push((at("main.ts"), main_ts(&valid_names).into_bytes()));
     entries.push((at("README.md"), readme_md(&valid_names).into_bytes()));
     entries.push((
@@ -94,15 +103,170 @@ pub fn zip_filename() -> &'static str {
     "nano-workers-app.zip"
 }
 
-const DENO_JSON: &str = r#"{
-  "imports": {
-    "@nanobpm/worker": "./sdk/worker-sdk.ts"
-  },
-  "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-env main.ts"
-  }
+/// The embedded worker SDK source. Served to the console editor so Monaco can
+/// offer full IntelliSense for `@nanobpm/worker`, and shipped verbatim into
+/// exported apps — a single source of truth for all three consumers.
+pub fn worker_sdk_source() -> &'static str {
+    WORKER_SDK_TS
 }
-"#;
+
+const DENO_JSON_HEAD: &str = "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./sdk/worker-sdk.ts\"";
+
+/// Build the app's `deno.json`: an import map aliasing `@nanobpm/worker` to the
+/// bundled SDK plus a generated **dependency manifest** — every npm package the
+/// selected workers import, mapped to its `npm:` specifier (and a trailing-slash
+/// form for subpath imports) so Deno resolves bare imports without edits. Also
+/// declares the `start` task with the network + file-read permissions the app
+/// needs to deploy models and run workers.
+fn deno_json(packages: &BTreeSet<String>) -> String {
+    let mut s = String::from(DENO_JSON_HEAD);
+    for pkg in packages {
+        let key = json_string(pkg);
+        let val = json_string(&format!("npm:{pkg}"));
+        let key_slash = json_string(&format!("{pkg}/"));
+        let val_slash = json_string(&format!("npm:/{pkg}/"));
+        s.push_str(",\n    ");
+        s.push_str(&format!("{key}: {val}"));
+        s.push_str(",\n    ");
+        s.push_str(&format!("{key_slash}: {val_slash}"));
+    }
+    s.push_str(
+        "\n  },\n  \"tasks\": {\n    \"start\": \"deno run --allow-net --allow-read --allow-env main.ts\"\n  }\n}\n",
+    );
+    s
+}
+
+/// True for TypeScript/JavaScript files whose imports we scan.
+fn is_source_file(file: &str) -> bool {
+    let f = file.to_ascii_lowercase();
+    [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+        .iter()
+        .any(|ext| f.ends_with(ext))
+}
+
+/// Scan a TS/JS source for imported npm package base names, adding each to `out`.
+fn collect_packages(source: &str, out: &mut BTreeSet<String>) {
+    for spec in import_specifiers(source) {
+        if let Some(pkg) = npm_package_name(&spec) {
+            out.insert(pkg);
+        }
+    }
+}
+
+/// Extract module specifiers from `from "x"`, `import("x")`, and side-effect
+/// `import "x"` forms. Pragmatic (string-level, not a full parser) — worker
+/// files are small, developer-authored sources, so this is sufficient.
+fn import_specifiers(src: &str) -> Vec<String> {
+    let b = src.as_bytes();
+    let mut specs = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if matches_word(b, i, b"from") {
+            if let Some((spec, j)) = read_string_after(src, i + 4) {
+                specs.push(spec);
+                i = j;
+                continue;
+            }
+        } else if matches_word(b, i, b"import") {
+            let mut k = i + 6;
+            while k < b.len() && (b[k] as char).is_whitespace() {
+                k += 1;
+            }
+            if k < b.len() && b[k] == b'(' {
+                // dynamic import("x")
+                if let Some((spec, j)) = read_string_after(src, k + 1) {
+                    specs.push(spec);
+                    i = j;
+                    continue;
+                }
+            } else if k < b.len() && (b[k] == b'"' || b[k] == b'\'' || b[k] == b'`') {
+                // side-effect import "x"
+                if let Some((spec, j)) = read_string_after(src, k) {
+                    specs.push(spec);
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    specs
+}
+
+/// `kw` occurs at `i` on identifier-character word boundaries.
+fn matches_word(b: &[u8], i: usize, kw: &[u8]) -> bool {
+    if i + kw.len() > b.len() || &b[i..i + kw.len()] != kw {
+        return false;
+    }
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+    let before_ok = i == 0 || !ident(b[i - 1]);
+    let after_ok = i + kw.len() == b.len() || !ident(b[i + kw.len()]);
+    before_ok && after_ok
+}
+
+/// Skip whitespace from `pos`, then read a single-quoted/double-quoted/backtick
+/// string literal. Returns its contents and the index just past the close quote.
+fn read_string_after(src: &str, pos: usize) -> Option<(String, usize)> {
+    let b = src.as_bytes();
+    let mut i = pos;
+    while i < b.len() && (b[i] as char).is_whitespace() {
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    let quote = b[i];
+    if quote != b'"' && quote != b'\'' && quote != b'`' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < b.len() && b[i] != quote {
+        i += 1;
+    }
+    if i >= b.len() {
+        return None;
+    }
+    Some((src[start..i].to_string(), i + 1))
+}
+
+/// Reduce an import specifier to its npm base package name, or `None` for
+/// imports that are not npm-resolvable (relative, URL, `jsr:`, `node:`, the
+/// worker SDK alias, …).
+fn npm_package_name(spec: &str) -> Option<String> {
+    let s = spec.trim();
+    let s = s.strip_prefix("npm:").unwrap_or(s);
+    if s.is_empty() || s.starts_with('.') || s.starts_with('/') {
+        return None;
+    }
+    for prefix in ["http:", "https:", "jsr:", "node:", "file:", "data:"] {
+        if s.starts_with(prefix) {
+            return None;
+        }
+    }
+    if s == "@nanobpm/worker" {
+        return None;
+    }
+    let base = if let Some(rest) = s.strip_prefix('@') {
+        // @scope/name[/sub][@version]
+        let (scope, after) = rest.split_once('/')?;
+        let name = after.split('/').next().unwrap_or(after);
+        let name = name.split('@').next().unwrap_or(name);
+        if scope.is_empty() || name.is_empty() {
+            return None;
+        }
+        format!("@{scope}/{name}")
+    } else {
+        // name[/sub][@version]
+        let first = s.split('/').next().unwrap_or(s);
+        first.split('@').next().unwrap_or(first).to_string()
+    };
+    if base.is_empty() {
+        None
+    } else {
+        Some(base)
+    }
+}
 
 const RESOURCES_README: &str = "Drop the .bpmn model files your workers serve into this folder.\n\
 Every .bpmn here is deployed to the gateway when the app starts (idempotently).\n";
@@ -389,5 +553,70 @@ mod tests {
         let tail = &zip[zip.len() - 22..];
         let count = u16::from_le_bytes([tail[10], tail[11]]);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn collects_npm_packages_from_imports() {
+        let src = r#"
+            import { defineWorker } from "@nanobpm/worker";
+            import { Camunda8 } from "@camunda8/orchestration-cluster-api";
+            import _ from "npm:lodash@4.17.21";
+            import "side-effect-pkg";
+            const x = await import("@scope/dyn/sub");
+            import rel from "./helper.ts";
+            import url from "https://deno.land/std/x.ts";
+            import sub from "lodash/fp";
+        "#;
+        let mut got = BTreeSet::new();
+        collect_packages(src, &mut got);
+        // @nanobpm/worker and relative/URL imports are excluded; scoped + subpath
+        // imports reduce to their base package; npm: prefix + version stripped.
+        let want: BTreeSet<String> = [
+            "@camunda8/orchestration-cluster-api",
+            "lodash",
+            "side-effect-pkg",
+            "@scope/dyn",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn npm_package_name_extracts_base() {
+        assert_eq!(npm_package_name("lodash").as_deref(), Some("lodash"));
+        assert_eq!(npm_package_name("lodash/fp").as_deref(), Some("lodash"));
+        assert_eq!(npm_package_name("npm:chalk@5").as_deref(), Some("chalk"));
+        assert_eq!(
+            npm_package_name("@camunda8/sdk/foo").as_deref(),
+            Some("@camunda8/sdk")
+        );
+        assert_eq!(npm_package_name("./local").as_deref(), None);
+        assert_eq!(npm_package_name("node:fs").as_deref(), None);
+        assert_eq!(npm_package_name("@nanobpm/worker").as_deref(), None);
+    }
+
+    #[test]
+    fn deno_json_emits_dependency_manifest() {
+        let mut pkgs = BTreeSet::new();
+        pkgs.insert("@camunda8/sdk".to_string());
+        pkgs.insert("lodash".to_string());
+        let json = deno_json(&pkgs);
+        // SDK alias is always present.
+        assert!(json.contains("\"@nanobpm/worker\": \"./sdk/worker-sdk.ts\""));
+        // Each package maps to its npm: specifier, plus a subpath form.
+        assert!(json.contains("\"@camunda8/sdk\": \"npm:@camunda8/sdk\""));
+        assert!(json.contains("\"@camunda8/sdk/\": \"npm:/@camunda8/sdk/\""));
+        assert!(json.contains("\"lodash\": \"npm:lodash\""));
+        // Valid JSON.
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn deno_json_without_packages_is_valid() {
+        let json = deno_json(&BTreeSet::new());
+        assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+        assert!(json.contains("--allow-net"));
     }
 }
