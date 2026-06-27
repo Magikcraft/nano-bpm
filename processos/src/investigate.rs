@@ -399,7 +399,8 @@ impl ToolBox for AnalysisTools {
                     (conservedRate, then latency, then fewer required new workers). The current \
                     model is included as the 'baseline' by default (set includeBaseline=false to \
                     omit). Use this to decide whether a redesign actually beats today's process on \
-                    real history. Returns datasetSize, the ranked candidates with their scorecards, \
+                    real history. Returns datasetSize (instances replayed) and populationTotal \
+                    (the full recorded population), the ranked candidates with their scorecards, \
                     and the best one. This is SAFE, FAST and CHEAP — it deploys nothing and cannot \
                     break production; tip: validate each variant with a single `simulate(limit:1)` \
                     first, then compare the survivors here. You can also pass `limit` to compare on \
@@ -748,8 +749,8 @@ pub async fn run_chat_turn(
         .unwrap_or(false);
     tools.set_model(model_xml);
     if has_model {
-        let recorded =
-            crate::experiment::build_recorded_dataset(src, crate::experiment::RECORDED_CAP).await;
+        let cap = crate::experiment::recorded_cap(src);
+        let recorded = crate::experiment::build_recorded_dataset(src, cap).await;
         tools.set_recorded(Some(recorded));
     }
     let model = OpenAiAgent { cfg };

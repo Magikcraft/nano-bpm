@@ -26,24 +26,60 @@ use crate::harness::{
     parse_mock_workers, rank_candidates_by_replay, CandidateModel, RecordedInstance,
 };
 
-/// How many recent instances to draw into the replay dataset (bounds the per-turn I/O
-/// and keeps replay fast); mirrors the replay-rank HTTP endpoint's default.
-pub const RECORDED_CAP: usize = 300;
+/// Default cap on recorded instances pulled from a LIVE gateway per turn — each instance
+/// is a network round-trip, so the live path stays bounded. Overridable via
+/// `PROCESSOS_REPLAY_CAP`.
+pub const LIVE_RECORDED_CAP: usize = 300;
+
+/// Ceiling on instances replayed per turn for an IN-MEMORY dataset. The traces are already
+/// loaded (reading them is free), but replay *executes* each instance on the engine, so this
+/// bounds worst-case per-call cost. Mirrors the Insights full-analysis cap. Overridable via
+/// `PROCESSOS_REPLAY_CAP`.
+pub const REPLAY_CEILING: usize = 50_000;
+
+/// How many recorded instances to distil for this source. An in-memory dataset knows its true
+/// population and costs nothing to read, so replay the WHOLE population (bounded by the ceiling)
+/// — the experiment then measures against the real dataset, not an arbitrary head slice. A live
+/// gateway pays a request per instance, so it keeps the bounded default. Either may be overridden
+/// with `PROCESSOS_REPLAY_CAP`.
+pub fn recorded_cap(src: &TraceSource) -> usize {
+    let env = std::env::var("PROCESSOS_REPLAY_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    match src.total() {
+        Some(total) => env.unwrap_or(REPLAY_CEILING).min(total.max(1)),
+        None => env.unwrap_or(LIVE_RECORDED_CAP),
+    }
+}
 
 /// The recorded-input dataset distilled for a chat turn, with skip accounting so the
 /// model can explain *why* instances were dropped (capture off, truncated, fetch error).
 #[derive(Default, Clone)]
 pub struct RecordedDataset {
     pub instances: Vec<RecordedInstance>,
+    /// The true recorded population this was distilled from, when the source can report it
+    /// up front (an in-memory dataset). `None` for a live gateway, whose total is only
+    /// discoverable by paging — there `instances.len()` is the best estimate.
+    pub population: Option<usize>,
     pub matched: u32,
     pub skipped: u32,
     pub skip_reasons: BTreeMap<String, u32>,
 }
 
+/// The full recorded population this dataset was distilled from: the source total when known,
+/// else the number actually loaded (a live gateway can't cheaply know there are more).
+fn population_total(dataset: &RecordedDataset) -> usize {
+    dataset.population.unwrap_or(dataset.instances.len())
+}
+
 /// Distil up to `cap` replayable recorded instances from a trace source. Best-effort:
 /// unreplayable / unfetchable instances are counted in the skip accounting, never fatal.
 pub async fn build_recorded_dataset(src: &TraceSource, cap: usize) -> RecordedDataset {
-    let mut ds = RecordedDataset::default();
+    let mut ds = RecordedDataset {
+        population: src.total(),
+        ..Default::default()
+    };
     let summaries = match src.list_traces(cap).await {
         Ok(s) => s,
         Err(_) => return ds,
@@ -205,8 +241,8 @@ pub fn simulate(
     let instances = sample_slice(&dataset.instances, args);
     let ranking =
         rank_candidates_by_replay(std::slice::from_ref(&candidate), instances, pid.as_deref());
-    let total = dataset.instances.len();
-    let sampled = (ranking.dataset_size as usize) < total;
+    let population = population_total(dataset);
+    let sampled = (ranking.dataset_size as usize) < population;
     let mut v = serde_json::to_value(&ranking).map_err(|e| format!("serialise ranking: {e}"))?;
     if let Some(c) = v["candidates"].as_array_mut().and_then(|a| a.first_mut()) {
         trim_report(&mut c["report"]);
@@ -219,7 +255,7 @@ pub fn simulate(
         return Ok(json!({
             "replayable": true,
             "datasetSize": ranking.dataset_size,
-            "datasetTotal": total,
+            "populationTotal": population,
             "sampled": sampled,
             "authoringFixes": fixes,
             "scorecard": c,
@@ -228,7 +264,7 @@ pub fn simulate(
     Ok(json!({
         "replayable": true,
         "datasetSize": ranking.dataset_size,
-        "datasetTotal": total,
+        "populationTotal": population,
         "sampled": sampled,
         "scorecard": Value::Null,
     }))
@@ -319,8 +355,8 @@ pub fn compare_variants(
     let pid = default_process_id(dataset);
     let instances = sample_slice(&dataset.instances, args);
     let ranking = rank_candidates_by_replay(&candidates, instances, pid.as_deref());
-    let total = dataset.instances.len();
-    let sampled = (ranking.dataset_size as usize) < total;
+    let population = population_total(dataset);
+    let sampled = (ranking.dataset_size as usize) < population;
     let mut v = serde_json::to_value(&ranking).map_err(|e| format!("serialise ranking: {e}"))?;
     if let Some(arr) = v["candidates"].as_array_mut() {
         for c in arr.iter_mut() {
@@ -336,7 +372,7 @@ pub fn compare_variants(
             }
         }
     }
-    v["datasetTotal"] = json!(total);
+    v["populationTotal"] = json!(population);
     v["sampled"] = json!(sampled);
     Ok(v)
 }
@@ -420,6 +456,7 @@ mod tests {
             .collect();
         RecordedDataset {
             instances,
+            population: None,
             matched: 3,
             skipped: 0,
             skip_reasons: BTreeMap::new(),
@@ -490,8 +527,22 @@ mod tests {
         let ds = dataset();
         let v = simulate(None, &ds, &json!({ "model": TWO_TASK })).unwrap();
         assert_eq!(v["datasetSize"], 3);
-        assert_eq!(v["datasetTotal"], 3);
+        assert_eq!(v["populationTotal"], 3);
         assert_eq!(v["sampled"], false);
+    }
+
+    #[test]
+    fn simulate_reports_the_true_population_even_when_fewer_were_loaded() {
+        // A capped/distilled dataset: only 3 instances loaded, but the source population is 6553.
+        let mut ds = dataset();
+        ds.population = Some(6553);
+        let v = simulate(None, &ds, &json!({ "model": TWO_TASK })).unwrap();
+        assert_eq!(v["datasetSize"], 3, "replayed what was loaded");
+        assert_eq!(
+            v["populationTotal"], 6553,
+            "reports the real population, not the loaded slice"
+        );
+        assert_eq!(v["sampled"], true, "3 of 6553 is a sample");
     }
 
     #[test]
@@ -500,7 +551,7 @@ mod tests {
         // limit:1 — the cheap single-run smoke.
         let v = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 1 })).unwrap();
         assert_eq!(v["datasetSize"], 1, "only one instance replayed");
-        assert_eq!(v["datasetTotal"], 3, "full size still reported");
+        assert_eq!(v["populationTotal"], 3, "full population still reported");
         assert_eq!(v["sampled"], true);
         assert_eq!(v["scorecard"]["report"]["instancesTotal"], 1);
 
@@ -522,7 +573,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["datasetSize"], 1);
-        assert_eq!(v["datasetTotal"], 3);
+        assert_eq!(v["populationTotal"], 3);
         assert_eq!(v["sampled"], true);
     }
 
@@ -597,6 +648,7 @@ mod tests {
             matched: 1,
             skipped: 0,
             skip_reasons: BTreeMap::new(),
+            population: None,
         };
         let v = simulate(
             None,
