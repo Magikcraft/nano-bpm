@@ -69,6 +69,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+      - name: Stub console assets
+        # The `console` feature embeds ../console/dist via rust-embed, but that
+        # built frontend is gitignored. A stub satisfies the proc-macro so the
+        # gate can clippy/test the console code without a full npm build.
+        run: mkdir -p console/dist && printf '<!doctype html>\n' > console/dist/index.html
       - name: Clippy
         working-directory: server
         run: cargo clippy --all-targets --features console -- -D warnings
