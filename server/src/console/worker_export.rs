@@ -448,7 +448,7 @@ Edit the handler, add `npm:`/`jsr:` dependencies as needed, and re-run.
 /// Build a zip archive from `(path, bytes)` entries using STORED (no
 /// compression). The bundled files are small text, so compression buys little
 /// and a dependency-free writer keeps the gateway lean.
-fn build_stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
+pub(crate) fn build_stored_zip(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
     // Fixed DOS timestamp (1980-01-01 00:00) — valid and deterministic.
     const DOS_DATE: u16 = 0x0021;
     const DOS_TIME: u16 = 0x0000;

@@ -33,6 +33,7 @@ use tokio::sync::broadcast;
 
 use crate::ServerImpl;
 
+pub mod projects;
 pub mod trace;
 pub mod worker_export;
 pub mod workers;
@@ -114,6 +115,28 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/workers/{name}/start", axum::routing::post(worker_start))
         .route("/console/api/workers/{name}/stop", axum::routing::post(worker_stop))
         .route("/console/api/workers/{name}/logs", get(worker_logs))
+        .route("/console/api/projects", get(projects_list).post(project_create))
+        .route(
+            "/console/api/projects/{name}",
+            get(project_get).delete(project_delete),
+        )
+        .route(
+            "/console/api/projects/{name}/config",
+            get(project_config_get).put(project_config_put),
+        )
+        .route("/console/api/projects/{name}/files", get(project_files))
+        .route(
+            "/console/api/projects/{name}/file",
+            get(project_file_get)
+                .put(project_file_save)
+                .post(project_path_create)
+                .delete(project_path_delete),
+        )
+        .route("/console/api/projects/{name}/run", axum::routing::post(project_run))
+        .route("/console/api/projects/{name}/stop", axum::routing::post(project_stop))
+        .route("/console/api/projects/{name}/logs", get(project_logs))
+        .route("/console/api/projects/{name}/compile", axum::routing::post(project_compile))
+        .route("/console/api/projects/{name}/export", get(project_export))
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
@@ -1753,6 +1776,349 @@ async fn recv_live(
     loop {
         match rx.recv().await {
             Ok(line) => return Some((Ok(log_event(&line)), LogStreamState::Live(rx))),
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projects API — the RAD environment. A project is a self-contained directory
+// (resources/, workers/, lib/, main.ts, deno.json, nanobpm.project.json) that
+// is itself a runnable Deno app. See `projects`.
+// ---------------------------------------------------------------------------
+
+/// `GET /console/api/projects` — list projects (tiles) with resource counts and
+/// live run status.
+async fn projects_list() -> Response {
+    let mut list = match projects::list_projects() {
+        Ok(l) => l,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read projects: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let sup = projects::supervisor();
+    let mut out = Vec::with_capacity(list.len());
+    for mut p in list.drain(..) {
+        p.running = sup.is_running(&p.name).await;
+        out.push(p);
+    }
+    Json(serde_json::json!({
+        "projects": out,
+        "denoAvailable": sup.deno_available(),
+        "platforms": projects::PLATFORMS,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateProjectBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// `POST /console/api/projects` — scaffold a new project.
+async fn project_create(Json(body): Json<CreateProjectBody>) -> Response {
+    match projects::create_project(&body.name, &body.description) {
+        Ok(cfg) => (StatusCode::CREATED, Json(cfg)).into_response(),
+        Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, e).into_response(),
+        Err(e) if e.contains("invalid") => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+/// `GET /console/api/projects/{name}` — config + file tree + run state.
+async fn project_get(Path(name): Path<String>) -> Response {
+    project_detail(&name).await
+}
+
+async fn project_detail(name: &str) -> Response {
+    let Some(cfg) = projects::read_config(name) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let tree = projects::file_tree(name).unwrap_or_default();
+    let sup = projects::supervisor();
+    Json(serde_json::json!({
+        "config": cfg,
+        "files": tree,
+        "runState": sup.run_state(name).await,
+        "denoAvailable": sup.deno_available(),
+        "platforms": projects::PLATFORMS,
+    }))
+    .into_response()
+}
+
+/// `DELETE /console/api/projects/{name}` — remove a project (must be stopped).
+async fn project_delete(Path(name): Path<String>) -> Response {
+    if projects::supervisor().is_running(&name).await {
+        return (StatusCode::CONFLICT, "stop the application before deleting it").into_response();
+    }
+    match projects::delete_project(&name) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "no such project").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not delete project: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /console/api/projects/{name}/config` — the project config.
+async fn project_config_get(Path(name): Path<String>) -> Response {
+    match projects::read_config(&name) {
+        Some(cfg) => Json(cfg).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such project").into_response(),
+    }
+}
+
+/// `PUT /console/api/projects/{name}/config` — update the project config.
+async fn project_config_put(
+    Path(name): Path<String>,
+    Json(mut cfg): Json<projects::ProjectConfig>,
+) -> Response {
+    if projects::read_config(&name).is_none() {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    }
+    cfg.name = name.clone();
+    cfg.updated_ms = now_ms_proj();
+    match projects::write_config(&name, &cfg) {
+        Ok(()) => Json(cfg).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save config: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+fn now_ms_proj() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `GET /console/api/projects/{name}/files` — the recursive file tree.
+async fn project_files(Path(name): Path<String>) -> Response {
+    match projects::file_tree(&name) {
+        Some(tree) => Json(serde_json::json!({ "files": tree })).into_response(),
+        None => (StatusCode::NOT_FOUND, "no such project").into_response(),
+    }
+}
+
+/// `GET /console/api/projects/{name}/file?path=...` — read a file.
+async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
+    let Some(path) = projects::safe_project_path(&name, &q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text.into_response(),
+            Err(e) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                e.into_bytes(),
+            )
+                .into_response(),
+        },
+        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
+    }
+}
+
+/// `PUT /console/api/projects/{name}/file?path=...` — save (create/overwrite).
+async fn project_file_save(
+    Path(name): Path<String>,
+    Query(q): Query<FilePathQuery>,
+    body: String,
+) -> Response {
+    let Some(path) = projects::safe_project_path(&name, &q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, &body) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save file: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateProjectPathBody {
+    path: String,
+    /// Create a directory instead of an empty file.
+    #[serde(default)]
+    dir: bool,
+}
+
+/// `POST /console/api/projects/{name}/file` — create an empty file or a folder.
+async fn project_path_create(
+    Path(name): Path<String>,
+    Json(body): Json<CreateProjectPathBody>,
+) -> Response {
+    let Some(path) = projects::safe_project_path(&name, &body.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    if path.exists() {
+        return (StatusCode::CONFLICT, "that path already exists").into_response();
+    }
+    let res = if body.dir {
+        std::fs::create_dir_all(&path)
+    } else {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&path, "")
+    };
+    match res {
+        Ok(()) => StatusCode::CREATED.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.
+async fn project_path_delete(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
+    let Some(path) = projects::safe_project_path(&name, &q.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    };
+    let res = if path.is_dir() {
+        std::fs::remove_dir_all(&path)
+    } else {
+        std::fs::remove_file(&path)
+    };
+    match res {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, "no such path").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not delete: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /console/api/projects/{name}/run` — deploy + start the application.
+async fn project_run(Path(name): Path<String>) -> Response {
+    let sup = projects::supervisor();
+    match sup.run(&name).await {
+        Ok(()) => Json(sup.run_state(&name).await).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// `POST /console/api/projects/{name}/stop` — stop the application.
+async fn project_stop(Path(name): Path<String>) -> Response {
+    let sup = projects::supervisor();
+    match sup.stop(&name).await {
+        Ok(()) => Json(sup.run_state(&name).await).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompileBody {
+    /// Deno target triples to cross-compile for. Empty = host only.
+    #[serde(default)]
+    targets: Vec<String>,
+}
+
+/// `POST /console/api/projects/{name}/compile` — compile the project (host or
+/// cross-compile). Runs in the background; progress streams over the log SSE.
+async fn project_compile(Path(name): Path<String>, Json(body): Json<CompileBody>) -> Response {
+    if projects::read_config(&name).is_none() {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    }
+    let targets = body.targets;
+    tokio::spawn(async move {
+        let _ = projects::supervisor().compile(&name, &targets).await;
+    });
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "started": true }))).into_response()
+}
+
+/// `GET /console/api/projects/{name}/export` — download the project as a zip.
+async fn project_export(Path(name): Path<String>) -> Response {
+    let include_dist = projects::project_dir(&name)
+        .map(|d| d.join("dist").is_dir())
+        .unwrap_or(false);
+    match projects::export_zip(&name, include_dist) {
+        Ok(zip) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", projects::export_filename(&name)),
+                ),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            zip,
+        )
+            .into_response(),
+        Err(e) if e.contains("no such") => (StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// SSE state for a project's run/compile log stream.
+enum ProjLogState {
+    History(
+        std::vec::IntoIter<projects::LogLine>,
+        broadcast::Receiver<projects::LogLine>,
+    ),
+    Live(broadcast::Receiver<projects::LogLine>),
+}
+
+/// `GET /console/api/projects/{name}/logs` — SSE stream of run/compile output.
+async fn project_logs(
+    Path(name): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let sup = projects::supervisor();
+    let history = sup.log_history(&name).await;
+    let rx = sup.subscribe(&name).await;
+    let stream = unfold(ProjLogState::History(history.into_iter(), rx), |st| async move {
+        match st {
+            ProjLogState::History(mut it, rx) => match it.next() {
+                Some(line) => Some((Ok(proj_log_event(&line)), ProjLogState::History(it, rx))),
+                None => proj_recv_live(rx).await,
+            },
+            ProjLogState::Live(rx) => proj_recv_live(rx).await,
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn proj_log_event(line: &projects::LogLine) -> Event {
+    let data = serde_json::to_string(line).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event("log").data(data)
+}
+
+async fn proj_recv_live(
+    mut rx: broadcast::Receiver<projects::LogLine>,
+) -> Option<(Result<Event, Infallible>, ProjLogState)> {
+    loop {
+        match rx.recv().await {
+            Ok(line) => return Some((Ok(proj_log_event(&line)), ProjLogState::Live(rx))),
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return None,
         }

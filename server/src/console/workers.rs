@@ -177,6 +177,11 @@ pub fn set_gateway_port(port: u16) {
     supervisor().gateway_port.store(port, Ordering::Relaxed);
 }
 
+/// The gateway's bound port (for composing a default deploy/base URL).
+pub(crate) fn gateway_port() -> u16 {
+    supervisor().gateway_port.load(Ordering::Relaxed)
+}
+
 /// Writes the embedded worker SDK to `<workspace>/.nanobpm/worker-sdk.ts`,
 /// overwriting any prior copy so it tracks the running binary.
 fn ensure_sdk_written() -> std::io::Result<()> {
@@ -211,7 +216,7 @@ fn ensure_lib_alias(dir: &std::path::Path) {
 }
 
 /// Locates the Deno binary: `NANOBPMN_DENO_BIN`, then `PATH`, then `~/.deno/bin`.
-fn find_deno() -> Option<PathBuf> {
+pub(crate) fn find_deno() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("NANOBPMN_DENO_BIN")
         && !p.is_empty()
     {
