@@ -127,6 +127,17 @@ pub fn worker_sdk_source() -> &'static str {
     WORKER_SDK_TS
 }
 
+/// Ambient `Deno.*` namespace types (extracted from `deno types`) served to the
+/// console editor as a Monaco extra-lib so worker/`main.ts` code that uses
+/// `Deno.env`, `Deno.readDir`, etc. type-checks instead of erroring with
+/// "Cannot find name 'Deno'". Web globals are intentionally omitted so they
+/// don't collide with the editor's `dom` lib.
+pub fn deno_namespace_types() -> &'static str {
+    DENO_NS_DTS
+}
+
+const DENO_NS_DTS: &str = include_str!("deno_ns.d.ts");
+
 const DENO_JSON_HEAD: &str = "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./sdk/worker-sdk.ts\"";
 
 /// Build the app's `deno.json`: an import map aliasing `@nanobpm/worker` to the

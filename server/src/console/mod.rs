@@ -92,6 +92,7 @@ pub fn router(server: ServerImpl) -> Router {
         )
         .route("/console/api/workers", get(workers_list).post(worker_create))
         .route("/console/api/worker-sdk", get(worker_sdk_source))
+        .route("/console/api/deno-types", get(deno_types_source))
         .route(
             "/console/api/lib",
             get(lib_list).post(lib_file_create),
@@ -1481,6 +1482,20 @@ async fn worker_sdk_source() -> Response {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         worker_export::worker_sdk_source(),
+    )
+        .into_response()
+}
+
+/// `GET /console/api/deno-types` — the embedded Deno namespace ambient types,
+/// served so the console editor can register them as a Monaco extra-lib. This
+/// makes `Deno.env`, `Deno.readDir`, `Deno.serve`, etc. resolve in worker and
+/// `main.ts` code instead of erroring with "Cannot find name 'Deno'". Fully
+/// offline (embedded in the gateway binary).
+async fn deno_types_source() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        worker_export::deno_namespace_types(),
     )
         .into_response()
 }

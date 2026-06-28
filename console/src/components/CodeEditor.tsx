@@ -47,8 +47,35 @@ monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
   diagnosticCodesToIgnore: [
     2307, // Cannot find module '...' (Deno URL / npm: specifiers)
     2792, // Cannot find module — consider moduleResolution
+    1375, // Top-level await "needs imports/exports": Deno runs every file as an
+    //       ES module, so top-level await is always valid here.
   ],
 });
+
+// --- IntelliSense: ambient Deno types --------------------------------------
+// Worker and main.ts code runs on Deno, so `Deno.env`, `Deno.readDir`,
+// `Deno.serve`, etc. must resolve. Fetch the embedded Deno namespace types once
+// and register them as a Monaco extra-lib. Fully offline (served by the gateway
+// from its embedded copy of `deno types`).
+let denoLibRegistered = false;
+async function ensureDenoLib(): Promise<void> {
+  if (denoLibRegistered) return;
+  denoLibRegistered = true;
+  try {
+    const res = await fetch("/console/api/deno-types");
+    if (!res.ok) {
+      denoLibRegistered = false;
+      return;
+    }
+    const src = await res.text();
+    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+      src,
+      "file:///node_modules/@types/deno/index.d.ts",
+    );
+  } catch {
+    denoLibRegistered = false; // let a later mount retry
+  }
+}
 
 // --- IntelliSense: the @nanobpm/worker SDK ---------------------------------
 // Fetch the embedded SDK source once and register it under a node_modules path
@@ -194,6 +221,7 @@ export default function CodeEditor({
 
   useEffect(() => {
     void ensureSdkLib();
+    void ensureDenoLib();
     if (isCode) acquireTypes(value);
     return () => clearTimeout(ataTimer.current);
     // Re-run when switching to a different file/value.
