@@ -398,14 +398,16 @@ const DEMO_MAIN_TS: &str = r#"// Throughput Explorer — finds the out-of-the-bo
 // For 30 seconds it fires-and-forgets process-instance creates (no awaiting
 // completion) with a concurrency pool that ramps up every 2 seconds. The single
 // "tick" worker drains the resulting jobs. Each second it prints the achieved
-// creates/sec; at the end it reports the peak. This is a stock laptop demo — no
-// tuning, just "see how fast it is".
+// creates/sec and the engine's resident memory; at the end it stops creating,
+// lets the worker drain the backlog, then reports the peak rate + peak memory.
+// Stock laptop demo — no tuning, just "see how fast it is".
 
 const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
 const PROCESS_ID = "throughput-demo";
 const DURATION_MS = 30_000;
 const RAMP_EVERY_MS = 2_000;
 const RAMP_STEP = 32; // +32 concurrent creators every 2s
+const DRAIN_MAX_MS = 30_000; // give the worker up to 30s to finish the backlog
 
 async function deploy(): Promise<void> {
   const xml = await Deno.readTextFile("resources/processes/throughput.bpmn");
@@ -414,6 +416,14 @@ async function deploy(): Promise<void> {
   const res = await fetch(`${BASE_URL}/v2/deployments`, { method: "POST", body: form });
   if (!res.ok) throw new Error(`deploy failed: ${res.status} ${await res.text().catch(() => "")}`);
   console.log(`deployed ${PROCESS_ID} to ${BASE_URL}`);
+}
+
+async function residentMb(): Promise<number> {
+  try {
+    const r = await fetch(`${BASE_URL}/v2/system/memory`);
+    const j = await r.json();
+    return j.residentBytes ? j.residentBytes / 1_048_576 : 0;
+  } catch { return 0; }
 }
 
 await deploy();
@@ -442,13 +452,16 @@ console.log("ramping process-instance creation for 30s…\n");
 const t0 = performance.now();
 let lastCreated = 0;
 let peak = 0;
+let peakMem = 0;
 
-const tick = setInterval(() => {
+const tick = setInterval(async () => {
   const total = created;
   const rate = total - lastCreated;
   lastCreated = total;
   if (rate > peak) peak = rate;
-  console.log(`t+${Math.round((performance.now() - t0) / 1000)}s  conc=${concurrency}  ${rate}/s  (total ${total})`);
+  const mem = await residentMb();
+  if (mem > peakMem) peakMem = mem;
+  console.log(`t+${Math.round((performance.now() - t0) / 1000)}s  conc=${concurrency}  ${rate}/s  (total ${total}, mem ${mem.toFixed(0)}MB)`);
 }, 1000);
 
 const ramp = setInterval(() => {
@@ -459,12 +472,36 @@ const ramp = setInterval(() => {
 for (let i = 0; i < RAMP_STEP; i++) creator();
 concurrency = RAMP_STEP;
 
-setTimeout(() => {
-  running = false;
-  clearInterval(tick);
+setTimeout(async () => {
+  running = false; // stop creating
   clearInterval(ramp);
+  console.log(`\n${created} created. draining the backlog (worker finishing jobs)…`);
+  // Graceful drain: stop creating and wait until the engine reports no jobs
+  // pending, or DRAIN_MAX_MS elapses, so we don't leave instances parked.
+  const drainStart = performance.now();
+  let prev = -1;
+  while (performance.now() - drainStart < DRAIN_MAX_MS) {
+    await new Promise((r) => setTimeout(r, 1000));
+    let pending = 0;
+    try {
+      const r = await fetch(`${BASE_URL}/v2/jobs/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ filter: { type: "tick", state: "CREATED" }, page: { limit: 1 } }),
+      });
+      const j = await r.json();
+      pending = j?.page?.totalItems ?? 0;
+    } catch { break; }
+    const mem = await residentMb();
+    if (mem > peakMem) peakMem = mem;
+    console.log(`  pending jobs: ${pending}`);
+    if (pending === 0 || pending === prev) break; // done, or stuck — stop waiting
+    prev = pending;
+  }
+  clearInterval(tick);
   console.log(`\n=== peak ${peak} instances/sec (single-task, fire-and-forget) ===`);
   console.log(`=== ${created} instances created in 30s, ~${Math.round(created / 30)}/s average ===`);
+  console.log(`=== peak engine memory ${peakMem.toFixed(0)}MB ===`);
   Deno.exit(0);
 }, DURATION_MS);
 "#;

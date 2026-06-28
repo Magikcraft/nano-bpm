@@ -7572,6 +7572,20 @@ async fn metrics_handler() -> Response {
         .expect("metrics response builds")
 }
 
+/// `GET /v2/system/memory` — current resident memory of the engine process, as
+/// jemalloc accounts it (the most meaningful figure: `ps`/RSS under-reports on
+/// macOS). Used by the Throughput Explorer demo to report peak memory; cheap to
+/// poll. Returns `{ residentBytes }` (omitted/null if jemalloc isn't available).
+async fn system_memory_handler() -> Response {
+    let bytes = memory::resident_bytes();
+    let body = serde_json::json!({ "residentBytes": bytes }).to_string();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("memory response builds")
+}
+
 fn debug_rest_enabled() -> bool {
     std::env::var("DEBUG_REST")
         .map(|v| {
@@ -8021,7 +8035,8 @@ async fn main() {
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
-        .route("/metrics", axum::routing::get(metrics_handler));
+        .route("/metrics", axum::routing::get(metrics_handler))
+        .route("/v2/system/memory", axum::routing::get(system_memory_handler));
 
     #[cfg(feature = "console")]
     {
