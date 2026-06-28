@@ -361,18 +361,45 @@ const WORKER_DENO_JSON: &str = r#"{
 /// worker auto-completes, so each created instance runs end-to-end through the
 /// engine: this measures create + worker-complete throughput.
 const DEMO_PROCESS_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-throughput-demo" targetNamespace="http://nanobpm">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-throughput-demo" targetNamespace="http://nanobpm">
   <bpmn:process id="throughput-demo" isExecutable="true">
-    <bpmn:startEvent id="start" />
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:startEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="task" />
     <bpmn:serviceTask id="task" name="Tick">
       <bpmn:extensionElements>
         <zeebe:taskDefinition type="tick" />
       </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
     </bpmn:serviceTask>
     <bpmn:sequenceFlow id="f2" sourceRef="task" targetRef="end" />
-    <bpmn:endEvent id="end" />
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>f2</bpmn:incoming>
+    </bpmn:endEvent>
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="diagram">
+    <bpmndi:BPMNPlane id="plane" bpmnElement="throughput-demo">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="task_di" bpmnElement="task">
+        <dc:Bounds x="260" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="430" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="260" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="360" y="118" />
+        <di:waypoint x="430" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>
 "#;
 
@@ -508,12 +535,23 @@ setTimeout(async () => {
 
 fn demo_readme() -> String {
     "# Throughput Explorer\n\n\
-A 30-second benchmark demo: see how many process instances Nano can create and \
-complete out of the box. It fires-and-forgets `throughput-demo` instances with a \
-creator pool that ramps up every 2 seconds; the single `tick` worker drains the \
-jobs. Each second prints the achieved creates/sec, then it reports the peak.\n\n\
-## Run\n\n```sh\ndeno task start\n```\n\n\
-Open the engine (default `http://localhost:8080`) first, then Run.\n"
+A 30-second benchmark that shows how fast Nano runs out of the box. It \
+fire-and-forgets `throughput-demo` instances (a single auto-completed `tick` \
+task) from a creator pool that ramps every 2 seconds, while one worker drains \
+the jobs. Each second it prints the achieved **creates/sec** and the engine's \
+**resident memory**; at 30s it stops creating, drains the backlog (so no \
+instances are left parked), then reports the peak instances/sec and peak memory.\n\n\
+## Run it in the IDE\n\n\
+1. Make sure the engine is up (the console you're reading this in is the engine).\n\
+2. Open this project and press **Run**. Watch the log console fill with per-second \
+rates; the final lines report the peak. It runs ~30s then drains and stops on its \
+own. Press **Stop** anytime to end early.\n\n\
+## Reclaim disk after the test\n\n\
+The benchmark creates ~1M instances; their journal/data can be large. When you're \
+done, free the disk with:\n\n\
+```sh\nc8ctl nano stop --purge\n```\n\n\
+or, equivalently:\n\n\
+```sh\nc8ctl nano stop && c8ctl nano clean\n```\n"
         .into()
 }
 
@@ -1035,18 +1073,22 @@ impl ProjectSupervisor {
             inner.pid.store(0, Ordering::Relaxed);
             let desired = inner.desired_running.load(Ordering::Relaxed);
             let code = status.and_then(|s| s.code());
-            if desired {
+            if !desired {
+                *inner.phase.lock().await = Phase::Stopped;
+                inner.push_log("sys", "application stopped".into()).await;
+            } else if code == Some(0) {
+                // Finite apps (e.g. the Throughput Explorer) exit 0 when their
+                // work is done — a clean completion, not a crash.
+                inner.desired_running.store(false, Ordering::Relaxed);
+                *inner.phase.lock().await = Phase::Stopped;
+                inner.push_log("sys", "application finished".into()).await;
+            } else {
                 *inner.phase.lock().await = Phase::Crashed;
                 inner.desired_running.store(false, Ordering::Relaxed);
-                if code.unwrap_or(0) != 0 {
-                    *inner.last_error.lock().await = Some(format!("exited with code {code:?}"));
-                }
+                *inner.last_error.lock().await = Some(format!("exited with code {code:?}"));
                 inner
                     .push_log("sys", format!("application exited (code {code:?})"))
                     .await;
-            } else {
-                *inner.phase.lock().await = Phase::Stopped;
-                inner.push_log("sys", "application stopped".into()).await;
             }
         });
 
