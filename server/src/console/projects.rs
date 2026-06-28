@@ -757,6 +757,9 @@ impl ProjectSupervisor {
             *inner.phase.lock().await = Phase::Stopped;
             return Err(format!("entrypoint {} not found", cfg.main));
         }
+        // Canonicalize so the --allow-read scope matches the path Deno resolves
+        // (e.g. macOS /tmp -> /private/tmp), otherwise reads are denied.
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
         let cache = dir.join(".deno-cache");
         let _ = std::fs::create_dir_all(&cache);
         let base_url = Self::base_url(&cfg);

@@ -2056,12 +2056,20 @@ async fn project_compile(Path(name): Path<String>, Json(body): Json<CompileBody>
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "started": true }))).into_response()
 }
 
-/// `GET /console/api/projects/{name}/export` — download the project as a zip.
-async fn project_export(Path(name): Path<String>) -> Response {
-    let include_dist = projects::project_dir(&name)
-        .map(|d| d.join("dist").is_dir())
-        .unwrap_or(false);
-    match projects::export_zip(&name, include_dist) {
+/// Query for `project_export`: include compiled `dist/` binaries (default off,
+/// since they are large and platform-specific).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportQuery {
+    #[serde(default)]
+    dist: bool,
+}
+
+/// `GET /console/api/projects/{name}/export[?dist=true]` — download the project
+/// as a zip. Source-only by default; pass `dist=true` to bundle compiled
+/// binaries from `dist/`.
+async fn project_export(Path(name): Path<String>, Query(q): Query<ExportQuery>) -> Response {
+    match projects::export_zip(&name, q.dist) {
         Ok(zip) => (
             StatusCode::OK,
             [
