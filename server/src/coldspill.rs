@@ -259,6 +259,7 @@ mod tests {
             jobs: vec![job(job_key, instance_key, job_type)],
             timers: Vec::new(),
             message_subscriptions: Vec::new(),
+            signal_subscriptions: Vec::new(),
             user_tasks: Vec::new(),
             incidents: Vec::new(),
         }

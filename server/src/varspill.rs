@@ -195,6 +195,7 @@ mod tests {
             jobs: Vec::new(),
             timers: Vec::new(),
             message_subscriptions: Vec::new(),
+            signal_subscriptions: Vec::new(),
             user_tasks: Vec::new(),
             incidents: Vec::new(),
         };

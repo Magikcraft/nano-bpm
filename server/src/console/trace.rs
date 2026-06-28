@@ -562,15 +562,14 @@ impl Inner {
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
-                    if let Some(&idx) = t.by_job.get(job_key) {
-                        if let Some(job) = t.elements[idx].job.as_mut() {
+                    if let Some(&idx) = t.by_job.get(job_key)
+                        && let Some(job) = t.elements[idx].job.as_mut() {
                             job.attempts += 1;
                             job.worker = Some(worker.clone());
                             if job.activated_at.is_none() {
                                 job.activated_at = Some(now);
                             }
                         }
-                    }
                 }
             }
             Event::JobCompleted {
@@ -580,12 +579,11 @@ impl Inner {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
                     let mut job_type = None;
-                    if let Some(&idx) = t.by_job.get(job_key) {
-                        if let Some(job) = t.elements[idx].job.as_mut() {
+                    if let Some(&idx) = t.by_job.get(job_key)
+                        && let Some(job) = t.elements[idx].job.as_mut() {
                             job.completed_at = Some(now);
                             job_type = Some(job.job_type.clone());
                         }
-                    }
                     // Tier 2: a job completion is an external input; its output
                     // variables (if any) arrive on the next `VariablesUpdated`,
                     // which attaches to this pending stimulus.
@@ -602,11 +600,10 @@ impl Inner {
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
-                    if let Some(&idx) = t.by_job.get(job_key) {
-                        if let Some(job) = t.elements[idx].job.as_mut() {
+                    if let Some(&idx) = t.by_job.get(job_key)
+                        && let Some(job) = t.elements[idx].job.as_mut() {
                             job.failures += 1;
                         }
-                    }
                 }
             }
             Event::IncidentRaised {
@@ -672,22 +669,21 @@ impl Inner {
             }
             // --- Tier 2 recorded-input stimuli (only when enabled) -------------
             Event::UserTaskCompleted { instance_key, .. } => {
-                if self.capture_stimuli {
-                    if let Some(t) = self.instances.get_mut(instance_key) {
+                if self.capture_stimuli
+                    && let Some(t) = self.instances.get_mut(instance_key) {
                         t.last_at = now;
                         let idx =
                             t.record_stimulus("userTaskCompleted", None, None, now, self.stimuli_max);
                         t.pending_stimulus = idx;
                     }
-                }
             }
             Event::MessageCorrelated {
                 instance_key,
                 element_id,
                 ..
             } => {
-                if self.capture_stimuli {
-                    if let Some(t) = self.instances.get_mut(instance_key) {
+                if self.capture_stimuli
+                    && let Some(t) = self.instances.get_mut(instance_key) {
                         t.last_at = now;
                         let idx = t.record_stimulus(
                             "message",
@@ -698,7 +694,6 @@ impl Inner {
                         );
                         t.pending_stimulus = idx;
                     }
-                }
             }
             Event::RemoteMessageCorrelation {
                 instance_key,
@@ -729,8 +724,8 @@ impl Inner {
             } => {
                 // A timer fire carries no payload, but its occurrence and timing
                 // are part of the recorded input ordering.
-                if self.capture_stimuli {
-                    if let Some(t) = self.instances.get_mut(instance_key) {
+                if self.capture_stimuli
+                    && let Some(t) = self.instances.get_mut(instance_key) {
                         t.last_at = now;
                         t.record_stimulus(
                             "timer",
@@ -740,7 +735,6 @@ impl Inner {
                             self.stimuli_max,
                         );
                     }
-                }
             }
             _ => {}
         }
@@ -763,9 +757,9 @@ impl Inner {
     /// set on the first activation only (so `queueMs` reflects the initial queue
     /// wait); `attempts` counts every activation (lease re-activations included).
     fn record_activation(&mut self, instance_key: u64, job_key: u64, worker: &str, now: u64) {
-        if let Some(t) = self.instances.get_mut(&instance_key) {
-            if let Some(&idx) = t.by_job.get(&job_key) {
-                if let Some(job) = t.elements[idx].job.as_mut() {
+        if let Some(t) = self.instances.get_mut(&instance_key)
+            && let Some(&idx) = t.by_job.get(&job_key)
+                && let Some(job) = t.elements[idx].job.as_mut() {
                     job.attempts += 1;
                     job.worker = Some(worker.to_string());
                     if job.activated_at.is_none() {
@@ -776,8 +770,6 @@ impl Inner {
                     }
                     return;
                 }
-            }
-        }
         // JobCreated not folded yet (or the instance was evicted): buffer it.
         let entry = self.pending_acts.entry(job_key).or_insert(PendingAct {
             worker: worker.to_string(),
@@ -791,11 +783,10 @@ impl Inner {
         }
         // Defensive bound: stale entries only lose activation metadata for a
         // since-evicted job, never correctness.
-        if self.pending_acts.len() > self.capacity.saturating_mul(4) {
-            if let Some(&k) = self.pending_acts.keys().find(|&&k| k != job_key) {
+        if self.pending_acts.len() > self.capacity.saturating_mul(4)
+            && let Some(&k) = self.pending_acts.keys().find(|&&k| k != job_key) {
                 self.pending_acts.remove(&k);
             }
-        }
     }
 }
 

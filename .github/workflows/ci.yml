@@ -1,0 +1,77 @@
+# Test + clippy gate. Runs on every push to main and on PRs so a red build is
+# caught BEFORE a release tag is cut. Each crate is independent (no root
+# workspace), so it gets its own job with a scoped cache.
+#
+# Scope: clippy (-D warnings) + cargo test per crate. Formatting is intentionally
+# NOT gated here — the tree is formatted with a nightly/2024 rustfmt whose output
+# differs from stable `cargo fmt`, so a stable fmt check would report false drift.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine-core:
+    name: engine-core (clippy + test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-core
+      - name: Clippy
+        working-directory: engine-core
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        working-directory: engine-core
+        run: cargo test
+
+  processos:
+    name: processos (clippy + test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: processos
+      - name: Clippy
+        working-directory: processos
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        working-directory: processos
+        run: cargo test
+
+  server:
+    name: server (clippy + test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Clippy
+        working-directory: server
+        run: cargo clippy --all-targets --features console -- -D warnings
+      - name: Test
+        working-directory: server
+        run: cargo test --features console
