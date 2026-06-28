@@ -10281,20 +10281,30 @@ mod clustered_startup_tests {
             node2.raft_bootstrap()
         );
 
+        // Every partition must have an elected leader before creates fan out
+        // round-robin across all three; otherwise a create routed to a partition
+        // whose leader hasn't been elected yet (e.g. on a slow CI runner) comes
+        // back non-200. Node 0, an RF=3 voter in every partition, is the vantage
+        // point: it must see itself leading partition 0 and *some* leader settled
+        // for partitions 1 and 2.
+        let leader_of = |p: u64| {
+            node0
+                .raft_registry()
+                .get(p)
+                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+        };
         let mut ok = false;
         for _ in 0..500 {
-            if node0
-                .raft_registry()
-                .get(0)
-                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
-                == Some(0)
-            {
+            if leader_of(0) == Some(0) && leader_of(1).is_some() && leader_of(2).is_some() {
                 ok = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(ok, "node 0 must lead partition 0");
+        assert!(
+            ok,
+            "every partition must have an elected leader before creates"
+        );
         (node0, node1, node2, serve_handles)
     }
 
