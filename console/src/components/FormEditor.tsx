@@ -1,0 +1,136 @@
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+import {
+  FormEditor as FormJsEditor,
+  schemaVersion,
+} from "@bpmn-io/form-js-editor";
+import "@bpmn-io/form-js/dist/assets/form-js.css";
+import "@bpmn-io/form-js/dist/assets/form-js-editor.css";
+
+type JsonPrimitive = string | number | boolean | null;
+type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue[];
+
+interface FormSchema {
+  type: "default";
+  components: JsonValue[];
+  schemaVersion: number;
+  [key: string]: JsonValue;
+}
+
+/// Imperative handle the form editor view drives. Keeps the live form schema
+/// inside this component and exposes just the operations the toolbar needs.
+export interface FormEditorHandle {
+  /// Serializes the current schema to pretty-printed JSON.
+  getSchema(): Promise<string>;
+  /// Replaces the schema with parsed JSON.
+  importSchema(json: string): Promise<void>;
+  /// Loads a blank form schema.
+  createBlank(): Promise<void>;
+}
+
+interface FormEditorProps {
+  /// Called whenever the schema changes (after the first import). The initial
+  /// blank schema does not mark dirty.
+  onChange?: () => void;
+}
+
+const createEmptySchema = (): FormSchema => ({
+  type: "default",
+  components: [],
+  schemaVersion,
+});
+
+const parseSchema = (json: string): FormSchema => {
+  const parsed: unknown = JSON.parse(json);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Form schema must be a JSON object");
+  }
+  return parsed as FormSchema;
+};
+
+const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
+  function FormEditor({ onChange }, ref) {
+    const containerRef = useRef<HTMLDivElement>(null);
+    const editorRef = useRef<FormJsEditor | null>(null);
+    // Set once the editor has been destroyed, so async work already in flight
+    // doesn't touch a dead instance.
+    const disposedRef = useRef(false);
+    // Serializes schema loads. importSchema must never overlap.
+    const opChainRef = useRef<Promise<unknown>>(Promise.resolve());
+    // Suppress the change callback for programmatic loads (import/createBlank).
+    const suppressChange = useRef(false);
+    const suppressTimerRef = useRef<number | null>(null);
+    const onChangeRef = useRef(onChange);
+    onChangeRef.current = onChange;
+
+    const clearSuppressTimer = () => {
+      if (suppressTimerRef.current === null) return;
+      window.clearTimeout(suppressTimerRef.current);
+      suppressTimerRef.current = null;
+    };
+
+    const runLoad = (
+      loader: (editor: FormJsEditor) => Promise<unknown>,
+    ): Promise<void> => {
+      const editor = editorRef.current;
+      if (!editor) return Promise.resolve();
+      const run = opChainRef.current.then(async () => {
+        if (disposedRef.current || editorRef.current !== editor) return;
+        clearSuppressTimer();
+        suppressChange.current = true;
+        try {
+          await loader(editor);
+        } finally {
+          suppressTimerRef.current = window.setTimeout(() => {
+            if (!disposedRef.current && editorRef.current === editor) {
+              suppressChange.current = false;
+            }
+            suppressTimerRef.current = null;
+          }, 0);
+        }
+      });
+      // Keep the chain alive even when this op fails, so one bad import doesn't
+      // wedge every later load.
+      opChainRef.current = run.catch(() => {});
+      return run;
+    };
+
+    useEffect(() => {
+      if (!containerRef.current) return;
+      disposedRef.current = false;
+      const editor = new FormJsEditor({ container: containerRef.current });
+      editorRef.current = editor;
+
+      const handleChanged = () => {
+        if (suppressChange.current) return;
+        onChangeRef.current?.();
+      };
+
+      editor.on("changed", handleChanged);
+      void runLoad((e) => e.importSchema(createEmptySchema()));
+
+      return () => {
+        disposedRef.current = true;
+        clearSuppressTimer();
+        editor.off("changed", handleChanged);
+        editor.destroy();
+        editorRef.current = null;
+      };
+    }, []);
+
+    useImperativeHandle(ref, () => ({
+      async getSchema() {
+        const editor = editorRef.current;
+        if (!editor || disposedRef.current) return "";
+        return JSON.stringify(editor.getSchema() as unknown, null, 2);
+      },
+      importSchema: (json: string) =>
+        runLoad((editor) => editor.importSchema(parseSchema(json))),
+      createBlank: () =>
+        runLoad((editor) => editor.importSchema(createEmptySchema())),
+    }));
+
+    return <div ref={containerRef} className="h-full w-full bg-white" />;
+  },
+);
+
+export default FormEditor;

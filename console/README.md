@@ -49,3 +49,68 @@ NANO_BACKEND=http://127.0.0.1:9000 npm run dev
 ```sh
 npm run build   # → console/dist, embedded by the gateway's `console` feature
 ```
+
+## Projects (RAD environment)
+
+The **Projects** view (the console's home) is a Rapid Application Development
+environment. A project is a self-contained
+[Deno](https://deno.com) application directory holding everything an automation
+needs: process models, the workers that service their jobs, shared libraries,
+and a generated entry point that ties them together.
+
+### Layout
+
+```
+<projectsRoot>/<project>/
+  nanobpm.project.json   # name, description, deployTarget, main, export platforms
+  deno.json              # import map (@nanobpm/worker, @lib/) + `start` task
+  main.ts                # deploys resources/processes/*.bpmn, then starts workers
+  resources/
+    processes/  *.bpmn   # deployed to the engine on Run
+    decisions/  *.dmn    # authored + exported (see note below)
+    forms/      *.form    # authored + exported (see note below)
+  workers/<name>/        # one folder per worker (worker.ts + deno.json)
+  lib/                   # shared @lib/… modules usable from every worker
+  .nanobpm/worker-sdk.ts # embedded worker SDK
+```
+
+`<projectsRoot>` defaults to `<workspace>/projects` and can be overridden with
+the `NANOBPMN_PROJECTS_DIR` environment variable. Each immediate subdirectory is
+one project, surfaced as a tile on the Projects home.
+
+### Workflow
+
+Open a project to get a file browser, graphical/code editors, the run console,
+and a toolbar:
+
+- **Run** — `deno run main.ts`: deploys every `resources/processes/*.bpmn` to the
+  configured deploy target, then imports and starts each worker. Stdout/stderr
+  stream live into the Output panel. **Stop** terminates the application.
+- **Compile** — `deno compile`: produces standalone binaries under `dist/`.
+  Selecting export platforms cross-compiles for them (this downloads the Deno
+  runtime per target and can take a few minutes; progress streams to Output).
+- **Configure** — edits the deploy target (`<target>/v2` is the REST API the app
+  deploys to and dials the command stream on), the entry point, and the set of
+  export platforms.
+- **Export** — downloads the whole project as a `.zip` (add the compiled `dist/`
+  binaries with the `?dist=true` option).
+
+### Editors
+
+The center pane dispatches on file extension:
+
+| Extension | Editor |
+| --------- | ------ |
+| `.bpmn`   | bpmn-js modeler (with properties panel) |
+| `.dmn`    | dmn-js (DRD + decision table) |
+| `.form`   | @bpmn-io/form-js builder |
+| other     | Monaco code editor (with worker-SDK IntelliSense) |
+
+> **Note — decisions and forms are authoring + export artifacts.** The nanobpmn
+> engine executes BPMN only; it has no DMN or form runtime. You can author
+> `.dmn`/`.form` resources graphically and they travel with the project (and its
+> export zip), but only `resources/processes/*.bpmn` are deployed and executed.
+
+Running and compiling require a Deno runtime on the gateway host; when none is
+detected the editors and Export still work, but Run and Compile are disabled.
+

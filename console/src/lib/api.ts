@@ -528,3 +528,188 @@ export async function fetchProcessXml(
   // 204 (no XML) or 404 (unknown / non-latest version).
   return null;
 }
+
+// --- RAD projects ----------------------------------------------------------
+// A project is a self-contained Deno application directory under the projects
+// root (resources/processes|decisions|forms, workers/, lib/, main.ts). The
+// console drives its whole lifecycle — author, run, compile, export — through
+// the `/console/api/projects` endpoints below.
+
+export interface ProjectSummary {
+  name: string;
+  description: string;
+  deployTarget: string;
+  updatedMs: number;
+  processes: number;
+  decisions: number;
+  forms: number;
+  workers: number;
+  running: boolean;
+}
+
+export interface ProjectConfig {
+  name: string;
+  description: string;
+  /** Gateway base URL the app deploys to (REST API at `<deployTarget>/v2`). */
+  deployTarget: string;
+  /** Entrypoint module run on Run/Compile (default `main.ts`). */
+  main: string;
+  /** Cross-compile targets selected for export. */
+  platforms: string[];
+  createdMs: number;
+  updatedMs: number;
+}
+
+/// One node in a project's file tree. Directories carry `children`.
+export interface FileNode {
+  name: string;
+  /** Project-relative, `/`-separated path. */
+  path: string;
+  kind: "dir" | "file";
+  children?: FileNode[];
+}
+
+export type RunStatus = "stopped" | "starting" | "running" | "stopping" | "error";
+
+/// Runtime view of a project's application process.
+export interface RunState {
+  status: RunStatus;
+  pid: number | null;
+  startedAtMs: number | null;
+  lastError: string | null;
+  /** Whether a compile (possibly cross-platform) is in progress. */
+  compiling: boolean;
+}
+
+export interface ProjectsResponse {
+  projects: ProjectSummary[];
+  /** Whether a Deno runtime is available to actually run/compile projects. */
+  denoAvailable: boolean;
+  platforms: string[];
+}
+
+export interface ProjectDetail {
+  config: ProjectConfig;
+  files: FileNode[];
+  runState: RunState;
+  denoAvailable: boolean;
+  platforms: string[];
+}
+
+/// A single line of a project's run/compile log stream.
+export interface ProjectLogLine {
+  tsMs: number;
+  /** `out` (stdout), `err` (stderr), or `sys` (supervisor notes). */
+  stream: "out" | "err" | "sys";
+  text: string;
+}
+
+/// Project-scoped console API. Kept separate from `api` so the project
+/// lifecycle (author/run/compile/export) reads as one cohesive client.
+export const projectsApi = {
+  projects: () => getJson<ProjectsResponse>("/projects"),
+  project: (name: string) =>
+    getJson<ProjectDetail>(`/projects/${encodeURIComponent(name)}`),
+  createProject: (name: string, description: string) =>
+    send<ProjectConfig>(
+      "POST",
+      "/projects",
+      JSON.stringify({ name, description }),
+      "application/json",
+    ),
+  deleteProject: (name: string) =>
+    send<void>("DELETE", `/projects/${encodeURIComponent(name)}`),
+  projectConfig: (name: string) =>
+    getJson<ProjectConfig>(`/projects/${encodeURIComponent(name)}/config`),
+  saveProjectConfig: (name: string, config: ProjectConfig) =>
+    send<ProjectConfig>(
+      "PUT",
+      `/projects/${encodeURIComponent(name)}/config`,
+      JSON.stringify(config),
+      "application/json",
+    ),
+  projectFiles: (name: string) =>
+    getJson<{ files: FileNode[] }>(`/projects/${encodeURIComponent(name)}/files`),
+  projectFile: (name: string, path: string) =>
+    getText(
+      `/projects/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+    ),
+  saveProjectFile: (name: string, path: string, content: string) =>
+    send<void>(
+      "PUT",
+      `/projects/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+      content,
+      "text/plain",
+    ),
+  createProjectPath: (name: string, path: string, dir: boolean) =>
+    send<void>(
+      "POST",
+      `/projects/${encodeURIComponent(name)}/file`,
+      JSON.stringify({ path, dir }),
+      "application/json",
+    ),
+  deleteProjectPath: (name: string, path: string) =>
+    send<void>(
+      "DELETE",
+      `/projects/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+    ),
+  runProject: (name: string) =>
+    send<RunState>("POST", `/projects/${encodeURIComponent(name)}/run`),
+  stopProject: (name: string) =>
+    send<RunState>("POST", `/projects/${encodeURIComponent(name)}/stop`),
+  compileProject: (name: string, targets: string[]) =>
+    send<{ started: boolean }>(
+      "POST",
+      `/projects/${encodeURIComponent(name)}/compile`,
+      JSON.stringify({ targets }),
+      "application/json",
+    ),
+};
+
+/// The download URL for a project export zip. When `dist` is set the compiled
+/// `dist/` binaries are bundled too (large + platform-specific).
+export function projectExportUrl(name: string, dist = false): string {
+  const q = dist ? "?dist=true" : "";
+  return `/console/api/projects/${encodeURIComponent(name)}/export${q}`;
+}
+
+/// Triggers a browser download of a project's export zip.
+export async function exportProject(name: string, dist = false): Promise<void> {
+  const res = await fetch(projectExportUrl(name, dist));
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `export → HTTP ${res.status}`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("content-disposition") || "";
+  const match = /filename="?([^"]+)"?/.exec(disposition);
+  const filename = match ? match[1] : `${name}.zip`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/// Opens an SSE stream of a project's run/compile log lines. `onLine` is called
+/// for each line (history is replayed first, then live). Returns the
+/// `EventSource`; the caller is responsible for `.close()`.
+export function projectLogs(
+  name: string,
+  onLine: (line: ProjectLogLine) => void,
+): EventSource {
+  const src = new EventSource(
+    `/console/api/projects/${encodeURIComponent(name)}/logs`,
+  );
+  src.addEventListener("log", (ev) => {
+    try {
+      onLine(JSON.parse((ev as MessageEvent).data) as ProjectLogLine);
+    } catch {
+      /* ignore malformed line */
+    }
+  });
+  return src;
+}

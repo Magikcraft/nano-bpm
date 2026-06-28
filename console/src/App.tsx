@@ -4,6 +4,8 @@ import Topology from "./views/Topology";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
+const Projects = lazy(() => import("./views/Projects"));
+const ProjectWorkspace = lazy(() => import("./views/ProjectWorkspace"));
 const Modeler = lazy(() => import("./views/Modeler"));
 const Explorer = lazy(() => import("./views/Explorer"));
 const Workers = lazy(() => import("./views/Workers"));
@@ -11,6 +13,7 @@ const Metrics = lazy(() => import("./views/Metrics"));
 const Traces = lazy(() => import("./views/Traces"));
 
 const navItems = [
+  { to: "/projects", label: "Projects" },
   { to: "/topology", label: "Topology" },
   { to: "/metrics", label: "Metrics" },
   { to: "/modeler", label: "Modeler" },
@@ -60,14 +63,16 @@ export default function App() {
           }
         >
           <Routes>
-            <Route path="/" element={<Navigate to="/topology" replace />} />
+            <Route path="/" element={<Navigate to="/projects" replace />} />
+            <Route path="/projects" element={<Projects />} />
+            <Route path="/projects/:name" element={<ProjectWorkspace />} />
             <Route path="/topology" element={<Topology />} />
             <Route path="/metrics" element={<Metrics />} />
             <Route path="/modeler" element={<Modeler />} />
             <Route path="/explorer" element={<Explorer />} />
             <Route path="/traces" element={<Traces />} />
             <Route path="/workers" element={<Workers />} />
-            <Route path="*" element={<Navigate to="/topology" replace />} />
+            <Route path="*" element={<Navigate to="/projects" replace />} />
           </Routes>
         </Suspense>
       </main>

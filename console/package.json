@@ -10,12 +10,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@bpmn-io/form-js": "^1.21.3",
     "@bpmn-io/properties-panel": "^3.44.1",
     "@monaco-editor/react": "^4.7.0",
     "@tanstack/react-query": "^5.59.0",
     "@typescript/ata": "^0.9.8",
     "bpmn-js": "^17.11.1",
     "bpmn-js-properties-panel": "^5.59.0",
+    "dmn-js": "^17.8.1",
     "monaco-editor": "^0.52.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
