@@ -244,8 +244,9 @@ impl Settings {
 /// The seeded default when no settings file exists. Ships ready-to-run **local llama.cpp
 /// sidecar** profiles spanning a size spread for two model families — **Gemma 4** (E2B / E4B /
 /// 12B / 26B-A4B / 31B) and **Qwen** (Qwen3 4B / 8B / 32B / Coder 30B-A3B and Qwen 3.6 35B-A3B) —
-/// from a ~4 GB monitor up to a ~64 GB flagship, plus a coding-tuned variant (a RAM hint is in
-/// each name). Each is given its **own port** (8888–8897) so two can run side by side — a primary
+/// plus **Ornith 1.0** (9B / 35B, coding-specialised) — from a ~4 GB monitor up to a ~64 GB
+/// flagship, plus a coding-tuned variant (a RAM hint is in
+/// each name). Each is given its **own port** (8888–8899) so two can run side by side — a primary
 /// plus a sparring-partner / monitor.
 /// The operator picks one as active and presses Start. Models download/cache to the shared models
 /// directory ([`default_models_dir`]).
@@ -345,6 +346,22 @@ fn seeded() -> Settings {
                 "Qwen3 Coder 30B-A3B · local (needs 24GB)",
                 "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:UD-Q4_K_XL",
                 8897,
+                32768,
+            ),
+            // Ornith 1.0 — a coding-specialised family. The 9B is a 16GB-class
+            // primary; the 35B (Q4) fills the 48GB coder tier, fitting in 64GB.
+            local(
+                "ornith-9b-local",
+                "Ornith 1.0 9B · local (needs 16GB)",
+                "deepreinforce-ai/Ornith-1.0-9B-GGUF:Q6_K",
+                8898,
+                32768,
+            ),
+            local(
+                "ornith-35b-local",
+                "Ornith 1.0 35B · local (needs 48GB)",
+                "deepreinforce-ai/Ornith-1.0-35B-GGUF:Q4_K_M",
+                8899,
                 32768,
             ),
         ],
@@ -761,7 +778,7 @@ mod tests {
         let store = store_in(&tmp);
         let v = store.view();
         // Ships ready-to-run local sidecar models across a size spread, with RAM hints in the name.
-        assert_eq!(v.profiles.len(), 10);
+        assert_eq!(v.profiles.len(), 12);
         assert_eq!(v.active_profile.as_deref(), Some("gemma-4-local"));
         assert!(v.profiles.iter().all(|p| p.sidecar));
         // Every sidecar gets its own port so several can run side by side.
