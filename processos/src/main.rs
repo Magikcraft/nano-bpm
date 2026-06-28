@@ -2284,6 +2284,43 @@ fn build_pair_stages(
     Ok(stages)
 }
 
+/// Build the optional subagent (delegation) from a chat request. When enabled, the primary may
+/// call the `delegate` tool to hand a self-contained research task to this worker, which runs in
+/// its own context with read-only tools and returns a capped digest. A disabled/absent request
+/// ⇒ no subagent (the `delegate` tool is not offered). Errors only if explicitly enabled but the
+/// referenced profile can't resolve to a ready model.
+fn build_subagent(
+    state: &AppState,
+    req: &ChatSendRequest,
+) -> Result<Option<investigate::SubAgent>, String> {
+    let Some(spec) = req.subagent.as_ref().filter(|s| s.enabled) else {
+        return Ok(None);
+    };
+    let cfg = resolve_llm_for_profile(state, spec.profile_id.as_deref(), spec.llm.as_ref())
+        .ok_or_else(|| {
+            format!(
+                "Subagent references unknown profile '{}'",
+                spec.profile_id.as_deref().unwrap_or("")
+            )
+        })?;
+    if !cfg.is_ready() {
+        return Err("Subagent is enabled but has no model configured — pick a profile for the \
+                    subagent, or disable delegation"
+            .to_string());
+    }
+    let (_id, name, system) = state.personas.resolve_subagent(spec.persona_id.as_deref());
+    Ok(Some(investigate::SubAgent {
+        cfg,
+        name,
+        system,
+        max_rounds: spec.max_rounds.unwrap_or(8).clamp(1, 30),
+        digest_cap: spec.digest_cap.unwrap_or(4000).clamp(500, 20000),
+        src: None,
+        limit: 0,
+        model: None,
+    }))
+}
+
 /// Resolve the loop-monitor config from a chat request, honouring an env default. Returns the
 /// `(LlmConfig, persona_system)` to run the monitor with, or `None` when monitoring is off or no
 /// model can be resolved (in which case the turn simply runs without a monitor).
@@ -2998,6 +3035,35 @@ struct ChatSendRequest {
     /// primary when it goes in circles (off unless `enabled`).
     #[serde(default)]
     monitor: Option<MonitorRequest>,
+    /// Subagent: a worker the primary can DELEGATE self-contained research tasks to, sparing its
+    /// context window. Off unless `enabled`; when on, the primary gets a `delegate` tool.
+    #[serde(default)]
+    subagent: Option<SubagentRequest>,
+}
+
+/// Subagent (delegation) configuration for a chat turn. When `enabled`, the primary is offered a
+/// `delegate` tool; each call runs a read-only subagent in its own context and returns a capped
+/// digest. `maxRounds`/`digestCap` are advanced tuning surfaces (sensible defaults otherwise).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentRequest {
+    #[serde(default)]
+    enabled: bool,
+    /// The saved LLM profile the subagent uses (ideally a small/fast model). Env default if absent.
+    #[serde(default)]
+    profile_id: Option<String>,
+    /// A one-off LLM override layered on top of the profile (rarely needed).
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    /// The subagent persona (its system prompt); defaults to the built-in researcher.
+    #[serde(default)]
+    persona_id: Option<String>,
+    /// Advanced: tool-loop budget per delegated task (default 8, clamped 1..30).
+    #[serde(default)]
+    max_rounds: Option<usize>,
+    /// Advanced: max chars of digest fed back to the primary (default 4000, clamped 500..20000).
+    #[serde(default)]
+    digest_cap: Option<usize>,
 }
 
 /// One configured Pair AI reviewer in a chat request.
@@ -3100,6 +3166,10 @@ async fn cockpit_chat_send(
         Ok(p) => p,
         Err(e) => return unprocessable(e),
     };
+    let subagent = match build_subagent(&state, &req) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
     let message = req.message;
     // Register a wrap-up flag for this in-flight turn so `POST .../chat/wrapup` can ask the
     // agent to report early. Cleared in all exit paths below.
@@ -3138,6 +3208,7 @@ async fn cockpit_chat_send(
                 None,
                 &mut sink,
                 &pairs,
+                subagent,
                 prior,
                 &message,
                 None,
@@ -3232,6 +3303,10 @@ async fn cockpit_chat_stream(
     let user_ts = chat_now_ms();
     let pairs = match build_pair_stages(&state, &req) {
         Ok(p) => p,
+        Err(e) => return unprocessable(e),
+    };
+    let subagent = match build_subagent(&state, &req) {
+        Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
     let message = req.message;
@@ -3390,6 +3465,7 @@ async fn cockpit_chat_stream(
             Some(&steer),
             &mut sink,
             &pairs,
+            subagent,
             prior,
             &message,
             Some(&mut checkpoint),

@@ -314,6 +314,10 @@
   .persona-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a1a1aa; }
   .persona-pick > span { white-space: nowrap; }
   .persona-pick select:disabled { opacity: .7; cursor: not-allowed; }
+  .sub-adv { display:inline-block; }
+  .sub-adv > summary { cursor:pointer; list-style:none; color:#a1a1aa; font-size:12px; user-select:none; }
+  .sub-adv[open] { display:inline-flex; gap:6px; align-items:center; }
+  .sub-adv label { font-size:11px; color:#a1a1aa; }
   .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 10px 12px; font-family: inherit; font-size: var(--chat-font, 15px); line-height: 1.55; resize: vertical; min-height: 72px; }
   .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
   .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
@@ -1482,6 +1486,17 @@ async function renderWorkspace(ws, proc){
             <span class="persona-pick" id="chatMonitorCfg" style="display:none">
               <select id="chatMonitorProfile" title="The monitor's LLM profile (defaults to the local sidecar)"></select>
               <select id="chatMonitorPersona" title="The monitor's persona (how it decides to intervene)"></select>
+            </span>
+            <label class="persona-pick" id="chatSubToggle" title="Subagent: lets the primary delegate self-contained research tasks (the `delegate` tool) to a second model that investigates in its own context with read-only tools and reports back only a compact digest. Protects the primary's context window on long, query-heavy investigations. Off by default. Use a cheap/fast model — it does the noisy exploration.">
+              <span><input type="checkbox" id="chatSubOn" style="vertical-align:-1px"> Subagent</span>
+            </label>
+            <span class="persona-pick" id="chatSubCfg" style="display:none">
+              <select id="chatSubProfile" title="The subagent's LLM profile (its own model — pick a small/fast one)"></select>
+              <select id="chatSubPersona" title="The subagent's persona (how it researches)"></select>
+              <details class="sub-adv" title="Advanced tuning"><summary>⚙</summary>
+                <label title="Tool-loop budget per delegated task. Lower = cheaper/faster but may under-investigate; higher = more thorough but slower. Suggested: 6–10. Clamped 1–30.">rounds <input type="number" id="chatSubRounds" min="1" max="30" value="8" style="width:48px"></label>
+                <label title="Max characters of the digest fed back to the primary. Lower protects context harder; raise if subagents truncate useful findings. Suggested: 2000–6000. Clamped 500–20000.">digest <input type="number" id="chatSubDigest" min="500" max="20000" step="500" value="4000" style="width:64px"></label>
+              </details>
             </span>
             <select id="chatPrompt"><option value="">Load a prompt…</option></select>
             <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
@@ -2689,9 +2704,11 @@ async function loadPersonas(){
   const all = STATE.personas || [];
   const isPair = p => p.kind === 'pair';
   const isMonitor = p => p.kind === 'monitor';
-  const primary = all.filter(p => !isPair(p) && !isMonitor(p));
+  const isSub = p => p.kind === 'subagent';
+  const primary = all.filter(p => !isPair(p) && !isMonitor(p) && !isSub(p));
   const pairPersonas = all.filter(isPair);
   const monitorPersonas = all.filter(isMonitor);
+  const subPersonas = all.filter(isSub);
   if(sel){
     const def = (primary.find(p => p.default) || primary[0] || {}).id || '';
     sel.innerHTML = primary.map(p =>
@@ -2719,10 +2736,22 @@ async function loadPersonas(){
     msel.title = personaSummary(msel.value);
     msel.onchange = () => { msel.title = personaSummary(msel.value); localStorage.setItem('processos.monitorPersona', msel.value); };
   }
+  // Subagent persona picker (subagent-kind personas only).
+  const ssel = $('#chatSubPersona');
+  if(ssel){
+    const want = localStorage.getItem('processos.subPersona') || 'subagent-researcher';
+    ssel.innerHTML = subPersonas.map(p =>
+      '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
+      || '<option value="subagent-researcher">Researcher</option>';
+    ssel.title = personaSummary(ssel.value);
+    ssel.onchange = () => { ssel.title = personaSummary(ssel.value); localStorage.setItem('processos.subPersona', ssel.value); };
+  }
   await fillPairProfiles();
   wirePairControls();
   await fillMonitorProfiles();
   wireMonitorControls();
+  await fillSubProfiles();
+  wireSubControls();
 }
 // ── partner roles (pair / monitor) + active-model roster ─────────────────────
 // An investigation runs a PRIMARY model plus, optionally, ONE partner — a sparring partner
@@ -2734,6 +2763,7 @@ function partnerProfileIds(){
   const ids = new Set();
   const pr = pairRequest(); if(pr && pr.profileId) ids.add(pr.profileId);
   const mr = monitorRequest(); if(mr && mr.profileId) ids.add(mr.profileId);
+  const sr = subRequest(); if(sr && sr.profileId) ids.add(sr.profileId);
   return ids;
 }
 // Re-fill both partner pickers (preserving each selection when still valid) so they always exclude
@@ -2741,6 +2771,7 @@ function partnerProfileIds(){
 async function refreshPartnerPickers(){
   await fillPairProfiles();
   await fillMonitorProfiles();
+  await fillSubProfiles();
   refreshChatRoster();
 }
 // Populate the Pair AI reviewer's LLM-profile picker. Excludes the active primary and the monitor's
@@ -2819,6 +2850,48 @@ function monitorRequest(){
   const profileId = ($('#chatMonitorProfile')||{}).value || undefined;
   const personaId = ($('#chatMonitorPersona')||{}).value || undefined;
   return { enabled: true, profileId, personaId };
+}
+
+// Populate the subagent's LLM-profile picker. Excludes the active primary and the other partners.
+// Defaults to a sidecar profile when free (subagents do the cheap, noisy exploration).
+async function fillSubProfiles(){
+  const sel = $('#chatSubProfile'); if(!sel) return;
+  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
+  const pairSel = $('#chatPairProfile'), monSel = $('#chatMonitorProfile');
+  const pairActive = $('#chatPairOn') && $('#chatPairOn').checked && pairSel ? pairSel.value : null;
+  const monActive = $('#chatMonitorOn') && $('#chatMonitorOn').checked && monSel ? monSel.value : null;
+  const taken = new Set([s.activeProfile, pairActive, monActive].filter(Boolean));
+  const profiles = (s.profiles || []).filter(p => !taken.has(p.id));
+  const saved = localStorage.getItem('processos.subProfile');
+  const sidecar = (profiles.find(p => p.sidecar) || {}).id;
+  const fallback = sidecar || (profiles[0] || {}).id || '';
+  const want = (saved && profiles.some(p => p.id===saved)) ? saved : ((sel.value && profiles.some(p=>p.id===sel.value)) ? sel.value : fallback);
+  sel.innerHTML = profiles.length
+    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
+    : '<option value="">No other profile available</option>';
+  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.subProfile', sel.value); refreshPartnerPickers(); };
+}
+// Wire the Subagent on/off toggle: reveal config when on, persist, refresh partner pickers.
+function wireSubControls(){
+  const on = $('#chatSubOn'), cfg = $('#chatSubCfg'); if(!on || !cfg) return;
+  const sync = () => {
+    cfg.style.display = on.checked ? '' : 'none';
+    localStorage.setItem('processos.subOn', on.checked ? '1' : '0');
+    refreshPartnerPickers();
+  };
+  on.checked = localStorage.getItem('processos.subOn') === '1';
+  on.onchange = sync;
+  sync();
+}
+// The subagent config the composer will send (or null when off). maxRounds/digestCap are advanced.
+function subRequest(){
+  const on = $('#chatSubOn');
+  if(!on || !on.checked) return null;
+  const profileId = ($('#chatSubProfile')||{}).value || undefined;
+  const personaId = ($('#chatSubPersona')||{}).value || undefined;
+  const maxRounds = parseInt(($('#chatSubRounds')||{}).value,10) || undefined;
+  const digestCap = parseInt(($('#chatSubDigest')||{}).value,10) || undefined;
+  return { enabled: true, profileId, personaId, maxRounds, digestCap };
 }
 
 // Paint the active-model roster beside the Send button: the PRIMARY plus any enabled partner,
@@ -2999,7 +3072,7 @@ async function sendChat(ws, proc){
     onErrorRestore: () => { box.value = msg; },
     fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined })
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined, subagent: subRequest() || undefined })
     }),
   });
 }

@@ -29,6 +29,29 @@ struct PyEnv {
     workdir: PathBuf,
 }
 
+/// Configuration for the `delegate` tool: the primary can hand a self-contained research task
+/// to a subagent that runs in its own context with read-only tools and reports back a compact
+/// digest, sparing the primary's context window. `None` ⇒ the tool is not offered.
+pub struct SubAgent {
+    /// The subagent's LLM connection (its own profile — often a small/fast model).
+    pub cfg: LlmConfig,
+    /// Display name for provenance (cockpit attribution).
+    pub name: String,
+    /// The subagent persona's system prompt.
+    pub system: String,
+    /// Tool-loop budget for one delegated task.
+    pub max_rounds: usize,
+    /// Hard cap (chars) on the digest returned to the primary — context protection.
+    pub digest_cap: usize,
+    /// The trace source + cap the subagent builds its OWN dataset from (independent DuckDB
+    /// connection, so it never shares the primary's non-Send analysis across threads). Filled in
+    /// by [`run_chat_turn`] from the bound dataset; the request builder leaves it `None`.
+    pub src: Option<TraceSource>,
+    pub limit: usize,
+    /// The BPMN model XML, if any, so the subagent gets read_model too.
+    pub model: Option<String>,
+}
+
 /// A [`ToolBox`] exposing the read-only trace-analysis surface to the model, and
 /// optionally a (trusted) Python escape hatch and the BPMN model-analysis tools.
 pub struct AnalysisTools {
@@ -40,6 +63,8 @@ pub struct AnalysisTools {
     /// Recorded-input instances for replay, distilled once per turn. Enables the
     /// `simulate` / `compare_variants` Alternate Reality Engine tools.
     recorded: Option<crate::experiment::RecordedDataset>,
+    /// When set, exposes the `delegate` tool so the primary can spawn a subagent.
+    sub: Option<SubAgent>,
 }
 
 impl Drop for AnalysisTools {
@@ -58,6 +83,7 @@ impl AnalysisTools {
             python: None,
             model: None,
             recorded: None,
+            sub: None,
         }
     }
 
@@ -85,7 +111,13 @@ impl AnalysisTools {
             python,
             model: None,
             recorded: None,
+            sub: None,
         }
+    }
+
+    /// Attach a subagent so the `delegate` tool becomes available. A `None` leaves it off.
+    pub fn set_subagent(&mut self, sub: Option<SubAgent>) {
+        self.sub = sub;
     }
 
     /// Attach the process's BPMN model so the structural model-analysis tools become
@@ -464,6 +496,30 @@ impl ToolBox for AnalysisTools {
                 }),
             });
         }
+        if self.sub.is_some() {
+            specs.push(ToolSpec {
+                name: "delegate".into(),
+                description: "Delegate a SELF-CONTAINED research sub-task to a subagent that runs \
+                    in its OWN context with read-only tools and reports back a compact digest. Use \
+                    this to keep YOUR context lean: offload noisy multi-query exploration (mapping \
+                    a job's queue/failure profile, scanning a time window, characterising one job \
+                    type) and get back only the conclusion + key figures — not dozens of raw query \
+                    results. Give a crisp task with success criteria; the subagent cannot edit the \
+                    model or run Python. Returns the subagent's digest (truncated if very long)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The self-contained research question to investigate, \
+                                with enough context to act without your transcript."
+                        }
+                    },
+                    "required": ["task"]
+                }),
+            });
+        }
         specs
     }
 
@@ -576,7 +632,140 @@ impl ToolBox for AnalysisTools {
                 let v = crate::experiment::compare_variants(self.model.as_deref(), ds, args)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise comparison: {e}"))
             }
+            "delegate" => {
+                let sub = self
+                    .sub
+                    .as_ref()
+                    .ok_or("delegate is not enabled for this investigation")?;
+                let task = args["task"]
+                    .as_str()
+                    .ok_or("delegate requires a string 'task' argument")?
+                    .trim();
+                if task.is_empty() {
+                    return Err("delegate requires a non-empty 'task'".into());
+                }
+                // The subagent runs in its OWN context with its OWN dataset (independent DuckDB
+                // connection built from a cloned source) and read-only tools — no delegate (no
+                // recursion), no edit/python. We surface only its capped digest, protecting the
+                // primary's context window. Build it on a fresh thread+runtime so it works under
+                // either runtime flavour and never shares the non-Send analysis.
+                let cfg = sub.cfg.clone();
+                let system = sub.system.clone();
+                let src = sub
+                    .src
+                    .clone()
+                    .ok_or("delegate: subagent has no bound dataset")?;
+                let limit = sub.limit;
+                let model_xml = sub.model.clone();
+                let max_rounds = sub.max_rounds;
+                let task_owned = task.to_string();
+                let digest = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| format!("subagent runtime: {e}"))?;
+                    rt.block_on(async move {
+                        let analysis = Analysis::from_source(&src, limit).await?;
+                        let research = ResearchTools {
+                            analysis: &analysis,
+                            model: model_xml.as_deref(),
+                        };
+                        let model = OpenAiAgent { cfg };
+                        run_agent(&model, &research, &system, &task_owned, max_rounds)
+                            .await
+                            .map(|run| run.answer)
+                    })
+                })
+                .join()
+                .map_err(|_| "subagent thread panicked".to_string())??;
+                let digest = clip_digest(&digest, sub.digest_cap);
+                let digest = clip_digest(&digest, sub.digest_cap);
+                Ok(serde_json::json!({
+                    "subagent": sub.name,
+                    "task": task,
+                    "digest": digest,
+                })
+                .to_string())
+            }
             other => Err(format!("unknown tool '{other}'")),
+        }
+    }
+}
+
+/// Truncate a subagent digest to `cap` chars, appending a marker so the primary knows it was cut.
+fn clip_digest(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…[digest truncated to {cap} chars]", &s[..end])
+}
+
+/// The read-only research surface a delegated subagent gets: the same trace/model/replay tools
+/// as the primary, but borrowing the parent's data and OMITTING `delegate` (no recursion),
+/// `run_python` and `edit_model` (no side effects). Keeps a subagent strictly an investigator.
+struct ResearchTools<'a> {
+    analysis: &'a Analysis,
+    model: Option<&'a str>,
+}
+
+impl ToolBox for ResearchTools<'_> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = vec![
+            ToolSpec {
+                name: "query_traces".into(),
+                description: format!(
+                    "Run a single read-only DuckDB SQL query (SELECT/WITH only) over the captured \
+                     trace dataset and return the (row-capped) result.\n\n{}",
+                    self.analysis.schema_doc()
+                ),
+                parameters: json!({
+                    "type": "object",
+                    "properties": { "sql": { "type": "string" } },
+                    "required": ["sql"]
+                }),
+            },
+            ToolSpec {
+                name: "discover_flow".into(),
+                description: "Mine the directly-follows graph the trace implies. Takes no \
+                    arguments."
+                    .into(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            },
+        ];
+        if self.model.is_some() {
+            specs.push(ToolSpec {
+                name: "read_model".into(),
+                description: "Structural view of the BPMN model. Args: expand (boolean).".into(),
+                parameters: json!({ "type": "object", "properties": { "expand": {"type":"boolean"} } }),
+            });
+        }
+        specs
+    }
+
+    fn call(&self, name: &str, args: &Value) -> Result<String, String> {
+        match name {
+            "query_traces" => {
+                let sql = args["sql"].as_str().ok_or("query_traces requires 'sql'")?;
+                serde_json::to_string(&self.analysis.query(sql)?)
+                    .map_err(|e| format!("serialise result: {e}"))
+            }
+            "discover_flow" => serde_json::to_string(&crate::conformance::discover_flow(self.analysis)?)
+                .map_err(|e| format!("serialise flow: {e}")),
+            "read_model" => {
+                let xml = self.model.ok_or("read_model: this process has no BPMN model")?;
+                let expand = args.get("expand").and_then(|v| v.as_bool()).unwrap_or(false);
+                let v = if expand {
+                    crate::bpmn_model::read_model_expanded(xml)?
+                } else {
+                    crate::bpmn_model::read_model(xml)?
+                };
+                serde_json::to_string(&v).map_err(|e| format!("serialise model: {e}"))
+            }
+            other => Err(format!("subagent has no tool '{other}'")),
         }
     }
 }
@@ -725,6 +914,7 @@ pub async fn run_chat_turn(
     steer: Option<&std::sync::Mutex<Vec<String>>>,
     sink: &mut dyn FnMut(AgentEvent),
     pairs: &[PairStage],
+    subagent: Option<SubAgent>,
     mut messages: Vec<Msg>,
     user_message: &str,
     mut checkpoint: Checkpoint<'_>,
@@ -747,12 +937,19 @@ pub async fn run_chat_turn(
         .as_ref()
         .map(|x| !x.trim().is_empty())
         .unwrap_or(false);
+    let model_for_sub = model_xml.clone();
     tools.set_model(model_xml);
     if has_model {
         let cap = crate::experiment::recorded_cap(src);
         let recorded = crate::experiment::build_recorded_dataset(src, cap).await;
         tools.set_recorded(Some(recorded));
     }
+    tools.set_subagent(subagent.map(|mut s| {
+        s.src = Some(src.clone());
+        s.limit = limit;
+        s.model = model_for_sub;
+        s
+    }));
     let model = OpenAiAgent { cfg };
 
     // Seed the system message (with one-time dataset framing) only at the start of a

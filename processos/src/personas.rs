@@ -28,12 +28,22 @@ pub const DEFAULT_PAIR_PERSONA_ID: &str = "pair-skeptic";
 /// The id of the default loop-monitor persona (used when the monitor is enabled with none named).
 pub const DEFAULT_MONITOR_PERSONA_ID: &str = "monitor-loop-breaker";
 
+/// The id of the default subagent persona (used when delegation is enabled with none named).
+pub const DEFAULT_SUBAGENT_PERSONA_ID: &str = "subagent-researcher";
+
 /// Last-resort pair system prompt if the built-in library is somehow unavailable.
 const FALLBACK_PAIR_SYSTEM: &str = "\
 You are a skeptical reviewer paired with a primary analyst on a captured BPMN trace dataset. \
 You are shown the operator's question and the primary analyst's answer. Pressure-test that \
 answer against the data using query_traces, name what held up and what did not with figures, \
 and deliver a sharper corrected bottom line. Clear prose for a human; do NOT emit JSON.";
+
+/// Last-resort subagent system prompt if the built-in library is somehow unavailable.
+const FALLBACK_SUBAGENT_SYSTEM: &str = "\
+You are a research subagent delegated a single self-contained task by a primary analyst. \
+Investigate ONLY that task with the read-only tools, then report a compact, self-contained \
+digest: the answer, the few figures that support it (with sample sizes), and any caveat. Be \
+concise — your reply is fed back into the primary's limited context. Clear prose; no JSON.";
 
 /// What an agent built from this persona is *for*. An **investigator** is a primary analyst
 /// the operator drives directly; a **pair** is a second agent that reviews/refines a primary's
@@ -49,6 +59,11 @@ pub enum PersonaKind {
     /// when it goes in circles. Offered only in the monitor picker, never as a primary chat
     /// persona. See [`crate::monitor`].
     Monitor,
+    /// A subagent: a worker the primary investigator can DELEGATE a self-contained research
+    /// task to (the `delegate` tool). It runs in its own context with read-only tools and
+    /// reports back a compact digest, sparing the primary's context window. Offered only in the
+    /// subagent picker, never as a primary chat persona.
+    Subagent,
 }
 
 /// A selectable chat persona (a standing system prompt).
@@ -169,6 +184,31 @@ impl PersonaStore {
         match pick {
             Some(p) => (p.id, p.system),
             None => (DEFAULT_MONITOR_PERSONA_ID.to_string(), String::new()),
+        }
+    }
+
+    /// Resolve a subagent persona to `(id, name, system_prompt)`. Falls back to the default
+    /// researcher ([`DEFAULT_SUBAGENT_PERSONA_ID`]) when the id is unknown/absent, and to a
+    /// built-in researcher prompt if even that is missing — delegation must always be able to run.
+    pub fn resolve_subagent(&self, id: Option<&str>) -> (String, String, String) {
+        let want = id.map(str::trim).filter(|s| !s.is_empty());
+        let pick = want
+            .and_then(|id| self.get(id))
+            .or_else(|| self.get(DEFAULT_SUBAGENT_PERSONA_ID));
+        match pick {
+            Some(p) => {
+                let name = if p.name.trim().is_empty() {
+                    p.id.clone()
+                } else {
+                    p.name.clone()
+                };
+                (p.id, name, p.system)
+            }
+            None => (
+                DEFAULT_SUBAGENT_PERSONA_ID.to_string(),
+                "Researcher".to_string(),
+                FALLBACK_SUBAGENT_SYSTEM.to_string(),
+            ),
         }
     }
 
@@ -643,6 +683,34 @@ instruction, or empty>\"}\n\
 When circling is true, 'steer' must name the ONE concrete next action to take now. Prefer letting \
 the agent act and iterate over more analysis. If it is genuinely progressing, return \
 circling=false with an empty steer."
+                .into(),
+            builtin: true,
+            default: false,
+        },
+        // ── Subagent (delegation) ────────────────────────────────────────────
+        // A worker the PRIMARY investigator can hand a self-contained research task to via the
+        // `delegate` tool. It runs in its own context with read-only tools and returns only a
+        // compact digest, so noisy multi-query exploration never bloats the primary's context.
+        Persona {
+            id: DEFAULT_SUBAGENT_PERSONA_ID.into(),
+            kind: PersonaKind::Subagent,
+            name: "Researcher".into(),
+            summary: "A delegated worker: does a focused, read-only investigation and reports \
+                      back a compact digest, sparing the primary's context window."
+                .into(),
+            system: "\
+You are a research subagent. A primary analyst has delegated you ONE self-contained task on a \
+captured BPMN trace dataset. Investigate only that task — do not broaden scope. Use the read-only \
+tools (query_traces, discover_flow, read_model, simulate, …) to gather just enough evidence, then \
+stop.\n\
+\n\
+State a hypothesis before you query; prefer queries that report an EFFECT SIZE and a SAMPLE SIZE; \
+replicate a key claim on a held-out slice before trusting it. Do NOT keep digging once the task is \
+answered.\n\
+\n\
+Report a COMPACT, self-contained digest: the direct answer, the 2-4 figures that justify it (with \
+counts), and any caveat — nothing the primary must re-derive. Your reply is fed back into the \
+primary's limited context, so be terse. Clear prose for a human; do NOT emit JSON."
                 .into(),
             builtin: true,
             default: false,
