@@ -10284,18 +10284,21 @@ mod clustered_startup_tests {
         // Every partition must have an elected leader before creates fan out
         // round-robin across all three; otherwise a create routed to a partition
         // whose leader hasn't been elected yet (e.g. on a slow CI runner) comes
-        // back non-200. Node 0, an RF=3 voter in every partition, is the vantage
-        // point: it must see itself leading partition 0 and *some* leader settled
-        // for partitions 1 and 2.
-        let leader_of = |p: u64| {
-            node0
+        // back non-200. Check each partition from its owning node (node `p` leads
+        // partition `p` in this symmetric topology) — node 0 is only a learner for
+        // partitions 1 and 2 under leader-durable replication, so it can't observe
+        // their leaders.
+        let nodes = [&node0, &node1, &node2];
+        let leads_own = |p: usize| -> bool {
+            nodes[p]
                 .raft_registry()
-                .get(p)
+                .get(p as u64)
                 .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+                == Some(p as u64)
         };
         let mut ok = false;
         for _ in 0..500 {
-            if leader_of(0) == Some(0) && leader_of(1).is_some() && leader_of(2).is_some() {
+            if (0..3).all(leads_own) {
                 ok = true;
                 break;
             }
@@ -10303,7 +10306,7 @@ mod clustered_startup_tests {
         }
         assert!(
             ok,
-            "every partition must have an elected leader before creates"
+            "every partition must have its owning node as leader before creates"
         );
         (node0, node1, node2, serve_handles)
     }
