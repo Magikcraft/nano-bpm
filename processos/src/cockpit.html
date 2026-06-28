@@ -1487,7 +1487,7 @@ async function renderWorkspace(ws, proc){
               <select id="chatMonitorProfile" title="The monitor's LLM profile (defaults to the local sidecar)"></select>
               <select id="chatMonitorPersona" title="The monitor's persona (how it decides to intervene)"></select>
             </span>
-            <label class="persona-pick" id="chatSubToggle" title="Subagent: lets the primary delegate self-contained research tasks (the `delegate` tool) to a second model that investigates in its own context with read-only tools and reports back only a compact digest. Protects the primary's context window on long, query-heavy investigations. Off by default. Use a cheap/fast model — it does the noisy exploration.">
+            <label class="persona-pick" id="chatSubToggle" title="Subagent: lets the primary delegate self-contained research tasks (the delegate tool) to a second model that investigates in its own context with read-only tools and reports back only a compact digest. Protects the primary's context window on long, query-heavy investigations. Off by default. Use a cheap/fast model — it does the noisy exploration.">
               <span><input type="checkbox" id="chatSubOn" style="vertical-align:-1px"> Subagent</span>
             </label>
             <span class="persona-pick" id="chatSubCfg" style="display:none">
