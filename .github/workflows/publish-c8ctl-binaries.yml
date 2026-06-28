@@ -238,9 +238,12 @@ jobs:
           GH_TOKEN: ${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}
         run: |
           set -euo pipefail
-          ver="${GITHUB_REF_NAME:-$(git rev-parse --short HEAD)}"
+          # This job downloads artifacts only (no checkout), so derive the
+          # version/sha from GitHub-provided env vars rather than `git` in the
+          # workspace (which has no .git and would fail under `set -e`).
+          ver="${GITHUB_REF_NAME:-${GITHUB_SHA:0:7}}"
           ver="${ver#v}"
-          sha="$(git rev-parse --short HEAD)"
+          sha="${GITHUB_SHA:0:7}"
           now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           tmp="$(mktemp -d)"
           git clone --depth 1 \
