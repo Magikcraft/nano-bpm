@@ -48,20 +48,25 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             asset: processos-darwin-arm64
-          - target: x86_64-apple-darwin
-            os: macos-14
-            asset: processos-darwin-x64
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
-            asset: processos-linux-x64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
-            asset: processos-linux-arm64
-            apt: g++-aarch64-linux-gnu
-            linker: aarch64-linux-gnu-g++
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-            asset: processos-win32-x64.exe
+          # Other platforms are disabled to cut CI time — the full DuckDB
+          # cross-build matrix takes ~30 min/leg. Re-enable any of these when we
+          # have users on that platform (all five were validated end-to-end in
+          # run 28309081340). The linux-arm64 leg needs the `apt`/`linker` keys
+          # for the bundled DuckDB C++ amalgamation.
+          # - target: x86_64-apple-darwin
+          #   os: macos-14
+          #   asset: processos-darwin-x64
+          # - target: x86_64-unknown-linux-gnu
+          #   os: ubuntu-24.04
+          #   asset: processos-linux-x64
+          # - target: aarch64-unknown-linux-gnu
+          #   os: ubuntu-24.04
+          #   asset: processos-linux-arm64
+          #   apt: g++-aarch64-linux-gnu
+          #   linker: aarch64-linux-gnu-g++
+          # - target: x86_64-pc-windows-msvc
+          #   os: windows-2022
+          #   asset: processos-win32-x64.exe
     steps:
       - uses: actions/checkout@v4
 

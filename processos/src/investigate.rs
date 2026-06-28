@@ -874,7 +874,13 @@ mod tests {
     fn corpus_tools() -> AnalysisTools {
         let def = corpus::tests::loan_def();
         let pack = corpus::tests::loan_pack();
-        let tmp = std::env::temp_dir().join(format!("invest-test-{}", std::process::id()));
+        // Unique per call: these tests run in parallel and each removes its own
+        // dir, so a shared per-PID path would race (one test's cleanup deletes
+        // another's dir mid-write).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp =
+            std::env::temp_dir().join(format!("invest-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         corpus::generate(&pack, &def, &tmp).expect("generate corpus");
         let src = TraceSource::Dataset(std::sync::Arc::new(
