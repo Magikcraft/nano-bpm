@@ -1826,6 +1826,7 @@ async fn projects_list() -> Response {
         "projects": out,
         "denoAvailable": sup.deno_available(),
         "platforms": projects::PLATFORMS,
+        "templates": projects::TEMPLATES.iter().map(|(id, label)| serde_json::json!({"id": id, "label": label})).collect::<Vec<_>>(),
     }))
     .into_response()
 }
@@ -1836,11 +1837,14 @@ struct CreateProjectBody {
     name: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    template: Option<String>,
 }
 
 /// `POST /console/api/projects` — scaffold a new project.
 async fn project_create(Json(body): Json<CreateProjectBody>) -> Response {
-    match projects::create_project(&body.name, &body.description) {
+    let template = body.template.as_deref().unwrap_or("starter");
+    match projects::create_project(&body.name, &body.description, template) {
         Ok(cfg) => (StatusCode::CREATED, Json(cfg)).into_response(),
         Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, e).into_response(),
         Err(e) if e.contains("invalid") => (StatusCode::BAD_REQUEST, e).into_response(),

@@ -581,11 +581,17 @@ export interface RunState {
   compiling: boolean;
 }
 
+export interface ProjectTemplate {
+  id: string;
+  label: string;
+}
+
 export interface ProjectsResponse {
   projects: ProjectSummary[];
   /** Whether a Deno runtime is available to actually run/compile projects. */
   denoAvailable: boolean;
   platforms: string[];
+  templates?: ProjectTemplate[];
 }
 
 export interface ProjectDetail {
@@ -610,11 +616,11 @@ export const projectsApi = {
   projects: () => getJson<ProjectsResponse>("/projects"),
   project: (name: string) =>
     getJson<ProjectDetail>(`/projects/${encodeURIComponent(name)}`),
-  createProject: (name: string, description: string) =>
+  createProject: (name: string, description: string, template?: string) =>
     send<ProjectConfig>(
       "POST",
       "/projects",
-      JSON.stringify({ name, description }),
+      JSON.stringify({ name, description, template }),
       "application/json",
     ),
   deleteProject: (name: string) =>

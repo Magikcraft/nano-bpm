@@ -54,6 +54,15 @@ pub const PLATFORMS: &[&str] = &[
     "x86_64-pc-windows-msvc",
 ];
 
+/// The project templates the scaffolder can stamp out. `(id, label)`.
+pub const TEMPLATES: &[(&str, &str)] = &[
+    ("starter", "Starter app — one process, one worker"),
+    (
+        "throughput",
+        "Throughput Explorer — 30s ramp benchmark (see how fast it is)",
+    ),
+];
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -344,6 +353,133 @@ const WORKER_DENO_JSON: &str = r#"{
 }
 "#;
 
+// ---------------------------------------------------------------------------
+// "Throughput Explorer" demo template — a 30-second ceiling finder
+// ---------------------------------------------------------------------------
+
+/// A minimal one-task process: start → single service task ("tick") → end. The
+/// worker auto-completes, so each created instance runs end-to-end through the
+/// engine: this measures create + worker-complete throughput.
+const DEMO_PROCESS_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-throughput-demo" targetNamespace="http://nanobpm">
+  <bpmn:process id="throughput-demo" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="task" />
+    <bpmn:serviceTask id="task" name="Tick">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="tick" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="task" targetRef="end" />
+    <bpmn:endEvent id="end" />
+  </bpmn:process>
+</bpmn:definitions>
+"#;
+
+/// The single worker: drains "tick" jobs as fast as it can, fire-and-forget.
+const DEMO_WORKER_TS: &str = r#"import { defineWorker } from "@nanobpm/worker";
+
+// Drains "tick" jobs as fast as the engine emits them. High parallelism + an
+// empty handler keep the worker off the critical path so the engine sets the
+// ceiling, not the worker.
+defineWorker({
+  type: "tick",
+  maxParallelJobs: 200,
+  async handle() {
+    return {};
+  },
+});
+"#;
+
+/// The explorer entrypoint: deploy, start the worker, then ramp instance
+/// creation every 2s for 30s and report the peak sustained rate.
+const DEMO_MAIN_TS: &str = r#"// Throughput Explorer — finds the out-of-the-box process-instance ceiling.
+//
+// For 30 seconds it fires-and-forgets process-instance creates (no awaiting
+// completion) with a concurrency pool that ramps up every 2 seconds. The single
+// "tick" worker drains the resulting jobs. Each second it prints the achieved
+// creates/sec; at the end it reports the peak. This is a stock laptop demo — no
+// tuning, just "see how fast it is".
+
+const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const PROCESS_ID = "throughput-demo";
+const DURATION_MS = 30_000;
+const RAMP_EVERY_MS = 2_000;
+const RAMP_STEP = 32; // +32 concurrent creators every 2s
+
+async function deploy(): Promise<void> {
+  const xml = await Deno.readTextFile("resources/processes/throughput.bpmn");
+  const form = new FormData();
+  form.append("resources", new Blob([xml], { type: "text/xml" }), "throughput.bpmn");
+  const res = await fetch(`${BASE_URL}/v2/deployments`, { method: "POST", body: form });
+  if (!res.ok) throw new Error(`deploy failed: ${res.status} ${await res.text().catch(() => "")}`);
+  console.log(`deployed ${PROCESS_ID} to ${BASE_URL}`);
+}
+
+await deploy();
+// Start the tick worker (drains jobs created below).
+Deno.env.set("NANOBPMN_BASE_URL", BASE_URL);
+Deno.env.set("NANOBPMN_WORKER_NAME", "tick");
+await import("./workers/tick/worker.ts");
+
+let created = 0;
+let running = true;
+let concurrency = 0;
+
+async function creator(): Promise<void> {
+  const body = JSON.stringify({ processDefinitionId: PROCESS_ID, awaitCompletion: false });
+  const headers = { "content-type": "application/json" };
+  while (running) {
+    try {
+      const r = await fetch(`${BASE_URL}/v2/process-instances`, { method: "POST", body, headers });
+      await r.body?.cancel(); // free the connection promptly
+      if (r.ok) created++;
+    } catch { /* keep pushing */ }
+  }
+}
+
+console.log("ramping process-instance creation for 30s…\n");
+const t0 = performance.now();
+let lastCreated = 0;
+let peak = 0;
+
+const tick = setInterval(() => {
+  const total = created;
+  const rate = total - lastCreated;
+  lastCreated = total;
+  if (rate > peak) peak = rate;
+  console.log(`t+${Math.round((performance.now() - t0) / 1000)}s  conc=${concurrency}  ${rate}/s  (total ${total})`);
+}, 1000);
+
+const ramp = setInterval(() => {
+  for (let i = 0; i < RAMP_STEP; i++) creator();
+  concurrency += RAMP_STEP;
+}, RAMP_EVERY_MS);
+
+for (let i = 0; i < RAMP_STEP; i++) creator();
+concurrency = RAMP_STEP;
+
+setTimeout(() => {
+  running = false;
+  clearInterval(tick);
+  clearInterval(ramp);
+  console.log(`\n=== peak ${peak} instances/sec (single-task, fire-and-forget) ===`);
+  console.log(`=== ${created} instances created in 30s, ~${Math.round(created / 30)}/s average ===`);
+  Deno.exit(0);
+}, DURATION_MS);
+"#;
+
+fn demo_readme() -> String {
+    "# Throughput Explorer\n\n\
+A 30-second benchmark demo: see how many process instances Nano can create and \
+complete out of the box. It fires-and-forgets `throughput-demo` instances with a \
+creator pool that ramps up every 2 seconds; the single `tick` worker drains the \
+jobs. Each second prints the achieved creates/sec, then it reports the peak.\n\n\
+## Run\n\n```sh\ndeno task start\n```\n\n\
+Open the engine (default `http://localhost:8080`) first, then Run.\n"
+        .into()
+}
+
 /// Materialises the embedded worker SDK into `<project>/.nanobpm/worker-sdk.ts`,
 /// overwriting any prior copy so project code imports the current version.
 pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
@@ -356,7 +492,9 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
 }
 
 /// Scaffolds a brand-new project directory. Fails if it already exists.
-pub fn create_project(name: &str, description: &str) -> Result<ProjectConfig, String> {
+/// `template` selects which starter content to stamp out ("starter" default, or
+/// "throughput" for the benchmark demo). Unknown templates fall back to starter.
+pub fn create_project(name: &str, description: &str, template: &str) -> Result<ProjectConfig, String> {
     let dir = project_dir(name).ok_or("invalid project name")?;
     if dir.exists() {
         return Err("a project with that name already exists".into());
@@ -367,20 +505,34 @@ pub fn create_project(name: &str, description: &str) -> Result<ProjectConfig, St
     mk(dir.join("resources").join("forms"))?;
     mk(dir.join("lib"))?;
     mk(dir.join(".nanobpm"))?;
-    let starter_worker = dir.join("workers").join("do-work");
-    mk(starter_worker.clone())?;
 
     let w = |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
-    w(dir.join("main.ts"), MAIN_TS)?;
-    w(dir.join("README.md"), &readme_md(name))?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
-    w(
-        dir.join("resources").join("processes").join(format!("{name}.bpmn")),
-        &starter_process(name),
-    )?;
-    w(starter_worker.join("worker.ts"), STARTER_WORKER_TS)?;
-    w(starter_worker.join("deno.json"), WORKER_DENO_JSON)?;
+
+    if template == "throughput" {
+        let worker = dir.join("workers").join("tick");
+        mk(worker.clone())?;
+        w(dir.join("main.ts"), DEMO_MAIN_TS)?;
+        w(dir.join("README.md"), &demo_readme())?;
+        w(
+            dir.join("resources").join("processes").join("throughput.bpmn"),
+            DEMO_PROCESS_BPMN,
+        )?;
+        w(worker.join("worker.ts"), DEMO_WORKER_TS)?;
+        w(worker.join("deno.json"), WORKER_DENO_JSON)?;
+    } else {
+        let starter_worker = dir.join("workers").join("do-work");
+        mk(starter_worker.clone())?;
+        w(dir.join("main.ts"), MAIN_TS)?;
+        w(dir.join("README.md"), &readme_md(name))?;
+        w(
+            dir.join("resources").join("processes").join(format!("{name}.bpmn")),
+            &starter_process(name),
+        )?;
+        w(starter_worker.join("worker.ts"), STARTER_WORKER_TS)?;
+        w(starter_worker.join("deno.json"), WORKER_DENO_JSON)?;
+    }
 
     let cfg = ProjectConfig::new(name, description);
     write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
@@ -1056,7 +1208,7 @@ mod tests {
     fn create_scaffolds_a_runnable_project() {
         let _g = lock();
         let root = temp_root();
-        let cfg = create_project("demo", "a demo").expect("create");
+        let cfg = create_project("demo", "a demo", "starter").expect("create");
         assert_eq!(cfg.name, "demo");
         assert_eq!(cfg.deploy_target, "http://localhost:8080");
         let dir = root.join("demo");
@@ -1067,14 +1219,28 @@ mod tests {
         assert!(dir.join("resources/processes/demo.bpmn").is_file());
         assert!(dir.join("workers/do-work/worker.ts").is_file());
         // Idempotency guard.
-        assert!(create_project("demo", "").is_err());
+        assert!(create_project("demo", "", "starter").is_err());
+    }
+
+    #[test]
+    fn throughput_template_scaffolds_demo_files() {
+        let _g = lock();
+        let root = temp_root();
+        create_project("bench", "", "throughput").expect("create");
+        let dir = root.join("bench");
+        assert!(dir.join("main.ts").is_file());
+        assert!(dir.join("resources/processes/throughput.bpmn").is_file());
+        assert!(dir.join("workers/tick/worker.ts").is_file());
+        assert!(!dir.join("workers/do-work").exists());
+        let bpmn = std::fs::read_to_string(dir.join("resources/processes/throughput.bpmn")).unwrap();
+        assert!(bpmn.contains("throughput-demo") && bpmn.contains(r#"type="tick""#));
     }
 
     #[test]
     fn lists_projects_with_counts() {
         let _g = lock();
         let _root = temp_root();
-        create_project("alpha", "").unwrap();
+        create_project("alpha", "", "starter").unwrap();
         let list = list_projects().unwrap();
         let alpha = list.iter().find(|p| p.name == "alpha").unwrap();
         assert_eq!(alpha.processes, 1);
@@ -1085,7 +1251,7 @@ mod tests {
     fn file_tree_hides_dotdirs_and_nests() {
         let _g = lock();
         let _root = temp_root();
-        create_project("tree", "").unwrap();
+        create_project("tree", "", "starter").unwrap();
         let nodes = file_tree("tree").unwrap();
         assert!(nodes.iter().all(|n| !n.name.starts_with('.')));
         let resources = nodes.iter().find(|n| n.name == "resources").unwrap();
@@ -1097,7 +1263,7 @@ mod tests {
     fn export_zip_bundles_the_project() {
         let _g = lock();
         let _root = temp_root();
-        create_project("ziptest", "").unwrap();
+        create_project("ziptest", "", "starter").unwrap();
         let zip = export_zip("ziptest", false).expect("zip");
         // Local file header signature.
         assert_eq!(&zip[0..4], &[0x50, 0x4b, 0x03, 0x04]);
@@ -1110,7 +1276,7 @@ mod tests {
     fn config_roundtrips() {
         let _g = lock();
         let _root = temp_root();
-        let mut cfg = create_project("cfg", "").unwrap();
+        let mut cfg = create_project("cfg", "", "starter").unwrap();
         cfg.deploy_target = "http://example.test:9999".into();
         cfg.platforms = vec!["aarch64-apple-darwin".into()];
         write_config("cfg", &cfg).unwrap();

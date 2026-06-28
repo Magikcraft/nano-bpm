@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { projectsApi, type ProjectSummary } from "../lib/api";
+import { projectsApi, type ProjectSummary, type ProjectTemplate } from "../lib/api";
 
 /// Home view of the RAD environment: every project as a tile (like the LLM
 /// profile tiles), plus a create form. Opening a tile routes to its workspace.
@@ -8,6 +8,8 @@ export default function Projects() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [denoAvailable, setDenoAvailable] = useState(true);
+  const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
+  const [newTemplate, setNewTemplate] = useState("starter");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -20,6 +22,7 @@ export default function Projects() {
       const res = await projectsApi.projects();
       setProjects(res.projects);
       setDenoAvailable(res.denoAvailable);
+      setTemplates(res.templates ?? []);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -37,7 +40,7 @@ export default function Projects() {
     if (!name) return;
     setBusy(true);
     try {
-      await projectsApi.createProject(name, newDesc.trim());
+      await projectsApi.createProject(name, newDesc.trim(), newTemplate);
       navigate(`/projects/${encodeURIComponent(name)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -105,6 +108,22 @@ export default function Projects() {
               onKeyDown={(e) => e.key === "Enter" && void create()}
             />
           </div>
+          {templates.length > 0 && (
+            <div className="mt-3">
+              <label className="mb-1 block text-xs text-zinc-500">Template</label>
+              <select
+                value={newTemplate}
+                onChange={(e) => setNewTemplate(e.target.value)}
+                className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-500"
+              >
+                {templates.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className="mt-3 flex items-center gap-3">
             <button
               onClick={() => void create()}
