@@ -80,7 +80,11 @@ jobs:
 
       - name: Install wasm-pack
         shell: bash
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        # Pinned install from crates.io. The old rustwasm.github.io installer is
+        # permanently stuck on v0.13.1 (the project moved to wasm-bindgen/wasm-pack),
+        # so installing a fixed version here keeps the build deterministic and
+        # silences wasm-pack's "newer version available" self-update warning.
+        run: cargo install wasm-pack --version 0.15.0 --locked
 
       - name: Generate REST layer + stubs
         shell: bash
