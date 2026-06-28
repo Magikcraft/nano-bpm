@@ -63,12 +63,25 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: astral-sh/setup-uv@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+      - name: Generate REST layer + stub impls
+        # The server depends on the path crate ../generated and on
+        # server/src/stub_impls.rs, both produced by codegen (gitignored). Mirror
+        # the release `prepare` job's codegen (Java + uv); no Node/wasm needed.
+        run: |
+          set -euo pipefail
+          uv sync
+          make generate
       - name: Stub console assets
         # The `console` feature embeds ../console/dist via rust-embed, but that
         # built frontend is gitignored. A stub satisfies the proc-macro so the
