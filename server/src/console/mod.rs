@@ -141,6 +141,7 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/projects/{name}/compile", axum::routing::post(project_compile))
         .route("/console/api/projects/{name}/export", get(project_export))
         .route("/console/api/extensions", get(extensions_list))
+        .route("/console/api/extensions/marketplace", get(extensions_marketplace))
         .route("/console/api/extensions/install", axum::routing::post(extensions_install))
         .route("/console/api/extensions/remove", axum::routing::post(extensions_remove))
         .route("/console/api/extensions/trust", axum::routing::post(extensions_trust))
@@ -1880,6 +1881,16 @@ async fn project_get(Path(name): Path<String>) -> Response {
 /// `GET /console/api/extensions` — installed + built-in packs and trust state.
 async fn extensions_list() -> Response {
     Json(extensions_overview()).into_response()
+}
+
+/// `GET /console/api/extensions/marketplace` — packs on npm tagged `nano-ide-ext`,
+/// categorised by language/app/example, with installed status.
+async fn extensions_marketplace() -> Response {
+    match tokio::task::spawn_blocking(extensions::marketplace).await {
+        Ok(Ok(list)) => Json(serde_json::json!({ "entries": list })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

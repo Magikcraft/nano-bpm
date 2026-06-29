@@ -335,6 +335,70 @@ pub fn remove(pkg: &str) -> Result<(), String> {
     std::fs::remove_dir_all(dir).map_err(|e| format!("remove: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// Marketplace — discover packs on npm by the `nano-ide-ext` keyword
+// ---------------------------------------------------------------------------
+
+/// The discovery keyword every published pack carries. The marketplace lists
+/// every npm package tagged with it; categories come from `nano-ide-{lang,app,
+/// example}`.
+pub const MARKETPLACE_KEYWORD: &str = "nano-ide-ext";
+
+/// One npm package surfaced in the marketplace.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketEntry {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    /// "lang" | "app" | "example" | "other", from keywords.
+    pub category: String,
+    pub installed: bool,
+}
+
+/// Browse npm for packs tagged `nano-ide-ext`. Shells out to `npm search`
+/// (npm is already required for install). Best-effort; empty on offline/error.
+pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
+    let npm = find_program("npm").ok_or("npm not found on PATH")?;
+    let out = std::process::Command::new(&npm)
+        .args(["search", &format!("keywords:{MARKETPLACE_KEYWORD}"), "--json"])
+        .output()
+        .map_err(|e| format!("npm search: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("npm search failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let raw: Vec<serde_json::Value> =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("parse search: {e}"))?;
+    let mut entries: Vec<MarketEntry> = raw
+        .into_iter()
+        .map(|p| {
+            let kws: Vec<String> = p["keywords"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let category = if kws.iter().any(|k| k == "nano-ide-lang") {
+                "lang"
+            } else if kws.iter().any(|k| k == "nano-ide-app") {
+                "app"
+            } else if kws.iter().any(|k| k == "nano-ide-example") {
+                "example"
+            } else {
+                "other"
+            };
+            let name = p["name"].as_str().unwrap_or_default().to_string();
+            MarketEntry {
+                installed: safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false),
+                version: p["version"].as_str().unwrap_or_default().to_string(),
+                description: p["description"].as_str().unwrap_or_default().to_string(),
+                category: category.to_string(),
+                name,
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+    Ok(entries)
+}
+
 /// Find a program on PATH (and the Cargo bin dir for Rust). Mirrors
 /// [`super::workers::find_deno`]'s resolution order.
 pub fn find_program(name: &str) -> Option<PathBuf> {

@@ -601,7 +601,7 @@ export interface ExtensionFileType {
 }
 export interface Extension {
   id: string;
-  kind: "lang" | "app";
+  kind: "lang" | "app" | "example";
   displayName: string;
   builtin: boolean;
   fileTypes: ExtensionFileType[];
@@ -612,6 +612,18 @@ export interface Extension {
 export interface ExtensionsOverview {
   extensions: Extension[];
   yolo: boolean;
+}
+
+/// A pack discoverable on npm (keyword `nano-ide-ext`), shown in the marketplace.
+export interface MarketEntry {
+  name: string;
+  version: string;
+  description: string;
+  category: "lang" | "app" | "example" | "other";
+  installed: boolean;
+}
+export interface Marketplace {
+  entries: MarketEntry[];
 }
 
 export interface ProjectDetail {
@@ -635,6 +647,7 @@ export interface ProjectLogLine {
 export const projectsApi = {
   projects: () => getJson<ProjectsResponse>("/projects"),
   extensions: () => getJson<ExtensionsOverview>("/extensions"),
+  marketplace: () => getJson<Marketplace>("/extensions/marketplace"),
   installExtension: (pkg: string) =>
     send<Extension>("POST", "/extensions/install", JSON.stringify({ pkg }), "application/json"),
   removeExtension: (pkg: string) =>
