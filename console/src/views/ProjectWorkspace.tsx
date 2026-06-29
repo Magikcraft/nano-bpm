@@ -28,6 +28,30 @@ export default function ProjectWorkspace() {
   const [showConfig, setShowConfig] = useState(false);
   const [showCompile, setShowCompile] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  const [consoleHeight, setConsoleHeight] = useState(() => {
+    const saved = Number(localStorage.getItem("nano.consoleHeight"));
+    return saved >= 80 && saved <= 1200 ? saved : 224;
+  });
+  const dragging = useRef(false);
+  const startDrag = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    dragging.current = true;
+    const onMove = (ev: MouseEvent) => {
+      if (!dragging.current) return;
+      const next = Math.min(Math.max(window.innerHeight - ev.clientY, 80), 1200);
+      setConsoleHeight(next);
+    };
+    const onUp = () => {
+      dragging.current = false;
+      localStorage.setItem("nano.consoleHeight", String(consoleHeightRef.current));
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, []);
+  const consoleHeightRef = useRef(consoleHeight);
+  consoleHeightRef.current = consoleHeight;
 
   const reloadFiles = useCallback(async () => {
     try {
@@ -185,7 +209,12 @@ export default function ProjectWorkspace() {
               </div>
             )}
           </div>
-          <RunConsole logs={logs} forwardRef={logRef} onClear={() => setLogs([])} />
+          <div
+            onMouseDown={startDrag}
+            className="h-1.5 shrink-0 cursor-row-resize bg-zinc-800 transition-colors hover:bg-violet-500"
+            title="Drag to resize console"
+          />
+          <RunConsole logs={logs} forwardRef={logRef} onClear={() => setLogs([])} height={consoleHeight} />
         </div>
       </div>
 
@@ -542,13 +571,15 @@ function RunConsole({
   logs,
   forwardRef,
   onClear,
+  height,
 }: {
   logs: ProjectLogLine[];
   forwardRef: React.RefObject<HTMLDivElement>;
   onClear: () => void;
+  height: number;
 }) {
   return (
-    <div className="flex h-56 shrink-0 flex-col bg-zinc-950">
+    <div className="flex shrink-0 flex-col bg-zinc-950" style={{ height }}>
       <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-1 text-xs uppercase tracking-wider text-zinc-500">
         <span>Output</span>
         <button onClick={onClear} className="rounded px-1.5 py-0.5 hover:bg-zinc-800 hover:text-zinc-300">
