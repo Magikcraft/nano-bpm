@@ -15,6 +15,45 @@ export class TestEngine {
         wasm.__wbg_testengine_free(ptr, 0);
     }
     /**
+     * Activate up to `max_jobs` `Created` jobs of `job_type`, locking them to
+     * `worker` until `now + timeout_ms`. Returns a JSON array of activated jobs
+     * (key, type, instance/element, retries, variables) for the dispatch loop to
+     * hand to worker handlers. The host owns the wall clock via `tickNow`.
+     * @param {string} job_type
+     * @param {number} max_jobs
+     * @param {number} timeout_ms
+     * @param {string} worker
+     * @returns {string}
+     */
+    activateJobs(job_type, max_jobs, timeout_ms, worker) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(job_type, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(worker, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_activateJobs(retptr, this.__wbg_ptr, ptr0, len0, max_jobs, timeout_ms, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * Advance the virtual clock by `by_ms` milliseconds, firing any timers that
      * become due and expiring any lapsed job locks.
      * @param {number} by_ms
@@ -41,7 +80,7 @@ export class TestEngine {
             return getStringFromWasm0(ptr1, len1);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred2_0, deferred2_1, 1);
+            wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
         }
     }
     /**
@@ -57,9 +96,9 @@ export class TestEngine {
         let deferred4_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
             wasm.testengine_completeJob(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -77,7 +116,7 @@ export class TestEngine {
             return getStringFromWasm0(ptr3, len3);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred4_0, deferred4_1, 1);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
         }
     }
     /**
@@ -94,9 +133,9 @@ export class TestEngine {
         let deferred4_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(process_id, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr0 = passStringToWasm0(process_id, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
             wasm.testengine_createInstance(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -114,7 +153,7 @@ export class TestEngine {
             return getStringFromWasm0(ptr3, len3);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred4_0, deferred4_1, 1);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
         }
     }
     /**
@@ -129,7 +168,7 @@ export class TestEngine {
         let deferred3_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(xml, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr0 = passStringToWasm0(xml, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
             wasm.testengine_deploy(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -147,7 +186,7 @@ export class TestEngine {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
         }
     }
     /**
@@ -176,7 +215,7 @@ export class TestEngine {
             return getStringFromWasm0(ptr1, len1);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred2_0, deferred2_1, 1);
+            wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
         }
     }
     /**
@@ -192,9 +231,9 @@ export class TestEngine {
         let deferred4_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passStringToWasm0(message, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr1 = passStringToWasm0(message, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
             wasm.testengine_failJob(retptr, this.__wbg_ptr, ptr0, len0, retries, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -212,7 +251,7 @@ export class TestEngine {
             return getStringFromWasm0(ptr3, len3);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred4_0, deferred4_1, 1);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
         }
     }
     /**
@@ -257,7 +296,39 @@ export class TestEngine {
             return getStringFromWasm0(ptr1, len1);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred2_0, deferred2_1, 1);
+            wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Set the engine clock to a wall-clock instant (ms), then trigger due timers
+     * and expire lapsed job locks. The embedded host calls this with `Date.now()`
+     * so `engine-core` stays clock-free while running as a real runtime. The
+     * clock never moves backwards. Returns the snapshot.
+     * @param {number} now_ms
+     * @returns {string}
+     */
+    tickNow(now_ms) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.testengine_tickNow(retptr, this.__wbg_ptr, now_ms);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
         }
     }
 }

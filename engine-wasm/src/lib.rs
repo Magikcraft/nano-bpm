@@ -150,6 +150,67 @@ impl TestEngine {
         to_json(&self.snapshot_value(None))
     }
 
+    /// Set the engine clock to a wall-clock instant (ms), then trigger due timers
+    /// and expire lapsed job locks. The embedded host calls this with `Date.now()`
+    /// so `engine-core` stays clock-free while running as a real runtime. The
+    /// clock never moves backwards. Returns the snapshot.
+    #[wasm_bindgen(js_name = tickNow)]
+    pub fn tick_now(&mut self, now_ms: f64) -> Result<String, JsValue> {
+        let now = if now_ms.is_finite() && now_ms > 0.0 { now_ms as u64 } else { 0 };
+        if now > self.now {
+            self.now = now;
+        }
+        let now = self.now;
+        self.apply(Command::TriggerTimers { now })
+            .map_err(|e| js_err(&format!("timer error: {e}")))?;
+        self.apply(Command::ExpireJobs { now })
+            .map_err(|e| js_err(&format!("expire error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Activate up to `max_jobs` `Created` jobs of `job_type`, locking them to
+    /// `worker` until `now + timeout_ms`. Returns a JSON array of activated jobs
+    /// (key, type, instance/element, retries, variables) for the dispatch loop to
+    /// hand to worker handlers. The host owns the wall clock via `tickNow`.
+    #[wasm_bindgen(js_name = activateJobs)]
+    pub fn activate_jobs(
+        &mut self,
+        job_type: &str,
+        max_jobs: u32,
+        timeout_ms: f64,
+        worker: &str,
+    ) -> Result<String, JsValue> {
+        let now = self.now;
+        let timeout = if timeout_ms.is_finite() && timeout_ms > 0.0 { timeout_ms as u64 } else { 30_000 };
+        self.apply(Command::ActivateJobs {
+            job_type: job_type.to_string(),
+            worker: worker.to_string(),
+            max_jobs: (max_jobs.max(1)) as usize,
+            timeout,
+            now,
+        })
+        .map_err(|e| js_err(&format!("activate error: {e}")))?;
+        let state = self.engine.state();
+        let mut out: Vec<serde_json::Value> = state
+            .jobs
+            .values()
+            .filter(|j| j.job_type == job_type && j.state == JobState::Activated && j.worker.as_deref() == Some(worker))
+            .map(|j| {
+                let vars = state.instances.get(&j.instance_key).map(|i| vars_to_json(&i.variables)).unwrap_or_default();
+                serde_json::json!({
+                    "key": j.key.to_string(),
+                    "type": j.job_type,
+                    "instanceKey": j.instance_key.to_string(),
+                    "elementId": j.element_id,
+                    "retries": j.retries,
+                    "variables": vars,
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
+        to_json(&serde_json::Value::Array(out))
+    }
+
     /// The current simulation state as a JSON [`Snapshot`].
     pub fn snapshot(&self) -> Result<String, JsValue> {
         to_json(&self.snapshot_value(None))

@@ -8,6 +8,13 @@ export class TestEngine {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * Activate up to `max_jobs` `Created` jobs of `job_type`, locking them to
+     * `worker` until `now + timeout_ms`. Returns a JSON array of activated jobs
+     * (key, type, instance/element, retries, variables) for the dispatch loop to
+     * hand to worker handlers. The host owns the wall clock via `tickNow`.
+     */
+    activateJobs(job_type: string, max_jobs: number, timeout_ms: number, worker: string): string;
+    /**
      * Advance the virtual clock by `by_ms` milliseconds, firing any timers that
      * become due and expiring any lapsed job locks.
      */
@@ -50,6 +57,13 @@ export class TestEngine {
      */
     snapshot(): string;
     /**
+     * Set the engine clock to a wall-clock instant (ms), then trigger due timers
+     * and expire lapsed job locks. The embedded host calls this with `Date.now()`
+     * so `engine-core` stays clock-free while running as a real runtime. The
+     * clock never moves backwards. Returns the snapshot.
+     */
+    tickNow(now_ms: number): string;
+    /**
      * The current virtual clock (milliseconds).
      */
     readonly now: number;
@@ -60,6 +74,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_testengine_free: (a: number, b: number) => void;
+    readonly testengine_activateJobs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_advanceTime: (a: number, b: number, c: number) => void;
     readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
@@ -69,10 +84,11 @@ export interface InitOutput {
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
     readonly testengine_snapshot: (a: number, b: number) => void;
+    readonly testengine_tickNow: (a: number, b: number, c: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export2: (a: number, b: number) => number;
-    readonly __wbindgen_export3: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export: (a: number, b: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export3: (a: number, b: number, c: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
