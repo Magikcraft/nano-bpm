@@ -1,6 +1,26 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { projectsApi, type ProjectSummary, type ProjectTemplate } from "../lib/api";
+
+/// Mirrors the server's `is_safe_name` (console/workspace.rs) so the New Project
+/// form can validate in real time instead of failing on submit. Returns a
+/// human-readable error, or `null` when the name is acceptable.
+function validateProjectName(
+  raw: string,
+  existing: ProjectSummary[],
+): string | null {
+  const name = raw.trim();
+  if (!name) return null; // empty is "incomplete", not an error to shout about
+  if (name.length > 128) return "Too long — 128 characters max.";
+  if (name === "." || name.includes(".."))
+    return "Cannot be “.” or contain “..”.";
+  if (/\s/.test(name)) return "No spaces — use dashes or underscores instead.";
+  const bad = [...name].find((c) => !/[A-Za-z0-9_.-]/.test(c));
+  if (bad) return `Invalid character “${bad}”. Use letters, digits, dashes, underscores or dots.`;
+  if (existing.some((p) => p.name.toLowerCase() === name.toLowerCase()))
+    return "A project with that name already exists.";
+  return null;
+}
 
 /// Home view of the RAD environment: every project as a tile (like the LLM
 /// profile tiles), plus a create form. Opening a tile routes to its workspace.
@@ -37,7 +57,7 @@ export default function Projects() {
 
   const create = async () => {
     const name = newName.trim();
-    if (!name) return;
+    if (!name || nameError) return;
     setBusy(true);
     try {
       await projectsApi.createProject(name, newDesc.trim(), newTemplate);
@@ -47,6 +67,12 @@ export default function Projects() {
       setBusy(false);
     }
   };
+
+  const nameError = useMemo(
+    () => validateProjectName(newName, projects),
+    [newName, projects],
+  );
+  const nameValid = newName.trim().length > 0 && !nameError;
 
   const remove = async (name: string) => {
     if (!confirm(`Delete project “${name}” and all its files? This cannot be undone.`)) return;
@@ -103,20 +129,35 @@ export default function Projects() {
       {creating && (
         <div className="mb-6 rounded-lg border border-zinc-800 bg-zinc-900 p-4">
           <div className="grid gap-3 sm:grid-cols-[1fr_2fr]">
-            <input
-              autoFocus
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="project-name"
-              className="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-violet-500"
-              onKeyDown={(e) => e.key === "Enter" && void create()}
-            />
+            <div>
+              <input
+                autoFocus
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="project-name"
+                aria-invalid={!!nameError}
+                className={`w-full rounded-md border bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none ${
+                  nameError
+                    ? "border-red-500/70 focus:border-red-500"
+                    : "border-zinc-700 focus:border-violet-500"
+                }`}
+                onKeyDown={(e) => e.key === "Enter" && nameValid && void create()}
+              />
+              <p
+                className={`mt-1 text-xs ${
+                  nameError ? "text-red-400" : "text-zinc-500"
+                }`}
+              >
+                {nameError ??
+                  "Letters, digits, dashes, underscores and dots — no spaces."}
+              </p>
+            </div>
             <input
               value={newDesc}
               onChange={(e) => setNewDesc(e.target.value)}
               placeholder="Short description (optional)"
-              className="rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-violet-500"
-              onKeyDown={(e) => e.key === "Enter" && void create()}
+              className="h-fit rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 outline-none focus:border-violet-500"
+              onKeyDown={(e) => e.key === "Enter" && nameValid && void create()}
             />
           </div>
           {templates.length > 0 && (
@@ -138,13 +179,13 @@ export default function Projects() {
           <div className="mt-3 flex items-center gap-3">
             <button
               onClick={() => void create()}
-              disabled={busy || !newName.trim()}
+              disabled={busy || !nameValid}
               className="rounded-md bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {busy ? "Creating…" : "Create project"}
             </button>
             <span className="text-xs text-zinc-500">
-              Lowercase letters, digits and dashes. A starter app is scaffolded for you.
+              A starter app is scaffolded for you.
             </span>
           </div>
         </div>

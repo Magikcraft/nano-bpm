@@ -1,5 +1,11 @@
-import { lazy, Suspense } from "react";
-import { NavLink, Navigate, Route, Routes } from "react-router-dom";
+import { lazy, Suspense, useEffect, useRef } from "react";
+import {
+  NavLink,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+} from "react-router-dom";
 import Topology from "./views/Topology";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -23,6 +29,21 @@ const navItems = [
 ];
 
 export default function App() {
+  const location = useLocation();
+  // Remember the last place the user was within the Projects section (the
+  // project list or a specific workspace) so the rail's "Projects" item returns
+  // them there after a detour through Metrics/Traces/etc. — instead of always
+  // dropping back at the root list.
+  const projectsRoute = useRef(
+    localStorage.getItem("nano.projectsRoute") || "/projects",
+  );
+  useEffect(() => {
+    if (location.pathname.startsWith("/projects")) {
+      projectsRoute.current = location.pathname;
+      localStorage.setItem("nano.projectsRoute", location.pathname);
+    }
+  }, [location.pathname]);
+
   return (
     <div className="flex h-full bg-zinc-950 text-zinc-100">
       <aside className="flex w-56 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900">
@@ -36,21 +57,29 @@ export default function App() {
           </a>
         </div>
         <nav className="flex flex-col gap-1 px-3">
-          {navItems.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              className={({ isActive }) =>
-                `rounded-md px-3 py-2 text-sm transition-colors ${
-                  isActive
+          {navItems.map((item) => {
+            // The Projects item is special: it links back to wherever the user
+            // last was in that section and stays highlighted across all
+            // /projects/* routes.
+            const isProjects = item.to === "/projects";
+            const to = isProjects ? projectsRoute.current : item.to;
+            const active = isProjects
+              ? location.pathname.startsWith("/projects")
+              : location.pathname === item.to;
+            return (
+              <NavLink
+                key={item.to}
+                to={to}
+                className={`rounded-md px-3 py-2 text-sm transition-colors ${
+                  active
                     ? "bg-zinc-800 text-white"
                     : "text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200"
-                }`
-              }
-            >
-              {item.label}
-            </NavLink>
-          ))}
+                }`}
+              >
+                {item.label}
+              </NavLink>
+            );
+          })}
         </nav>
       </aside>
 

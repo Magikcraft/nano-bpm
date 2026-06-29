@@ -135,7 +135,7 @@ function SimDiagram({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeIds, incidentIds]);
 
-  return <div ref={containerRef} className="h-full w-full" />;
+  return <div ref={containerRef} className="h-full w-full bg-white" />;
 }
 
 export default function TestRunPanel({

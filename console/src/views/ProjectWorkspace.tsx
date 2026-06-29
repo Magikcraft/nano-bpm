@@ -24,7 +24,20 @@ export default function ProjectWorkspace() {
   const { name = "" } = useParams();
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
+  // Remember the open file per project so leaving the workspace (e.g. to peek
+  // at Metrics) and coming back restores the same editor tab.
+  const selectedKey = `nano.project.${name}.openFile`;
+  const [selected, setSelectedState] = useState<string | null>(
+    () => localStorage.getItem(selectedKey),
+  );
+  const setSelected = useCallback(
+    (path: string | null) => {
+      setSelectedState(path);
+      if (path) localStorage.setItem(selectedKey, path);
+      else localStorage.removeItem(selectedKey);
+    },
+    [selectedKey],
+  );
   const [runState, setRunState] = useState<RunState | null>(null);
   const [logs, setLogs] = useState<ProjectLogLine[]>([]);
   const [showConfig, setShowConfig] = useState(false);
@@ -78,6 +91,19 @@ export default function ProjectWorkspace() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Drop a remembered open-file selection if that file no longer exists (e.g.
+  // it was deleted since the last visit), so we don't render a 404 editor pane.
+  useEffect(() => {
+    if (!detail || !selected) return;
+    const exists = (nodes: FileNode[]): boolean =>
+      nodes.some(
+        (n) =>
+          n.path === selected || (n.children ? exists(n.children) : false),
+      );
+    if (!exists(detail.files)) setSelected(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail]);
 
   // Stream run/compile logs for the life of the workspace.
   useEffect(() => {
@@ -154,10 +180,13 @@ export default function ProjectWorkspace() {
     <div className="flex h-full flex-col">
       {/* Toolbar */}
       <div className="flex items-center gap-2 border-b border-zinc-800 bg-zinc-900 px-4 py-2">
-        <Link to="/projects" className="text-sm text-zinc-500 hover:text-zinc-300">
-          ← Projects
-        </Link>
-        <span className="text-sm font-semibold text-zinc-100">{detail.config.name}</span>
+        <nav className="flex items-center gap-1.5 text-sm" aria-label="Breadcrumb">
+          <Link to="/projects" className="text-zinc-500 hover:text-zinc-300">
+            Projects
+          </Link>
+          <span className="text-zinc-600">/</span>
+          <span className="font-semibold text-zinc-100">{detail.config.name}</span>
+        </nav>
         {running && (
           <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-400">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> running
