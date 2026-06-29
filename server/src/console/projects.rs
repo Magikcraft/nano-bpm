@@ -886,9 +886,9 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
-    let mut cfg_lang = "deno";
+    let mut cfg_lang = "deno".to_string();
     let mut cfg_app = "console";
-    let mut cfg_main = "main.ts";
+    let mut cfg_main = "main.ts".to_string();
 
     if template == "throughput" {
         let worker = dir.join("workers").join("tick");
@@ -918,8 +918,8 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
             dir.join("resources").join("processes").join("throughput.bpmn"),
             DEMO_PROCESS_BPMN,
         )?;
-        cfg_lang = "rust";
-        cfg_main = "src/main.rs";
+        cfg_lang = "rust".to_string();
+        cfg_main = "src/main.rs".to_string();
     } else if template == "gui-starter" {
         mk(dir.join("public"))?;
         w(dir.join("deno.json"), GUI_DENO_JSON)?;
@@ -944,10 +944,26 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(starter_worker.join("deno.json"), WORKER_DENO_JSON)?;
     }
 
+    // Installed packs may contribute templates/example apps; copy theirs in and
+    // adopt their lang. Built-ins above win on id collision (offline baseline).
+    let is_builtin_template =
+        matches!(template, "starter" | "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter");
+    if !is_builtin_template
+        && let Some((m, src)) = super::extensions::template_source(template)
+    {
+        super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
+        if let Some(lang) = m.requires.first() {
+            cfg_lang = lang.clone();
+        }
+        if std::path::Path::new(&dir).join("src").join("main.rs").exists() {
+            cfg_main = "src/main.rs".to_string();
+        }
+    }
+
     let mut cfg = ProjectConfig::new(name, description);
-    cfg.lang = cfg_lang.to_string();
+    cfg.lang = cfg_lang;
     cfg.app = cfg_app.to_string();
-    cfg.main = cfg_main.to_string();
+    cfg.main = cfg_main;
     write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
     Ok(cfg)
 }
@@ -1829,6 +1845,30 @@ mod tests {
         let dir = root.join("gdemo");
         assert!(dir.join("public/index.html").is_file());
         assert!(dir.join("main.ts").is_file());
+    }
+
+    #[test]
+    fn installed_example_pack_is_scaffolded() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__example-demo");
+        std::fs::create_dir_all(pack.join("app/src")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"demo-ex","kind":"example","displayName":"Demo","requires":["rust"],"appDir":"app"}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("app/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(pack.join("app/src/main.rs"), "fn main(){}\n").unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let cfg = create_project("exdemo", "", "demo-ex").expect("create");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        assert_eq!(cfg.lang, "rust");
+        assert_eq!(cfg.main, "src/main.rs");
+        let dir = root.join("exdemo");
+        assert!(dir.join("Cargo.toml").is_file());
+        assert!(dir.join("src/main.rs").is_file());
     }
 
     #[test]

@@ -34,6 +34,9 @@ pub enum ExtKind {
     /// An output/runtime pack: project templates + compile/run profile
     /// (`nano-ide-app-*`).
     App,
+    /// A complete example app shipped under `appDir`, copied into a new
+    /// project (`nano-ide-example-*`).
+    Example,
 }
 
 /// Editor profile for one file extension.
@@ -89,6 +92,15 @@ pub struct ExtManifest {
     pub templates: Vec<TemplateSpec>,
     #[serde(default)]
     pub toolchain: Toolchain,
+    /// example packs: lang pack ids required to build/run this example.
+    #[serde(default)]
+    pub requires: Vec<String>,
+    /// example packs: subdir holding the ready-to-copy project.
+    #[serde(default)]
+    pub app_dir: Option<String>,
+    /// example packs: one-line description for the picker.
+    #[serde(default)]
+    pub summary: Option<String>,
     /// Whether this pack is bundled in the binary (cannot be removed).
     #[serde(default)]
     pub builtin: bool,
@@ -108,6 +120,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             ],
             templates: vec![],
             toolchain: Toolchain::default(),
+            requires: vec![], app_dir: None, summary: None,
             builtin: true,
         },
         ExtManifest {
@@ -125,6 +138,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 compile: vec!["cargo".into(), "build".into(), "--release".into()],
                 targets: vec![],
             },
+            requires: vec![], app_dir: None, summary: None,
             builtin: true,
         },
         ExtManifest {
@@ -137,6 +151,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 label: "GUI app — served UI binary (Deno.serve)".into(),
             }],
             toolchain: Toolchain::default(),
+            requires: vec![], app_dir: None, summary: None,
             builtin: true,
         },
     ]
@@ -176,6 +191,50 @@ pub fn all_extensions() -> Vec<ExtManifest> {
 /// Resolve the lang pack for a project's `lang` id (default "deno").
 pub fn lang_pack(id: &str) -> Option<ExtManifest> {
     all_extensions().into_iter().find(|e| e.kind == ExtKind::Lang && e.id == id)
+}
+
+/// Locate the on-disk source dir for a scaffold template contributed by an
+/// installed pack: `templates/<template_id>` for lang/app packs, or the
+/// example's `appDir`. Returns (manifest, dir) so the scaffolder can copy it.
+pub fn template_source(template_id: &str) -> Option<(ExtManifest, PathBuf)> {
+    let rd = std::fs::read_dir(extensions_root()).ok()?;
+    for entry in rd.flatten() {
+        let base = entry.path();
+        let txt = std::fs::read_to_string(base.join(manifest_name())).ok()?;
+        let m: ExtManifest = match serde_json::from_str(&txt) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if m.kind == ExtKind::Example && m.id == template_id {
+            let dir = base.join(m.app_dir.clone().unwrap_or_else(|| "app".into()));
+            if dir.is_dir() {
+                return Some((m, dir));
+            }
+        }
+        if m.templates.iter().any(|t| t.id == template_id) {
+            let dir = base.join("templates").join(template_id);
+            if dir.is_dir() {
+                return Some((m, dir));
+            }
+        }
+    }
+    None
+}
+
+/// Recursively copy a pack template dir into a project dir.
+pub fn copy_tree(src: &PathBuf, dst: &PathBuf) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
