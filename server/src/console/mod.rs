@@ -1950,11 +1950,21 @@ async fn project_detail(name: &str) -> Response {
     };
     let tree = projects::file_tree(name).unwrap_or_default();
     let sup = projects::supervisor();
+    // Run/Compile readiness is language-aware: Deno projects need the Deno
+    // runtime; a polyglot lang pack (e.g. Rust) needs its own toolchain (cargo).
+    let runnable = if cfg.lang == "deno" {
+        sup.deno_available()
+    } else {
+        extensions::lang_pack(&cfg.lang)
+            .map(|p| extensions::toolchain_available(&p))
+            .unwrap_or(false)
+    };
     Json(serde_json::json!({
         "config": cfg,
         "files": tree,
         "runState": sup.run_state(name).await,
         "denoAvailable": sup.deno_available(),
+        "runnable": runnable,
         "platforms": projects::PLATFORMS,
     }))
     .into_response()

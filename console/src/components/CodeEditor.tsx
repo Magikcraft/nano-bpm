@@ -146,8 +146,10 @@ function acquireTypes(code: string): void {
 }
 
 export function languageForFile(file: string): string {
-  if (file.endsWith(".json") || file.endsWith(".lock")) return "json";
+  if (file.endsWith(".json")) return "json";
   if (file.endsWith(".js") || file.endsWith(".mjs") || file.endsWith(".cjs")) return "javascript";
+  if (file.endsWith(".rs")) return "rust";
+  if (file.endsWith(".toml") || file.endsWith(".lock")) return "ini";
   if (file.endsWith(".md")) return "markdown";
   return "typescript";
 }

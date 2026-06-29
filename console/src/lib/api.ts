@@ -556,6 +556,10 @@ export interface ProjectConfig {
   main: string;
   /** Cross-compile targets selected for export. */
   platforms: string[];
+  /** Language pack id driving editor grammar + toolchain (default `deno`). */
+  lang: string;
+  /** App/output pack id (`console`, or e.g. `deno-gui`). */
+  app: string;
   createdMs: number;
   updatedMs: number;
 }
@@ -631,6 +635,9 @@ export interface ProjectDetail {
   files: FileNode[];
   runState: RunState;
   denoAvailable: boolean;
+  /** Whether this project's language toolchain (Deno, or a lang pack's cargo
+   * etc.) is available so Run/Compile can work. */
+  runnable: boolean;
   platforms: string[];
 }
 

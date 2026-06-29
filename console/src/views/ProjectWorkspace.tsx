@@ -110,7 +110,8 @@ export default function ProjectWorkspace() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [logs]);
 
-  const denoAvailable = detail?.denoAvailable ?? false;
+  const runnable = detail?.runnable ?? false;
+  const lang = detail?.config.lang ?? "deno";
   const running = runState?.status === "running" || runState?.status === "starting";
   const compiling = runState?.compiling ?? false;
 
@@ -171,20 +172,22 @@ export default function ProjectWorkspace() {
             ■ Stop
           </ToolbarButton>
         ) : (
-          <ToolbarButton onClick={() => void run()} kind="primary" disabled={!denoAvailable}>
+          <ToolbarButton onClick={() => void run()} kind="primary" disabled={!runnable}>
             ▶ Run
           </ToolbarButton>
         )}
-        <ToolbarButton onClick={() => setShowCompile(true)} disabled={!denoAvailable || compiling}>
+        <ToolbarButton onClick={() => setShowCompile(true)} disabled={!runnable || compiling}>
           Compile
         </ToolbarButton>
         <ToolbarButton onClick={() => setShowConfig(true)}>Configure</ToolbarButton>
         <ToolbarButton onClick={() => void exportProject(name, false)}>Export</ToolbarButton>
       </div>
 
-      {!denoAvailable && (
+      {!runnable && (
         <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-300">
-          No Deno runtime detected — Run and Compile are disabled. Authoring and Export still work.
+          {lang === "deno"
+            ? "No Deno runtime detected — Run and Compile are disabled. Authoring and Export still work."
+            : `No ${lang} toolchain detected — install it (and approve the extension) to enable Run and Compile. Authoring and Export still work.`}
         </div>
       )}
 
