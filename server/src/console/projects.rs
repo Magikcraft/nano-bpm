@@ -476,7 +476,7 @@ let running = true;
 let concurrency = 0;
 
 async function creator(): Promise<void> {
-  const body = JSON.stringify({ processDefinitionId: PROCESS_ID, awaitCompletion: false });
+  const body = JSON.stringify({ processDefinitionId: PROCESS_ID as unknown as never, awaitCompletion: false });
   const headers = { "content-type": "application/json" };
   while (running) {
     try {
@@ -571,7 +571,7 @@ or, equivalently:\n\n\
 /// auto-upgrades to the command stream against a Nano server.
 const DEMO_STREAM_DENO_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^0",
+    "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1",
     "@lib/": "./lib/"
   },
   "tasks": {
@@ -619,7 +619,7 @@ let concurrency = 0;
 async function creator(): Promise<void> {
   while (running) {
     try {
-      await client.createProcessInstance({ processDefinitionId: PROCESS_ID, awaitCompletion: false });
+      await client.createProcessInstance({ processDefinitionId: PROCESS_ID as unknown as never, awaitCompletion: false });
       created++;
     } catch { /* keep pushing */ }
   }
