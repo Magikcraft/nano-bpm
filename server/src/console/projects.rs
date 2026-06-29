@@ -570,6 +570,12 @@ Pair this with **Throughput (command-stream)** (same benchmark via \
 REST wins raw throughput (pooled HTTP connections parallelise well); the \
 command stream uses ~4x less engine memory. Run each on a fresh engine \
 (`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
+> **Note:** in JavaScript/Deno there is no command-stream *throughput* win — \
+even across two processes (separate producer + worker) the SDK awaits one \
+create at a time over a single socket (~2–3k/s) while pooled REST fans out \
+across many connections (~20k/s). The stream's only JS benefit is ~4x lower \
+engine memory. Its throughput edge needs a pipelining native producer \
+(e.g. Rust), where it beats REST ~32k vs ~20k.\n\n\
 ## Reclaim disk after the test\n\n\
 The benchmark creates ~1M instances; their journal/data can be large. When you're \
 done, free the disk with:\n\n\
@@ -694,6 +700,11 @@ On a clean engine (30s ramp, fire-and-forget):\n\n\
 The command stream trades raw throughput for ~4x lower engine memory; REST \
 parallelises better over pooled HTTP connections. Run each on a fresh engine \
 (`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
+> **Note:** in JavaScript/Deno the stream does *not* win on throughput — even \
+splitting producer and worker into two processes, the SDK awaits one create \
+at a time over a single socket (~2–3k/s) vs pooled REST (~20k/s). Pick the \
+stream here for low engine memory, not speed; its throughput edge needs a \
+pipelining native producer (Rust beats REST ~32k vs ~20k).\n\n\
 ## Reclaim disk after the test\n\n\
 ```sh\nc8ctl nano stop --purge\n```\n"
         .into()
