@@ -231,66 +231,87 @@ const PROJECT_DENO_JSON: &str = r#"{
 
 /// The generated entrypoint. It is runtime-dynamic: it discovers BPMN processes
 /// and workers on disk, so dropping a file into the project is all it takes.
-const MAIN_TS: &str = r#"// Generated entrypoint for your Nano application.
-//
-// On start it (1) deploys every BPMN process in resources/processes/ to the
-// engine, then (2) starts every worker in workers/. Add your own startup logic
-// at the bottom. You can edit this file freely.
+const MAIN_TS: &str = r#"// Generated entrypoint for your Nano application. Edit freely. The deploy +
+// worker bootstrap helpers live in lib/nano.ts so this stays a clean entrypoint.
+import { deployAllResources, startWorkers } from "@lib/nano.ts";
 
-const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+await deployAllResources();
+await startWorkers();
 
-async function deployProcesses(): Promise<void> {
+// ---- Your application logic below ----
+console.log("application running.");
+"#;
+
+/// Shared bootstrap helpers, written into every project's lib/ and imported via
+/// `@lib/nano.ts`. Keeps entrypoints (main.ts) free of deploy/worker plumbing.
+const NANO_LIB_TS: &str = r#"// Shared bootstrap helpers for a Nano application. Imported via @lib/nano.ts.
+
+/// Base URL of the engine; honours NANOBPMN_BASE_URL, defaults to localhost.
+export const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+
+/// Deploys every BPMN process under resources/processes/ to the engine. Returns
+/// the number of resources deployed (0 if the folder is empty/missing).
+export async function deployAllResources(): Promise<number> {
   const dir = "resources/processes";
-  let entries: Deno.DirEntry[] = [];
-  try {
-    for await (const e of Deno.readDir(dir)) entries.push(e);
-  } catch {
-    return; // no processes folder yet
-  }
   const form = new FormData();
   let count = 0;
-  for (const e of entries) {
-    if (!e.isFile || !e.name.endsWith(".bpmn")) continue;
-    const xml = await Deno.readTextFile(`${dir}/${e.name}`);
-    form.append("resources", new Blob([xml], { type: "text/xml" }), e.name);
-    count++;
+  try {
+    for await (const e of Deno.readDir(dir)) {
+      if (!e.isFile || !e.name.endsWith(".bpmn")) continue;
+      const xml = await Deno.readTextFile(`${dir}/${e.name}`);
+      form.append("resources", new Blob([xml], { type: "text/xml" }), e.name);
+      count++;
+    }
+  } catch {
+    return 0; // no processes folder yet
   }
-  if (count === 0) return;
+  if (count === 0) return 0;
   const res = await fetch(`${BASE_URL}/v2/deployments`, { method: "POST", body: form });
   if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`deployment failed: ${res.status} ${detail}`);
+    throw new Error(`deployment failed: ${res.status} ${await res.text().catch(() => "")}`);
   }
   console.log(`deployed ${count} process(es) to ${BASE_URL}/v2`);
+  return count;
 }
 
-async function startWorkers(): Promise<void> {
+/// Workers to start: a directory name list to `include` or `exclude`; omit to
+/// start every worker under workers/.
+export type WorkerSelection = { exclude: string[] } | { include: string[] };
+
+/// Starts each selected worker by importing its worker.ts. Returns the names
+/// started. Workers self-register via defineWorker(); failures are logged, not
+/// fatal.
+export async function startWorkers(workers?: WorkerSelection): Promise<string[]> {
   let names: string[] = [];
   try {
     for await (const e of Deno.readDir("workers")) {
       if (e.isDirectory) names.push(e.name);
     }
   } catch {
-    return; // no workers folder yet
+    return []; // no workers folder yet
+  }
+  if (workers && "include" in workers) {
+    const set = new Set(workers.include);
+    names = names.filter((n) => set.has(n));
+  } else if (workers && "exclude" in workers) {
+    const set = new Set(workers.exclude);
+    names = names.filter((n) => !set.has(n));
   }
   names.sort();
+  const started: string[] = [];
   for (const name of names) {
     try {
       Deno.env.set("NANOBPMN_BASE_URL", BASE_URL);
       Deno.env.set("NANOBPMN_WORKER_NAME", name);
-      await import(`./workers/${name}/worker.ts`);
+      await import(`../workers/${name}/worker.ts`);
       console.log(`started worker: ${name}`);
+      started.push(name);
     } catch (err) {
       console.error(`worker ${name} failed to start: ${err}`);
     }
   }
+  return started;
 }
-
-await deployProcesses();
-await startWorkers();
-
-// ---- Your application logic below ----
-console.log("application running.");
 "#;
 
 fn readme_md(name: &str) -> String {
@@ -302,8 +323,8 @@ A Nano BPM application created with the RAD environment.\n\n\
 - `resources/decisions/` — DMN decisions (authoring/bundling; the engine does not execute DMN).\n\
 - `resources/forms/` — forms (authoring/bundling; the engine does not execute forms).\n\
 - `workers/<name>/` — Deno job workers.\n\
-- `lib/` — shared TS/JS, importable via `@lib/`.\n\
-- `main.ts` — entrypoint that deploys processes and starts workers.\n\n\
+- `lib/` — shared TS/JS, importable via `@lib/` (e.g. `lib/nano.ts` deploy/worker helpers).\n\
+- `main.ts` — entrypoint; calls `deployAllResources()` and `startWorkers()` from `@lib/nano.ts`.\n\n\
 ## Run\n\n\
 ```sh\ndeno task start\n```\n"
     )
@@ -428,22 +449,13 @@ const DEMO_MAIN_TS: &str = r#"// Throughput Explorer — finds the out-of-the-bo
 // creates/sec and the engine's resident memory; at the end it stops creating,
 // lets the worker drain the backlog, then reports the peak rate + peak memory.
 // Stock laptop demo — no tuning, just "see how fast it is".
+import { BASE_URL, deployAllResources, startWorkers } from "@lib/nano.ts";
 
-const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
 const PROCESS_ID = "throughput-demo";
 const DURATION_MS = 30_000;
 const RAMP_EVERY_MS = 2_000;
 const RAMP_STEP = 32; // +32 concurrent creators every 2s
 const DRAIN_MAX_MS = 30_000; // give the worker up to 30s to finish the backlog
-
-async function deploy(): Promise<void> {
-  const xml = await Deno.readTextFile("resources/processes/throughput.bpmn");
-  const form = new FormData();
-  form.append("resources", new Blob([xml], { type: "text/xml" }), "throughput.bpmn");
-  const res = await fetch(`${BASE_URL}/v2/deployments`, { method: "POST", body: form });
-  if (!res.ok) throw new Error(`deploy failed: ${res.status} ${await res.text().catch(() => "")}`);
-  console.log(`deployed ${PROCESS_ID} to ${BASE_URL}`);
-}
 
 async function residentMb(): Promise<number> {
   try {
@@ -453,11 +465,8 @@ async function residentMb(): Promise<number> {
   } catch { return 0; }
 }
 
-await deploy();
-// Start the tick worker (drains jobs created below).
-Deno.env.set("NANOBPMN_BASE_URL", BASE_URL);
-Deno.env.set("NANOBPMN_WORKER_NAME", "tick");
-await import("./workers/tick/worker.ts");
+await deployAllResources();
+await startWorkers({ include: ["tick"] });
 
 let created = 0;
 let running = true;
@@ -584,6 +593,7 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
     let w = |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
+    w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
     if template == "throughput" {
         let worker = dir.join("workers").join("tick");
