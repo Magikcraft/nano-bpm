@@ -58,6 +58,17 @@ export default function Projects() {
     }
   };
 
+  const rename = async (name: string) => {
+    const next = prompt(`Rename “${name}” to:`, name)?.trim();
+    if (!next || next === name) return;
+    try {
+      await projectsApi.renameProject(name, next);
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   return (
     <div className="mx-auto max-w-6xl p-8">
       <header className="mb-6 flex items-start justify-between">
@@ -148,7 +159,7 @@ export default function Projects() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => (
-            <ProjectTile key={p.name} project={p} onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)} onDelete={() => void remove(p.name)} />
+            <ProjectTile key={p.name} project={p} onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)} onDelete={() => void remove(p.name)} onRename={() => void rename(p.name)} />
           ))}
         </div>
       )}
@@ -160,20 +171,31 @@ function ProjectTile({
   project,
   onOpen,
   onDelete,
+  onRename,
 }: {
   project: ProjectSummary;
   onOpen: () => void;
   onDelete: () => void;
+  onRename: () => void;
 }) {
   return (
     <div className="group relative flex flex-col rounded-lg border border-zinc-800 bg-zinc-900 p-4 transition-colors hover:border-zinc-600">
-      <button
-        onClick={onDelete}
-        title="Delete project"
-        className="absolute right-3 top-3 hidden rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-red-500/10 hover:text-red-400 group-hover:block"
-      >
-        ✕
-      </button>
+      <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex">
+        <button
+          onClick={onRename}
+          title="Rename project"
+          className="rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-zinc-700/40 hover:text-zinc-200"
+        >
+          ✎
+        </button>
+        <button
+          onClick={onDelete}
+          title="Delete project"
+          className="rounded px-1.5 py-0.5 text-xs text-zinc-500 hover:bg-red-500/10 hover:text-red-400"
+        >
+          ✕
+        </button>
+      </div>
       <button onClick={onOpen} className="flex flex-1 flex-col text-left">
         <div className="flex items-center gap-2">
           <span className="truncate text-base font-semibold text-zinc-100">{project.name}</span>

@@ -134,6 +134,7 @@ pub fn router(server: ServerImpl) -> Router {
                 .delete(project_path_delete),
         )
         .route("/console/api/projects/{name}/run", axum::routing::post(project_run))
+        .route("/console/api/projects/{name}/rename", axum::routing::post(project_rename))
         .route("/console/api/projects/{name}/stop", axum::routing::post(project_stop))
         .route("/console/api/projects/{name}/logs", get(project_logs))
         .route("/console/api/projects/{name}/compile", axum::routing::post(project_compile))
@@ -1889,6 +1890,26 @@ async fn project_delete(Path(name): Path<String>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// `POST /console/api/projects/{name}/rename` — rename a project (must be stopped).
+async fn project_rename(Path(name): Path<String>, Json(body): Json<RenameProjectBody>) -> Response {
+    if projects::supervisor().is_running(&name).await {
+        return (StatusCode::CONFLICT, "stop the application before renaming it").into_response();
+    }
+    match projects::rename_project(&name, body.new_name.trim()) {
+        Ok(cfg) => (StatusCode::OK, Json(cfg)).into_response(),
+        Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, e).into_response(),
+        Err(e) if e.contains("no such") => (StatusCode::NOT_FOUND, e).into_response(),
+        Err(e) if e.contains("invalid") => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenameProjectBody {
+    new_name: String,
 }
 
 /// `GET /console/api/projects/{name}/config` — the project config.

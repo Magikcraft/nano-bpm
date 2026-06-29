@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, lazy, Suspense } from "react";
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
 import BpmnModeler, { type BpmnModelerHandle } from "../components/BpmnModeler";
 import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
+const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 import {
   projectsApi,
   projectLogs,
@@ -401,6 +402,7 @@ function EditorPane({ name, path }: { name: string; path: string }) {
   const bpmnRef = useRef<BpmnModelerHandle>(null);
   const dmnRef = useRef<DmnModelerHandle>(null);
   const formRef = useRef<FormEditorHandle>(null);
+  const [testXml, setTestXml] = useState<string | null>(null);
 
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   const kind: "bpmn" | "dmn" | "form" | "code" =
@@ -477,6 +479,17 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         <span className="truncate font-mono text-xs text-zinc-400">{path}</span>
         {dirty && <span className="text-[10px] text-amber-400">● unsaved</span>}
         <div className="flex-1" />
+        {kind === "bpmn" && (
+          <button
+            onClick={async () => {
+              const xml = await bpmnRef.current?.getXml();
+              if (xml) setTestXml(xml);
+            }}
+            className="rounded-md border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-emerald-500 hover:text-emerald-300"
+          >
+            Test
+          </button>
+        )}
         <button
           onClick={() => void save()}
           disabled={saving || (kind === "code" && !dirty)}
@@ -487,7 +500,22 @@ function EditorPane({ name, path }: { name: string; path: string }) {
       </div>
       <div className="min-h-0 flex-1">
         {kind === "bpmn" && (
-          <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} />
+          <div className="relative h-full">
+            <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} />
+            {testXml && (
+              <div className="absolute inset-0 z-10 bg-zinc-950">
+                <Suspense
+                  fallback={
+                    <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+                      Loading the in-browser engine…
+                    </div>
+                  }
+                >
+                  <TestRunPanel xml={testXml} onClose={() => setTestXml(null)} />
+                </Suspense>
+              </div>
+            )}
+          </div>
         )}
         {kind === "dmn" && <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} />}
         {kind === "form" && <FormEditor ref={formRef} onChange={() => setDirty(true)} />}

@@ -1,91 +1,13 @@
-import { useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { api, nodeConsoleUrl, type MetricsSnapshot } from "../lib/api";
-
-/// How many derived samples to retain for the sparklines (~2 min at 1 Hz).
-const MAX_SAMPLES = 120;
-
-/// One derived sample: instantaneous rates computed from the delta between two
-/// successive raw snapshots, plus the live gauge readings at that instant.
-interface Sample {
-  t: number;
-  startsPerSec: number;
-  jobsPerSec: number;
-  active: number;
-  connections: number;
-  inflight: number;
-}
+import { useSyncExternalStore } from "react";
+import { nodeConsoleUrl } from "../lib/api";
+import { metricsStore } from "../lib/metricsStore";
 
 export default function Metrics() {
-  const [paused, setPaused] = useState(false);
-  const { data, error, isLoading } = useQuery({
-    queryKey: ["metrics"],
-    queryFn: api.metrics,
-    refetchInterval: paused ? false : 1000,
-  });
+  const state = useSyncExternalStore(metricsStore.subscribe, metricsStore.getSnapshot);
+  const { samples, latest: data, cluster, clusterRates, paused, error } = state;
+  const isLoading = !data;
+  const reset = () => metricsStore.clear();
 
-  // Rolling derived history. Kept in a ref (the source of truth) and mirrored
-  // into state so the chart re-renders; `prev` holds the last raw snapshot so we
-  // can difference counters into rates.
-  const prev = useRef<MetricsSnapshot | null>(null);
-  const history = useRef<Sample[]>([]);
-  const [samples, setSamples] = useState<Sample[]>([]);
-
-  useEffect(() => {
-    if (!data) return;
-    const p = prev.current;
-    prev.current = data;
-    if (p && data.timestampMs > p.timestampMs) {
-      const dt = (data.timestampMs - p.timestampMs) / 1000;
-      const rate = (cur: number, was: number) =>
-        dt > 0 ? Math.max(0, (cur - was) / dt) : 0;
-      const s: Sample = {
-        t: data.timestampMs,
-        startsPerSec: rate(data.createsTotal, p.createsTotal),
-        jobsPerSec: rate(data.completionsTotal, p.completionsTotal),
-        active: data.activeInstances,
-        connections: data.connectionsActive,
-        inflight: data.commitInflight,
-      };
-      const next = [...history.current, s].slice(-MAX_SAMPLES);
-      history.current = next;
-      setSamples(next);
-    }
-  }, [data]);
-
-  const reset = () => {
-    history.current = [];
-    prev.current = null;
-    setSamples([]);
-  };
-
-  // Cluster-wide metrics: per-node breakdown + aggregate. Probes every peer, so
-  // a slower cadence than the local 1 Hz poll. Cluster throughput is derived
-  // from successive deltas of the aggregate counters.
-  const { data: cluster } = useQuery({
-    queryKey: ["clusterMetrics"],
-    queryFn: api.clusterMetrics,
-    refetchInterval: paused ? false : 2000,
-  });
-  const clusterPrev = useRef<{ t: number; creates: number; completions: number } | null>(null);
-  const [clusterRates, setClusterRates] = useState<{ starts: number; jobs: number } | null>(null);
-  useEffect(() => {
-    if (!cluster) return;
-    const agg = cluster.aggregate;
-    const p = clusterPrev.current;
-    clusterPrev.current = {
-      t: cluster.checkedAtMs,
-      creates: agg.createsTotal,
-      completions: agg.completionsTotal,
-    };
-    if (p && cluster.checkedAtMs > p.t) {
-      const dt = (cluster.checkedAtMs - p.t) / 1000;
-      setClusterRates({
-        starts: Math.max(0, (agg.createsTotal - p.creates) / dt),
-        jobs: Math.max(0, (agg.completionsTotal - p.completions) / dt),
-      });
-    }
-  }, [cluster]);
   const isCluster = (cluster?.aggregate.totalNodes ?? 1) > 1;
 
   const latest = samples[samples.length - 1];
@@ -105,7 +27,7 @@ export default function Metrics() {
         </div>
         <div className="flex gap-2">
           <button
-            onClick={() => setPaused((v) => !v)}
+            onClick={() => metricsStore.setPaused(!paused)}
             className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800"
           >
             {paused ? "Resume" : "Pause"}

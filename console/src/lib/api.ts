@@ -625,6 +625,13 @@ export const projectsApi = {
     ),
   deleteProject: (name: string) =>
     send<void>("DELETE", `/projects/${encodeURIComponent(name)}`),
+  renameProject: (name: string, newName: string) =>
+    send<ProjectConfig>(
+      "POST",
+      `/projects/${encodeURIComponent(name)}/rename`,
+      JSON.stringify({ newName }),
+      "application/json",
+    ),
   projectConfig: (name: string) =>
     getJson<ProjectConfig>(`/projects/${encodeURIComponent(name)}/config`),
   saveProjectConfig: (name: string, config: ProjectConfig) =>

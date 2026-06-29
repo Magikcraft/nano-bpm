@@ -622,6 +622,26 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     std::fs::remove_dir_all(dir)
 }
 
+/// Renames a project directory and updates its persisted config name. Fails if
+/// the source is missing, the target name is unsafe, or the target exists. The
+/// caller must ensure the project is stopped first.
+pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
+    let from = project_dir(old).ok_or("invalid project name")?;
+    let to = project_dir(new).ok_or("invalid new name")?;
+    if !from.is_dir() {
+        return Err("no such project".into());
+    }
+    if to.exists() {
+        return Err("a project with that name already exists".into());
+    }
+    std::fs::rename(&from, &to).map_err(|e| format!("rename: {e}"))?;
+    let mut cfg = read_config(new).ok_or("config missing after rename")?;
+    cfg.name = new.to_string();
+    cfg.updated_ms = now_ms();
+    write_config(new, &cfg).map_err(|e| format!("write config: {e}"))?;
+    Ok(cfg)
+}
+
 // ---------------------------------------------------------------------------
 // Listing / tiles
 // ---------------------------------------------------------------------------
@@ -1362,5 +1382,21 @@ mod tests {
         let back = read_config("cfg").unwrap();
         assert_eq!(back.deploy_target, "http://example.test:9999");
         assert_eq!(back.platforms, vec!["aarch64-apple-darwin".to_string()]);
+    }
+
+    #[test]
+    fn rename_moves_project_and_updates_config() {
+        let _g = lock();
+        let _root = temp_root();
+        create_project("oldname", "", "starter").unwrap();
+        let cfg = rename_project("oldname", "newname").unwrap();
+        assert_eq!(cfg.name, "newname");
+        assert!(project_dir("newname").unwrap().is_dir());
+        assert!(!project_dir("oldname").unwrap().exists());
+        assert_eq!(read_config("newname").unwrap().name, "newname");
+        // Collision and missing-source are rejected.
+        create_project("other", "", "starter").unwrap();
+        assert!(rename_project("newname", "other").is_err());
+        assert!(rename_project("ghost", "fresh").is_err());
     }
 }

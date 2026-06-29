@@ -6,7 +6,6 @@ import Topology from "./views/Topology";
 // panel, monaco) stay out of the initial bundle and load on navigation.
 const Projects = lazy(() => import("./views/Projects"));
 const ProjectWorkspace = lazy(() => import("./views/ProjectWorkspace"));
-const Modeler = lazy(() => import("./views/Modeler"));
 const Explorer = lazy(() => import("./views/Explorer"));
 const Workers = lazy(() => import("./views/Workers"));
 const Metrics = lazy(() => import("./views/Metrics"));
@@ -16,7 +15,6 @@ const navItems = [
   { to: "/projects", label: "Projects" },
   { to: "/topology", label: "Topology" },
   { to: "/metrics", label: "Metrics" },
-  { to: "/modeler", label: "Modeler" },
   { to: "/explorer", label: "Explorer" },
   { to: "/traces", label: "Traces" },
   { to: "/workers", label: "Workers" },
@@ -68,7 +66,7 @@ export default function App() {
             <Route path="/projects/:name" element={<ProjectWorkspace />} />
             <Route path="/topology" element={<Topology />} />
             <Route path="/metrics" element={<Metrics />} />
-            <Route path="/modeler" element={<Modeler />} />
+            <Route path="/modeler" element={<Navigate to="/projects" replace />} />
             <Route path="/explorer" element={<Explorer />} />
             <Route path="/traces" element={<Traces />} />
             <Route path="/workers" element={<Workers />} />
