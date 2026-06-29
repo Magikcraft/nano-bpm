@@ -87,3 +87,114 @@ body {
   background: #e4e4e7;
 }
 
+/*
+ * Markdown preview tab (.md files). Tailwind's preflight strips default
+ * heading/list/quote styling, so restore a readable document look for the
+ * HTML markdown-it produces.
+ */
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4,
+.markdown-preview h5,
+.markdown-preview h6 {
+  font-weight: 600;
+  line-height: 1.25;
+  color: #fafafa;
+  margin: 1.5em 0 0.5em;
+}
+.markdown-preview h1 {
+  font-size: 1.6em;
+  border-bottom: 1px solid #27272a;
+  padding-bottom: 0.3em;
+}
+.markdown-preview h2 {
+  font-size: 1.35em;
+  border-bottom: 1px solid #27272a;
+  padding-bottom: 0.3em;
+}
+.markdown-preview h3 {
+  font-size: 1.15em;
+}
+.markdown-preview h4 {
+  font-size: 1em;
+}
+.markdown-preview > :first-child {
+  margin-top: 0;
+}
+.markdown-preview p,
+.markdown-preview ul,
+.markdown-preview ol,
+.markdown-preview blockquote,
+.markdown-preview pre,
+.markdown-preview table {
+  margin: 0 0 1em;
+}
+.markdown-preview ul,
+.markdown-preview ol {
+  padding-left: 1.6em;
+}
+.markdown-preview ul {
+  list-style: disc;
+}
+.markdown-preview ol {
+  list-style: decimal;
+}
+.markdown-preview li {
+  margin: 0.25em 0;
+}
+.markdown-preview li > ul,
+.markdown-preview li > ol {
+  margin: 0.25em 0;
+}
+.markdown-preview a {
+  color: #7dd3fc;
+  text-decoration: underline;
+}
+.markdown-preview code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875em;
+  background: #27272a;
+  border-radius: 4px;
+  padding: 0.15em 0.4em;
+}
+.markdown-preview pre {
+  background: #18181b;
+  border: 1px solid #27272a;
+  border-radius: 6px;
+  padding: 0.9em 1em;
+  overflow: auto;
+}
+.markdown-preview pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.85em;
+}
+.markdown-preview blockquote {
+  border-left: 3px solid #3f3f46;
+  padding-left: 1em;
+  color: #a1a1aa;
+}
+.markdown-preview hr {
+  border: 0;
+  border-top: 1px solid #27272a;
+  margin: 1.5em 0;
+}
+.markdown-preview table {
+  border-collapse: collapse;
+  width: 100%;
+}
+.markdown-preview th,
+.markdown-preview td {
+  border: 1px solid #27272a;
+  padding: 0.4em 0.7em;
+  text-align: left;
+}
+.markdown-preview th {
+  background: #18181b;
+  font-weight: 600;
+}
+.markdown-preview img {
+  max-width: 100%;
+}
+

@@ -328,6 +328,39 @@ async function getText(path: string): Promise<string> {
   return res.text();
 }
 
+/// A project file's contents plus metadata. For binary files `text` is empty
+/// and the UI shows a placeholder built from `absPath`/`size` instead.
+export interface ProjectFile {
+  binary: boolean;
+  text: string;
+  absPath: string;
+  size: number;
+}
+
+/// Fetches a project file, distinguishing binary files (which the server
+/// reports via `X-File-Binary` and a `{ absPath, size }` JSON descriptor).
+async function getProjectFile(path: string): Promise<ProjectFile> {
+  const res = await fetch(`/console/api${path}`);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `${path} → HTTP ${res.status}`);
+  }
+  const size = Number(res.headers.get("X-File-Size") ?? "0");
+  if (res.headers.get("X-File-Binary") === "true") {
+    const meta = (await res.json().catch(() => ({}))) as {
+      absPath?: string;
+      size?: number;
+    };
+    return {
+      binary: true,
+      text: "",
+      absPath: meta.absPath ?? "",
+      size: meta.size ?? size,
+    };
+  }
+  return { binary: false, text: await res.text(), absPath: "", size };
+}
+
 async function send<T>(
   method: string,
   path: string,
@@ -692,6 +725,10 @@ export const projectsApi = {
     getJson<{ files: FileNode[] }>(`/projects/${encodeURIComponent(name)}/files`),
   projectFile: (name: string, path: string) =>
     getText(
+      `/projects/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
+    ),
+  projectFileEx: (name: string, path: string) =>
+    getProjectFile(
       `/projects/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
     ),
   saveProjectFile: (name: string, path: string, content: string) =>

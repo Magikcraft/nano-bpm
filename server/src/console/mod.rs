@@ -2052,21 +2052,54 @@ async fn project_files(Path(name): Path<String>) -> Response {
 }
 
 /// `GET /console/api/projects/{name}/file?path=...` — read a file.
+///
+/// Text files are returned verbatim as `text/plain`. Binary files are *not*
+/// streamed back (the editor cannot render them): instead the body is a small
+/// JSON descriptor `{ absPath, size }` so the UI can show a placeholder. Every
+/// response carries `X-File-Binary` (`true`/`false`) and `X-File-Size` (bytes).
 async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
     let Some(path) = projects::safe_project_path(&name, &q.path) else {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
     };
-    match std::fs::read(&path) {
-        Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(text) => text.into_response(),
-            Err(e) => (
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "no such file").into_response(),
+    };
+    let size = bytes.len();
+    // A file is treated as binary if it contains a NUL byte or is not valid
+    // UTF-8 — the same heuristic git uses for "is this text?".
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) if !s.contains('\u{0}') => Some(s.to_owned()),
+        _ => None,
+    };
+    match text {
+        Some(s) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+                ("x-file-binary".parse().unwrap(), "false".to_string()),
+                ("x-file-size".parse().unwrap(), size.to_string()),
+            ],
+            s,
+        )
+            .into_response(),
+        None => {
+            let abs = std::fs::canonicalize(&path)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            let body = serde_json::json!({ "absPath": abs, "size": size }).to_string();
+            (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                e.into_bytes(),
+                [
+                    (header::CONTENT_TYPE, "application/json".to_string()),
+                    ("x-file-binary".parse().unwrap(), "true".to_string()),
+                    ("x-file-size".parse().unwrap(), size.to_string()),
+                ],
+                body,
             )
-                .into_response(),
-        },
-        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
+                .into_response()
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, lazy, Suspense } from "react";
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
+import MarkdownPreview from "../components/MarkdownPreview";
 import BpmnModeler, { type BpmnModelerHandle } from "../components/BpmnModeler";
 import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
@@ -14,6 +15,7 @@ import {
   type ProjectConfig,
   type RunState,
   type ProjectLogLine,
+  type ProjectFile,
 } from "../lib/api";
 
 /// One project's workspace: file browser, graphical/code editors, the run
@@ -428,6 +430,7 @@ function TreeNode({
 
 function EditorPane({ name, path }: { name: string; path: string }) {
   const [content, setContent] = useState<string | null>(null);
+  const [meta, setMeta] = useState<ProjectFile | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -435,19 +438,35 @@ function EditorPane({ name, path }: { name: string; path: string }) {
   const dmnRef = useRef<DmnModelerHandle>(null);
   const formRef = useRef<FormEditorHandle>(null);
   const [testXml, setTestXml] = useState<string | null>(null);
+  // Markdown files open in a rendered Preview tab; the user can switch to Edit.
+  const [mdView, setMdView] = useState<"preview" | "edit">("preview");
 
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  const kind: "bpmn" | "dmn" | "form" | "code" =
-    ext === "bpmn" ? "bpmn" : ext === "dmn" ? "dmn" : ext === "form" ? "form" : "code";
+  const kind: "bpmn" | "dmn" | "form" | "md" | "code" =
+    ext === "bpmn"
+      ? "bpmn"
+      : ext === "dmn"
+        ? "dmn"
+        : ext === "form"
+          ? "form"
+          : ext === "md" || ext === "markdown"
+            ? "md"
+            : "code";
 
   useEffect(() => {
     let alive = true;
     setContent(null);
+    setMeta(null);
     setDirty(false);
     setLoadError(null);
+    setMdView("preview");
     projectsApi
-      .projectFile(name, path)
-      .then((text) => alive && setContent(text))
+      .projectFileEx(name, path)
+      .then((f) => {
+        if (!alive) return;
+        setMeta(f);
+        setContent(f.binary ? null : f.text);
+      })
       .catch((e) => alive && setLoadError(e instanceof Error ? e.message : String(e)));
     return () => {
       alive = false;
@@ -501,6 +520,24 @@ function EditorPane({ name, path }: { name: string; path: string }) {
   if (loadError) {
     return <div className="p-6 text-sm text-red-400">{loadError}</div>;
   }
+  if (meta == null) {
+    return <div className="p-6 text-sm text-zinc-500">Loading {path}…</div>;
+  }
+  if (meta.binary) {
+    const mb = (meta.size / (1024 * 1024)).toFixed(2);
+    return (
+      <div className="flex h-full flex-col">
+        <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900/60 px-3 py-1.5">
+          <span className="truncate font-mono text-xs text-zinc-400">{path}</span>
+        </div>
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+          <p className="max-w-2xl break-words text-center font-mono text-sm leading-relaxed text-zinc-400">
+            Binary file. Path on disk: {meta.absPath}. Size: {meta.size} ({mb}MB)
+          </p>
+        </div>
+      </div>
+    );
+  }
   if (content == null) {
     return <div className="p-6 text-sm text-zinc-500">Loading {path}…</div>;
   }
@@ -511,6 +548,23 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         <span className="truncate font-mono text-xs text-zinc-400">{path}</span>
         {dirty && <span className="text-[10px] text-amber-400">● unsaved</span>}
         <div className="flex-1" />
+        {kind === "md" && (
+          <div className="flex overflow-hidden rounded-md border border-zinc-700">
+            {(["preview", "edit"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => setMdView(mode)}
+                className={`px-3 py-1 text-xs font-medium capitalize transition-colors ${
+                  mdView === mode
+                    ? "bg-violet-600 text-white"
+                    : "text-zinc-300 hover:bg-zinc-800"
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+        )}
         {kind === "bpmn" && (
           <button
             onClick={async () => {
@@ -524,7 +578,7 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         )}
         <button
           onClick={() => void save()}
-          disabled={saving || (kind === "code" && !dirty)}
+          disabled={saving || ((kind === "code" || kind === "md") && !dirty)}
           className="rounded-md bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-40"
         >
           {saving ? "Saving…" : "Save"}
@@ -551,6 +605,21 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         )}
         {kind === "dmn" && <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} />}
         {kind === "form" && <FormEditor ref={formRef} onChange={() => setDirty(true)} />}
+        {kind === "md" &&
+          (mdView === "preview" ? (
+            <MarkdownPreview source={content} />
+          ) : (
+            <CodeEditor
+              value={content}
+              language="markdown"
+              path={`file:///${name}/${path}`}
+              onChange={(v) => {
+                setContent(v);
+                setDirty(true);
+              }}
+              onSave={() => void save()}
+            />
+          ))}
         {kind === "code" && (
           <CodeEditor
             value={content}
