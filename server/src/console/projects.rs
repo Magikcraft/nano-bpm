@@ -59,7 +59,11 @@ pub const TEMPLATES: &[(&str, &str)] = &[
     ("starter", "Starter app — one process, one worker"),
     (
         "throughput",
-        "Throughput Explorer — 30s ramp benchmark (see how fast it is)",
+        "Throughput (REST) — 30s ramp benchmark over the HTTP API",
+    ),
+    (
+        "throughput-stream",
+        "Throughput (command-stream) — same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
     ),
 ];
 
@@ -441,14 +445,13 @@ defineWorker({
 
 /// The explorer entrypoint: deploy, start the worker, then ramp instance
 /// creation every 2s for 30s and report the peak sustained rate.
-const DEMO_MAIN_TS: &str = r#"// Throughput Explorer — finds the out-of-the-box process-instance ceiling.
+const DEMO_MAIN_TS: &str = r#"// Throughput (REST) — finds the ceiling using the plain HTTP API.
 //
-// For 30 seconds it fires-and-forgets process-instance creates (no awaiting
-// completion) with a concurrency pool that ramps up every 2 seconds. The single
-// "tick" worker drains the resulting jobs. Each second it prints the achieved
-// creates/sec and the engine's resident memory; at the end it stops creating,
-// lets the worker drain the backlog, then reports the peak rate + peak memory.
-// Stock laptop demo — no tuning, just "see how fast it is".
+// For 30 seconds it fires-and-forgets process-instance creates over REST
+// (POST /v2/process-instances, no awaiting completion) with a pool that ramps
+// every 2 seconds. The single "tick" worker drains the jobs. A/B this against
+// the "Throughput (command-stream)" demo, which runs identical logic through
+// @nanobpm/nano-sdk on the command stream.
 import { BASE_URL, deployAllResources, startWorkers } from "@lib/nano.ts";
 
 const PROCESS_ID = "throughput-demo";
@@ -564,6 +567,115 @@ or, equivalently:\n\n\
         .into()
 }
 
+/// Stream variant deno.json: pulls the Nano SDK (drop-in C8 client) which
+/// auto-upgrades to the command stream against a Nano server.
+const DEMO_STREAM_DENO_JSON: &str = r#"{
+  "imports": {
+    "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^0",
+    "@lib/": "./lib/"
+  },
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-sys main.ts"
+  }
+}
+"#;
+
+/// The command-stream entrypoint: identical benchmark to the REST demo, but
+/// creation + the worker run through @nanobpm/nano-sdk, which upgrades to the
+/// command-stream protocol on Nano. A/B it against the REST demo.
+const DEMO_STREAM_MAIN_TS: &str = r#"// Throughput (command-stream) — same benchmark, run through @nanobpm/nano-sdk.
+//
+// Identical to the "Throughput (REST)" demo, except instance creation and the
+// "tick" worker go through the Nano SDK, which auto-upgrades to the command
+// stream when it detects a Nano server. Compare the peak/sec against REST.
+import { createCamundaClient } from "@nanobpm/nano-sdk";
+import { deployAllResources } from "@lib/nano.ts";
+
+const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const PROCESS_ID = "throughput-demo";
+const DURATION_MS = 30_000;
+const RAMP_EVERY_MS = 2_000;
+const RAMP_STEP = 32;
+
+const client = createCamundaClient({
+  config: { CAMUNDA_AUTH_STRATEGY: "NONE", CAMUNDA_REST_ADDRESS: BASE_URL, CAMUNDA_TRANSPORT: "auto" },
+});
+
+async function residentMb(): Promise<number> {
+  try {
+    const r = await fetch(`${BASE_URL}/v2/system/memory`);
+    const j = await r.json();
+    return j.residentBytes ? j.residentBytes / 1_048_576 : 0;
+  } catch { return 0; }
+}
+
+await deployAllResources();
+client.createJobWorker({ jobType: "tick", maxParallelJobs: 200, jobHandler: (job: any) => job.complete({}) });
+
+let created = 0;
+let running = true;
+let concurrency = 0;
+
+async function creator(): Promise<void> {
+  while (running) {
+    try {
+      await client.createProcessInstance({ processDefinitionId: PROCESS_ID, awaitCompletion: false });
+      created++;
+    } catch { /* keep pushing */ }
+  }
+}
+
+console.log("ramping process-instance creation for 30s (command stream)…\n");
+const t0 = performance.now();
+let lastCreated = 0;
+let peak = 0;
+let peakMem = 0;
+
+const tick = setInterval(async () => {
+  const total = created;
+  const rate = total - lastCreated;
+  lastCreated = total;
+  if (rate > peak) peak = rate;
+  const mem = await residentMb();
+  if (mem > peakMem) peakMem = mem;
+  console.log(`t+${Math.round((performance.now() - t0) / 1000)}s  conc=${concurrency}  ${rate}/s  (total ${total}, mem ${mem.toFixed(0)}MB)`);
+}, 1000);
+
+const ramp = setInterval(() => {
+  for (let i = 0; i < RAMP_STEP; i++) creator();
+  concurrency += RAMP_STEP;
+}, RAMP_EVERY_MS);
+
+for (let i = 0; i < RAMP_STEP; i++) creator();
+concurrency = RAMP_STEP;
+
+setTimeout(() => {
+  running = false;
+  clearInterval(ramp);
+  clearInterval(tick);
+  console.log(`\n=== peak ${peak} instances/sec (command stream, fire-and-forget) ===`);
+  console.log(`=== ${created} instances created in 30s, ~${Math.round(created / 30)}/s average ===`);
+  console.log(`=== peak engine memory ${peakMem.toFixed(0)}MB ===`);
+  client.stopAllWorkers?.();
+  Deno.exit(0);
+}, DURATION_MS);
+"#;
+
+fn demo_stream_readme() -> String {
+    "# Throughput (command-stream)\n\n\
+A/B partner to **Throughput (REST)**. Identical 30-second ramp benchmark, but \
+instance creation and the `tick` worker run through `@nanobpm/nano-sdk` — a \
+drop-in Camunda 8 client that upgrades to Nano's command-stream protocol. \
+Compare its peak instances/sec against the REST demo to see the wire-protocol \
+difference on the same engine.\n\n\
+## Run it in the IDE\n\n\
+1. Make sure the engine is up (this console is the engine).\n\
+2. Open this project and press **Run**; compare the peak with the REST demo.\n\n\
+## Reclaim disk after the test\n\n\
+```sh\nc8ctl nano stop --purge\n```\n"
+        .into()
+}
+
 /// Materialises the embedded worker SDK into `<project>/.nanobpm/worker-sdk.ts`,
 /// overwriting any prior copy so project code imports the current version.
 pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
@@ -606,6 +718,14 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         )?;
         w(worker.join("worker.ts"), DEMO_WORKER_TS)?;
         w(worker.join("deno.json"), WORKER_DENO_JSON)?;
+    } else if template == "throughput-stream" {
+        w(dir.join("deno.json"), DEMO_STREAM_DENO_JSON)?;
+        w(dir.join("main.ts"), DEMO_STREAM_MAIN_TS)?;
+        w(dir.join("README.md"), &demo_stream_readme())?;
+        w(
+            dir.join("resources").join("processes").join("throughput.bpmn"),
+            DEMO_PROCESS_BPMN,
+        )?;
     } else {
         let starter_worker = dir.join("workers").join("do-work");
         mk(starter_worker.clone())?;
@@ -1341,9 +1461,23 @@ mod tests {
         assert!(dir.join("resources/processes/throughput.bpmn").is_file());
         assert!(dir.join("workers/tick/worker.ts").is_file());
         assert!(!dir.join("workers/do-work").exists());
-        let bpmn = std::fs::read_to_string(dir.join("resources/processes/throughput.bpmn")).unwrap();
-        assert!(bpmn.contains("throughput-demo") && bpmn.contains(r#"type="tick""#));
     }
+
+    #[test]
+    fn throughput_stream_template_scaffolds_sdk_demo() {
+        let _g = lock();
+        let root = temp_root();
+        create_project("bench-stream", "", "throughput-stream").expect("create");
+        let dir = root.join("bench-stream");
+        assert!(dir.join("main.ts").is_file());
+        assert!(dir.join("resources/processes/throughput.bpmn").is_file());
+        assert!(!dir.join("workers/tick").exists());
+        let main = std::fs::read_to_string(dir.join("main.ts")).unwrap();
+        assert!(main.contains("@nanobpm/nano-sdk") && main.contains("createCamundaClient"));
+        let deno = std::fs::read_to_string(dir.join("deno.json")).unwrap();
+        assert!(deno.contains("@nanobpm/nano-sdk"));
+    }
+
 
     #[test]
     fn lists_projects_with_counts() {
