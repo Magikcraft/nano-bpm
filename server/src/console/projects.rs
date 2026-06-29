@@ -558,6 +558,18 @@ instances are left parked), then reports the peak instances/sec and peak memory.
 2. Open this project and press **Run**. Watch the log console fill with per-second \
 rates; the final lines report the peak. It runs ~30s then drains and stops on its \
 own. Press **Stop** anytime to end early.\n\n\
+## A/B: command-stream vs REST\n\n\
+Pair this with **Throughput (command-stream)** (same benchmark via \
+`@nanobpm/nano-sdk`). On a clean engine (30s ramp, fire-and-forget):\n\n\
+| Metric | REST (this demo) | Command-stream |\n\
+|---|---|---|\n\
+| Peak instances/sec | **8,353** | 4,393 |\n\
+| Avg instances/sec | 7,593 | 2,753 |\n\
+| Created in 30s | 227,780 | 82,591 |\n\
+| Peak engine memory | 233 MB | **58 MB** |\n\n\
+REST wins raw throughput (pooled HTTP connections parallelise well); the \
+command stream uses ~4x less engine memory. Run each on a fresh engine \
+(`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
 ## Reclaim disk after the test\n\n\
 The benchmark creates ~1M instances; their journal/data can be large. When you're \
 done, free the disk with:\n\n\
@@ -671,6 +683,17 @@ difference on the same engine.\n\n\
 ## Run it in the IDE\n\n\
 1. Make sure the engine is up (this console is the engine).\n\
 2. Open this project and press **Run**; compare the peak with the REST demo.\n\n\
+## A/B: command-stream vs REST\n\n\
+On a clean engine (30s ramp, fire-and-forget):\n\n\
+| Metric | Command-stream (this demo) | REST |\n\
+|---|---|---|\n\
+| Peak instances/sec | 4,393 | **8,353** |\n\
+| Avg instances/sec | 2,753 | 7,593 |\n\
+| Created in 30s | 82,591 | 227,780 |\n\
+| Peak engine memory | **58 MB** | 233 MB |\n\n\
+The command stream trades raw throughput for ~4x lower engine memory; REST \
+parallelises better over pooled HTTP connections. Run each on a fresh engine \
+(`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
 ## Reclaim disk after the test\n\n\
 ```sh\nc8ctl nano stop --purge\n```\n"
         .into()
