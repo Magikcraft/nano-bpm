@@ -1,6 +1,6 @@
 # ADR 0007 — RAD extension system (npm-installable IDE packs)
 
-Status: **Proposed — design/exploration only. No code changed by this document.**
+Status: **Accepted — implemented (extension manifest, builtin deno/rust/deno-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).**
 Date: 2026-06-29.
 Relates to: ADR 0005 (`docs/adr/0005-embedded-u-nano.md`, the application-binary direction),
 `server/src/console/projects.rs` (`TEMPLATES`, scaffolder, run/compile supervisor),

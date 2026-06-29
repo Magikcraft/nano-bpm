@@ -10,9 +10,11 @@ const Explorer = lazy(() => import("./views/Explorer"));
 const Workers = lazy(() => import("./views/Workers"));
 const Metrics = lazy(() => import("./views/Metrics"));
 const Traces = lazy(() => import("./views/Traces"));
+const Extensions = lazy(() => import("./views/Extensions"));
 
 const navItems = [
   { to: "/projects", label: "Projects" },
+  { to: "/extensions", label: "Extensions" },
   { to: "/topology", label: "Topology" },
   { to: "/metrics", label: "Metrics" },
   { to: "/explorer", label: "Explorer" },
@@ -64,6 +66,7 @@ export default function App() {
             <Route path="/" element={<Navigate to="/projects" replace />} />
             <Route path="/projects" element={<Projects />} />
             <Route path="/projects/:name" element={<ProjectWorkspace />} />
+            <Route path="/extensions" element={<Extensions />} />
             <Route path="/topology" element={<Topology />} />
             <Route path="/metrics" element={<Metrics />} />
             <Route path="/modeler" element={<Navigate to="/projects" replace />} />

@@ -592,6 +592,26 @@ export interface ProjectsResponse {
   denoAvailable: boolean;
   platforms: string[];
   templates?: ProjectTemplate[];
+  extensions?: ExtensionsOverview;
+}
+
+export interface ExtensionFileType {
+  ext: string;
+  monacoLang: string;
+}
+export interface Extension {
+  id: string;
+  kind: "lang" | "app";
+  displayName: string;
+  builtin: boolean;
+  fileTypes: ExtensionFileType[];
+  templates: { id: string; label: string }[];
+  toolchainAvailable: boolean;
+  trusted: boolean;
+}
+export interface ExtensionsOverview {
+  extensions: Extension[];
+  yolo: boolean;
 }
 
 export interface ProjectDetail {
@@ -614,6 +634,13 @@ export interface ProjectLogLine {
 /// lifecycle (author/run/compile/export) reads as one cohesive client.
 export const projectsApi = {
   projects: () => getJson<ProjectsResponse>("/projects"),
+  extensions: () => getJson<ExtensionsOverview>("/extensions"),
+  installExtension: (pkg: string) =>
+    send<Extension>("POST", "/extensions/install", JSON.stringify({ pkg }), "application/json"),
+  removeExtension: (pkg: string) =>
+    send<void>("POST", "/extensions/remove", JSON.stringify({ pkg }), "application/json"),
+  trustExtension: (body: { yolo?: boolean; approve?: string; revoke?: string }) =>
+    send<ExtensionsOverview>("POST", "/extensions/trust", JSON.stringify(body), "application/json"),
   project: (name: string) =>
     getJson<ProjectDetail>(`/projects/${encodeURIComponent(name)}`),
   createProject: (name: string, description: string, template?: string) =>

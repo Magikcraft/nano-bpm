@@ -33,6 +33,7 @@ use tokio::sync::broadcast;
 
 use crate::ServerImpl;
 
+pub mod extensions;
 pub mod projects;
 pub mod trace;
 pub mod worker_export;
@@ -139,6 +140,10 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/projects/{name}/logs", get(project_logs))
         .route("/console/api/projects/{name}/compile", axum::routing::post(project_compile))
         .route("/console/api/projects/{name}/export", get(project_export))
+        .route("/console/api/extensions", get(extensions_list))
+        .route("/console/api/extensions/install", axum::routing::post(extensions_install))
+        .route("/console/api/extensions/remove", axum::routing::post(extensions_remove))
+        .route("/console/api/extensions/trust", axum::routing::post(extensions_trust))
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
@@ -1828,8 +1833,22 @@ async fn projects_list() -> Response {
         "denoAvailable": sup.deno_available(),
         "platforms": projects::PLATFORMS,
         "templates": projects::TEMPLATES.iter().map(|(id, label)| serde_json::json!({"id": id, "label": label})).collect::<Vec<_>>(),
+        "extensions": extensions_overview(),
     }))
     .into_response()
+}
+
+/// Extensions + which lang/app packs are usable on this machine.
+fn extensions_overview() -> serde_json::Value {
+    let exts = extensions::all_extensions();
+    let trust = extensions::load_trust();
+    let list: Vec<_> = exts.iter().map(|e| serde_json::json!({
+        "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
+        "fileTypes": e.file_types, "templates": e.templates,
+        "toolchainAvailable": extensions::toolchain_available(e),
+        "trusted": extensions::is_trusted(&e.id),
+    })).collect();
+    serde_json::json!({ "extensions": list, "yolo": trust.yolo })
 }
 
 #[derive(Deserialize)]
@@ -1856,6 +1875,62 @@ async fn project_create(Json(body): Json<CreateProjectBody>) -> Response {
 /// `GET /console/api/projects/{name}` — config + file tree + run state.
 async fn project_get(Path(name): Path<String>) -> Response {
     project_detail(&name).await
+}
+
+/// `GET /console/api/extensions` — installed + built-in packs and trust state.
+async fn extensions_list() -> Response {
+    Json(extensions_overview()).into_response()
+}
+
+#[derive(Deserialize)]
+struct ExtPkgBody {
+    pkg: String,
+}
+
+/// `POST /console/api/extensions/install` — install a `nano-ide-ext-*` pkg from npm.
+async fn extensions_install(Json(b): Json<ExtPkgBody>) -> Response {
+    match tokio::task::spawn_blocking(move || extensions::install_from_npm(&b.pkg)).await {
+        Ok(Ok(m)) => (StatusCode::CREATED, Json(m)).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// `POST /console/api/extensions/remove` — uninstall an installed pack.
+async fn extensions_remove(Json(b): Json<ExtPkgBody>) -> Response {
+    match extensions::remove(&b.pkg) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrustBody {
+    #[serde(default)]
+    yolo: Option<bool>,
+    #[serde(default)]
+    approve: Option<String>,
+    #[serde(default)]
+    revoke: Option<String>,
+}
+
+/// `POST /console/api/extensions/trust` — toggle yolo / approve-always per pack.
+async fn extensions_trust(Json(b): Json<TrustBody>) -> Response {
+    let mut t = extensions::load_trust();
+    if let Some(y) = b.yolo {
+        t.yolo = y;
+    }
+    if let Some(id) = b.approve {
+        t.approved.insert(id);
+    }
+    if let Some(id) = b.revoke {
+        t.approved.remove(&id);
+    }
+    match extensions::save_trust(&t) {
+        Ok(()) => Json(extensions_overview()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 async fn project_detail(name: &str) -> Response {

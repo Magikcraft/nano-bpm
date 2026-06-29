@@ -1,6 +1,6 @@
 # ADR 0008 — Polyglot RAD: language packs (Rust first)
 
-Status: **Proposed — design/exploration only. No code changed by this document.**
+Status: **Accepted — implemented (extension manifest, builtin deno/rust/deno-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).**
 Date: 2026-06-29.
 Relates to: ADR 0007 (`0007-rad-extension-system.md`, the pack contract this consumes),
 `server/src/console/projects.rs` (scaffolder, supervisor, `PLATFORMS`),

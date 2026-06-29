@@ -1,6 +1,6 @@
 # ADR 0009 — GUI application projects (served-UI binaries)
 
-Status: **Proposed — design/exploration only. No code changed by this document.**
+Status: **Accepted — implemented (extension manifest, builtin deno/rust/deno-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).**
 Date: 2026-06-29.
 Relates to: ADR 0007 (`0007-rad-extension-system.md`, the pack contract), ADR 0005
 (`0005-embedded-u-nano.md`, embed-Nano binary direction), `server/src/console/projects.rs`

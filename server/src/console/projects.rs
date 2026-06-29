@@ -65,6 +65,14 @@ pub const TEMPLATES: &[(&str, &str)] = &[
         "throughput-stream",
         "Throughput (command-stream) — same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
     ),
+    (
+        "rust-throughput",
+        "Throughput (Rust) — native pipelined command-stream (where stream beats REST)",
+    ),
+    (
+        "gui-starter",
+        "GUI app — served-UI binary (Deno.serve) for a process application",
+    ),
 ];
 
 fn now_ms() -> u64 {
@@ -146,6 +154,14 @@ pub struct ProjectConfig {
     /// Cross-compilation targets selected for export (Deno `--target` triples).
     #[serde(default)]
     pub platforms: Vec<String>,
+    /// Language pack id driving editor grammar + toolchain (ADR 0008). Default
+    /// `deno` (TypeScript) — the legacy runtime, zero regression.
+    #[serde(default = "default_lang")]
+    pub lang: String,
+    /// App/output pack id (ADR 0009). `console` (today) or e.g. `deno-gui` for a
+    /// served-UI binary. Default `console`.
+    #[serde(default = "default_app")]
+    pub app: String,
     #[serde(default)]
     pub created_ms: u64,
     #[serde(default)]
@@ -160,6 +176,14 @@ fn default_main() -> String {
     "main.ts".to_string()
 }
 
+fn default_lang() -> String {
+    "deno".to_string()
+}
+
+fn default_app() -> String {
+    "console".to_string()
+}
+
 impl ProjectConfig {
     fn new(name: &str, description: &str) -> Self {
         let ts = now_ms();
@@ -169,6 +193,8 @@ impl ProjectConfig {
             deploy_target: default_deploy_target(),
             main: default_main(),
             platforms: vec![host_target().to_string()],
+            lang: default_lang(),
+            app: default_app(),
             created_ms: ts,
             updated_ms: ts,
         }
@@ -710,7 +736,126 @@ pipelining native producer (Rust beats REST ~32k vs ~20k).\n\n\
         .into()
 }
 
-/// Materialises the embedded worker SDK into `<project>/.nanobpm/worker-sdk.ts`,
+// ---------------------------------------------------------------------------
+// Rust throughput template (lang pack: rust) — native pipelined producer/worker
+// ---------------------------------------------------------------------------
+
+const RUST_CARGO_TOML: &str = r#"[package]
+name = "throughput-rust"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "throughput-rust"
+path = "src/main.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+"#;
+
+const RUST_THROUGHPUT_MAIN: &str = r#"// Throughput (Rust) — the mode where the command stream actually wins.
+//
+// Unlike the JS demos (single-socket, await-per-create), a native producer
+// pipelines creates concurrently across pooled connections. The README A/B
+// shows ~32k/s here vs ~20k REST. This starter drives REST creates via reqwest;
+// swap to the command stream for the headline number. cargo run --release.
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+    let base = std::env::var("NANOBPMN_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+    let pid = std::env::var("PID").unwrap_or_else(|_| "throughput-demo".into());
+    let conns: usize = std::env::var("PROD_CONNS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let dur = Duration::from_secs(15);
+    let created = Arc::new(AtomicU64::new(0));
+    let body = serde_json::json!({ "processDefinitionId": pid, "awaitCompletion": false }).to_string();
+    let client = reqwest::Client::builder().pool_max_idle_per_host(usize::MAX).build().unwrap();
+    let url = format!("{}/v2/process-instances", base.trim_end_matches('/'));
+    let t0 = Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..conns {
+        let c = client.clone(); let u = url.clone(); let b = body.clone(); let n = created.clone();
+        tasks.push(tokio::spawn(async move {
+            while t0.elapsed() < dur {
+                if c.post(&u).header("content-type", "application/json").body(b.clone()).send().await.is_ok() {
+                    n.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for t in tasks { let _ = t.await; }
+    let total = created.load(Ordering::Relaxed);
+    println!("=== {total} created in 15s, ~{}/s ===", total / 15);
+}
+"#;
+
+fn rust_throughput_readme() -> String {
+    "# Throughput (Rust)\n\n\
+A native producer that pipelines creates across pooled connections — the mode \
+where the command stream beats REST. cargo runs it: press **Run** (needs the \
+Rust toolchain installed; the IDE detects `cargo`).\n\n\
+## A/B (native, clean engine, async durability)\n\n\
+| Metric | REST | Command-stream |\n\
+|---|---|---|\n\
+| Peak instances/sec | ~20k | **~32k** |\n\
+| Engine memory | high | **~4x lower** |\n\n\
+In JS the SDK awaits one create at a time so REST wins; a native pipelining \
+producer flips it. Swap the reqwest loop for the stream client for the headline.\n"
+        .into()
+}
+
+// ---------------------------------------------------------------------------
+// GUI app template (app pack: deno-gui) — served-UI binary
+// ---------------------------------------------------------------------------
+
+const GUI_DENO_JSON: &str = r#"{
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@lib/": "./lib/" },
+  "tasks": { "start": "deno run --allow-net --allow-read --allow-env main.ts" }
+}
+"#;
+
+const GUI_MAIN_TS: &str = r#"// GUI app — a self-contained binary serving a UI for your process application.
+// deno compile bundles this + ./public into one binary (deno compile --include public).
+import { deployAllResources } from "@lib/nano.ts";
+const BASE = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const PORT = Number(Deno.env.get("PORT") ?? 8090);
+await deployAllResources();
+Deno.serve({ port: PORT }, async (req) => {
+  const url = new URL(req.url);
+  if (url.pathname === "/api/start") {
+    const r = await fetch(`${BASE}/v2/process-instances`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ processDefinitionId: "starter", awaitCompletion: false }) });
+    return new Response(await r.text(), { headers: { "content-type": "application/json" } });
+  }
+  const path = url.pathname === "/" ? "/index.html" : url.pathname;
+  try { return new Response(await Deno.readTextFile(`./public${path}`), { headers: { "content-type": path.endsWith(".html") ? "text/html" : "text/plain" } }); }
+  catch { return new Response("not found", { status: 404 }); }
+});
+console.log(`GUI app serving on :${PORT}`);
+"#;
+
+const GUI_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Nano GUI App</title>
+<style>body{font:16px system-ui;margin:3rem;max-width:40rem}button{font:inherit;padding:.6rem 1rem}</style></head>
+<body><h1>Process application</h1><p>Served by a Nano GUI app binary.</p>
+<button onclick="fetch('/api/start',{method:'POST'}).then(r=>r.json()).then(j=>out.textContent=JSON.stringify(j))">Start instance</button>
+<pre id="out"></pre></body></html>
+"#;
+
+fn gui_readme(name: &str) -> String {
+    format!(
+        "# {name} (GUI app)\n\n\
+A served-UI process application. `main.ts` runs `Deno.serve`, deploys processes \
+and serves `public/`. Press **Run**, open the port, or **Compile** to a binary \
+(`deno compile --include public`). Future: one-click *Embed Nano* (ADR 0005) \
+for a self-contained engine+UI binary.\n"
+    )
+}
 /// overwriting any prior copy so project code imports the current version.
 pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     let dir = project_dir(name).ok_or_else(|| {
@@ -741,6 +886,10 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
+    let mut cfg_lang = "deno";
+    let mut cfg_app = "console";
+    let mut cfg_main = "main.ts";
+
     if template == "throughput" {
         let worker = dir.join("workers").join("tick");
         mk(worker.clone())?;
@@ -760,6 +909,28 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
             dir.join("resources").join("processes").join("throughput.bpmn"),
             DEMO_PROCESS_BPMN,
         )?;
+    } else if template == "rust-throughput" {
+        mk(dir.join("src"))?;
+        w(dir.join("Cargo.toml"), RUST_CARGO_TOML)?;
+        w(dir.join("src").join("main.rs"), RUST_THROUGHPUT_MAIN)?;
+        w(dir.join("README.md"), &rust_throughput_readme())?;
+        w(
+            dir.join("resources").join("processes").join("throughput.bpmn"),
+            DEMO_PROCESS_BPMN,
+        )?;
+        cfg_lang = "rust";
+        cfg_main = "src/main.rs";
+    } else if template == "gui-starter" {
+        mk(dir.join("public"))?;
+        w(dir.join("deno.json"), GUI_DENO_JSON)?;
+        w(dir.join("main.ts"), GUI_MAIN_TS)?;
+        w(dir.join("public").join("index.html"), GUI_INDEX_HTML)?;
+        w(dir.join("README.md"), &gui_readme(name))?;
+        w(
+            dir.join("resources").join("processes").join(format!("{name}.bpmn")),
+            &starter_process(name),
+        )?;
+        cfg_app = "deno-gui";
     } else {
         let starter_worker = dir.join("workers").join("do-work");
         mk(starter_worker.clone())?;
@@ -773,7 +944,10 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(starter_worker.join("deno.json"), WORKER_DENO_JSON)?;
     }
 
-    let cfg = ProjectConfig::new(name, description);
+    let mut cfg = ProjectConfig::new(name, description);
+    cfg.lang = cfg_lang.to_string();
+    cfg.app = cfg_app.to_string();
+    cfg.main = cfg_main.to_string();
     write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
     Ok(cfg)
 }
@@ -1152,6 +1326,11 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        // Polyglot: a non-Deno lang pack drives its own on-machine toolchain
+        // (ADR 0007/0008). Gated by the trust store.
+        if cfg.lang != "deno" {
+            return self.run_toolchain(name, &cfg, &dir).await;
+        }
         let deno = workers::find_deno().ok_or_else(|| {
             "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN.".to_string()
         })?;
@@ -1279,6 +1458,101 @@ impl ProjectSupervisor {
         Ok(())
     }
 
+    /// Runs a non-Deno lang pack via its declared toolchain (ADR 0007/0008).
+    /// Gated by the extension trust store; the toolchain binary must be on PATH.
+    async fn run_toolchain(
+        &self,
+        name: &str,
+        cfg: &ProjectConfig,
+        dir: &Path,
+    ) -> Result<(), String> {
+        let pack = super::extensions::lang_pack(&cfg.lang)
+            .ok_or_else(|| format!("unknown language pack '{}'", cfg.lang))?;
+        let argv = pack.toolchain.run.clone();
+        if argv.is_empty() {
+            return Err(format!("lang pack '{}' has no run command", cfg.lang));
+        }
+        if !super::extensions::is_trusted(&pack.id) {
+            return Err(format!(
+                "extension '{}' is not approved to run toolchain commands; approve it (or enable yolo) in Extensions",
+                pack.id
+            ));
+        }
+        let bin = super::extensions::find_program(&argv[0])
+            .ok_or_else(|| format!("toolchain '{}' not found — install it and retry", argv[0]))?;
+        let inner = self.entry(name).await;
+        if matches!(*inner.phase.lock().await, Phase::Starting | Phase::Running) {
+            return Ok(());
+        }
+        *inner.phase.lock().await = Phase::Starting;
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let base_url = Self::base_url(cfg);
+        let mut cmd = Command::new(&bin);
+        cmd.current_dir(&dir)
+            .args(&argv[1..])
+            .env("NO_COLOR", "1")
+            .env("NANOBPMN_BASE_URL", &base_url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                *inner.phase.lock().await = Phase::Stopped;
+                return Err(format!("failed to spawn {}: {e}", argv[0]));
+            }
+        };
+        let pid = child.id().unwrap_or(0);
+        inner.pid.store(pid, Ordering::Relaxed);
+        inner.desired_running.store(true, Ordering::Relaxed);
+        *inner.phase.lock().await = Phase::Running;
+        *inner.started_at_ms.lock().await = Some(now_ms());
+        *inner.last_error.lock().await = None;
+        inner
+            .push_log("sys", format!("running {} (pid {pid}) -> {base_url}", argv.join(" ")))
+            .await;
+        if let Some(stdout) = child.stdout.take() {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    inner.push_log("out", line).await;
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    inner.push_log("err", line).await;
+                }
+            });
+        }
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                _ = inner.stop.notified() => { let _ = child.start_kill(); child.wait().await.ok() }
+                st = child.wait() => st.ok(),
+            };
+            inner.pid.store(0, Ordering::Relaxed);
+            let desired = inner.desired_running.load(Ordering::Relaxed);
+            let code = status.and_then(|s| s.code());
+            if !desired || code == Some(0) {
+                inner.desired_running.store(false, Ordering::Relaxed);
+                *inner.phase.lock().await = Phase::Stopped;
+                inner.push_log("sys", "application finished".into()).await;
+            } else {
+                *inner.phase.lock().await = Phase::Crashed;
+                inner.desired_running.store(false, Ordering::Relaxed);
+                *inner.last_error.lock().await = Some(format!("exited with code {code:?}"));
+                inner.push_log("sys", format!("application exited (code {code:?})")).await;
+            }
+        });
+        Ok(())
+    }
+
     /// Stops a running project. No-op if not running.
     pub async fn stop(&self, name: &str) -> Result<(), String> {
         let inner = self.entry(name).await;
@@ -1299,6 +1573,9 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        if cfg.lang != "deno" {
+            return self.compile_toolchain(name, &cfg, &dir).await;
+        }
         let deno = workers::find_deno().ok_or_else(|| {
             "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN.".to_string()
         })?;
@@ -1425,6 +1702,70 @@ impl ProjectSupervisor {
             }
         }
     }
+
+    /// Compiles a non-Deno lang pack via its toolchain (e.g. `cargo build
+    /// --release`), streaming output. Host target only; cross-compile is a pack
+    /// concern. Gated by the trust store.
+    async fn compile_toolchain(
+        &self,
+        name: &str,
+        cfg: &ProjectConfig,
+        dir: &Path,
+    ) -> Result<Vec<String>, String> {
+        let pack = super::extensions::lang_pack(&cfg.lang)
+            .ok_or_else(|| format!("unknown language pack '{}'", cfg.lang))?;
+        let argv = pack.toolchain.compile.clone();
+        if argv.is_empty() {
+            return Err(format!("lang pack '{}' has no compile command", cfg.lang));
+        }
+        if !super::extensions::is_trusted(&pack.id) {
+            return Err(format!("extension '{}' is not approved; approve it in Extensions", pack.id));
+        }
+        let bin = super::extensions::find_program(&argv[0])
+            .ok_or_else(|| format!("toolchain '{}' not found", argv[0]))?;
+        let inner = self.entry(name).await;
+        if inner.compiling.swap(true, Ordering::Relaxed) {
+            return Err("a compile is already in progress".into());
+        }
+        inner.push_log("sys", format!("compiling: {}", argv.join(" "))).await;
+        let mut cmd = Command::new(&bin);
+        cmd.current_dir(dir)
+            .args(&argv[1..])
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let result = match cmd.spawn() {
+            Ok(mut child) => {
+                if let Some(o) = child.stdout.take() {
+                    let inner = inner.clone();
+                    tokio::spawn(async move {
+                        let mut l = BufReader::new(o).lines();
+                        while let Ok(Some(line)) = l.next_line().await { inner.push_log("out", line).await; }
+                    });
+                }
+                if let Some(e) = child.stderr.take() {
+                    let inner = inner.clone();
+                    tokio::spawn(async move {
+                        let mut l = BufReader::new(e).lines();
+                        while let Ok(Some(line)) = l.next_line().await { inner.push_log("err", line).await; }
+                    });
+                }
+                match child.wait().await {
+                    Ok(st) if st.success() => Ok(vec!["target/release/".to_string()]),
+                    Ok(st) => Err(format!("compile failed (code {:?})", st.code())),
+                    Err(e) => Err(format!("compile error: {e}")),
+                }
+            }
+            Err(e) => Err(format!("failed to spawn {}: {e}", argv[0])),
+        };
+        inner.compiling.store(false, Ordering::Relaxed);
+        match &result {
+            Ok(_) => inner.push_log("sys", "compile complete".into()).await,
+            Err(e) => inner.push_log("sys", format!("compile failed: {e}")).await,
+        }
+        result
+    }
 }
 
 #[cfg(test)]
@@ -1465,6 +1806,29 @@ mod tests {
         assert!(safe_project_path("app", "a/../b").is_none());
         assert!(safe_project_path("app", "resources/processes/x.bpmn").is_some());
         assert!(safe_project_path("../bad", "x").is_none());
+    }
+
+    #[test]
+    fn rust_template_sets_lang_and_cargo_files() {
+        let _g = lock();
+        let root = temp_root();
+        let cfg = create_project("rdemo", "", "rust-throughput").expect("create");
+        assert_eq!(cfg.lang, "rust");
+        assert_eq!(cfg.main, "src/main.rs");
+        let dir = root.join("rdemo");
+        assert!(dir.join("Cargo.toml").is_file());
+        assert!(dir.join("src/main.rs").is_file());
+    }
+
+    #[test]
+    fn gui_template_sets_app_and_serves_public() {
+        let _g = lock();
+        let root = temp_root();
+        let cfg = create_project("gdemo", "", "gui-starter").expect("create");
+        assert_eq!(cfg.app, "deno-gui");
+        let dir = root.join("gdemo");
+        assert!(dir.join("public/index.html").is_file());
+        assert!(dir.join("main.ts").is_file());
     }
 
     #[test]
