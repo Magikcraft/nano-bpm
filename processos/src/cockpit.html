@@ -45,6 +45,9 @@
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 12px; }
   .tile { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
   .tile:hover { border-color: #3f3f6a; transform: translateY(-1px); }
+  .tile.tile-undownloaded { border-style: dotted; border-color: #34343c; opacity: .68; background: #101013; }
+  .tile.tile-undownloaded:hover { opacity: 1; border-color: #3f3f6a; }
+  .tile.tile-undownloaded h3 { font-weight: 400; color: #8b8b93; }
   .tile h3 { margin: 0 0 4px; font-size: 15px; font-family: ui-monospace, monospace; color: #c7d2fe; }
   .sc-star { background: none; border: none; padding: 0 2px; cursor: pointer; font-size: 15px; line-height: 1; color: #6b7280; vertical-align: middle; }
   .sc-star:hover { color: #fbbf24; }
@@ -189,14 +192,19 @@
   .dbg-round .dbg-actions { padding: 0 12px 8px; display: flex; gap: 8px; flex-wrap: wrap; }
   .dbg-round .dbg-actions .copybtn { float: none; margin: 0; border: 1px solid #34343c; border-radius: 6px; padding: 3px 9px; font-size: 11px; color: #a1a1aa; }
   .dbg-round .dbg-actions .copybtn:hover { color: #c7d2fe; border-color: #4b5563; }
-  .dbg-msg { border-top: 1px solid #1c1c22; padding: 8px 12px; }
-  .dbg-msg .role { font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 999px; display: inline-block; margin-bottom: 5px; }
+  .dbg-msg { border-top: 1px solid #1c1c22; }
+  .dbg-msg > summary { cursor: pointer; padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; list-style: none; }
+  .dbg-msg > summary::-webkit-details-marker { display: none; }
+  .dbg-msg > summary::before { content: '\25B8'; color: #52525b; font-size: 10px; }
+  .dbg-msg[open] > summary::before { content: '\25BE'; }
+  .dbg-msg .role { font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 999px; display: inline-block; }
   .dbg-msg .role.system { color: #fcd34d; background: rgba(252,211,77,.1); }
   .dbg-msg .role.user { color: #93c5fd; background: rgba(147,197,253,.1); }
   .dbg-msg .role.assistant { color: #a5b4fc; background: rgba(165,180,252,.1); }
   .dbg-msg .role.tool { color: #86efac; background: rgba(134,239,172,.1); }
-  .dbg-msg pre { margin: 0; white-space: pre-wrap; word-break: break-word; font: 11.5px/1.5 ui-monospace, monospace; color: #cbd5e1; max-height: 320px; overflow: auto; }
-  .dbg-msg .meta { color: #6b7280; font: 11px/1.4 ui-monospace, monospace; margin-top: 4px; white-space: pre-wrap; word-break: break-word; }
+  .dbg-msg .dbg-tool { color: #c4b5fd; font: 600 11px/1.4 ui-monospace, monospace; }
+  .dbg-msg pre { margin: 0 12px 8px; white-space: pre-wrap; word-break: break-word; font: 11.5px/1.5 ui-monospace, monospace; color: #cbd5e1; max-height: 320px; overflow: auto; }
+  .dbg-msg .meta { color: #6b7280; font: 11px/1.4 ui-monospace, monospace; margin: 0 12px 4px; white-space: pre-wrap; word-break: break-word; }
   .dbg-tools { border-top: 1px solid #1c1c22; padding: 8px 12px; }
   .dbg-tools summary { cursor: pointer; color: #8b8b93; font: 600 11px/1.4 inherit; }
   .dbg-tools .meta { color: #71717a; font: 11px/1.5 ui-monospace, monospace; padding-top: 5px; white-space: pre-wrap; }
@@ -1009,6 +1017,8 @@ async function renderSidecars(){
                        : atCap ? ('Already running '+max+' sidecars — stop one first')
                        : 'Start this sidecar';
       const runPort = isRunning ? runById[p.id].port : null;
+      // Undownloaded sidecars are dimmed with a dotted outline so cached/ready models stand out.
+      const undownloaded = !isRunning && !isDownloading && !isDownloaded;
       // The action button reflects the lifecycle: download the weights, then start (serve) them.
       let actions;
       if(isRunning){
@@ -1024,7 +1034,7 @@ async function renderSidecars(){
         actions = '<button class="btn primary" data-download="'+esc(p.id)+'" title="Download this model in the background">Download</button>'
                 + '<button class="btn ghost" data-start="'+esc(p.id)+'" '+startDisabled+' title="Start now (downloads first, then serves)">Start</button>';
       }
-      return '<div class="tile" style="cursor:default">'
+      return '<div class="tile'+(undownloaded?' tile-undownloaded':'')+'" style="cursor:default">'
         + '<h3>'+esc(p.name||p.id)+' '+pills
         + ' <button class="sc-star'+(p.starred?' on':'')+'" data-star="'+esc(p.id)+'" data-starred="'+(p.starred?'1':'0')+'" title="'+(p.starred?'Unstar':'Star (pin to top)')+'">'+(p.starred?'\u2605':'\u2606')+'</button>'
         + '</h3>'
@@ -1774,8 +1784,18 @@ function renderDebug(data){
       ' <span class="dim">'+esc(b.model||'')+(b.temperature!=null?(' · temp '+esc(b.temperature)):'')+(b.max_tokens!=null?(' · max_tokens '+esc(b.max_tokens)):'')+' · '+msgs.length+' messages</span>'+
       (entry.ts?'<span class="dbg-ts" title="'+esc(new Date(entry.ts).toLocaleString())+'">'+esc(fmtClock(entry.ts))+'</span>':'');
     const copyJson = esc(JSON.stringify(b, null, 2));
+    // Resolve tool_call_id → tool name so a tool RESULT message can name the tool it answers.
+    const callName = {};
+    msgs.forEach(m => (m.tool_calls||[]).forEach(c => { if(c.id && c.function && c.function.name) callName[c.id] = c.function.name; }));
     const msgHtml = msgs.map(m => {
       const rc = roleClass(m.role);
+      // Title hint: which tool(s) this message calls (assistant) or returns (tool role).
+      let toolHint = '';
+      if(m.tool_calls && m.tool_calls.length){
+        toolHint = m.tool_calls.map(c => c.function && c.function.name).filter(Boolean).join(', ');
+      } else if(m.role==='tool' && m.tool_call_id){
+        toolHint = callName[m.tool_call_id] || '';
+      }
       let body = '';
       if(m.content) body += '<pre>'+esc(typeof m.content==='string'?m.content:JSON.stringify(m.content,null,2))+'</pre>';
       if(m.tool_calls && m.tool_calls.length){
@@ -1783,11 +1803,12 @@ function renderDebug(data){
       }
       if(m.tool_call_id) body += '<div class="meta">tool_call_id: '+esc(m.tool_call_id)+'</div>';
       if(!body) body = '<pre>(empty)</pre>';
-      return '<div class="dbg-msg"><span class="role '+rc+'">'+esc(m.role||'?')+'</span>'+body+'</div>';
+      return '<details class="dbg-msg"><summary><span class="role '+rc+'">'+esc(m.role||'?')+'</span>'+
+        (toolHint?'<span class="dbg-tool">'+esc(toolHint)+'</span>':'')+'</summary>'+body+'</details>';
     }).join('');
     const toolHtml = tools.length ? '<details class="dbg-tools"><summary>'+tools.length+' tool'+(tools.length===1?'':'s')+' offered</summary><div class="meta">'+
       esc(tools.map(t => (t.function&&t.function.name)+' — '+((t.function&&t.function.description)||'').split('\n')[0]).join('\n'))+'</div></details>' : '';
-    return '<details class="dbg-round"'+(idx===reqs.length-1?' open':'')+'>'+
+    return '<details class="dbg-round">'+
       '<summary>'+head+'</summary>'+
       '<div class="dbg-actions"><button class="copybtn" title="Copy the full JSON payload" data-copy="'+copyJson+'">Copy JSON payload</button></div>'+
       msgHtml + toolHtml +
@@ -2802,7 +2823,7 @@ function wirePairControls(){
     refreshPartnerPickers();
   };
   on.checked = localStorage.getItem('processos.pairOn') === '1';
-  on.onchange = sync;
+  on.onchange = () => { sync(); reconcileSidecars(); };
   sync();
 }
 // The Pair AI config the composer will send (or null when off / unavailable).
@@ -2840,7 +2861,7 @@ function wireMonitorControls(){
     refreshPartnerPickers();
   };
   on.checked = localStorage.getItem('processos.monitorOn') === '1';
-  on.onchange = sync;
+  on.onchange = () => { sync(); reconcileSidecars(); };
   sync();
 }
 // The loop-monitor config the composer will send (or null when off / unavailable).
@@ -2880,7 +2901,7 @@ function wireSubControls(){
     refreshPartnerPickers();
   };
   on.checked = localStorage.getItem('processos.subOn') === '1';
-  on.onchange = sync;
+  on.onchange = () => { sync(); reconcileSidecars(); };
   sync();
 }
 // The subagent config the composer will send (or null when off). maxRounds/digestCap are advanced.
@@ -2917,17 +2938,36 @@ async function refreshChatRoster(){
   const parts = [chip(primary, 'primary')];
   const pr = pairRequest(); if(pr && pr.profileId && byId[pr.profileId]) parts.push(chip(byId[pr.profileId], 'pair'));
   const mr = monitorRequest(); if(mr && mr.profileId && byId[mr.profileId]) parts.push(chip(byId[mr.profileId], 'monitor'));
+  const sr = subRequest(); if(sr && sr.profileId && byId[sr.profileId]) parts.push(chip(byId[sr.profileId], 'subagent'));
   // Warn if the primary somehow equals an enabled partner (the send would hit the partner).
   const clash = primary && partnerProfileIds().has(primary.id);
   el.innerHTML = parts.filter(Boolean).join('<span style="opacity:.4">·</span> ')
     + (clash ? ' <span style="color:#f87171" title="Pick a different partner — you can\'t send to the model already acting as the partner">⚠ partner = primary</span>' : '');
 }
-// Ensure every sidecar this investigation needs is up: the PRIMARY (when it's a sidecar) plus any
-// enabled partner (pair/monitor) that is a sidecar — up to two distinct local servers. Prompts
+// When a partner mode is turned off (switching back toward a single LLM), free the now-unused
+// sidecar's memory: stop any running sidecar that is no longer the primary or an enabled partner.
+// Never stops the primary's sidecar or a sidecar still claimed by another active mode.
+async function reconcileSidecars(){
+  let s; try { s = await api('/api/settings') || {}; } catch(e){ return; }
+  const byId = {}; (s.profiles||[]).forEach(p => byId[p.id]=p);
+  const needed = new Set();
+  const primary = byId[s.activeProfile];
+  if(primary && primary.sidecar) needed.add(primary.id);
+  [pairRequest(), monitorRequest(), subRequest()].forEach(req => {
+    if(req && req.profileId){ const p = byId[req.profileId]; if(p && p.sidecar) needed.add(p.id); }
+  });
+  let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return; }
+  const stale = (st.sidecars||[]).map(x => x.profileId).filter(id => id && !needed.has(id));
+  for(const id of stale){
+    try { await api('/api/llama/stop', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId:id})}); } catch(e){}
+  }
+  if(stale.length) refreshLlamaDot();
+}
+// enabled partner (pair/monitor/subagent) that is a sidecar — up to two distinct local servers. Prompts
 // once to start the missing ones, then waits for each to finish loading. Returns true to proceed
 // with the send, false to abort (composer untouched). Any settings/status lookup failure is
 // non-blocking — we proceed and let the chat call surface its own error.
-// Ensure every needed sidecar (primary + any enabled pair/monitor partner that is a sidecar) is up
+// Ensure every needed sidecar (primary + any enabled pair/monitor/subagent partner that is a sidecar) is up
 // and its model has finished loading before we send. `onProgress(text, info)` (optional) is called
 // at each step — start, then every poll while downloading/loading — so the caller can show a live
 // warm-up bubble. Returns true to proceed with the send, false to abort (declined or failed start).
@@ -2938,7 +2978,7 @@ async function ensureSidecarsReady(onProgress){
   const primary = byId[s.activeProfile];
   if(primary && primary.sidecar) needed.set(primary.id, primary);
   const addPartner = (req) => { if(req && req.profileId){ const p = byId[req.profileId]; if(p && p.sidecar) needed.set(p.id, p); } };
-  addPartner(pairRequest()); addPartner(monitorRequest());
+  addPartner(pairRequest()); addPartner(monitorRequest()); addPartner(subRequest());
   if(!needed.size) return true;   // nothing local to start
 
   let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return true; }
