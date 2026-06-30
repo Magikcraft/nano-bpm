@@ -44,6 +44,26 @@ impl Engine {
         }
     }
 
+    /// Replays a tail of recorded events **onto an already-restored engine** (e.g.
+    /// one rebuilt via [`Engine::from_snapshot`]). Each event is applied through
+    /// the same applier as runtime/replay, and this partition's local key
+    /// generator is advanced past every replayed key it owns — identical to the
+    /// per-event bookkeeping in [`Engine::replay_partition`]. This is the
+    /// snapshot-plus-journal-tail recovery primitive: load a periodic snapshot,
+    /// then catch up on only the events the snapshot did not yet cover.
+    pub fn apply_replayed_events<I>(&mut self, events: I)
+    where
+        I: IntoIterator<Item = Event>,
+    {
+        for event in events {
+            let max_key = event.max_key();
+            if state::partition_of(max_key) == self.partition_id {
+                self.next_local = self.next_local.max(state::local_of(max_key));
+            }
+            state::apply(&mut self.state, &event);
+        }
+    }
+
     /// Evicts a *completed* process instance and every entity it owns (jobs,
     /// timers, message subscriptions, incidents) from hot state, returning
     /// `true` if it was evicted. Process-level message-start subscriptions and

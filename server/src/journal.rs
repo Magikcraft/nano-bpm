@@ -16,8 +16,8 @@
 //! only durable business facts keeps the log small and gives a clean recovery
 //! semantic — after a restart, workers simply re-activate.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -30,14 +30,28 @@ use nanobpmn_engine_core::{
 use tokio::sync::oneshot;
 
 use crate::coldspill::ColdIndex;
+use crate::seglog::{ActiveSegment, SegShared};
 use crate::varspill::VarSpillStore;
 
 /// A durable-write request handed to the background journal writer: the
-/// newline-terminated, serialized bytes for one command's events, plus a
-/// one-shot sender signalled once those bytes are fsynced to disk.
+/// newline-terminated, serialized bytes for one command's events, the number of
+/// events they encode (so the segmented writer can track absolute positions),
+/// plus a one-shot sender signalled once those bytes are fsynced to disk.
 struct WriteRequest {
     bytes: Vec<u8>,
+    events: usize,
     ack: oneshot::Sender<()>,
+}
+
+/// A message to the background journal writer: either a durable write, or a
+/// control request to **seal** (rotate) the active segment at the current
+/// boundary and report it. Routing both through one ordered channel guarantees
+/// a rotate is processed exactly between the writes before and after it, so a
+/// snapshot taken on the engine actor covers precisely the sealed segment(s).
+enum WriterMsg {
+    Write(WriteRequest),
+    /// Seal the active segment now; reply with the sealed boundary.
+    Rotate(oneshot::Sender<crate::seglog::SealInfo>),
 }
 
 /// A handle to the durability of a single write. Awaiting [`Commit::wait`]
@@ -73,10 +87,15 @@ pub struct Journal {
     engine: Engine,
     /// `None` for an in-memory (non-persistent) journal; otherwise the channel to
     /// the background writer thread that owns the log file.
-    writer: Option<Sender<WriteRequest>>,
+    writer: Option<Sender<WriterMsg>>,
     /// Joined on drop so any not-yet-acked writes are flushed before the journal
     /// goes away (matters for synchronous callers that never await the commit).
     writer_thread: Option<JoinHandle<()>>,
+    /// Shared seal/boundary state when this journal is backed by a *segmented*
+    /// log (the single-partition bounded-disk path). `None` for in-memory and the
+    /// legacy single-file paths. Lets the snapshot/compaction task read segment
+    /// boundaries and drives [`Journal::snapshot_and_rotate`].
+    seg: Option<Arc<SegShared>>,
     /// Channel to the read-model exporter thread, if one is wired. Every command's
     /// journaled events are forwarded here (in command order: the actor applies
     /// commands serially) to be projected into the read store. The events are
@@ -137,30 +156,51 @@ const MAX_GROUP_BATCH: usize = 8192;
 /// advanced past the durable log — so the process is aborted rather than risk
 /// acknowledging or serving non-durable state (mirrors the previous
 /// panic-on-I/O-error contract).
-fn writer_loop(mut file: File, rx: Receiver<WriteRequest>, linger: Duration) {
+fn writer_loop(mut seg: ActiveSegment, rx: Receiver<WriterMsg>, linger: Duration) {
     loop {
         let idle_start = Instant::now();
         let Ok(first) = rx.recv() else { break };
         let idle = idle_start.elapsed();
         let busy_start = Instant::now();
 
-        let mut batch = vec![first];
-        while let Ok(next) = rx.try_recv() {
-            batch.push(next);
+        let mut batch: Vec<WriteRequest> = Vec::new();
+        let mut pending_rotate: Option<oneshot::Sender<crate::seglog::SealInfo>> = None;
+        match first {
+            WriterMsg::Write(w) => batch.push(w),
+            WriterMsg::Rotate(reply) => pending_rotate = Some(reply),
+        }
+
+        // Drain queued writes into this batch, stopping at a rotate (handled
+        // after the batch is durable) or the group-commit cap.
+        if pending_rotate.is_none() {
+            while batch.len() < MAX_GROUP_BATCH {
+                match rx.try_recv() {
+                    Ok(WriterMsg::Write(w)) => batch.push(w),
+                    Ok(WriterMsg::Rotate(reply)) => {
+                        pending_rotate = Some(reply);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
         }
 
         // Optional group-commit linger: hold the fsync briefly so more
         // concurrently in-flight writes can join this batch. Bounded by both the
         // window and a hard batch cap so a steady flood can't defer a commit
-        // indefinitely.
-        if !linger.is_zero() && batch.len() < MAX_GROUP_BATCH {
+        // indefinitely. A rotate ends the linger (the boundary must be exact).
+        if pending_rotate.is_none() && !linger.is_zero() && batch.len() < MAX_GROUP_BATCH {
             let deadline = Instant::now() + linger;
             while batch.len() < MAX_GROUP_BATCH {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
                 match rx.recv_timeout(remaining) {
-                    Ok(next) => batch.push(next),
+                    Ok(WriterMsg::Write(w)) => batch.push(w),
+                    Ok(WriterMsg::Rotate(reply)) => {
+                        pending_rotate = Some(reply);
+                        break;
+                    }
                     Err(RecvTimeoutError::Timeout) => break,
                     // All senders gone: flush what we have; the outer `recv`
                     // will then observe the disconnect and exit.
@@ -169,25 +209,50 @@ fn writer_loop(mut file: File, rx: Receiver<WriteRequest>, linger: Duration) {
             }
         }
 
-        let mut buf = Vec::new();
-        for req in &batch {
-            buf.extend_from_slice(&req.bytes);
+        if !batch.is_empty() {
+            let mut buf = Vec::new();
+            let mut events: u64 = 0;
+            for req in &batch {
+                buf.extend_from_slice(&req.bytes);
+                events += req.events as u64;
+            }
+
+            let fsync_start = Instant::now();
+            if let Err(e) = seg.write_all(&buf, events).and_then(|()| seg.fsync()) {
+                tracing::error!(
+                    "journal write failed: {e}; aborting to avoid serving non-durable state"
+                );
+                std::process::abort();
+            }
+            crate::metrics::record_commit(batch.len(), fsync_start.elapsed(), buf.len());
+            crate::metrics::inflight_sub(batch.len());
+
+            for req in batch {
+                // The receiver is gone for fire-and-forget writes (the background
+                // tick and startup seeding never await their commit); that's fine.
+                let _ = req.ack.send(());
+            }
+
+            // Size-based segment seal (no-op in the legacy single-file path,
+            // whose threshold is infinite).
+            if let Err(e) = seg.maybe_seal() {
+                tracing::error!("journal segment seal failed: {e}; aborting");
+                std::process::abort();
+            }
         }
 
-        let fsync_start = Instant::now();
-        if let Err(e) = file.write_all(&buf).and_then(|()| file.sync_all()) {
-            tracing::error!(
-                "journal write failed: {e}; aborting to avoid serving non-durable state"
-            );
-            std::process::abort();
-        }
-        crate::metrics::record_commit(batch.len(), fsync_start.elapsed(), buf.len());
-        crate::metrics::inflight_sub(batch.len());
-
-        for req in batch {
-            // The receiver is gone for fire-and-forget writes (the background
-            // tick and startup seeding never await their commit); that's fine.
-            let _ = req.ack.send(());
+        // A rotate seals the active segment at the exact boundary AFTER the
+        // preceding writes are durable, then reports it to the snapshot caller.
+        if let Some(reply) = pending_rotate {
+            match seg.seal() {
+                Ok(info) => {
+                    let _ = reply.send(info);
+                }
+                Err(e) => {
+                    tracing::error!("journal rotate failed: {e}; aborting");
+                    std::process::abort();
+                }
+            }
         }
         crate::metrics::record_writer_cycle(idle, busy_start.elapsed());
     }
@@ -206,8 +271,8 @@ fn writer_loop(mut file: File, rx: Receiver<WriteRequest>, linger: Duration) {
 /// `recv_timeout` to flush that tail, so the window is always bounded by
 /// `interval`. Write/fsync errors abort, identical to the sync path.
 fn writer_loop_async(
-    mut file: File,
-    rx: Receiver<WriteRequest>,
+    mut seg: ActiveSegment,
+    rx: Receiver<WriterMsg>,
     linger: Duration,
     flush: AsyncFlush,
 ) {
@@ -216,12 +281,17 @@ fn writer_loop_async(
     let mut unsynced_writes: usize = 0;
 
     // Force a durability barrier for everything written since the last fsync.
-    let do_fsync = |file: &mut File, bytes: &mut usize, writes: &mut usize, last: &mut Instant| {
+    fn do_fsync(
+        seg: &mut ActiveSegment,
+        bytes: &mut usize,
+        writes: &mut usize,
+        last: &mut Instant,
+    ) {
         if *bytes == 0 {
             return;
         }
         let fsync_start = Instant::now();
-        if let Err(e) = file.sync_all() {
+        if let Err(e) = seg.fsync() {
             tracing::error!(
                 "journal fsync failed: {e}; aborting to avoid serving non-durable state"
             );
@@ -231,10 +301,10 @@ fn writer_loop_async(
         *bytes = 0;
         *writes = 0;
         *last = Instant::now();
-    };
+    }
 
     loop {
-        // Wait for the next request. While an unfsynced tail is outstanding,
+        // Wait for the next message. While an unfsynced tail is outstanding,
         // bound the wait so a quiet producer can't leave it unflushed past the
         // configured interval.
         let idle_start = Instant::now();
@@ -244,10 +314,10 @@ fn writer_loop_async(
                 .checked_sub(last_fsync.elapsed())
                 .unwrap_or_default();
             match rx.recv_timeout(budget) {
-                Ok(req) => req,
+                Ok(msg) => msg,
                 Err(RecvTimeoutError::Timeout) => {
                     do_fsync(
-                        &mut file,
+                        &mut seg,
                         &mut unsynced_bytes,
                         &mut unsynced_writes,
                         &mut last_fsync,
@@ -258,69 +328,125 @@ fn writer_loop_async(
             }
         } else {
             match rx.recv() {
-                Ok(req) => req,
+                Ok(msg) => msg,
                 Err(_) => break,
             }
         };
         let idle = idle_start.elapsed();
         let busy_start = Instant::now();
 
-        let mut batch = vec![first];
-        while let Ok(next) = rx.try_recv() {
-            batch.push(next);
+        let mut batch: Vec<WriteRequest> = Vec::new();
+        let mut pending_rotate: Option<oneshot::Sender<crate::seglog::SealInfo>> = None;
+        match first {
+            WriterMsg::Write(w) => batch.push(w),
+            WriterMsg::Rotate(reply) => pending_rotate = Some(reply),
+        }
+
+        if pending_rotate.is_none() {
+            while batch.len() < MAX_GROUP_BATCH {
+                match rx.try_recv() {
+                    Ok(WriterMsg::Write(w)) => batch.push(w),
+                    Ok(WriterMsg::Rotate(reply)) => {
+                        pending_rotate = Some(reply);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
         }
         // Linger still fattens the *write* batch (fewer write_all syscalls), even
         // though it no longer gates an fsync on the caller's behalf.
-        if !linger.is_zero() && batch.len() < MAX_GROUP_BATCH {
+        if pending_rotate.is_none() && !linger.is_zero() && batch.len() < MAX_GROUP_BATCH {
             let deadline = Instant::now() + linger;
             while batch.len() < MAX_GROUP_BATCH {
                 let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                     break;
                 };
                 match rx.recv_timeout(remaining) {
-                    Ok(next) => batch.push(next),
+                    Ok(WriterMsg::Write(w)) => batch.push(w),
+                    Ok(WriterMsg::Rotate(reply)) => {
+                        pending_rotate = Some(reply);
+                        break;
+                    }
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
         }
 
-        let mut buf = Vec::new();
-        for req in &batch {
-            buf.extend_from_slice(&req.bytes);
-        }
-        if let Err(e) = file.write_all(&buf) {
-            tracing::error!(
-                "journal write failed: {e}; aborting to avoid serving non-durable state"
-            );
-            std::process::abort();
-        }
-        unsynced_bytes += buf.len();
-        unsynced_writes += batch.len();
-        crate::metrics::record_write_batch(batch.len(), buf.len());
+        if !batch.is_empty() {
+            let mut buf = Vec::new();
+            let mut events: u64 = 0;
+            for req in &batch {
+                buf.extend_from_slice(&req.bytes);
+                events += req.events as u64;
+            }
+            if let Err(e) = seg.write_all(&buf, events) {
+                tracing::error!(
+                    "journal write failed: {e}; aborting to avoid serving non-durable state"
+                );
+                std::process::abort();
+            }
+            unsynced_bytes += buf.len();
+            unsynced_writes += batch.len();
+            crate::metrics::record_write_batch(batch.len(), buf.len());
 
-        // Acknowledge now: the write is in the page cache and will survive a
-        // process restart; the amortized fsync below upgrades it to
-        // power-loss-durable.
-        crate::metrics::inflight_sub(batch.len());
-        for req in batch {
-            let _ = req.ack.send(());
+            // Acknowledge now: the write is in the page cache and will survive a
+            // process restart; the amortized fsync below upgrades it to
+            // power-loss-durable.
+            crate::metrics::inflight_sub(batch.len());
+            for req in batch {
+                let _ = req.ack.send(());
+            }
+
+            if unsynced_bytes >= flush.max_bytes || last_fsync.elapsed() >= flush.interval {
+                do_fsync(
+                    &mut seg,
+                    &mut unsynced_bytes,
+                    &mut unsynced_writes,
+                    &mut last_fsync,
+                );
+            }
+
+            // A size-based seal flushes the segment it closes (seal fsyncs), so
+            // the unsynced tail is now durable; reset the window.
+            match seg.maybe_seal() {
+                Ok(Some(_)) => {
+                    unsynced_bytes = 0;
+                    unsynced_writes = 0;
+                    last_fsync = Instant::now();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("journal segment seal failed: {e}; aborting");
+                    std::process::abort();
+                }
+            }
         }
 
-        if unsynced_bytes >= flush.max_bytes || last_fsync.elapsed() >= flush.interval {
-            do_fsync(
-                &mut file,
-                &mut unsynced_bytes,
-                &mut unsynced_writes,
-                &mut last_fsync,
-            );
+        // A rotate seals the active segment at the exact boundary. Sealing
+        // fsyncs the closed segment, so the unsynced tail (now in that segment)
+        // is durable; reset the window.
+        if let Some(reply) = pending_rotate {
+            match seg.seal() {
+                Ok(info) => {
+                    unsynced_bytes = 0;
+                    unsynced_writes = 0;
+                    last_fsync = Instant::now();
+                    let _ = reply.send(info);
+                }
+                Err(e) => {
+                    tracing::error!("journal rotate failed: {e}; aborting");
+                    std::process::abort();
+                }
+            }
         }
         crate::metrics::record_writer_cycle(idle, busy_start.elapsed());
     }
 
     // Drain on shutdown: fsync whatever tail was acked but not yet synced.
     do_fsync(
-        &mut file,
+        &mut seg,
         &mut unsynced_bytes,
         &mut unsynced_writes,
         &mut last_fsync,
@@ -401,18 +527,19 @@ fn async_flush_from_env() -> AsyncFlush {
     AsyncFlush { interval, max_bytes }
 }
 
-/// Spawns the journal writer thread for `file`/`rx`, selecting the sync or async
-/// commit loop from `NANOBPMN_DURABILITY`. Shared by [`SharedWriter::open`] and
-/// [`Journal::open_partition`] so both honour the same durability configuration.
-fn spawn_writer(file: File, rx: Receiver<WriteRequest>) -> io::Result<JoinHandle<()>> {
+/// Spawns the journal writer thread for `seg`/`rx`, selecting the sync or async
+/// commit loop from `NANOBPMN_DURABILITY`. Shared by [`SharedWriter::open`],
+/// [`Journal::open_partition`] and the segmented path so all honour the same
+/// durability configuration.
+fn spawn_writer(seg: ActiveSegment, rx: Receiver<WriterMsg>) -> io::Result<JoinHandle<()>> {
     let linger = journal_linger_from_env();
     let mode = durability_mode_from_env();
     let flush = async_flush_from_env();
     thread::Builder::new()
         .name("nanobpmn-journal-writer".into())
         .spawn(move || match mode {
-            DurabilityMode::Sync => writer_loop(file, rx, linger),
-            DurabilityMode::Async => writer_loop_async(file, rx, linger, flush),
+            DurabilityMode::Sync => writer_loop(seg, rx, linger),
+            DurabilityMode::Async => writer_loop_async(seg, rx, linger, flush),
         })
 }
 
@@ -437,7 +564,7 @@ fn spawn_writer(file: File, rx: Receiver<WriteRequest>) -> io::Result<JoinHandle
 /// so the thread can simply be reclaimed by the OS on exit. It stays alive as
 /// long as any partition journal (holding a cloned sender) is alive.
 pub struct SharedWriter {
-    tx: Sender<WriteRequest>,
+    tx: Sender<WriterMsg>,
 }
 
 impl SharedWriter {
@@ -445,15 +572,16 @@ impl SharedWriter {
     /// and spawns its group-commit writer thread, reading the same
     /// `NANOBPMN_JOURNAL_LINGER_US` linger window as a per-partition journal.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let (tx, rx) = mpsc::channel::<WriteRequest>();
-        spawn_writer(file, rx).expect("spawn shared journal writer thread");
+        let shared = SegShared::legacy(path.as_ref().to_path_buf());
+        let seg = ActiveSegment::open(shared)?;
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
+        spawn_writer(seg, rx).expect("spawn shared journal writer thread");
         Ok(Self { tx })
     }
 
     /// A fresh sender into the shared writer, for one partition's [`Journal`].
     /// The writer thread lives until every such sender is dropped.
-    fn sender(&self) -> Sender<WriteRequest> {
+    fn sender(&self) -> Sender<WriterMsg> {
         self.tx.clone()
     }
 }
@@ -472,6 +600,7 @@ impl Journal {
             engine: Engine::with_partition(partition_id),
             writer: None,
             writer_thread: None,
+            seg: None,
             exporter: None,
             fresh: true,
             spill: None,
@@ -493,6 +622,7 @@ impl Journal {
             engine,
             writer: None,
             writer_thread: None,
+            seg: None,
             exporter: None,
             fresh: false,
             spill: None,
@@ -509,6 +639,7 @@ impl Journal {
             engine: Engine::from_snapshot(snapshot),
             writer: None,
             writer_thread: None,
+            seg: None,
             exporter: None,
             fresh: false,
             spill: None,
@@ -558,19 +689,48 @@ impl Journal {
             fresh = false;
         }
 
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let (tx, rx) = mpsc::channel::<WriteRequest>();
-        let writer_thread = spawn_writer(file, rx).expect("spawn journal writer thread");
+        let shared = SegShared::legacy(path.to_path_buf());
+        let seg_active = ActiveSegment::open(shared)?;
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
+        let writer_thread = spawn_writer(seg_active, rx).expect("spawn journal writer thread");
 
         Ok(Self {
             engine,
             writer: Some(tx),
             writer_thread: Some(writer_thread),
+            seg: None,
             exporter: None,
             fresh,
             spill: None,
             cold: None,
         })
+    }
+
+    /// Opens (or recovers) a **segmented** journal rooted at directory `dir` —
+    /// the bounded-disk single-partition path. Loads the latest snapshot, replays
+    /// only the events it did not cover, and spawns the segment-aware writer so
+    /// the active segment continues from the recovered boundary. The returned
+    /// surviving event list + `first_index` let the caller catch the read model
+    /// up (events compacted before `first_index` are already in the read model).
+    pub fn open_segmented(dir: impl AsRef<Path>) -> io::Result<(Self, crate::seglog::SegRecovery)> {
+        let (engine, recovery) = crate::seglog::recover(dir.as_ref())?;
+        let fresh = recovery.fresh;
+        let shared = Arc::clone(&recovery.shared);
+        let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
+        let writer_thread = spawn_writer(seg_active, rx).expect("spawn journal writer thread");
+
+        let journal = Self {
+            engine,
+            writer: Some(tx),
+            writer_thread: Some(writer_thread),
+            seg: Some(shared),
+            exporter: None,
+            fresh,
+            spill: None,
+            cold: None,
+        };
+        Ok((journal, recovery))
     }
 
     /// Builds a partition journal that persists through a [`SharedWriter`] (one
@@ -595,6 +755,7 @@ impl Journal {
             engine,
             writer: Some(shared.sender()),
             writer_thread: None,
+            seg: None,
             exporter: None,
             fresh,
             spill: None,
@@ -928,7 +1089,12 @@ impl Journal {
         }
 
         let (ack, rx) = oneshot::channel();
-        match writer.send(WriteRequest { bytes, ack }) {
+        let events_count = events.len();
+        match writer.send(WriterMsg::Write(WriteRequest {
+            bytes,
+            events: events_count,
+            ack,
+        })) {
             Ok(()) => {
                 crate::metrics::inflight_inc();
                 Commit(CommitInner::Pending(rx))
@@ -1124,6 +1290,34 @@ impl Journal {
     /// whose size tracks the working set rather than the full event history.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         self.engine.snapshot()
+    }
+
+    /// Whether this journal is backed by a segmented (bounded-disk) log.
+    pub fn is_segmented(&self) -> bool {
+        self.seg.is_some()
+    }
+
+    /// Captures the engine snapshot and seals (rotates) the active segment at the
+    /// exact boundary the snapshot covers, returning `(snapshot, covered_events)`
+    /// — the absolute count of events the snapshot subsumes. `None` for a journal
+    /// that is not segmented (or whose writer is gone).
+    ///
+    /// Must run **on the engine actor thread** (e.g. via `EngineHandle::with`):
+    /// the snapshot reflects every command applied so far, and routing the rotate
+    /// through the same ordered writer channel — after the writes those commands
+    /// already enqueued — makes the sealed boundary line up exactly with the
+    /// snapshot. No command runs between the snapshot and the seal because the
+    /// actor is single-threaded.
+    pub fn snapshot_and_rotate(&self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
+        self.seg.as_ref()?;
+        let writer = self.writer.as_ref()?;
+        let snap = self.engine.snapshot();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
+            return None;
+        }
+        let info = reply_rx.blocking_recv().ok()?;
+        Some((snap, info.end))
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {

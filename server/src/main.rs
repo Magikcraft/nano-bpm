@@ -30,6 +30,7 @@ mod raft;
 mod raft_logstore;
 mod raft_net;
 mod readstore;
+mod seglog;
 mod stub_impls;
 mod varspill;
 
@@ -7792,31 +7793,66 @@ async fn main() {
             );
             let partitions = partition_count_from_env();
             let topology = cluster::Topology::from_env(partitions as u64);
+            let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
             let (journals, recovered) = if topology.is_single_node() && partitions == 1 {
-                // Single partition: warm-start fast by replaying only the events
-                // the store has not yet projected (a full rebuild on a
-                // fresh/reset store). The journal file keeps its historical name.
-                let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
-                    panic!("failed to read journal {}: {e}", journal_path.display())
-                });
-                let mut pos = store.exported_position();
-                if pos > events.len() {
-                    // The store is ahead of the log (truncated/corrupt journal):
-                    // rebuild from scratch.
-                    store.reset().expect("reset read store");
-                    pos = 0;
+                // Single partition: the bounded-disk segmented journal (snapshot
+                // + segment rotation + compaction) unless explicitly disabled, in
+                // which case the legacy single-file journal is used. Either way we
+                // warm-start by replaying only the events the read store has not
+                // yet projected.
+                if seglog::segmented_enabled() {
+                    let dir = journal_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let (journal, recovery) = Journal::open_segmented(&dir).unwrap_or_else(|e| {
+                        panic!("failed to open segmented journal at {}: {e}", dir.display())
+                    });
+                    seg_shared = Some(Arc::clone(&recovery.shared));
+                    // Read-store catch-up over absolute event positions. The
+                    // surviving events span `[first_index, total_events)`; events
+                    // compacted before `first_index` were already projected (the
+                    // exporter watermark gates compaction), so the store is never
+                    // behind the compacted prefix.
+                    let mut pos = store.exported_position() as u64;
+                    if pos > recovery.total_events {
+                        // Store ahead of the log (truncated/corrupt): rebuild from
+                        // whatever survives.
+                        store.reset().expect("reset read store");
+                        pos = recovery.first_index;
+                    }
+                    let skip = pos.saturating_sub(recovery.first_index) as usize;
+                    if skip < recovery.events.len() {
+                        let refs: Vec<&Event> = recovery.events[skip..].iter().collect();
+                        store
+                            .export(&refs)
+                            .expect("catch up read model from segmented journal");
+                    }
+                    let recovered = !journal.is_fresh();
+                    (vec![journal], recovered)
+                } else {
+                    let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                        panic!("failed to read journal {}: {e}", journal_path.display())
+                    });
+                    let mut pos = store.exported_position();
+                    if pos > events.len() {
+                        // The store is ahead of the log (truncated/corrupt journal):
+                        // rebuild from scratch.
+                        store.reset().expect("reset read store");
+                        pos = 0;
+                    }
+                    if pos < events.len() {
+                        let refs: Vec<&Event> = events[pos..].iter().collect();
+                        store
+                            .export(&refs)
+                            .expect("catch up read model from journal");
+                    }
+                    let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
+                        panic!("failed to open journal {}: {e}", journal_path.display())
+                    });
+                    let recovered = !journal.is_fresh();
+                    (vec![journal], recovered)
                 }
-                if pos < events.len() {
-                    let refs: Vec<&Event> = events[pos..].iter().collect();
-                    store
-                        .export(&refs)
-                        .expect("catch up read model from journal");
-                }
-                let journal = Journal::open(&journal_path).unwrap_or_else(|e| {
-                    panic!("failed to open journal {}: {e}", journal_path.display())
-                });
-                let recovered = !journal.is_fresh();
-                (vec![journal], recovered)
             } else if topology.is_single_node() {
                 // Multi-partition: ONE shared group-commit WAL for every
                 // partition (a single [`SharedWriter`]: one file, one writer
@@ -7965,6 +8001,48 @@ async fn main() {
             } else {
                 tracing::info!("started a fresh journal at {}", journal_path.display());
             }
+
+            // Bounded-disk maintenance: periodically snapshot the engine, seal the
+            // active segment at the snapshot boundary, and compact (delete) sealed
+            // segments the snapshot AND the read model no longer need. Only the
+            // segmented single-partition path arms this.
+            if let Some(shared) = seg_shared.clone()
+                && let Some(interval) = seglog::snapshot_interval_from_env()
+                && let Some(handle) = server.engine.all().first().cloned()
+            {
+                let store = server.store.clone();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    // Skip the immediate first tick.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
+                        let Some((snap, covered)) = snapped else {
+                            continue;
+                        };
+                        if let Err(e) = seglog::write_snapshot(&shared.dir, snap, covered) {
+                            tracing::warn!("journal snapshot write failed: {e}");
+                            continue;
+                        }
+                        // Never delete a segment the read model has not yet
+                        // projected: bound compaction by the exporter watermark
+                        // as well as the snapshot.
+                        let watermark = covered.min(store.exported_position() as u64);
+                        let removed = seglog::compact(&shared, watermark);
+                        if removed > 0 {
+                            tracing::debug!(
+                                "journal compaction removed {removed} sealed segment(s) (watermark {watermark})"
+                            );
+                        }
+                    }
+                });
+                tracing::info!(
+                    "segmented journal enabled (snapshot/compaction every {:?})",
+                    interval
+                );
+            }
+
             server
         }
         None => {
