@@ -589,7 +589,11 @@ fn activate_one_job(server: &ServerProcess, job_type: &str) -> String {
     assert_eq!(status, 200, "activation failed: {resp}");
     let json: serde_json::Value = serde_json::from_str(&resp).expect("activation response is JSON");
     let jobs = json["jobs"].as_array().expect("jobs array");
-    assert_eq!(jobs.len(), 1, "exactly one {job_type} job should activate: {resp}");
+    assert_eq!(
+        jobs.len(),
+        1,
+        "exactly one {job_type} job should activate: {resp}"
+    );
     jobs[0]["jobKey"]
         .as_str()
         .expect("jobKey present")
@@ -658,7 +662,10 @@ fn a_non_interrupting_message_boundary_deploys_and_spawns_a_parallel_token() {
         &path("/messages/correlation"),
         Some(r#"{"name":"reminder","correlationKey":""}"#),
     );
-    assert_eq!(status, 200, "correlating the boundary message failed: {body}");
+    assert_eq!(
+        status, 200,
+        "correlating the boundary message failed: {body}"
+    );
 
     // Both paths now have an activatable job: the spawned notify-work job AND the
     // still-running main-work job (the task was not cancelled).
@@ -747,7 +754,10 @@ fn an_interrupting_message_boundary_on_a_subprocess_tears_down_the_inner_scope()
     // The abort-flow job is now activatable; the cancelled inner job cannot be
     // re-activated (the inner scope was torn down), so no inner-work job remains.
     let abort_key = activate_one_job(&server, "abort-flow");
-    assert_ne!(abort_key, inner_key, "a distinct abort-flow job was created");
+    assert_ne!(
+        abort_key, inner_key,
+        "a distinct abort-flow job was created"
+    );
     let (status, resp) = server.request(
         "POST",
         &path("/jobs/activation"),
@@ -819,7 +829,10 @@ fn variables_set_on_an_instance_are_searchable_and_fetchable() {
     // truncated. Integer values render bare in the serialized-JSON value string.
     let mut names: Vec<&str> = Vec::new();
     for it in items {
-        assert_eq!(it["processInstanceKey"].as_str(), Some(instance_key.as_str()));
+        assert_eq!(
+            it["processInstanceKey"].as_str(),
+            Some(instance_key.as_str())
+        );
         assert_eq!(it["scopeKey"], it["processInstanceKey"]);
         assert_eq!(it["tenantId"].as_str(), Some("<default>"));
         assert_eq!(it["isTruncated"].as_bool(), Some(false));
@@ -850,7 +863,10 @@ fn variables_set_on_an_instance_are_searchable_and_fetchable() {
     let v: serde_json::Value = serde_json::from_str(&body).expect("get response is JSON");
     assert_eq!(v["name"].as_str(), Some("b"));
     assert_eq!(v["value"].as_str(), Some("2"));
-    assert_eq!(v["processInstanceKey"].as_str(), Some(instance_key.as_str()));
+    assert_eq!(
+        v["processInstanceKey"].as_str(),
+        Some(instance_key.as_str())
+    );
     assert_eq!(v["scopeKey"].as_str(), Some(instance_key.as_str()));
 
     // An unknown variable key 404s.
@@ -1388,7 +1404,11 @@ fn create_instance_variables_flow_through_to_activated_jobs() {
     let obj = vars.as_object().expect("variables is an object");
     let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, vec!["a", "b", "c"], "created variables present on job");
+    assert_eq!(
+        keys,
+        vec!["a", "b", "c"],
+        "created variables present on job"
+    );
     assert_eq!(obj["a"].as_i64(), Some(1));
     assert_eq!(obj["b"].as_i64(), Some(2));
     assert_eq!(obj["c"].as_i64(), Some(3));
@@ -1436,7 +1456,11 @@ fn await_completion_returns_variables_when_the_process_completes() {
     let vars = json["variables"].as_object().expect("variables object");
     let keys: Vec<&str> = vars.keys().map(String::as_str).collect();
     assert_eq!(keys, vec!["x"], "only fetched variable returned: {body}");
-    assert_eq!(vars["x"].as_i64(), Some(7), "fetched value is authoritative");
+    assert_eq!(
+        vars["x"].as_i64(),
+        Some(7),
+        "fetched value is authoritative"
+    );
 
     server.shutdown();
 }
@@ -1600,7 +1624,8 @@ fn backpressure_absorbs_an_undrained_create_burst() {
     // drains — is fully absorbed: at any instant at most one create is in the
     // engine apply, which is below the limit. (Under the old backlog gauge this
     // same watermark would have shed every create after the first.)
-    let server = ServerProcess::boot_with_env(&journal, &[("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "1")]);
+    let server =
+        ServerProcess::boot_with_env(&journal, &[("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "1")]);
 
     for i in 0..25 {
         let (status, body) = server.request(
@@ -1626,10 +1651,14 @@ fn backpressure_can_be_turned_off() {
     // shedding entirely, so creates always succeed however many instances are
     // already parked in-flight. (Backpressure is otherwise on by default; the
     // default watermark is far above the handful of creates exercised here.)
-    let server = ServerProcess::boot_with_env(&journal, &[("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "off")]);
+    let server =
+        ServerProcess::boot_with_env(&journal, &[("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT", "off")]);
     for _ in 0..5 {
         let key = create_demo_instance(&server);
-        assert!(!key.is_empty(), "create should always succeed with backpressure off");
+        assert!(
+            !key.is_empty(),
+            "create should always succeed with backpressure off"
+        );
     }
 
     server.shutdown();
@@ -1657,9 +1686,8 @@ fn spilled_variables_rehydrate_correctly_on_job_activation() {
     // Create several instances, each carrying distinct variables, so a stale or
     // cross-wired rehydration would be caught.
     for i in 0..5 {
-        let body = format!(
-            r#"{{"processDefinitionId":"demo","variables":{{"n":{i},"tag":"v{i}"}}}}"#
-        );
+        let body =
+            format!(r#"{{"processDefinitionId":"demo","variables":{{"n":{i},"tag":"v{i}"}}}}"#);
         let (status, resp) = server.request("POST", &path("/process-instances"), Some(&body));
         assert_eq!(status, 200, "create {i} failed: {resp}");
     }
@@ -1679,7 +1707,11 @@ fn spilled_variables_rehydrate_correctly_on_job_activation() {
         seen.push(n);
     }
     seen.sort_unstable();
-    assert_eq!(seen, vec![0, 1, 2, 3, 4], "every instance's variables rehydrated exactly once");
+    assert_eq!(
+        seen,
+        vec![0, 1, 2, 3, 4],
+        "every instance's variables rehydrated exactly once"
+    );
 
     server.shutdown();
 }
@@ -1849,7 +1881,10 @@ fn multi_partition_state_survives_a_restart() {
             break;
         }
     }
-    assert_eq!(completed, 8, "all recovered jobs must activate after restart");
+    assert_eq!(
+        completed, 8,
+        "all recovered jobs must activate after restart"
+    );
 
     restarted.shutdown();
 }

@@ -9,8 +9,9 @@
 //! can tell the operator exactly *what* is missing, *why* it's needed, and link
 //! them to the official, OS-aware install instructions.
 
-use serde::Serialize;
 use std::process::Command;
+
+use serde::Serialize;
 
 /// OS-aware install instructions (cover macOS/Linux/Windows package managers).
 const DENO_INSTALL_URL: &str = "https://docs.deno.com/runtime/getting_started/installation/";

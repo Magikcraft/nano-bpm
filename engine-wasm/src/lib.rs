@@ -13,12 +13,13 @@
 //!     re-render the diagram (active tokens), variables, jobs and incidents from
 //!     a single round-trip.
 
+use std::collections::HashMap;
+
 use nanobpmn_engine_core::{
     bpmn::parse_bpmn, Command, Engine, Event, IncidentState, JobState, ProcessInstanceState,
     TimerState, Value,
 };
 use serde::Serialize;
-use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
 /// A simulated engine instance bound to one modeler session.
@@ -156,7 +157,11 @@ impl TestEngine {
     /// clock never moves backwards. Returns the snapshot.
     #[wasm_bindgen(js_name = tickNow)]
     pub fn tick_now(&mut self, now_ms: f64) -> Result<String, JsValue> {
-        let now = if now_ms.is_finite() && now_ms > 0.0 { now_ms as u64 } else { 0 };
+        let now = if now_ms.is_finite() && now_ms > 0.0 {
+            now_ms as u64
+        } else {
+            0
+        };
         if now > self.now {
             self.now = now;
         }
@@ -181,7 +186,11 @@ impl TestEngine {
         worker: &str,
     ) -> Result<String, JsValue> {
         let now = self.now;
-        let timeout = if timeout_ms.is_finite() && timeout_ms > 0.0 { timeout_ms as u64 } else { 30_000 };
+        let timeout = if timeout_ms.is_finite() && timeout_ms > 0.0 {
+            timeout_ms as u64
+        } else {
+            30_000
+        };
         self.apply(Command::ActivateJobs {
             job_type: job_type.to_string(),
             worker: worker.to_string(),
@@ -194,9 +203,17 @@ impl TestEngine {
         let mut out: Vec<serde_json::Value> = state
             .jobs
             .values()
-            .filter(|j| j.job_type == job_type && j.state == JobState::Activated && j.worker.as_deref() == Some(worker))
+            .filter(|j| {
+                j.job_type == job_type
+                    && j.state == JobState::Activated
+                    && j.worker.as_deref() == Some(worker)
+            })
             .map(|j| {
-                let vars = state.instances.get(&j.instance_key).map(|i| vars_to_json(&i.variables)).unwrap_or_default();
+                let vars = state
+                    .instances
+                    .get(&j.instance_key)
+                    .map(|i| vars_to_json(&i.variables))
+                    .unwrap_or_default();
                 serde_json::json!({
                     "key": j.key.to_string(),
                     "type": j.job_type,
@@ -542,9 +559,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::Str(s) => serde_json::Value::String(s.clone()),
-        Value::List(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
         Value::Map(entries) => {
             let mut m = serde_json::Map::new();
             for (k, val) in entries {
@@ -570,8 +585,10 @@ fn json_to_value(v: &serde_json::Value) -> Value {
         }
         serde_json::Value::String(s) => Value::Str(s.clone()),
         serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
-        serde_json::Value::Object(map) => {
-            Value::Map(map.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
-        }
+        serde_json::Value::Object(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+        ),
     }
 }

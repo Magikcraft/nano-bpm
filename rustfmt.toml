@@ -1,0 +1,5 @@
+# Canonical formatter config — requires nightly rustfmt (see `make fmt`),
+# because `group_imports` is unstable. On stable it is ignored, which is the
+# import-ordering drift CI must guard against. Pin: nightly-2026-06-26.
+edition = "2024"
+group_imports = "StdExternalCrate"

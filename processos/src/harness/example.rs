@@ -159,8 +159,9 @@ pub fn example_scenario() -> Scenario {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nanobpmn_engine_core::bpmn::parse_bpmn;
+
+    use super::*;
 
     #[test]
     fn example_bpmn_parses() {

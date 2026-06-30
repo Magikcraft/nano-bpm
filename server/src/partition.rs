@@ -153,7 +153,10 @@ impl PartitionRouter {
         match self.resolve(p) {
             Location::Local(h) => h,
             Location::Remote(_) => {
-                debug_assert!(false, "local_for called on a remote partition; callers must check resolve()/locate() and forward Remote");
+                debug_assert!(
+                    false,
+                    "local_for called on a remote partition; callers must check resolve()/locate() and forward Remote"
+                );
                 &self.local[0]
             }
         }
@@ -297,7 +300,6 @@ impl Partitions {
         nodes
     }
 
-
     /// round-robin across the partitions **this node owns**. An instance lives on
     /// the partition that created it for its whole life (its key embeds the
     /// partition). In a single-node cluster the owned set is every partition in
@@ -395,9 +397,10 @@ impl Partitions {
 
 #[cfg(test)]
 mod tests {
+    use nanobpmn_engine_core::compose_key;
+
     use super::*;
     use crate::journal::Journal;
-    use nanobpmn_engine_core::compose_key;
 
     fn spawn_partitions(n: u64) -> Partitions {
         let handles = (0..n)
@@ -484,11 +487,16 @@ mod tests {
         for p in [1u64, 3] {
             match parts.router.resolve(PartitionId(p)) {
                 Location::Remote(NodeId(1)) => {}
-                Location::Remote(NodeId(other)) => panic!("partition {p} owner should be node 1, got {other}"),
+                Location::Remote(NodeId(other)) => {
+                    panic!("partition {p} owner should be node 1, got {other}")
+                }
                 Location::Local(_) => panic!("partition {p} should be Remote on node 0"),
             }
         }
         // by_key of an owned partition resolves locally; both 0 and 2 present.
-        assert!(std::ptr::eq(parts.by_key(compose_key(2, 1)), &parts.all()[1]));
+        assert!(std::ptr::eq(
+            parts.by_key(compose_key(2, 1)),
+            &parts.all()[1]
+        ));
     }
 }

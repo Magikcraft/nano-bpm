@@ -15,9 +15,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use prometheus::{
-    Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder,
-};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 
 /// The process-wide metrics registry and the Phase-1 handles.
 struct Metrics {
@@ -50,7 +48,6 @@ struct Metrics {
     writer_busy_seconds: prometheus::Counter,
 
     // ---- Phase 2: command-stream and protocol metrics ----
-    
     /// Command-stream WebSocket frames processed, by frame type.
     stream_frames_total: prometheus::IntCounterVec,
     /// How many times a streaming client stalled waiting for submission credits.
@@ -59,7 +56,7 @@ struct Metrics {
     stream_connections_active: IntGauge,
     /// Time spent processing each command-stream frame (read + apply + reply).
     stream_frame_processing_seconds: Histogram,
-    
+
     /// Process instance creates, split by protocol (rest vs stream).
     creates_total: prometheus::IntCounterVec,
     /// Job completions, split by protocol (rest vs stream).
@@ -291,7 +288,10 @@ pub fn gather() -> String {
 
 /// Records a command-stream frame processed (by frame type).
 pub fn record_stream_frame(frame_type: &str) {
-    METRICS.stream_frames_total.with_label_values(&[frame_type]).inc();
+    METRICS
+        .stream_frames_total
+        .with_label_values(&[frame_type])
+        .inc();
 }
 
 /// Records a streaming client stalling for submission credits.
@@ -311,7 +311,9 @@ pub fn stream_connection_dec() {
 
 /// Records time spent processing one command-stream frame.
 pub fn record_stream_frame_processing(elapsed: Duration) {
-    METRICS.stream_frame_processing_seconds.observe(elapsed.as_secs_f64());
+    METRICS
+        .stream_frame_processing_seconds
+        .observe(elapsed.as_secs_f64());
 }
 
 /// Records a process instance create (by protocol: "rest" or "stream").
@@ -321,7 +323,10 @@ pub fn record_create(protocol: &str) {
 
 /// Records a job completion (by protocol: "rest" or "stream").
 pub fn record_job_completion(protocol: &str) {
-    METRICS.job_completions_total.with_label_values(&[protocol]).inc();
+    METRICS
+        .job_completions_total
+        .with_label_values(&[protocol])
+        .inc();
 }
 
 /// A plain, dependency-free snapshot of the current metric values, taken in one

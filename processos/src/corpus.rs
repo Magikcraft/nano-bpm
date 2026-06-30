@@ -24,14 +24,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value as Json;
-
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    Command, ElementKind, Engine, JobState, ProcessDefinition, ProcessInstanceState, Value,
-    UserTaskState,
+    Command, ElementKind, Engine, JobState, ProcessDefinition, ProcessInstanceState, UserTaskState,
+    Value,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
 
 use crate::harness::{draw, min_workers_for_p99};
 
@@ -305,11 +304,12 @@ pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> 
     // (a file, or a directory scanned for `*.bpmn`). A single BPMN file may
     // itself declare several `<process>` elements.
     let mut library: HashMap<String, ProcessDefinition> = HashMap::new();
-    let add_file = |path: &Path, library: &mut HashMap<String, ProcessDefinition>| -> Result<(), String> {
+    let add_file = |path: &Path,
+                    library: &mut HashMap<String, ProcessDefinition>|
+     -> Result<(), String> {
         let xml = std::fs::read_to_string(path)
             .map_err(|e| format!("read bpmn {}: {e}", path.display()))?;
-        let defs =
-            parse_bpmn(&xml).map_err(|e| format!("parse bpmn {}: {e}", path.display()))?;
+        let defs = parse_bpmn(&xml).map_err(|e| format!("parse bpmn {}: {e}", path.display()))?;
         for d in defs {
             library.insert(d.id.clone(), d);
         }

@@ -341,13 +341,29 @@ impl Engine {
         business_id: Option<String>,
     ) {
         if self.num_partitions <= 1 {
-            self.start_instance(log, queue, process_id, start_event, variables, tags, business_id);
+            self.start_instance(
+                log,
+                queue,
+                process_id,
+                start_event,
+                variables,
+                tags,
+                business_id,
+            );
             return;
         }
         let target = self.start_dispatch_rr % self.num_partitions;
         self.start_dispatch_rr = self.start_dispatch_rr.wrapping_add(1);
         if target == self.partition_id {
-            self.start_instance(log, queue, process_id, start_event, variables, tags, business_id);
+            self.start_instance(
+                log,
+                queue,
+                process_id,
+                start_event,
+                variables,
+                tags,
+                business_id,
+            );
         } else {
             self.emit(
                 log,
@@ -514,7 +530,15 @@ impl Engine {
                     }
                 })?;
                 let start_event = process.definition.start_event.clone();
-                self.start_instance(&mut log, &mut queue, process_id, start_event, variables, tags, business_id);
+                self.start_instance(
+                    &mut log,
+                    &mut queue,
+                    process_id,
+                    start_event,
+                    variables,
+                    tags,
+                    business_id,
+                );
             }
 
             Command::CompleteJob { job_key, variables } => {
@@ -634,9 +658,8 @@ impl Engine {
                 let instance_key = task.instance_key;
                 // Normalise empty-string dates to "reset" (None), matching the
                 // REST contract ("Reset by providing an empty String").
-                let normalize = |d: Option<String>| -> Option<String> {
-                    d.filter(|s| !s.is_empty())
-                };
+                let normalize =
+                    |d: Option<String>| -> Option<String> { d.filter(|s| !s.is_empty()) };
                 self.emit(
                     &mut log,
                     Event::UserTaskUpdated {
@@ -1092,7 +1115,9 @@ impl Engine {
                 // completed/errored jobs are terminal.
                 if matches!(
                     job.state,
-                    state::JobState::Completed | state::JobState::Errored | state::JobState::Canceled
+                    state::JobState::Completed
+                        | state::JobState::Errored
+                        | state::JobState::Canceled
                 ) {
                     return Err(EngineError::JobNotActive { job_key });
                 }
@@ -1345,7 +1370,8 @@ impl Engine {
                     // An earlier boundary correlation in this batch may have
                     // interrupted an activity that cancelled this subscription;
                     // re-check it is still open.
-                    let subscription = match self.state.signal_subscriptions.get(&subscription_key) {
+                    let subscription = match self.state.signal_subscriptions.get(&subscription_key)
+                    {
                         Some(s) if s.state == state::MessageSubscriptionState::Open => s,
                         _ => continue,
                     };
@@ -1537,8 +1563,10 @@ impl Engine {
                     })
                     .collect();
                 subs.sort_unstable_by_key(|s| s.key);
-                let sub_cancels: Vec<Event> =
-                    subs.iter().map(|s| Self::disarm_subscription_event(s)).collect();
+                let sub_cancels: Vec<Event> = subs
+                    .iter()
+                    .map(|s| Self::disarm_subscription_event(s))
+                    .collect();
 
                 let mut sig_subs: Vec<&state::SignalSubscription> = self
                     .state
@@ -1565,8 +1593,7 @@ impl Engine {
                     .user_tasks
                     .values()
                     .filter(|t| {
-                        t.instance_key == instance_key
-                            && t.state == state::UserTaskState::Created
+                        t.instance_key == instance_key && t.state == state::UserTaskState::Created
                     })
                     .collect();
                 user_tasks.sort_unstable_by_key(|t| t.key);
@@ -2464,10 +2491,7 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
         .filter(|(_, v)| v.instance_key() == instance_key)
         .map(|(k, _)| *k)
         .collect();
-    owned
-        .into_iter()
-        .filter_map(|k| map.remove(&k))
-        .collect()
+    owned.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
 
 /// Errors returned by [`Engine::apply_command`].
@@ -2601,7 +2625,6 @@ fn job_activatable(job: &state::Job, now: u64) -> bool {
         state::JobState::Activated => job.deadline.is_some_and(|d| d <= now),
     }
 }
-
 
 #[cfg(test)]
 mod tests;

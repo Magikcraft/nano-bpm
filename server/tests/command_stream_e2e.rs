@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Path to the compiled server binary, provided by Cargo for integration tests.
 const SERVER_BIN: &str = env!("CARGO_BIN_EXE_nanobpm-gateway-rest-server");
@@ -314,7 +314,8 @@ impl WsClient {
 
     /// Like [`Self::recv_frame`] but returns `None` if a read times out or the
     /// stream ends, instead of panicking.
-    fn try_recv_frame(&mut self) -> Option<(u8, Vec<u8>)> {        let mut header = [0u8; 2];
+    fn try_recv_frame(&mut self) -> Option<(u8, Vec<u8>)> {
+        let mut header = [0u8; 2];
         if self.stream.read_exact(&mut header).is_err() {
             return None;
         }
@@ -435,7 +436,11 @@ fn subscribe_create_push_and_complete_a_job() {
     }));
     let result = ws.recv_until(&["commandResult"]);
     assert_eq!(result["corr"].as_u64(), Some(1));
-    assert_eq!(result["status"].as_u64(), Some(200), "create failed: {result}");
+    assert_eq!(
+        result["status"].as_u64(),
+        Some(200),
+        "create failed: {result}"
+    );
 
     // The dispatcher should push the parked job to our subscription.
     let job_frame = ws.recv_until(&["job"]);
@@ -750,4 +755,3 @@ fn a_heartbeating_client_is_not_reaped() {
         Some(200)
     );
 }
-

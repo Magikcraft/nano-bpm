@@ -4,13 +4,12 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use crate::model::Value;
-
 use super::ast::{BinOp, CallArgs, Node, Quantifier, RangeNode};
 use super::builtins;
 use super::error::FeelError;
 use super::temporal::{Date, DateTime, DtDuration, Time, YmDuration};
 use super::value::{FeelVal, Func, Range};
+use crate::model::Value;
 
 /// A lexical scope: a stack of frames over the engine's base variable map.
 pub struct Ctx<'a> {
@@ -125,7 +124,10 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
             let xv = eval_node(x, ctx)?;
             let lov = eval_node(lo, ctx)?;
             let hiv = eval_node(hi, ctx)?;
-            let ge = matches!(compare(&xv, &lov), Some(Ordering::Greater | Ordering::Equal));
+            let ge = matches!(
+                compare(&xv, &lov),
+                Some(Ordering::Greater | Ordering::Equal)
+            );
             let le = matches!(compare(&xv, &hiv), Some(Ordering::Less | Ordering::Equal));
             Ok(FeelVal::Bool(ge && le))
         }
@@ -332,7 +334,11 @@ fn eval_call(callee: &Node, args: &CallArgs, ctx: &mut Ctx) -> Result<FeelVal, F
 }
 
 /// Invokes a function value with already-evaluated positional arguments.
-pub fn apply(func: &Func, args: Vec<FeelVal>, base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
+pub fn apply(
+    func: &Func,
+    args: Vec<FeelVal>,
+    base: &HashMap<String, Value>,
+) -> Result<FeelVal, FeelError> {
     match func {
         Func::Builtin(name) => builtins::call(name, args, base),
         Func::Lambda {
@@ -383,11 +389,7 @@ fn time_member(t: &Time, name: &str) -> FeelVal {
         "hour" => FeelVal::Int(t.hour as i64),
         "minute" => FeelVal::Int(t.minute as i64),
         "second" => FeelVal::Int(t.second as i64),
-        "timezone" => t
-            .zone
-            .clone()
-            .map(FeelVal::Str)
-            .unwrap_or(FeelVal::Null),
+        "timezone" => t.zone.clone().map(FeelVal::Str).unwrap_or(FeelVal::Null),
         _ => FeelVal::Null,
     }
 }
@@ -536,10 +538,12 @@ fn add(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
             };
             Ok(FeelVal::Date(base.add_dt(*dt).date))
         }
-        (DateTime(d), YmDur(y)) | (YmDur(y), DateTime(d)) => Ok(FeelVal::DateTime(super::temporal::DateTime {
-            date: d.date.add_months(y.months),
-            time: d.time.clone(),
-        })),
+        (DateTime(d), YmDur(y)) | (YmDur(y), DateTime(d)) => {
+            Ok(FeelVal::DateTime(super::temporal::DateTime {
+                date: d.date.add_months(y.months),
+                time: d.time.clone(),
+            }))
+        }
         (DateTime(d), DtDur(dt)) | (DtDur(dt), DateTime(d)) => Ok(FeelVal::DateTime(d.add_dt(*dt))),
         (Time(t), DtDur(dt)) | (DtDur(dt), Time(t)) => {
             let nanos = t.nano_of_day() + dt.nanos;
@@ -572,14 +576,21 @@ fn sub(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
                 date: *d,
                 time: super::temporal::Time::new(0, 0, 0, 0),
             };
-            Ok(FeelVal::Date(base.add_dt(DtDuration::from_nanos(-dt.nanos)).date))
+            Ok(FeelVal::Date(
+                base.add_dt(DtDuration::from_nanos(-dt.nanos)).date,
+            ))
         }
         (DateTime(d), YmDur(y)) => Ok(FeelVal::DateTime(super::temporal::DateTime {
             date: d.date.add_months(-y.months),
             time: d.time.clone(),
         })),
-        (DateTime(d), DtDur(dt)) => Ok(FeelVal::DateTime(d.add_dt(DtDuration::from_nanos(-dt.nanos)))),
-        (Time(t), DtDur(dt)) => Ok(FeelVal::Time(time_from_nanos(t.nano_of_day() - dt.nanos, t))),
+        (DateTime(d), DtDur(dt)) => Ok(FeelVal::DateTime(
+            d.add_dt(DtDuration::from_nanos(-dt.nanos)),
+        )),
+        (Time(t), DtDur(dt)) => Ok(FeelVal::Time(time_from_nanos(
+            t.nano_of_day() - dt.nanos,
+            t,
+        ))),
         (YmDur(a), YmDur(b)) => Ok(FeelVal::YmDur(YmDuration::new(a.months - b.months))),
         (DtDur(a), DtDur(b)) => Ok(FeelVal::DtDur(DtDuration::from_nanos(a.nanos - b.nanos))),
         _ => Err(type_err("-", l, r)),
@@ -595,9 +606,9 @@ fn mul(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
         (YmDur(d), n) | (n, YmDur(d)) if n.is_number() => Ok(FeelVal::YmDur(YmDuration::new(
             (d.months as f64 * n.as_f64().unwrap()).round() as i64,
         ))),
-        (DtDur(d), n) | (n, DtDur(d)) if n.is_number() => Ok(FeelVal::DtDur(DtDuration::from_nanos(
-            (d.nanos as f64 * n.as_f64().unwrap()).round() as i128,
-        ))),
+        (DtDur(d), n) | (n, DtDur(d)) if n.is_number() => Ok(FeelVal::DtDur(
+            DtDuration::from_nanos((d.nanos as f64 * n.as_f64().unwrap()).round() as i128),
+        )),
         _ => Err(type_err("*", l, r)),
     }
 }
@@ -632,7 +643,9 @@ fn div(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
             if x == 0.0 {
                 Ok(FeelVal::Null)
             } else {
-                Ok(FeelVal::YmDur(YmDuration::new((d.months as f64 / x).round() as i64)))
+                Ok(FeelVal::YmDur(YmDuration::new(
+                    (d.months as f64 / x).round() as i64,
+                )))
             }
         }
         (DtDur(d), n) if n.is_number() => {
@@ -640,7 +653,9 @@ fn div(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
             if x == 0.0 {
                 Ok(FeelVal::Null)
             } else {
-                Ok(FeelVal::DtDur(DtDuration::from_nanos((d.nanos as f64 / x).round() as i128)))
+                Ok(FeelVal::DtDur(DtDuration::from_nanos(
+                    (d.nanos as f64 / x).round() as i128,
+                )))
             }
         }
         _ => Err(type_err("/", l, r)),
@@ -686,7 +701,9 @@ pub fn feel_eq(l: &FeelVal, r: &FeelVal) -> bool {
 pub fn compare(l: &FeelVal, r: &FeelVal) -> Option<Ordering> {
     use FeelVal::*;
     match (l, r) {
-        (a, b) if a.is_number() && b.is_number() => a.as_f64().unwrap().partial_cmp(&b.as_f64().unwrap()),
+        (a, b) if a.is_number() && b.is_number() => {
+            a.as_f64().unwrap().partial_cmp(&b.as_f64().unwrap())
+        }
         (Str(a), Str(b)) => Some(a.cmp(b)),
         (Date(a), Date(b)) => Some(a.cmp(b)),
         (Time(a), Time(b)) => Some(a.cmp(b)),

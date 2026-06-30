@@ -144,9 +144,7 @@ fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
         }
         E::JobNotFound { job_key } => (404, format!("No job with key {job_key}.")),
         E::JobNotActive { job_key } => (409, format!("Job {job_key} is not active.")),
-        E::JobNotActivated { job_key } => {
-            (409, format!("Job {job_key} has not been activated."))
-        }
+        E::JobNotActivated { job_key } => (409, format!("Job {job_key} has not been activated.")),
         other => (500, other.to_string()),
     }
 }
@@ -362,7 +360,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<ReplicatedResponse>, StorageError<NodeId>>
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> Result<Vec<ReplicatedResponse>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<RaftConfig>> + Send,
     {
@@ -383,8 +384,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                 EntryPayload::Normal(batch) => {
                     // Phase 1: apply every command in the batch in ONE actor hop,
                     // returning per-command (events, commit) or the engine rejection.
-                    type ApplyOutcome =
-                        Result<(Arc<Vec<Event>>, crate::journal::Commit), nanobpmn_engine_core::EngineError>;
+                    type ApplyOutcome = Result<
+                        (Arc<Vec<Event>>, crate::journal::Commit),
+                        nanobpmn_engine_core::EngineError,
+                    >;
                     let outcomes: Vec<ApplyOutcome> = self
                         .engine
                         .with(move |journal| {
@@ -789,11 +792,7 @@ impl RaftPartition {
     /// as soon as the local log write lands. Routed through the per-partition
     /// [`Batcher`], so a flood of concurrent proposes coalesces into batched
     /// entries; a lone proposer forms a batch of one.
-    pub async fn propose(
-        &self,
-        command: Command,
-        now: u64,
-    ) -> anyhow::Result<Vec<Event>> {
+    pub async fn propose(&self, command: Command, now: u64) -> anyhow::Result<Vec<Event>> {
         Ok(self.batcher.submit(command, now).await?.events)
     }
 
@@ -847,8 +846,9 @@ impl RaftRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nanobpmn_engine_core::ProcessBuilder;
+
+    use super::*;
 
     fn deploy_command() -> Command {
         let proc = ProcessBuilder::new("p")
@@ -916,7 +916,9 @@ mod tests {
         // actor (the same effect `apply` has), then snapshots it.
         let src = EngineHandle::spawn(Journal::in_memory_partition(0), None);
         src.with(|j| {
-            let _ = j.apply_command_at(deploy_command(), 1).expect("deploy applies");
+            let _ = j
+                .apply_command_at(deploy_command(), 1)
+                .expect("deploy applies");
         })
         .await;
         src.with(|j| {
@@ -1092,13 +1094,18 @@ mod tests {
         }
         parts[0].initialize(members).await.expect("form group");
         assert!(
-            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader == Some(0)).await,
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
             "node 0 should win the initial election"
         );
 
         // Propose on the leader: with RF=3 this commits only once a quorum (2 of
         // 3) has the entry, exercising the network end to end.
-        let deploy_events = parts[0].propose(deploy_command(), 1_000).await.expect("deploy");
+        let deploy_events = parts[0]
+            .propose(deploy_command(), 1_000)
+            .await
+            .expect("deploy");
         assert!(
             deploy_events
                 .iter()

@@ -1410,7 +1410,12 @@ mod placement_tests {
     #[test]
     fn placement_is_stable_and_within_range() {
         let n = 4;
-        for key in ["order-1", "order-2", "x", "really-long-correlation-key-value"] {
+        for key in [
+            "order-1",
+            "order-2",
+            "x",
+            "really-long-correlation-key-value",
+        ] {
             let p = subscription_partition(key, n);
             assert!(p < n);
             // Stable across calls.

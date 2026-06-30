@@ -413,8 +413,9 @@ pub fn root_from_env(data_dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
 
     fn tmp() -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);

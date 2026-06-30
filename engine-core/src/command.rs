@@ -45,9 +45,7 @@ pub enum Command {
         allow_override: bool,
     },
     /// Clear a user task's assignee. The task must be in the `Created` state.
-    UnassignUserTask {
-        user_task_key: Key,
-    },
+    UnassignUserTask { user_task_key: Key },
     /// Update a user task's attributes (candidate groups/users, due/follow-up
     /// date, priority). The task must be in the `Created` state. Each field of
     /// the changeset is `Some` only when that attribute is being changed.
@@ -316,10 +314,7 @@ impl Command {
     }
 
     /// Convenience constructor for a `CompleteUserTask` that sets variables.
-    pub fn complete_user_task_with(
-        user_task_key: Key,
-        variables: HashMap<String, Value>,
-    ) -> Self {
+    pub fn complete_user_task_with(user_task_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::CompleteUserTask {
             user_task_key,
             variables,

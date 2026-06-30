@@ -212,7 +212,8 @@ impl LlmConfig {
     /// The concrete reasoning token budget for this request, if a thinking level is set.
     /// `None` means "no budget sent" — the model reasons without an imposed cap.
     pub fn thinking_budget(&self) -> Option<u32> {
-        self.thinking_level.map(|l| l.budget_tokens(self.max_tokens))
+        self.thinking_level
+            .map(|l| l.budget_tokens(self.max_tokens))
     }
 }
 
@@ -550,7 +551,10 @@ mod tests {
         // Always at least one token, never zero, even for a tiny capacity.
         assert_eq!(ThinkingLevel::Fast.budget_tokens(1), 1);
         assert_eq!(ThinkingLevel::parse("FAST"), Some(ThinkingLevel::Fast));
-        assert_eq!(ThinkingLevel::parse("balanced"), Some(ThinkingLevel::Medium));
+        assert_eq!(
+            ThinkingLevel::parse("balanced"),
+            Some(ThinkingLevel::Medium)
+        );
         assert_eq!(ThinkingLevel::parse("max"), Some(ThinkingLevel::Max));
         assert_eq!(ThinkingLevel::parse("nope"), None);
     }

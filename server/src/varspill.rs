@@ -173,6 +173,7 @@ mod tests {
     #[test]
     fn cold_snapshot_round_trips() {
         use std::sync::Arc;
+
         use nanobpmn_engine_core::{ProcessInstance, ProcessInstanceState};
 
         let store = VarSpillStore::open(None).unwrap();

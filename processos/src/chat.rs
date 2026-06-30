@@ -254,7 +254,8 @@ impl ChatStore {
     }
 
     /// Load a session by id (its full transcript + stamps).
-    pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {        self.ensure_loaded(key);
+    pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {
+        self.ensure_loaded(key);
         self.mem.read().ok().and_then(|m| {
             m.get(key)
                 .and_then(|s| s.iter().find(|s| s.id == session_id).cloned())
@@ -980,7 +981,6 @@ fn compact_json(v: &serde_json::Value) -> String {
     }
 }
 
-
 /// turn is stamped `user_ts` and newly-appeared droid turns `droid_ts`. Existing stamps are
 /// preserved; the result is truncated to the turn count.
 pub fn extend_stamps(
@@ -1028,8 +1028,9 @@ pub fn extend_turn_models(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn tmp() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};

@@ -54,7 +54,12 @@ const DEFAULT_STIMULI_MAX: usize = 1024;
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -262,23 +267,37 @@ struct IncidentRec {
 
 impl TraceStore {
     pub fn new(capacity: usize) -> Self {
-        Self::build(capacity, false, false, DEFAULT_VARS_MAX_BYTES, DEFAULT_STIMULI_MAX)
+        Self::build(
+            capacity,
+            false,
+            false,
+            DEFAULT_VARS_MAX_BYTES,
+            DEFAULT_STIMULI_MAX,
+        )
     }
 
     /// Like [`new`], but with variable capture enabled and a snapshot byte cap.
     /// Used where the caller explicitly opts into capturing variables.
     pub fn with_variables(capacity: usize, vars_max_bytes: usize) -> Self {
-        Self::build(capacity, true, false, vars_max_bytes.max(1), DEFAULT_STIMULI_MAX)
+        Self::build(
+            capacity,
+            true,
+            false,
+            vars_max_bytes.max(1),
+            DEFAULT_STIMULI_MAX,
+        )
     }
 
     /// Like [`new`], but with both variable capture and the recorded-input
     /// stimulus log (Tier 2) enabled. Used in tests / explicit opt-in.
-    pub fn with_capture(
-        capacity: usize,
-        vars_max_bytes: usize,
-        stimuli_max: usize,
-    ) -> Self {
-        Self::build(capacity, true, true, vars_max_bytes.max(1), stimuli_max.max(1))
+    pub fn with_capture(capacity: usize, vars_max_bytes: usize, stimuli_max: usize) -> Self {
+        Self::build(
+            capacity,
+            true,
+            true,
+            vars_max_bytes.max(1),
+            stimuli_max.max(1),
+        )
     }
 
     fn build(
@@ -330,7 +349,13 @@ impl TraceStore {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_STIMULI_MAX);
-        Self::build(cap, capture_vars, capture_stimuli, vars_max_bytes, stimuli_max)
+        Self::build(
+            cap,
+            capture_vars,
+            capture_stimuli,
+            vars_max_bytes,
+            stimuli_max,
+        )
     }
 
     /// Folds one exporter batch into the trace store. `now` is the server's
@@ -563,13 +588,14 @@ impl Inner {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
                     if let Some(&idx) = t.by_job.get(job_key)
-                        && let Some(job) = t.elements[idx].job.as_mut() {
-                            job.attempts += 1;
-                            job.worker = Some(worker.clone());
-                            if job.activated_at.is_none() {
-                                job.activated_at = Some(now);
-                            }
+                        && let Some(job) = t.elements[idx].job.as_mut()
+                    {
+                        job.attempts += 1;
+                        job.worker = Some(worker.clone());
+                        if job.activated_at.is_none() {
+                            job.activated_at = Some(now);
                         }
+                    }
                 }
             }
             Event::JobCompleted {
@@ -580,15 +606,22 @@ impl Inner {
                     t.last_at = now;
                     let mut job_type = None;
                     if let Some(&idx) = t.by_job.get(job_key)
-                        && let Some(job) = t.elements[idx].job.as_mut() {
-                            job.completed_at = Some(now);
-                            job_type = Some(job.job_type.clone());
-                        }
+                        && let Some(job) = t.elements[idx].job.as_mut()
+                    {
+                        job.completed_at = Some(now);
+                        job_type = Some(job.job_type.clone());
+                    }
                     // Tier 2: a job completion is an external input; its output
                     // variables (if any) arrive on the next `VariablesUpdated`,
                     // which attaches to this pending stimulus.
                     if self.capture_stimuli {
-                        let idx = t.record_stimulus("jobCompleted", job_type, None, now, self.stimuli_max);
+                        let idx = t.record_stimulus(
+                            "jobCompleted",
+                            job_type,
+                            None,
+                            now,
+                            self.stimuli_max,
+                        );
                         t.pending_stimulus = idx;
                     }
                 }
@@ -601,9 +634,10 @@ impl Inner {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
                     if let Some(&idx) = t.by_job.get(job_key)
-                        && let Some(job) = t.elements[idx].job.as_mut() {
-                            job.failures += 1;
-                        }
+                        && let Some(job) = t.elements[idx].job.as_mut()
+                    {
+                        job.failures += 1;
+                    }
                 }
             }
             Event::IncidentRaised {
@@ -647,7 +681,11 @@ impl Inner {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
                     let when = if *resolved_at != 0 { *resolved_at } else { now };
-                    if let Some(rec) = t.incidents.iter_mut().rev().find(|r| r.resolved_at.is_none())
+                    if let Some(rec) = t
+                        .incidents
+                        .iter_mut()
+                        .rev()
+                        .find(|r| r.resolved_at.is_none())
                     {
                         rec.resolved_at = Some(when);
                     }
@@ -670,12 +708,13 @@ impl Inner {
             // --- Tier 2 recorded-input stimuli (only when enabled) -------------
             Event::UserTaskCompleted { instance_key, .. } => {
                 if self.capture_stimuli
-                    && let Some(t) = self.instances.get_mut(instance_key) {
-                        t.last_at = now;
-                        let idx =
-                            t.record_stimulus("userTaskCompleted", None, None, now, self.stimuli_max);
-                        t.pending_stimulus = idx;
-                    }
+                    && let Some(t) = self.instances.get_mut(instance_key)
+                {
+                    t.last_at = now;
+                    let idx =
+                        t.record_stimulus("userTaskCompleted", None, None, now, self.stimuli_max);
+                    t.pending_stimulus = idx;
+                }
             }
             Event::MessageCorrelated {
                 instance_key,
@@ -683,17 +722,18 @@ impl Inner {
                 ..
             } => {
                 if self.capture_stimuli
-                    && let Some(t) = self.instances.get_mut(instance_key) {
-                        t.last_at = now;
-                        let idx = t.record_stimulus(
-                            "message",
-                            Some(element_id.clone()),
-                            None,
-                            now,
-                            self.stimuli_max,
-                        );
-                        t.pending_stimulus = idx;
-                    }
+                    && let Some(t) = self.instances.get_mut(instance_key)
+                {
+                    t.last_at = now;
+                    let idx = t.record_stimulus(
+                        "message",
+                        Some(element_id.clone()),
+                        None,
+                        now,
+                        self.stimuli_max,
+                    );
+                    t.pending_stimulus = idx;
+                }
             }
             Event::RemoteMessageCorrelation {
                 instance_key,
@@ -725,16 +765,17 @@ impl Inner {
                 // A timer fire carries no payload, but its occurrence and timing
                 // are part of the recorded input ordering.
                 if self.capture_stimuli
-                    && let Some(t) = self.instances.get_mut(instance_key) {
-                        t.last_at = now;
-                        t.record_stimulus(
-                            "timer",
-                            Some(element_id.clone()),
-                            None,
-                            now,
-                            self.stimuli_max,
-                        );
-                    }
+                    && let Some(t) = self.instances.get_mut(instance_key)
+                {
+                    t.last_at = now;
+                    t.record_stimulus(
+                        "timer",
+                        Some(element_id.clone()),
+                        None,
+                        now,
+                        self.stimuli_max,
+                    );
+                }
             }
             _ => {}
         }
@@ -759,17 +800,18 @@ impl Inner {
     fn record_activation(&mut self, instance_key: u64, job_key: u64, worker: &str, now: u64) {
         if let Some(t) = self.instances.get_mut(&instance_key)
             && let Some(&idx) = t.by_job.get(&job_key)
-                && let Some(job) = t.elements[idx].job.as_mut() {
-                    job.attempts += 1;
-                    job.worker = Some(worker.to_string());
-                    if job.activated_at.is_none() {
-                        job.activated_at = Some(now);
-                    }
-                    if now > t.last_at {
-                        t.last_at = now;
-                    }
-                    return;
-                }
+            && let Some(job) = t.elements[idx].job.as_mut()
+        {
+            job.attempts += 1;
+            job.worker = Some(worker.to_string());
+            if job.activated_at.is_none() {
+                job.activated_at = Some(now);
+            }
+            if now > t.last_at {
+                t.last_at = now;
+            }
+            return;
+        }
         // JobCreated not folded yet (or the instance was evicted): buffer it.
         let entry = self.pending_acts.entry(job_key).or_insert(PendingAct {
             worker: worker.to_string(),
@@ -784,9 +826,10 @@ impl Inner {
         // Defensive bound: stale entries only lose activation metadata for a
         // since-evicted job, never correctness.
         if self.pending_acts.len() > self.capacity.saturating_mul(4)
-            && let Some(&k) = self.pending_acts.keys().find(|&&k| k != job_key) {
-                self.pending_acts.remove(&k);
-            }
+            && let Some(&k) = self.pending_acts.keys().find(|&&k| k != job_key)
+        {
+            self.pending_acts.remove(&k);
+        }
     }
 }
 
@@ -875,12 +918,8 @@ impl InstanceTrace {
                         completed_at: j.completed_at,
                         // Total parked + service time. Reliable because both
                         // endpoints are exported (unlike activation).
-                        wait_ms: j
-                            .completed_at
-                            .map(|c| c.saturating_sub(j.created_at)),
-                        queue_ms: j
-                            .activated_at
-                            .map(|a| a.saturating_sub(j.created_at)),
+                        wait_ms: j.completed_at.map(|c| c.saturating_sub(j.created_at)),
+                        queue_ms: j.activated_at.map(|a| a.saturating_sub(j.created_at)),
                         service_ms: match (j.activated_at, j.completed_at) {
                             (Some(a), Some(c)) => Some(c.saturating_sub(a)),
                             _ => None,
@@ -1162,14 +1201,18 @@ pub struct IncidentDto {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nanobpmn_engine_core::IncidentKind;
+
+    use super::*;
 
     fn created(key: u64, vars: &[(&str, Value)]) -> Event {
         Event::ProcessInstanceCreated {
             instance_key: key,
             process_id: "p".to_string(),
-            variables: vars.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            variables: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
             created_at: 100,
             tags: vec![],
             business_id: None,
@@ -1220,12 +1263,19 @@ mod tests {
         assert!(!creation.truncated);
         let cv = creation.values.unwrap();
         assert_eq!(cv["amount"], serde_json::json!(5));
-        assert!(cv.get("fee").is_none(), "creation snapshot is the original inputs only");
+        assert!(
+            cv.get("fee").is_none(),
+            "creation snapshot is the original inputs only"
+        );
 
         let snap = dto.incidents[0].variables.as_ref().expect("incident vars");
         let sv = snap.values.as_ref().unwrap();
         assert_eq!(sv["amount"], serde_json::json!(5));
-        assert_eq!(sv["fee"], serde_json::json!("late"), "snapshot reflects merges at incident time");
+        assert_eq!(
+            sv["fee"],
+            serde_json::json!("late"),
+            "snapshot reflects merges at incident time"
+        );
     }
 
     #[test]
@@ -1255,7 +1305,10 @@ mod tests {
     fn vars_updated(key: u64, vars: &[(&str, Value)]) -> Event {
         Event::VariablesUpdated {
             instance_key: key,
-            variables: vars.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+            variables: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
         }
     }
 
@@ -1267,7 +1320,10 @@ mod tests {
         store.ingest(&[&job_created(1, 10, 2, "classify")], 1010);
         store.ingest(
             &[
-                &Event::JobCompleted { job_key: 10, instance_key: 1 },
+                &Event::JobCompleted {
+                    job_key: 10,
+                    instance_key: 1,
+                },
                 &vars_updated(1, &[("label", Value::Str("vip".into()))]),
             ],
             1020,
@@ -1283,7 +1339,10 @@ mod tests {
         // Job completes with output → JobCompleted then its VariablesUpdated.
         store.ingest(
             &[
-                &Event::JobCompleted { job_key: 10, instance_key: 1 },
+                &Event::JobCompleted {
+                    job_key: 10,
+                    instance_key: 1,
+                },
                 &vars_updated(1, &[("label", Value::Str("vip".into()))]),
                 &Event::ElementCompleted {
                     instance_key: 1,
@@ -1324,7 +1383,13 @@ mod tests {
         assert_eq!(stimuli[0].kind, "jobCompleted");
         assert_eq!(stimuli[0].reference.as_deref(), Some("classify"));
         assert_eq!(
-            stimuli[0].variables.as_ref().unwrap().values.as_ref().unwrap()["label"],
+            stimuli[0]
+                .variables
+                .as_ref()
+                .unwrap()
+                .values
+                .as_ref()
+                .unwrap()["label"],
             serde_json::json!("vip"),
             "job output delta attributed to its completion"
         );
@@ -1332,7 +1397,13 @@ mod tests {
         assert_eq!(stimuli[1].kind, "message");
         assert_eq!(stimuli[1].reference.as_deref(), Some("catch"));
         assert_eq!(
-            stimuli[1].variables.as_ref().unwrap().values.as_ref().unwrap()["approved"],
+            stimuli[1]
+                .variables
+                .as_ref()
+                .unwrap()
+                .values
+                .as_ref()
+                .unwrap()["approved"],
             serde_json::json!(true)
         );
 
@@ -1348,7 +1419,10 @@ mod tests {
         // Job completes with NO output; the token advances (ElementCompleted).
         store.ingest(
             &[
-                &Event::JobCompleted { job_key: 10, instance_key: 1 },
+                &Event::JobCompleted {
+                    job_key: 10,
+                    instance_key: 1,
+                },
                 &Event::ElementCompleted {
                     instance_key: 1,
                     element_instance_key: 2,
@@ -1363,10 +1437,19 @@ mod tests {
         let stimuli = store.get(1).unwrap().stimuli.unwrap();
         assert_eq!(stimuli.len(), 2);
         assert_eq!(stimuli[0].kind, "jobCompleted");
-        assert!(stimuli[0].variables.is_none(), "empty-output job stays varless");
+        assert!(
+            stimuli[0].variables.is_none(),
+            "empty-output job stays varless"
+        );
         assert_eq!(stimuli[1].kind, "variablesSet");
         assert_eq!(
-            stimuli[1].variables.as_ref().unwrap().values.as_ref().unwrap()["flag"],
+            stimuli[1]
+                .variables
+                .as_ref()
+                .unwrap()
+                .values
+                .as_ref()
+                .unwrap()["flag"],
             serde_json::json!(true)
         );
     }
@@ -1376,7 +1459,10 @@ mod tests {
         let store = TraceStore::with_capture(8, 16 * 1024, 2);
         store.ingest(&[&created(1, &[])], 1000);
         for i in 0..5u64 {
-            store.ingest(&[&vars_updated(1, &[("n", Value::Int(i as i64))])], 1010 + i);
+            store.ingest(
+                &[&vars_updated(1, &[("n", Value::Int(i as i64))])],
+                1010 + i,
+            );
         }
         let dto = store.get(1).unwrap();
         assert_eq!(dto.stimuli.unwrap().len(), 2);

@@ -165,9 +165,10 @@ pub fn apply(scenario: &Scenario, calibration: &Calibration) -> Scenario {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::harness::{Objective, ScenarioInput};
-    use std::collections::HashMap;
 
     fn worker(id: &str, cost: f64, latency_ms: u64, failure_rate: f64) -> WorkerModel {
         WorkerModel {

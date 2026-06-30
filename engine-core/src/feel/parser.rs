@@ -121,11 +121,7 @@ impl Parser {
                             let low = self.parse_bp(RANGE_RBP)?;
                             self.expect_keyword("and")?;
                             let high = self.parse_bp(RANGE_RBP)?;
-                            lhs = Node::Between(
-                                Box::new(lhs),
-                                Box::new(low),
-                                Box::new(high),
-                            );
+                            lhs = Node::Between(Box::new(lhs), Box::new(low), Box::new(high));
                             continue;
                         }
                         "in" => {
@@ -502,7 +498,9 @@ impl Parser {
                 let mut name = match self.next() {
                     Some(Tok::Ident(s)) => s,
                     other => {
-                        return Err(FeelError(format!("expected an argument name, got {other:?}")))
+                        return Err(FeelError(format!(
+                            "expected an argument name, got {other:?}"
+                        )))
                     }
                 };
                 while let Some(Tok::Ident(n)) = self.peek() {

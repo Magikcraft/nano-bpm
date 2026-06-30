@@ -317,11 +317,9 @@ impl ReadStore {
     fn ensure_schema(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("read store poisoned");
         let version: Option<i64> = conn
-            .query_row(
-                "SELECT v FROM meta WHERE k = 'schema_version'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .unwrap_or(None);
         if version == Some(SCHEMA_VERSION) {
@@ -775,7 +773,13 @@ fn upsert_variables(
             "INSERT INTO variables (instance_key, scope_key, name, value, \
              process_definition_id, process_definition_key) VALUES (?1, ?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(scope_key, name) DO UPDATE SET value = excluded.value",
-            params![instance_key as i64, name, json_value(value), def_id, def_key],
+            params![
+                instance_key as i64,
+                name,
+                json_value(value),
+                def_id,
+                def_key
+            ],
         )?;
     }
     Ok(())
@@ -1220,8 +1224,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
 
 #[cfg(test)]
 mod writability_tests {
-    use super::ReadStore;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::ReadStore;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -1276,8 +1281,9 @@ mod writability_tests {
 
 #[cfg(test)]
 mod definition_xml_tests {
-    use super::ReadStore;
     use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
+
+    use super::ReadStore;
 
     fn deployed_event(key: u64, xml: &str) -> Event {
         let mut def: ProcessDefinition = ProcessBuilder::new("p")

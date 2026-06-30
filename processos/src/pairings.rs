@@ -242,7 +242,11 @@ mod tests {
         let saved = store.upsert(p).expect("upsert ok");
         assert!(saved.primary_profile_id.is_none());
         assert_eq!(store.list().len(), 1);
-        let got = store.list().into_iter().find(|x| x.id == "skeptic-pair").unwrap();
+        let got = store
+            .list()
+            .into_iter()
+            .find(|x| x.id == "skeptic-pair")
+            .unwrap();
         assert_eq!(got.name, "Skeptic Pair");
 
         // Reopen from disk to prove persistence.

@@ -125,7 +125,11 @@ impl ToolDef {
     pub fn render_python(&self, args: &Value) -> String {
         let params = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
         let body = interpolate(&self.template, args, ToolBackend::Python);
-        format!("import json\nparams = json.loads({})\n{}", py_str(&params), body)
+        format!(
+            "import json\nparams = json.loads({})\n{}",
+            py_str(&params),
+            body
+        )
     }
 
     /// Render the SQL by substituting `{{name}}` placeholders with **safe SQL literals**. The
@@ -165,7 +169,8 @@ impl ToolDef {
         }
         if !is_valid_tool_name(&self.name) {
             return Err(
-                "tool name must be a function-style identifier (letters, digits, underscore)".into(),
+                "tool name must be a function-style identifier (letters, digits, underscore)"
+                    .into(),
             );
         }
         if BUILTIN_NAMES.contains(&self.name.as_str()) {
@@ -194,7 +199,11 @@ fn is_valid_tool_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        && name.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+        && name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
 }
 
 /// Replace `{{name}}` placeholders in `tpl` with the corresponding argument, rendered for the
@@ -265,18 +274,66 @@ fn py_str(s: &str) -> String {
 /// through the store.
 pub fn builtin_catalog() -> Vec<ToolDef> {
     const ENTRIES: &[(&str, &str, &str)] = &[
-        ("query_traces", "Run a read-only DuckDB SQL query over the captured trace dataset.", "always"),
-        ("discover_flow", "Mine the directly-follows graph the trace implies (model-independent).", "always"),
-        ("run_python", "Run model-authored Python over the dataset's flattened tables.", "Python enabled"),
-        ("read_model", "Structural view of the bound BPMN model (nodes, kinds, reachability).", "model present"),
-        ("read_model_xml", "Raw BPMN XML of the model (or one phase of an orchestrator).", "model present"),
-        ("analyze_model", "Deterministic static checks over the model structure.", "model present"),
-        ("validate_model", "Lint/validate a candidate BPMN model before simulating.", "model present"),
-        ("edit_model", "Author a candidate BPMN variant via validated structured operations.", "model present"),
-        ("simulate", "Replay recorded instances against a forked variant (Alternate Reality Engine).", "recorded inputs"),
-        ("compare_variants", "Compare two model variants over the recorded inputs.", "recorded inputs"),
-        ("conformance_check", "Check the trace against the model for conformance.", "model present"),
-        ("delegate", "Hand a self-contained research task to an isolated subagent.", "subagent paired"),
+        (
+            "query_traces",
+            "Run a read-only DuckDB SQL query over the captured trace dataset.",
+            "always",
+        ),
+        (
+            "discover_flow",
+            "Mine the directly-follows graph the trace implies (model-independent).",
+            "always",
+        ),
+        (
+            "run_python",
+            "Run model-authored Python over the dataset's flattened tables.",
+            "Python enabled",
+        ),
+        (
+            "read_model",
+            "Structural view of the bound BPMN model (nodes, kinds, reachability).",
+            "model present",
+        ),
+        (
+            "read_model_xml",
+            "Raw BPMN XML of the model (or one phase of an orchestrator).",
+            "model present",
+        ),
+        (
+            "analyze_model",
+            "Deterministic static checks over the model structure.",
+            "model present",
+        ),
+        (
+            "validate_model",
+            "Lint/validate a candidate BPMN model before simulating.",
+            "model present",
+        ),
+        (
+            "edit_model",
+            "Author a candidate BPMN variant via validated structured operations.",
+            "model present",
+        ),
+        (
+            "simulate",
+            "Replay recorded instances against a forked variant (Alternate Reality Engine).",
+            "recorded inputs",
+        ),
+        (
+            "compare_variants",
+            "Compare two model variants over the recorded inputs.",
+            "recorded inputs",
+        ),
+        (
+            "conformance_check",
+            "Check the trace against the model for conformance.",
+            "model present",
+        ),
+        (
+            "delegate",
+            "Hand a self-contained research task to an isolated subagent.",
+            "subagent paired",
+        ),
     ];
     ENTRIES
         .iter()

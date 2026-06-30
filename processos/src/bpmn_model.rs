@@ -178,10 +178,7 @@ fn definition_library(
 /// returned with its call activities expanded inline. Inlined node ids are the
 /// `Parent$Child` keys the trace tables carry, so the structural view lines up
 /// with `jobs.element_id` / `incidents.element_id`.
-pub fn inline_definition(
-    xml: &str,
-    process_id: Option<&str>,
-) -> Result<ProcessDefinition, String> {
+pub fn inline_definition(xml: &str, process_id: Option<&str>) -> Result<ProcessDefinition, String> {
     let (defs, library) = definition_library(xml)?;
     let root = match process_id {
         Some(pid) => library
@@ -1553,7 +1550,10 @@ fn emit_element(
     // Every node carries a human label (operator-set name preserved across the edit, else a
     // readable label derived from the id) so the rendered diagram and the downloaded .bpmn are
     // legible rather than a wall of machine ids.
-    let na = format!(" name=\"{}\"", xml_escape(labels.get(id).map(String::as_str).unwrap_or(id)));
+    let na = format!(
+        " name=\"{}\"",
+        xml_escape(labels.get(id).map(String::as_str).unwrap_or(id))
+    );
     match &el.kind {
         ElementKind::StartEvent => {
             out.push_str(&format!("    <bpmn:startEvent id=\"{eid}\"{na}/>\n"));
@@ -1706,7 +1706,9 @@ fn emit_element(
             out.push_str("    </bpmn:boundaryEvent>\n");
         }
         ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
-            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"));
+            out.push_str(&format!(
+                "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
+            ));
             out.push_str("      <bpmn:timerEventDefinition>\n");
             out.push_str(&format!(
                 "        <bpmn:timeDuration>{}</bpmn:timeDuration>\n",
@@ -1723,7 +1725,9 @@ fn emit_element(
                 .get(&(message_name.clone(), Some(correlation_key.clone())))
                 .cloned()
                 .unwrap_or_default();
-            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"));
+            out.push_str(&format!(
+                "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
+            ));
             out.push_str(&format!(
                 "      <bpmn:messageEventDefinition messageRef=\"{}\"/>\n",
                 xml_escape(&mref)
@@ -1764,7 +1768,9 @@ fn emit_element(
         }
         ElementKind::SignalIntermediateCatchEvent { signal_name } => {
             let sref = signals.get(signal_name).cloned().unwrap_or_default();
-            out.push_str(&format!("    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"));
+            out.push_str(&format!(
+                "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
+            ));
             out.push_str(&format!(
                 "      <bpmn:signalEventDefinition signalRef=\"{}\"/>\n",
                 xml_escape(&sref)
@@ -1799,7 +1805,14 @@ fn emit_element(
                     // Children are emitted at the same indentation; the engine parser keys
                     // containment off the scope stack, not indentation, so this is faithful.
                     emit_element(
-                        def, child, errors, messages, signals, children_by_parent, labels, out,
+                        def,
+                        child,
+                        errors,
+                        messages,
+                        signals,
+                        children_by_parent,
+                        labels,
+                        out,
                     );
                 }
             }
@@ -1909,7 +1922,16 @@ pub fn definition_to_xml_labeled(
         .collect();
     top.sort();
     for id in top {
-        emit_element(def, id, &errors, &msg_lookup, &signals, &children_by_parent, &labels, &mut out);
+        emit_element(
+            def,
+            id,
+            &errors,
+            &msg_lookup,
+            &signals,
+            &children_by_parent,
+            &labels,
+            &mut out,
+        );
     }
 
     // Synthesize a stable flow id for every sequence flow once, so the process body and the DI
@@ -3193,7 +3215,10 @@ mod tests {
             .unwrap();
         let xml = definition_to_xml(&def);
         assert!(xml.contains("<bpmn:signal "), "emits a signal declaration");
-        assert!(xml.contains("signalEventDefinition"), "emits signalRef defs");
+        assert!(
+            xml.contains("signalEventDefinition"),
+            "emits signalRef defs"
+        );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
     }
@@ -3504,8 +3529,7 @@ mod tests {
         );
         // The LOAN model guards Decision->Approve with `creditScore >= 700`.
         assert!(
-            xml.contains("<bpmn:sequenceFlow")
-                && xml.contains("name=\"creditScore &gt;= 700\""),
+            xml.contains("<bpmn:sequenceFlow") && xml.contains("name=\"creditScore &gt;= 700\""),
             "guarded branch carries its condition as a name: {xml}"
         );
         assert!(
@@ -3542,10 +3566,20 @@ mod tests {
         let defs = parse_bpmn(&merged).expect("merged model parses");
         // Orchestrator + the two phases we merged.
         let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
-        assert!(ids.contains(&"Process02DocumentRequest"), "phase 2 present: {ids:?}");
-        assert!(ids.contains(&"Process05ParallelScreeningProcess"), "phase 5 present: {ids:?}");
+        assert!(
+            ids.contains(&"Process02DocumentRequest"),
+            "phase 2 present: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"Process05ParallelScreeningProcess"),
+            "phase 5 present: {ids:?}"
+        );
         // Exactly one diagram survives (the orchestrator's).
-        assert_eq!(merged.matches("<bpmndi:BPMNDiagram").count(), 1, "single diagram");
+        assert_eq!(
+            merged.matches("<bpmndi:BPMNDiagram").count(),
+            1,
+            "single diagram"
+        );
     }
 
     #[test]
@@ -3572,7 +3606,8 @@ mod tests {
             .collect();
         // The inner task the trace tables address as Parent$Child is now a visible node.
         assert!(
-            ids.iter().any(|i| i == "Phase2_DocumentRequest$Task_SendRefreshRequest"),
+            ids.iter()
+                .any(|i| i == "Phase2_DocumentRequest$Task_SendRefreshRequest"),
             "expanded view exposes the inlined trace id: {ids:?}"
         );
     }
@@ -3584,8 +3619,14 @@ mod tests {
         let v = read_model_xml(&merged, Some("Phase2_DocumentRequest")).expect("xml by node");
         assert_eq!(v["processId"], json!("Process02DocumentRequest"));
         let block = v["xml"].as_str().unwrap();
-        assert!(block.contains("Task_SendRefreshRequest"), "phase 2 body: {block}");
-        assert!(!block.contains("Process05"), "only phase 2, not other phases");
+        assert!(
+            block.contains("Task_SendRefreshRequest"),
+            "phase 2 body: {block}"
+        );
+        assert!(
+            !block.contains("Process05"),
+            "only phase 2, not other phases"
+        );
         // By process id directly.
         let v2 = read_model_xml(&merged, Some("Process05ParallelScreeningProcess")).expect("xml");
         assert_eq!(v2["processId"], json!("Process05ParallelScreeningProcess"));
@@ -3609,17 +3650,29 @@ mod tests {
         let model = v["model"].as_str().unwrap();
         let defs = parse_bpmn(model).expect("edited model still parses");
         let ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
-        assert!(ids.contains(&"Process05ParallelScreeningProcess"), "phase 5 preserved: {ids:?}");
-        assert!(ids.contains(&"CddRefreshOrchestrator"), "orchestrator preserved: {ids:?}");
+        assert!(
+            ids.contains(&"Process05ParallelScreeningProcess"),
+            "phase 5 preserved: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"CddRefreshOrchestrator"),
+            "orchestrator preserved: {ids:?}"
+        );
         // The edit can still be inlined for replay.
         let inlined = inline_definition(model, None).expect("inline edited model");
-        assert!(inlined.elements.keys().any(|k| k.contains('$')), "still inlines to Parent$Child");
+        assert!(
+            inlined.elements.keys().any(|k| k.contains('$')),
+            "still inlines to Parent$Child"
+        );
     }
 
     #[test]
     fn edit_model_in_rejects_an_unknown_phase_with_the_known_ids() {
         let ops = vec![json!({"op":"set_name","node":"X","name":"Y"})];
         let err = edit_model_in(&merged_cdd(), &ops, Some("NoSuchPhase")).expect_err("should fail");
-        assert!(err.contains("Process02DocumentRequest"), "lists known ids: {err}");
+        assert!(
+            err.contains("Process02DocumentRequest"),
+            "lists known ids: {err}"
+        );
     }
 }

@@ -3,7 +3,6 @@
 use super::*;
 
 impl Engine {
-
     /// Looks up a process instance.
     pub fn instance(&self, key: Key) -> Option<&state::ProcessInstance> {
         self.state.instances.get(&key)

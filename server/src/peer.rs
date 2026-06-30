@@ -101,8 +101,12 @@ impl PeerLink {
         // of forwarded creates/jobs can never delay an AppendEntries/Vote past its
         // election deadline (head-of-line isolation for the replication transport).
         let out_app = Self::dial(&ws_url(base_url), pending_app.clone(), connected.clone()).await?;
-        let out_raft =
-            Self::dial(&raft_ws_url(base_url), pending_raft.clone(), connected.clone()).await?;
+        let out_raft = Self::dial(
+            &raft_ws_url(base_url),
+            pending_raft.clone(),
+            connected.clone(),
+        )
+        .await?;
 
         Ok(Self {
             out_app,
@@ -387,14 +391,17 @@ impl PeerLink {
         rpc: String,
         zip: bool,
     ) -> Result<PeerResult, PeerError> {
-        self.request_on(&self.out_raft, &self.pending_raft, request_timeout(), |corr| {
-            ClientFrame::Raft {
+        self.request_on(
+            &self.out_raft,
+            &self.pending_raft,
+            request_timeout(),
+            |corr| ClientFrame::Raft {
                 corr,
                 partition,
                 rpc,
                 zip,
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -406,11 +413,13 @@ impl PeerLink {
         user_task_key: String,
         payload: Option<Value>,
     ) -> Result<PeerResult, PeerError> {
-        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ForwardUserTask {
-            corr,
-            op,
-            user_task_key,
-            payload,
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::ForwardUserTask {
+                corr,
+                op,
+                user_task_key,
+                payload,
+            }
         })
         .await
     }
@@ -518,10 +527,12 @@ impl PeerLink {
         job_key: String,
         retries: i32,
     ) -> Result<PeerResult, PeerError> {
-        self.request_within(fast_forward_timeout(), |corr| ClientFrame::UpdateJobRetries {
-            corr,
-            job_key,
-            retries,
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::UpdateJobRetries {
+                corr,
+                job_key,
+                retries,
+            }
         })
         .await
     }
@@ -532,10 +543,12 @@ impl PeerLink {
         incident_key: String,
         operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
-        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ResolveIncident {
-            corr,
-            incident_key,
-            operation_reference,
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::ResolveIncident {
+                corr,
+                incident_key,
+                operation_reference,
+            }
         })
         .await
     }
@@ -777,8 +790,14 @@ mod tests {
 
     #[test]
     fn ws_url_maps_scheme_and_appends_path() {
-        assert_eq!(ws_url("http://10.0.0.2:8080"), "ws://10.0.0.2:8080/command-stream");
-        assert_eq!(ws_url("http://10.0.0.2:8080/"), "ws://10.0.0.2:8080/command-stream");
+        assert_eq!(
+            ws_url("http://10.0.0.2:8080"),
+            "ws://10.0.0.2:8080/command-stream"
+        );
+        assert_eq!(
+            ws_url("http://10.0.0.2:8080/"),
+            "ws://10.0.0.2:8080/command-stream"
+        );
         assert_eq!(ws_url("https://node:443"), "wss://node:443/command-stream");
         assert_eq!(ws_url("host:9000"), "ws://host:9000/command-stream");
     }
@@ -883,7 +902,9 @@ mod tests {
     async fn peer_set_single_node_has_no_peers() {
         let peers = PeerSet::new(crate::cluster::Topology::single(1));
         assert!(!peers.has_peers());
-        assert!(peers.link(0).await.is_err(), "single node has no peer to dial");
+        assert!(
+            peers.link(0).await.is_err(),
+            "single node has no peer to dial"
+        );
     }
 }
-

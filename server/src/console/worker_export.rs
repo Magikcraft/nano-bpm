@@ -21,8 +21,9 @@
 //! The archive is written by a tiny self-contained **STORED** (uncompressed) zip
 //! builder so the server needs no zip crate — the bundled files are small text.
 
-use super::workspace;
 use std::collections::BTreeSet;
+
+use super::workspace;
 
 /// The worker SDK source, baked into the binary (the same file the supervisor
 /// materialises to disk). Shipped verbatim into the exported app's `sdk/` so it
@@ -66,13 +67,15 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
             let Some(path) = workspace::worker_file_path(name, &file) else {
                 continue;
             };
-            let bytes = std::fs::read(&path)
-                .map_err(|e| format!("could not read {name}/{file}: {e}"))?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("could not read {name}/{file}: {e}"))?;
             if file == "worker.ts" {
                 copied_entrypoint = true;
             }
             // Scan TS/JS sources for imported npm packages.
-            if is_source_file(&file) && let Ok(text) = std::str::from_utf8(&bytes) {
+            if is_source_file(&file)
+                && let Ok(text) = std::str::from_utf8(&bytes)
+            {
                 collect_packages(text, &mut packages);
             }
             entries.push((at(&format!("workers/{name}/{file}")), bytes));
@@ -92,9 +95,10 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
         let Some(path) = workspace::lib_file_path(file) else {
             continue;
         };
-        let bytes =
-            std::fs::read(&path).map_err(|e| format!("could not read lib/{file}: {e}"))?;
-        if is_source_file(file) && let Ok(text) = std::str::from_utf8(&bytes) {
+        let bytes = std::fs::read(&path).map_err(|e| format!("could not read lib/{file}: {e}"))?;
+        if is_source_file(file)
+            && let Ok(text) = std::str::from_utf8(&bytes)
+        {
             collect_packages(text, &mut packages);
         }
         entries.push((at(&format!("lib/{file}")), bytes));
@@ -138,7 +142,8 @@ pub fn deno_namespace_types() -> &'static str {
 
 const DENO_NS_DTS: &str = include_str!("deno_ns.d.ts");
 
-const DENO_JSON_HEAD: &str = "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./sdk/worker-sdk.ts\"";
+const DENO_JSON_HEAD: &str =
+    "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./sdk/worker-sdk.ts\"";
 
 /// Build the app's `deno.json`: an import map aliasing `@nanobpm/worker` to the
 /// bundled SDK plus a generated **dependency manifest** — every npm package the
@@ -150,7 +155,11 @@ fn deno_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
     let mut s = String::from(DENO_JSON_HEAD);
     if has_lib {
         s.push_str(",\n    ");
-        s.push_str(&format!("{}: {}", json_string("@lib/"), json_string("./lib/")));
+        s.push_str(&format!(
+            "{}: {}",
+            json_string("@lib/"),
+            json_string("./lib/")
+        ));
     }
     for pkg in packages {
         let key = json_string(pkg);
@@ -297,11 +306,7 @@ fn npm_package_name(spec: &str) -> Option<String> {
         let first = s.split('/').next().unwrap_or(s);
         first.split('@').next().unwrap_or(first).to_string()
     };
-    if base.is_empty() {
-        None
-    } else {
-        Some(base)
-    }
+    if base.is_empty() { None } else { Some(base) }
 }
 
 const RESOURCES_README: &str = "Drop the .bpmn model files your workers serve into this folder.\n\

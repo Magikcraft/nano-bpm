@@ -246,7 +246,13 @@ impl InstAcc {
     /// Append one recorded external input to the Tier-2 log, assigning the next
     /// sequence number. `reference` is the job type (jobs) or the catch element
     /// id (messages/timers/signals); `variables` is the input's payload delta.
-    fn push_stimulus(&mut self, at: u64, kind: &str, reference: Option<String>, variables: Option<Json>) {
+    fn push_stimulus(
+        &mut self,
+        at: u64,
+        kind: &str,
+        reference: Option<String>,
+        variables: Option<Json>,
+    ) {
         // A message/timer/signal input with no catch element cannot be routed to
         // a token during replay, so the recorded log is incomplete (partial).
         // (`userTaskCompleted` legitimately has no reference — replay completes
@@ -534,10 +540,12 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "elementId").map(|s| s.to_string());
                 let vars = variables_of(v);
-                insts
-                    .get_mut(&pik)
-                    .unwrap()
-                    .push_stimulus(ts, "userTaskCompleted", element_id, vars);
+                insts.get_mut(&pik).unwrap().push_stimulus(
+                    ts,
+                    "userTaskCompleted",
+                    element_id,
+                    vars,
+                );
             }
 
             // A message correlated to one of the instance's open subscriptions
@@ -832,8 +840,9 @@ pub fn import(input: &Path, out_dir: &Path, tier2: bool) -> Result<ImportSummary
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn rec(value_type: &str, intent: &str, key: i64, ts: i64, pos: i64, value: Json) -> RawRecord {
         RawRecord {
@@ -1305,6 +1314,9 @@ mod tests {
             ),
         ];
         let t = &transform(&recs, true)[0];
-        assert!(t.stimuli_truncated, "referenceless message should flag partial");
+        assert!(
+            t.stimuli_truncated,
+            "referenceless message should flag partial"
+        );
     }
 }

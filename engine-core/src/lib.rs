@@ -82,9 +82,9 @@ pub mod feel;
 pub mod ffi;
 
 pub use command::{Command, UserTaskChangeset};
-pub use engine::{ActivatedJob, Engine, EngineError};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
+pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
@@ -92,11 +92,10 @@ pub use model::{
     SequenceFlow, UserTaskProps, Value,
 };
 pub use state::{
-    DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, DeployedProcess, Incident, IncidentKind,
-    IncidentState, InstanceSnapshot,
-    Job, JobState, Key, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, MessageStartSubscription,
-    MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, PARTITION_BITS,
-    ProcessInstance, ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind,
-    TimerState, UserTask, UserTaskState, compose_key, local_of, partition_of, stable_hash,
-    subscription_partition,
+    compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,
+    Incident, IncidentKind, IncidentState, InstanceSnapshot, Job, JobState, Key,
+    MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
+    MessageSubscriptionState, ProcessInstance, ProcessInstanceState, SignalSubscription,
+    StartTimer, State, Timer, TimerKind, TimerState, UserTask, UserTaskState, DEFAULT_JOB_PRIORITY,
+    DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS,
 };

@@ -30,13 +30,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use openraft::BasicNode;
 use openraft::error::{NetworkError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 
 use crate::peer::PeerSet;
@@ -81,9 +81,10 @@ pub(crate) fn encode_rpc_payload(json: String) -> (String, bool) {
     if json.len() < RAFT_RPC_COMPRESS_THRESHOLD {
         return (json, false);
     }
-    use base64::Engine;
-    use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
+
+    use base64::Engine;
+    use flate2::{Compression, write::DeflateEncoder};
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
     if enc.write_all(json.as_bytes()).is_err() {
         return (json, false);
@@ -103,9 +104,10 @@ pub(crate) fn decode_rpc_payload(payload: &str, compressed: bool) -> Result<Stri
     if !compressed {
         return Ok(payload.to_string());
     }
+    use std::io::Read;
+
     use base64::Engine;
     use flate2::read::DeflateDecoder;
-    use std::io::Read;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload.as_bytes())
         .map_err(|e| format!("raft rpc base64 decode: {e}"))?;
@@ -198,13 +200,18 @@ pub struct PartitionConnection {
 
 impl PartitionConnection {
     /// Maps a transport failure to a retryable openraft [`Unreachable`] error.
-    fn unreachable<E: std::error::Error + 'static>(&self, e: TransportError) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
+    fn unreachable<E: std::error::Error + 'static>(
+        &self,
+        e: TransportError,
+    ) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
         RPCError::Unreachable(Unreachable::new(&NetworkError::new(&e)))
     }
 
     /// A response of the wrong RPC kind is a protocol bug; surface it as a
     /// retryable network error rather than panicking the raft core.
-    fn mismatch<E: std::error::Error + 'static>(&self) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
+    fn mismatch<E: std::error::Error + 'static>(
+        &self,
+    ) -> RPCError<NodeId, BasicNode, RaftError<NodeId, E>> {
         let e = TransportError(format!(
             "raft transport returned a mismatched response kind (partition {}, target {})",
             self.partition, self.target
@@ -221,7 +228,11 @@ impl RaftNetwork<RaftConfig> for PartitionConnection {
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let resp = self
             .transport
-            .send(self.target, self.partition, RaftRpcRequest::AppendEntries(req))
+            .send(
+                self.target,
+                self.partition,
+                RaftRpcRequest::AppendEntries(req),
+            )
             .await
             .map_err(|e| self.unreachable(e))?;
         match resp {
@@ -321,7 +332,9 @@ impl RaftTransport for LocalCluster {
             .cloned();
         Box::pin(async move {
             let raft = raft.ok_or_else(|| {
-                TransportError(format!("no registered node {target} for partition {partition}"))
+                TransportError(format!(
+                    "no registered node {target} for partition {partition}"
+                ))
             })?;
             dispatch(&raft, req)
                 .await
@@ -388,8 +401,8 @@ mod codec_tests {
 
     #[test]
     fn small_payloads_ride_raw_and_round_trip() {
-        let json = r#"{"Vote":{"vote":{"leader_id":1,"committed":true},"last_log_id":null}}"#
-            .to_string();
+        let json =
+            r#"{"Vote":{"vote":{"leader_id":1,"committed":true},"last_log_id":null}}"#.to_string();
         let (payload, zip) = encode_rpc_payload(json.clone());
         assert!(!zip, "small RPC must not be compressed");
         assert_eq!(payload, json);
@@ -403,7 +416,10 @@ mod codec_tests {
         assert!(json.len() >= RAFT_RPC_COMPRESS_THRESHOLD);
         let (payload, zip) = encode_rpc_payload(json.clone());
         assert!(zip, "large RPC must be compressed");
-        assert!(payload.len() < json.len(), "compression should shrink the payload");
+        assert!(
+            payload.len() < json.len(),
+            "compression should shrink the payload"
+        );
         assert_eq!(decode_rpc_payload(&payload, zip).unwrap(), json);
     }
 

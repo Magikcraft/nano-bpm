@@ -305,11 +305,13 @@ fn candidate_order(c: &RankedCandidate) -> (u8, u8, i64, u64, usize, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::harness::replay::{RecordedInstance, RecordedStimulus};
+    use std::collections::HashMap;
+
     use serde_json::json;
     use serde_json::Value as Json;
-    use std::collections::HashMap;
+
+    use super::*;
+    use crate::harness::replay::{RecordedInstance, RecordedStimulus};
 
     const TWO_TASK: &str = r#"<?xml version="1.0"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
@@ -452,7 +454,11 @@ mod tests {
         }];
         let ranking = rank_candidates_by_replay(&cands, &ds, Some("P"));
         let c = &ranking.candidates[0];
-        assert!(c.feasible && c.report.error.is_none(), "deploys: {:?}", c.report.error);
+        assert!(
+            c.feasible && c.report.error.is_none(),
+            "deploys: {:?}",
+            c.report.error
+        );
         // The inlined phase fires classify then summarize, conserving against the recorded runs.
         assert!(
             (c.report.conserved_rate - 1.0).abs() < 1e-9,

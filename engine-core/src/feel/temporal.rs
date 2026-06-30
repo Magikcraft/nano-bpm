@@ -186,7 +186,11 @@ impl Time {
             + self.nano as i128
     }
 
-    fn from_nano_of_day(mut nanos: i128, offset_seconds: Option<i32>, zone: Option<String>) -> Time {
+    fn from_nano_of_day(
+        mut nanos: i128,
+        offset_seconds: Option<i32>,
+        zone: Option<String>,
+    ) -> Time {
         let day = SECS_PER_DAY * NANOS_PER_SEC;
         nanos = nanos.rem_euclid(day);
         let nano = (nanos % NANOS_PER_SEC) as u32;
@@ -280,11 +284,7 @@ impl DateTime {
         let nanos = total.rem_euclid(day);
         DateTime {
             date: Date::from_epoch_day(epoch_day),
-            time: Time::from_nano_of_day(
-                nanos,
-                self.time.offset_seconds,
-                self.time.zone.clone(),
-            ),
+            time: Time::from_nano_of_day(nanos, self.time.offset_seconds, self.time.zone.clone()),
         }
     }
 }
@@ -607,7 +607,10 @@ mod tests {
         assert_eq!(YmDuration::new(14).format(), "P1Y2M");
         assert_eq!(YmDuration::new(-3).format(), "-P3M");
         let dt = DtDuration::parse("P1DT2H3M4S").unwrap();
-        assert_eq!(dt.nanos, ((24 + 2) * 3600 + 3 * 60 + 4) as i128 * NANOS_PER_SEC);
+        assert_eq!(
+            dt.nanos,
+            ((24 + 2) * 3600 + 3 * 60 + 4) as i128 * NANOS_PER_SEC
+        );
         assert_eq!(dt.format(), "P1DT2H3M4S");
         assert_eq!(DtDuration::parse("PT0.5S").unwrap().format(), "PT0.5S");
     }

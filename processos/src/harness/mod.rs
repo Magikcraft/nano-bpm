@@ -32,6 +32,8 @@ mod replay;
 mod replay_rank;
 mod sim;
 
+use std::collections::HashMap;
+
 pub use calibrate::{apply as apply_calibration, calibrate_from_measured};
 #[allow(unused_imports)]
 pub use calibrate::{calibrate_from_cluster, Calibration, MeasuredJobType};
@@ -69,9 +71,6 @@ pub use replay::{
 pub use replay_rank::{
     rank_candidates_by_replay, CandidateModel, FidelityTier, RankedCandidate, ReplayRanking,
 };
-
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 

@@ -10,10 +10,9 @@
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use crate::model::{format_double, Value};
-
 use super::ast::Node;
 use super::temporal::{Date, DateTime, DtDuration, Time, YmDuration};
+use crate::model::{format_double, Value};
 
 /// A value produced while evaluating a FEEL expression.
 #[derive(Clone, Debug, PartialEq)]

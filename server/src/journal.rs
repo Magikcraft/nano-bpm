@@ -524,7 +524,10 @@ fn async_flush_from_env() -> AsyncFlush {
         Ok(v) => v.trim().parse::<usize>().unwrap_or(8 << 20).max(4096),
         Err(_) => 8 << 20,
     };
-    AsyncFlush { interval, max_bytes }
+    AsyncFlush {
+        interval,
+        max_bytes,
+    }
 }
 
 /// Spawns the journal writer thread for `seg`/`rx`, selecting the sync or async
@@ -542,7 +545,6 @@ fn spawn_writer(seg: ActiveSegment, rx: Receiver<WriterMsg>) -> io::Result<JoinH
             DurabilityMode::Async => writer_loop_async(seg, rx, linger, flush),
         })
 }
-
 
 /// file+thread. Because every partition's in-flight commands land in the *same*
 /// group-commit batch, a single `fsync` drains them all — the batch coalesces
@@ -900,7 +902,10 @@ impl Journal {
                 correlation_key,
                 ..
             } => {
-                targets.extend(cold.index.instances_for_message(message_name, correlation_key));
+                targets.extend(
+                    cold.index
+                        .instances_for_message(message_name, correlation_key),
+                );
             }
             Command::TriggerTimers { now } => {
                 targets.extend(cold.index.instances_due(*now));
@@ -946,7 +951,11 @@ impl Journal {
                     continue;
                 };
                 if store.put_cold(key, &snapshot).is_ok() {
-                    self.cold.as_mut().expect("cold set").index.insert(&snapshot);
+                    self.cold
+                        .as_mut()
+                        .expect("cold set")
+                        .index
+                        .insert(&snapshot);
                     spilled_in_batch += 1;
                 } else {
                     // Store write failed: keep the instance resident rather than
@@ -996,7 +1005,11 @@ impl Journal {
                     continue;
                 };
                 if store.put_cold(key, &snapshot).is_ok() {
-                    self.cold.as_mut().expect("cold set").index.insert(&snapshot);
+                    self.cold
+                        .as_mut()
+                        .expect("cold set")
+                        .index
+                        .insert(&snapshot);
                     spilled_in_batch += 1;
                 } else {
                     self.engine.rehydrate_instance(snapshot);
@@ -1346,8 +1359,9 @@ impl Drop for Journal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nanobpmn_engine_core::ProcessBuilder;
+
+    use super::*;
 
     fn demo() -> nanobpmn_engine_core::ProcessDefinition {
         ProcessBuilder::new("demo")
@@ -1468,9 +1482,9 @@ mod tests {
             .unwrap();
         assert_eq!(journal.cold_count(), 0);
         assert!(journal.instance(key).is_some());
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, Event::VariablesUpdated { instance_key, .. } if *instance_key == key)));
+        assert!(events.iter().any(
+            |e| matches!(e, Event::VariablesUpdated { instance_key, .. } if *instance_key == key)
+        ));
     }
 
     #[test]
@@ -1524,7 +1538,10 @@ mod tests {
         // leaving the still-live instance b's payload in the store.
         journal.evict_instances(&[a]);
 
-        assert!(store.take(a).is_none(), "evicted instance's spill row is gone");
+        assert!(
+            store.take(a).is_none(),
+            "evicted instance's spill row is gone"
+        );
         assert!(
             store.take(b).is_some(),
             "a live instance's spill row is untouched"

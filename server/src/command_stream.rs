@@ -33,21 +33,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
 use axum::routing::get;
-use axum::Router;
-use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
+use futures_util::stream::StreamExt;
+use nanobpmn_engine_core::Event;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 use crate::ServerImpl;
 use crate::journal::Commit;
-use nanobpmn_engine_core::Event;
 
 /// Per-connection submission-credit window (creates the client may have in flight
 /// before it must wait for the server to replenish). Overridable via
@@ -121,7 +121,10 @@ pub enum ClientFrame {
     },
     /// Replenish job-push demand for a type.
     #[serde(rename_all = "camelCase")]
-    JobCredits { job_type: String, n: i64 },
+    JobCredits {
+        job_type: String,
+        n: i64,
+    },
     /// Start a process instance (consumes one submission credit).
     #[serde(rename_all = "camelCase")]
     CreateInstance {
@@ -202,7 +205,10 @@ pub enum ClientFrame {
     /// deployment partition). Answered by a `CommandResult` once the install is
     /// committed.
     #[serde(rename_all = "camelCase")]
-    InstallDeployment { corr: u64, events: Vec<Event> },
+    InstallDeployment {
+        corr: u64,
+        events: Vec<Event>,
+    },
     /// **Intra-cluster only.** A gateway fans a published message out to this peer
     /// so it correlates the message against the subscriptions on *its* owned
     /// partitions (open message subscriptions are spread across the cluster with
@@ -223,7 +229,10 @@ pub enum ClientFrame {
     /// cancellation to the peer that owns the instance's partition. Answered by a
     /// `CommandResult` (204 on success, 404 unknown instance, 4xx/5xx otherwise).
     #[serde(rename_all = "camelCase")]
-    CancelInstance { corr: u64, instance_key: String },
+    CancelInstance {
+        corr: u64,
+        instance_key: String,
+    },
     /// **Intra-cluster only.** Routes a cross-partition subscription follow-up
     /// (a `MessageSubscriptionOpening` opening a canonical subscription on its
     /// `hash(correlationKey)` partition, or a `RemoteMessageCorrelation` advancing
@@ -233,7 +242,10 @@ pub enum ClientFrame {
     /// on again), so there is no central fan-out. Answered by a `CommandResult`
     /// (200) once applied + durable.
     #[serde(rename_all = "camelCase")]
-    RouteSubscription { corr: u64, event: Event },
+    RouteSubscription {
+        corr: u64,
+        event: Event,
+    },
     /// **Intra-cluster only.** A gateway forwards a by-key job-retries update to
     /// the peer that owns the job's partition. Answered by a `CommandResult`.
     #[serde(rename_all = "camelCase")]
@@ -414,7 +426,9 @@ pub enum ServerFrame {
     },
     /// A pushed activated job (consumes one job-delivery credit). `job` is the
     /// same shape as a REST `ActivatedJobResult`.
-    Job { job: Value },
+    Job {
+        job: Value,
+    },
     /// Ack/result for a create/complete/fail/throwError, correlated by `corr`.
     #[serde(rename_all = "camelCase")]
     CommandResult {
@@ -433,7 +447,9 @@ pub enum ServerFrame {
         variables: Value,
     },
     /// Grants the client additional submission (create-side) capacity.
-    SubmissionCredits { n: i64 },
+    SubmissionCredits {
+        n: i64,
+    },
     /// Coarse fleet pressure signal.
     #[serde(rename_all = "camelCase")]
     Pressure {
@@ -518,7 +534,10 @@ impl Registry {
 
     fn register(&self, conn: Arc<Connection>) {
         crate::metrics::stream_connection_inc();
-        self.conns.lock().expect("registry poisoned").insert(conn.id, conn);
+        self.conns
+            .lock()
+            .expect("registry poisoned")
+            .insert(conn.id, conn);
     }
 
     /// Removes a connection. Idempotent: returns `true` only the first time a
@@ -570,7 +589,12 @@ impl Registry {
             for offset in 0..ids.len() {
                 let id = ids[(start + offset) % ids.len()];
                 let Some(conn) = conns.get(&id) else { continue };
-                let sub = conn.subs.lock().expect("registry poisoned").get(job_type).cloned();
+                let sub = conn
+                    .subs
+                    .lock()
+                    .expect("registry poisoned")
+                    .get(job_type)
+                    .cloned();
                 if let Some(sub) = sub {
                     targets.push((conn.clone(), sub));
                 }
@@ -805,7 +829,7 @@ async fn handle_client_frame(
 ) {
     use std::time::Instant;
     let start = Instant::now();
-    
+
     // Record frame type
     let frame_type = match &frame {
         ClientFrame::Subscribe { .. } => "subscribe",
@@ -833,7 +857,7 @@ async fn handle_client_frame(
         ClientFrame::Promote { .. } => "promote",
     };
     crate::metrics::record_stream_frame(frame_type);
-    
+
     match frame {
         ClientFrame::Subscribe {
             job_type,
@@ -942,11 +966,7 @@ async fn handle_client_frame(
                     } else {
                         let vars = to_engine_vars(variables);
                         match server
-                            .create_for_stream(
-                                process_definition_id,
-                                process_definition_key,
-                                vars,
-                            )
+                            .create_for_stream(process_definition_id, process_definition_key, vars)
                             .await
                         {
                             Ok((instance_key, sync_completed)) => {
@@ -973,39 +993,38 @@ async fn handle_client_frame(
                 });
                 return;
             }
-            if !awaiting
-                && let Some(node) = server.stream_create_placement() {
-                    match server
-                        .create_forwarded_stream(
-                            node,
-                            process_definition_id,
-                            process_definition_key,
-                            variables,
-                        )
-                        .await
-                    {
-                        Ok((instance_key, sync_completed)) => {
-                            conn.send(ServerFrame::CommandResult {
-                                corr,
-                                status: 200,
-                                body: Some(serde_json::json!({
-                                    "processInstanceKey": instance_key.to_string(),
-                                    "processCompleted": sync_completed,
-                                })),
-                            });
-                            grant_submission_credit_if_clear(server, conn, 1);
-                        }
-                        Err((status, message)) => {
-                            conn.send(ServerFrame::CommandResult {
-                                corr,
-                                status,
-                                body: Some(Value::String(message)),
-                            });
-                            grant_submission_credit_if_clear(server, conn, 1);
-                        }
+            if !awaiting && let Some(node) = server.stream_create_placement() {
+                match server
+                    .create_forwarded_stream(
+                        node,
+                        process_definition_id,
+                        process_definition_key,
+                        variables,
+                    )
+                    .await
+                {
+                    Ok((instance_key, sync_completed)) => {
+                        conn.send(ServerFrame::CommandResult {
+                            corr,
+                            status: 200,
+                            body: Some(serde_json::json!({
+                                "processInstanceKey": instance_key.to_string(),
+                                "processCompleted": sync_completed,
+                            })),
+                        });
+                        grant_submission_credit_if_clear(server, conn, 1);
                     }
-                    return;
+                    Err((status, message)) => {
+                        conn.send(ServerFrame::CommandResult {
+                            corr,
+                            status,
+                            body: Some(Value::String(message)),
+                        });
+                        grant_submission_credit_if_clear(server, conn, 1);
+                    }
                 }
+                return;
+            }
 
             let vars = to_engine_vars(variables);
             match server
@@ -1061,7 +1080,9 @@ async fn handle_client_frame(
             if let Some(node) = server.job_route(key) {
                 let server = server.clone();
                 spawn_forward_stream_reply(conn, corr, async move {
-                    server.forward_complete_job_stream(node, key, variables).await
+                    server
+                        .forward_complete_job_stream(node, key, variables)
+                        .await
                 });
             } else {
                 let vars = to_engine_vars(variables);
@@ -1107,14 +1128,17 @@ async fn handle_client_frame(
                 let retries = retries.unwrap_or(0);
                 let error_message = error_message.unwrap_or_default();
                 if server.raft_registry().is_empty() {
-                    let outcome = server.fail_job_for_stream(key, retries, error_message).await;
+                    let outcome = server
+                        .fail_job_for_stream(key, retries, error_message)
+                        .await;
                     pipeline_job_command(server, conn, corr, outcome);
                 } else {
                     let server = server.clone();
                     let conn = conn.clone();
                     tokio::spawn(async move {
-                        let outcome =
-                            server.fail_job_for_stream(key, retries, error_message).await;
+                        let outcome = server
+                            .fail_job_for_stream(key, retries, error_message)
+                            .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
                 }
@@ -1141,14 +1165,17 @@ async fn handle_client_frame(
             } else {
                 let error_message = error_message.unwrap_or_default();
                 if server.raft_registry().is_empty() {
-                    let outcome = server.throw_error_for_stream(key, error_code, error_message).await;
+                    let outcome = server
+                        .throw_error_for_stream(key, error_code, error_message)
+                        .await;
                     pipeline_job_command(server, conn, corr, outcome);
                 } else {
                     let server = server.clone();
                     let conn = conn.clone();
                     tokio::spawn(async move {
-                        let outcome =
-                            server.throw_error_for_stream(key, error_code, error_message).await;
+                        let outcome = server
+                            .throw_error_for_stream(key, error_code, error_message)
+                            .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
                 }
@@ -1193,7 +1220,10 @@ async fn handle_client_frame(
             // Deploy here when it does not). Process it centrally — durable local
             // deploy + broadcast to every peer — and return the deployment JSON.
             match server
-                .deploy_centralized(resources, tenant_id.unwrap_or_else(|| "<default>".to_string()))
+                .deploy_centralized(
+                    resources,
+                    tenant_id.unwrap_or_else(|| "<default>".to_string()),
+                )
                 .await
             {
                 Ok(body) => conn.send(ServerFrame::CommandResult {
@@ -1223,8 +1253,9 @@ async fn handle_client_frame(
             variables,
         } => {
             let vars = to_engine_vars(variables);
-            let (message_key, instance) =
-                server.correlate_message_local(name, correlation_key, vars).await;
+            let (message_key, instance) = server
+                .correlate_message_local(name, correlation_key, vars)
+                .await;
             // Correlation may have advanced a token onto a service task on one of
             // this peer's partitions, creating an activatable job: wake pollers.
             server.signal_jobs_available();
@@ -1269,7 +1300,9 @@ async fn handle_client_frame(
             operation_reference,
         } => {
             forward_by_key_reply(conn, corr, &incident_key, |key| async move {
-                server.resolve_incident_local(key, operation_reference).await
+                server
+                    .resolve_incident_local(key, operation_reference)
+                    .await
             })
             .await;
         }
@@ -1448,7 +1481,7 @@ async fn handle_client_frame(
             server.handle_promotion(partition, epoch, leader_node).await;
         }
     }
-    
+
     // Record frame processing time
     crate::metrics::record_stream_frame_processing(start.elapsed());
 }
@@ -1528,7 +1561,9 @@ fn parse_job_key(conn: &Arc<Connection>, corr: u64, raw: &str) -> Option<u64> {
             conn.send(ServerFrame::CommandResult {
                 corr,
                 status: 404,
-                body: Some(Value::String(format!("Job key '{raw}' is not a valid key."))),
+                body: Some(Value::String(format!(
+                    "Job key '{raw}' is not a valid key."
+                ))),
             });
             None
         }
@@ -2306,10 +2341,7 @@ mod fair_plan_weighted_tests {
     fn cold_start_falls_back_to_even_split() {
         // All hints 0 (nothing learned yet): identical to the Stage 1 even split,
         // so every source is probed and learns a hint.
-        assert_eq!(
-            fair_plan_weighted(64, &[0, 0, 0], 0),
-            fair_plan(64, 3, 0)
-        );
+        assert_eq!(fair_plan_weighted(64, &[0, 0, 0], 0), fair_plan(64, 3, 0));
     }
 
     #[test]
@@ -2342,10 +2374,22 @@ mod fair_plan_weighted_tests {
         let plan = fair_plan_weighted(60, &[600, 0, 0], 0);
         // Start source (0) is deep and first; give a skewed-empty start a refresh.
         let plan2 = fair_plan_weighted(60, &[0, 600, 0], 0);
-        let start_cap = plan2.iter().find(|(s, _)| *s == 0).map(|(_, c)| *c).unwrap();
-        assert!(start_cap >= 1, "rotation-start source keeps a refresh probe");
+        let start_cap = plan2
+            .iter()
+            .find(|(s, _)| *s == 0)
+            .map(|(_, c)| *c)
+            .unwrap();
+        assert!(
+            start_cap >= 1,
+            "rotation-start source keeps a refresh probe"
+        );
         // The deep source still carries the bulk.
-        let deep_cap: usize = plan.iter().filter(|(s, _)| *s == 0).map(|(_, c)| *c).max().unwrap();
+        let deep_cap: usize = plan
+            .iter()
+            .filter(|(s, _)| *s == 0)
+            .map(|(_, c)| *c)
+            .max()
+            .unwrap();
         assert!(deep_cap >= 30, "deep source carries the budget: {plan:?}");
     }
 
@@ -2366,9 +2410,11 @@ mod fair_plan_weighted_tests {
 /// the `/asyncapi` docs generated from it — cannot silently drift out of sync.
 #[cfg(test)]
 mod asyncapi_spec_guard {
-    use super::{ClientFrame, ServerFrame};
-    use serde_json::json;
     use std::collections::BTreeSet;
+
+    use serde_json::json;
+
+    use super::{ClientFrame, ServerFrame};
 
     /// The spec, embedded at compile time (repo `docs/`, two levels up from
     /// `server/src/`). If this path breaks, the spec moved and the docs pipeline
@@ -2456,7 +2502,12 @@ mod asyncapi_spec_guard {
         ];
         let tags: BTreeSet<String> = all
             .iter()
-            .map(|f| serde_json::to_value(f).unwrap()["type"].as_str().unwrap().to_string())
+            .map(|f| {
+                serde_json::to_value(f).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         let expected: BTreeSet<String> = PUBLIC_SERVER.iter().map(|s| s.to_string()).collect();
         assert_eq!(
@@ -2483,7 +2534,10 @@ mod asyncapi_spec_guard {
         for &t in PUBLIC_CLIENT {
             let frame: ClientFrame = serde_json::from_value(minimal(t))
                 .unwrap_or_else(|e| panic!("documented client type {t:?} no longer decodes: {e}"));
-            let got = serde_json::to_value(&frame).unwrap()["type"].as_str().unwrap().to_string();
+            let got = serde_json::to_value(&frame).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string();
             assert_eq!(got, t, "client type {t:?} round-trips to a different tag");
         }
     }

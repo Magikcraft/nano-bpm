@@ -379,10 +379,12 @@ pub fn compare_variants(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
     use super::*;
     use crate::harness::RecordedStimulus;
-    use serde_json::json;
-    use std::collections::HashMap;
 
     // start -> Classify(classify) -> Summarize(summarize) -> end. Process id "P".
     const TWO_TASK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -698,7 +700,10 @@ mod tests {
     fn surface_divergence_hint_lifts_existing_over_issued_workers() {
         let mut sc = json!({ "divergentWorkers": ["credit-check", "reject-application"] });
         surface_divergence_hint(&mut sc);
-        let hint = sc.get("structuralDivergence").and_then(|v| v.as_str()).unwrap();
+        let hint = sc
+            .get("structuralDivergence")
+            .and_then(|v| v.as_str())
+            .unwrap();
         assert!(hint.contains("credit-check"));
         assert!(hint.contains("do NOT add mockWorkers"));
     }

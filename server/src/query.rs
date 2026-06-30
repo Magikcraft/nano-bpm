@@ -48,7 +48,11 @@ impl Ops {
         if self.neq.as_deref().is_some_and(|neq| v == neq) {
             return false;
         }
-        if self.in_.as_ref().is_some_and(|in_| !in_.iter().any(|x| x == v)) {
+        if self
+            .in_
+            .as_ref()
+            .is_some_and(|in_| !in_.iter().any(|x| x == v))
+        {
             return false;
         }
         if self
@@ -58,7 +62,11 @@ impl Ops {
         {
             return false;
         }
-        if self.like.as_deref().is_some_and(|like| !like_matches(like, v)) {
+        if self
+            .like
+            .as_deref()
+            .is_some_and(|like| !like_matches(like, v))
+        {
             return false;
         }
         true
@@ -127,10 +135,7 @@ macro_rules! ops {
             eq: a.dollar_eq.as_ref().map(&conv),
             neq: a.dollar_neq.as_ref().map(&conv),
             exists: a.dollar_exists,
-            in_: a
-                .dollar_in
-                .as_ref()
-                .map(|v| v.iter().map(&conv).collect()),
+            in_: a.dollar_in.as_ref().map(|v| v.iter().map(&conv).collect()),
             not_in: a
                 .dollar_not_in
                 .as_ref()
@@ -172,10 +177,7 @@ pub fn match_string(filter: &Option<models::StringFilterProperty>, value: &str) 
 
 /// Matches a `BasicStringFilterProperty` (bare string or basic filter — no
 /// `$like`) against a value.
-pub fn match_basic_string(
-    filter: &Option<models::BasicStringFilterProperty>,
-    value: &str,
-) -> bool {
+pub fn match_basic_string(filter: &Option<models::BasicStringFilterProperty>, value: &str) -> bool {
     match filter {
         None => true,
         Some(models::BasicStringFilterProperty::String(s)) => s == value,
@@ -239,10 +241,7 @@ pub fn match_job_key(filter: &Option<models::JobKeyFilterProperty>, value: &str)
 }
 
 /// Matches a `VariableKeyFilterProperty` against a key's decimal string.
-pub fn match_variable_key(
-    filter: &Option<models::VariableKeyFilterProperty>,
-    value: &str,
-) -> bool {
+pub fn match_variable_key(filter: &Option<models::VariableKeyFilterProperty>, value: &str) -> bool {
     match filter {
         None => true,
         Some(models::VariableKeyFilterProperty::VariableKey(k)) => k.0 == value,
@@ -306,7 +305,12 @@ pub fn match_process_instance_state(
             e.to_string() == value
         }
         Some(models::ProcessInstanceStateFilterProperty::AdvancedProcessInstanceStateFilter(a)) => {
-            ops!(a, |e: &models::ProcessInstanceStateEnum| e.to_string(), like_no_notin).matches(Some(value))
+            ops!(
+                a,
+                |e: &models::ProcessInstanceStateEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
         }
     }
 }
@@ -331,10 +335,12 @@ pub fn match_user_task_state(
     match filter {
         None => true,
         Some(models::UserTaskStateFilterProperty::UserTaskStateEnum(e)) => e.to_string() == value,
-        Some(models::UserTaskStateFilterProperty::AdvancedUserTaskStateFilter(a)) => {
-            ops!(a, |e: &models::UserTaskStateEnum| e.to_string(), like_no_notin)
-                .matches(Some(value))
-        }
+        Some(models::UserTaskStateFilterProperty::AdvancedUserTaskStateFilter(a)) => ops!(
+            a,
+            |e: &models::UserTaskStateEnum| e.to_string(),
+            like_no_notin
+        )
+        .matches(Some(value)),
     }
 }
 
@@ -352,17 +358,17 @@ pub fn sort_keys<S>(
     extract: impl Fn(&S) -> (String, Option<models::SortOrderEnum>),
 ) -> Vec<SortKey> {
     sort.map(|reqs| {
-            reqs.iter()
-                .map(|r| {
-                    let (field, order) = extract(r);
-                    SortKey {
-                        field,
-                        descending: matches!(order, Some(models::SortOrderEnum::Desc)),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        reqs.iter()
+            .map(|r| {
+                let (field, order) = extract(r);
+                SortKey {
+                    field,
+                    descending: matches!(order, Some(models::SortOrderEnum::Desc)),
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// A value to sort by: numeric keys sort numerically, everything else

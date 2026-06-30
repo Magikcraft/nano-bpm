@@ -121,7 +121,10 @@ pub enum Event {
         job_type: String,
         #[cfg_attr(feature = "serde", serde(default))]
         created_at: u64,
-        #[cfg_attr(feature = "serde", serde(default = "crate::state::default_job_priority"))]
+        #[cfg_attr(
+            feature = "serde",
+            serde(default = "crate::state::default_job_priority")
+        )]
         priority: i32,
     },
     /// A job was activated by a worker and locked until `deadline` (a logical
@@ -153,7 +156,8 @@ pub enum Event {
         error_code: String,
     },
     /// A job was completed.
-    JobCompleted { job_key: Key, instance_key: Key },    /// A job's remaining retries were updated (e.g. by an operator recovering a
+    JobCompleted { job_key: Key, instance_key: Key },
+    /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {
         job_key: Key,

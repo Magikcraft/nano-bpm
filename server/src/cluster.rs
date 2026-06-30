@@ -185,7 +185,12 @@ mod tests {
     fn ownership_is_round_robin_across_nodes() {
         // 3 nodes, 7 partitions: node i owns partitions p where p % 3 == i.
         let peers = vec!["a".into(), "b".into(), "c".into()];
-        let node = |id: u32| Topology { node_id: id, peers: peers.clone(), num_partitions: 7, replication_factor: 1 };
+        let node = |id: u32| Topology {
+            node_id: id,
+            peers: peers.clone(),
+            num_partitions: 7,
+            replication_factor: 1,
+        };
         assert_eq!(node(0).local_partitions(), vec![0, 3, 6]);
         assert_eq!(node(1).local_partitions(), vec![1, 4]);
         assert_eq!(node(2).local_partitions(), vec![2, 5]);
@@ -199,7 +204,12 @@ mod tests {
 
     #[test]
     fn peer_addr_resolves_by_id() {
-        let t = Topology { node_id: 0, peers: vec!["http://n0".into(), "http://n1".into()], num_partitions: 2, replication_factor: 1 };
+        let t = Topology {
+            node_id: 0,
+            peers: vec!["http://n0".into(), "http://n1".into()],
+            num_partitions: 2,
+            replication_factor: 1,
+        };
         assert_eq!(t.peer_addr(1), Some("http://n1"));
         assert_eq!(t.peer_addr(9), None);
     }
@@ -254,10 +264,20 @@ mod tests {
         // RF can never exceed the number of nodes (no duplicate replicas) nor
         // drop below 1.
         let peers = vec!["a".into(), "b".into()];
-        let over = Topology { node_id: 0, peers: peers.clone(), num_partitions: 4, replication_factor: 9 };
+        let over = Topology {
+            node_id: 0,
+            peers: peers.clone(),
+            num_partitions: 4,
+            replication_factor: 9,
+        };
         assert_eq!(over.effective_rf(), 2);
         assert_eq!(over.replicas_of(0), vec![0, 1]);
-        let zero = Topology { node_id: 0, peers, num_partitions: 4, replication_factor: 0 };
+        let zero = Topology {
+            node_id: 0,
+            peers,
+            num_partitions: 4,
+            replication_factor: 0,
+        };
         assert_eq!(zero.effective_rf(), 1);
         assert_eq!(zero.replicas_of(1), vec![zero.owner_of(1)]);
     }

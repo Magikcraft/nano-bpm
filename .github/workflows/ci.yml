@@ -2,9 +2,10 @@
 # caught BEFORE a release tag is cut. Each crate is independent (no root
 # workspace), so it gets its own job with a scoped cache.
 #
-# Scope: clippy (-D warnings) + cargo test per crate. Formatting is intentionally
-# NOT gated here — the tree is formatted with a nightly/2024 rustfmt whose output
-# differs from stable `cargo fmt`, so a stable fmt check would report false drift.
+# Scope: clippy (-D warnings) + cargo test per crate, plus a formatting gate.
+# Formatting uses a PINNED NIGHTLY rustfmt (see the `fmt` job and rustfmt.toml):
+# the canonical style relies on unstable rustfmt options (group_imports) that
+# stable `cargo fmt` silently ignores, so only the pinned nightly reproduces it.
 
 name: CI
 
@@ -22,6 +23,27 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    name: rustfmt (pinned nightly)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Keep this version in lockstep with FMT_TOOLCHAIN in the Makefile. The
+      # canonical style uses unstable rustfmt options, so a specific nightly is
+      # pinned; bump it deliberately in a single style commit.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-26
+          components: rustfmt
+      # server/src/stub_impls.rs is codegen (gitignored) but is a `mod` of the
+      # server crate, so rustfmt needs *a* file there to resolve the module tree.
+      # A canonical one-line stub suffices for a parse-only format check — no need
+      # for the full Java/uv codegen the build jobs run.
+      - name: Stub codegen module
+        run: printf '// fmt stub\n' > server/src/stub_impls.rs
+      - name: Format check
+        run: make fmt-check
+
   engine-core:
     name: engine-core (clippy + test)
     runs-on: ubuntu-24.04

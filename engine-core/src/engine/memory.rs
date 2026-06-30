@@ -3,7 +3,6 @@
 use super::*;
 
 impl Engine {
-
     /// Captures a complete, compact snapshot of this engine: the materialized
     /// [`State`] (already pruned of terminal instances) plus the scalar
     /// generator/clock metadata needed to resume minting keys and placing

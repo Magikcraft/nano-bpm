@@ -42,7 +42,10 @@ pub fn accepted(status: u16) -> bool {
 /// Build the control endpoint URL from an OpenAI-style base URL (e.g.
 /// `http://127.0.0.1:8080/v1` → `http://127.0.0.1:8080/v1/chat/completions/control`).
 fn control_url(base_url: &str) -> String {
-    format!("{}/chat/completions/control", base_url.trim_end_matches('/'))
+    format!(
+        "{}/chat/completions/control",
+        base_url.trim_end_matches('/')
+    )
 }
 
 /// Per-`base_url` cache of the support probe, so we pay the round-trip at most once per endpoint.
@@ -128,11 +131,17 @@ mod tests {
     fn endpoint_exists_treats_only_404_405_501_as_absent() {
         // Present: 2xx, and 4xx that the route itself returns (missing id / unknown action).
         for s in [200, 202, 400, 401, 403, 422, 500, 503] {
-            assert!(endpoint_exists(s), "status {s} should mean the route exists");
+            assert!(
+                endpoint_exists(s),
+                "status {s} should mean the route exists"
+            );
         }
         // Absent: the router has no such route / method / it's unimplemented.
         for s in [404, 405, 501] {
-            assert!(!endpoint_exists(s), "status {s} should mean the route is absent");
+            assert!(
+                !endpoint_exists(s),
+                "status {s} should mean the route is absent"
+            );
         }
     }
 

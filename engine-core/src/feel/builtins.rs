@@ -4,12 +4,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::Value;
-
 use super::error::FeelError;
 use super::regex::Regex;
 use super::temporal::{civil_from_days, Date, DateTime, DtDuration, Time, YmDuration};
 use super::value::FeelVal;
+use crate::model::Value;
 
 /// The canonical names of every builtin we recognise.
 const BUILTINS: &[&str] = &[
@@ -184,14 +183,15 @@ fn list_or_varargs(args: &[FeelVal]) -> Vec<FeelVal> {
     args.to_vec()
 }
 
-pub fn call(name: &str, args: Vec<FeelVal>, base: &HashMap<String, Value>) -> Result<FeelVal, FeelError> {
+pub fn call(
+    name: &str,
+    args: Vec<FeelVal>,
+    base: &HashMap<String, Value>,
+) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
     match name {
         // --- conversion ---
-        "string" => Ok(arg(&args, 0)
-            .to_feel_string()
-            .map(Str)
-            .unwrap_or(Null)),
+        "string" => Ok(arg(&args, 0).to_feel_string().map(Str).unwrap_or(Null)),
         "number" => number_from(&args),
         "context" => context_from(&arg(&args, 0)),
         "get value" => Ok(match (arg(&args, 0), arg(&args, 1)) {
@@ -227,7 +227,9 @@ pub fn call(name: &str, args: Vec<FeelVal>, base: &HashMap<String, Value>) -> Re
 
         // --- string ---
         "substring" => substring(&args),
-        "string length" => Ok(Int(want_str(&arg(&args, 0), "string length")?.chars().count() as i64)),
+        "string length" => Ok(Int(
+            want_str(&arg(&args, 0), "string length")?.chars().count() as i64,
+        )),
         "upper case" => Ok(Str(want_str(&arg(&args, 0), "upper case")?.to_uppercase())),
         "lower case" => Ok(Str(want_str(&arg(&args, 0), "lower case")?.to_lowercase())),
         "substring before" => {
@@ -444,7 +446,11 @@ pub fn call(name: &str, args: Vec<FeelVal>, base: &HashMap<String, Value>) -> Re
         }
         "sqrt" => {
             let n = want_num(&arg(&args, 0), "sqrt")?;
-            Ok(if n < 0.0 { Null } else { FeelVal::num(n.sqrt()) })
+            Ok(if n < 0.0 {
+                Null
+            } else {
+                FeelVal::num(n.sqrt())
+            })
         }
         "log" => Ok(FeelVal::num(want_num(&arg(&args, 0), "log")?.ln())),
         "exp" => Ok(FeelVal::num(want_num(&arg(&args, 0), "exp")?.exp())),
@@ -543,7 +549,11 @@ fn with_date(v: &FeelVal, f: impl Fn(&Date) -> FeelVal) -> FeelVal {
     }
 }
 
-fn reduce_num(items: &[FeelVal], ctx: &str, f: impl Fn(f64, f64) -> f64) -> Result<FeelVal, FeelError> {
+fn reduce_num(
+    items: &[FeelVal],
+    ctx: &str,
+    f: impl Fn(f64, f64) -> f64,
+) -> Result<FeelVal, FeelError> {
     if items.is_empty() {
         return Ok(FeelVal::Null);
     }
@@ -582,7 +592,10 @@ fn median(items: &[FeelVal]) -> Result<FeelVal, FeelError> {
     if items.is_empty() {
         return Ok(FeelVal::Null);
     }
-    let mut nums: Vec<f64> = items.iter().map(|v| want_num(v, "median")).collect::<Result<_, _>>()?;
+    let mut nums: Vec<f64> = items
+        .iter()
+        .map(|v| want_num(v, "median"))
+        .collect::<Result<_, _>>()?;
     nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = nums.len();
     Ok(if n % 2 == 1 {
@@ -597,7 +610,10 @@ fn stddev(items: &[FeelVal]) -> Result<FeelVal, FeelError> {
     if n < 2 {
         return Ok(FeelVal::Null);
     }
-    let nums: Vec<f64> = items.iter().map(|v| want_num(v, "stddev")).collect::<Result<_, _>>()?;
+    let nums: Vec<f64> = items
+        .iter()
+        .map(|v| want_num(v, "stddev"))
+        .collect::<Result<_, _>>()?;
     let mean = nums.iter().sum::<f64>() / n as f64;
     let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
     Ok(FeelVal::num(var.sqrt()))
@@ -607,7 +623,10 @@ fn mode(items: &[FeelVal]) -> Result<FeelVal, FeelError> {
     if items.is_empty() {
         return Ok(FeelVal::List(Vec::new()));
     }
-    let nums: Vec<f64> = items.iter().map(|v| want_num(v, "mode")).collect::<Result<_, _>>()?;
+    let nums: Vec<f64> = items
+        .iter()
+        .map(|v| want_num(v, "mode"))
+        .collect::<Result<_, _>>()?;
     let mut counts: Vec<(f64, usize)> = Vec::new();
     for &x in &nums {
         if let Some(entry) = counts.iter_mut().find(|(v, _)| *v == x) {
@@ -617,7 +636,11 @@ fn mode(items: &[FeelVal]) -> Result<FeelVal, FeelError> {
         }
     }
     let max = counts.iter().map(|(_, c)| *c).max().unwrap();
-    let mut modes: Vec<f64> = counts.into_iter().filter(|(_, c)| *c == max).map(|(v, _)| v).collect();
+    let mut modes: Vec<f64> = counts
+        .into_iter()
+        .filter(|(_, c)| *c == max)
+        .map(|(v, _)| v)
+        .collect();
     modes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Ok(FeelVal::List(modes.into_iter().map(FeelVal::num).collect()))
 }
@@ -682,13 +705,13 @@ fn sort(args: &[FeelVal], base: &HashMap<String, Value>) -> Result<FeelVal, Feel
     match args.get(1) {
         Some(FeelVal::Function(f)) => {
             let f = f.clone();
-            list.sort_by(|a, b| {
-                match super::eval::apply(&f, vec![a.clone(), b.clone()], base) {
+            list.sort_by(
+                |a, b| match super::eval::apply(&f, vec![a.clone(), b.clone()], base) {
                     Ok(FeelVal::Bool(true)) => std::cmp::Ordering::Less,
                     Ok(FeelVal::Bool(false)) => std::cmp::Ordering::Greater,
                     _ => std::cmp::Ordering::Equal,
-                }
-            });
+                },
+            );
         }
         _ => {
             list.sort_by(|a, b| super::eval::compare(a, b).unwrap_or(std::cmp::Ordering::Equal));
@@ -704,7 +727,9 @@ fn partition(args: &[FeelVal]) -> Result<FeelVal, FeelError> {
         return Ok(FeelVal::Null);
     }
     Ok(FeelVal::List(
-        list.chunks(size).map(|c| FeelVal::List(c.to_vec())).collect(),
+        list.chunks(size)
+            .map(|c| FeelVal::List(c.to_vec()))
+            .collect(),
     ))
 }
 
@@ -944,7 +969,8 @@ fn years_months_between(a: &FeelVal, b: &FeelVal) -> Result<FeelVal, FeelError> 
         (Some(x), Some(y)) => (x, y),
         _ => return Ok(FeelVal::Null),
     };
-    let mut months = (to.year as i64 - from.year as i64) * 12 + (to.month as i64 - from.month as i64);
+    let mut months =
+        (to.year as i64 - from.year as i64) * 12 + (to.month as i64 - from.month as i64);
     if to.day < from.day && months > 0 {
         months -= 1;
     } else if to.day > from.day && months < 0 {

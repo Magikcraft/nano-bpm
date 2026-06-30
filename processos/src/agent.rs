@@ -601,8 +601,9 @@ impl AgentStep for OpenAiAgent {
         on_delta: &mut dyn FnMut(Delta),
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<Turn, String> {
-        use futures_util::StreamExt;
         use std::sync::atomic::Ordering;
+
+        use futures_util::StreamExt;
         if !self.cfg.is_ready() {
             return Err("no LLM model configured (set PROCESSOS_LLM_MODEL)".into());
         }
@@ -994,7 +995,10 @@ fn parse_hermes_tool_calls(content: &str) -> Vec<ToolCall> {
     while let Some(start) = rest.find(FN_OPEN) {
         let region = &rest[start..];
         let (segment, consumed) = match region.find(FN_CLOSE) {
-            Some(end) => (&region[..end + FN_CLOSE.len()], start + end + FN_CLOSE.len()),
+            Some(end) => (
+                &region[..end + FN_CLOSE.len()],
+                start + end + FN_CLOSE.len(),
+            ),
             None => (region, rest.len()),
         };
         if let Some(call) = parse_hermes_segment(segment.trim(), idx) {
@@ -1341,8 +1345,9 @@ fn truncate(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::cell::Cell;
+
+    use super::*;
 
     /// A deterministic mock model: replays a scripted list of turns, one per step.
     struct ScriptedModel {
@@ -1520,9 +1525,11 @@ mod tests {
                 seen.push(id);
             }
         };
-        run_agent_streaming(&IdModel, &EchoTools, &mut msgs, 3, None, None, &mut sink, None)
-            .await
-            .unwrap();
+        run_agent_streaming(
+            &IdModel, &EchoTools, &mut msgs, 3, None, None, &mut sink, None,
+        )
+        .await
+        .unwrap();
         assert_eq!(seen, vec!["chatcmpl-xyz".to_string()]);
     }
 
@@ -1741,8 +1748,7 @@ mod tests {
     fn does_not_double_count_a_wrapped_xml_call() {
         // A properly wrapped XML call must still yield exactly one call (the JSON pass skips it,
         // the <function=-anchored pass claims it once).
-        let leaked =
-            "<tool_call><function=read_model></function></tool_call>";
+        let leaked = "<tool_call><function=read_model></function></tool_call>";
         let calls = parse_leaked_tool_calls(leaked);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read_model");
@@ -1976,7 +1982,10 @@ mod tests {
             Msg::System("Stop investigating now and report your findings so far.".into()),
         ];
         let wire = wire_messages(&msgs);
-        assert_eq!(wire[0]["role"], "system", "leading system prompt is preserved");
+        assert_eq!(
+            wire[0]["role"], "system",
+            "leading system prompt is preserved"
+        );
         assert_eq!(wire[0]["content"], "persona system prompt");
         assert_eq!(
             wire[3]["role"], "user",
@@ -1987,7 +1996,6 @@ mod tests {
             "Stop investigating now and report your findings so far."
         );
     }
-
 
     struct AlwaysSameCall {
         call: ToolCall,

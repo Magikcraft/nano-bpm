@@ -254,7 +254,10 @@ fn boot_cluster(scratch: &ScratchDir) -> (Node, Node) {
             |status, body| status == 200 && body_has_demo(body),
         );
         assert_eq!(status, 200, "definition search failed: {body}");
-        assert!(body_has_demo(&body), "demo definition never replicated: {body}");
+        assert!(
+            body_has_demo(&body),
+            "demo definition never replicated: {body}"
+        );
     }
     (node0, node1)
 }
@@ -339,7 +342,11 @@ fn a_worker_at_one_gateway_drains_jobs_from_the_whole_cluster() {
         let json: serde_json::Value = serde_json::from_str(&resp).expect("activation JSON");
         let jobs = json["jobs"].as_array().expect("jobs array");
         for job in jobs {
-            let job_key: u64 = job["jobKey"].as_str().expect("jobKey").parse().expect("numeric");
+            let job_key: u64 = job["jobKey"]
+                .as_str()
+                .expect("jobKey")
+                .parse()
+                .expect("numeric");
             completed_partitions.insert(partition_of(job_key));
             let (cstatus, cbody) = node0.request(
                 "POST",
@@ -351,7 +358,10 @@ fn a_worker_at_one_gateway_drains_jobs_from_the_whole_cluster() {
         }
     }
 
-    assert_eq!(completed, N, "every parked job must complete via the single gateway");
+    assert_eq!(
+        completed, N,
+        "every parked job must complete via the single gateway"
+    );
     // node 0 owns partitions 0 & 2; node 1 owns 1 & 3. The drained set must
     // include at least one partition from EACH node, proving aggregation +
     // completion routing crossed the node boundary.
@@ -450,7 +460,9 @@ impl WsClient {
             self.stream.read_exact(&mut mask).expect("read mask");
         }
         let mut payload = vec![0u8; len];
-        self.stream.read_exact(&mut payload).expect("read ws payload");
+        self.stream
+            .read_exact(&mut payload)
+            .expect("read ws payload");
         if masked {
             for (i, b) in payload.iter_mut().enumerate() {
                 *b ^= mask[i % 4];

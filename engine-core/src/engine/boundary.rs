@@ -3,7 +3,6 @@
 use super::*;
 
 impl Engine {
-
     /// Finds the error boundary event attached to `task_element_id` that catches
     /// `error_code`, if any. When several match (a malformed model), the one with
     /// the smallest id is chosen so selection stays deterministic.
@@ -39,7 +38,11 @@ impl Engine {
     }
 
     /// The element id of an active element instance, if it is still active.
-    pub(crate) fn element_id_of_instance(&self, instance_key: Key, element_instance_key: Key) -> Option<ElementId> {
+    pub(crate) fn element_id_of_instance(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Option<ElementId> {
         self.state
             .instances
             .get(&instance_key)?
@@ -506,7 +509,10 @@ impl Engine {
     /// `MessageSubscriptionCanceled` events. Called when the guarded activity
     /// leaves the flow another way (it completed normally or a different boundary
     /// interrupted it), so a stale subscription never correlates later.
-    pub(crate) fn cancel_boundary_message_subscriptions_on(&self, element_instance_key: Key) -> Vec<Event> {
+    pub(crate) fn cancel_boundary_message_subscriptions_on(
+        &self,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
         let mut subs: Vec<&state::MessageSubscription> = self
             .state
             .message_subscriptions

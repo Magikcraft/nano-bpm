@@ -181,10 +181,9 @@ impl AnalysisTools {
                 serde_json::to_string(&result).map_err(|e| format!("serialise result: {e}"))
             }
             ToolBackend::Python => {
-                let py = self
-                    .python
-                    .as_ref()
-                    .ok_or("this Python tool requires Python to be enabled for the investigation")?;
+                let py = self.python.as_ref().ok_or(
+                    "this Python tool requires Python to be enabled for the investigation",
+                )?;
                 let code = def.render_python(args);
                 pyrunner::run_python(&py.cfg, &py.workdir, &code)
             }
@@ -211,9 +210,7 @@ impl AnalysisTools {
         if let Some(p) = &self.model_path {
             cmd.env("PROCESSOS_MODEL", p);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("spawn '{program}': {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("spawn '{program}': {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(def.stdin_json(args).as_bytes());
         }
@@ -873,14 +870,18 @@ impl<'a> ScopedTools<'a> {
     /// Wrap `inner` with an optional allowlist of tool names. An empty list is treated as "all"
     /// (so a caller that forgot to choose doesn't accidentally disable every tool).
     pub fn new(inner: &'a AnalysisTools, allow: Option<Vec<String>>) -> Self {
-        let allow = allow
-            .filter(|v| !v.is_empty())
-            .map(|v| v.into_iter().collect::<std::collections::BTreeSet<String>>());
+        let allow = allow.filter(|v| !v.is_empty()).map(|v| {
+            v.into_iter()
+                .collect::<std::collections::BTreeSet<String>>()
+        });
         Self { inner, allow }
     }
 
     fn allowed(&self, name: &str) -> bool {
-        self.allow.as_ref().map(|s| s.contains(name)).unwrap_or(true)
+        self.allow
+            .as_ref()
+            .map(|s| s.contains(name))
+            .unwrap_or(true)
     }
 }
 
@@ -950,11 +951,18 @@ impl ToolBox for ResearchTools<'_> {
                 serde_json::to_string(&self.analysis.query(sql)?)
                     .map_err(|e| format!("serialise result: {e}"))
             }
-            "discover_flow" => serde_json::to_string(&crate::conformance::discover_flow(self.analysis)?)
-                .map_err(|e| format!("serialise flow: {e}")),
+            "discover_flow" => {
+                serde_json::to_string(&crate::conformance::discover_flow(self.analysis)?)
+                    .map_err(|e| format!("serialise flow: {e}"))
+            }
             "read_model" => {
-                let xml = self.model.ok_or("read_model: this process has no BPMN model")?;
-                let expand = args.get("expand").and_then(|v| v.as_bool()).unwrap_or(false);
+                let xml = self
+                    .model
+                    .ok_or("read_model: this process has no BPMN model")?;
+                let expand = args
+                    .get("expand")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let v = if expand {
                     crate::bpmn_model::read_model_expanded(xml)?
                 } else {
@@ -1264,11 +1272,12 @@ pub struct InvestigationReport {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::path::Path;
+
     use super::*;
     use crate::agent::{AgentStep, Msg, ToolCall, Turn};
     use crate::corpus;
-    use std::cell::Cell;
-    use std::path::Path;
 
     /// Build a real corpus + Analysis the same way the generator does, returning the
     /// tools over it.
@@ -1280,8 +1289,7 @@ mod tests {
         // another's dir mid-write).
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp =
-            std::env::temp_dir().join(format!("invest-test-{}-{n}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("invest-test-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         corpus::generate(&pack, &def, &tmp).expect("generate corpus");
         let src = TraceSource::Dataset(std::sync::Arc::new(

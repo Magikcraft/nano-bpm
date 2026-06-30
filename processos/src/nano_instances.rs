@@ -271,7 +271,10 @@ mod tests {
             assert_eq!(list.len(), 1);
             assert_eq!(list[0].base_url, "http://localhost:8080");
             assert_eq!(active.as_deref(), Some(list[0].id.as_str()));
-            assert_eq!(store.active_base_url().as_deref(), Some("http://localhost:8080"));
+            assert_eq!(
+                store.active_base_url().as_deref(),
+                Some("http://localhost:8080")
+            );
         }
         // Reopen: the seeded instance survives, no second seed.
         {
@@ -295,10 +298,15 @@ mod tests {
 
         // Selecting switches the active target.
         store.select(&staging.id).unwrap();
-        assert_eq!(store.active_base_url().as_deref(), Some("http://nano.staging:8080"));
+        assert_eq!(
+            store.active_base_url().as_deref(),
+            Some("http://nano.staging:8080")
+        );
 
         // Updating edits in place.
-        let edited = store.update(&staging.id, "Staging EU", "https://eu.example/").unwrap();
+        let edited = store
+            .update(&staging.id, "Staging EU", "https://eu.example/")
+            .unwrap();
         assert_eq!(edited.name, "Staging EU");
         assert_eq!(edited.base_url, "https://eu.example");
 
@@ -312,7 +320,10 @@ mod tests {
 
         // Removing the active falls back to a remaining instance.
         store.remove(&staging.id).unwrap();
-        assert_eq!(store.active_base_url().as_deref(), Some("http://localhost:8080"));
+        assert_eq!(
+            store.active_base_url().as_deref(),
+            Some("http://localhost:8080")
+        );
         assert_eq!(store.list().1.as_deref(), Some(seed.as_str()));
 
         // Unknown ids error.

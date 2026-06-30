@@ -202,9 +202,11 @@ fn ensure_lib_alias(dir: &std::path::Path) {
     let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) else {
         return;
     };
-    let imports = json
-        .as_object_mut()
-        .and_then(|o| o.entry("imports").or_insert_with(|| serde_json::json!({})).as_object_mut());
+    let imports = json.as_object_mut().and_then(|o| {
+        o.entry("imports")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    });
     let Some(imports) = imports else { return };
     if imports.contains_key("@lib/") {
         return;
@@ -369,7 +371,9 @@ impl WorkerSupervisor {
                             } else if s.state == "error" {
                                 *inner.last_error.lock().await = Some(s.message.clone());
                             }
-                            inner.push_log("sys", format!("{}: {}", s.state, s.message)).await;
+                            inner
+                                .push_log("sys", format!("{}: {}", s.state, s.message))
+                                .await;
                         }
                     } else {
                         inner.push_log("out", line).await;

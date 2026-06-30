@@ -295,9 +295,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // zeebe:calledElement processId="…" — the Camunda 8
                             // form of a call activity's callee reference.
                             "calledElement" => {
-                                if let (Some(idx), Some(p)) =
-                                    (cur_call, attr(attrs, "processId"))
-                                {
+                                if let (Some(idx), Some(p)) = (cur_call, attr(attrs, "processId")) {
                                     acc.nodes[idx].called_process_id = Some(p.to_string());
                                 }
                             }
@@ -382,8 +380,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 // On an intermediate catch event or a boundary
                                 // event, marks it a signal event referencing a
                                 // definitions-level <signal>.
-                                let signal_ref =
-                                    attr(attrs, "signalRef").unwrap_or("").to_string();
+                                let signal_ref = attr(attrs, "signalRef").unwrap_or("").to_string();
                                 if let Some(idx) = cur_intermediate {
                                     acc.nodes[idx].signal_ref = Some(signal_ref);
                                 } else if let Some(boundary) = cur_boundary.as_mut() {
@@ -402,8 +399,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 // zeebe:assignmentDefinition inside a user task.
                                 if let Some(idx) = cur_user_task {
                                     let props = &mut acc.nodes[idx].user_task;
-                                    props.assignee =
-                                        attr(attrs, "assignee").map(str::to_string);
+                                    props.assignee = attr(attrs, "assignee").map(str::to_string);
                                     props.candidate_groups =
                                         attr(attrs, "candidateGroups").map(str::to_string);
                                     props.candidate_users =
@@ -414,8 +410,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 // zeebe:taskSchedule inside a user task.
                                 if let Some(idx) = cur_user_task {
                                     let props = &mut acc.nodes[idx].user_task;
-                                    props.due_date =
-                                        attr(attrs, "dueDate").map(str::to_string);
+                                    props.due_date = attr(attrs, "dueDate").map(str::to_string);
                                     props.follow_up_date =
                                         attr(attrs, "followUpDate").map(str::to_string);
                                 }
@@ -790,7 +785,9 @@ impl ProcessAcc {
             if !pruned.is_empty() {
                 self.nodes.retain(|n| !pruned.contains(&n.id));
                 self.flows.retain(|f| {
-                    let keep = |o: &Option<String>| o.as_ref().map(|s| !pruned.contains(s)).unwrap_or(true);
+                    let keep = |o: &Option<String>| {
+                        o.as_ref().map(|s| !pruned.contains(s)).unwrap_or(true)
+                    };
                     keep(&f.source) && keep(&f.target)
                 });
                 self.boundaries.retain(|b| {
@@ -953,10 +950,7 @@ impl ProcessAcc {
                     let called = node.called_process_id.clone().ok_or_else(|| {
                         ParseError::InvalidProcess {
                             process_id: self.id.clone(),
-                            reason: format!(
-                                "call activity {} has no calledElement",
-                                node.id
-                            ),
+                            reason: format!("call activity {} has no calledElement", node.id),
                         }
                     })?;
                     builder.call_activity(node.id, called)
@@ -1041,11 +1035,7 @@ impl ProcessAcc {
                 builder = if boundary.interrupting {
                     builder.signal_boundary_event(boundary.id, attached_to, name)
                 } else {
-                    builder.non_interrupting_signal_boundary_event(
-                        boundary.id,
-                        attached_to,
-                        name,
-                    )
+                    builder.non_interrupting_signal_boundary_event(boundary.id, attached_to, name)
                 };
             } else {
                 let error_ref = boundary.error_ref.unwrap_or_default();
@@ -2265,11 +2255,11 @@ mod tests {
         );
         // The inner nodes are tagged as contained in the sub-process; the outer
         // ones are not.
+        assert_eq!(def.element("inner").unwrap().parent.as_deref(), Some("sub"));
         assert_eq!(
-            def.element("inner").unwrap().parent.as_deref(),
+            def.element("sub_start").unwrap().parent.as_deref(),
             Some("sub")
         );
-        assert_eq!(def.element("sub_start").unwrap().parent.as_deref(), Some("sub"));
         assert_eq!(def.element("sub").unwrap().parent, None);
         assert_eq!(def.element("start").unwrap().parent, None);
         // The error boundary is attached to the sub-process and routes to sad-flow.

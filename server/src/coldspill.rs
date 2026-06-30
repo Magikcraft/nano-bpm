@@ -211,12 +211,14 @@ impl ColdIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
+
     use nanobpmn_engine_core::{
         Job, MessageSubscription, MessageSubscriptionKind, ProcessInstance, ProcessInstanceState,
         Timer, TimerKind,
     };
+
+    use super::*;
 
     fn instance(key: Key) -> ProcessInstance {
         ProcessInstance {

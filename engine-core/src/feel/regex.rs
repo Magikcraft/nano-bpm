@@ -101,7 +101,13 @@ impl Regex {
         }
     }
 
-    fn run(&self, mut pc: usize, input: &[char], mut sp: usize, caps: &mut Vec<Option<usize>>) -> bool {
+    fn run(
+        &self,
+        mut pc: usize,
+        input: &[char],
+        mut sp: usize,
+        caps: &mut Vec<Option<usize>>,
+    ) -> bool {
         loop {
             match &self.prog[pc] {
                 Inst::Char(c) => {

@@ -951,7 +951,11 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
 /// Scaffolds a brand-new project directory. Fails if it already exists.
 /// `template` selects which starter content to stamp out ("starter" default, or
 /// "throughput" for the benchmark demo). Unknown templates fall back to starter.
-pub fn create_project(name: &str, description: &str, template: &str) -> Result<ProjectConfig, String> {
+pub fn create_project(
+    name: &str,
+    description: &str,
+    template: &str,
+) -> Result<ProjectConfig, String> {
     let dir = project_dir(name).ok_or("invalid project name")?;
     if dir.exists() {
         return Err("a project with that name already exists".into());
@@ -963,7 +967,8 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
     mk(dir.join("lib"))?;
     mk(dir.join(".nanobpm"))?;
 
-    let w = |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
+    let w =
+        |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
@@ -978,7 +983,9 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(dir.join("main.ts"), DEMO_MAIN_TS)?;
         w(dir.join("README.md"), &demo_readme())?;
         w(
-            dir.join("resources").join("processes").join("throughput.bpmn"),
+            dir.join("resources")
+                .join("processes")
+                .join("throughput.bpmn"),
             DEMO_PROCESS_BPMN,
         )?;
         w(worker.join("worker.ts"), DEMO_WORKER_TS)?;
@@ -988,7 +995,9 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(dir.join("main.ts"), DEMO_STREAM_MAIN_TS)?;
         w(dir.join("README.md"), &demo_stream_readme())?;
         w(
-            dir.join("resources").join("processes").join("throughput.bpmn"),
+            dir.join("resources")
+                .join("processes")
+                .join("throughput.bpmn"),
             DEMO_PROCESS_BPMN,
         )?;
     } else if template == "rust-throughput" {
@@ -997,7 +1006,9 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(dir.join("src").join("main.rs"), RUST_THROUGHPUT_MAIN)?;
         w(dir.join("README.md"), &rust_throughput_readme())?;
         w(
-            dir.join("resources").join("processes").join("throughput.bpmn"),
+            dir.join("resources")
+                .join("processes")
+                .join("throughput.bpmn"),
             DEMO_PROCESS_BPMN,
         )?;
         cfg_lang = "rust".to_string();
@@ -1009,7 +1020,9 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(dir.join("public").join("index.html"), GUI_INDEX_HTML)?;
         w(dir.join("README.md"), &gui_readme(name))?;
         w(
-            dir.join("resources").join("processes").join(format!("{name}.bpmn")),
+            dir.join("resources")
+                .join("processes")
+                .join(format!("{name}.bpmn")),
             &starter_process(name),
         )?;
         cfg_app = "deno-gui";
@@ -1019,7 +1032,9 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
         w(dir.join("main.ts"), MAIN_TS)?;
         w(dir.join("README.md"), &readme_md(name))?;
         w(
-            dir.join("resources").join("processes").join(format!("{name}.bpmn")),
+            dir.join("resources")
+                .join("processes")
+                .join(format!("{name}.bpmn")),
             &starter_process(name),
         )?;
         w(starter_worker.join("worker.ts"), STARTER_WORKER_TS)?;
@@ -1028,16 +1043,20 @@ pub fn create_project(name: &str, description: &str, template: &str) -> Result<P
 
     // Installed packs may contribute templates/example apps; copy theirs in and
     // adopt their lang. Built-ins above win on id collision (offline baseline).
-    let is_builtin_template =
-        matches!(template, "starter" | "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter");
-    if !is_builtin_template
-        && let Some((m, src)) = super::extensions::template_source(template)
-    {
+    let is_builtin_template = matches!(
+        template,
+        "starter" | "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter"
+    );
+    if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
         super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
         if let Some(lang) = m.requires.first() {
             cfg_lang = lang.clone();
         }
-        if std::path::Path::new(&dir).join("src").join("main.rs").exists() {
+        if std::path::Path::new(&dir)
+            .join("src")
+            .join("main.rs")
+            .exists()
+        {
             cfg_main = "src/main.rs".to_string();
         }
     }
@@ -1430,7 +1449,8 @@ impl ProjectSupervisor {
             return self.run_toolchain(name, &cfg, &dir).await;
         }
         let deno = workers::find_deno().ok_or_else(|| {
-            "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN.".to_string()
+            "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN."
+                .to_string()
         })?;
 
         let inner = self.entry(name).await;
@@ -1483,7 +1503,10 @@ impl ProjectSupervisor {
         *inner.started_at_ms.lock().await = Some(now_ms());
         *inner.last_error.lock().await = None;
         inner
-            .push_log("sys", format!("running {} (pid {pid}) -> {base_url}", cfg.main))
+            .push_log(
+                "sys",
+                format!("running {} (pid {pid}) -> {base_url}", cfg.main),
+            )
             .await;
 
         if let Some(stdout) = child.stdout.take() {
@@ -1608,7 +1631,10 @@ impl ProjectSupervisor {
         *inner.started_at_ms.lock().await = Some(now_ms());
         *inner.last_error.lock().await = None;
         inner
-            .push_log("sys", format!("running {} (pid {pid}) -> {base_url}", argv.join(" ")))
+            .push_log(
+                "sys",
+                format!("running {} (pid {pid}) -> {base_url}", argv.join(" ")),
+            )
             .await;
         if let Some(stdout) = child.stdout.take() {
             let inner = inner.clone();
@@ -1645,7 +1671,9 @@ impl ProjectSupervisor {
                 *inner.phase.lock().await = Phase::Crashed;
                 inner.desired_running.store(false, Ordering::Relaxed);
                 *inner.last_error.lock().await = Some(format!("exited with code {code:?}"));
-                inner.push_log("sys", format!("application exited (code {code:?})")).await;
+                inner
+                    .push_log("sys", format!("application exited (code {code:?})"))
+                    .await;
             }
         });
         Ok(())
@@ -1675,7 +1703,8 @@ impl ProjectSupervisor {
             return self.compile_toolchain(name, &cfg, &dir).await;
         }
         let deno = workers::find_deno().ok_or_else(|| {
-            "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN.".to_string()
+            "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN."
+                .to_string()
         })?;
         let inner = self.entry(name).await;
         if inner.compiling.swap(true, Ordering::Relaxed) {
@@ -1743,7 +1772,9 @@ impl ProjectSupervisor {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
-            let child = cmd.spawn().map_err(|e| format!("failed to spawn deno: {e}"));
+            let child = cmd
+                .spawn()
+                .map_err(|e| format!("failed to spawn deno: {e}"));
             let mut child = match child {
                 Ok(c) => c,
                 Err(e) => {
@@ -1794,7 +1825,10 @@ impl ProjectSupervisor {
             }
             None => {
                 inner
-                    .push_log("sys", format!("compile complete ({} artifact(s))", produced.len()))
+                    .push_log(
+                        "sys",
+                        format!("compile complete ({} artifact(s))", produced.len()),
+                    )
                     .await;
                 Ok(produced)
             }
@@ -1817,7 +1851,10 @@ impl ProjectSupervisor {
             return Err(format!("lang pack '{}' has no compile command", cfg.lang));
         }
         if !super::extensions::is_trusted(&pack.id) {
-            return Err(format!("extension '{}' is not approved; approve it in Extensions", pack.id));
+            return Err(format!(
+                "extension '{}' is not approved; approve it in Extensions",
+                pack.id
+            ));
         }
         let bin = super::extensions::find_program(&argv[0])
             .ok_or_else(|| format!("toolchain '{}' not found", argv[0]))?;
@@ -1825,7 +1862,9 @@ impl ProjectSupervisor {
         if inner.compiling.swap(true, Ordering::Relaxed) {
             return Err("a compile is already in progress".into());
         }
-        inner.push_log("sys", format!("compiling: {}", argv.join(" "))).await;
+        inner
+            .push_log("sys", format!("compiling: {}", argv.join(" ")))
+            .await;
         let mut cmd = Command::new(&bin);
         cmd.current_dir(dir)
             .args(&argv[1..])
@@ -1839,14 +1878,18 @@ impl ProjectSupervisor {
                     let inner = inner.clone();
                     tokio::spawn(async move {
                         let mut l = BufReader::new(o).lines();
-                        while let Ok(Some(line)) = l.next_line().await { inner.push_log("out", line).await; }
+                        while let Ok(Some(line)) = l.next_line().await {
+                            inner.push_log("out", line).await;
+                        }
                     });
                 }
                 if let Some(e) = child.stderr.take() {
                     let inner = inner.clone();
                     tokio::spawn(async move {
                         let mut l = BufReader::new(e).lines();
-                        while let Ok(Some(line)) = l.next_line().await { inner.push_log("err", line).await; }
+                        while let Ok(Some(line)) = l.next_line().await {
+                            inner.push_log("err", line).await;
+                        }
                     });
                 }
                 match child.wait().await {
@@ -1868,9 +1911,10 @@ impl ProjectSupervisor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering as AOrd};
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use super::*;
 
     /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
     fn lock() -> MutexGuard<'static, ()> {
@@ -1997,7 +2041,6 @@ mod tests {
         let deno = std::fs::read_to_string(dir.join("deno.json")).unwrap();
         assert!(deno.contains("@nanobpm/nano-sdk"));
     }
-
 
     #[test]
     fn lists_projects_with_counts() {

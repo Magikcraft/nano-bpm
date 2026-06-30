@@ -55,7 +55,8 @@ impl Eq for Value {}
 
 impl Value {
     /// The number this value holds, if it is numeric (`Int` or `Double`).
-    pub fn as_f64(&self) -> Option<f64> {        match self {
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
             Value::Int(i) => Some(*i as f64),
             Value::Double(d) => Some(*d),
             _ => None,
@@ -808,7 +809,10 @@ impl ProcessBuilder {
         id: impl Into<String>,
         duration_millis: u64,
     ) -> Self {
-        self.add(id, ElementKind::TimerIntermediateCatchEvent { duration_millis })
+        self.add(
+            id,
+            ElementKind::TimerIntermediateCatchEvent { duration_millis },
+        )
     }
 
     /// Adds an interrupting timer boundary event attached to `attached_to`. A
@@ -1136,14 +1140,26 @@ impl ProcessBuilder {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuildError {
     DuplicateElement(ElementId),
-    UnknownFlowSource { from: ElementId, to: ElementId },
-    UnknownFlowTarget { from: ElementId, to: ElementId },
+    UnknownFlowSource {
+        from: ElementId,
+        to: ElementId,
+    },
+    UnknownFlowTarget {
+        from: ElementId,
+        to: ElementId,
+    },
     NoStartEvent,
     MultipleStartEvents,
     /// A `contained_in` referenced a sub-process element that does not exist.
-    UnknownParent { child: ElementId, parent: ElementId },
+    UnknownParent {
+        child: ElementId,
+        parent: ElementId,
+    },
     /// A `contained_in` referenced a child element that does not exist.
-    UnknownChild { child: ElementId, parent: ElementId },
+    UnknownChild {
+        child: ElementId,
+        parent: ElementId,
+    },
 }
 
 impl std::fmt::Display for BuildError {
@@ -1165,10 +1181,16 @@ impl std::fmt::Display for BuildError {
             BuildError::NoStartEvent => write!(f, "process has no start event"),
             BuildError::MultipleStartEvents => write!(f, "process has more than one start event"),
             BuildError::UnknownParent { child, parent } => {
-                write!(f, "element {child} is contained in unknown sub-process {parent}")
+                write!(
+                    f,
+                    "element {child} is contained in unknown sub-process {parent}"
+                )
             }
             BuildError::UnknownChild { child, parent } => {
-                write!(f, "unknown element {child} declared as contained in sub-process {parent}")
+                write!(
+                    f,
+                    "unknown element {child} declared as contained in sub-process {parent}"
+                )
             }
         }
     }

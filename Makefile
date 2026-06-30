@@ -18,7 +18,15 @@ STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
 ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
 PROCESSOS_DIR := $(PROJECT_ROOT)/processos
+WASM_DIR := $(PROJECT_ROOT)/engine-wasm
 UV := uv
+
+# Canonical formatter: pinned nightly rustfmt. The repo's rustfmt.toml uses
+# unstable options (group_imports), which stable `cargo fmt` silently ignores —
+# producing import-ordering drift. Always format via this toolchain so the tree
+# matches the `make fmt-check` CI gate. Bump deliberately (single style commit).
+FMT_TOOLCHAIN := nightly-2026-06-26
+FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR)
 
 .DEFAULT_GOAL := build
 
@@ -168,10 +176,18 @@ processos-run: ## Run ProcessOS (PROCESSOS_PORT=8090, NANO_BASE_URL=http://local
 	cd processos && cargo run
 
 .PHONY: fmt
-fmt: $(GENERATED_DIR)/Cargo.toml ## Format the generated crate, the stub server and engine-core
-	cd $(GENERATED_DIR) && cargo fmt
-	cd $(PROJECT_ROOT)/server && cargo fmt
-	cd $(ENGINE_DIR) && cargo fmt
+fmt: ## Format every hand-written crate with the pinned nightly rustfmt (see FMT_TOOLCHAIN)
+	@for d in $(FMT_CRATES); do \
+		echo "fmt $$d"; \
+		(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt) || exit 1; \
+	done
+
+.PHONY: fmt-check
+fmt-check: ## Verify formatting with the pinned nightly rustfmt (CI gate; fails on drift)
+	@for d in $(FMT_CRATES); do \
+		echo "fmt-check $$d"; \
+		(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check) || exit 1; \
+	done
 
 .PHONY: clippy
 clippy: $(GENERATED_DIR)/Cargo.toml ## Lint the generated crate, the stub server and engine-core

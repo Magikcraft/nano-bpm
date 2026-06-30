@@ -16,9 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Serialize;
-
 use nanobpmn_engine_core::bpmn::parse_bpmn;
+use serde::Serialize;
 
 /// The built-in default pilot process, embedded so a factory-fresh instance always has
 /// a craft to fly regardless of the directory the binary is launched from.
@@ -159,8 +158,9 @@ fn process_ids(xml: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
 
     fn tmp() -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);

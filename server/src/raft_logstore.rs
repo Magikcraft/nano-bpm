@@ -106,7 +106,10 @@ fn async_flush_from_env() -> AsyncFlush {
         Ok(v) => v.trim().parse::<usize>().unwrap_or(8 << 20).max(4096),
         Err(_) => 8 << 20,
     };
-    AsyncFlush { interval, max_bytes }
+    AsyncFlush {
+        interval,
+        max_bytes,
+    }
 }
 
 /// The durable markers persisted in `state.json`.
@@ -235,10 +238,7 @@ impl RaftLogStore {
         let state: PersistedState = read_json(&state_path(&dir))?.unwrap_or_default();
 
         // Keep an append handle open for the common write path.
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&lpath)?;
+        let log_file = OpenOptions::new().create(true).append(true).open(&lpath)?;
 
         let mode = durability_mode_from_env();
         let store = Self {

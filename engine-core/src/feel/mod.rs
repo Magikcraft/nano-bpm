@@ -36,9 +36,9 @@ mod value;
 
 use std::collections::HashMap;
 
-use crate::model::Value;
-
 pub use error::FeelError;
+
+use crate::model::Value;
 
 /// Evaluates a FEEL expression against `ctx`, returning the resulting [`Value`].
 ///
@@ -54,7 +54,9 @@ pub fn eval(expr: &str, ctx: &HashMap<String, Value>) -> Result<Value, FeelError
 pub fn eval_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, FeelError> {
     let v = evaluate(expr, ctx)?;
     if matches!(v, value::FeelVal::Null) {
-        return Err(FeelError("expected a string-like result, got null".to_string()));
+        return Err(FeelError(
+            "expected a string-like result, got null".to_string(),
+        ));
     }
     v.to_feel_string().ok_or_else(|| {
         FeelError(format!(
@@ -96,8 +98,9 @@ fn strip_marker(expr: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::BTreeMap;
+
+    use super::*;
 
     fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
         pairs
@@ -129,7 +132,10 @@ mod tests {
 
     #[test]
     fn evaluates_comparisons_and_equality() {
-        let c = ctx(&[("amount", Value::Int(42)), ("name", Value::Str("ann".into()))]);
+        let c = ctx(&[
+            ("amount", Value::Int(42)),
+            ("name", Value::Str("ann".into())),
+        ]);
         assert_eq!(eval("amount > 10", &c), Ok(Value::Bool(true)));
         assert_eq!(eval("amount >= 42", &c), Ok(Value::Bool(true)));
         assert_eq!(eval("amount = 42", &c), Ok(Value::Bool(true)));
@@ -160,7 +166,10 @@ mod tests {
 
     #[test]
     fn eval_bool_and_string_helpers() {
-        let c = ctx(&[("jobType", Value::Str("payment".into())), ("n", Value::Int(3))]);
+        let c = ctx(&[
+            ("jobType", Value::Str("payment".into())),
+            ("n", Value::Int(3)),
+        ]);
         assert_eq!(eval_string("=jobType", &c), Ok("payment".to_string()));
         assert_eq!(eval_string("=n", &c), Ok("3".to_string()));
         assert_eq!(eval_bool("n > 1", &c), Ok(true));
@@ -180,7 +189,11 @@ mod tests {
         let c = ctx(&[]);
         assert_eq!(
             eval("[1, 2, 3]", &c),
-            Ok(Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]))
+            Ok(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3)
+            ]))
         );
     }
 
@@ -205,7 +218,10 @@ mod tests {
 
     #[test]
     fn in_operator_with_list_and_range() {
-        let c = ctx(&[("t", Value::Str("CDD_REMINDER_7DAY".into())), ("n", Value::Int(5))]);
+        let c = ctx(&[
+            ("t", Value::Str("CDD_REMINDER_7DAY".into())),
+            ("n", Value::Int(5)),
+        ]);
         assert_eq!(
             eval_bool(r#"t in ["CDD_REFRESH_REQUEST", "CDD_REMINDER_7DAY"]"#, &c),
             Ok(true)
@@ -230,7 +246,11 @@ mod tests {
         let c = ctx(&[]);
         assert_eq!(
             eval("for x in [1, 2, 3] return x * x", &c),
-            Ok(Value::List(vec![Value::Int(1), Value::Int(4), Value::Int(9)]))
+            Ok(Value::List(vec![
+                Value::Int(1),
+                Value::Int(4),
+                Value::Int(9)
+            ]))
         );
         assert_eq!(
             eval("[1, 2, 3, 4][item > 2]", &c),
@@ -262,7 +282,10 @@ mod tests {
             eval(r#"contains("banana", "nan")"#, &c),
             Ok(Value::Bool(true))
         );
-        assert_eq!(eval(r#"list contains([1, 2], 2)"#, &c), Ok(Value::Bool(true)));
+        assert_eq!(
+            eval(r#"list contains([1, 2], 2)"#, &c),
+            Ok(Value::Bool(true))
+        );
         assert_eq!(
             eval(r#"substring("hello", 2, 3)"#, &c),
             Ok(Value::Str("ell".into()))
@@ -277,7 +300,11 @@ mod tests {
         );
         assert_eq!(
             eval("sort([3, 1, 2])", &c),
-            Ok(Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]))
+            Ok(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3)
+            ]))
         );
         assert_eq!(eval("floor(3.7)", &c), Ok(Value::Int(3)));
         assert_eq!(eval("abs(-4)", &c), Ok(Value::Int(4)));
@@ -293,7 +320,11 @@ mod tests {
         );
         assert_eq!(
             eval("sort([3, 1, 2], function(a, b) a < b)", &c),
-            Ok(Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]))
+            Ok(Value::List(vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3)
+            ]))
         );
     }
 
@@ -327,13 +358,13 @@ mod tests {
             Ok(Value::Bool(true))
         );
         assert_eq!(
-            eval(r#"date and time("2024-01-01T10:00:00") + duration("PT2H")"#, &c),
+            eval(
+                r#"date and time("2024-01-01T10:00:00") + duration("PT2H")"#,
+                &c
+            ),
             Ok(Value::Str("2024-01-01T12:00:00".into()))
         );
-        assert_eq!(
-            eval(r#"date("2024-03-15").month"#, &c),
-            Ok(Value::Int(3))
-        );
+        assert_eq!(eval(r#"date("2024-03-15").month"#, &c), Ok(Value::Int(3)));
         assert_eq!(
             eval(r#"day of week(date("2024-01-01"))"#, &c),
             Ok(Value::Str("Monday".into()))
@@ -362,10 +393,7 @@ mod tests {
         ]);
         let c = ctx(&[("documents", docs)]);
         assert_eq!(
-            eval_bool(
-                r#"some d in documents satisfies d.status = "REJECTED""#,
-                &c
-            ),
+            eval_bool(r#"some d in documents satisfies d.status = "REJECTED""#, &c),
             Ok(true)
         );
     }

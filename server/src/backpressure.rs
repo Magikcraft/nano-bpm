@@ -17,8 +17,8 @@
 //! exporter in a lock-free [`AtomicUsize`]. Adaptive mode does not change *what*
 //! is limited (instances) — it makes the *limit itself* track latency.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Parsed configuration for the backpressure subsystem.
@@ -272,29 +272,50 @@ mod tests {
 
     #[test]
     fn parse_defaults_to_adaptive() {
-        assert_eq!(parse_backpressure_setting(None), BackpressureSetting::Adaptive);
+        assert_eq!(
+            parse_backpressure_setting(None),
+            BackpressureSetting::Adaptive
+        );
         for raw in ["auto", "adaptive", "ADAPTIVE", " Auto "] {
-            assert_eq!(parse_backpressure_setting(Some(raw)), BackpressureSetting::Adaptive, "{raw:?}");
+            assert_eq!(
+                parse_backpressure_setting(Some(raw)),
+                BackpressureSetting::Adaptive,
+                "{raw:?}"
+            );
         }
     }
 
     #[test]
     fn parse_off_aliases_disable() {
         for raw in ["0", "off", "none", "false", "disabled", "OFF", " Off "] {
-            assert_eq!(parse_backpressure_setting(Some(raw)), BackpressureSetting::Disabled, "{raw:?}");
+            assert_eq!(
+                parse_backpressure_setting(Some(raw)),
+                BackpressureSetting::Disabled,
+                "{raw:?}"
+            );
         }
     }
 
     #[test]
     fn parse_positive_integer_is_fixed() {
-        assert_eq!(parse_backpressure_setting(Some("6000")), BackpressureSetting::Fixed(6000));
-        assert_eq!(parse_backpressure_setting(Some(" 1 ")), BackpressureSetting::Fixed(1));
+        assert_eq!(
+            parse_backpressure_setting(Some("6000")),
+            BackpressureSetting::Fixed(6000)
+        );
+        assert_eq!(
+            parse_backpressure_setting(Some(" 1 ")),
+            BackpressureSetting::Fixed(1)
+        );
     }
 
     #[test]
     fn parse_unparseable_falls_back_to_adaptive() {
         for raw in ["garbage", "-5", "1.5"] {
-            assert_eq!(parse_backpressure_setting(Some(raw)), BackpressureSetting::Adaptive, "{raw:?}");
+            assert_eq!(
+                parse_backpressure_setting(Some(raw)),
+                BackpressureSetting::Adaptive,
+                "{raw:?}"
+            );
         }
     }
 
@@ -314,9 +335,15 @@ mod tests {
 
         // Fixed watermark sheds at or above the limit, admits below it.
         let bp = Backpressure::Fixed(2);
-        assert!(!bp.should_shed(0), "0 concurrent creates is below the limit");
+        assert!(
+            !bp.should_shed(0),
+            "0 concurrent creates is below the limit"
+        );
         assert!(!bp.should_shed(1), "1 concurrent create is below the limit");
-        assert!(bp.should_shed(2), "at the limit sheds (admits at most `limit`)");
+        assert!(
+            bp.should_shed(2),
+            "at the limit sheds (admits at most `limit`)"
+        );
         assert!(bp.should_shed(3), "above the limit sheds");
 
         // Adaptive tracks its shared atomic.
@@ -345,7 +372,10 @@ mod tests {
         let before = a.limit();
         // avg 500us = 5x baseline > 2x threshold => congested
         let after = a.on_window(500.0, 10_000);
-        assert!(after < before, "congestion must shrink the limit: {before} -> {after}");
+        assert!(
+            after < before,
+            "congestion must shrink the limit: {before} -> {after}"
+        );
         // Now healthy + loaded but slow-start is over => additive (+1), not doubling.
         let add = a.on_window(120.0, 10_000);
         assert_eq!(add, after + 1, "post-congestion growth is additive");
@@ -375,6 +405,10 @@ mod tests {
             // avg pinned high (queueing / heap pressure), inflight saturated.
             a.on_window(5_000.0, 10_000);
         }
-        assert_eq!(a.limit(), 256, "must stay shedding at the floor under sustained congestion");
+        assert_eq!(
+            a.limit(),
+            256,
+            "must stay shedding at the floor under sustained congestion"
+        );
     }
 }

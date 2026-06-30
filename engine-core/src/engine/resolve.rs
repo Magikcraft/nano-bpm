@@ -3,14 +3,17 @@
 use super::*;
 
 impl Engine {
-
     /// Resolves the correlation value a subscription captures at open time by
     /// evaluating the stored `correlation_key` FEEL expression against the
     /// instance variables (a bare name like `orderId` is just a variable
     /// reference; `order.id` reads a context member). A missing variable, an
     /// empty key, or an evaluation error yields the empty string (matching the
     /// REST default `correlationKey` of `""`).
-    pub(crate) fn resolve_correlation_value(&self, instance_key: Key, correlation_key: &str) -> String {
+    pub(crate) fn resolve_correlation_value(
+        &self,
+        instance_key: Key,
+        correlation_key: &str,
+    ) -> String {
         if correlation_key.is_empty() {
             return String::new();
         }
@@ -87,7 +90,11 @@ impl Engine {
     /// the instance variables; a list result yields its string items, a string
     /// result is split on commas, anything else (or a failure) yields an empty
     /// list. `None` resolves to an empty list.
-    pub(crate) fn resolve_user_task_list(&self, instance_key: Key, raw: Option<&str>) -> Vec<String> {
+    pub(crate) fn resolve_user_task_list(
+        &self,
+        instance_key: Key,
+        raw: Option<&str>,
+    ) -> Vec<String> {
         let Some(raw) = raw else {
             return Vec::new();
         };

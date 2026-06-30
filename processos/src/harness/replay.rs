@@ -469,7 +469,8 @@ pub fn replay_instance_with_mocks(
     // Non-job recorded inputs (messages, native user tasks, signals, timer
     // fires), drained in `seq` order. Each carries the catch element id (when
     // recorded), the real timestamp, and the payload delta it merged.
-    let mut msg_inputs: std::collections::VecDeque<PendingInput> = std::collections::VecDeque::new();
+    let mut msg_inputs: std::collections::VecDeque<PendingInput> =
+        std::collections::VecDeque::new();
     let mut usertask_inputs: std::collections::VecDeque<PendingInput> =
         std::collections::VecDeque::new();
     let mut signal_inputs: std::collections::VecDeque<PendingInput> =
@@ -490,7 +491,11 @@ pub fn replay_instance_with_mocks(
         let vars: HashMap<String, Value> = s
             .variables
             .as_ref()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), json_to_value(v))).collect())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), json_to_value(v)))
+                    .collect()
+            })
             .unwrap_or_default();
         let input = PendingInput {
             reference: s.reference.clone(),
@@ -1118,9 +1123,10 @@ fn json_to_value(v: &Json) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nanobpmn_engine_core::bpmn::parse_bpmn;
     use serde_json::json;
+
+    use super::*;
 
     // Classify -> Summarize (two service tasks, jobs "classify" then "summarize").
     const TWO_TASK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1727,7 +1733,13 @@ mod tests {
     // --- Non-job recorded inputs: message / user task / timer -----------------
     use nanobpmn_engine_core::ProcessBuilder;
 
-    fn input(seq: u32, at: u64, kind: &str, reference: Option<&str>, vars: Option<&[(&str, Json)]>) -> RecordedStimulus {
+    fn input(
+        seq: u32,
+        at: u64,
+        kind: &str,
+        reference: Option<&str>,
+        vars: Option<&[(&str, Json)]>,
+    ) -> RecordedStimulus {
         RecordedStimulus {
             seq,
             at,
@@ -1737,7 +1749,11 @@ mod tests {
         }
     }
 
-    fn rec_for(process_id: &str, creation: &[(&str, Json)], stimuli: Vec<RecordedStimulus>) -> RecordedInstance {
+    fn rec_for(
+        process_id: &str,
+        creation: &[(&str, Json)],
+        stimuli: Vec<RecordedStimulus>,
+    ) -> RecordedInstance {
         RecordedInstance {
             instance_key: "1".to_string(),
             process_id: process_id.to_string(),
@@ -1766,7 +1782,13 @@ mod tests {
             &[("orderId", json!("o1"))],
             vec![
                 job(1, 1100, "prep-job", None),
-                input(2, 1500, "message", Some("await"), Some(&[("paid", json!(true))])),
+                input(
+                    2,
+                    1500,
+                    "message",
+                    Some("await"),
+                    Some(&[("paid", json!(true))]),
+                ),
             ],
         );
         let res = replay_instance(&[def], "M", &r);
@@ -1794,7 +1816,13 @@ mod tests {
             &[],
             vec![
                 job(1, 1100, "prep-job", None),
-                input(2, 1500, "signal", Some("await"), Some(&[("ok", json!(true))])),
+                input(
+                    2,
+                    1500,
+                    "signal",
+                    Some("await"),
+                    Some(&[("ok", json!(true))]),
+                ),
             ],
         );
         let res = replay_instance(&[def], "S", &r);
@@ -1829,7 +1857,8 @@ mod tests {
         let res = replay_instance(&[def], "U", &r);
         assert!(res.valid && res.completed, "{:?}", res.error);
         assert_eq!(
-            res.divergences, vec![],
+            res.divergences,
+            vec![],
             "user-task output should be conserved"
         );
         assert_eq!(res.e2e_latency_ms, 400);

@@ -220,7 +220,10 @@ mod tests {
         let (m2, s2) = parse_zip(bytes).expect("parse");
         assert_eq!(m2.workspace, "meridian-trust");
         assert_eq!(m2.process, "cdd-refresh");
-        assert_eq!(m2.llm_profiles[0]["apiKey"], serde_json::json!("***redacted***"));
+        assert_eq!(
+            m2.llm_profiles[0]["apiKey"],
+            serde_json::json!("***redacted***")
+        );
         assert_eq!(s2.id, "s-original");
         assert_eq!(s2.name, "North Wind Bank");
         assert_eq!(s2.models, vec!["qwen3".to_string()]);

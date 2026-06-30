@@ -505,8 +505,9 @@ pub fn compact(shared: &SegShared, watermark: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nanobpmn_engine_core::{Command, ProcessBuilder};
+
+    use super::*;
 
     fn demo() -> nanobpmn_engine_core::ProcessDefinition {
         ProcessBuilder::new("demo")

@@ -232,7 +232,10 @@ pub async fn evaluate(cfg: &LlmConfig, persona_system: &str, window: &str) -> Mo
         Ok(Turn::Final(text)) => (parse_verdict(&text), text),
         // A monitor that calls tools or fails is treated as 'no signal'.
         Ok(Turn::ToolCalls(_)) => (MonitorVerdict::none(), String::new()),
-        Err(e) => (MonitorVerdict::none(), format!("(monitor request failed: {e})")),
+        Err(e) => (
+            MonitorVerdict::none(),
+            format!("(monitor request failed: {e})"),
+        ),
     };
     MonitorEval {
         verdict,
@@ -309,9 +312,10 @@ fn first_json_object(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::agent::ToolCall;
-    use serde_json::json;
 
     #[test]
     fn parses_a_bare_json_verdict() {

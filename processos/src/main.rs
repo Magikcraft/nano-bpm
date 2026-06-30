@@ -53,6 +53,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 use serde::Deserialize;
 
 use crate::contracts::NanoClient;
@@ -64,7 +65,6 @@ use crate::harness::{
     LlmOverride, MeasuredJobType, Prompt, PromptLibrary, RecordedInstance, Scenario,
     DEFAULT_EVOLVE_SYSTEM_PROMPT, DEFAULT_PROMPT_ID, DEFAULT_SYSTEM_PROMPT,
 };
-use nanobpmn_engine_core::bpmn::parse_bpmn;
 
 /// Per-session steering queues: an operator instruction stack drained into the running turn.
 type SteerQueues =
@@ -1000,10 +1000,7 @@ async fn dashboard() -> Html<&'static str> {
 async fn cockpit_page() -> impl IntoResponse {
     (
         [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "text/html; charset=utf-8",
-            ),
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (axum::http::header::CACHE_CONTROL, NO_CACHE),
         ],
         COCKPIT_HTML,
@@ -1520,10 +1517,13 @@ async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
         "zeebe-moddle.json" => (BPMN_ZEEBE_MODDLE_JSON, "application/json; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
-    ([
-        (axum::http::header::CONTENT_TYPE, ctype),
-        (axum::http::header::CACHE_CONTROL, NO_CACHE),
-    ], body)
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, ctype),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
+        body,
+    )
         .into_response()
 }
 
@@ -1692,8 +1692,7 @@ fn seed_demo(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("seed tmp dir: {e}"))?;
         }
-        std::fs::write(&dest, file.contents)
-            .map_err(|e| format!("write {}: {e}", file.rel))?;
+        std::fs::write(&dest, file.contents).map_err(|e| format!("write {}: {e}", file.rel))?;
     }
 
     let (pack, def) = corpus::load_pack(&tmp.join(dataset.pack_rel))?;
@@ -1876,7 +1875,11 @@ fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
     }
     if model.to_ascii_lowercase().ends_with(".gguf") {
         let p = std::path::PathBuf::from(model);
-        let resolved = if p.is_absolute() { p } else { models_dir.join(&p) };
+        let resolved = if p.is_absolute() {
+            p
+        } else {
+            models_dir.join(&p)
+        };
         return resolved.exists();
     }
     // Hugging Face spec: split repo from the optional :quant tag.
@@ -1973,9 +1976,7 @@ async fn sidecar_context_window(port: u16) -> Option<u64> {
     }
     let v: serde_json::Value = resp.json().await.ok()?;
     let items = v.get("data").or_else(|| v.get("models"))?.as_array()?;
-    items
-        .iter()
-        .find_map(harness::llm::extract_context_window)
+    items.iter().find_map(harness::llm::extract_context_window)
 }
 
 /// `GET /api/system/dependencies` — preflight the external CLI tools ProcessOS
@@ -2196,10 +2197,12 @@ async fn llama_download(
     let m = model.clone();
     let is_complete: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
         std::sync::Arc::new(move || model_downloaded(&dir, &m));
-    match state
-        .llama
-        .start_download(&profile, &models_dir, snap.llama_bin.as_deref(), is_complete)
-    {
+    match state.llama.start_download(
+        &profile,
+        &models_dir,
+        snap.llama_bin.as_deref(),
+        is_complete,
+    ) {
         Ok(s) => Json(s).into_response(),
         Err(e) => unprocessable(e),
     }
@@ -2410,9 +2413,11 @@ fn build_subagent(
             )
         })?;
     if !cfg.is_ready() {
-        return Err("Subagent is enabled but has no model configured — pick a profile for the \
+        return Err(
+            "Subagent is enabled but has no model configured — pick a profile for the \
                     subagent, or disable delegation"
-            .to_string());
+                .to_string(),
+        );
     }
     let (_id, name, system) = state.personas.resolve_subagent(spec.persona_id.as_deref());
     let system = spec
@@ -2554,7 +2559,9 @@ async fn run_loop_monitor(
         // What (if anything) the monitor injected into the PRIMARY this round, and a label.
         let (action_label, injected): (&str, Option<String>) = match &action {
             monitor::MonitorAction::None => ("none", None),
-            monitor::MonitorAction::Steer(text) => ("steer", Some(format!("[loop monitor] {text}"))),
+            monitor::MonitorAction::Steer(text) => {
+                ("steer", Some(format!("[loop monitor] {text}")))
+            }
             monitor::MonitorAction::WrapUp(reason) => ("wrapup", Some(reason.clone())),
         };
         // Record this evaluation for the Debug tab: the exact request the second model received,
@@ -2885,9 +2892,7 @@ struct WorkbenchXmlRequest {
 /// in `normalize_authoring` + `lint_task_definition_attribute`) and also returns the normalized
 /// XML so the canvas can offer to apply the heal. The cockpit blocks Simulate until `valid` is
 /// true with no error-severity finding.
-async fn cockpit_workbench_validate(
-    Json(req): Json<WorkbenchXmlRequest>,
-) -> impl IntoResponse {
+async fn cockpit_workbench_validate(Json(req): Json<WorkbenchXmlRequest>) -> impl IntoResponse {
     let report = match crate::bpmn_model::validate_model(&req.xml) {
         Ok(v) => v,
         Err(e) => return unprocessable(e),
@@ -2902,7 +2907,11 @@ async fn cockpit_workbench_validate(
                 .any(|f| f.get("severity").and_then(|s| s.as_str()) == Some("error"))
         })
         .unwrap_or(false);
-    let deployable = report.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) && !has_error;
+    let deployable = report
+        .get("valid")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && !has_error;
     Json(serde_json::json!({
         "deployable": deployable,
         "report": report,
@@ -2938,9 +2947,7 @@ struct WorkbenchApplyRequest {
 /// `POST .../workbench/apply-edit` — deterministically apply structured `edit_model` ops to the
 /// canvas XML (used by "Apply suggestion" when the agent returns counter-edits, and reusable for
 /// any structured authoring). Returns the engine-validated resulting XML.
-async fn cockpit_workbench_apply_edit(
-    Json(req): Json<WorkbenchApplyRequest>,
-) -> impl IntoResponse {
+async fn cockpit_workbench_apply_edit(Json(req): Json<WorkbenchApplyRequest>) -> impl IntoResponse {
     match crate::bpmn_model::edit_model(&req.xml, &req.ops) {
         Ok(v) => Json(v).into_response(),
         Err(e) => unprocessable(e),
@@ -3039,7 +3046,10 @@ async fn cockpit_workbench_compare(
         Err(e) => return unprocessable(e),
     };
     let model = state.workspaces.read_model(&workspace, &process);
-    let name = req.name.clone().unwrap_or_else(|| "workbench variant".to_string());
+    let name = req
+        .name
+        .clone()
+        .unwrap_or_else(|| "workbench variant".to_string());
     let mut candidates = vec![serde_json::json!({ "name": name, "model": req.xml })];
     if let Some(base) = &model {
         candidates.push(serde_json::json!({ "name": "baseline (recorded)", "model": base }));
@@ -3209,7 +3219,11 @@ fn last_edit_model(messages: &[agent::Msg]) -> (serde_json::Value, Option<String
                 if tc.name != "edit_model" {
                     continue;
                 }
-                let ops = tc.arguments.get("ops").cloned().unwrap_or(serde_json::Value::Null);
+                let ops = tc
+                    .arguments
+                    .get("ops")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let xml = results.get(tc.id.as_str()).and_then(|c| {
                     serde_json::from_str::<serde_json::Value>(c)
                         .ok()
@@ -3229,7 +3243,9 @@ fn last_edit_model(messages: &[agent::Msg]) -> (serde_json::Value, Option<String
 /// is synchronous and CPU-bound, so it runs off the async executor like `run_investigation`.
 async fn run_dataset_op<F>(src: dataset::TraceSource, f: F) -> Result<serde_json::Value, String>
 where
-    F: FnOnce(crate::experiment::RecordedDataset) -> Result<serde_json::Value, String> + Send + 'static,
+    F: FnOnce(crate::experiment::RecordedDataset) -> Result<serde_json::Value, String>
+        + Send
+        + 'static,
 {
     tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -3287,9 +3303,7 @@ fn append_workbench_run(
     let stamps = chat::extend_stamps(&session.messages, session.stamps.clone(), now, now);
     let turn_models =
         chat::extend_turn_models(&session.messages, session.turn_models.clone(), "workbench");
-    state
-        .chat
-        .save(&key, sid, session.messages.clone(), stamps);
+    state.chat.save(&key, sid, session.messages.clone(), stamps);
     state.chat.set_turn_models(&key, sid, turn_models);
 }
 
@@ -3310,7 +3324,10 @@ async fn cockpit_chat_session_export(
             .into_response();
     };
     let verbose = q.mode.as_deref() == Some("debug");
-    let markdown = !matches!(q.format.as_deref(), Some("txt") | Some("text") | Some("plain"));
+    let markdown = !matches!(
+        q.format.as_deref(),
+        Some("txt") | Some("text") | Some("plain")
+    );
     let turns = chat::render_view_full(&s.messages, &s.stamps, &s.turn_models);
     let body = chat::export_transcript(&s.name, &turns, markdown, verbose);
     let ext = if markdown { "md" } else { "txt" };
@@ -4390,10 +4407,7 @@ async fn tools_upsert(
 }
 
 /// `DELETE /api/tools/{id}` — delete a custom tool.
-async fn tools_delete(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn tools_delete(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
     match state.tools.delete(&id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => unprocessable(e),
@@ -4515,8 +4529,6 @@ async fn nano_instances_health(
     let ok = NanoClient::new(&inst.base_url).health_ok().await;
     Json(serde_json::json!({ "id": id, "baseUrl": inst.base_url, "ok": ok })).into_response()
 }
-
-
 
 /// `GET /api/harness/example` — the bundled example scenario JSON, so callers have
 /// a ready template to copy and adapt.
@@ -5303,7 +5315,14 @@ async fn harness_production(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match build_baseline(&state.active_target(), q.process_id.as_deref(), limit, sample).await {
+    match build_baseline(
+        &state.active_target(),
+        q.process_id.as_deref(),
+        limit,
+        sample,
+    )
+    .await
+    {
         Ok(baseline) => Json(baseline).into_response(),
         // A read-contract failure surfaces the underlying GET error; an empty or
         // unknown-process result is a request the caller can fix, so 422.
@@ -5334,7 +5353,14 @@ async fn harness_cluster(
 ) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let sample = q.sample.unwrap_or(50).clamp(1, 500);
-    match build_cluster_summary(&state.active_target(), q.process_id.as_deref(), limit, sample).await {
+    match build_cluster_summary(
+        &state.active_target(),
+        q.process_id.as_deref(),
+        limit,
+        sample,
+    )
+    .await
+    {
         Ok(summary) => match q.target_p99_ms {
             // Attach the staffing recommendation derived from the measured run.
             Some(target) => {
@@ -5800,8 +5826,9 @@ mod config_tests {
 
 #[cfg(test)]
 mod sidecar_phase_tests {
-    use super::{download_in_progress, model_downloaded};
     use std::fs;
+
+    use super::{download_in_progress, model_downloaded};
 
     #[test]
     fn detects_an_in_progress_hf_download_and_reports_its_size() {
@@ -5841,7 +5868,10 @@ mod sidecar_phase_tests {
 
         // Mid-download: only a .downloadInProgress blob, no snapshot file yet.
         fs::write(blobs.join("sha1.downloadInProgress"), vec![0u8; 4096]).unwrap();
-        assert!(!model_downloaded(&dir, model), "partial download is not downloaded");
+        assert!(
+            !model_downloaded(&dir, model),
+            "partial download is not downloaded"
+        );
 
         // Complete: a snapshot .gguf (whose name carries the quant) backed by a real blob, and the
         // partial file gone.
@@ -5853,7 +5883,10 @@ mod sidecar_phase_tests {
         std::os::unix::fs::symlink(&blob, &gguf).unwrap();
         #[cfg(not(unix))]
         fs::write(&gguf, vec![0u8; 8192]).unwrap();
-        assert!(model_downloaded(&dir, model), "complete cache reads as downloaded");
+        assert!(
+            model_downloaded(&dir, model),
+            "complete cache reads as downloaded"
+        );
 
         // A different quant of the same repo must not read as downloaded.
         assert!(
@@ -5863,7 +5896,10 @@ mod sidecar_phase_tests {
 
         // A still-in-progress blob alongside the complete snapshot still reads as not-ready.
         fs::write(blobs.join("sha2.downloadInProgress"), vec![0u8; 16]).unwrap();
-        assert!(!model_downloaded(&dir, model), "an active partial blocks downloaded");
+        assert!(
+            !model_downloaded(&dir, model),
+            "an active partial blocks downloaded"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

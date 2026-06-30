@@ -22,9 +22,9 @@ mod metrics;
 // Intra-cluster peer uplink (command-stream client to peers). The forwarding
 // seam that drives it (create-forward, by-key forward, broadcast) lands in the
 // following increments; the transport is integration-tested now.
+mod partition;
 #[allow(dead_code)]
 mod peer;
-mod partition;
 mod query;
 mod raft;
 mod raft_logstore;
@@ -44,20 +44,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::extract::Multipart;
 use axum::response::Response;
-use nanobpm_gateway_rest::{apis, models, types};
 use http::StatusCode;
+use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    partition_of, ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, Key,
-    ProcessBuilder, ProcessDefinition, ProcessInstanceState, Value, MAX_PARTITION_ID,
+    ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
+    ProcessBuilder, ProcessDefinition, ProcessInstanceState, Value, partition_of,
 };
 
 use crate::backpressure::{
-    parse_backpressure_setting, AdaptiveController, Backpressure, BackpressureSetting,
+    AdaptiveController, Backpressure, BackpressureSetting, parse_backpressure_setting,
 };
 use crate::engine_actor::EngineHandle;
-use crate::partition::Partitions;
 use crate::journal::{Commit, Journal, SharedWriter};
+use crate::partition::Partitions;
 use crate::readstore::ReadStore;
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
@@ -266,7 +266,11 @@ impl ServerImpl {
     /// partitions so any of them can instantiate it. Each journal's exporter must
     /// already be wired to the shared read store so the seed deployment is
     /// projected.
-    pub fn new(mut journals: Vec<Journal>, store: Arc<ReadStore>, topology: cluster::Topology) -> Self {
+    pub fn new(
+        mut journals: Vec<Journal>,
+        store: Arc<ReadStore>,
+        topology: cluster::Topology,
+    ) -> Self {
         assert!(!journals.is_empty(), "at least one partition is required");
         // Teach every owned partition the cluster-wide partition count so the
         // engine places message subscriptions on the partition owning their
@@ -367,10 +371,11 @@ impl ServerImpl {
         let var_cfg = spill_from_env();
         let cold_cfg = cold_spill_from_env();
         if var_cfg.is_some() || cold_cfg.is_some() {
-            let path = var_cfg
-                .as_ref()
-                .and_then(|(p, _)| p.clone())
-                .or_else(|| resolve_data_paths().1.map(|db| db.with_file_name("var-spill.sqlite")));
+            let path = var_cfg.as_ref().and_then(|(p, _)| p.clone()).or_else(|| {
+                resolve_data_paths()
+                    .1
+                    .map(|db| db.with_file_name("var-spill.sqlite"))
+            });
             let location = path
                 .as_deref()
                 .map(|p| format!(", store {}", p.display()))
@@ -492,8 +497,13 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
 #[allow(clippy::type_complexity)]
 fn parse_deploy_resources(
     resources: &[(String, String)],
-) -> Result<(Vec<ProcessDefinition>, std::collections::HashMap<String, String>), (&'static str, String)>
-{
+) -> Result<
+    (
+        Vec<ProcessDefinition>,
+        std::collections::HashMap<String, String>,
+    ),
+    (&'static str, String),
+> {
     let mut processes = Vec::new();
     let mut resource_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -506,7 +516,10 @@ fn parse_deploy_resources(
                 }
             }
             Err(e) => {
-                return Err(("Invalid BPMN", format!("Failed to parse '{resource_name}': {e}.")));
+                return Err((
+                    "Invalid BPMN",
+                    format!("Failed to parse '{resource_name}': {e}."),
+                ));
             }
         }
     }
@@ -516,7 +529,11 @@ fn parse_deploy_resources(
 impl Default for ServerImpl {
     fn default() -> Self {
         let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        build_server(vec![Journal::in_memory()], store, cluster::Topology::single(1))
+        build_server(
+            vec![Journal::in_memory()],
+            store,
+            cluster::Topology::single(1),
+        )
     }
 }
 
@@ -548,8 +565,8 @@ impl ServerImpl {
         // straight from JSON — no intermediate `serde_json::Value` DOM.
         let rpc = crate::raft_net::decode_rpc_payload(rpc, zip)
             .map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
-        let req: crate::raft_net::RaftRpcRequest = serde_json::from_str(&rpc)
-            .map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
+        let req: crate::raft_net::RaftRpcRequest =
+            serde_json::from_str(&rpc).map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
         let part = self.raft.get(partition).ok_or_else(|| {
             (
                 404u16,
@@ -750,7 +767,11 @@ fn parse_host_port(url: &str) -> Option<(String, i32)> {
 /// See [`parse_backpressure_setting`] for the grammar; backpressure is on (and
 /// adaptive) by default.
 fn backpressure_setting_from_env() -> BackpressureSetting {
-    parse_backpressure_setting(std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT").ok().as_deref())
+    parse_backpressure_setting(
+        std::env::var("NANOBPMN_BACKPRESSURE_MAX_INFLIGHT")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Whether the job activation lock is replicated through Raft. `true` (the
@@ -773,7 +794,10 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
 /// fully replicated. Prefer the default for workloads that need failover to honor
 /// in-flight lease deadlines; opt in for throughput-bound, idempotent workloads.
 fn replicate_activation_from_env() -> bool {
-    match std::env::var("NANOBPMN_REPLICATE_ACTIVATION").ok().as_deref() {
+    match std::env::var("NANOBPMN_REPLICATE_ACTIVATION")
+        .ok()
+        .as_deref()
+    {
         Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no" | "digest"
@@ -1070,12 +1094,20 @@ impl ServerImpl {
         // When `awaitCompletion` is set, the request blocks until the instance
         // reaches a terminal state or `requestTimeout` elapses.
         let (await_completion, fetch_variables, request_timeout) = match body {
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
-                (b.await_completion, b.fetch_variables.as_ref(), b.request_timeout)
-            }
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
-                (b.await_completion, b.fetch_variables.as_ref(), b.request_timeout)
-            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                b,
+            ) => (
+                b.await_completion,
+                b.fetch_variables.as_ref(),
+                b.request_timeout,
+            ),
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
+                b,
+            ) => (
+                b.await_completion,
+                b.fetch_variables.as_ref(),
+                b.request_timeout,
+            ),
         };
         let await_completion = await_completion.unwrap_or(false);
 
@@ -1084,12 +1116,12 @@ impl ServerImpl {
         // single command thread. The variables come from the request body and so
         // are available for both creation variants without touching the engine.
         let variables = match body {
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
-                b.variables.as_ref()
-            }
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
-                b.variables.as_ref()
-            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                b,
+            ) => b.variables.as_ref(),
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
+                b,
+            ) => b.variables.as_ref(),
         }
         .map(from_object_map)
         .unwrap_or_default();
@@ -1097,29 +1129,25 @@ impl ServerImpl {
         // Extract tags and business_id from the request body (both variants have
         // these fields). Convert Option<Vec<Tag>> to Vec<String> for the engine.
         let (tags, business_id) = match body {
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
-                (b.tags.clone(), b.business_id.clone())
-            }
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
-                (b.tags.clone(), b.business_id.clone())
-            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                b,
+            ) => (b.tags.clone(), b.business_id.clone()),
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
+                b,
+            ) => (b.tags.clone(), b.business_id.clone()),
         };
-        let tags_vec: Vec<String> = tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| t.0)
-            .collect();
+        let tags_vec: Vec<String> = tags.unwrap_or_default().into_iter().map(|t| t.0).collect();
         let business_id_str = business_id;
 
         // Only the by-key variant needs the engine (to resolve a deployed key to a
         // process id); capture the lookup inputs the engine thread will need.
         let (by_id, by_key) = match body {
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
-                (Some(b.process_definition_id.clone()), None)
-            }
-            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
-                (None, Some(b.process_definition_key.0.clone()))
-            }
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                b,
+            ) => (Some(b.process_definition_id.clone()), None),
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
+                b,
+            ) => (None, Some(b.process_definition_key.0.clone())),
         };
 
         // Under Raft (RF>=2) the create must be REPLICATED through a partition's
@@ -1228,106 +1256,108 @@ impl ServerImpl {
         let business_id_for_response = business_id_str.clone();
         let outcome: Result<CreateOk, Box<Resp>> = {
             let _processing = ProcessingGuard::enter(&self.processing);
-            self
-            .engine
-            .for_create()
-            .with_low(move |engine| {
-                // The engine starts processes by BPMN process id. A creation-by-key
-                // request is resolved to its process id by looking up the deployed
-                // definition whose key matches; an unknown key is rejected as
-                // invalid input (the create endpoint has no 404 variant).
-                let process_id = match (by_id, by_key) {
-                    (Some(id), _) => id,
-                    (None, Some(requested)) => {
-                        match engine
-                            .state()
-                            .processes
-                            .values()
-                            .find(|d| d.key.to_string() == requested)
-                        {
-                            Some(d) => d.definition.id.clone(),
-                            None => {
-                                return Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(
-                                    problem(
-                                        "Process not found",
-                                        400,
-                                        format!("No deployed process with key '{requested}'."),
-                                    ),
-                                )));
+            self.engine
+                .for_create()
+                .with_low(move |engine| {
+                    // The engine starts processes by BPMN process id. A creation-by-key
+                    // request is resolved to its process id by looking up the deployed
+                    // definition whose key matches; an unknown key is rejected as
+                    // invalid input (the create endpoint has no 404 variant).
+                    let process_id = match (by_id, by_key) {
+                        (Some(id), _) => id,
+                        (None, Some(requested)) => {
+                            match engine
+                                .state()
+                                .processes
+                                .values()
+                                .find(|d| d.key.to_string() == requested)
+                            {
+                                Some(d) => d.definition.id.clone(),
+                                None => {
+                                    return Err(Box::new(
+                                        Resp::Status400_TheProvidedDataIsNotValid(problem(
+                                            "Process not found",
+                                            400,
+                                            format!("No deployed process with key '{requested}'."),
+                                        )),
+                                    ));
+                                }
                             }
                         }
-                    }
-                    (None, None) => unreachable!("one creation variant is always set"),
-                };
+                        (None, None) => unreachable!("one creation variant is always set"),
+                    };
 
-                match engine.apply_command_at(
-                    Command::create_instance_full(process_id.clone(), variables, tags_vec, business_id_str),
-                    now_millis(),
-                ) {
-                    Ok((events, commit)) => {
-                        let instance_key = events
-                            .iter()
-                            .find_map(Event::instance_key)
-                            .expect("created instance has a key");
-                        // Project the real deployed key and version now that the
-                        // instance exists, so by-id and by-key requests report the
-                        // same definition identity.
-                        let (definition_key, version) = engine
-                            .state()
-                            .processes
-                            .get(&process_id)
-                            .map(|d| (d.key.to_string(), d.version))
-                            .unwrap_or_else(|| (process_id.clone(), 1));
-                        // An auto-completing process (no wait states) finishes
-                        // synchronously within this create command; a process that
-                        // parks on a job/timer/etc. is still running.
-                        let sync_completed = engine.engine().is_completed(instance_key);
-                        // Collect any cross-partition subscription follow-ups to
-                        // route once durable (none single-partition).
-                        let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
-                            events
+                    match engine.apply_command_at(
+                        Command::create_instance_full(
+                            process_id.clone(),
+                            variables,
+                            tags_vec,
+                            business_id_str,
+                        ),
+                        now_millis(),
+                    ) {
+                        Ok((events, commit)) => {
+                            let instance_key = events
                                 .iter()
-                                .filter(|e| {
-                                    matches!(
-                                        e,
-                                        Event::MessageSubscriptionOpening { .. }
-                                            | Event::RemoteMessageCorrelation { .. }
-                                            | Event::MessageSubscriptionClosing { .. }
-                                            | Event::StartInstanceDispatched { .. }
-                                    )
-                                })
-                                .cloned()
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                        Ok((
-                            process_id,
-                            version,
-                            definition_key,
-                            instance_key,
-                            sync_completed,
-                            routable,
-                            commit,
-                        ))
-                    }
-                    Err(EngineError::ProcessNotFound { process_id }) => {
-                        Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                            "Process not found",
-                            400,
-                            format!("No deployed process with id '{process_id}'."),
-                        ))))
-                    }
-                    Err(e) => Err(Box::new(
-                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                            "Internal error",
-                            500,
-                            e.to_string(),
+                                .find_map(Event::instance_key)
+                                .expect("created instance has a key");
+                            // Project the real deployed key and version now that the
+                            // instance exists, so by-id and by-key requests report the
+                            // same definition identity.
+                            let (definition_key, version) = engine
+                                .state()
+                                .processes
+                                .get(&process_id)
+                                .map(|d| (d.key.to_string(), d.version))
+                                .unwrap_or_else(|| (process_id.clone(), 1));
+                            // An auto-completing process (no wait states) finishes
+                            // synchronously within this create command; a process that
+                            // parks on a job/timer/etc. is still running.
+                            let sync_completed = engine.engine().is_completed(instance_key);
+                            // Collect any cross-partition subscription follow-ups to
+                            // route once durable (none single-partition).
+                            let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
+                                events
+                                    .iter()
+                                    .filter(|e| {
+                                        matches!(
+                                            e,
+                                            Event::MessageSubscriptionOpening { .. }
+                                                | Event::RemoteMessageCorrelation { .. }
+                                                | Event::MessageSubscriptionClosing { .. }
+                                                | Event::StartInstanceDispatched { .. }
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            Ok((
+                                process_id,
+                                version,
+                                definition_key,
+                                instance_key,
+                                sync_completed,
+                                routable,
+                                commit,
+                            ))
+                        }
+                        Err(EngineError::ProcessNotFound { process_id }) => Err(Box::new(
+                            Resp::Status400_TheProvidedDataIsNotValid(problem(
+                                "Process not found",
+                                400,
+                                format!("No deployed process with id '{process_id}'."),
+                            )),
                         )),
-                    )),
-                }
-            })
-            .await
+                        Err(e) => Err(Box::new(
+                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                problem("Internal error", 500, e.to_string()),
+                            ),
+                        )),
+                    }
+                })
+                .await
         };
 
         let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
@@ -1372,7 +1402,8 @@ impl ServerImpl {
             models::ProcessDefinitionKey(definition_key),
             models::ProcessInstanceKey(instance_key.to_string()),
             tags_for_response.into_iter().map(models::Tag).collect(),
-            business_id_for_response.map(nanobpm_gateway_rest::types::Nullable::Present)
+            business_id_for_response
+                .map(nanobpm_gateway_rest::types::Nullable::Present)
                 .unwrap_or(nanobpm_gateway_rest::types::Nullable::Null),
             process_completed,
         );
@@ -1435,9 +1466,7 @@ impl ServerImpl {
         fetch_variables: Option<&Vec<String>>,
     ) -> std::collections::HashMap<String, types::Object> {
         let wanted: Option<std::collections::HashSet<&str>> = match fetch_variables {
-            Some(names) if !names.is_empty() => {
-                Some(names.iter().map(String::as_str).collect())
-            }
+            Some(names) if !names.is_empty() => Some(names.iter().map(String::as_str).collect()),
             _ => None,
         };
         self.store
@@ -1558,7 +1587,8 @@ impl ServerImpl {
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
+                engine
+                    .apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
             })
             .await;
         match result {
@@ -1633,14 +1663,19 @@ impl ServerImpl {
             .unwrap_or_default();
 
         if let Some(node) = self.route_by_leader(job_key) {
-            return Ok(self.forward_fail_job(node, job_key, retries, error_message).await);
+            return Ok(self
+                .forward_fail_job(node, job_key, retries, error_message)
+                .await);
         }
 
         let result = self
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
+                engine.apply_command_at(
+                    Command::fail_job(job_key, retries, error_message),
+                    now_millis(),
+                )
             })
             .await;
         match result {
@@ -1992,27 +2027,32 @@ impl ServerImpl {
 
         let result = self.store.process_instance(key);
         if result.is_none()
-            && let Some(node) = self.read_route(key) {
-                let (status, body) = self
-                    .forward_get(node, crate::command_stream::ReadKind::ProcessInstance, key)
-                    .await;
-                return Ok(match (status, body) {
-                    (200, Some(b)) => match serde_json::from_value(b) {
-                        Ok(r) => Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(r),
-                        Err(e) => {
-                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                                problem("Peer error", 500, e.to_string()),
-                            )
-                        }
-                    },
-                    (404, _) => Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(
-                        problem("Process instance not found", 404, format!("No process instance with key {key}.")),
+            && let Some(node) = self.read_route(key)
+        {
+            let (status, body) = self
+                .forward_get(node, crate::command_stream::ReadKind::ProcessInstance, key)
+                .await;
+            return Ok(match (status, body) {
+                (200, Some(b)) => match serde_json::from_value(b) {
+                    Ok(r) => Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(r),
+                    Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", 500, e.to_string()),
                     ),
-                    (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", 500, format!("peer node {node} returned status {s}")),
-                    ),
-                });
-            }
+                },
+                (404, _) => Resp::Status404_TheProcessInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    format!("No process instance with key {key}."),
+                )),
+                (s, _) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        500,
+                        format!("peer node {node} returned status {s}"),
+                    ))
+                }
+            });
+        }
         match result {
             Some(instance) => Ok(Resp::Status200_TheProcessInstanceIsSuccessfullyReturned(
                 process_instance_result(&instance),
@@ -2042,16 +2082,16 @@ impl ServerImpl {
         let key: u64 = match path_params.process_definition_key.parse() {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(
-                    problem(
+                return Ok(
+                    Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(problem(
                         "Process definition not found",
                         404,
                         format!(
                             "Process definition key '{}' is not a valid key.",
                             path_params.process_definition_key
                         ),
-                    ),
-                ));
+                    )),
+                );
             }
         };
 
@@ -2059,16 +2099,16 @@ impl ServerImpl {
             Some(xml) if !xml.is_empty() => {
                 Ok(Resp::Status200_TheXMLOfTheProcessDefinitionIsSuccessfullyReturned(xml))
             }
-            Some(_) => Ok(Resp::Status204_TheProcessDefinitionWasFoundButDoesNotHaveXML(
-                String::new(),
-            )),
-            None => Ok(Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(
-                problem(
+            Some(_) => {
+                Ok(Resp::Status204_TheProcessDefinitionWasFoundButDoesNotHaveXML(String::new()))
+            }
+            None => Ok(
+                Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(problem(
                     "Process definition not found",
                     404,
                     format!("No process definition with key {key}."),
-                ),
-            )),
+                )),
+            ),
         }
     }
 
@@ -2099,7 +2139,11 @@ impl ServerImpl {
             if node == topology.node_id {
                 return ("0.0.0.0".to_string(), self_port);
             }
-            let url = topology.peers.get(node as usize).map(String::as_str).unwrap_or("");
+            let url = topology
+                .peers
+                .get(node as usize)
+                .map(String::as_str)
+                .unwrap_or("");
             parse_host_port(url).unwrap_or(("0.0.0.0".to_string(), self_port))
         };
 
@@ -2152,7 +2196,11 @@ impl ServerImpl {
             }),
         };
 
-        Ok(Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(topology_response))
+        Ok(
+            Resp::Status200_ObtainsTheCurrentTopologyOfTheClusterTheGatewayIsPartOf(
+                topology_response,
+            ),
+        )
     }
 
     /// Correlates a message, routing it to **only** the partitions that can hold a
@@ -2833,9 +2881,7 @@ impl ServerImpl {
                     },
                     None => return (400, Some("missing assignment payload".to_string())),
                 };
-                let path = models::AssignUserTaskPathParams {
-                    user_task_key: key,
-                };
+                let path = models::AssignUserTaskPathParams { user_task_key: key };
                 match self.assign_user_task_impl(&path, &body).await {
                     Ok(R::Status204_TheUserTask) => (204, None),
                     Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
@@ -2859,9 +2905,7 @@ impl ServerImpl {
                     },
                     None => None,
                 };
-                let path = models::CompleteUserTaskPathParams {
-                    user_task_key: key,
-                };
+                let path = models::CompleteUserTaskPathParams { user_task_key: key };
                 match self.complete_user_task_impl(&path, &body).await {
                     Ok(R::Status204_TheUserTaskWasCompletedSuccessfully) => (204, None),
                     Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
@@ -2878,9 +2922,7 @@ impl ServerImpl {
             }
             UserTaskOp::Unassign => {
                 use apis::user_task::UnassignUserTaskResponse as R;
-                let path = models::UnassignUserTaskPathParams {
-                    user_task_key: key,
-                };
+                let path = models::UnassignUserTaskPathParams { user_task_key: key };
                 match self.unassign_user_task_impl(&path).await {
                     Ok(R::Status204_TheUserTaskWasUnassignedSuccessfully) => (204, None),
                     Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
@@ -2904,9 +2946,7 @@ impl ServerImpl {
                     },
                     None => None,
                 };
-                let path = models::UpdateUserTaskPathParams {
-                    user_task_key: key,
-                };
+                let path = models::UpdateUserTaskPathParams { user_task_key: key };
                 match self.update_user_task_impl(&path, &body).await {
                     Ok(R::Status204_TheUserTaskWasUpdatedSuccessfully) => (204, None),
                     Ok(R::Status404_TheUserTaskWithTheGivenKeyWasNotFound(p)) => {
@@ -2961,10 +3001,15 @@ impl ServerImpl {
         variables: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> apis::job::CompleteJobResponse {
         use apis::job::CompleteJobResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.complete_job(job_key.to_string(), variables).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => link.complete_job(job_key.to_string(), variables).await,
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasCompletedSuccessfully,
             Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
@@ -3001,17 +3046,23 @@ impl ServerImpl {
         error_message: String,
     ) -> apis::job::FailJobResponse {
         use apis::job::FailJobResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.fail_job(job_key.to_string(), retries, error_message).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => {
+                    link.fail_job(job_key.to_string(), retries, error_message)
+                        .await
+                }
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobIsFailed,
-            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
-                "Job not found",
-                404,
-                peer_detail(&r),
-            )),
+            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(
+                problem("Job not found", 404, peer_detail(&r)),
+            ),
             Ok(r) if r.status == 409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
                 problem("Job in wrong state", 409, peer_detail(&r)),
             ),
@@ -3037,10 +3088,18 @@ impl ServerImpl {
         error_message: String,
     ) -> apis::job::ThrowJobErrorResponse {
         use apis::job::ThrowJobErrorResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.throw_error(job_key.to_string(), error_code, error_message).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => {
+                    link.throw_error(job_key.to_string(), error_code, error_message)
+                        .await
+                }
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_AnErrorIsThrownForTheJob,
             Ok(r) if r.status == 404 => {
@@ -3100,7 +3159,10 @@ impl ServerImpl {
         error_message: String,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
-            Ok(link) => match link.fail_job(job_key.to_string(), retries, error_message).await {
+            Ok(link) => match link
+                .fail_job(job_key.to_string(), retries, error_message)
+                .await
+            {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
             },
@@ -3118,7 +3180,10 @@ impl ServerImpl {
         error_message: String,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
-            Ok(link) => match link.throw_error(job_key.to_string(), error_code, error_message).await {
+            Ok(link) => match link
+                .throw_error(job_key.to_string(), error_code, error_message)
+                .await
+            {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
             },
@@ -3182,10 +3247,15 @@ impl ServerImpl {
         instance_key: u64,
     ) -> apis::process_instance::CancelProcessInstanceResponse {
         use apis::process_instance::CancelProcessInstanceResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.cancel_instance(instance_key.to_string()).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => link.cancel_instance(instance_key.to_string()).await,
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheProcessInstanceIsCanceled,
             Ok(r) if r.status == 404 => Resp::Status404_TheProcessInstanceIsNotFound(problem(
@@ -3214,10 +3284,15 @@ impl ServerImpl {
         retries: i32,
     ) -> apis::job::UpdateJobResponse {
         use apis::job::UpdateJobResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.update_job_retries(job_key.to_string(), retries).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => link.update_job_retries(job_key.to_string(), retries).await,
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasUpdatedSuccessfully,
             Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
@@ -3253,10 +3328,18 @@ impl ServerImpl {
         operation_reference: Option<i64>,
     ) -> apis::incident::ResolveIncidentResponse {
         use apis::incident::ResolveIncidentResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.resolve_incident(incident_key.to_string(), operation_reference).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => {
+                    link.resolve_incident(incident_key.to_string(), operation_reference)
+                        .await
+                }
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheIncidentIsMarkedAsResolved,
             Ok(r) if r.status == 404 => Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(
@@ -3290,10 +3373,15 @@ impl ServerImpl {
         variables: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> apis::element_instance::CreateElementInstanceVariablesResponse {
         use apis::element_instance::CreateElementInstanceVariablesResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => link.set_variables(scope_key.to_string(), variables).await,
-            Err((s, m)) => return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem("Peer error", s, m)),
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => link.set_variables(scope_key.to_string(), variables).await,
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheVariablesWereUpdated,
             Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -3344,7 +3432,14 @@ impl ServerImpl {
             self.raft_create_core(by_id, by_key, variables, tags, business_id)
                 .await
                 .map(
-                    |(process_id, version, definition_key, instance_key, sync_completed, routable)| {
+                    |(
+                        process_id,
+                        version,
+                        definition_key,
+                        instance_key,
+                        sync_completed,
+                        routable,
+                    )| {
                         (
                             process_id,
                             version,
@@ -3489,38 +3584,40 @@ impl ServerImpl {
         request_timeout: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
-        let res = match self.peer_link(node).await {
-            Ok(link) => {
-                link.forward_create(
-                    by_id,
-                    by_key,
-                    variables,
-                    tags,
-                    business_id,
-                    await_completion,
-                    fetch_variables,
-                    request_timeout,
-                )
-                .await
-            }
-            Err((s, m)) => {
-                return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Peer error",
-                    s,
-                    m,
-                ));
-            }
-        };
+        let res =
+            match self.peer_link(node).await {
+                Ok(link) => {
+                    link.forward_create(
+                        by_id,
+                        by_key,
+                        variables,
+                        tags,
+                        business_id,
+                        await_completion,
+                        fetch_variables,
+                        request_timeout,
+                    )
+                    .await
+                }
+                Err((s, m)) => {
+                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", s, m),
+                    );
+                }
+            };
         match res {
             Ok(r) if is_ok_status(r.status) => {
-                match r
-                    .body
-                    .and_then(|b| serde_json::from_value::<models::CreateProcessInstanceResult>(b).ok())
-                {
+                match r.body.and_then(|b| {
+                    serde_json::from_value::<models::CreateProcessInstanceResult>(b).ok()
+                }) {
                     Some(result) => Resp::Status200_TheProcessInstanceWasCreated(result),
-                    None => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", 500, "peer returned an unparseable create result".into()),
-                    ),
+                    None => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Peer error",
+                            500,
+                            "peer returned an unparseable create result".into(),
+                        ))
+                    }
                 }
             }
             Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -3748,29 +3845,32 @@ impl ServerImpl {
 
         let result = self.store.incident(key);
         if result.is_none()
-            && let Some(node) = self.read_route(key) {
-                let (status, body) = self
-                    .forward_get(node, crate::command_stream::ReadKind::Incident, key)
-                    .await;
-                return Ok(match (status, body) {
-                    (200, Some(b)) => match serde_json::from_value(b) {
-                        Ok(r) => Resp::Status200_TheIncidentIsSuccessfullyReturned(r),
-                        Err(e) => {
-                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                                problem("Peer error", 500, e.to_string()),
-                            )
-                        }
-                    },
-                    (404, _) => Resp::Status404_TheIncidentWithTheGivenKeyWasNotFound(problem(
-                        "Incident not found",
-                        404,
-                        format!("No incident with key {key}."),
-                    )),
-                    (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+            && let Some(node) = self.read_route(key)
+        {
+            let (status, body) = self
+                .forward_get(node, crate::command_stream::ReadKind::Incident, key)
+                .await;
+            return Ok(match (status, body) {
+                (200, Some(b)) => match serde_json::from_value(b) {
+                    Ok(r) => Resp::Status200_TheIncidentIsSuccessfullyReturned(r),
+                    Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", 500, e.to_string()),
                     ),
-                });
-            }
+                },
+                (404, _) => Resp::Status404_TheIncidentWithTheGivenKeyWasNotFound(problem(
+                    "Incident not found",
+                    404,
+                    format!("No incident with key {key}."),
+                )),
+                (s, _) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        500,
+                        format!("peer node {node} returned status {s}"),
+                    ))
+                }
+            });
+        }
         match result {
             Some(incident) => Ok(Resp::Status200_TheIncidentIsSuccessfullyReturned(
                 incident_result(&incident),
@@ -3802,31 +3902,35 @@ impl ServerImpl {
             .filter(|inc| match filter {
                 None => true,
                 Some(f) => {
-                    query::match_basic_string(
-                        &f.incident_key,
-                        &inc.key.to_string(),
-                    ) && query::match_process_instance_key(
-                        &f.process_instance_key,
-                        &inc.instance_key.to_string(),
-                    ) && query::match_element_instance_key(
-                        &f.element_instance_key,
-                        &inc.element_instance_key.to_string(),
-                    ) && query::match_process_definition_key(
-                        &f.process_definition_key,
-                        &inc.process_definition_key,
-                    ) && match &f.job_key {
-                        None => true,
-                        some => query::match_job_key(
-                            some,
-                            &inc.job_key.map(|k| k.to_string()).unwrap_or_default(),
-                        ),
-                    } && query::match_incident_state(
-                        &f.state,
-                        &incident_state_enum(inc.state).to_string(),
-                    ) && query::match_incident_error_type(
-                        &f.error_type,
-                        &incident_error_type_enum(inc.kind).to_string(),
-                    ) && query::match_string(&f.element_id, &inc.element_id)
+                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
+                        && query::match_process_instance_key(
+                            &f.process_instance_key,
+                            &inc.instance_key.to_string(),
+                        )
+                        && query::match_element_instance_key(
+                            &f.element_instance_key,
+                            &inc.element_instance_key.to_string(),
+                        )
+                        && query::match_process_definition_key(
+                            &f.process_definition_key,
+                            &inc.process_definition_key,
+                        )
+                        && match &f.job_key {
+                            None => true,
+                            some => query::match_job_key(
+                                some,
+                                &inc.job_key.map(|k| k.to_string()).unwrap_or_default(),
+                            ),
+                        }
+                        && query::match_incident_state(
+                            &f.state,
+                            &incident_state_enum(inc.state).to_string(),
+                        )
+                        && query::match_incident_error_type(
+                            &f.error_type,
+                            &incident_error_type_enum(inc.kind).to_string(),
+                        )
+                        && query::match_string(&f.element_id, &inc.element_id)
                         && query::match_string(&f.error_message, &inc.reason)
                 }
             })
@@ -3843,9 +3947,7 @@ impl ServerImpl {
             |inc, field| match field {
                 "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
                 "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
-                "errorType" => {
-                    query::SortVal::Str(incident_error_type_enum(inc.kind).to_string())
-                }
+                "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
                 "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
                 "elementId" => query::SortVal::Str(inc.element_id.clone()),
                 _ => query::SortVal::Num(inc.key as i64),
@@ -3900,15 +4002,11 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |inst, field| match field {
-                "processDefinitionId" => {
-                    query::SortVal::Str(inst.process_definition_id.clone())
-                }
+                "processDefinitionId" => query::SortVal::Str(inst.process_definition_id.clone()),
                 "processDefinitionKey" => {
                     query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
                 }
-                "state" => {
-                    query::SortVal::Str(process_instance_state_enum(inst.state).to_string())
-                }
+                "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
                 _ => query::SortVal::Num(inst.key as i64),
             },
             |inst| inst.key,
@@ -3919,8 +4017,11 @@ impl ServerImpl {
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         // Build result models only for the returned page, never the whole
         // (potentially very large) matched set.
-        let items: Vec<models::ProcessInstanceResult> =
-            page.items.into_iter().map(process_instance_result).collect();
+        let items: Vec<models::ProcessInstanceResult> = page
+            .items
+            .into_iter()
+            .map(process_instance_result)
+            .collect();
 
         Ok(Resp::Status200_TheProcessInstanceSearchResult(
             models::ProcessInstanceSearchQueryResult::new(page.response, items),
@@ -3956,10 +4057,7 @@ impl ServerImpl {
                         )
                         && query::match_string(&f.r_type, &job.job_type)
                         && query::match_string(&f.element_id, &job.element_id)
-                        && query::match_job_state(
-                            &f.state,
-                            &job_state_enum(job.state).to_string(),
-                        )
+                        && query::match_job_state(&f.state, &job_state_enum(job.state).to_string())
                 }
             })
             .collect();
@@ -4039,9 +4137,7 @@ impl ServerImpl {
             |task, field| match field {
                 "processInstanceKey" => query::SortVal::Num(task.instance_key as i64),
                 "elementId" => query::SortVal::Str(task.element_id.clone()),
-                "state" => {
-                    query::SortVal::Str(user_task_state_enum(task.state).to_string())
-                }
+                "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
                 "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
                 _ => query::SortVal::Num(task.key as i64),
             },
@@ -4135,15 +4231,13 @@ impl ServerImpl {
                 commit.wait().await;
                 Ok(Resp::Status204_TheUserTask)
             }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => {
-                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
-                    problem(
-                        "User task not found",
-                        404,
-                        format!("No user task with key {user_task_key}."),
-                    ),
-                ))
-            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
+                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    format!("No user task with key {user_task_key}."),
+                )),
+            ),
             Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
                     "User task not active",
@@ -4250,15 +4344,13 @@ impl ServerImpl {
                 self.signal_jobs_available();
                 Ok(Resp::Status204_TheUserTaskWasCompletedSuccessfully)
             }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => {
-                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
-                    problem(
-                        "User task not found",
-                        404,
-                        format!("No user task with key {user_task_key}."),
-                    ),
-                ))
-            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
+                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    format!("No user task with key {user_task_key}."),
+                )),
+            ),
             Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
                     "User task not active",
@@ -4311,7 +4403,11 @@ impl ServerImpl {
             None => {
                 if let Some(node) = self.read_route(user_task_key) {
                     let (status, body) = self
-                        .forward_get(node, crate::command_stream::ReadKind::UserTask, user_task_key)
+                        .forward_get(
+                            node,
+                            crate::command_stream::ReadKind::UserTask,
+                            user_task_key,
+                        )
                         .await;
                     return Ok(match (status, body) {
                         (200, Some(b)) => match serde_json::from_value(b) {
@@ -4328,7 +4424,11 @@ impl ServerImpl {
                             format!("No user task with key {user_task_key}."),
                         )),
                         (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                            problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+                            problem(
+                                "Peer error",
+                                500,
+                                format!("peer node {node} returned status {s}"),
+                            ),
                         ),
                     });
                 }
@@ -4407,15 +4507,13 @@ impl ServerImpl {
                 commit.wait().await;
                 Ok(Resp::Status204_TheUserTaskWasUnassignedSuccessfully)
             }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => {
-                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
-                    problem(
-                        "User task not found",
-                        404,
-                        format!("No user task with key {user_task_key}."),
-                    ),
-                ))
-            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
+                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    format!("No user task with key {user_task_key}."),
+                )),
+            ),
             Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
                     "User task not active",
@@ -4538,15 +4636,13 @@ impl ServerImpl {
                 commit.wait().await;
                 Ok(Resp::Status204_TheUserTaskWasUpdatedSuccessfully)
             }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => {
-                Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
-                    problem(
-                        "User task not found",
-                        404,
-                        format!("No user task with key {user_task_key}."),
-                    ),
-                ))
-            }
+            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
+                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
+                    "User task not found",
+                    404,
+                    format!("No user task with key {user_task_key}."),
+                )),
+            ),
             Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
                     "User task not active",
@@ -4584,8 +4680,7 @@ impl ServerImpl {
             .filter(|v| match filter {
                 None => true,
                 Some(f) => {
-                    let tenant_ok =
-                        f.tenant_id.as_ref().is_none_or(|t| t == "<default>");
+                    let tenant_ok = f.tenant_id.as_ref().is_none_or(|t| t == "<default>");
                     let truncated = value_is_truncated(&v.value, truncate);
                     tenant_ok
                         && query::match_string(&f.name, &v.name)
@@ -4679,7 +4774,11 @@ impl ServerImpl {
                             format!("No variable with key {key}."),
                         )),
                         (s, _) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                            problem("Peer error", 500, format!("peer node {node} returned status {s}")),
+                            problem(
+                                "Peer error",
+                                500,
+                                format!("peer node {node} returned status {s}"),
+                            ),
                         ),
                     });
                 }
@@ -4740,9 +4839,7 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |d, field| match field {
-                "processDefinitionId" | "name" => {
-                    query::SortVal::Str(d.process_id.clone())
-                }
+                "processDefinitionId" | "name" => query::SortVal::Str(d.process_id.clone()),
                 "version" => query::SortVal::Num(d.version as i64),
                 _ => query::SortVal::Num(d.key as i64),
             },
@@ -4858,16 +4955,18 @@ impl ServerImpl {
                     self.broadcast_deployment(&events).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
-                Err((title, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
-                    problem(title, 400, detail),
-                )),
+                Err((title, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    title, 400, detail,
+                ))),
             }
         } else {
             match self.forward_deploy(resources, tenant_id).await {
                 Ok(result) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
-                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
-                    problem("Deployment failed", status, detail),
-                )),
+                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Deployment failed",
+                    status,
+                    detail,
+                ))),
             }
         }
     }
@@ -5109,7 +5208,9 @@ impl ServerImpl {
                                 break;
                             }
                             Err(e) => {
-                                tracing::warn!("seed broadcast to node {node} failed: {e}; retrying")
+                                tracing::warn!(
+                                    "seed broadcast to node {node} failed: {e}; retrying"
+                                )
                             }
                         },
                         Err(e) => tracing::debug!(
@@ -5229,9 +5330,7 @@ impl ServerImpl {
                             break;
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "raft: initialize partition {p} failed: {e}; retrying"
-                            );
+                            tracing::warn!("raft: initialize partition {p} failed: {e}; retrying");
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
@@ -5244,7 +5343,10 @@ impl ServerImpl {
                             continue;
                         }
                         let addr = topology.peer_addr(n).unwrap_or("").to_string();
-                        match part.add_learner(n as u64, openraft::BasicNode::new(addr)).await {
+                        match part
+                            .add_learner(n as u64, openraft::BasicNode::new(addr))
+                            .await
+                        {
                             Ok(()) => tracing::info!(
                                 "raft: node {} added node {n} as a learner for partition {p}",
                                 topology.node_id,
@@ -5287,7 +5389,9 @@ impl ServerImpl {
                 std::collections::HashMap::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                server.leader_durable_recovery_tick(grace_ticks, &mut leaderless).await;
+                server
+                    .leader_durable_recovery_tick(grace_ticks, &mut leaderless)
+                    .await;
             }
         });
     }
@@ -5423,13 +5527,18 @@ impl ServerImpl {
             }
         };
         let mut members = std::collections::BTreeMap::new();
-        members.insert(me, openraft::BasicNode::new(topology.peer_addr(me as u32).unwrap_or("").to_string()));
+        members.insert(
+            me,
+            openraft::BasicNode::new(topology.peer_addr(me as u32).unwrap_or("").to_string()),
+        );
         if let Err(e) = part.initialize(members).await {
             tracing::error!("leader-durable: promote partition {p} failed to initialize: {e}");
             return;
         }
         self.raft.insert(part.clone());
-        tracing::info!("leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})");
+        tracing::info!(
+            "leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})"
+        );
 
         // Announce so peers rejoin as learners and any stale leader steps down,
         // then (best-effort) add the reachable survivors as learners.
@@ -5440,7 +5549,9 @@ impl ServerImpl {
             }
             if self.peer_reachable(n).await {
                 let addr = topology.peer_addr(n).unwrap_or("").to_string();
-                part.add_learner(n as u64, openraft::BasicNode::new(addr)).await.ok();
+                part.add_learner(n as u64, openraft::BasicNode::new(addr))
+                    .await
+                    .ok();
             }
         }
     }
@@ -5456,7 +5567,9 @@ impl ServerImpl {
                 continue;
             }
             if let Ok(link) = self.peers.link(n).await {
-                link.send_promote(p, epoch, me as u64, addr.clone()).await.ok();
+                link.send_promote(p, epoch, me as u64, addr.clone())
+                    .await
+                    .ok();
             }
         }
     }
@@ -5498,20 +5611,19 @@ impl ServerImpl {
             // We did not adopt. If we are the standing leader for `p` at this epoch
             // and the sender is a tie-loser/concurrent promoter, pull it back in as a
             // learner so it stops diverging and resumes receiving our log.
-            if i_lead_here && leader_node != me
+            if i_lead_here
+                && leader_node != me
                 && let Some(addr) = self
                     .engine
                     .topology()
                     .peer_addr(leader_node as u32)
                     .map(str::to_string)
-                    && let Some(part) = self.raft.get(p) {
-                        part.add_learner(
-                            leader_node,
-                            openraft::BasicNode::new(addr),
-                        )
-                        .await
-                        .ok();
-                    }
+                && let Some(part) = self.raft.get(p)
+            {
+                part.add_learner(leader_node, openraft::BasicNode::new(addr))
+                    .await
+                    .ok();
+            }
             return; // stale / duplicate / tie-loser
         }
 
@@ -5613,9 +5725,9 @@ impl ServerImpl {
         let node_id = self.engine.topology().node_id as u64;
         (0..self.engine.topology().num_partitions)
             .filter(|&p| {
-                self.raft
-                    .get(p)
-                    .is_some_and(|part| part.raft.metrics().borrow().current_leader == Some(node_id))
+                self.raft.get(p).is_some_and(|part| {
+                    part.raft.metrics().borrow().current_leader == Some(node_id)
+                })
             })
             .collect()
     }
@@ -5640,10 +5752,10 @@ impl ServerImpl {
         if !self.lease_digest {
             return;
         }
-        self.lease_digests.lock().unwrap().insert(
-            partition,
-            ReceivedDigest { leases },
-        );
+        self.lease_digests
+            .lock()
+            .unwrap()
+            .insert(partition, ReceivedDigest { leases });
     }
 
     /// One pass of the soft lease-digest protocol, driven by the 500ms tick when
@@ -5904,12 +6016,11 @@ impl ServerImpl {
                     );
                 }
             }
-            let activated: Vec<ActivatedJobWithIdentity> =
-                futures_util::future::join_all(futures)
-                    .await
-                    .into_iter()
-                    .flatten()
-                    .collect();
+            let activated: Vec<ActivatedJobWithIdentity> = futures_util::future::join_all(futures)
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
             return activated
                 .into_iter()
                 .map(|activated| activated_job_result(activated, fetch_variable))
@@ -6021,7 +6132,8 @@ impl ServerImpl {
         want: usize,
         timeout: u64,
     ) -> Vec<ActivatedJobWithIdentity> {
-        self.activate_on(&handle, job_type, worker, want, timeout).await
+        self.activate_on(&handle, job_type, worker, want, timeout)
+            .await
     }
 
     /// `p`'s leader so the activation lock is committed to the log and applied on
@@ -6049,7 +6161,10 @@ impl ServerImpl {
         // and the journal apply, so leader and followers mint identical state.
         let now = now_millis();
         let response = match part
-            .propose_result(Command::activate_jobs(job_type, worker, want, timeout, now), now)
+            .propose_result(
+                Command::activate_jobs(job_type, worker, want, timeout, now),
+                now,
+            )
             .await
         {
             Ok(r) if r.error.is_none() => r,
@@ -6117,7 +6232,8 @@ impl ServerImpl {
             .iter()
             .map(|a| (a.job.instance_key, a.job.key))
             .collect();
-        self.trace_store.record_activations(&acts, worker, now_millis());
+        self.trace_store
+            .record_activations(&acts, worker, now_millis());
     }
 
     /// The Raft clock tick for partition `p`: when this node leads `p`, replicate
@@ -6162,32 +6278,38 @@ impl ServerImpl {
         let mut produced = false;
         let mut routable: Vec<Event> = Vec::new();
         if timers_due
-            && let Ok(resp) = part.propose_result(Command::TriggerTimers { now }, now).await
-                && resp.error.is_none() && !resp.events.is_empty() {
-                    produced = true;
-                    if multi_partition {
-                        routable.extend(
-                            resp.events
-                                .iter()
-                                .filter(|e| {
-                                    matches!(
-                                        e,
-                                        Event::MessageSubscriptionOpening { .. }
-                                            | Event::RemoteMessageCorrelation { .. }
-                                            | Event::MessageSubscriptionClosing { .. }
-                                            | Event::StartInstanceDispatched { .. }
-                                    )
-                                })
-                                .cloned(),
-                        );
-                    }
-                }
+            && let Ok(resp) = part
+                .propose_result(Command::TriggerTimers { now }, now)
+                .await
+            && resp.error.is_none()
+            && !resp.events.is_empty()
+        {
+            produced = true;
+            if multi_partition {
+                routable.extend(
+                    resp.events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                Event::MessageSubscriptionOpening { .. }
+                                    | Event::RemoteMessageCorrelation { .. }
+                                    | Event::MessageSubscriptionClosing { .. }
+                                    | Event::StartInstanceDispatched { .. }
+                            )
+                        })
+                        .cloned(),
+                );
+            }
+        }
         if jobs_due {
             if self.replicate_activation {
                 if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await
-                    && resp.error.is_none() && !resp.events.is_empty() {
-                        produced = true;
-                    }
+                    && resp.error.is_none()
+                    && !resp.events.is_empty()
+                {
+                    produced = true;
+                }
             } else {
                 // Leader-local activation: the job lock lives ONLY on this leader's
                 // engine actor (it was never replicated), so expiring leases must
@@ -6259,7 +6381,10 @@ impl ServerImpl {
             return Err((503, message));
         }
         #[allow(clippy::type_complexity)]
-        let outcome: Result<(nanobpmn_engine_core::Key, bool, Vec<Event>, Commit), (u16, String)> = {
+        let outcome: Result<
+            (nanobpmn_engine_core::Key, bool, Vec<Event>, Commit),
+            (u16, String),
+        > = {
             let _processing = ProcessingGuard::enter(&self.processing);
             self.engine
                 .for_create()
@@ -6379,7 +6504,16 @@ impl ServerImpl {
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         let link = self.peer_link(node).await?;
         let res = link
-            .forward_create(by_id, by_key, variables, Vec::new(), None, false, None, None)
+            .forward_create(
+                by_id,
+                by_key,
+                variables,
+                Vec::new(),
+                None,
+                false,
+                None,
+                None,
+            )
             .await
             .map_err(|e| (502u16, e.to_string()))?;
         if !is_ok_status(res.status) {
@@ -6392,7 +6526,10 @@ impl ServerImpl {
             .get("processInstanceKey")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<nanobpmn_engine_core::Key>().ok())
-            .ok_or((502u16, "peer create result missing processInstanceKey".to_string()))?;
+            .ok_or((
+                502u16,
+                "peer create result missing processInstanceKey".to_string(),
+            ))?;
         let sync_completed = body
             .get("processCompleted")
             .and_then(|v| v.as_bool())
@@ -6426,7 +6563,9 @@ impl ServerImpl {
         // This node leads nothing right now: forward to a peer leader instead of
         // shedding a 503 the client would have to retry.
         if self.led_partitions().is_empty() {
-            return self.forward_create_to_leader(by_id, by_key, variables).await;
+            return self
+                .forward_create_to_leader(by_id, by_key, variables)
+                .await;
         }
         // Attempt a local quorum-commit on a led partition. Retain the inputs
         // (cheap clone of small/empty maps, off the single-writer thread) so that
@@ -6435,10 +6574,23 @@ impl ServerImpl {
         // forwarding to the current leader instead of surfacing a 500 the client
         // would have to retry.
         match self
-            .raft_create_core(by_id.clone(), by_key.clone(), variables.clone(), Vec::new(), None)
+            .raft_create_core(
+                by_id.clone(),
+                by_key.clone(),
+                variables.clone(),
+                Vec::new(),
+                None,
+            )
             .await
         {
-            Ok((_process_id, _version, _definition_key, instance_key, sync_completed, routable)) => {
+            Ok((
+                _process_id,
+                _version,
+                _definition_key,
+                instance_key,
+                sync_completed,
+                routable,
+            )) => {
                 if !routable.is_empty() {
                     self.drive_subscription_routing(routable).await;
                 }
@@ -6446,7 +6598,8 @@ impl ServerImpl {
                 Ok((instance_key, sync_completed))
             }
             Err(e) if Self::create_should_forward(&e) => {
-                self.forward_create_to_leader(by_id, by_key, variables).await
+                self.forward_create_to_leader(by_id, by_key, variables)
+                    .await
             }
             Err(e) => Err(e),
         }
@@ -6661,8 +6814,17 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
-    ) -> Result<(String, i32, String, nanobpmn_engine_core::Key, bool, Vec<Event>), (u16, String)>
-    {
+    ) -> Result<
+        (
+            String,
+            i32,
+            String,
+            nanobpmn_engine_core::Key,
+            bool,
+            Vec<Event>,
+        ),
+        (u16, String),
+    > {
         let led = self.led_partitions();
         let Some(p) = self.engine.for_create_among(&led) else {
             return Err((503, "this node leads no partition; retry".to_string()));
@@ -6867,7 +7029,8 @@ impl ServerImpl {
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
+                engine
+                    .apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
             })
             .await;
         if let Ok((events, _)) = &result {
@@ -6886,17 +7049,17 @@ impl ServerImpl {
     ) -> Result<Commit, (u16, String)> {
         if !self.raft.is_empty() {
             return self
-                .propose_job_for_stream(
-                    job_key,
-                    Command::fail_job(job_key, retries, error_message),
-                )
+                .propose_job_for_stream(job_key, Command::fail_job(job_key, retries, error_message))
                 .await;
         }
         let result = self
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::fail_job(job_key, retries, error_message), now_millis())
+                engine.apply_command_at(
+                    Command::fail_job(job_key, retries, error_message),
+                    now_millis(),
+                )
             })
             .await;
         if let Ok((events, _)) = &result {
@@ -7074,10 +7237,9 @@ fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentResult 
         Some(k) => types::Nullable::Present(models::JobKey(k.to_string())),
         None => types::Nullable::Null,
     };
-    let creation_time = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        incident.created_at_ms as i64,
-    )
-    .unwrap_or_else(epoch);
+    let creation_time =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(incident.created_at_ms as i64)
+            .unwrap_or_else(epoch);
 
     let incident_state = incident_state_enum(incident.state);
 
@@ -7108,10 +7270,9 @@ fn process_instance_result(
 
     let state_enum = process_instance_state_enum(instance.state);
 
-    let start_date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-        instance.start_date_ms as i64,
-    )
-    .unwrap_or_else(epoch);
+    let start_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(instance.start_date_ms as i64)
+            .unwrap_or_else(epoch);
 
     models::ProcessInstanceResult::new(
         process_definition_id,
@@ -7129,7 +7290,11 @@ fn process_instance_result(
         types::Nullable::Null,
         types::Nullable::Null,
         instance.tags.clone().into_iter().map(models::Tag).collect(),
-        instance.business_id.clone().map(types::Nullable::Present).unwrap_or(types::Nullable::Null),
+        instance
+            .business_id
+            .clone()
+            .map(types::Nullable::Present)
+            .unwrap_or(types::Nullable::Null),
     )
 }
 
@@ -7217,9 +7382,7 @@ fn variable_result(v: &readstore::VariableRow) -> models::VariableResult {
 }
 
 /// Maps an engine [`ProcessInstanceState`] to the REST state enum.
-fn process_instance_state_enum(
-    state: ProcessInstanceState,
-) -> models::ProcessInstanceStateEnum {
+fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessInstanceStateEnum {
     match state {
         ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
         ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
@@ -7285,9 +7448,7 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
 
 /// Maps an engine [`nanobpmn_engine_core::UserTaskState`] to the REST user-task
 /// state enum.
-fn user_task_state_enum(
-    state: nanobpmn_engine_core::UserTaskState,
-) -> models::UserTaskStateEnum {
+fn user_task_state_enum(state: nanobpmn_engine_core::UserTaskState) -> models::UserTaskStateEnum {
     use nanobpmn_engine_core::UserTaskState;
     match state {
         UserTaskState::Created => models::UserTaskStateEnum::Created,
@@ -7304,7 +7465,10 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
             .unwrap_or_else(chrono::Utc::now);
 
     let parse_date = |d: &Option<String>| -> types::Nullable<chrono::DateTime<chrono::Utc>> {
-        match d.as_deref().map(|s| s.parse::<chrono::DateTime<chrono::Utc>>()) {
+        match d
+            .as_deref()
+            .map(|s| s.parse::<chrono::DateTime<chrono::Utc>>())
+        {
             Some(Ok(dt)) => types::Nullable::Present(dt),
             _ => types::Nullable::Null,
         }
@@ -7469,9 +7633,7 @@ pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
             }
         }
         serde_json::Value::String(s) => Value::Str(s.clone()),
-        serde_json::Value::Array(items) => {
-            Value::List(items.iter().map(json_to_value).collect())
-        }
+        serde_json::Value::Array(items) => Value::List(items.iter().map(json_to_value).collect()),
         serde_json::Value::Object(entries) => Value::Map(
             entries
                 .iter()
@@ -7491,9 +7653,7 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::Str(s) => serde_json::Value::String(s.clone()),
-        Value::List(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
         Value::Map(entries) => serde_json::Value::Object(
             entries
                 .iter()
@@ -7782,15 +7942,15 @@ async fn main() {
         Some(journal_path) => {
             // Persistent run: the read store is a derived projection of the
             // journal(s), so reconcile it against the log before serving.
-            let store = Arc::new(
-                ReadStore::open(db_path.as_deref()).unwrap_or_else(|e| {
-                    let at = db_path
-                        .as_deref()
-                        .map(|p| format!(" at {}", p.display()))
-                        .unwrap_or_default();
-                    panic!("failed to open read model{at} (is the file or its directory writable?): {e}")
-                }),
-            );
+            let store = Arc::new(ReadStore::open(db_path.as_deref()).unwrap_or_else(|e| {
+                let at = db_path
+                    .as_deref()
+                    .map(|p| format!(" at {}", p.display()))
+                    .unwrap_or_default();
+                panic!(
+                    "failed to open read model{at} (is the file or its directory writable?): {e}"
+                )
+            }));
             let partitions = partition_count_from_env();
             let topology = cluster::Topology::from_env(partitions as u64);
             let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
@@ -8046,12 +8206,9 @@ async fn main() {
             server
         }
         None => {
-            tracing::info!(
-                "no journal configured; running in-memory (state is not persisted)"
-            );
-            let store = Arc::new(
-                ReadStore::open(db_path.as_deref()).expect("open in-memory read store"),
-            );
+            tracing::info!("no journal configured; running in-memory (state is not persisted)");
+            let store =
+                Arc::new(ReadStore::open(db_path.as_deref()).expect("open in-memory read store"));
             let partitions = partition_count_from_env();
             let topology = cluster::Topology::from_env(partitions as u64);
             let journals: Vec<Journal> = if topology.is_single_node() {
@@ -8114,7 +8271,10 @@ async fn main() {
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route("/metrics", axum::routing::get(metrics_handler))
-        .route("/v2/system/memory", axum::routing::get(system_memory_handler));
+        .route(
+            "/v2/system/memory",
+            axum::routing::get(system_memory_handler),
+        );
 
     #[cfg(feature = "console")]
     {
@@ -8161,38 +8321,38 @@ async fn main() {
                     .await
                 } else {
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
-                    handle.with(move |journal| {
-                        let (fired, _commit) = journal.trigger_timers(now);
-                        let expired = journal.expire_jobs(now);
-                        // Shed dormant instances to disk if hot RAM is over the
-                        // high-water mark (cheap no-op below it / when unset).
-                        journal.maybe_cold_spill();
-                        // A fired timer may advance a token into an off-partition
-                        // message catch: surface those follow-ups for routing.
-                        let routable: Vec<Event> = if multi_partition {
-                            fired
-                                .iter()
-                                .filter(|e| {
-                                    matches!(
-                                        e,
-                                        Event::MessageSubscriptionOpening { .. }
-                                            | Event::RemoteMessageCorrelation { .. }
-                                            | Event::MessageSubscriptionClosing { .. }
-                                            | Event::StartInstanceDispatched { .. }
-                                    )
-                                })
-                                .cloned()
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                        // Either a fired timer (may create a job) or a reclaimed
-                        // job lease (frees a job for redelivery) means there is
-                        // pushable work — wake dispatch instead of waiting for
-                        // its own backstop tick.
-                        (!fired.is_empty() || !expired.is_empty(), routable)
-                    })
-                }))
+                        handle.with(move |journal| {
+                            let (fired, _commit) = journal.trigger_timers(now);
+                            let expired = journal.expire_jobs(now);
+                            // Shed dormant instances to disk if hot RAM is over the
+                            // high-water mark (cheap no-op below it / when unset).
+                            journal.maybe_cold_spill();
+                            // A fired timer may advance a token into an off-partition
+                            // message catch: surface those follow-ups for routing.
+                            let routable: Vec<Event> = if multi_partition {
+                                fired
+                                    .iter()
+                                    .filter(|e| {
+                                        matches!(
+                                            e,
+                                            Event::MessageSubscriptionOpening { .. }
+                                                | Event::RemoteMessageCorrelation { .. }
+                                                | Event::MessageSubscriptionClosing { .. }
+                                                | Event::StartInstanceDispatched { .. }
+                                        )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            // Either a fired timer (may create a job) or a reclaimed
+                            // job lease (frees a job for redelivery) means there is
+                            // pushable work — wake dispatch instead of waiting for
+                            // its own backstop tick.
+                            (!fired.is_empty() || !expired.is_empty(), routable)
+                        })
+                    }))
                     .await
                 };
                 let mut produced = false;
@@ -8288,10 +8448,7 @@ async fn main() {
     // The actual bound port (may differ from `port` when `PORT=0`, i.e. the OS
     // assigns a free one). Print it on stdout so a supervising process (the e2e
     // harness) can learn it without racing on a pre-reserved port.
-    let local_port = listener
-        .local_addr()
-        .map(|a| a.port())
-        .unwrap_or(port);
+    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     println!("LISTENING_PORT={local_port}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
@@ -8452,10 +8609,7 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
             std::fs::create_dir(dir)
                 .map_err(|e| format!("failed to create data dir {}: {e}", dir.display()))
         }
-        Err(e) => Err(format!(
-            "failed to access data dir {}: {e}",
-            dir.display()
-        )),
+        Err(e) => Err(format!("failed to access data dir {}: {e}", dir.display())),
     }
 }
 
@@ -8514,7 +8668,11 @@ mod clustered_startup_tests {
         }
         // Over many calls it must exercise BOTH owned partitions (round-robin),
         // not collapse onto one.
-        assert_eq!(seen.len(), 2, "for_create should spread across both owned partitions");
+        assert_eq!(
+            seen.len(),
+            2,
+            "for_create should spread across both owned partitions"
+        );
     }
 
     /// The `ProcessDeployed` events the deployment-partition owner broadcasts: the
@@ -8554,7 +8712,10 @@ mod clustered_startup_tests {
         // The instance lives on one of node 1's owned partitions (1 or 3) — the
         // definition is partition-agnostic but the instance is minted locally.
         let p = nanobpmn_engine_core::partition_of(key);
-        assert!(p == 1 || p == 3, "instance must live on an owned partition, got {p}");
+        assert!(
+            p == 1 || p == 3,
+            "instance must live on an owned partition, got {p}"
+        );
     }
 
     #[tokio::test]
@@ -8768,7 +8929,10 @@ mod clustered_startup_tests {
             .expect("create on node 0");
         assert!(!completed, "the instance parks at the message catch");
         let p_inst = nanobpmn_engine_core::partition_of(instance_key);
-        assert!(p_inst == 0 || p_inst == 2, "instance on a node-0 partition, got {p_inst}");
+        assert!(
+            p_inst == 0 || p_inst == 2,
+            "instance on a node-0 partition, got {p_inst}"
+        );
 
         // Publish at node 0: it has no local match (the canonical sub is on node
         // 1), so the publish fans to node 1, which correlates and routes the
@@ -8892,7 +9056,6 @@ mod clustered_startup_tests {
             "the dispatcher must also keep some on node 0 (n0={on_node0}, n1={on_node1})"
         );
     }
-
 
     #[tokio::test]
     async fn complete_job_forwards_to_the_owning_peer() {
@@ -9175,22 +9338,38 @@ mod clustered_startup_tests {
         let mut by_node: std::collections::HashMap<i32, Vec<i32>> =
             std::collections::HashMap::new();
         for b in &t.brokers {
-            assert_eq!(b.partitions.iter().filter(|p| p.role != "leader").count(), 0);
+            assert_eq!(
+                b.partitions.iter().filter(|p| p.role != "leader").count(),
+                0
+            );
             by_node.insert(
                 b.node_id,
                 b.partitions.iter().map(|p| p.partition_id).collect(),
             );
         }
         // 1-based partition ids: node 0 owns internal {0,2} -> {1,3}; node 1 {1,3} -> {2,4}.
-        assert_eq!(by_node.get(&0), Some(&vec![1, 3]), "node 0 owns partitions 1 & 3 (1-based)");
-        assert_eq!(by_node.get(&1), Some(&vec![2, 4]), "node 1 owns partitions 2 & 4 (1-based)");
+        assert_eq!(
+            by_node.get(&0),
+            Some(&vec![1, 3]),
+            "node 0 owns partitions 1 & 3 (1-based)"
+        );
+        assert_eq!(
+            by_node.get(&1),
+            Some(&vec![2, 4]),
+            "node 1 owns partitions 2 & 4 (1-based)"
+        );
 
         // The response advertises that this is a nanobpmn gateway so SDK clients
         // can detect the engine and upgrade to the command stream.
-        let nano = t.nano.expect("nanobpmn topology must advertise the `nano` object");
+        let nano = t
+            .nano
+            .expect("nanobpmn topology must advertise the `nano` object");
         assert_eq!(nano.engine, "nanobpmn");
         assert_eq!(nano.command_stream_path, "/command-stream");
-        assert!(nano.version.is_some(), "nano advertises the gateway version");
+        assert!(
+            nano.version.is_some(),
+            "nano advertises the gateway version"
+        );
     }
 
     #[tokio::test]
@@ -9305,7 +9484,9 @@ mod clustered_startup_tests {
         let node1 = clustered_node(1);
         // node 1 owns no deployment partition, so install the demo over the wire
         // path (mirrors the centralized broadcast) before it can create.
-        node1.install_replicated_deployment(demo_deployment_events().await).await;
+        node1
+            .install_replicated_deployment(demo_deployment_events().await)
+            .await;
         let node1_url = serve_node(&node1).await;
 
         // node 0 is the gateway the client hits; it points at the served node 1.
@@ -9325,7 +9506,17 @@ mod clustered_startup_tests {
 
         use apis::process_instance::CreateProcessInstanceResponse as R;
         let resp = node0
-            .forward_create(1, Some("demo".into()), None, None, vec![], None, false, None, None)
+            .forward_create(
+                1,
+                Some("demo".into()),
+                None,
+                None,
+                vec![],
+                None,
+                false,
+                None,
+                None,
+            )
             .await;
         let result = match resp {
             R::Status200_TheProcessInstanceWasCreated(r) => r,
@@ -9370,7 +9561,9 @@ mod clustered_startup_tests {
         let node1 = build_server(journals, store, topology);
 
         // node 1 owns no demo job locally; it must pull from node 0.
-        let local = node1.activate_for_stream("demo-work", "w", 10, 60_000, None).await;
+        let local = node1
+            .activate_for_stream("demo-work", "w", 10, 60_000, None)
+            .await;
         assert!(local.is_empty(), "node 1 owns no demo-work job of its own");
 
         let pulled = node1
@@ -9379,19 +9572,32 @@ mod clustered_startup_tests {
         assert_eq!(pulled.len(), 1, "node 1 pulls the peer's parked job");
         let job_key: u64 = pulled[0].job_key.0.parse().expect("numeric job key");
         let p = nanobpmn_engine_core::partition_of(job_key);
-        assert!(p == 0 || p == 2, "the pulled job lives on a node-0 partition, got {p}");
+        assert!(
+            p == 0 || p == 2,
+            "the pulled job lives on a node-0 partition, got {p}"
+        );
 
         // The owner owns the job's partition, so the completion must forward.
         let owner = node1
             .remote_owner_of(job_key)
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
-        let (status, _) = node1.forward_complete_job_stream(owner, job_key, None).await;
-        assert!(is_ok_status(status), "forwarded completion succeeds, got {status}");
+        let (status, _) = node1
+            .forward_complete_job_stream(owner, job_key, None)
+            .await;
+        assert!(
+            is_ok_status(status),
+            "forwarded completion succeeds, got {status}"
+        );
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
-        let (again, _) = node1.forward_complete_job_stream(owner, job_key, None).await;
-        assert!(!is_ok_status(again), "re-completing must not succeed, got {again}");
+        let (again, _) = node1
+            .forward_complete_job_stream(owner, job_key, None)
+            .await;
+        assert!(
+            !is_ok_status(again),
+            "re-completing must not succeed, got {again}"
+        );
     }
 
     #[test]
@@ -9453,10 +9659,17 @@ mod clustered_startup_tests {
             R::Status200_TheListOfActivatedJobs(r) => r.jobs,
             other => panic!("expected 200 list, got {other:?}"),
         };
-        assert_eq!(jobs.len(), 1, "node 1 aggregates the peer's parked job over REST");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "node 1 aggregates the peer's parked job over REST"
+        );
         let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
         let p = nanobpmn_engine_core::partition_of(job_key);
-        assert!(p == 0 || p == 2, "the aggregated job lives on a node-0 partition, got {p}");
+        assert!(
+            p == 0 || p == 2,
+            "the aggregated job lives on a node-0 partition, got {p}"
+        );
     }
 
     #[tokio::test]
@@ -9466,9 +9679,11 @@ mod clustered_startup_tests {
         // command stream (PeerTransport -> ClientFrame::Raft -> dispatch_raft_rpc),
         // and a command proposed on the leader commits via quorum and applies on
         // BOTH nodes.
-        use crate::raft::RaftPartition;
-        use openraft::BasicNode;
         use std::collections::BTreeMap;
+
+        use openraft::BasicNode;
+
+        use crate::raft::RaftPartition;
 
         // Pre-bind both listeners so each node can embed the other's real URL.
         let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -9830,7 +10045,13 @@ mod clustered_startup_tests {
             .engine
             .local_for_partition(part)
             .expect("leader owns the partition")
-            .with(move |journal| journal.engine().state().instances.contains_key(&instance_key))
+            .with(move |journal| {
+                journal
+                    .engine()
+                    .state()
+                    .instances
+                    .contains_key(&instance_key)
+            })
             .await;
         assert!(present, "the committed instance is visible on the leader");
 
@@ -10013,7 +10234,9 @@ mod clustered_startup_tests {
                     let inst = e.instance(instance_key).map(|i| format!("{:?}", i.state));
                     let njobs = e.state().jobs.len();
                     let ninst = e.state().instances.len();
-                    let job = e.job(job_key).map(|j| format!("{:?} activated={}", j.state, j.activated));
+                    let job = e
+                        .job(job_key)
+                        .map(|j| format!("{:?} activated={}", j.state, j.activated));
                     format!("instance={inst:?} njobs={njobs} ninst={ninst} job={job:?}")
                 })
                 .await;
@@ -10054,7 +10277,10 @@ mod clustered_startup_tests {
             ports.push(l.local_addr().expect("addr").port());
             listeners.push(l);
         }
-        let peers: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{p}")).collect();
+        let peers: Vec<String> = ports
+            .iter()
+            .map(|p| format!("http://127.0.0.1:{p}"))
+            .collect();
 
         let build_node = |node_id: u32| {
             let topology = cluster::Topology {
@@ -10169,7 +10395,10 @@ mod clustered_startup_tests {
             .expect("new leader materializes partition 0")
             .with(move |journal| journal.engine().instance(instance_key).is_some())
             .await;
-        assert!(survived, "the committed instance must survive the leader loss");
+        assert!(
+            survived,
+            "the committed instance must survive the leader loss"
+        );
 
         // Write continuity: activate + complete on the NEW leader over a fresh quorum.
         let mut job_key = None;
@@ -10243,9 +10472,7 @@ mod clustered_startup_tests {
     /// leader-local activation plus a soft lease broadcast. Tests can't set the env
     /// var (it would race other parallel tests), so the relevant per-node state is
     /// configured directly before the nodes are served and bootstrapped.
-    async fn boot_rf3_intake_cluster_cfg(
-        digest: bool,
-    ) -> (ServerImpl, ServerImpl, ServerImpl) {
+    async fn boot_rf3_intake_cluster_cfg(digest: bool) -> (ServerImpl, ServerImpl, ServerImpl) {
         let (n0, n1, n2, _h) = boot_rf3_intake_cluster_cfg2(digest, false).await;
         (n0, n1, n2)
     }
@@ -10277,7 +10504,10 @@ mod clustered_startup_tests {
             ports.push(l.local_addr().expect("addr").port());
             listeners.push(l);
         }
-        let peers: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{p}")).collect();
+        let peers: Vec<String> = ports
+            .iter()
+            .map(|p| format!("http://127.0.0.1:{p}"))
+            .collect();
 
         let build_node = |node_id: u32| {
             let topology = cluster::Topology {
@@ -10406,11 +10636,7 @@ mod clustered_startup_tests {
 
     /// Re-election helper: polls survivors {n1, n2} until partition `p` has a leader
     /// that is not the killed node, returning the survivor that won.
-    async fn wait_new_leader<'a>(
-        n1: &'a ServerImpl,
-        n2: &'a ServerImpl,
-        p: u64,
-    ) -> &'a ServerImpl {
+    async fn wait_new_leader<'a>(n1: &'a ServerImpl, n2: &'a ServerImpl, p: u64) -> &'a ServerImpl {
         use crate::raft::RaftPartition;
         let leader_of = |node: &ServerImpl, p: u64| -> Option<u64> {
             node.raft_registry()
@@ -10742,8 +10968,7 @@ mod clustered_startup_tests {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         let (node0, node1, node2) = boot_rf3_intake_cluster().await;
 
-        let mut instr =
-            models::ProcessInstanceCreationInstructionById::new("auto".to_string());
+        let mut instr = models::ProcessInstanceCreationInstructionById::new("auto".to_string());
         instr.await_completion = Some(true);
         instr.request_timeout = Some(5000);
         let body = models::ProcessInstanceCreationInstruction::from(instr);
@@ -11083,7 +11308,13 @@ mod clustered_startup_tests {
         let mut present = false;
         for _ in 0..400 {
             if handle
-                .with(move |journal| journal.engine().state().instances.contains_key(&instance_key))
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
                 .await
             {
                 present = true;
@@ -11171,7 +11402,11 @@ mod clustered_startup_tests {
         let membership = metrics.membership_config.membership().clone();
         let voters: Vec<u64> = membership.voter_ids().collect();
         let learners: Vec<u64> = membership.learner_ids().collect();
-        assert_eq!(voters, vec![0], "only the leader is a voter in leader-durable");
+        assert_eq!(
+            voters,
+            vec![0],
+            "only the leader is a voter in leader-durable"
+        );
         assert_eq!(
             {
                 let mut l = learners.clone();
@@ -11234,8 +11469,7 @@ mod clustered_startup_tests {
         // leaderless partition and the deterministic surviving successor app-promotes
         // itself, seeded from the replica engine that already holds the shipped
         // state — restoring write availability with NO manual intervention.
-        let (node0, node1, node2, mut handles) =
-            boot_rf3_intake_cluster_cfg2(false, true).await;
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
 
         // Create an instance on partition 0 (led by node 0, the sole voter). It acks
         // on node 0 and ships to the learners; wait until node 1's replica engine has
@@ -11266,7 +11500,10 @@ mod clustered_startup_tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(shipped, "the create ships to node 1 (learner) before the leader dies");
+        assert!(
+            shipped,
+            "the create ships to node 1 (learner) before the leader dies"
+        );
 
         // Kill node 0 entirely: stop its Raft groups AND mark it unreachable from
         // the survivors. Aborting node 0's serve task is not enough on its own —
@@ -11316,10 +11553,11 @@ mod clustered_startup_tests {
         );
         // node 2 must NOT also promote (single promoter — deterministic successor).
         assert_ne!(
-            node2
-                .raft_registry()
-                .get(0)
-                .and_then(|part| part.raft.metrics().borrow().current_leader),
+            node2.raft_registry().get(0).and_then(|part| part
+                .raft
+                .metrics()
+                .borrow()
+                .current_leader),
             Some(2),
             "only the deterministic successor promotes; node 2 stands down"
         );
@@ -11329,14 +11567,17 @@ mod clustered_startup_tests {
         // leader's shipped state) and confirm the instance completes on node 1.
         let mut job_key = None;
         for _ in 0..200 {
-            let jobs = node1.activate_for_stream("do-work", "w", 10, 60_000, None).await;
+            let jobs = node1
+                .activate_for_stream("do-work", "w", 10, 60_000, None)
+                .await;
             if let Some(j) = jobs.into_iter().next() {
                 job_key = Some(j.job_key.0.parse::<u64>().expect("numeric job key"));
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let job_key = job_key.expect("the auto-promoted leader serves activateJobs for partition 0");
+        let job_key =
+            job_key.expect("the auto-promoted leader serves activateJobs for partition 0");
         node1
             .complete_job_for_stream(job_key, Default::default())
             .await
@@ -11381,8 +11622,7 @@ mod clustered_startup_tests {
         // node id, and the tie-loser steps down to a learner of the winner. Without
         // the tiebreak both would keep leading at equal epochs forever (permanent
         // split-brain). This proves reconvergence.
-        let (node0, node1, node2, mut handles) =
-            boot_rf3_intake_cluster_cfg2(false, true).await;
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
 
         // Seed partition-0 state and let it ship to BOTH survivors' replica engines
         // so each has something to promote from.
@@ -11398,7 +11638,11 @@ mod clustered_startup_tests {
             let mut shipped = false;
             for _ in 0..400 {
                 if h.with(move |journal| {
-                    journal.engine().state().instances.contains_key(&instance_key)
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
                 })
                 .await
                 {
@@ -11407,7 +11651,10 @@ mod clustered_startup_tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
-            assert!(shipped, "the create ships to both survivors before the split");
+            assert!(
+                shipped,
+                "the create ships to both survivors before the split"
+            );
         }
 
         // Symmetric split: node 0 is gone, AND node 1 / node 2 cannot see each other.
@@ -11449,8 +11696,14 @@ mod clustered_startup_tests {
             "the symmetric split produces two equal-epoch leaders (split-brain to be resolved)"
         );
         // Both promoted at epoch 1, each naming itself.
-        assert_eq!(node1.promotion_epoch.lock().unwrap().get(&0).copied(), Some((1, 1)));
-        assert_eq!(node2.promotion_epoch.lock().unwrap().get(&0).copied(), Some((1, 2)));
+        assert_eq!(
+            node1.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1))
+        );
+        assert_eq!(
+            node2.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 2))
+        );
 
         // Heal: each side now learns of the other's promotion (same epoch). Deliver
         // both announcements. The lowest-id winner (node 1) keeps leadership; node 2
@@ -11793,7 +12046,6 @@ mod subscription_placement_tests {
         );
     }
 
-
     /// token reaches the catch only when the job COMPLETES, exercising the
     /// completion-path pump (not the create-path pump).
     const SERVICE_THEN_CATCH_BPMN: &str = r#"
@@ -11899,7 +12151,10 @@ mod subscription_placement_tests {
         let (_vars, completed) = server
             .await_completion_for_stream(instance_key, None, Some(2000))
             .await;
-        assert!(completed, "instance completes after the post-job-completion correlation");
+        assert!(
+            completed,
+            "instance completes after the post-job-completion correlation"
+        );
     }
 
     #[tokio::test]
@@ -11938,11 +12193,7 @@ mod subscription_placement_tests {
             .expect("a non-zero-hashing key exists");
 
         let (_message_key, instance) = server
-            .correlate_message_local(
-                "order-placed".into(),
-                key,
-                std::collections::HashMap::new(),
-            )
+            .correlate_message_local("order-placed".into(), key, std::collections::HashMap::new())
             .await;
         let instance_key = instance.expect("the message-start created an instance on p0");
         assert_eq!(
@@ -11992,9 +12243,10 @@ mod subscription_placement_tests {
 
 #[cfg(test)]
 mod data_dir_tests {
-    use super::ensure_data_dir;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::ensure_data_dir;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 

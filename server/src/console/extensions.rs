@@ -115,19 +115,30 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             kind: ExtKind::Lang,
             display_name: "Deno (TypeScript)".into(),
             file_types: vec![
-                FileType { ext: ".ts".into(), monaco_lang: "typescript".into() },
-                FileType { ext: ".js".into(), monaco_lang: "javascript".into() },
+                FileType {
+                    ext: ".ts".into(),
+                    monaco_lang: "typescript".into(),
+                },
+                FileType {
+                    ext: ".js".into(),
+                    monaco_lang: "javascript".into(),
+                },
             ],
             templates: vec![],
             toolchain: Toolchain::default(),
-            requires: vec![], app_dir: None, summary: None,
+            requires: vec![],
+            app_dir: None,
+            summary: None,
             builtin: true,
         },
         ExtManifest {
             id: "rust".into(),
             kind: ExtKind::Lang,
             display_name: "Rust".into(),
-            file_types: vec![FileType { ext: ".rs".into(), monaco_lang: "rust".into() }],
+            file_types: vec![FileType {
+                ext: ".rs".into(),
+                monaco_lang: "rust".into(),
+            }],
             templates: vec![TemplateSpec {
                 id: "rust-throughput".into(),
                 label: "Throughput (Rust) — native pipelined command-stream A/B".into(),
@@ -138,7 +149,9 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 compile: vec!["cargo".into(), "build".into(), "--release".into()],
                 targets: vec![],
             },
-            requires: vec![], app_dir: None, summary: None,
+            requires: vec![],
+            app_dir: None,
+            summary: None,
             builtin: true,
         },
         ExtManifest {
@@ -151,7 +164,9 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 label: "GUI app — served UI binary (Deno.serve)".into(),
             }],
             toolchain: Toolchain::default(),
-            requires: vec![], app_dir: None, summary: None,
+            requires: vec![],
+            app_dir: None,
+            summary: None,
             builtin: true,
         },
     ]
@@ -190,7 +205,9 @@ pub fn all_extensions() -> Vec<ExtManifest> {
 
 /// Resolve the lang pack for a project's `lang` id (default "deno").
 pub fn lang_pack(id: &str) -> Option<ExtManifest> {
-    all_extensions().into_iter().find(|e| e.kind == ExtKind::Lang && e.id == id)
+    all_extensions()
+        .into_iter()
+        .find(|e| e.kind == ExtKind::Lang && e.id == id)
 }
 
 /// Locate the on-disk source dir for a scaffold template contributed by an
@@ -287,7 +304,9 @@ fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
     let flat = pkg.trim_start_matches('@').replace('/', "__");
     if flat.is_empty()
         || flat.contains("..")
-        || !flat.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        || !flat
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
     {
         return None;
     }
@@ -312,7 +331,10 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
         .output()
         .map_err(|e| format!("npm pack: {e}"))?;
     if !out.status.success() {
-        return Err(format!("npm pack failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "npm pack failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let tar = find_program("tar").ok_or("tar not found")?;
@@ -326,7 +348,8 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
     }
     let _ = std::fs::remove_file(dir.join(&tgz));
     let mf = dir.join(manifest_name());
-    let txt = std::fs::read_to_string(&mf).map_err(|_| "package has no nano-ide.ext.json".to_string())?;
+    let txt =
+        std::fs::read_to_string(&mf).map_err(|_| "package has no nano-ide.ext.json".to_string())?;
     let m: ExtManifest = serde_json::from_str(&txt).map_err(|e| format!("bad manifest: {e}"))?;
     Ok(m)
 }
@@ -385,11 +408,18 @@ pub struct MarketEntry {
 pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
     let npm = find_program("npm").ok_or("npm not found on PATH")?;
     let out = std::process::Command::new(&npm)
-        .args(["search", &format!("keywords:{MARKETPLACE_KEYWORD}"), "--json"])
+        .args([
+            "search",
+            &format!("keywords:{MARKETPLACE_KEYWORD}"),
+            "--json",
+        ])
         .output()
         .map_err(|e| format!("npm search: {e}"))?;
     if !out.status.success() {
-        return Err(format!("npm search failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(format!(
+            "npm search failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     let raw: Vec<serde_json::Value> =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("parse search: {e}"))?;
@@ -398,7 +428,11 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
         .map(|p| {
             let kws: Vec<String> = p["keywords"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|k| k.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let category = if kws.iter().any(|k| k == "nano-ide-lang") {
                 "lang"
@@ -412,8 +446,8 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
             let name = p["name"].as_str().unwrap_or_default().to_string();
             let latest = p["version"].as_str().unwrap_or_default().to_string();
             let inst_ver = installed_version(&name);
-            let installed = inst_ver.is_some()
-                || safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false);
+            let installed =
+                inst_ver.is_some() || safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false);
             // Flag an update only when we can read the installed version and it
             // differs from the latest published one.
             let update_available = inst_ver

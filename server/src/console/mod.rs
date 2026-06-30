@@ -13,10 +13,13 @@
 //! - Everything here is additive and feature-gated, so the default gateway build
 //!   is unaffected.
 
+use std::convert::Infallible;
+use std::time::Duration;
+
 use axum::{
     Router,
     extract::{Path, Query, State},
-    http::{StatusCode, HeaderMap, header},
+    http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
@@ -27,8 +30,6 @@ use futures_util::stream::{Stream, unfold};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
-use std::time::Duration;
 use tokio::sync::broadcast;
 
 use crate::ServerImpl;
@@ -83,26 +84,26 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/traces", get(traces))
         .route("/console/api/traces/{key}", get(trace_detail))
         .route("/console/api/traces/{key}/otel", get(trace_otel))
-        .route(
-            "/console/api/models",
-            get(models).post(model_create),
-        )
+        .route("/console/api/models", get(models).post(model_create))
         .route(
             "/console/api/models/{name}",
             get(model_get).put(model_save).delete(model_delete),
         )
-        .route("/console/api/workers", get(workers_list).post(worker_create))
+        .route(
+            "/console/api/workers",
+            get(workers_list).post(worker_create),
+        )
         .route("/console/api/worker-sdk", get(worker_sdk_source))
         .route("/console/api/deno-types", get(deno_types_source))
-        .route(
-            "/console/api/lib",
-            get(lib_list).post(lib_file_create),
-        )
+        .route("/console/api/lib", get(lib_list).post(lib_file_create))
         .route(
             "/console/api/lib/file",
             get(lib_file_get).put(lib_file_save).delete(lib_file_delete),
         )
-        .route("/console/api/export-workers-app", axum::routing::post(workers_export))
+        .route(
+            "/console/api/export-workers-app",
+            axum::routing::post(workers_export),
+        )
         .route(
             "/console/api/workers/{name}",
             get(worker_get).delete(worker_delete),
@@ -114,10 +115,19 @@ pub fn router(server: ServerImpl) -> Router {
                 .post(worker_file_create)
                 .delete(worker_file_delete),
         )
-        .route("/console/api/workers/{name}/start", axum::routing::post(worker_start))
-        .route("/console/api/workers/{name}/stop", axum::routing::post(worker_stop))
+        .route(
+            "/console/api/workers/{name}/start",
+            axum::routing::post(worker_start),
+        )
+        .route(
+            "/console/api/workers/{name}/stop",
+            axum::routing::post(worker_stop),
+        )
         .route("/console/api/workers/{name}/logs", get(worker_logs))
-        .route("/console/api/projects", get(projects_list).post(project_create))
+        .route(
+            "/console/api/projects",
+            get(projects_list).post(project_create),
+        )
         .route(
             "/console/api/projects/{name}",
             get(project_get).delete(project_delete),
@@ -134,17 +144,41 @@ pub fn router(server: ServerImpl) -> Router {
                 .post(project_path_create)
                 .delete(project_path_delete),
         )
-        .route("/console/api/projects/{name}/run", axum::routing::post(project_run))
-        .route("/console/api/projects/{name}/rename", axum::routing::post(project_rename))
-        .route("/console/api/projects/{name}/stop", axum::routing::post(project_stop))
+        .route(
+            "/console/api/projects/{name}/run",
+            axum::routing::post(project_run),
+        )
+        .route(
+            "/console/api/projects/{name}/rename",
+            axum::routing::post(project_rename),
+        )
+        .route(
+            "/console/api/projects/{name}/stop",
+            axum::routing::post(project_stop),
+        )
         .route("/console/api/projects/{name}/logs", get(project_logs))
-        .route("/console/api/projects/{name}/compile", axum::routing::post(project_compile))
+        .route(
+            "/console/api/projects/{name}/compile",
+            axum::routing::post(project_compile),
+        )
         .route("/console/api/projects/{name}/export", get(project_export))
         .route("/console/api/extensions", get(extensions_list))
-        .route("/console/api/extensions/marketplace", get(extensions_marketplace))
-        .route("/console/api/extensions/install", axum::routing::post(extensions_install))
-        .route("/console/api/extensions/remove", axum::routing::post(extensions_remove))
-        .route("/console/api/extensions/trust", axum::routing::post(extensions_trust))
+        .route(
+            "/console/api/extensions/marketplace",
+            get(extensions_marketplace),
+        )
+        .route(
+            "/console/api/extensions/install",
+            axum::routing::post(extensions_install),
+        )
+        .route(
+            "/console/api/extensions/remove",
+            axum::routing::post(extensions_remove),
+        )
+        .route(
+            "/console/api/extensions/trust",
+            axum::routing::post(extensions_trust),
+        )
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
@@ -232,7 +266,10 @@ fn accepts_gzip(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|e| e.trim().split(';').next() == Some("gzip")))
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|e| e.trim().split(';').next() == Some("gzip"))
+        })
 }
 
 /// Whether a MIME type benefits from gzip (text-like, JS/JSON, wasm, SVG).
@@ -241,18 +278,16 @@ fn is_compressible(mime: &str) -> bool {
     mime.starts_with("text/")
         || matches!(
             mime,
-            "application/javascript"
-                | "application/json"
-                | "application/wasm"
-                | "image/svg+xml"
+            "application/javascript" | "application/json" | "application/wasm" | "image/svg+xml"
         )
 }
 
 /// Gzip a byte slice; returns `None` on the (unexpected) encoder failure so the
 /// caller transparently falls back to the uncompressed body.
 fn gzip(bytes: &[u8]) -> Option<Vec<u8>> {
-    use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
+
+    use flate2::{Compression, write::GzEncoder};
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(bytes).ok()?;
     enc.finish().ok()
@@ -351,8 +386,6 @@ async fn docs_asset(
     };
     serve_embedded(&key, gz)
 }
-
-
 
 #[derive(Serialize)]
 struct TopologyDto {
@@ -528,7 +561,10 @@ async fn cluster_health(State(server): State<ServerImpl>) -> Json<ClusterHealthD
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    Json(ClusterHealthDto { checked_at_ms, nodes })
+    Json(ClusterHealthDto {
+        checked_at_ms,
+        nodes,
+    })
 }
 
 /// Probes one peer's `GET {base_url}/v2/topology`, returning its reported
@@ -645,11 +681,21 @@ struct MetricsDto {
 fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
     let s = crate::metrics::snapshot();
 
-    let mean_ms = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 * 1000.0 };
+    let mean_ms = |sum: f64, count: u64| {
+        if count == 0 {
+            0.0
+        } else {
+            sum / count as f64 * 1000.0
+        }
+    };
     let mean = |sum: f64, count: u64| if count == 0 { 0.0 } else { sum / count as f64 };
     let busy_ratio = {
         let total = s.writer_busy_seconds + s.writer_idle_seconds;
-        if total == 0.0 { 0.0 } else { s.writer_busy_seconds / total }
+        if total == 0.0 {
+            0.0
+        } else {
+            s.writer_busy_seconds / total
+        }
     };
 
     let timestamp_ms = std::time::SystemTime::now()
@@ -802,7 +848,11 @@ async fn cluster_metrics(State(server): State<ServerImpl>) -> Json<ClusterMetric
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    Json(ClusterMetricsDto { checked_at_ms, nodes, aggregate })
+    Json(ClusterMetricsDto {
+        checked_at_ms,
+        nodes,
+        aggregate,
+    })
 }
 
 /// Probes one peer's `GET {base_url}/console/api/metrics` and parses its
@@ -967,10 +1017,7 @@ async fn instances(
 
 /// `GET /console/api/instances/{key}` — one instance with its variables, jobs,
 /// and incidents. 404 when the key is malformed or unknown.
-async fn instance_detail(
-    State(server): State<ServerImpl>,
-    Path(key): Path<String>,
-) -> Response {
+async fn instance_detail(State(server): State<ServerImpl>, Path(key): Path<String>) -> Response {
     let Ok(key) = key.parse::<u64>() else {
         return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
     };
@@ -1070,7 +1117,6 @@ struct TraceListQuery {
     limit: Option<usize>,
 }
 
-
 /// `GET /console/api/stream` — Server-Sent Events feed for live updates.
 ///
 /// Emits an `instances` event whenever the read model's exported position
@@ -1131,20 +1177,25 @@ fn deploy_status_of(server: &ServerImpl, xml: &str) -> ModelStatus {
     // Status is reported against the file's primary (first) process id; a
     // multi-process resource is rare in the modeler.
     let primary = process_ids.first().cloned();
-    let deployed = primary
-        .as_ref()
-        .and_then(|id| {
-            server
-                .store
-                .process_definitions()
-                .into_iter()
-                .find(|d| &d.process_id == id)
-        });
+    let deployed = primary.as_ref().and_then(|id| {
+        server
+            .store
+            .process_definitions()
+            .into_iter()
+            .find(|d| &d.process_id == id)
+    });
     let (deploy_status, deployed_version, deployed_key) = match deployed {
         None => ("not_deployed", None, None),
         Some(row) => {
-            let deployed_xml = server.store.process_definition_xml(row.key).unwrap_or_default();
-            let status = if deployed_xml == xml { "in_sync" } else { "modified" };
+            let deployed_xml = server
+                .store
+                .process_definition_xml(row.key)
+                .unwrap_or_default();
+            let status = if deployed_xml == xml {
+                "in_sync"
+            } else {
+                "modified"
+            };
             (status, Some(row.version), Some(row.key.to_string()))
         }
     };
@@ -1295,7 +1346,11 @@ async fn model_create(
             .into_response();
     }
     if path.exists() {
-        return (StatusCode::CONFLICT, "a model with that name already exists").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "a model with that name already exists",
+        )
+            .into_response();
     }
     if let Err(e) = std::fs::write(&path, &body.xml) {
         return (
@@ -1457,7 +1512,11 @@ async fn worker_create(Json(body): Json<CreateWorkerBody>) -> Response {
         return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
     };
     if dir.exists() {
-        return (StatusCode::CONFLICT, "a worker with that name already exists").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "a worker with that name already exists",
+        )
+            .into_response();
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return (
@@ -1526,10 +1585,7 @@ async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
                 (header::CONTENT_TYPE, "application/zip".to_string()),
                 (
                     header::CONTENT_DISPOSITION,
-                    format!(
-                        "attachment; filename=\"{}\"",
-                        worker_export::zip_filename()
-                    ),
+                    format!("attachment; filename=\"{}\"", worker_export::zip_filename()),
                 ),
                 (header::CACHE_CONTROL, "no-store".to_string()),
             ],
@@ -1541,7 +1597,8 @@ async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
 }
 
 /// `GET /console/api/workers/{name}` — one worker's files and runtime status.
-async fn worker_get(Path(name): Path<String>) -> Response {    match worker_summary(&name).await {
+async fn worker_get(Path(name): Path<String>) -> Response {
+    match worker_summary(&name).await {
         Some(s) => Json(s).into_response(),
         None => (StatusCode::NOT_FOUND, "no such worker").into_response(),
     }
@@ -1606,7 +1663,10 @@ async fn worker_file_save(
 }
 
 /// `POST /console/api/workers/{name}/file` — create a new empty worker file.
-async fn worker_file_create(Path(name): Path<String>, Json(body): Json<CreateFileBody>) -> Response {
+async fn worker_file_create(
+    Path(name): Path<String>,
+    Json(body): Json<CreateFileBody>,
+) -> Response {
     let Some(dir) = workspace::worker_dir(&name) else {
         return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
     };
@@ -1689,7 +1749,11 @@ async fn lib_file_get(Query(q): Query<FilePathQuery>) -> Response {
 /// shared library file. Body is the raw file content.
 async fn lib_file_save(Query(q): Query<FilePathQuery>, body: String) -> Response {
     let Ok(_) = workspace::ensure_lib_dir() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "could not create library dir").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create library dir",
+        )
+            .into_response();
     };
     let Some(path) = workspace::lib_file_path(&q.path) else {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
@@ -1707,7 +1771,11 @@ async fn lib_file_save(Query(q): Query<FilePathQuery>, body: String) -> Response
 /// `POST /console/api/lib/file` — create a new empty shared library file.
 async fn lib_file_create(Json(body): Json<CreateFileBody>) -> Response {
     let Ok(_) = workspace::ensure_lib_dir() else {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "could not create library dir").into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create library dir",
+        )
+            .into_response();
     };
     let Some(path) = workspace::lib_file_path(&body.path) else {
         return (StatusCode::BAD_REQUEST, "invalid path").into_response();
@@ -1843,12 +1911,17 @@ async fn projects_list() -> Response {
 fn extensions_overview() -> serde_json::Value {
     let exts = extensions::all_extensions();
     let trust = extensions::load_trust();
-    let list: Vec<_> = exts.iter().map(|e| serde_json::json!({
-        "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
-        "fileTypes": e.file_types, "templates": e.templates,
-        "toolchainAvailable": extensions::toolchain_available(e),
-        "trusted": extensions::is_trusted(&e.id),
-    })).collect();
+    let list: Vec<_> = exts
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
+                "fileTypes": e.file_types, "templates": e.templates,
+                "toolchainAvailable": extensions::toolchain_available(e),
+                "trusted": extensions::is_trusted(&e.id),
+            })
+        })
+        .collect();
     serde_json::json!({ "extensions": list, "yolo": trust.yolo })
 }
 
@@ -1973,7 +2046,11 @@ async fn project_detail(name: &str) -> Response {
 /// `DELETE /console/api/projects/{name}` — remove a project (must be stopped).
 async fn project_delete(Path(name): Path<String>) -> Response {
     if projects::supervisor().is_running(&name).await {
-        return (StatusCode::CONFLICT, "stop the application before deleting it").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "stop the application before deleting it",
+        )
+            .into_response();
     }
     match projects::delete_project(&name) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -1991,7 +2068,11 @@ async fn project_delete(Path(name): Path<String>) -> Response {
 /// `POST /console/api/projects/{name}/rename` — rename a project (must be stopped).
 async fn project_rename(Path(name): Path<String>, Json(body): Json<RenameProjectBody>) -> Response {
     if projects::supervisor().is_running(&name).await {
-        return (StatusCode::CONFLICT, "stop the application before renaming it").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "stop the application before renaming it",
+        )
+            .into_response();
     }
     match projects::rename_project(&name, body.new_name.trim()) {
         Ok(cfg) => (StatusCode::OK, Json(cfg)).into_response(),
@@ -2076,7 +2157,10 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
         Some(s) => (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+                (
+                    header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8".to_string(),
+                ),
                 ("x-file-binary".parse().unwrap(), "false".to_string()),
                 ("x-file-size".parse().unwrap(), size.to_string()),
             ],
@@ -2222,7 +2306,11 @@ async fn project_compile(Path(name): Path<String>, Json(body): Json<CompileBody>
     tokio::spawn(async move {
         let _ = projects::supervisor().compile(&name, &targets).await;
     });
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "started": true }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "started": true })),
+    )
+        .into_response()
 }
 
 /// Query for `project_export`: include compiled `dist/` binaries (default off,
@@ -2245,7 +2333,10 @@ async fn project_export(Path(name): Path<String>, Query(q): Query<ExportQuery>) 
                 (header::CONTENT_TYPE, "application/zip".to_string()),
                 (
                     header::CONTENT_DISPOSITION,
-                    format!("attachment; filename=\"{}\"", projects::export_filename(&name)),
+                    format!(
+                        "attachment; filename=\"{}\"",
+                        projects::export_filename(&name)
+                    ),
                 ),
                 (header::CACHE_CONTROL, "no-store".to_string()),
             ],
@@ -2273,15 +2364,18 @@ async fn project_logs(
     let sup = projects::supervisor();
     let history = sup.log_history(&name).await;
     let rx = sup.subscribe(&name).await;
-    let stream = unfold(ProjLogState::History(history.into_iter(), rx), |st| async move {
-        match st {
-            ProjLogState::History(mut it, rx) => match it.next() {
-                Some(line) => Some((Ok(proj_log_event(&line)), ProjLogState::History(it, rx))),
-                None => proj_recv_live(rx).await,
-            },
-            ProjLogState::Live(rx) => proj_recv_live(rx).await,
-        }
-    });
+    let stream = unfold(
+        ProjLogState::History(history.into_iter(), rx),
+        |st| async move {
+            match st {
+                ProjLogState::History(mut it, rx) => match it.next() {
+                    Some(line) => Some((Ok(proj_log_event(&line)), ProjLogState::History(it, rx))),
+                    None => proj_recv_live(rx).await,
+                },
+                ProjLogState::Live(rx) => proj_recv_live(rx).await,
+            }
+        },
+    );
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
