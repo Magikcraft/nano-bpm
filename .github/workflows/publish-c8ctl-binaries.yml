@@ -52,6 +52,24 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Fail fast if the pushed tag and the gateway crate version disagree. The
+      # tag is the source of truth for the stamped binary (NANOBPM_VERSION in
+      # server/build.rs), but Cargo.toml is the local/dev fallback + crate
+      # metadata; they must be bumped together so a release can't ship a manifest
+      # that contradicts its own tag. Only enforced on tag pushes.
+      - name: Assert tag matches server/Cargo.toml version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version' server/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag=$tag  server/Cargo.toml=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::Tag v$tag does not match server/Cargo.toml version $crate. Bump server/Cargo.toml (+ Cargo.lock) to $tag in the tagged commit." >&2
+            exit 1
+          fi
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
