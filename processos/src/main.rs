@@ -28,6 +28,7 @@ mod investigate;
 mod llama;
 mod monitor;
 mod nano_instances;
+mod pairings;
 mod personas;
 mod pilot;
 mod pyrunner;
@@ -117,6 +118,9 @@ struct AppState {
     /// The operator's persona library (selectable standing system prompts for chat),
     /// persisted to the user's config dir alongside `settings.json`.
     personas: Arc<personas::PersonaStore>,
+    /// The operator's LLM-pairing library (named, first-class "Pair AI" configs), persisted to
+    /// the user's config dir alongside `settings.json`.
+    pairings: Arc<pairings::PairingStore>,
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
     chat_cancels: Arc<
@@ -414,6 +418,9 @@ async fn main() {
         personas: Arc::new(personas::PersonaStore::open(
             settings::config_dir().join("personas.json"),
         )),
+        pairings: Arc::new(pairings::PairingStore::open(
+            settings::config_dir().join("pairings.json"),
+        )),
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_cmpl_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -563,6 +570,8 @@ async fn main() {
         )
         .route("/api/personas", get(personas_list).post(personas_upsert))
         .route("/api/personas/{id}", axum::routing::delete(personas_delete))
+        .route("/api/pairings", get(pairings_list).post(pairings_upsert))
+        .route("/api/pairings/{id}", axum::routing::delete(pairings_delete))
         .route(
             "/api/nano/instances",
             get(nano_instances_list).post(nano_instances_add),
@@ -2274,6 +2283,21 @@ fn build_pair_stages(
             );
         }
         let (id, name, system) = state.personas.resolve_pair(spec.persona_id.as_deref());
+        // An inline pairing prompt/name (self-contained) wins over the resolved persona.
+        let system = spec
+            .system
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(system);
+        let name = spec
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or(name);
         stages.push(investigate::PairStage {
             id,
             name,
@@ -2309,6 +2333,20 @@ fn build_subagent(
             .to_string());
     }
     let (_id, name, system) = state.personas.resolve_subagent(spec.persona_id.as_deref());
+    let system = spec
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(system);
+    let name = spec
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(name);
     Ok(Some(investigate::SubAgent {
         cfg,
         name,
@@ -2329,12 +2367,13 @@ fn build_subagent(
 /// truthy value (or a profile id) enables it so the monitor can be used without UI.
 fn resolve_monitor(state: &AppState, mon: Option<&MonitorRequest>) -> Option<(LlmConfig, String)> {
     let env = std::env::var("PROCESSOS_MONITOR").ok();
-    let (enabled, profile_id, ovr, persona_id) = match mon {
+    let (enabled, profile_id, ovr, persona_id, system_override) = match mon {
         Some(m) if m.enabled => (
             true,
             m.profile_id.clone(),
             m.llm.clone(),
             m.persona_id.clone(),
+            m.system.clone(),
         ),
         _ => {
             // Env fallback: "0"/"off"/"false"/"" disable; anything else enables (and a non-bool
@@ -2352,7 +2391,7 @@ fn resolve_monitor(state: &AppState, mon: Option<&MonitorRequest>) -> Option<(Ll
                 "1" | "on" | "true" | "yes"
             );
             let profile = if is_bool { None } else { Some(raw.to_string()) };
-            (true, profile, None, None)
+            (true, profile, None, None, None)
         }
     };
     if !enabled {
@@ -2363,6 +2402,13 @@ fn resolve_monitor(state: &AppState, mon: Option<&MonitorRequest>) -> Option<(Ll
         return None;
     }
     let (_id, system) = state.personas.resolve_monitor(persona_id.as_deref());
+    // An inline pairing prompt (self-contained) wins over the resolved persona.
+    let system = system_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(system);
     Some((cfg, system))
 }
 
@@ -3094,6 +3140,13 @@ struct SubagentRequest {
     /// The subagent persona (its system prompt); defaults to the built-in researcher.
     #[serde(default)]
     persona_id: Option<String>,
+    /// An inline system-prompt override (from a saved pairing). Wins over `persona_id` when a
+    /// non-empty string is provided, so a pairing's self-contained prompt takes effect.
+    #[serde(default)]
+    system: Option<String>,
+    /// An inline display name (from a saved pairing) shown on the subagent's outputs.
+    #[serde(default)]
+    name: Option<String>,
     /// Advanced: tool-loop budget per delegated task (default 8, clamped 1..30).
     #[serde(default)]
     max_rounds: Option<usize>,
@@ -3120,6 +3173,13 @@ struct PairRequest {
     /// The pairing persona (reviewer system prompt); defaults to the built-in skeptic.
     #[serde(default)]
     persona_id: Option<String>,
+    /// An inline system-prompt override (from a saved pairing). Wins over `persona_id` when a
+    /// non-empty string is provided.
+    #[serde(default)]
+    system: Option<String>,
+    /// An inline display name (from a saved pairing) shown on the reviewer's bubble.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Loop-monitor configuration for a chat turn. When `enabled`, a second model watches the
@@ -3140,6 +3200,10 @@ struct MonitorRequest {
     /// The monitor persona (its system prompt); defaults to the built-in loop breaker.
     #[serde(default)]
     persona_id: Option<String>,
+    /// An inline system-prompt override (from a saved pairing). Wins over `persona_id` when a
+    /// non-empty string is provided.
+    #[serde(default)]
+    system: Option<String>,
 }
 
 /// `POST .../chat` — send one operator message; the droid replies (running SQL/Python
@@ -3748,6 +3812,33 @@ async fn personas_delete(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.personas.delete(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `GET /api/pairings` — list the saved Pair AI configurations.
+async fn pairings_list(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.pairings.list()).into_response()
+}
+
+/// `POST /api/pairings` — author or update a pairing (persisted to the config dir).
+async fn pairings_upsert(
+    State(state): State<AppState>,
+    Json(pairing): Json<pairings::Pairing>,
+) -> impl IntoResponse {
+    match state.pairings.upsert(pairing) {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `DELETE /api/pairings/{id}` — delete a non-built-in pairing.
+async fn pairings_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.pairings.delete(&id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => unprocessable(e),
     }

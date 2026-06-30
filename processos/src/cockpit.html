@@ -292,6 +292,11 @@
   .bub.monitor .who { color: #f59e0b; text-transform: none; letter-spacing: 0; margin-bottom: 2px; }
   .bub.monitor .mon-reason { color: #fcd34d; }
   .bub.monitor .mon-steer { color: #fde68a; font: 600 12px/1.5 ui-monospace, monospace; margin-top: 4px; }
+  /* LLM Pairings panel — mode badges */
+  .pair-mode-badge { font: 700 9.5px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; vertical-align: 1px; }
+  .pair-mode-badge.pair { color: #c084fc; background: rgba(168,85,247,.14); }
+  .pair-mode-badge.monitor { color: #fbbf24; background: rgba(251,191,36,.14); }
+  .pair-mode-badge.subagent { color: #67e8f9; background: rgba(103,232,249,.14); }
   /* GitHub-style markdown tables (answers + thinking) */
   .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
   .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
@@ -421,6 +426,7 @@
       <a data-view="console">Console</a>
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
+      <a data-view="pairings" title="LLM Pairings — named Pair AI configs (mode + second model + its prompt) you select per investigation">Pairings</a>
       <a data-view="experiments">Experiments</a>
       <a data-view="sidecars" class="with-dot">LLMs <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
@@ -1304,6 +1310,152 @@ async function deletePersona(id){
   const ps = await api('/api/personas'); PERSONAS = Array.isArray(ps)?ps:[]; drawPersonas(PERSONAS.length?PERSONAS[0].id:null);
 }
 
+// ── LLM Pairings panel (named, first-class Pair AI configs) ──────────────────
+// A pairing bundles a mode (pair/monitor/subagent), the second model's profile, an optional
+// primary profile (full "team"), and the second LLM's inline prompt. Selected per investigation
+// in the composer instead of assembling a mode + model + prompt ad-hoc each turn.
+let PAIRINGS = [], PAIR_PROFILES = [], PAIR_PERSONAS = [];
+const PAIR_MODES = [
+  { v:'pair', label:'Pair AI — reviews the answer each turn', kind:'pair' },
+  { v:'monitor', label:'Monitor — watches the live transcript & steers out of loops', kind:'monitor' },
+  { v:'subagent', label:'Subagent — primary delegates research tasks to it', kind:'subagent' },
+];
+async function renderPairings(){
+  STATE.view='pairings'; setActive(); main.innerHTML='Loading…';
+  try {
+    const [ps, s, per] = await Promise.all([
+      api('/api/pairings').catch(()=>[]),
+      api('/api/settings').catch(()=>({})),
+      api('/api/personas').catch(()=>[]),
+    ]);
+    PAIRINGS = Array.isArray(ps)?ps:[];
+    PAIR_PROFILES = (s && s.profiles) || [];
+    PAIR_PERSONAS = Array.isArray(per)?per:[];
+  } catch(e){ return fail(e); }
+  main.innerHTML =
+    '<h1>LLM Pairings</h1>'
+    + '<p class="lede">A <b>pairing</b> is a saved, first-class Pair AI config: a <b>mode</b> (review, monitor, or delegate), the <b>second model</b> it runs on, an optional <b>primary model</b> (set it for a full team, or leave it blank to keep your current model), and the <b>second model\u2019s prompt</b> \u2014 stored inline so the pairing is self-contained. Pick one in the composer\u2019s <b>Pair AI</b> selector instead of wiring it up ad-hoc each turn.</p>'
+    + '<div id="pairingsWrap"></div>';
+  drawPairings(PAIRINGS.length ? PAIRINGS[0].id : null);
+}
+function modeBadge(m){
+  const def = PAIR_MODES.find(x=>x.v===m) || PAIR_MODES[0];
+  return '<span class="pair-mode-badge '+esc(def.v)+'">'+esc(def.v)+'</span>';
+}
+function drawPairings(selId){
+  const wrap = document.getElementById('pairingsWrap'); if(!wrap) return;
+  let h = '<div style="display:grid;grid-template-columns:300px 1fr;gap:18px;align-items:start">';
+  h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editPairing(null)">+ New pairing</button>';
+  if(!PAIRINGS.length){
+    h += '<div class="muted" style="font-size:12px;padding:6px 2px">No pairings yet. Create one to pair a second model with your investigations.</div>';
+  }
+  for(const p of PAIRINGS){
+    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    const prof = PAIR_PROFILES.find(x=>x.id===p.secondaryProfileId);
+    const sub = (prof?(prof.name||prof.id):(p.secondaryProfileId||'no model'));
+    h += '<div class="tile"'+active+' onclick="editPairing(\''+esc(p.id)+'\')">'
+      + '<h3 style="font-size:14px">'+esc(p.name||p.id)+' '+modeBadge(p.mode)+'</h3>'
+      + '<div class="meta">2nd model: '+esc(sub)+(p.primaryProfileId?(' \u00b7 primary: '+esc(p.primaryProfileId)):'')+'</div></div>';
+  }
+  h += '</div><div id="pairingEditor" class="pane"></div></div>';
+  wrap.innerHTML = h;
+  editPairing(selId);
+}
+// Build the profile <option> list, optionally marking one selected. `blankLabel` adds a leading
+// empty option (used for the optional primary).
+function pairProfileOptions(selected, blankLabel){
+  let opts = blankLabel ? '<option value="">'+esc(blankLabel)+'</option>' : '';
+  opts += PAIR_PROFILES.map(p => '<option value="'+esc(p.id)+'"'+(p.id===selected?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('');
+  return opts;
+}
+function editPairing(id){
+  const ed = $('#pairingEditor'); if(!ed) return;
+  const blank = {id:'',name:'',mode:'pair',secondaryProfileId:'',primaryProfileId:'',system:'',maxRounds:8,digestCap:4000,builtin:false};
+  const p = id===null ? blank : (PAIRINGS.find(x=>x.id===id)||blank);
+  const isNew = id===null;
+  const ro = p.builtin;
+  const mode = p.mode||'pair';
+  let h = '<h2 style="margin-top:0">'+(isNew?'New pairing':'Edit pairing')+'</h2>';
+  h += '<label class="lbl">Id</label><input id="prId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. skeptic-team" />';
+  h += '<label class="lbl">Name</label><input id="prName" value="'+esc(p.name)+'" '+(ro?'disabled':'')+' placeholder="Shown in the composer" />';
+  h += '<label class="lbl">Mode</label><select id="prMode" '+(ro?'disabled':'')+' onchange="onPairingModeChange()">'
+    + PAIR_MODES.map(m=>'<option value="'+m.v+'"'+(m.v===mode?' selected':'')+'>'+esc(m.label)+'</option>').join('')
+    + '</select>';
+  h += '<label class="lbl">Second model (the paired LLM)</label><select id="prSecondary" '+(ro?'disabled':'')+'>'
+    + pairProfileOptions(p.secondaryProfileId, PAIR_PROFILES.length?null:'No profiles configured') + '</select>';
+  h += '<label class="lbl">Primary model <span class="muted" style="font-weight:400">(optional \u2014 set for a full team, or leave blank to keep your current model)</span></label><select id="prPrimary" '+(ro?'disabled':'')+'>'
+    + pairProfileOptions(p.primaryProfileId||'', 'Use current / default primary') + '</select>';
+  // Inline prompt + a "start from template" picker drawn from built-in/authored personas of this mode.
+  h += '<label class="lbl">Second model\u2019s prompt</label>';
+  h += '<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="muted" style="font-size:12px">Start from template:</span><select id="prTemplate" '+(ro?'disabled':'')+' onchange="applyPairingTemplate()"></select></div>';
+  h += '<textarea id="prSystem" rows="12" '+(ro?'disabled':'')+' placeholder="Leave blank to use this mode\u2019s default prompt.">'+esc(p.system||'')+'</textarea>';
+  // Subagent-only advanced tuning.
+  h += '<div id="prSubAdv" style="display:'+(mode==='subagent'?'block':'none')+';margin-top:10px">'
+    + '<label class="lbl">Delegation tuning</label>'
+    + '<div style="display:flex;gap:14px;align-items:center">'
+    + '<label class="muted" style="font-size:12px" title="Tool-loop budget per delegated task (1\u201330).">rounds <input type="number" id="prRounds" min="1" max="30" value="'+esc(p.maxRounds||8)+'" style="width:56px" '+(ro?'disabled':'')+'></label>'
+    + '<label class="muted" style="font-size:12px" title="Max chars of digest fed back to the primary (500\u201320000).">digest <input type="number" id="prDigest" min="500" max="20000" step="500" value="'+esc(p.digestCap||4000)+'" style="width:72px" '+(ro?'disabled':'')+'></label>'
+    + '</div></div>';
+  h += '<div class="actions">';
+  if(ro){
+    h += '<span class="muted" style="font-size:12px">Built-in pairings are read-only.</span>';
+  } else {
+    h += '<button class="btn primary" onclick="savePairing()">Save</button>';
+    if(!isNew) h += '<button class="btn ghost" onclick="deletePairing(\''+esc(p.id)+'\')">Delete</button>';
+  }
+  h += '</div>';
+  ed.innerHTML = h;
+  fillPairingTemplates(mode);
+}
+// Refresh the template dropdown to the personas matching the selected mode.
+function fillPairingTemplates(mode){
+  const sel = $('#prTemplate'); if(!sel) return;
+  const kind = (PAIR_MODES.find(m=>m.v===mode)||{}).kind;
+  const matches = PAIR_PERSONAS.filter(p => (p.kind||'investigator')===kind);
+  sel.innerHTML = '<option value="">\u2014 pick a template \u2014</option>'
+    + matches.map(p => '<option value="'+esc(p.id)+'">'+esc(p.name||p.id)+(p.builtin?' (built-in)':'')+'</option>').join('');
+}
+function onPairingModeChange(){
+  const mode = ($('#prMode')||{}).value || 'pair';
+  const adv = $('#prSubAdv'); if(adv) adv.style.display = mode==='subagent' ? 'block' : 'none';
+  fillPairingTemplates(mode);
+}
+function applyPairingTemplate(){
+  const id = ($('#prTemplate')||{}).value; if(!id) return;
+  const per = PAIR_PERSONAS.find(p=>p.id===id); if(!per) return;
+  const ta = $('#prSystem');
+  if(ta && (!ta.value.trim() || confirm('Replace the current prompt with the “'+(per.name||per.id)+'” template?'))){
+    ta.value = per.system||'';
+  }
+  ($('#prTemplate')||{}).value = '';
+}
+async function savePairing(){
+  const mode = ($('#prMode')||{}).value || 'pair';
+  const body = {
+    id: ($('#prId')||{}).value.trim(),
+    name: ($('#prName')||{}).value.trim(),
+    mode,
+    secondaryProfileId: ($('#prSecondary')||{}).value || '',
+    primaryProfileId: ($('#prPrimary')||{}).value || null,
+    system: ($('#prSystem')||{}).value || '',
+  };
+  if(mode==='subagent'){
+    body.maxRounds = parseInt(($('#prRounds')||{}).value,10) || undefined;
+    body.digestCap = parseInt(($('#prDigest')||{}).value,10) || undefined;
+  }
+  if(!body.id){ alert('Id is required.'); return; }
+  if(!body.secondaryProfileId){ alert('Pick a second model for this pairing.'); return; }
+  try { await api('/api/pairings', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+  catch(e){ alert('Save failed: '+(e.message||e)); return; }
+  const ps = await api('/api/pairings'); PAIRINGS = Array.isArray(ps)?ps:[]; drawPairings(body.id);
+}
+async function deletePairing(id){
+  if(!confirm('Delete pairing “'+id+'”?')) return;
+  try { await api('/api/pairings/'+encodeURIComponent(id), {method:'DELETE'}); }
+  catch(e){ alert('Delete failed: '+(e.message||e)); return; }
+  const ps = await api('/api/pairings'); PAIRINGS = Array.isArray(ps)?ps:[]; drawPairings(PAIRINGS.length?PAIRINGS[0].id:null);
+}
+
 // --- chat-prompt library (cockpit message templates) inside the Prompts view ---
 function drawChatPrompts(selId){
   const wrap = document.getElementById('chatPromptsWrap'); if(!wrap) return;
@@ -1496,31 +1648,11 @@ async function renderWorkspace(ws, proc){
               <span>Persona</span>
               <select id="chatPersona"></select>
             </label>
-            <label class="persona-pick" id="chatPairToggle" title="Pair AI: a second model reviews the droid's answer each turn — verifying, refining, or challenging it with the same data/model tools. Off by default. Pick a different model family for the reviewer so their errors decorrelate.">
-              <span><input type="checkbox" id="chatPairOn" style="vertical-align:-1px"> Pair AI</span>
+            <label class="persona-pick" id="chatPairingPick" title="Pair AI: run a second model alongside this investigation using a saved pairing (a mode + second model + its prompt). Manage pairings in the Pairings panel.">
+              <span>Pair AI</span>
+              <select id="chatPairing" title="Pick a saved pairing, or Solo for a single model"><option value="">Solo (single model)</option></select>
+              <a href="?view=pairings" target="_blank" class="muted" style="font-size:11px;text-decoration:underline" title="Create or edit pairings">Manage</a>
             </label>
-            <span class="persona-pick" id="chatPairCfg" style="display:none">
-              <select id="chatPairProfile" title="The reviewer's LLM profile (its own model)"></select>
-              <select id="chatPairPersona" title="The reviewer's persona (how it reviews)"></select>
-            </span>
-            <label class="persona-pick" id="chatMonitorToggle" title="Loop monitor: a second model watches this investigation's live transcript and steers it (then forces a wrap-up) when it detects the droid circling — rephrasing dead-ends, oscillating hypotheses, or re-attacking an unreachable path. Off by default. Defaults to the local sidecar model so it's cheap to keep watching.">
-              <span><input type="checkbox" id="chatMonitorOn" style="vertical-align:-1px"> Monitor</span>
-            </label>
-            <span class="persona-pick" id="chatMonitorCfg" style="display:none">
-              <select id="chatMonitorProfile" title="The monitor's LLM profile (defaults to the local sidecar)"></select>
-              <select id="chatMonitorPersona" title="The monitor's persona (how it decides to intervene)"></select>
-            </span>
-            <label class="persona-pick" id="chatSubToggle" title="Subagent: lets the primary delegate self-contained research tasks (the delegate tool) to a second model that investigates in its own context with read-only tools and reports back only a compact digest. Protects the primary's context window on long, query-heavy investigations. Off by default. Use a cheap/fast model — it does the noisy exploration.">
-              <span><input type="checkbox" id="chatSubOn" style="vertical-align:-1px"> Subagent</span>
-            </label>
-            <span class="persona-pick" id="chatSubCfg" style="display:none">
-              <select id="chatSubProfile" title="The subagent's LLM profile (its own model — pick a small/fast one)"></select>
-              <select id="chatSubPersona" title="The subagent's persona (how it researches)"></select>
-              <details class="sub-adv" title="Advanced tuning"><summary>⚙</summary>
-                <label title="Tool-loop budget per delegated task. Lower = cheaper/faster but may under-investigate; higher = more thorough but slower. Suggested: 6–10. Clamped 1–30.">rounds <input type="number" id="chatSubRounds" min="1" max="30" value="8" style="width:48px"></label>
-                <label title="Max characters of the digest fed back to the primary. Lower protects context harder; raise if subagents truncate useful findings. Suggested: 2000–6000. Clamped 500–20000.">digest <input type="number" id="chatSubDigest" min="500" max="20000" step="500" value="4000" style="width:64px"></label>
-              </details>
-            </span>
             <select id="chatPrompt"><option value="">Load a prompt…</option></select>
             <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
             <span class="fontctl" title="Chat text size">
@@ -2772,10 +2904,9 @@ async function loadPersonas(){
   const isPair = p => p.kind === 'pair';
   const isMonitor = p => p.kind === 'monitor';
   const isSub = p => p.kind === 'subagent';
+  // The primary chat-persona picker lists only investigator-kind personas; pair/monitor/subagent
+  // personas live in the Pairings panel as prompt templates.
   const primary = all.filter(p => !isPair(p) && !isMonitor(p) && !isSub(p));
-  const pairPersonas = all.filter(isPair);
-  const monitorPersonas = all.filter(isMonitor);
-  const subPersonas = all.filter(isSub);
   if(sel){
     const def = (primary.find(p => p.default) || primary[0] || {}).id || '';
     sel.innerHTML = primary.map(p =>
@@ -2783,43 +2914,72 @@ async function loadPersonas(){
     sel.title = personaSummary(def);
     sel.onchange = () => { sel.title = personaSummary(sel.value); };
   }
-  // Pair AI reviewer persona picker (pair-kind personas only).
-  const psel = $('#chatPairPersona');
-  if(psel){
-    const want = localStorage.getItem('processos.pairPersona') || 'pair-skeptic';
-    psel.innerHTML = pairPersonas.map(p =>
-      '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
-      || '<option value="pair-skeptic">Skeptic / Red-Team</option>';
-    psel.title = personaSummary(psel.value);
-    psel.onchange = () => { psel.title = personaSummary(psel.value); localStorage.setItem('processos.pairPersona', psel.value); };
-  }
-  // Loop-monitor persona picker (monitor-kind personas only).
-  const msel = $('#chatMonitorPersona');
-  if(msel){
-    const want = localStorage.getItem('processos.monitorPersona') || 'monitor-loop-breaker';
-    msel.innerHTML = monitorPersonas.map(p =>
-      '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
-      || '<option value="monitor-loop-breaker">Loop Breaker</option>';
-    msel.title = personaSummary(msel.value);
-    msel.onchange = () => { msel.title = personaSummary(msel.value); localStorage.setItem('processos.monitorPersona', msel.value); };
-  }
-  // Subagent persona picker (subagent-kind personas only).
-  const ssel = $('#chatSubPersona');
-  if(ssel){
-    const want = localStorage.getItem('processos.subPersona') || 'subagent-researcher';
-    ssel.innerHTML = subPersonas.map(p =>
-      '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+'</option>').join('')
-      || '<option value="subagent-researcher">Researcher</option>';
-    ssel.title = personaSummary(ssel.value);
-    ssel.onchange = () => { ssel.title = personaSummary(ssel.value); localStorage.setItem('processos.subPersona', ssel.value); };
-  }
-  await fillPairProfiles();
-  wirePairControls();
-  await fillMonitorProfiles();
-  wireMonitorControls();
-  await fillSubProfiles();
-  wireSubControls();
+  await loadPairings();
 }
+// ── LLM Pairings in the composer ─────────────────────────────────────────────
+// The composer no longer wires pair/monitor/subagent ad-hoc: it offers ONE selector of saved
+// pairings (see the Pairings panel). The selected pairing is translated at send time into the
+// existing per-turn pair/monitor/subagent request shape (with the pairing's inline prompt).
+async function loadPairings(){
+  try { STATE.pairings = await api('/api/pairings') || []; }
+  catch(e){ STATE.pairings = []; }
+  fillPairingSelect();
+  wirePairingControl();
+}
+function fillPairingSelect(){
+  const sel = $('#chatPairing'); if(!sel) return;
+  const want = localStorage.getItem('processos.pairingId') || '';
+  const list = STATE.pairings || [];
+  sel.innerHTML = '<option value="">Solo (single model)</option>'
+    + list.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+' · '+esc(p.mode||'pair')+'</option>').join('');
+  // If the remembered pairing vanished, fall back to Solo.
+  if(want && !list.some(p => p.id===want)){ sel.value=''; localStorage.removeItem('processos.pairingId'); }
+}
+// The pairing currently selected in the composer, or null for Solo.
+function selectedPairing(){
+  const id = ($('#chatPairing')||{}).value || '';
+  if(!id) return null;
+  return (STATE.pairings||[]).find(p => p.id===id) || null;
+}
+function wirePairingControl(){
+  const sel = $('#chatPairing'); if(!sel) return;
+  sel.onchange = async () => {
+    localStorage.setItem('processos.pairingId', sel.value || '');
+    const p = selectedPairing();
+    // A pairing may carry a primary model (a full "team"): switch the active primary to it.
+    if(p && p.primaryProfileId){
+      try {
+        const s = await api('/api/settings') || {};
+        if(s.activeProfile !== p.primaryProfileId){
+          await api('/api/settings', {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({activeProfile:p.primaryProfileId})});
+          try{ window.dispatchEvent(new CustomEvent('processos:settings-changed')); }catch(_){}
+        }
+      } catch(e){}
+    }
+    labelSendButton();
+    refreshChatRoster();
+    reconcileSidecars();
+  };
+}
+// Translate the selected pairing into the existing per-turn request objects. Exactly one of these
+// is non-null (matching the pairing's mode); all are null for Solo. Downstream roster/sidecar
+// helpers consume these unchanged.
+function pairRequest(){
+  const p = selectedPairing();
+  if(!p || p.mode!=='pair') return null;
+  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined };
+}
+function monitorRequest(){
+  const p = selectedPairing();
+  if(!p || p.mode!=='monitor') return null;
+  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined };
+}
+function subRequest(){
+  const p = selectedPairing();
+  if(!p || p.mode!=='subagent') return null;
+  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined, maxRounds: p.maxRounds || undefined, digestCap: p.digestCap || undefined };
+}
+
 // ── partner roles (pair / monitor) + active-model roster ─────────────────────
 // An investigation runs a PRIMARY model plus, optionally, ONE partner — a sparring partner
 // (Pair AI) or a loop monitor. A profile can hold only one role at a time, so the partner pickers
@@ -2833,132 +2993,10 @@ function partnerProfileIds(){
   const sr = subRequest(); if(sr && sr.profileId) ids.add(sr.profileId);
   return ids;
 }
-// Re-fill both partner pickers (preserving each selection when still valid) so they always exclude
-// the active primary and the other partner. Then repaint the active-model roster.
+// Repaint the composer's pairing selector + active-model roster (e.g. after the primary changes).
 async function refreshPartnerPickers(){
-  await fillPairProfiles();
-  await fillMonitorProfiles();
-  await fillSubProfiles();
+  fillPairingSelect();
   refreshChatRoster();
-}
-// Populate the Pair AI reviewer's LLM-profile picker. Excludes the active primary and the monitor's
-// profile (one role per model). Defaults to a profile other than the active primary.
-async function fillPairProfiles(){
-  const sel = $('#chatPairProfile'); if(!sel) return;
-  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
-  const monSel = $('#chatMonitorProfile');
-  const monActive = $('#chatMonitorOn') && $('#chatMonitorOn').checked && monSel ? monSel.value : null;
-  const taken = new Set([s.activeProfile, monActive].filter(Boolean));
-  const profiles = (s.profiles || []).filter(p => !taken.has(p.id));
-  const saved = localStorage.getItem('processos.pairProfile');
-  const fallback = (profiles[0] || {}).id || '';
-  const want = (saved && profiles.some(p => p.id===saved)) ? saved : ((sel.value && profiles.some(p=>p.id===sel.value)) ? sel.value : fallback);
-  sel.innerHTML = profiles.length
-    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
-    : '<option value="">No other profile available</option>';
-  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.pairProfile', sel.value); fillMonitorProfiles(); refreshChatRoster(); };
-}
-// Wire the Pair AI on/off toggle: reveal the reviewer config when on, persist the choice, and
-// relabel the Send button + roster so the operator knows a reviewer will run.
-function wirePairControls(){
-  const on = $('#chatPairOn'), cfg = $('#chatPairCfg'); if(!on || !cfg) return;
-  const sync = () => {
-    cfg.style.display = on.checked ? '' : 'none';
-    localStorage.setItem('processos.pairOn', on.checked ? '1' : '0');
-    labelSendButton();
-    refreshPartnerPickers();
-  };
-  on.checked = localStorage.getItem('processos.pairOn') === '1';
-  on.onchange = () => { sync(); reconcileSidecars(); };
-  sync();
-}
-// The Pair AI config the composer will send (or null when off / unavailable).
-function pairRequest(){
-  const on = $('#chatPairOn');
-  if(!on || !on.checked) return null;
-  const profileId = ($('#chatPairProfile')||{}).value || undefined;
-  const personaId = ($('#chatPairPersona')||{}).value || undefined;
-  return { enabled: true, profileId, personaId };
-}
-// Populate the loop monitor's LLM-profile picker. Excludes the active primary and the pair's
-// profile. Defaults to the local sidecar profile when one is free (cheap to keep watching).
-async function fillMonitorProfiles(){
-  const sel = $('#chatMonitorProfile'); if(!sel) return;
-  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
-  const pairSel = $('#chatPairProfile');
-  const pairActive = $('#chatPairOn') && $('#chatPairOn').checked && pairSel ? pairSel.value : null;
-  const taken = new Set([s.activeProfile, pairActive].filter(Boolean));
-  const profiles = (s.profiles || []).filter(p => !taken.has(p.id));
-  const saved = localStorage.getItem('processos.monitorProfile');
-  const sidecar = (profiles.find(p => p.sidecar) || {}).id;
-  const fallback = sidecar || (profiles[0] || {}).id || '';
-  const want = (saved && profiles.some(p => p.id===saved)) ? saved : ((sel.value && profiles.some(p=>p.id===sel.value)) ? sel.value : fallback);
-  sel.innerHTML = profiles.length
-    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
-    : '<option value="">No other profile available</option>';
-  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.monitorProfile', sel.value); fillPairProfiles(); refreshChatRoster(); };
-}
-// Wire the Monitor on/off toggle: reveal the monitor config when on and persist the choice.
-function wireMonitorControls(){
-  const on = $('#chatMonitorOn'), cfg = $('#chatMonitorCfg'); if(!on || !cfg) return;
-  const sync = () => {
-    cfg.style.display = on.checked ? '' : 'none';
-    localStorage.setItem('processos.monitorOn', on.checked ? '1' : '0');
-    refreshPartnerPickers();
-  };
-  on.checked = localStorage.getItem('processos.monitorOn') === '1';
-  on.onchange = () => { sync(); reconcileSidecars(); };
-  sync();
-}
-// The loop-monitor config the composer will send (or null when off / unavailable).
-function monitorRequest(){
-  const on = $('#chatMonitorOn');
-  if(!on || !on.checked) return null;
-  const profileId = ($('#chatMonitorProfile')||{}).value || undefined;
-  const personaId = ($('#chatMonitorPersona')||{}).value || undefined;
-  return { enabled: true, profileId, personaId };
-}
-
-// Populate the subagent's LLM-profile picker. Excludes the active primary and the other partners.
-// Defaults to a sidecar profile when free (subagents do the cheap, noisy exploration).
-async function fillSubProfiles(){
-  const sel = $('#chatSubProfile'); if(!sel) return;
-  let s = {}; try { s = await api('/api/settings') || {}; } catch(e){}
-  const pairSel = $('#chatPairProfile'), monSel = $('#chatMonitorProfile');
-  const pairActive = $('#chatPairOn') && $('#chatPairOn').checked && pairSel ? pairSel.value : null;
-  const monActive = $('#chatMonitorOn') && $('#chatMonitorOn').checked && monSel ? monSel.value : null;
-  const taken = new Set([s.activeProfile, pairActive, monActive].filter(Boolean));
-  const profiles = (s.profiles || []).filter(p => !taken.has(p.id));
-  const saved = localStorage.getItem('processos.subProfile');
-  const sidecar = (profiles.find(p => p.sidecar) || {}).id;
-  const fallback = sidecar || (profiles[0] || {}).id || '';
-  const want = (saved && profiles.some(p => p.id===saved)) ? saved : ((sel.value && profiles.some(p=>p.id===sel.value)) ? sel.value : fallback);
-  sel.innerHTML = profiles.length
-    ? profiles.map(p => '<option value="'+esc(p.id)+'"'+(p.id===want?' selected':'')+'>'+esc(p.name||p.id)+(p.sidecar?' (sidecar)':'')+'</option>').join('')
-    : '<option value="">No other profile available</option>';
-  sel.onchange = () => { if(sel.value) localStorage.setItem('processos.subProfile', sel.value); refreshPartnerPickers(); };
-}
-// Wire the Subagent on/off toggle: reveal config when on, persist, refresh partner pickers.
-function wireSubControls(){
-  const on = $('#chatSubOn'), cfg = $('#chatSubCfg'); if(!on || !cfg) return;
-  const sync = () => {
-    cfg.style.display = on.checked ? '' : 'none';
-    localStorage.setItem('processos.subOn', on.checked ? '1' : '0');
-    refreshPartnerPickers();
-  };
-  on.checked = localStorage.getItem('processos.subOn') === '1';
-  on.onchange = () => { sync(); reconcileSidecars(); };
-  sync();
-}
-// The subagent config the composer will send (or null when off). maxRounds/digestCap are advanced.
-function subRequest(){
-  const on = $('#chatSubOn');
-  if(!on || !on.checked) return null;
-  const profileId = ($('#chatSubProfile')||{}).value || undefined;
-  const personaId = ($('#chatSubPersona')||{}).value || undefined;
-  const maxRounds = parseInt(($('#chatSubRounds')||{}).value,10) || undefined;
-  const digestCap = parseInt(($('#chatSubDigest')||{}).value,10) || undefined;
-  return { enabled: true, profileId, personaId, maxRounds, digestCap };
 }
 
 // Paint the active-model roster beside the Send button: the PRIMARY plus any enabled partner,
@@ -3441,6 +3479,7 @@ function showView(v){
   $('#viewHost').style.display='';
   if(v==='processes') return renderProcesses();
   if(v==='prompts') return renderPrompts();
+  if(v==='pairings') return renderPairings();
   if(v==='experiments') return renderExperiments();
   if(v==='sidecars') return renderSidecars();
   return renderConsole();
