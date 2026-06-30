@@ -191,13 +191,23 @@ credit-check to exercise the error boundary, or give your final answer.\" Be dec
 letting the agent act and iterate over more analysis. If it is making genuine progress, return \
 circling=false and an empty steer.";
 
+/// A monitor evaluation plus the exact payload it was given and the raw reply it produced, so the
+/// cockpit's Debug tab can show the operator everything the *second* model saw and said — not just
+/// the terse steer that reached the primary.
+#[derive(Debug, Clone)]
+pub struct MonitorEval {
+    pub verdict: MonitorVerdict,
+    /// The exact request body POSTed to the monitor model (system prompt + transcript window).
+    pub request: serde_json::Value,
+    /// The monitor model's raw text reply (the JSON verdict, before parsing).
+    pub raw: String,
+}
+
 /// Ask the monitor model to classify the primary's recent trajectory. Never panics and never
 /// returns a spurious intervention: on any transport or parse failure it yields a non-circling
-/// verdict (the safe default — missing a loop beats interrupting good work).
-pub async fn evaluate(cfg: &LlmConfig, persona_system: &str, window: &str) -> MonitorVerdict {
-    if window.trim().is_empty() {
-        return MonitorVerdict::none();
-    }
+/// verdict (the safe default — missing a loop beats interrupting good work). Returns the request
+/// body and raw reply alongside the verdict so the Debug tab can surface the full exchange.
+pub async fn evaluate(cfg: &LlmConfig, persona_system: &str, window: &str) -> MonitorEval {
     let agent = OpenAiAgent { cfg: cfg.clone() };
     let system = if persona_system.trim().is_empty() {
         MONITOR_SYSTEM
@@ -210,10 +220,24 @@ pub async fn evaluate(cfg: &LlmConfig, persona_system: &str, window: &str) -> Mo
          the JSON verdict."
     );
     let msgs = vec![Msg::System(system.to_string()), Msg::User(user)];
-    match agent.step(&msgs, &[]).await {
-        Ok(Turn::Final(text)) => parse_verdict(&text),
+    let request = agent.request_body(&msgs, &[], false);
+    if window.trim().is_empty() {
+        return MonitorEval {
+            verdict: MonitorVerdict::none(),
+            request,
+            raw: String::new(),
+        };
+    }
+    let (verdict, raw) = match agent.step(&msgs, &[]).await {
+        Ok(Turn::Final(text)) => (parse_verdict(&text), text),
         // A monitor that calls tools or fails is treated as 'no signal'.
-        Ok(Turn::ToolCalls(_)) | Err(_) => MonitorVerdict::none(),
+        Ok(Turn::ToolCalls(_)) => (MonitorVerdict::none(), String::new()),
+        Err(e) => (MonitorVerdict::none(), format!("(monitor request failed: {e})")),
+    };
+    MonitorEval {
+        verdict,
+        request,
+        raw,
     }
 }
 

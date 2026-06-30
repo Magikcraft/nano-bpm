@@ -2392,6 +2392,9 @@ async fn run_loop_monitor(
     primary_base_url: String,
     // The primary turn's live completion id (`chatcmpl-…`), set once it starts replying.
     primary_cmpl_id: Arc<std::sync::Mutex<Option<String>>>,
+    // Shared with the primary's Debug capture: each monitor evaluation is appended here (tagged
+    // `kind:"monitor"`) so the cockpit's Debug tab can show the second model's full exchange.
+    dbg: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 ) {
     use std::sync::atomic::Ordering;
     // Read the primary's current live completion id, if it has started replying.
@@ -2413,12 +2416,45 @@ async fn run_loop_monitor(
             continue;
         }
         last_window = window.clone();
-        let verdict = monitor::evaluate(&cfg, &persona_system, &window).await;
+        let eval = monitor::evaluate(&cfg, &persona_system, &window).await;
+        let verdict = eval.verdict.clone();
         // The primary may have finished while the monitor was thinking.
         if done.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
             return;
         }
-        match policy.observe(&verdict) {
+        let action = policy.observe(&verdict);
+        // What (if anything) the monitor injected into the PRIMARY this round, and a label.
+        let (action_label, injected): (&str, Option<String>) = match &action {
+            monitor::MonitorAction::None => ("none", None),
+            monitor::MonitorAction::Steer(text) => ("steer", Some(format!("[loop monitor] {text}"))),
+            monitor::MonitorAction::WrapUp(reason) => ("wrapup", Some(reason.clone())),
+        };
+        // Record this evaluation for the Debug tab: the exact request the second model received,
+        // its raw reply, the parsed verdict, and what (if anything) reached the primary. Build it
+        // once (cloning the verdict fields so the match arms below can still use them) and reuse it
+        // for both the persisted buffer and the live wire mirror.
+        let ts = chat_now_ms();
+        let record = serde_json::json!({
+            "kind": "monitor",
+            "ts": ts,
+            "action": action_label,
+            "verdict": {
+                "circling": verdict.circling,
+                "reason": verdict.reason.clone(),
+                "steer": verdict.steer.clone(),
+            },
+            "injected": injected,
+            "raw": eval.raw,
+            "body": eval.request,
+        });
+        if let Ok(mut d) = dbg.lock() {
+            d.push(record.clone());
+        }
+        // Mirror it onto the live wire so the Debug tab updates without waiting for turn-end.
+        let mut live_record = record;
+        live_record["type"] = serde_json::json!("monitorRequest");
+        live.emit(live_record);
+        match action {
             monitor::MonitorAction::None => {}
             monitor::MonitorAction::Steer(text) => {
                 if let Ok(mut q) = steer.lock() {
@@ -3341,6 +3377,10 @@ async fn cockpit_chat_stream(
     // primary signal completion so the watcher stops. Resolved before the blocking task so a
     // misconfiguration just means "no monitor", never a failed turn.
     let monitor_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // This turn's Debug capture, created before the monitor spawns so BOTH the primary agent loop
+    // and the out-of-band loop monitor append their request payloads to the same buffer (the
+    // monitor's entries are tagged `kind:"monitor"`). Persisted to `chat_debug` at turn end.
+    let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
     if let Some((mon_cfg, mon_persona)) = resolve_monitor(&state, req.monitor.as_ref()) {
         tokio::spawn(run_loop_monitor(
             mon_cfg,
@@ -3356,6 +3396,7 @@ async fn cockpit_chat_stream(
             // primary's live completion id for the reasoning-control "end thinking" call.
             cfg.base_url.clone(),
             cmpl_id.clone(),
+            dbg.clone(),
         ));
     }
 
@@ -3368,6 +3409,7 @@ async fn cockpit_chat_stream(
     let task_live = live.clone();
     let task_monitor_done = monitor_done.clone();
     let task_cmpl_id = cmpl_id.clone();
+    let task_dbg = dbg.clone();
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3411,8 +3453,9 @@ async fn cockpit_chat_stream(
             cp_chat.set_turn_models(&cp_key, &cp_sid, turn_models);
         };
         // Accumulate this turn's exact request payloads for the session's Debug tab while also
-        // forwarding each over the wire so the tab can update live.
-        let dbg = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        // forwarding each over the wire so the tab can update live. Shared with the loop monitor,
+        // whose evaluations are appended to the same buffer (tagged `kind:"monitor"`).
+        let dbg = task_dbg;
         let dbg_for_sink = dbg.clone();
         let cmpl_for_sink = task_cmpl_id.clone();
         let mut sink = move |ev: agent::AgentEvent| {

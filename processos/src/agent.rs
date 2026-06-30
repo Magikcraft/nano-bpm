@@ -511,7 +511,7 @@ pub struct OpenAiAgent {
 
 impl OpenAiAgent {
     /// Build the `chat/completions` request body shared by streaming and non-streaming calls.
-    fn request_body(&self, msgs: &[Msg], tools: &[ToolSpec], stream: bool) -> Value {
+    pub(crate) fn request_body(&self, msgs: &[Msg], tools: &[ToolSpec], stream: bool) -> Value {
         let tool_defs: Vec<Value> = tools
             .iter()
             .map(|t| {
