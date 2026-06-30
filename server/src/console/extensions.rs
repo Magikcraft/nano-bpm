@@ -299,6 +299,11 @@ fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
 /// manifest. Best-effort: requires `npm` on PATH.
 pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
     let dir = safe_pkg_dir(pkg).ok_or("invalid package name")?;
+    // Clean install: clear any prior copy so a re-install (i.e. an update to a
+    // newer npm version) never leaves stale files from the old version behind.
+    if dir.exists() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
     let npm = find_program("npm").ok_or("npm not found on PATH")?;
     let out = std::process::Command::new(&npm)
@@ -335,6 +340,19 @@ pub fn remove(pkg: &str) -> Result<(), String> {
     std::fs::remove_dir_all(dir).map_err(|e| format!("remove: {e}"))
 }
 
+/// The version of an installed pack, read from its bundled `package.json` (the
+/// `npm pack` tarball carries it). `None` when the pack isn't installed or has
+/// no readable version — used to tell whether a newer npm release is available.
+pub fn installed_version(pkg: &str) -> Option<String> {
+    let dir = safe_pkg_dir(pkg)?;
+    let txt = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    v.get("version")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 // ---------------------------------------------------------------------------
 // Marketplace — discover packs on npm by the `nano-ide-ext` keyword
 // ---------------------------------------------------------------------------
@@ -354,6 +372,12 @@ pub struct MarketEntry {
     /// "lang" | "app" | "example" | "other", from keywords.
     pub category: String,
     pub installed: bool,
+    /// The locally-installed version, when this pack is installed (else `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    /// True when the pack is installed and its version differs from the latest
+    /// on npm — i.e. an update can be pulled.
+    pub update_available: bool,
 }
 
 /// Browse npm for packs tagged `nano-ide-ext`. Shells out to `npm search`
@@ -386,11 +410,23 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 "other"
             };
             let name = p["name"].as_str().unwrap_or_default().to_string();
+            let latest = p["version"].as_str().unwrap_or_default().to_string();
+            let inst_ver = installed_version(&name);
+            let installed = inst_ver.is_some()
+                || safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false);
+            // Flag an update only when we can read the installed version and it
+            // differs from the latest published one.
+            let update_available = inst_ver
+                .as_deref()
+                .map(|iv| !iv.is_empty() && !latest.is_empty() && iv != latest)
+                .unwrap_or(false);
             MarketEntry {
-                installed: safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false),
-                version: p["version"].as_str().unwrap_or_default().to_string(),
+                installed,
+                version: latest,
                 description: p["description"].as_str().unwrap_or_default().to_string(),
                 category: category.to_string(),
+                installed_version: inst_ver,
+                update_available,
                 name,
             }
         })
@@ -462,5 +498,27 @@ mod tests {
         let s = serde_json::to_string(m).unwrap();
         let back: ExtManifest = serde_json::from_str(&s).unwrap();
         assert_eq!(back.toolchain.run, vec!["cargo", "run", "--release"]);
+    }
+
+    #[test]
+    fn installed_version_reads_package_json() {
+        // Point the extensions root at a unique temp dir and drop a pack with a
+        // package.json, then confirm installed_version reads its version.
+        let root = std::env::temp_dir().join(format!("nano-ext-test-{}", std::process::id()));
+        let pkg = "@nanobpm/nano-ide-lang-rust";
+        // SAFETY: test-local env set; other tests in this module don't depend on
+        // the extensions-root *value* (only on path suffixes / builtins).
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let dir = safe_pkg_dir(pkg).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"version":"1.0.0"}"#).unwrap();
+
+        assert_eq!(installed_version(pkg).as_deref(), Some("1.0.0"));
+        assert_eq!(installed_version("@nanobpm/not-installed"), None);
+        // The update-available rule: installed version differs from latest.
+        assert_ne!(installed_version(pkg).as_deref(), Some("1.1.0"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 }

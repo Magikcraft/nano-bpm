@@ -80,10 +80,19 @@ export default function Extensions() {
                 <div key={m.name} className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900 p-3">
                   <div className="min-w-0">
                     <span className="font-medium text-zinc-100">{m.name}</span>
-                    <span className="ml-2 text-xs text-zinc-600">{m.version}</span>
+                    <span className="ml-2 text-xs text-zinc-600">
+                      {m.installed && m.installedVersion && m.installedVersion !== m.version
+                        ? `${m.installedVersion} → ${m.version}`
+                        : m.version}
+                    </span>
                     <div className="truncate text-xs text-zinc-500">{m.description}</div>
                   </div>
-                  {m.installed ? (
+                  {m.updateAvailable ? (
+                    <button onClick={() => void install(m.name)} disabled={busy === m.name}
+                      className="ml-3 shrink-0 rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-500 disabled:opacity-50">
+                      {busy === m.name ? "Updating…" : "Update"}
+                    </button>
+                  ) : m.installed ? (
                     <span className="ml-3 shrink-0 text-xs text-emerald-500">installed</span>
                   ) : (
                     <button onClick={() => void install(m.name)} disabled={busy === m.name}

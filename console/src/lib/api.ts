@@ -658,6 +658,10 @@ export interface MarketEntry {
   description: string;
   category: "lang" | "app" | "example" | "other";
   installed: boolean;
+  /** The locally-installed version, when installed. */
+  installedVersion?: string;
+  /** True when installed and a newer version is available on npm. */
+  updateAvailable: boolean;
 }
 export interface Marketplace {
   entries: MarketEntry[];
