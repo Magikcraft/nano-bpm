@@ -201,3 +201,32 @@ jobs:
             upload_to "processos/${GITHUB_REF_NAME}"
           fi
           upload_to "processos/latest"
+
+      # Publish a small version.json next to the binaries so clients (the
+      # c8ctl-plugin-nano update notifier) can learn the latest published
+      # version without a GitHub token. Only tag pushes carry a real version, so
+      # this writes the per-tag copy AND refreshes processos/latest/version.json;
+      # manual runs (no tag) skip it and leave the existing pointer untouched.
+      - name: Publish version.json to S3
+        if: ${{ env.AWS_ACCESS_KEY_ID != '' && github.ref_type == 'tag' }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          assets="$(cd dist && ls | sed 's/.*/"&"/' | paste -sd, -)"
+          cat > version.json <<JSON
+          {
+            "version": "${version}",
+            "tag": "${GITHUB_REF_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "updated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "assets": [${assets}]
+          }
+          JSON
+          echo "version.json:"; cat version.json
+          for prefix in "processos/${GITHUB_REF_NAME}" "processos/latest"; do
+            echo "↑ s3://${S3_BUCKET}/${prefix}/version.json"
+            aws s3 cp version.json "s3://${S3_BUCKET}/${prefix}/version.json" \
+              --no-progress \
+              --content-type application/json \
+              --cache-control "public, max-age=300"
+          done
