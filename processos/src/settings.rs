@@ -46,6 +46,13 @@ pub struct LlmProfile {
     pub api_key: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// The model's advertised context window in tokens, learned by querying the endpoint
+    /// (`/models` → `meta.n_ctx`/`n_ctx_train`/`context_length`) or, for a running sidecar, the
+    /// live `n_ctx` it was launched with. Metadata only — distinct from [`max_tokens`] (the
+    /// per-request budget, which may be smaller). Shown on the LLM tile so the operator knows how
+    /// much context the model affords.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     #[serde(default)]
     pub temperature: Option<f32>,
     /// When true, this profile is served by ProcessOS's **local llama.cpp `llama-server`
@@ -108,6 +115,9 @@ impl LlmProfile {
         }
         if let Some(v) = patch.max_tokens {
             self.max_tokens = (v != 0).then_some(v);
+        }
+        if let Some(v) = patch.context_window {
+            self.context_window = (v != 0).then_some(v);
         }
         if let Some(v) = patch.temperature {
             self.temperature = (v >= 0.0).then_some(v);
@@ -260,6 +270,7 @@ fn seeded() -> Settings {
             model: Some(model.to_string()),
             api_key: None,
             max_tokens: Some(max_tokens),
+            context_window: None,
             temperature: None,
             sidecar: true,
             model_file: Some(model.to_string()),
@@ -408,6 +419,7 @@ pub struct ProfilePatch {
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u64>,
     pub temperature: Option<f32>,
     pub sidecar: Option<bool>,
     pub model_file: Option<String>,
@@ -451,6 +463,7 @@ pub struct ProfileView {
     pub model: Option<String>,
     pub api_key_set: bool,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u64>,
     pub temperature: Option<f32>,
     pub sidecar: bool,
     pub model_file: Option<String>,
@@ -469,6 +482,7 @@ impl ProfileView {
             model: p.model.clone(),
             api_key_set: p.api_key.as_deref().is_some_and(|k| !k.is_empty()),
             max_tokens: p.max_tokens,
+            context_window: p.context_window,
             temperature: p.temperature,
             sidecar: p.sidecar,
             model_file: p.model_file.clone(),
@@ -584,6 +598,7 @@ impl SettingsStore {
             model: None,
             api_key: None,
             max_tokens: None,
+            context_window: None,
             temperature: None,
             sidecar: false,
             model_file: None,
@@ -707,6 +722,7 @@ fn migrate(s: &str) -> Option<Settings> {
                 model: st.llm_model,
                 api_key: st.llm_api_key,
                 max_tokens: st.llm_max_tokens,
+                context_window: None,
                 temperature: st.llm_temperature,
                 sidecar: false,
                 model_file: None,
@@ -812,6 +828,7 @@ mod tests {
             model: None,
             api_key: None,
             max_tokens: None,
+            context_window: None,
             temperature: None,
             sidecar: true,
             model_file: None,

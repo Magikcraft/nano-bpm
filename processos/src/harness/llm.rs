@@ -376,7 +376,7 @@ pub struct ModelInfo {
 /// use: llama.cpp nests it under `meta` (`n_ctx`, the server's configured window, else
 /// `n_ctx_train`); others expose a top-level `context_length` / `max_context_length` /
 /// `max_model_len` / `context_window`.
-fn extract_context_window(item: &serde_json::Value) -> Option<u64> {
+pub fn extract_context_window(item: &serde_json::Value) -> Option<u64> {
     let as_u64 = |v: &serde_json::Value| v.as_u64().filter(|n| *n > 0);
     if let Some(meta) = item.get("meta") {
         if let Some(n) = meta.get("n_ctx").and_then(as_u64) {

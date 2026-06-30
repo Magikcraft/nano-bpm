@@ -155,6 +155,7 @@ mod tests {
             model: Some("qwen3".into()),
             api_key: Some("sk-secret-value".into()),
             max_tokens: None,
+            context_window: None,
             temperature: None,
             sidecar: true,
             model_file: None,

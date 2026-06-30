@@ -833,6 +833,9 @@ function startDepsPoll(){
 // scope so it survives the view's re-renders; the warming auto-refresh is suppressed
 // while it's open so typed input isn't wiped.
 let LLM_EDITOR = { open:false, id:null, type:null };
+// Context windows learned from the editor's last "Fetch models", keyed by model id, so saving a
+// remote profile persists the model's advertised window alongside it.
+let LE_CTX = {};
 
 // Build the inline add/edit profile form (string) for the current LLM_EDITOR state.
 // `profiles` is the full settings.profiles list; `active` is the active profile id.
@@ -866,6 +869,9 @@ function llmEditorBlock(profiles, active){
     +   '<div style="flex:1"><label>Max tokens</label><input id="le-maxTokens" type="number" min="1" placeholder="2048" value="'+(p&&p.maxTokens!=null?p.maxTokens:'')+'"></div>'
     +   '<div style="flex:1"><label>Temperature</label><input id="le-temp" type="number" step="0.05" min="0" placeholder="0.2" value="'+(p&&p.temperature!=null?p.temperature:'')+'"></div>'
     +   '<div style="flex:1"><label>Thinking level</label><select id="le-thinking"><option value="">Default</option><option value="fast">Fast (20%)</option><option value="medium">Medium (50%)</option><option value="max">Max (100%)</option></select></div>'
+    + '</div>'
+    + '<div id="le-ctxnote" class="le-hint" style="margin-top:6px">'
+    +   (p&&p.contextWindow!=null ? ('Model context window: <b>'+Number(p.contextWindow).toLocaleString()+'</b> tokens') : '')
     + '</div>'
     + '<div id="le-status" class="le-hint" style="min-height:16px;margin-top:8px"></div>'
     + '<div class="btnrow" style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">'
@@ -903,6 +909,12 @@ function wireLlmEditor(profiles, active){
       thinkingLevel: g('le-thinking').value || '',
       sidecar: t === 'sidecar'
     };
+    // Persist the model's advertised context window when we learned one from Fetch (else keep
+    // whatever is already stored — passing 0 would clear it).
+    if(t !== 'sidecar'){
+      const ctx = LE_CTX[g('le-model').value.trim()];
+      if(ctx) o.contextWindow = ctx;
+    }
     if(t === 'sidecar'){
       const mf = g('le-modelFile').value.trim();
       o.modelFile = mf; o.sidecarArgs = g('le-sidecarArgs').value; o.provider = 'openai'; o.model = mf;
@@ -923,8 +935,24 @@ function wireLlmEditor(profiles, active){
     try {
       const d = await api('/api/settings/models', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
       const dl = g('le-modellist'); dl.innerHTML = '';
-      (d.models||[]).forEach(m => { const id = typeof m==='string'?m:m.id; const o=document.createElement('option'); o.value=id; dl.appendChild(o); });
+      LE_CTX = {};
+      (d.models||[]).forEach(m => {
+        const id = typeof m==='string'?m:m.id;
+        const ctx = (m && typeof m==='object') ? m.contextWindow : null;
+        if(ctx) LE_CTX[id] = ctx;
+        const o=document.createElement('option'); o.value=id;
+        if(ctx) o.label = id+' ('+Number(ctx).toLocaleString()+' ctx)';
+        dl.appendChild(o);
+      });
       if(!g('le-model').value && (d.models||[]).length===1){ g('le-model').value = typeof d.models[0]==='string'?d.models[0]:d.models[0].id; }
+      const reflectCtx = () => {
+        const ctx = LE_CTX[g('le-model').value.trim()];
+        const note = g('le-ctxnote');
+        if(note) note.innerHTML = ctx ? ('Model context window: <b>'+Number(ctx).toLocaleString()+'</b> tokens') : '';
+        if(ctx && !g('le-maxTokens').value) g('le-maxTokens').value = ctx;
+      };
+      const mEl = g('le-model'); if(mEl) mEl.onchange = reflectCtx;
+      reflectCtx();
       setStatus('Found '+((d.models||[]).length)+' model(s) \u2014 pick one from the field');
     } catch(e){ setStatus('fetch failed: '+(e.message||e)); }
   };
@@ -966,6 +994,14 @@ async function renderSidecars(){
   const sidecars = st.sidecars || [];
   const max = st.max || 2;
   const runById = {}; sidecars.forEach(r => { if(r.profileId) runById[r.profileId] = r; });
+  // Persist a running sidecar's live context window back onto its profile (fire-and-forget) so the
+  // value stays visible on the tile after the sidecar is stopped. Only PUT when it actually changed.
+  (s.profiles||[]).forEach(p => {
+    const r = runById[p.id];
+    if(r && r.contextWindow && r.contextWindow !== p.contextWindow){
+      api('/api/settings/profiles/'+encodeURIComponent(p.id), {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({contextWindow:r.contextWindow})}).catch(()=>{});
+    }
+  });
   // Per-profile download state: which models are already cached, and which are downloading now.
   const downloadedById = {}; (st.models||[]).forEach(m => { downloadedById[m.profileId] = !!m.downloaded; });
   const dlById = {}; (st.downloads||[]).forEach(d => { if(d.profileId) dlById[d.profileId] = d; });
@@ -1044,6 +1080,9 @@ async function renderSidecars(){
                        : atCap ? ('Already running '+max+' sidecars — stop one first')
                        : 'Start this sidecar';
       const runPort = isRunning ? runById[p.id].port : null;
+      // Context window: prefer the live value the running sidecar reports, else the persisted one.
+      const ctxWin = (isRunning && runById[p.id].contextWindow) || p.contextWindow || null;
+      const ctxMeta = ctxWin ? ('<div class="meta" style="margin-top:4px;color:#a5b4fc">context window · '+Number(ctxWin).toLocaleString()+' tokens'+(isRunning&&runById[p.id].contextWindow?' (live)':'')+'</div>') : '';
       // Undownloaded sidecars are dimmed with a dotted outline so cached/ready models stand out.
       const undownloaded = !isRunning && !isDownloading && !isDownloaded;
       // The action button reflects the lifecycle: download the weights, then start (serve) them.
@@ -1066,6 +1105,7 @@ async function renderSidecars(){
         + ' <button class="sc-star'+(p.starred?' on':'')+'" data-star="'+esc(p.id)+'" data-starred="'+(p.starred?'1':'0')+'" title="'+(p.starred?'Unstar':'Star (pin to top)')+'">'+(p.starred?'\u2605':'\u2606')+'</button>'
         + '</h3>'
         + '<div class="meta">'+esc(p.modelFile||p.model||'')+(runPort?(' · port '+esc(String(runPort))):'')+'</div>'
+        + ctxMeta
         + (pm && pm.detail?('<div class="meta" style="margin-top:4px;color:#93c5fd">'+esc(pm.detail)+'</div>'):'')
         + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
@@ -1094,6 +1134,7 @@ async function renderSidecars(){
         + ' <button class="sc-star'+(p.starred?' on':'')+'" data-star="'+esc(p.id)+'" data-starred="'+(p.starred?'1':'0')+'" title="'+(p.starred?'Unstar':'Star (pin to top)')+'">'+(p.starred?'\u2605':'\u2606')+'</button>'
         + '</h3>'
         + '<div class="meta">'+esc(p.model||'(model unset)')+(p.baseUrl?(' · '+esc(p.baseUrl)):'')+'</div>'
+        + (p.contextWindow?('<div class="meta" style="margin-top:4px;color:#a5b4fc">context window · '+Number(p.contextWindow).toLocaleString()+' tokens</div>'):'')
         + (p.apiKeySet?'':'<div class="meta" style="margin-top:4px;color:#fca5a5">No API key set</div>')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
         + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
@@ -1139,7 +1180,7 @@ async function renderSidecars(){
   const showLogs = (id) => openLogStream(id || null);
   main.querySelectorAll('[data-logs]').forEach(b => b.onclick = () => showLogs(b.dataset.logs || null));
   // Inline editor: opening sets LLM_EDITOR and re-renders so the form mounts in-view.
-  const openEditor = (id, type) => { LLM_EDITOR = { open:true, id:id||null, type:type||null }; renderSidecars(); };
+  const openEditor = (id, type) => { LE_CTX = {}; LLM_EDITOR = { open:true, id:id||null, type:type||null }; renderSidecars(); };
   const addBtnTop = document.getElementById('llAddProfileBtn'); if(addBtnTop) addBtnTop.onclick = () => openEditor(null, null);
   const addBtn = document.getElementById('llAddProfile'); if(addBtn) addBtn.onclick = (e) => { e.preventDefault(); openEditor(null, 'sidecar'); };
   const addRemoteBtn = document.getElementById('llAddRemote'); if(addRemoteBtn) addRemoteBtn.onclick = (e) => { e.preventDefault(); openEditor(null, 'remote'); };

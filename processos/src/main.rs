@@ -1921,6 +1921,28 @@ async fn sidecar_phase(status: &llama::LlamaStatus) -> (String, Option<String>) 
     ("starting".into(), Some("starting llama-server…".into()))
 }
 
+/// Probe a running sidecar for the **live context window** it was launched with. llama.cpp's
+/// OpenAI-compatible `/v1/models` reports `data[0].meta.n_ctx` (the configured window, honouring
+/// the sidecar's `-c`/`--ctx-size` arg), which is the most accurate "how much context this model
+/// actually affords right now". Returns `None` if the endpoint is unreachable or doesn't report
+/// one. A short timeout keeps `/api/llama/status` snappy.
+async fn sidecar_context_window(port: u16) -> Option<u64> {
+    let url = format!("http://127.0.0.1:{port}/v1/models");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let items = v.get("data").or_else(|| v.get("models"))?.as_array()?;
+    items
+        .iter()
+        .find_map(harness::llm::extract_context_window)
+}
+
 /// `GET /api/system/dependencies` — preflight the external CLI tools ProcessOS
 /// shells out to (Deno for embedded Nano workers; llama.cpp's `llama-server` for
 /// local LLM sidecars). Reports each tool's presence, resolved binary, version,
@@ -1955,10 +1977,24 @@ async fn llama_status(State(state): State<AppState>) -> impl IntoResponse {
         if phase == "ready" {
             any_ready = true;
         }
+        // For a ready sidecar, surface the live context window it was launched with so the LLM
+        // tile can show how much context the model actually affords (may differ from the model's
+        // trained window if started with a smaller `-c`).
+        let ctx = if phase == "ready" {
+            match s.port {
+                Some(port) => sidecar_context_window(port).await,
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut v = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = v.as_object_mut() {
             obj.insert("phase".into(), serde_json::json!(phase));
             obj.insert("detail".into(), serde_json::json!(detail));
+            if let Some(ctx) = ctx {
+                obj.insert("contextWindow".into(), serde_json::json!(ctx));
+            }
         }
         sidecars.push(v);
     }

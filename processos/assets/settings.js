@@ -270,6 +270,8 @@
       patch.model = $('s-model').value;
       patch.modelFile = ''; // not a sidecar — clear any managed-model fields
       patch.sidecarArgs = '';
+      var ctx = MODEL_CTX[$('s-model').value];
+      if (ctx) patch.contextWindow = ctx; // persist the model's advertised context window
       var key = $('s-apiKey').value;
       if (key) patch.apiKey = key;
     }

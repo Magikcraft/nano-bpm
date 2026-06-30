@@ -800,6 +800,7 @@ mod tests {
             model: Some(model_file.into()),
             api_key: None,
             max_tokens: None,
+            context_window: None,
             temperature: None,
             sidecar: true,
             model_file: Some(model_file.into()),
