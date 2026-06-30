@@ -304,6 +304,9 @@
   .tool-badge.builtin { color: #9aa3b2; background: rgba(148,163,184,.14); }
   .tool-tile.builtin { border-style: dashed; opacity: .82; }
   .tool-tile.disabled h3 { color: #8b93a4; font-weight: 500; }
+  .tool-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 4px 14px; margin: 4px 0 12px; padding: 8px 10px; border: 1px solid #2a2a33; border-radius: 8px; background: rgba(255,255,255,.02); }
+  .tool-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; cursor: pointer; padding: 2px 0; }
+  .tool-check input { margin: 0; cursor: pointer; }
   /* GitHub-style markdown tables (answers + thinking) */
   .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
   .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
@@ -1470,25 +1473,26 @@ function fillPairingTemplates(mode){
   sel.innerHTML = '<option value="">\u2014 pick a template \u2014</option>'
     + matches.map(p => '<option value="'+esc(p.id)+'">'+esc(p.name||p.id)+(p.builtin?' (built-in)':'')+'</option>').join('');
 }
-// Render a multi-select of available tool names. `sel` is the current allowlist (array) or
-// null/undefined meaning "all tools". An empty multi-select selection is sent as null (= all).
+// Render a checkbox group of available tool names. `sel` is the current allowlist (array) or
+// null/undefined meaning "all tools". No box checked is sent as null (= all tools).
 function toolMultiSelect(elId, sel){
   const all = PAIR_TOOLS.length ? PAIR_TOOLS : [];
   const chosen = Array.isArray(sel) ? sel : null;
-  let h = '<select id="'+elId+'" multiple size="'+Math.min(8, Math.max(3, all.length||3))+'" style="width:100%">';
-  if(!all.length) h += '<option disabled>No tools available</option>';
+  if(!all.length) return '<div id="'+elId+'" class="tool-checks"><span class="muted" style="font-size:12px">No tools available</span></div>';
+  let h = '<div id="'+elId+'" class="tool-checks">';
   for(const t of all){
     const isSel = chosen ? chosen.includes(t.name) : false;
     const tag = t.builtin ? ' (built-in)' : (t.enabled?'':' (disabled)');
-    h += '<option value="'+esc(t.name)+'"'+(isSel?' selected':'')+'>'+esc(t.name)+tag+'</option>';
+    h += '<label class="tool-check"><input type="checkbox" value="'+esc(t.name)+'"'+(isSel?' checked':'')+'>'
+      + '<span>'+esc(t.name)+'<span class="muted" style="font-weight:400">'+esc(tag)+'</span></span></label>';
   }
-  h += '</select>';
+  h += '</div>';
   return h;
 }
 function readToolMultiSelect(elId){
   const el = document.getElementById(elId); if(!el) return null;
-  const vals = Array.from(el.selectedOptions).map(o=>o.value).filter(Boolean);
-  return vals.length ? vals : null; // empty selection = all tools
+  const vals = Array.from(el.querySelectorAll('input[type="checkbox"]:checked')).map(o=>o.value).filter(Boolean);
+  return vals.length ? vals : null; // nothing checked = all tools
 }
 function applyPairingTemplate(){
   const id = ($('#prTemplate')||{}).value; if(!id) return;
