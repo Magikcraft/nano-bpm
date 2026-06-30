@@ -25,10 +25,14 @@
 # The `publish` job also mirrors the binaries to a public S3 bucket so they can
 # be fetched over plain HTTPS without a GitHub token. Set two repo secrets:
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  (an IAM key that can s3:PutObject
-#   + s3:PutObjectAcl on the bucket). Tag pushes upload an immutable per-version
-# copy to s3://sitapati-storage/processos/<tag>/ AND refresh the rolling
+#   on the bucket). Tag pushes upload an immutable per-version copy to
+# s3://sitapati-storage/processos/<tag>/ AND refresh the rolling
 # s3://sitapati-storage/processos/latest/ pointer; manual runs refresh `latest/`
 # only. The step is skipped (not failed) when the credentials are absent.
+#
+# The bucket is "Bucket owner enforced" (ACLs disabled), so objects are NOT
+# uploaded with a per-object ACL — public read is granted by the bucket policy
+# instead. Do not re-add `--acl public-read` or it fails AccessControlListNotSupported.
 
 name: Publish ProcessOS binaries
 
@@ -176,10 +180,10 @@ jobs:
       # Mirror the same binaries to S3 so they're fetchable without a GitHub
       # token. Tag pushes publish an immutable per-version copy under
       # `processos/<tag>/` AND refresh the rolling `processos/latest/` pointer;
-      # a manual `workflow_dispatch` run only refreshes `latest/`. Objects are
-      # uploaded public-read so they can be downloaded over a plain HTTPS URL.
-      # The step is skipped (not failed) when the AWS credentials are absent so
-      # forks/credential-less runs still succeed.
+      # a manual `workflow_dispatch` run only refreshes `latest/`. The bucket is
+      # ACL-disabled (Bucket owner enforced); public read comes from the bucket
+      # policy, so no per-object ACL is set here. The step is skipped (not
+      # failed) when the AWS credentials are absent so credential-less runs pass.
       - name: Mirror binaries to S3
         if: ${{ env.AWS_ACCESS_KEY_ID != '' }}
         run: |
@@ -190,7 +194,6 @@ jobs:
               name="$(basename "$f")"
               echo "↑ s3://${S3_BUCKET}/$1/${name}"
               aws s3 cp "$f" "s3://${S3_BUCKET}/$1/${name}" \
-                --acl public-read \
                 --no-progress \
                 --content-type application/octet-stream \
                 --cache-control "public, max-age=300"
