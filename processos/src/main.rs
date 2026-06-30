@@ -537,6 +537,31 @@ async fn main() {
             "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/export",
             get(cockpit_chat_session_export),
         )
+        // ── Editable model Workbench (ADR 0011) ──────────────────────────────────────────
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/workbench/baseline",
+            get(cockpit_workbench_baseline),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/workbench/validate",
+            post(cockpit_workbench_validate),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/workbench/apply-edit",
+            post(cockpit_workbench_apply_edit),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/workbench/simulate",
+            post(cockpit_workbench_simulate),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/workbench/compare",
+            post(cockpit_workbench_compare),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/workbench/review",
+            post(cockpit_workbench_review),
+        )
         .route(
             "/api/workspaces/{workspace}/processes/{process}/chat/sessions/{id}/trace",
             get(cockpit_chat_session_trace_export),
@@ -1204,10 +1229,16 @@ const WORKSPACE_HTML: &str = include_str!("workspace.html");
 /// Vendored bpmn-js viewer assets (self-contained, served at `/assets/bpmn/*`), so
 /// the workspace console can render a real BPMN diagram with no CDN/build step.
 const BPMN_VIEWER_JS: &str = include_str!("../assets/bpmn/bpmn-navigated-viewer.js");
+/// The full bpmn-js **Modeler** (palette, context pad, structured editing), embedded so the
+/// cockpit's editable-model Workbench (ADR 0011) is self-contained like the read-only viewer.
+const BPMN_MODELER_JS: &str = include_str!("../assets/bpmn/bpmn-modeler.production.min.js");
 const BPMN_AUTO_LAYOUT_JS: &str = include_str!("../assets/bpmn/bpmn-auto-layout.js");
 const BPMN_ELK_JS: &str = include_str!("../assets/bpmn/elk.bundled.js");
 const BPMN_DIAGRAM_CSS: &str = include_str!("../assets/bpmn/diagram-js.css");
 const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css");
+/// Zeebe moddle descriptor, so the Workbench's bpmn-js Modeler binds `zeebe:` extension elements
+/// (e.g. `zeebe:taskDefinition`) and preserves them across an edit instead of dropping them.
+const BPMN_ZEEBE_MODDLE_JSON: &str = include_str!("../assets/bpmn/zeebe-moddle.json");
 const SETTINGS_JS: &str = include_str!("../assets/settings.js");
 
 /// A single embedded file belonging to a demo dataset, addressed by its path
@@ -1479,10 +1510,14 @@ async fn ws_update_process(
 async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
     let (body, ctype): (&'static str, &'static str) = match file.as_str() {
         "bpmn-navigated-viewer.js" => (BPMN_VIEWER_JS, "application/javascript; charset=utf-8"),
+        "bpmn-modeler.production.min.js" => {
+            (BPMN_MODELER_JS, "application/javascript; charset=utf-8")
+        }
         "bpmn-auto-layout.js" => (BPMN_AUTO_LAYOUT_JS, "application/javascript; charset=utf-8"),
         "elk.bundled.js" => (BPMN_ELK_JS, "application/javascript; charset=utf-8"),
         "diagram-js.css" => (BPMN_DIAGRAM_CSS, "text/css; charset=utf-8"),
         "bpmn-embedded.css" => (BPMN_EMBEDDED_CSS, "text/css; charset=utf-8"),
+        "zeebe-moddle.json" => (BPMN_ZEEBE_MODDLE_JSON, "application/json; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     ([
@@ -2830,6 +2865,434 @@ async fn cockpit_chat_session_simulations(
         .unwrap_or_default();
     Json(serde_json::json!({ "sessionId": id, "runs": runs }))
 }
+
+// ── Editable model Workbench (ADR 0011) ──────────────────────────────────────────────
+//
+// The investigation already owns the validate → simulate/compare → ranked-scorecard loop, but
+// only the LLM could drive it (those tools live behind the agent's tool surface). The Workbench
+// exposes the SAME deterministic machinery to a human-edited bpmn-js Modeler canvas over plain
+// HTTP, so an operator-authored variant is scored by the identical harness as an agent variant
+// and lands in the same Simulations tab — tagged by provenance.
+
+/// A request body that carries only a candidate BPMN document.
+#[derive(Debug, Deserialize)]
+struct WorkbenchXmlRequest {
+    xml: String,
+}
+
+/// `POST .../workbench/validate` — the instant, token-free lint-before-simulate gate. Runs the
+/// same deterministic checks the agent's `validate_model` tool uses (`validate_model`, which folds
+/// in `normalize_authoring` + `lint_task_definition_attribute`) and also returns the normalized
+/// XML so the canvas can offer to apply the heal. The cockpit blocks Simulate until `valid` is
+/// true with no error-severity finding.
+async fn cockpit_workbench_validate(
+    Json(req): Json<WorkbenchXmlRequest>,
+) -> impl IntoResponse {
+    let report = match crate::bpmn_model::validate_model(&req.xml) {
+        Ok(v) => v,
+        Err(e) => return unprocessable(e),
+    };
+    let (normalized, fixes) = crate::bpmn_model::normalize_authoring(&req.xml);
+    // Deployable iff it parses AND carries no error-severity finding.
+    let has_error = report
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .map(|a| {
+            a.iter()
+                .any(|f| f.get("severity").and_then(|s| s.as_str()) == Some("error"))
+        })
+        .unwrap_or(false);
+    let deployable = report.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) && !has_error;
+    Json(serde_json::json!({
+        "deployable": deployable,
+        "report": report,
+        "normalizedXml": normalized,
+        "autoFixes": fixes,
+    }))
+    .into_response()
+}
+
+/// `GET .../workbench/baseline` — the model to fork onto a blank canvas: the process's
+/// recorded/deployed BPMN. The frontend also forks suggested-model cards directly (they carry
+/// their own XML), so this is the "start from the real model" entry point.
+async fn cockpit_workbench_baseline(
+    State(state): State<AppState>,
+    Path((workspace, process, _id)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    match state.workspaces.read_model(&workspace, &process) {
+        Some(xml) => Json(serde_json::json!({ "xml": xml, "name": process })).into_response(),
+        None => unprocessable(format!(
+            "process '{process}' has no recorded BPMN model to fork; draw a new model on the canvas \
+             instead"
+        )),
+    }
+}
+
+/// Apply-an-edit request: a base document plus structured `edit_model` operations.
+#[derive(Debug, Deserialize)]
+struct WorkbenchApplyRequest {
+    xml: String,
+    ops: Vec<serde_json::Value>,
+}
+
+/// `POST .../workbench/apply-edit` — deterministically apply structured `edit_model` ops to the
+/// canvas XML (used by "Apply suggestion" when the agent returns counter-edits, and reusable for
+/// any structured authoring). Returns the engine-validated resulting XML.
+async fn cockpit_workbench_apply_edit(
+    Json(req): Json<WorkbenchApplyRequest>,
+) -> impl IntoResponse {
+    match crate::bpmn_model::edit_model(&req.xml, &req.ops) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// Simulate request: a candidate document plus optional name, staged `limit`, and `mockWorkers`
+/// for job types with no recorded history (`requiresNewWorkers`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkbenchSimulateRequest {
+    xml: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+    #[serde(default)]
+    mock_workers: Option<serde_json::Value>,
+}
+
+/// `POST .../workbench/simulate` — replay a human-authored variant against THIS investigation's
+/// recorded dataset, via the exact `experiment::simulate` path the agent's tool uses. The run is
+/// appended to the session transcript (so it surfaces in the Simulations tab and persists across
+/// restarts) tagged `authoredBy: "user"`. Staged with `limit` (1 → 25 → full) like the agent.
+async fn cockpit_workbench_simulate(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+    Json(req): Json<WorkbenchSimulateRequest>,
+) -> impl IntoResponse {
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let model = state.workspaces.read_model(&workspace, &process);
+    let name = req
+        .name
+        .clone()
+        .unwrap_or_else(|| "workbench variant".to_string());
+    let mut args = serde_json::json!({ "model": req.xml, "name": name });
+    if let Some(l) = req.limit {
+        args["limit"] = serde_json::json!(l);
+    }
+    if let Some(m) = &req.mock_workers {
+        args["mockWorkers"] = m.clone();
+    }
+    let args_for_record = args.clone();
+    let result = run_dataset_op(src, move |ds| {
+        crate::experiment::simulate(model.as_deref(), &ds, &args)
+    })
+    .await;
+    match result {
+        Ok(v) => {
+            append_workbench_run(
+                &state,
+                &workspace,
+                &process,
+                &id,
+                "simulate",
+                args_for_record,
+                &v,
+                &format!("Workbench: simulated user-authored variant “{name}”."),
+            );
+            Json(v).into_response()
+        }
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// Compare request: the human variant, plus an optional best agent candidate to rank against.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkbenchCompareRequest {
+    xml: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    limit: Option<u64>,
+    /// The current best agent-authored candidate's XML, so the human edit is ranked head-to-head
+    /// against it as well as the baseline. Optional.
+    #[serde(default)]
+    agent_best: Option<String>,
+    #[serde(default)]
+    agent_best_name: Option<String>,
+}
+
+/// `POST .../workbench/compare` — rank the human variant against the baseline (and, when supplied,
+/// the best agent candidate) on the same recorded dataset via `experiment::compare_variants`. The
+/// ranked run is appended to the transcript tagged `authoredBy: "user"`.
+async fn cockpit_workbench_compare(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+    Json(req): Json<WorkbenchCompareRequest>,
+) -> impl IntoResponse {
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let model = state.workspaces.read_model(&workspace, &process);
+    let name = req.name.clone().unwrap_or_else(|| "workbench variant".to_string());
+    let mut candidates = vec![serde_json::json!({ "name": name, "model": req.xml })];
+    if let Some(base) = &model {
+        candidates.push(serde_json::json!({ "name": "baseline (recorded)", "model": base }));
+    }
+    if let Some(best) = &req.agent_best {
+        let bn = req
+            .agent_best_name
+            .clone()
+            .unwrap_or_else(|| "agent best".to_string());
+        candidates.push(serde_json::json!({ "name": bn, "model": best }));
+    }
+    let mut args = serde_json::json!({ "candidates": candidates });
+    if let Some(l) = req.limit {
+        args["limit"] = serde_json::json!(l);
+    }
+    let args_for_record = args.clone();
+    let model_cloned = model.clone();
+    let result = run_dataset_op(src, move |ds| {
+        crate::experiment::compare_variants(model_cloned.as_deref(), &ds, &args)
+    })
+    .await;
+    match result {
+        Ok(v) => {
+            append_workbench_run(
+                &state,
+                &workspace,
+                &process,
+                &id,
+                "compare_variants",
+                args_for_record,
+                &v,
+                &format!("Workbench: compared user-authored variant “{name}”."),
+            );
+            Json(v).into_response()
+        }
+        Err(e) => bad_gateway(e),
+    }
+}
+
+/// Agent-review request: the current canvas plus an optional persona/LLM and instruction.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkbenchReviewRequest {
+    xml: String,
+    #[serde(default)]
+    persona_id: Option<String>,
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    #[serde(default)]
+    instruction: Option<String>,
+}
+
+/// `POST .../workbench/review` — ask an LLM (investigator or a chosen persona) to review the
+/// canvas. The turn runs through the normal `run_chat_turn` machinery (so it persists in the
+/// conversation and can itself simulate), and if the agent proposes structured `edit_model` ops we
+/// surface them as an applyable diff: `{ answer, ops, resultingXml }`. Counter-edits flow back to
+/// the canvas via `apply-edit`.
+async fn cockpit_workbench_review(
+    State(state): State<AppState>,
+    Path((workspace, process, id)): Path<(String, String, String)>,
+    Json(req): Json<WorkbenchReviewRequest>,
+) -> impl IntoResponse {
+    let cfg = resolve_llm(&state, req.llm.as_ref());
+    if !cfg.is_ready() {
+        return unprocessable("no LLM model configured for the review".to_string());
+    }
+    let src = match state.workspaces.resolve_source(&workspace, &process) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let py = state.settings.snapshot().py_config();
+    let objective = state
+        .workspaces
+        .get_process(&workspace, &process)
+        .and_then(|p| p.config.objective);
+    let model = state.workspaces.read_model(&workspace, &process);
+    let key = chat::session_key(&workspace, &process);
+    let sid = resolve_session(&state, &key, Some(&id)).id;
+    let (persona_id, persona_system) = state.personas.resolve(req.persona_id.as_deref());
+    let session = state.chat.get(&key, &sid).unwrap_or_default();
+    if session.messages.is_empty() {
+        state.chat.set_persona(&key, &sid, &persona_id);
+    }
+    state.chat.record_model(&key, &sid, &cfg.model);
+    let prior = session.messages;
+    let prior_stamps = session.stamps;
+    let prior_turn_models = session.turn_models;
+    let model_label = cfg.model.clone();
+    let user_ts = chat_now_ms();
+    let instruction = req.instruction.clone().unwrap_or_else(|| {
+        "Review the BPMN model below that I drew on the workbench canvas. Assess it for structural \
+         defects and whether it improves on the recorded baseline against this investigation's \
+         dataset. If you can improve it, call edit_model with `base` set to exactly this XML and \
+         return concrete ops. Then briefly summarise your assessment."
+            .to_string()
+    });
+    let message = format!("{instruction}\n\n```xml\n{}\n```", req.xml);
+    let task = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let mut sink = |_ev: agent::AgentEvent| {};
+        rt.block_on(investigate::run_chat_turn(
+            &src,
+            cfg,
+            py,
+            100_000,
+            12,
+            false,
+            objective.as_deref(),
+            Some(&persona_system),
+            model,
+            None,
+            None,
+            &mut sink,
+            &[],
+            None,
+            Vec::new(),
+            None,
+            prior,
+            &message,
+            None,
+        ))
+    })
+    .await;
+    match task {
+        Ok(Ok(result)) => {
+            let stamps =
+                chat::extend_stamps(&result.messages, prior_stamps, user_ts, chat_now_ms());
+            let turn_models =
+                chat::extend_turn_models(&result.messages, prior_turn_models, &model_label);
+            // Pull out the agent's last edit_model proposal, if any, as an applyable diff.
+            let (ops, resulting_xml) = last_edit_model(&result.messages);
+            state
+                .chat
+                .save(&key, &sid, result.messages.clone(), stamps.clone());
+            state.chat.set_turn_models(&key, &sid, turn_models.clone());
+            Json(serde_json::json!({
+                "sessionId": sid,
+                "answer": result.answer,
+                "ops": ops,
+                "resultingXml": resulting_xml,
+                "turns": chat::render_view_full(&result.messages, &stamps, &turn_models),
+            }))
+            .into_response()
+        }
+        Ok(Err(e)) => bad_gateway(e),
+        Err(e) => bad_gateway(format!("review task failed: {e}")),
+    }
+}
+
+/// Scan a finished transcript for the agent's most recent `edit_model` tool call and its result,
+/// returning the ops it applied and the resulting XML (so the canvas can offer "Apply suggestion").
+fn last_edit_model(messages: &[agent::Msg]) -> (serde_json::Value, Option<String>) {
+    use std::collections::HashMap;
+    let mut results: HashMap<&str, &str> = HashMap::new();
+    for m in messages {
+        if let agent::Msg::Tool { call_id, content } = m {
+            results.insert(call_id.as_str(), content.as_str());
+        }
+    }
+    let mut found = (serde_json::Value::Null, None);
+    for m in messages {
+        if let agent::Msg::Assistant { tool_calls, .. } = m {
+            for tc in tool_calls {
+                if tc.name != "edit_model" {
+                    continue;
+                }
+                let ops = tc.arguments.get("ops").cloned().unwrap_or(serde_json::Value::Null);
+                let xml = results.get(tc.id.as_str()).and_then(|c| {
+                    serde_json::from_str::<serde_json::Value>(c)
+                        .ok()
+                        .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from))
+                });
+                if xml.is_some() {
+                    found = (ops, xml);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Run a closure that needs the recorded dataset on a dedicated current-thread runtime. The
+/// dataset is distilled from the (Send) `TraceSource`; the closure (`simulate`/`compare_variants`)
+/// is synchronous and CPU-bound, so it runs off the async executor like `run_investigation`.
+async fn run_dataset_op<F>(src: dataset::TraceSource, f: F) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(crate::experiment::RecordedDataset) -> Result<serde_json::Value, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let cap = crate::experiment::recorded_cap(&src);
+        let ds = rt.block_on(crate::experiment::build_recorded_dataset(&src, cap));
+        f(ds)
+    })
+    .await
+    .map_err(|e| format!("dataset op failed: {e}"))?
+}
+
+/// Append a Workbench simulate/compare run to a session transcript so it renders in the
+/// Simulations tab beside agent runs. We write a self-contained mini-turn — an assistant tool
+/// call, its result, and a short note that flushes the timeline — so `extract_simulations` picks
+/// it up and the leftover timeline never leaks into the next real turn. The `authoredBy` field in
+/// the recorded arguments carries provenance.
+#[allow(clippy::too_many_arguments)]
+fn append_workbench_run(
+    state: &AppState,
+    workspace: &str,
+    process: &str,
+    sid: &str,
+    tool: &str,
+    mut arguments: serde_json::Value,
+    result: &serde_json::Value,
+    note: &str,
+) {
+    let key = chat::session_key(workspace, process);
+    let mut session = state.chat.get(&key, sid).unwrap_or_default();
+    if let Some(obj) = arguments.as_object_mut() {
+        obj.insert("authoredBy".into(), serde_json::json!("user"));
+    }
+    let call_id = format!("wb-{}-{}", tool, chat_now_ms());
+    let result_str = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_string());
+    session.messages.push(agent::Msg::Assistant {
+        text: None,
+        tool_calls: vec![agent::ToolCall {
+            id: call_id.clone(),
+            name: tool.to_string(),
+            arguments,
+        }],
+    });
+    session.messages.push(agent::Msg::Tool {
+        call_id,
+        content: result_str,
+    });
+    session.messages.push(agent::Msg::Assistant {
+        text: Some(note.to_string()),
+        tool_calls: Vec::new(),
+    });
+    let now = chat_now_ms();
+    let stamps = chat::extend_stamps(&session.messages, session.stamps.clone(), now, now);
+    let turn_models =
+        chat::extend_turn_models(&session.messages, session.turn_models.clone(), "workbench");
+    state
+        .chat
+        .save(&key, sid, session.messages.clone(), stamps);
+    state.chat.set_turn_models(&key, sid, turn_models);
+}
+
 /// `GET .../chat/sessions/{id}/export` — download this session's transcript as Markdown or
 /// plain text. `mode=chat` (default) is the clean conversation; `mode=debug` adds each turn's
 /// reasoning timeline and tool calls (arguments + results). `format=md` (default) or `txt`.

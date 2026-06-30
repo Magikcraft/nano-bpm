@@ -177,6 +177,38 @@
   .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: #8b8b93; cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
   .chat-tabs .ctab:hover { color: #c7d2fe; }
   .chat-tabs .ctab.active { color: #e4e4e7; background: #11142a; border-color: #28306a; }
+  /* ── Editable model Workbench (ADR 0011) ── */
+  .chatwb { display: flex; flex-direction: column; min-height: 480px; padding: 8px 10px; gap: 8px; }
+  .wb-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .wb-actions, .wb-run { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+  .wb-prov { font-size: 11px; color: #8b8b93; }
+  .wb-prov b { color: #c7d2fe; font-weight: 700; }
+  .wb-stage { font-size: 11px; color: #8b8b93; display: flex; align-items: center; gap: 4px; }
+  .wb-stage select { background: #14141a; color: #e4e4e7; border: 1px solid #2a2a33; border-radius: 6px; padding: 3px 5px; font: inherit; font-size: 11px; }
+  .wb-lint { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 9px; border-radius: 8px; background: #0c0c0e; border: 1px solid #1f1f25; }
+  .wb-lint-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .wb-lint-dot.ok { background: #34d399; box-shadow: 0 0 8px rgba(52,211,153,.6); }
+  .wb-lint-dot.bad { background: #f87171; box-shadow: 0 0 8px rgba(248,113,113,.6); }
+  .wb-lint-dot.warn { background: #fbbf24; }
+  .wb-lint-dot.pending { background: #6b7280; }
+  .wb-lint.bad { border-color: #5b2330; background: #1a0f12; }
+  .wb-lint-hints { color: #f0a3a3; font-size: 11px; margin-left: 4px; }
+  .wb-canvas { position: relative; height: 460px; background: #fafafa; border: 1px solid #26262b; border-radius: 12px; overflow: hidden; }
+  .wb-canvas .djs-palette { background: #fff; }
+  .wb-err-marker .djs-visual > :nth-child(1) { stroke: #e11d48 !important; stroke-width: 2.5px !important; }
+  .wb-warn-marker .djs-visual > :nth-child(1) { stroke: #d97706 !important; stroke-width: 2px !important; }
+  .wb-overlay { background: #1a0f12; color: #f0a3a3; border: 1px solid #5b2330; border-radius: 6px; padding: 4px 7px; font: 11px/1.35 ui-monospace, monospace; max-width: 260px; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
+  .wb-overlay.warn { background: #1c1505; color: #fbcf8a; border-color: #5b4310; }
+  .wb-side { border: 1px solid #1f1f25; border-radius: 10px; background: #0c0c0e; padding: 10px 12px; font-size: 12px; }
+  .wb-side h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #8b8b93; }
+  .wb-mock-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; flex-wrap: wrap; }
+  .wb-mock-row code { color: #c7d2fe; }
+  .wb-mock-row select, .wb-mock-row input { background: #14141a; color: #e4e4e7; border: 1px solid #2a2a33; border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 11px; }
+  .wb-apply { margin-top: 8px; }
+  .prov-badge { font: 700 9px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 6px; border-radius: 999px; vertical-align: 1px; margin-left: 6px; }
+  .prov-badge.user { color: #6ee7b7; background: rgba(16,185,129,.14); }
+  .prov-badge.agent { color: #93c5fd; background: rgba(59,130,246,.14); }
+  .prov-badge.co { color: #c084fc; background: rgba(168,85,247,.14); }
   .chat-export { position: relative; margin-left: auto; }
   .export-menu { position: absolute; right: 0; top: calc(100% + 2px); z-index: 30; background: #14141a; border: 1px solid #2a2a33; border-radius: 8px; padding: 4px; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
   .export-menu[hidden] { display: none; }
@@ -461,6 +493,11 @@
 </dialog>
 
 <script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
+<script>window.BpmnViewer = window.BpmnJS;</script>
+<!-- The Modeler bundle also exports the global `BpmnJS`; stash it as `BpmnModeler` and restore the
+     read-only viewer so every existing card/diagram keeps rendering with the viewer. -->
+<script src="/assets/bpmn/bpmn-modeler.production.min.js"></script>
+<script>window.BpmnModeler = window.BpmnJS; window.BpmnJS = window.BpmnViewer;</script>
 <script src="/assets/bpmn/bpmn-auto-layout.js"></script>
 <script src="/assets/bpmn/elk.bundled.js"></script>
 <script>
@@ -1869,6 +1906,7 @@ async function renderWorkspace(ws, proc){
           <button class="ctab active" id="tabChat" data-tab="chat">Chat</button>
           <button class="ctab" id="tabSims" data-tab="sims" title="The Alternate Reality Engine runs the droid forked this session — each variant and its fidelity scorecard">Simulations</button>
           <button class="ctab" id="tabDebug" data-tab="debug" title="See exactly what was sent to the model this session">Debug</button>
+          <button class="ctab" id="tabWb" data-tab="wb" title="Workbench — edit a BPMN model on a canvas and score it against this investigation's dataset (ADR 0011)">Workbench</button>
           <span class="chat-export" id="chatExportWrap">
             <button class="ctab" id="chatExport" title="Download this investigation as Markdown or text">Export \u25BE</button>
             <div class="export-menu" id="chatExportMenu" hidden>
@@ -1886,6 +1924,31 @@ async function renderWorkspace(ws, proc){
         <div id="chatLog" class="chatlog"><div class="empty">Loading conversation…</div></div>
         <div id="chatSims" class="chatsims" style="display:none"><div class="empty">No simulations yet. In the Experiment Designer persona, the droid forks the model and replays it against the dataset; each run appears here with its variant and scorecard.</div></div>
         <div id="chatDebug" class="chatdebug" style="display:none"><div class="empty">No request captured yet. Send a message; the exact payload sent to the model will appear here.</div></div>
+        <div id="chatWb" class="chatwb" style="display:none">
+          <div class="wb-toolbar">
+            <div class="wb-actions">
+              <button class="btn ghost" id="wbForkBaseline" title="Load the recorded/deployed model onto the canvas">Fork baseline</button>
+              <button class="btn ghost" id="wbReset" title="Clear the canvas to a fresh empty model">New</button>
+              <span class="wb-prov" id="wbProv" title="Who authored the model on the canvas">authored by <b>you</b></span>
+            </div>
+            <div class="wb-run">
+              <label class="wb-stage" title="Replay only the first N recorded instances (cheap staging), or the full population">replay
+                <select id="wbLimit">
+                  <option value="1">1 (smoke)</option>
+                  <option value="25" selected>25 (sample)</option>
+                  <option value="0">full</option>
+                </select>
+              </label>
+              <button class="btn primary" id="wbSimulate" title="Replay this model against the recorded dataset" disabled>Simulate →</button>
+              <button class="btn" id="wbCompare" title="Rank this model against the baseline (and the agent's best candidate)" disabled>Compare</button>
+              <button class="btn" id="wbReview" title="Ask the LLM to review the canvas and propose edits" disabled>Ask agent ▾</button>
+              <button class="btn ghost" id="wbDownload" title="Download the canvas as .bpmn">⤓ .bpmn</button>
+            </div>
+          </div>
+          <div class="wb-lint" id="wbLint"><span class="wb-lint-dot pending"></span><span id="wbLintText">Draw or fork a model to begin.</span></div>
+          <div class="wb-canvas" id="wbCanvas"></div>
+          <div class="wb-side" id="wbSide" style="display:none"></div>
+        </div>
         <div class="compose" id="chatCompose">
           <div class="compose-row">
             <label class="persona-pick" title="The persona sets the droid's standing instructions (system prompt) for this chat. It's fixed once the conversation starts.">
@@ -1940,6 +2003,7 @@ async function renderWorkspace(ws, proc){
   $('#tabChat').onclick = () => switchChatTab('chat', ws, proc);
   $('#tabSims').onclick = () => switchChatTab('sims', ws, proc);
   $('#tabDebug').onclick = () => switchChatTab('debug', ws, proc);
+  $('#tabWb').onclick = () => switchChatTab('wb', ws, proc);
   wireExportMenu(ws, proc);
   $('#chatSend').onclick = () => submitCompose(ws, proc);
   $('#chatSendMenu').onclick = (e) => { e.stopPropagation(); toggleProfileMenu(); };
@@ -2046,18 +2110,21 @@ function wireTraceImport(ws, proc){
 // ── Chat / Simulations / Debug tab switcher ──────────────────────────────────
 function switchChatTab(tab, ws, proc){
   STATE.chatTab = tab;
-  const onChat = tab === 'chat', onSims = tab === 'sims', onDebug = tab === 'debug';
-  const log = $('#chatLog'), sims = $('#chatSims'), dbg = $('#chatDebug'), compose = $('#chatCompose');
+  const onChat = tab === 'chat', onSims = tab === 'sims', onDebug = tab === 'debug', onWb = tab === 'wb';
+  const log = $('#chatLog'), sims = $('#chatSims'), dbg = $('#chatDebug'), compose = $('#chatCompose'), wb = $('#chatWb');
   if(log) log.style.display = onChat ? '' : 'none';
   if(compose) compose.style.display = onChat ? '' : 'none';
   if(sims) sims.style.display = onSims ? '' : 'none';
   if(dbg) dbg.style.display = onDebug ? '' : 'none';
-  const tc = $('#tabChat'), ts = $('#tabSims'), td = $('#tabDebug');
+  if(wb) wb.style.display = onWb ? '' : 'none';
+  const tc = $('#tabChat'), ts = $('#tabSims'), td = $('#tabDebug'), tw = $('#tabWb');
   if(tc) tc.classList.toggle('active', onChat);
   if(ts) ts.classList.toggle('active', onSims);
   if(td) td.classList.toggle('active', onDebug);
+  if(tw) tw.classList.toggle('active', onWb);
   if(onSims) loadSims(ws, proc);
   if(onDebug) loadDebug(ws, proc);
+  if(onWb) openWorkbench(ws, proc);
 }
 
 // Render the Alternate Reality Engine runs for this session — persisted runs (whole transcript)
@@ -2118,6 +2185,9 @@ function renderSims(runs){
     let args = run.arguments; if(typeof args === 'string'){ try { args = JSON.parse(args); } catch(_){ args = {}; } }
     let res = run.result; if(typeof res === 'string'){ try { res = JSON.parse(res); } catch(_){ res = { raw: run.result }; } }
     const ts = run.ts ? '<span class="dbg-ts" title="'+esc(new Date(run.ts).toLocaleString())+'">'+esc(fmtClock(run.ts))+'</span>' : '';
+    const prov = (args && args.authoredBy === 'user')
+      ? '<span class="prov-badge user" title="Human-authored variant from the Workbench">you</span>'
+      : '<span class="prov-badge agent" title="Agent-authored variant">agent</span>';
     let candidates = []; // {name, xml, sc, best}
     if(run.tool === 'compare_variants'){
       const argMap = {};
@@ -2129,7 +2199,7 @@ function renderSims(runs){
       const sc = res ? (res.scorecard || res) : null;
       candidates = [{ name: (args && args.name) || (sc && sc.name) || 'variant', xml: args && args.model, sc, best: false }];
     }
-    const head = '<div class="sim-head"><span class="sim-tool">'+(run.tool==='compare_variants'?'compare variants':'simulate')+'</span>'+
+    const head = '<div class="sim-head"><span class="sim-tool">'+(run.tool==='compare_variants'?'compare variants':'simulate')+'</span>'+prov+
       '<span class="sim-meta">'+candidates.length+' model'+(candidates.length===1?'':'s')+
       (res && res.datasetSize!=null ? (' \u00b7 '+res.datasetSize+' instances replayed') : '')+'</span>'+ts+'</div>';
     const note = (res && res.replayable === false)
@@ -2681,6 +2751,7 @@ function modelCardHtml(m){
         '<button class="mc-tab" data-mc-tab="xml">XML</button>'+
       '</div>'+
       '<div class="mc-actions">'+
+        '<button class="mc-btn mc-edit" title="Edit this model on the Workbench canvas">\u270e</button>'+
         '<button class="mc-btn mc-expand" title="Expand">\u2922</button>'+
         '<button class="mc-btn mc-dl" title="Download .bpmn">\u2913</button>'+
       '</div>'+
@@ -2978,8 +3049,274 @@ if(!window.__modelCardsWired){
     if(exp){ openModelModal(exp.closest('.modelcard')); return; }
     const dl = t.closest && t.closest('.mc-dl');
     if(dl){ downloadModel(dl.closest('.modelcard')); return; }
+    const ed = t.closest && t.closest('.mc-edit');
+    if(ed){ editModelOnWorkbench(modelXmlOf(ed.closest('.modelcard')), modelNameOf(ed.closest('.modelcard'))); return; }
   });
 }
+
+// ── Editable model Workbench (ADR 0011) ──────────────────────────────────────────────
+// A bpmn-js Modeler canvas bound to the open investigation. The human-edited model is a
+// first-class variant: validated by the same deterministic gate the agent uses, then simulated /
+// compared against the SAME recorded dataset, landing in the Simulations tab tagged by provenance.
+const WB = { modeler: null, ws: null, proc: null, prov: 'you', zeebe: null, debounce: null, deployable: false, busy: false };
+
+function wbBase(){
+  return '/api/workspaces/'+encodeURIComponent(WB.ws)+'/processes/'+encodeURIComponent(WB.proc)+
+    '/chat/sessions/'+encodeURIComponent(STATE.sessionId||'')+'/workbench';
+}
+async function wbPost(sub, body){
+  return api(wbBase()+sub, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{}) });
+}
+
+async function openWorkbench(ws, proc){
+  WB.ws = ws; WB.proc = proc;
+  if(typeof BpmnModeler === 'undefined'){ $('#wbLintText').textContent = 'Modeler bundle unavailable.'; return; }
+  if(!WB.modeler){
+    try {
+      if(!WB.zeebe){ WB.zeebe = await (await fetch('/assets/bpmn/zeebe-moddle.json')).json(); }
+    } catch(_){ WB.zeebe = null; }
+    WB.modeler = new BpmnModeler({ container: $('#wbCanvas'), moddleExtensions: WB.zeebe ? { zeebe: WB.zeebe } : {} });
+    WB.modeler.on('commandStack.changed', () => wbScheduleValidate());
+    wbWireToolbar();
+    await wbNewDiagram();
+  }
+  wbRefreshSessionGating();
+}
+
+function wbRefreshSessionGating(){
+  // simulate/compare/review persist into a session; without one, only draw/validate/download work.
+  const hasSession = !!STATE.sessionId;
+  const rev = $('#wbReview'); if(rev) rev.disabled = !hasSession || !WB.deployable;
+}
+
+function wbWireToolbar(){
+  $('#wbForkBaseline').onclick = wbForkBaseline;
+  $('#wbReset').onclick = () => wbNewDiagram();
+  $('#wbDownload').onclick = wbDownloadCanvas;
+  $('#wbSimulate').onclick = () => wbRun('simulate');
+  $('#wbCompare').onclick = () => wbRun('compare');
+  $('#wbReview').onclick = wbReview;
+}
+
+async function wbNewDiagram(){
+  try { await WB.modeler.createDiagram(); WB.prov = 'you'; wbSetProv(); await wbValidate(); }
+  catch(e){ $('#wbLintText').textContent = 'could not init canvas: '+((e&&e.message)||e); }
+}
+
+function wbSetProv(){
+  const m = { you:'<b>you</b>', agent:'<b>the agent</b>', 'co-edited':'<b>you + agent</b>' };
+  $('#wbProv').innerHTML = 'authored by '+(m[WB.prov]||'<b>you</b>');
+}
+
+// Load XML onto the canvas (laid out with ELK first if it lacks DI), set provenance, validate.
+async function wbLoadXml(xml, prov){
+  if(!WB.modeler) return;
+  let ready = xml;
+  try { ready = await ensureBpmnLayout(xml); } catch(_){}
+  try { await WB.modeler.importXML(ready); try { WB.modeler.get('canvas').zoom('fit-viewport','auto'); } catch(_){}
+    WB.prov = prov || 'you'; wbSetProv(); await wbValidate();
+  } catch(e){ $('#wbLintText').textContent = 'could not load model: '+((e&&e.message)||e); }
+}
+
+async function wbCurrentXml(){
+  const { xml } = await WB.modeler.saveXML({ format: true });
+  return xml;
+}
+
+// Switch to the Workbench tab and fork a model onto the canvas (from a card or the baseline).
+async function editModelOnWorkbench(xml, name){
+  if(STATE.chatTab !== 'wb'){ switchChatTab('wb', WB.ws || STATE.ws, WB.proc || STATE.wsProc); }
+  await openWorkbench(WB.ws || STATE.ws, WB.proc || STATE.wsProc);
+  await wbLoadXml(xml, 'agent');
+}
+
+async function wbForkBaseline(){
+  try {
+    const d = await api(wbBase()+'/baseline');
+    await wbLoadXml(d.xml, 'you');
+  } catch(e){ $('#wbLintText').textContent = 'no baseline to fork: '+((e&&e.message)||e); }
+}
+
+function wbScheduleValidate(){ clearTimeout(WB.debounce); WB.debounce = setTimeout(() => { wbValidate(); }, 400); }
+
+// The deterministic lint-before-simulate gate. Marks offending elements and toggles Simulate.
+async function wbValidate(){
+  let xml; try { xml = await wbCurrentXml(); } catch(_){ return; }
+  let d;
+  try { d = await wbPost('/validate', { xml }); }
+  catch(e){ wbSetLint(false, [(e&&e.message)||String(e)]); return; }
+  WB.deployable = !!d.deployable;
+  const findings = (d.report && d.report.findings) || [];
+  wbApplyMarkers(findings);
+  const errs = findings.filter(f => f.severity === 'error').map(f => f.message);
+  const warns = findings.filter(f => f.severity === 'warn').map(f => f.message);
+  wbSetLint(WB.deployable, errs, warns, d.report);
+  const en = WB.deployable;
+  $('#wbSimulate').disabled = !en;
+  $('#wbCompare').disabled = !en;
+  $('#wbReview').disabled = !en || !STATE.sessionId;
+}
+
+function wbSetLint(ok, errs, warns, report){
+  const lint = $('#wbLint'); const dot = lint.querySelector('.wb-lint-dot'); const txt = $('#wbLintText');
+  errs = errs || []; warns = warns || [];
+  dot.className = 'wb-lint-dot ' + (ok ? (warns.length ? 'warn' : 'ok') : 'bad');
+  lint.classList.toggle('bad', !ok);
+  if(!ok){
+    txt.innerHTML = '<b>Not deployable.</b> '+esc(errs[0]||'fix the errors before simulating')+
+      (errs.length>1?' <span class="wb-lint-hints">(+'+(errs.length-1)+' more)</span>':'');
+  } else if(warns.length){
+    txt.innerHTML = '<b>Deployable.</b> '+warns.length+' advisory finding'+(warns.length===1?'':'s')+'. Ready to simulate.';
+  } else {
+    txt.innerHTML = '<b>Deployable.</b> Validated on the nano engine — ready to simulate.';
+  }
+}
+
+function wbApplyMarkers(findings){
+  if(!WB.modeler) return;
+  let canvas, overlays, reg;
+  try { canvas = WB.modeler.get('canvas'); overlays = WB.modeler.get('overlays'); reg = WB.modeler.get('elementRegistry'); } catch(_){ return; }
+  // Clear previous markers/overlays.
+  (WB._marked||[]).forEach(id => { try { canvas.removeMarker(id,'wb-err-marker'); canvas.removeMarker(id,'wb-warn-marker'); } catch(_){} });
+  try { overlays.remove({ type: 'wb-lint' }); } catch(_){}
+  WB._marked = [];
+  findings.forEach(f => {
+    const id = f.element; if(!id || !reg.get(id)) return;
+    const sev = f.severity === 'error' ? 'err' : (f.severity === 'warn' ? 'warn' : null);
+    if(!sev) return;
+    canvas.addMarker(id, sev==='err'?'wb-err-marker':'wb-warn-marker');
+    WB._marked.push(id);
+    try { overlays.add(id, 'wb-lint', { position: { bottom: 0, left: 0 }, html: '<div class="wb-overlay'+(sev==='warn'?' warn':'')+'">'+esc(f.message||f.code||'issue')+'</div>' }); } catch(_){}
+  });
+}
+
+async function wbDownloadCanvas(){
+  try {
+    const xml = await wbCurrentXml();
+    const blob = new Blob([xml], { type:'application/xml' });
+    const url = URL.createObjectURL(blob); const a = document.createElement('a');
+    a.href = url; a.download = 'workbench-variant.bpmn'; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch(_){}
+}
+
+// Find the best agent-authored candidate's XML from this session's persisted sims (for Compare).
+function wbAgentBest(){
+  const runs = Array.isArray(STATE.simPersisted) ? STATE.simPersisted : [];
+  for(let i = runs.length - 1; i >= 0; i--){
+    const run = runs[i]; let args = run.arguments; if(typeof args==='string'){ try{args=JSON.parse(args);}catch(_){args={};} }
+    if(args && args.authoredBy === 'user') continue; // skip our own
+    let res = run.result; if(typeof res==='string'){ try{res=JSON.parse(res);}catch(_){res=null;} }
+    if(run.tool === 'compare_variants'){
+      const best = res && res.best; const argMap = {};
+      ((args&&args.candidates)||[]).forEach(c => { if(c&&c.name) argMap[c.name]=c.model; });
+      if(best && argMap[best]) return { xml: argMap[best], name: best };
+    } else if(run.tool === 'simulate' && args && args.model){
+      return { xml: args.model, name: (args.name||'agent variant') };
+    }
+  }
+  return null;
+}
+
+function wbLimit(){ const v = parseInt($('#wbLimit').value, 10); return isNaN(v) ? 0 : v; }
+
+async function wbRun(kind, mockWorkers){
+  if(WB.busy) return; WB.busy = true;
+  const side = $('#wbSide'); side.style.display = ''; side.innerHTML = '<h4>'+(kind==='compare'?'Compare':'Simulate')+'</h4><div class="muted">replaying against the recorded dataset…</div>';
+  try {
+    const xml = await wbCurrentXml();
+    const limit = wbLimit();
+    let d;
+    if(kind === 'compare'){
+      const best = wbAgentBest();
+      d = await wbPost('/compare', { xml, name:'workbench variant', limit, agentBest: best && best.xml, agentBestName: best && best.name });
+      wbRenderCompare(d);
+    } else {
+      const body = { xml, name:'workbench variant', limit };
+      if(mockWorkers) body.mockWorkers = mockWorkers;
+      d = await wbPost('/simulate', body);
+      wbRenderSimulate(d);
+    }
+    // Refresh the Simulations tab data so the new run shows there too.
+    STATE.simPersisted = null; loadSims(WB.ws, WB.proc);
+  } catch(e){
+    side.innerHTML = '<h4>'+(kind==='compare'?'Compare':'Simulate')+'</h4><div class="err">'+esc((e&&e.message)||e)+'</div>';
+  } finally { WB.busy = false; }
+}
+
+function wbRenderSimulate(d){
+  const side = $('#wbSide'); side.style.display = '';
+  const sc = d && (d.scorecard || d);
+  let html = '<h4>Simulation <span class="prov-badge user">you</span></h4>';
+  html += scorecardSummaryHtml(sc);
+  // requiresNewWorkers → inline mock authoring (token-free deterministic mocks).
+  const needs = (sc && sc.requiresNewWorkers) || [];
+  if(needs.length){
+    html += '<div style="margin-top:8px"><h4>'+needs.length+' new task'+(needs.length===1?'':'s')+' have no recorded behaviour</h4>'+
+      '<div class="muted" style="margin-bottom:6px">Mock them to simulate — fidelity caveat: these never ran in production.</div>';
+    needs.forEach(jt => {
+      html += '<div class="wb-mock-row" data-jt="'+esc(jt)+'"><code>'+esc(jt)+'</code>'+
+        '<select class="wb-mock-mode"><option value="complete">complete (no vars)</option><option value="error">throw error</option></select>'+
+        '<input class="wb-mock-code" placeholder="ERROR_CODE" style="display:none" /></div>';
+    });
+    html += '<button class="btn primary wb-apply" id="wbMockRun">Re-simulate with mocks</button></div>';
+  }
+  if(d && d.divergentWorkers && d.divergentWorkers.length){
+    html += '<div class="muted" style="margin-top:6px">Divergent (history exists but rerouted): <code>'+esc(d.divergentWorkers.join(', '))+'</code> — fix topology, don\u2019t mock.</div>';
+  }
+  side.innerHTML = html;
+  side.querySelectorAll('.wb-mock-row .wb-mock-mode').forEach(sel => {
+    sel.onchange = () => { const inp = sel.parentElement.querySelector('.wb-mock-code'); inp.style.display = sel.value==='error' ? '' : 'none'; };
+  });
+  const run = side.querySelector('#wbMockRun');
+  if(run) run.onclick = () => {
+    const mocks = {};
+    side.querySelectorAll('.wb-mock-row').forEach(row => {
+      const jt = row.dataset.jt; const mode = row.querySelector('.wb-mock-mode').value;
+      if(mode === 'error'){ const code = (row.querySelector('.wb-mock-code').value||'ERROR').trim(); mocks[jt] = { throwError: code }; }
+      else { mocks[jt] = {}; }
+    });
+    wbRun('simulate', mocks);
+  };
+}
+
+function wbRenderCompare(d){
+  const side = $('#wbSide'); side.style.display = '';
+  const cands = (d && d.candidates) || [];
+  if(!cands.length){ side.innerHTML = '<h4>Compare</h4><div class="err">'+esc((d&&d.note)||'no ranked candidates')+'</div>'; return; }
+  const best = d && d.best;
+  let rows = cands.map(c => {
+    const rep = c.report || {};
+    const prov = /workbench/i.test(c.name) ? '<span class="prov-badge user">you</span>' : '<span class="prov-badge agent">agent</span>';
+    return '<tr'+(c.name===best?' style="background:rgba(110,231,183,.08)"':'')+'><td>'+(c.name===best?'★ ':'')+esc(c.name)+prov+'</td>'+
+      '<td>'+esc(c.fidelityTier||'\u2014')+'</td>'+
+      '<td class="num">'+fmtSimPct(rep.conservedRate)+'</td>'+
+      '<td class="num">'+fmtSimMs(rep.p99E2eLatencyMs)+'</td></tr>';
+  }).join('');
+  side.innerHTML = '<h4>Ranked candidates</h4><table class="rank"><thead><tr><th>variant</th><th>fidelity</th><th class="num">conserved</th><th class="num">p99</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
+
+// Ask the LLM to review the canvas; surface its prose in Chat and any edit_model diff as Apply.
+async function wbReview(){
+  if(WB.busy || !STATE.sessionId) return; WB.busy = true;
+  const side = $('#wbSide'); side.style.display = ''; side.innerHTML = '<h4>Agent review</h4><div class="muted">the agent is reviewing the canvas…</div>';
+  try {
+    const xml = await wbCurrentXml();
+    const d = await wbPost('/review', { xml });
+    let html = '<h4>Agent review</h4><div style="white-space:pre-wrap">'+esc((d.answer||'').slice(0, 1200))+((d.answer||'').length>1200?'…':'')+'</div>';
+    if(d.resultingXml){
+      html += '<button class="btn primary wb-apply" id="wbApplyEdit">Apply suggestion to canvas</button>';
+    }
+    side.innerHTML = html;
+    const ap = side.querySelector('#wbApplyEdit');
+    if(ap) ap.onclick = async () => { await wbLoadXml(d.resultingXml, 'co-edited'); side.innerHTML += '<div class="muted" style="margin-top:6px">Applied. Re-validate &amp; simulate to score it.</div>'; };
+    // Reflect the new turn in the Chat tab too.
+    if(typeof loadChat === 'function'){ try { loadChat(WB.ws, WB.proc); } catch(_){} }
+  } catch(e){
+    side.innerHTML = '<h4>Agent review</h4><div class="err">'+esc((e&&e.message)||e)+'</div>';
+  } finally { WB.busy = false; }
+}
+
 
 // Copy-to-clipboard for droid bubbles (delegated once; survives chat re-renders).
 if(!window.__copyWired){
@@ -3742,6 +4079,13 @@ async function renderWsModel(url){
     const viewer = new BpmnJS({ container: el });
     await viewer.importXML(await ensureBpmnLayout(xml));
     viewer.get('canvas').zoom('fit-viewport', 'auto');
+    // Offer to fork the recorded model onto the Workbench canvas.
+    const btn = document.createElement('button');
+    btn.className = 'btn ghost'; btn.textContent = '\u270e Edit on Workbench';
+    btn.style.cssText = 'position:absolute;top:8px;right:8px;z-index:5;font-size:11px';
+    btn.onclick = () => editModelOnWorkbench(xml, 'recorded model');
+    el.style.position = 'relative';
+    el.appendChild(btn);
   } catch(e){ el.innerHTML = '<p class="err" style="padding:12px">could not render model: '+esc(e.message||e)+'</p>'; }
 }
 
