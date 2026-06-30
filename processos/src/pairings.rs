@@ -62,6 +62,13 @@ pub struct Pairing {
     /// Subagent only: max chars of digest fed back to the primary (server clamps 500..20000).
     #[serde(default)]
     pub digest_cap: Option<usize>,
+    /// Optional allowlist of tool names the PRIMARY model may use under this pairing. `None` =
+    /// the full available surface. Lets a pairing scope the primary's tools as well as the team.
+    #[serde(default)]
+    pub primary_tools: Option<Vec<String>>,
+    /// Optional allowlist of tool names the SECONDARY (paired) model may use. `None` = full surface.
+    #[serde(default)]
+    pub secondary_tools: Option<Vec<String>>,
     /// True for seeded built-ins (cannot be deleted/edited). Reserved; the library ships empty.
     #[serde(default)]
     pub builtin: bool,
@@ -193,6 +200,8 @@ mod tests {
             system: String::new(),
             max_rounds: None,
             digest_cap: None,
+            primary_tools: None,
+            secondary_tools: None,
             builtin: false,
         };
         assert!(store.upsert(bad).is_err());
@@ -205,6 +214,8 @@ mod tests {
             system: String::new(),
             max_rounds: None,
             digest_cap: None,
+            primary_tools: None,
+            secondary_tools: None,
             builtin: false,
         };
         assert!(store.upsert(no_model).is_err());
@@ -224,6 +235,8 @@ mod tests {
             system: "Pressure-test the answer.".into(),
             max_rounds: None,
             digest_cap: None,
+            primary_tools: None,
+            secondary_tools: None,
             builtin: false,
         };
         let saved = store.upsert(p).expect("upsert ok");

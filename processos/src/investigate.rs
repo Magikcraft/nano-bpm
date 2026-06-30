@@ -21,6 +21,7 @@ use crate::analysis::Analysis;
 use crate::dataset::TraceSource;
 use crate::harness::llm::LlmConfig;
 use crate::pyrunner::{self, PyConfig, PYTHON_TOOL_DOC};
+use crate::tools::{ToolBackend, ToolDef};
 
 /// The optional Python escape hatch attached to a toolbox: a CSV workdir + config. The
 /// workdir is removed on drop.
@@ -65,12 +66,25 @@ pub struct AnalysisTools {
     recorded: Option<crate::experiment::RecordedDataset>,
     /// When set, exposes the `delegate` tool so the primary can spawn a subagent.
     sub: Option<SubAgent>,
+    /// Operator-authored custom tools (enabled defs) offered alongside the built-ins.
+    custom: Vec<ToolDef>,
+    /// A private CSV export dir for `subprocess` custom tools (`PROCESSOS_DATASET`). Built lazily
+    /// when a subprocess tool is present and the Python workdir isn't already serving the CSVs.
+    custom_data: Option<PathBuf>,
+    /// The bound model XML written to a temp file for `subprocess` tools (`PROCESSOS_MODEL`).
+    model_path: Option<PathBuf>,
 }
 
 impl Drop for AnalysisTools {
     fn drop(&mut self) {
         if let Some(py) = &self.python {
             let _ = std::fs::remove_dir_all(&py.workdir);
+        }
+        if let Some(dir) = &self.custom_data {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        if let Some(p) = &self.model_path {
+            let _ = std::fs::remove_file(p);
         }
     }
 }
@@ -84,6 +98,9 @@ impl AnalysisTools {
             model: None,
             recorded: None,
             sub: None,
+            custom: Vec::new(),
+            custom_data: None,
+            model_path: None,
         }
     }
 
@@ -112,12 +129,135 @@ impl AnalysisTools {
             model: None,
             recorded: None,
             sub: None,
+            custom: Vec::new(),
+            custom_data: None,
+            model_path: None,
         }
     }
 
     /// Attach a subagent so the `delegate` tool becomes available. A `None` leaves it off.
     pub fn set_subagent(&mut self, sub: Option<SubAgent>) {
         self.sub = sub;
+    }
+
+    /// Attach the operator-authored custom tools (already filtered to enabled). For `subprocess`
+    /// tools, exports the trace CSVs to a private dir and writes the model XML to a temp file so
+    /// the external program can read them via `PROCESSOS_DATASET` / `PROCESSOS_MODEL`.
+    pub fn set_custom_tools(&mut self, defs: Vec<ToolDef>) {
+        let needs_data = defs.iter().any(|d| d.backend == ToolBackend::Subprocess);
+        if needs_data && self.custom_data.is_none() {
+            let dir = std::env::temp_dir().join(format!(
+                "processos-tooldata-{}-{}",
+                std::process::id(),
+                now_nanos()
+            ));
+            if std::fs::create_dir_all(&dir).is_ok() && self.analysis.export_csv(&dir).is_ok() {
+                self.custom_data = Some(dir);
+            } else {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        if needs_data && self.model_path.is_none() {
+            if let Some(xml) = self.model.as_ref() {
+                let p = std::env::temp_dir().join(format!(
+                    "processos-toolmodel-{}-{}.bpmn",
+                    std::process::id(),
+                    now_nanos()
+                ));
+                if std::fs::write(&p, xml).is_ok() {
+                    self.model_path = Some(p);
+                }
+            }
+        }
+        self.custom = defs;
+    }
+
+    /// Execute one custom tool by its definition and the model-supplied arguments.
+    fn call_custom(&self, def: &ToolDef, args: &Value) -> Result<String, String> {
+        match def.backend {
+            ToolBackend::Sql => {
+                let sql = def.render_sql(args);
+                let result = self.analysis.query(&sql)?;
+                serde_json::to_string(&result).map_err(|e| format!("serialise result: {e}"))
+            }
+            ToolBackend::Python => {
+                let py = self
+                    .python
+                    .as_ref()
+                    .ok_or("this Python tool requires Python to be enabled for the investigation")?;
+                let code = def.render_python(args);
+                pyrunner::run_python(&py.cfg, &py.workdir, &code)
+            }
+            ToolBackend::Subprocess => self.run_subprocess(def, args),
+        }
+    }
+
+    /// Run a `subprocess` custom tool: fixed argv (no shell), arguments delivered both interpolated
+    /// into argv and as JSON on stdin, with the dataset/model paths exposed via the environment.
+    fn run_subprocess(&self, def: &ToolDef, args: &Value) -> Result<String, String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let argv = def.build_argv(args)?;
+        let (program, rest) = argv.split_first().ok_or("subprocess tool has no command")?;
+        let mut cmd = Command::new(program);
+        cmd.args(rest)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(dir) = &self.custom_data {
+            cmd.env("PROCESSOS_DATASET", dir);
+        }
+        if let Some(p) = &self.model_path {
+            cmd.env("PROCESSOS_MODEL", p);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn '{program}': {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(def.stdin_json(args).as_bytes());
+        }
+        // Enforce the wall-clock budget by polling, then killing on overrun.
+        let deadline = std::time::Instant::now() + def.timeout();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!(
+                            "tool '{}' exceeded its {}ms time budget",
+                            def.name,
+                            def.timeout().as_millis()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => return Err(format!("wait '{program}': {e}")),
+            }
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("collect '{program}' output: {e}"))?;
+        let mut stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        const CAP: usize = 8_000;
+        if stdout.len() > CAP {
+            stdout.truncate(CAP);
+            stdout.push_str("\n…[output truncated]");
+        }
+        if out.status.success() {
+            Ok(stdout)
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = stderr.chars().take(2_000).collect::<String>();
+            Err(format!(
+                "tool '{}' exited with {}: {}",
+                def.name,
+                out.status,
+                stderr.trim()
+            ))
+        }
     }
 
     /// Attach the process's BPMN model so the structural model-analysis tools become
@@ -520,6 +660,14 @@ impl ToolBox for AnalysisTools {
                 }),
             });
         }
+        // Operator-authored custom tools (already filtered to enabled).
+        for def in &self.custom {
+            specs.push(ToolSpec {
+                name: def.name.clone(),
+                description: def.description.clone(),
+                parameters: def.parameters.clone(),
+            });
+        }
         specs
     }
 
@@ -687,7 +835,13 @@ impl ToolBox for AnalysisTools {
                 })
                 .to_string())
             }
-            other => Err(format!("unknown tool '{other}'")),
+            other => {
+                if let Some(def) = self.custom.iter().find(|d| d.name == other) {
+                    self.call_custom(def, args)
+                } else {
+                    Err(format!("unknown tool '{other}'"))
+                }
+            }
         }
     }
 }
@@ -702,6 +856,49 @@ fn clip_digest(s: &str, cap: usize) -> String {
         end -= 1;
     }
     format!("{}\n…[digest truncated to {cap} chars]", &s[..end])
+}
+
+/// A lightweight [`ToolBox`] adapter that scopes a shared [`AnalysisTools`] to an **allowlist** of
+/// tool names — so the primary and a paired second model can be handed *different* surfaces over
+/// the SAME underlying dataset (no DuckDB clone). `allow == None` means "all tools" (the historical
+/// behaviour); `Some(set)` filters both the advertised `specs()` and the dispatchable `call()`.
+/// Capability gating still applies underneath: an allowlisted tool whose prerequisite (model,
+/// Python, recorded inputs, subagent) is absent simply isn't advertised by the inner box.
+pub struct ScopedTools<'a> {
+    inner: &'a AnalysisTools,
+    allow: Option<std::collections::BTreeSet<String>>,
+}
+
+impl<'a> ScopedTools<'a> {
+    /// Wrap `inner` with an optional allowlist of tool names. An empty list is treated as "all"
+    /// (so a caller that forgot to choose doesn't accidentally disable every tool).
+    pub fn new(inner: &'a AnalysisTools, allow: Option<Vec<String>>) -> Self {
+        let allow = allow
+            .filter(|v| !v.is_empty())
+            .map(|v| v.into_iter().collect::<std::collections::BTreeSet<String>>());
+        Self { inner, allow }
+    }
+
+    fn allowed(&self, name: &str) -> bool {
+        self.allow.as_ref().map(|s| s.contains(name)).unwrap_or(true)
+    }
+}
+
+impl ToolBox for ScopedTools<'_> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.inner
+            .specs()
+            .into_iter()
+            .filter(|s| self.allowed(&s.name))
+            .collect()
+    }
+
+    fn call(&self, name: &str, args: &Value) -> Result<String, String> {
+        if !self.allowed(name) {
+            return Err(format!("tool '{name}' is not enabled for this model"));
+        }
+        self.inner.call(name, args)
+    }
 }
 
 /// The read-only research surface a delegated subagent gets: the same trace/model/replay tools
@@ -869,6 +1066,8 @@ pub struct PairStage {
     pub cfg: LlmConfig,
     /// The reviewer persona's system prompt.
     pub system: String,
+    /// Optional allowlist of tool names this reviewer may use. `None` = the full surface.
+    pub tools: Option<Vec<String>>,
 }
 
 /// Frame the handoff from the previous agent to the next reviewer: the operator's question plus
@@ -915,6 +1114,8 @@ pub async fn run_chat_turn(
     sink: &mut dyn FnMut(AgentEvent),
     pairs: &[PairStage],
     subagent: Option<SubAgent>,
+    custom_tools: Vec<ToolDef>,
+    primary_tools: Option<Vec<String>>,
     mut messages: Vec<Msg>,
     user_message: &str,
     mut checkpoint: Checkpoint<'_>,
@@ -950,6 +1151,7 @@ pub async fn run_chat_turn(
         s.model = model_for_sub;
         s
     }));
+    tools.set_custom_tools(custom_tools);
     let model = OpenAiAgent { cfg };
 
     // Seed the system message (with one-time dataset framing) only at the start of a
@@ -979,9 +1181,10 @@ pub async fn run_chat_turn(
         Some(ref mut c) => Some(&mut **c),
         None => None,
     };
+    let primary_scoped = ScopedTools::new(&tools, primary_tools);
     let run = run_agent_streaming(
         &model,
-        &tools,
+        &primary_scoped,
         &mut messages,
         max_rounds,
         cancel,
@@ -1015,9 +1218,10 @@ pub async fn run_chat_turn(
             Msg::System(sys),
             Msg::User(pair_handoff(user_message, &prior_answer)),
         ];
+        let pair_scoped = ScopedTools::new(&tools, stage.tools.clone());
         let pair_run = run_agent_streaming(
             &reviewer,
-            &tools,
+            &pair_scoped,
             &mut pair_msgs,
             max_rounds,
             cancel,

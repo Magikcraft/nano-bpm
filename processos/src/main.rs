@@ -36,6 +36,7 @@ mod reasoning;
 mod report;
 mod settings;
 mod supervisor;
+mod tools;
 mod trace;
 mod workspace;
 
@@ -121,6 +122,9 @@ struct AppState {
     /// The operator's LLM-pairing library (named, first-class "Pair AI" configs), persisted to
     /// the user's config dir alongside `settings.json`.
     pairings: Arc<pairings::PairingStore>,
+    /// The operator's custom-tool library (data-driven investigation tools), persisted to the
+    /// user's config dir alongside `settings.json`.
+    tools: Arc<tools::ToolStore>,
     /// Wrap-up flags for in-flight chat turns, keyed by session. The cockpit's "wrap it up"
     /// control sets the flag; the agent loop checks it between rounds and reports early.
     chat_cancels: Arc<
@@ -421,6 +425,9 @@ async fn main() {
         pairings: Arc::new(pairings::PairingStore::open(
             settings::config_dir().join("pairings.json"),
         )),
+        tools: Arc::new(tools::ToolStore::open(
+            settings::config_dir().join("tools.json"),
+        )),
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_cmpl_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -572,6 +579,9 @@ async fn main() {
         .route("/api/personas/{id}", axum::routing::delete(personas_delete))
         .route("/api/pairings", get(pairings_list).post(pairings_upsert))
         .route("/api/pairings/{id}", axum::routing::delete(pairings_delete))
+        .route("/api/tools", get(tools_list).post(tools_upsert))
+        .route("/api/tools/import", post(tools_import))
+        .route("/api/tools/{id}", axum::routing::delete(tools_delete))
         .route(
             "/api/nano/instances",
             get(nano_instances_list).post(nano_instances_add),
@@ -2303,6 +2313,7 @@ fn build_pair_stages(
             name,
             cfg,
             system,
+            tools: spec.tools.clone(),
         });
     }
     Ok(stages)
@@ -3121,6 +3132,10 @@ struct ChatSendRequest {
     /// context window. Off unless `enabled`; when on, the primary gets a `delegate` tool.
     #[serde(default)]
     subagent: Option<SubagentRequest>,
+    /// Optional allowlist of tool names the PRIMARY model may use this turn (the per-investigation
+    /// "Configure tools" selection). `None`/empty = the full available surface.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 /// Subagent (delegation) configuration for a chat turn. When `enabled`, the primary is offered a
@@ -3180,6 +3195,10 @@ struct PairRequest {
     /// An inline display name (from a saved pairing) shown on the reviewer's bubble.
     #[serde(default)]
     name: Option<String>,
+    /// Optional allowlist of tool names this reviewer (secondary model) may use. `None`/empty =
+    /// the full available surface.
+    #[serde(default)]
+    tools: Option<Vec<String>>,
 }
 
 /// Loop-monitor configuration for a chat turn. When `enabled`, a second model watches the
@@ -3270,6 +3289,8 @@ async fn cockpit_chat_send(
         Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
+    let custom_tools = state.tools.enabled();
+    let primary_tools = req.tools.clone();
     let message = req.message;
     // Register a wrap-up flag for this in-flight turn so `POST .../chat/wrapup` can ask the
     // agent to report early. Cleared in all exit paths below.
@@ -3309,6 +3330,8 @@ async fn cockpit_chat_send(
                 &mut sink,
                 &pairs,
                 subagent,
+                custom_tools,
+                primary_tools,
                 prior,
                 &message,
                 None,
@@ -3409,6 +3432,8 @@ async fn cockpit_chat_stream(
         Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
+    let custom_tools = state.tools.enabled();
+    let primary_tools = req.tools.clone();
     let message = req.message;
     // Register a wrap-up flag so `POST .../chat/wrapup` can ask this in-flight turn to report early.
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3573,6 +3598,8 @@ async fn cockpit_chat_stream(
             &mut sink,
             &pairs,
             subagent,
+            custom_tools,
+            primary_tools,
             prior,
             &message,
             Some(&mut checkpoint),
@@ -3842,6 +3869,46 @@ async fn pairings_delete(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => unprocessable(e),
     }
+}
+
+/// `GET /api/tools` — the full tool surface: the read-only built-in catalog followed by the
+/// operator's custom tools.
+async fn tools_list(State(state): State<AppState>) -> impl IntoResponse {
+    let mut all = tools::builtin_catalog();
+    all.extend(state.tools.list());
+    Json(all).into_response()
+}
+
+/// `POST /api/tools` — author or update a custom tool (persisted to the config dir).
+async fn tools_upsert(
+    State(state): State<AppState>,
+    Json(def): Json<tools::ToolDef>,
+) -> impl IntoResponse {
+    match state.tools.upsert(def) {
+        Ok(d) => Json(d).into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `DELETE /api/tools/{id}` — delete a custom tool.
+async fn tools_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.tools.delete(&id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => unprocessable(e),
+    }
+}
+
+/// `POST /api/tools/import` — import a bundle of custom tool definitions (shared by another
+/// operator). Returns how many were imported and any per-entry errors.
+async fn tools_import(
+    State(state): State<AppState>,
+    Json(defs): Json<Vec<tools::ToolDef>>,
+) -> impl IntoResponse {
+    let (imported, errors) = state.tools.import_many(defs);
+    Json(serde_json::json!({ "imported": imported, "errors": errors })).into_response()
 }
 
 // --- Nano instances (Console-managed connection targets) ------------------------

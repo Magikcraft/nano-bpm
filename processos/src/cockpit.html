@@ -297,6 +297,13 @@
   .pair-mode-badge.pair { color: #c084fc; background: rgba(168,85,247,.14); }
   .pair-mode-badge.monitor { color: #fbbf24; background: rgba(251,191,36,.14); }
   .pair-mode-badge.subagent { color: #67e8f9; background: rgba(103,232,249,.14); }
+  .tool-badge { font: 700 9.5px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; vertical-align: 1px; }
+  .tool-badge.python { color: #7dd3fc; background: rgba(56,189,248,.14); }
+  .tool-badge.sql { color: #86efac; background: rgba(34,197,94,.14); }
+  .tool-badge.subprocess { color: #fca5a5; background: rgba(248,113,113,.14); }
+  .tool-badge.builtin { color: #9aa3b2; background: rgba(148,163,184,.14); }
+  .tool-tile.builtin { border-style: dashed; opacity: .82; }
+  .tool-tile.disabled h3 { color: #8b93a4; font-weight: 500; }
   /* GitHub-style markdown tables (answers + thinking) */
   .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
   .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
@@ -427,6 +434,7 @@
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
       <a data-view="pairings" title="LLM Pairings — named Pair AI configs (mode + second model + its prompt) you select per investigation">Pairings</a>
+      <a data-view="tools" title="Tools — the built-in investigation tools plus your own custom tools (Python / SQL / external command) offered to the LLM">Tools</a>
       <a data-view="experiments">Experiments</a>
       <a data-view="sidecars" class="with-dot">LLMs <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
@@ -1314,7 +1322,7 @@ async function deletePersona(id){
 // A pairing bundles a mode (pair/monitor/subagent), the second model's profile, an optional
 // primary profile (full "team"), and the second LLM's inline prompt. Selected per investigation
 // in the composer instead of assembling a mode + model + prompt ad-hoc each turn.
-let PAIRINGS = [], PAIR_PROFILES = [], PAIR_PERSONAS = [];
+let PAIRINGS = [], PAIR_PROFILES = [], PAIR_PERSONAS = [], PAIR_TOOLS = [];
 const PAIR_MODES = [
   { v:'pair', label:'Pair AI — reviews the answer each turn', kind:'pair' },
   { v:'monitor', label:'Monitor — watches the live transcript & steers out of loops', kind:'monitor' },
@@ -1331,6 +1339,7 @@ async function renderPairings(){
     PAIRINGS = Array.isArray(ps)?ps:[];
     PAIR_PROFILES = (s && s.profiles) || [];
     PAIR_PERSONAS = Array.isArray(per)?per:[];
+    try { const ts = await api('/api/tools'); PAIR_TOOLS = (Array.isArray(ts)?ts:[]).map(t=>({name:t.name, builtin:!!t.builtin, enabled:!!t.enabled})); } catch(e){ PAIR_TOOLS = []; }
   } catch(e){ return fail(e); }
   main.innerHTML =
     '<h1>LLM Pairings</h1>'
@@ -1396,6 +1405,11 @@ function editPairing(id){
     + '<label class="muted" style="font-size:12px" title="Tool-loop budget per delegated task (1\u201330).">rounds <input type="number" id="prRounds" min="1" max="30" value="'+esc(p.maxRounds||8)+'" style="width:56px" '+(ro?'disabled':'')+'></label>'
     + '<label class="muted" style="font-size:12px" title="Max chars of digest fed back to the primary (500\u201320000).">digest <input type="number" id="prDigest" min="500" max="20000" step="500" value="'+esc(p.digestCap||4000)+'" style="width:72px" '+(ro?'disabled':'')+'></label>'
     + '</div></div>';
+  // Per-model tool selection: which tools each model in the pairing may use (empty = all).
+  h += '<label class="lbl" style="margin-top:12px">Tools for the second model <span class="muted" style="font-weight:400">(none selected = all available)</span></label>'
+    + toolMultiSelect('prSecondaryTools', p.secondaryTools);
+  h += '<label class="lbl">Tools for the primary model <span class="muted" style="font-weight:400">(none selected = all available)</span></label>'
+    + toolMultiSelect('prPrimaryTools', p.primaryTools);
   h += '<div class="actions">';
   if(ro){
     h += '<span class="muted" style="font-size:12px">Built-in pairings are read-only.</span>';
@@ -1415,10 +1429,25 @@ function fillPairingTemplates(mode){
   sel.innerHTML = '<option value="">\u2014 pick a template \u2014</option>'
     + matches.map(p => '<option value="'+esc(p.id)+'">'+esc(p.name||p.id)+(p.builtin?' (built-in)':'')+'</option>').join('');
 }
-function onPairingModeChange(){
-  const mode = ($('#prMode')||{}).value || 'pair';
-  const adv = $('#prSubAdv'); if(adv) adv.style.display = mode==='subagent' ? 'block' : 'none';
-  fillPairingTemplates(mode);
+// Render a multi-select of available tool names. `sel` is the current allowlist (array) or
+// null/undefined meaning "all tools". An empty multi-select selection is sent as null (= all).
+function toolMultiSelect(elId, sel){
+  const all = PAIR_TOOLS.length ? PAIR_TOOLS : [];
+  const chosen = Array.isArray(sel) ? sel : null;
+  let h = '<select id="'+elId+'" multiple size="'+Math.min(8, Math.max(3, all.length||3))+'" style="width:100%">';
+  if(!all.length) h += '<option disabled>No tools available</option>';
+  for(const t of all){
+    const isSel = chosen ? chosen.includes(t.name) : false;
+    const tag = t.builtin ? ' (built-in)' : (t.enabled?'':' (disabled)');
+    h += '<option value="'+esc(t.name)+'"'+(isSel?' selected':'')+'>'+esc(t.name)+tag+'</option>';
+  }
+  h += '</select>';
+  return h;
+}
+function readToolMultiSelect(elId){
+  const el = document.getElementById(elId); if(!el) return null;
+  const vals = Array.from(el.selectedOptions).map(o=>o.value).filter(Boolean);
+  return vals.length ? vals : null; // empty selection = all tools
 }
 function applyPairingTemplate(){
   const id = ($('#prTemplate')||{}).value; if(!id) return;
@@ -1438,6 +1467,8 @@ async function savePairing(){
     secondaryProfileId: ($('#prSecondary')||{}).value || '',
     primaryProfileId: ($('#prPrimary')||{}).value || null,
     system: ($('#prSystem')||{}).value || '',
+    primaryTools: readToolMultiSelect('prPrimaryTools'),
+    secondaryTools: readToolMultiSelect('prSecondaryTools'),
   };
   if(mode==='subagent'){
     body.maxRounds = parseInt(($('#prRounds')||{}).value,10) || undefined;
@@ -1455,6 +1486,174 @@ async function deletePairing(id){
   catch(e){ alert('Delete failed: '+(e.message||e)); return; }
   const ps = await api('/api/pairings'); PAIRINGS = Array.isArray(ps)?ps:[]; drawPairings(PAIRINGS.length?PAIRINGS[0].id:null);
 }
+
+// --- tool library (built-in catalog + operator-authored custom tools) -----------
+let TOOLS = [];
+const TOOL_BACKENDS = [
+  { v:'python', label:'Python — run code over the trace tables (params dict + {{name}})' },
+  { v:'sql', label:'SQL — a read-only DuckDB SELECT/WITH with {{name}} literals' },
+  { v:'subprocess', label:'External command — run a CLI (argv, no shell; args on stdin as JSON)' },
+];
+function toolBadge(t){
+  if(t.builtin) return '<span class="tool-badge builtin">built-in</span>';
+  return '<span class="tool-badge '+esc(t.backend||'python')+'">'+esc(t.backend||'python')+'</span>';
+}
+async function renderTools(){
+  STATE.view='tools'; setActive(); main.innerHTML='Loading…';
+  try {
+    const ts = await api('/api/tools').catch(()=>[]);
+    TOOLS = Array.isArray(ts)?ts:[];
+  } catch(e){ return fail(e); }
+  main.innerHTML =
+    '<h1>Tools</h1>'
+    + '<p class="lede">The investigator LLM\u2019s tool surface. The <b>built-in</b> tools are read-only \u2014 shown so you can see (and clone) what the model can do. Add your own <b>custom tools</b> backed by <b>Python</b>, read-only <b>SQL</b>, or an <b>external command</b>; enable the ones you want offered, and pick per-model subsets in a <a onclick="showView(\'pairings\')" style="color:#a5b4fc;cursor:pointer">Pairing</a> or per-investigation in the composer. <b>Import / export</b> bundles to share toolsets.</p>'
+    + '<div style="display:flex;gap:8px;margin-bottom:10px"><button class="btn ghost" onclick="exportTools()">Export custom tools</button><button class="btn ghost" onclick="document.getElementById(\'toolImportFile\').click()">Import tools…</button><input type="file" id="toolImportFile" accept="application/json" style="display:none" onchange="importTools(this)"></div>'
+    + '<div id="toolsWrap"></div>';
+  const firstCustom = TOOLS.find(t=>!t.builtin);
+  drawTools(firstCustom ? firstCustom.id : (TOOLS[0]||{}).id || null);
+}
+function drawTools(selId){
+  const wrap = document.getElementById('toolsWrap'); if(!wrap) return;
+  const custom = TOOLS.filter(t=>!t.builtin), builtin = TOOLS.filter(t=>t.builtin);
+  let h = '<div style="display:grid;grid-template-columns:320px 1fr;gap:18px;align-items:start">';
+  h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editTool(null)">+ New tool</button>';
+  h += '<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin:4px 2px 6px">Custom</div>';
+  if(!custom.length) h += '<div class="muted" style="font-size:12px;padding:2px 2px 8px">None yet. Create one, or clone a built-in below.</div>';
+  for(const t of custom){
+    const active = t.id===selId ? ' border-color:#4338ca;background:#14132a;' : '';
+    const cls = 'tile tool-tile'+(t.enabled?'':' disabled');
+    h += '<div class="'+cls+'" style="'+active+'" onclick="editTool(\''+esc(t.id)+'\')">'
+      + '<h3 style="font-size:14px">'+esc(t.name||t.id)+' '+toolBadge(t)+(t.enabled?'':' <span class="muted" style="font-size:10px">disabled</span>')+'</h3>'
+      + '<div class="meta">'+esc((t.description||'').slice(0,90))+'</div></div>';
+  }
+  h += '<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin:12px 2px 6px">Built-in (read-only)</div>';
+  for(const t of builtin){
+    const active = t.id===selId ? ' border-color:#4338ca;background:#14132a;' : '';
+    h += '<div class="tile tool-tile builtin" style="'+active+'" onclick="editTool(\''+esc(t.id)+'\')">'
+      + '<h3 style="font-size:14px">'+esc(t.name)+' '+toolBadge(t)+'</h3>'
+      + '<div class="meta">'+esc((t.description||'').slice(0,90))+'</div></div>';
+  }
+  h += '</div><div id="toolEditor" class="pane"></div></div>';
+  wrap.innerHTML = h;
+  editTool(selId);
+}
+function editTool(id){
+  const ed = $('#toolEditor'); if(!ed) return;
+  const blank = {id:'',name:'',description:'',backend:'python',enabled:true,tags:[],parameters:{type:'object',properties:{}},template:'',command:[],timeoutMs:20000,builtin:false};
+  const t = id===null ? blank : (TOOLS.find(x=>x.id===id)||blank);
+  const isNew = id===null;
+  const ro = !!t.builtin;
+  const backend = t.backend||'python';
+  if(ro){
+    // Read-only built-in: show what it is, plus a "clone to custom" affordance.
+    ed.innerHTML = '<h2 style="margin-top:0">'+esc(t.name)+' '+toolBadge(t)+'</h2>'
+      + '<p class="muted" style="font-size:12px">'+esc((t.tags||[]).join(' \u00b7 '))+'</p>'
+      + '<p>'+esc(t.description)+'</p>'
+      + '<p class="muted" style="font-size:12px">Built-in tools are implemented in the engine and can\u2019t be edited. You can clone this as a starting point for a custom tool (you\u2019ll supply its implementation).</p>'
+      + '<div class="actions"><button class="btn ghost" onclick="cloneBuiltinTool(\''+esc(t.name)+'\')">Clone to custom</button></div>';
+    return;
+  }
+  let h = '<h2 style="margin-top:0">'+(isNew?'New tool':'Edit tool')+'</h2>';
+  h += '<label class="lbl">Id</label><input id="tlId" '+(isNew?'':'disabled')+' value="'+esc(t.id)+'" placeholder="e.g. weekend-rate" />';
+  h += '<label class="lbl">Name <span class="muted" style="font-weight:400">(what the model calls \u2014 letters, digits, underscores)</span></label><input id="tlName" value="'+esc(t.name)+'" placeholder="e.g. weekend_rate" />';
+  h += '<label class="lbl">Description <span class="muted" style="font-weight:400">(steers the model on when/how to use it)</span></label><textarea id="tlDesc" rows="3" placeholder="A sharp description steers a small model far better than a vague one.">'+esc(t.description||'')+'</textarea>';
+  h += '<label class="lbl">Backend</label><select id="tlBackend" onchange="onToolBackendChange()">'
+    + TOOL_BACKENDS.map(b=>'<option value="'+b.v+'"'+(b.v===backend?' selected':'')+'>'+esc(b.label)+'</option>').join('') + '</select>';
+  h += '<label class="lbl">Parameters <span class="muted" style="font-weight:400">(JSON Schema object the model fills in; use <code>{{name}}</code> in the body)</span> <a style="color:#a5b4fc;cursor:pointer;font-size:11px" onclick="insertToolParam()">+ add a param</a></label>';
+  h += '<textarea id="tlParams" rows="6" spellcheck="false" style="font-family:ui-monospace,monospace;font-size:12px">'+esc(JSON.stringify(t.parameters||{type:'object',properties:{}},null,2))+'</textarea>';
+  // Template (python/sql) vs command (subprocess).
+  h += '<div id="tlTemplateWrap" style="display:'+(backend==='subprocess'?'none':'block')+'">'
+    + '<label class="lbl" id="tlTemplateLbl">'+(backend==='sql'?'SQL (read-only SELECT/WITH)':'Python source')+'</label>'
+    + '<textarea id="tlTemplate" rows="10" spellcheck="false" style="font-family:ui-monospace,monospace;font-size:12px" placeholder="'+(backend==='sql'?'SELECT count(*) FROM jobs WHERE job_type = {{jt}}':'print(params)  # tables exported as CSV; pandas/duckdb available')+'">'+esc(t.template||'')+'</textarea></div>';
+  h += '<div id="tlCommandWrap" style="display:'+(backend==='subprocess'?'block':'none')+'">'
+    + '<label class="lbl">Command (argv \u2014 one token per line; <code>{{name}}</code> interpolates as a single arg; args also arrive as JSON on stdin)</label>'
+    + '<textarea id="tlCommand" rows="5" spellcheck="false" style="font-family:ui-monospace,monospace;font-size:12px" placeholder="node&#10;/abs/path/check.js&#10;--id={{id}}">'+esc((t.command||[]).join('\n'))+'</textarea>'
+    + '<label class="lbl">Timeout (ms)</label><input type="number" id="tlTimeout" min="100" max="120000" step="100" value="'+esc(t.timeoutMs||20000)+'" style="width:120px">'
+    + '<p class="muted" style="font-size:11px">The trace CSVs dir is in <code>$PROCESSOS_DATASET</code> and the model XML in <code>$PROCESSOS_MODEL</code>.</p></div>';
+  h += '<label class="lbl">Tags <span class="muted" style="font-weight:400">(comma-separated; for browsing/sharing)</span></label><input id="tlTags" value="'+esc((t.tags||[]).join(', '))+'" placeholder="e.g. finance, validation">';
+  h += '<label class="ck" style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="tlEnabled" '+(t.enabled?'checked':'')+'> Offer this tool to investigations</label>';
+  h += '<div class="actions"><button class="btn primary" onclick="saveTool()">Save</button>';
+  if(!isNew) h += '<button class="btn ghost" onclick="deleteTool(\''+esc(t.id)+'\')">Delete</button>';
+  h += '</div>';
+  ed.innerHTML = h;
+}
+function onToolBackendChange(){
+  const b = ($('#tlBackend')||{}).value || 'python';
+  const tw = $('#tlTemplateWrap'), cw = $('#tlCommandWrap'), lbl = $('#tlTemplateLbl');
+  if(tw) tw.style.display = b==='subprocess' ? 'none' : 'block';
+  if(cw) cw.style.display = b==='subprocess' ? 'block' : 'none';
+  if(lbl) lbl.textContent = b==='sql' ? 'SQL (read-only SELECT/WITH)' : 'Python source';
+}
+function insertToolParam(){
+  const ta = $('#tlParams'); if(!ta) return;
+  let schema; try { schema = JSON.parse(ta.value||'{}'); } catch(e){ alert('Parameters is not valid JSON; fix it first.'); return; }
+  const name = (prompt('Parameter name (identifier):','arg')||'').trim(); if(!name) return;
+  schema.type = schema.type||'object'; schema.properties = schema.properties||{};
+  schema.properties[name] = { type:'string', description:'' };
+  schema.required = Array.from(new Set([...(schema.required||[]), name]));
+  ta.value = JSON.stringify(schema, null, 2);
+}
+function cloneBuiltinTool(name){
+  editTool(null);
+  const set=(id,v)=>{ const el=$(id); if(el) el.value=v; };
+  set('#tlId', name+'-custom'); set('#tlName', name+'_custom');
+  const src = TOOLS.find(t=>t.builtin && t.name===name);
+  if(src) set('#tlDesc', src.description||'');
+}
+async function saveTool(){
+  const backend = ($('#tlBackend')||{}).value || 'python';
+  let parameters; try { parameters = JSON.parse(($('#tlParams')||{}).value||'{}'); }
+  catch(e){ alert('Parameters must be valid JSON Schema.'); return; }
+  const tags = (($('#tlTags')||{}).value||'').split(',').map(s=>s.trim()).filter(Boolean);
+  const body = {
+    id: (($('#tlId')||{}).value||'').trim(),
+    name: (($('#tlName')||{}).value||'').trim(),
+    description: ($('#tlDesc')||{}).value||'',
+    backend, parameters, tags,
+    enabled: !!($('#tlEnabled')||{}).checked,
+  };
+  if(backend==='subprocess'){
+    body.command = (($('#tlCommand')||{}).value||'').split('\n').map(s=>s.trim()).filter(Boolean);
+    body.timeoutMs = parseInt(($('#tlTimeout')||{}).value,10) || undefined;
+  } else {
+    body.template = ($('#tlTemplate')||{}).value||'';
+  }
+  if(!body.id){ alert('Id is required.'); return; }
+  if(!body.name){ alert('Name is required.'); return; }
+  try { await api('/api/tools', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
+  catch(e){ alert('Save failed: '+(e.message||e)); return; }
+  const ts = await api('/api/tools'); TOOLS = Array.isArray(ts)?ts:[]; drawTools(body.id);
+}
+async function deleteTool(id){
+  if(!confirm('Delete tool “'+id+'”?')) return;
+  try { await api('/api/tools/'+encodeURIComponent(id), {method:'DELETE'}); }
+  catch(e){ alert('Delete failed: '+(e.message||e)); return; }
+  const ts = await api('/api/tools'); TOOLS = Array.isArray(ts)?ts:[];
+  const fc = TOOLS.find(t=>!t.builtin); drawTools(fc?fc.id:(TOOLS[0]||{}).id||null);
+}
+function exportTools(){
+  const custom = TOOLS.filter(t=>!t.builtin);
+  if(!custom.length){ alert('No custom tools to export.'); return; }
+  const blob = new Blob([JSON.stringify(custom,null,2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download='processos-tools.json'; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+async function importTools(input){
+  const file = input.files && input.files[0]; if(!file) return;
+  input.value='';
+  let defs;
+  try { const txt = await file.text(); defs = JSON.parse(txt); if(!Array.isArray(defs)) defs=[defs]; }
+  catch(e){ alert('Not a valid tools JSON bundle.'); return; }
+  let res;
+  try { res = await api('/api/tools/import', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(defs)}); }
+  catch(e){ alert('Import failed: '+(e.message||e)); return; }
+  const ts = await api('/api/tools'); TOOLS = Array.isArray(ts)?ts:[];
+  const errs = (res && res.errors)||[];
+  drawTools((TOOLS.find(t=>!t.builtin)||{}).id||null);
+  alert('Imported '+((res&&res.imported)||0)+' tool(s).'+(errs.length?('\nSkipped:\n'+errs.join('\n')):''));
+}
+
 
 // --- chat-prompt library (cockpit message templates) inside the Prompts view ---
 function drawChatPrompts(selId){
@@ -1653,6 +1852,7 @@ async function renderWorkspace(ws, proc){
               <select id="chatPairing" title="Pick a saved pairing, or Solo for a single model"><option value="">Solo (single model)</option></select>
               <a href="?view=pairings" target="_blank" class="muted" style="font-size:11px;text-decoration:underline" title="Create or edit pairings">Manage</a>
             </label>
+            <button class="btn ghost" id="chatToolsBtn" title="Choose which tools the primary model may use for this investigation" onclick="openInvestigationTools()">Tools…</button>
             <select id="chatPrompt"><option value="">Load a prompt…</option></select>
             <button class="btn ghost" id="chatSave" title="Save the compose box as a reusable prompt">Save prompt</button>
             <span class="fontctl" title="Chat text size">
@@ -2024,6 +2224,39 @@ function showModal(title, bodyHtml){
   back.onclick = e => { if(e.target===back) back.remove(); };
   document.body.appendChild(back);
   $('#modalClose').onclick = () => back.remove();
+}
+// Per-investigation primary-tool picker: choose which tools the primary model may use for this
+// investigation. Persists into STATE.investigationTools (array = override; null = use default).
+async function openInvestigationTools(){
+  let tools = [];
+  try { const ts = await api('/api/tools'); tools = (Array.isArray(ts)?ts:[]); } catch(e){}
+  const cur = Array.isArray(STATE.investigationTools) ? STATE.investigationTools : null;
+  const rows = tools.map(t => {
+    const checked = cur ? cur.includes(t.name) : true;
+    const tag = t.builtin ? '<span class="tool-badge builtin">built-in</span>' : '<span class="tool-badge '+esc(t.backend||'python')+'">'+esc(t.backend||'python')+'</span>'+(t.enabled?'':' <span class="muted" style="font-size:10px">disabled</span>');
+    return '<label style="display:flex;gap:8px;align-items:center;padding:3px 0"><input type="checkbox" class="invtool" value="'+esc(t.name)+'"'+(checked?' checked':'')+'> <span>'+esc(t.name)+'</span> '+tag+'<span class="muted" style="font-size:11px;margin-left:auto">'+esc((t.description||'').slice(0,60))+'</span></label>';
+  }).join('');
+  showModal('Tools for this investigation',
+    '<p class="muted" style="font-size:13px">Choose which tools the <b>primary</b> model may use this investigation. Unchecking trims its surface (helpful for small models). This overrides the pairing\u2019s primary-tool list; capability gates (model / Python / recorded inputs) still apply.</p>'
+    + '<div style="max-height:46vh;overflow:auto;border:1px solid #2a2a40;border-radius:8px;padding:8px 10px;margin-bottom:8px">'+(rows||'<span class="muted">No tools available.</span>')+'</div>'
+    + '<div style="display:flex;gap:8px"><button class="btn primary" id="invToolsApply">Apply</button><button class="btn ghost" id="invToolsAll">Select all</button><button class="btn ghost" id="invToolsDefault">Reset to default</button></div>');
+  const apply = ()=>{
+    const sel = Array.from(document.querySelectorAll('.invtool')).filter(c=>c.checked).map(c=>c.value);
+    STATE.investigationTools = sel; // empty array = explicit "all" override
+    reflectInvestigationTools();
+    const back = document.querySelector('.modal-back'); if(back) back.remove();
+  };
+  const ap = $('#invToolsApply'); if(ap) ap.onclick = apply;
+  const al = $('#invToolsAll'); if(al) al.onclick = ()=>document.querySelectorAll('.invtool').forEach(c=>c.checked=true);
+  const df = $('#invToolsDefault'); if(df) df.onclick = ()=>{ STATE.investigationTools = null; reflectInvestigationTools(); const back=document.querySelector('.modal-back'); if(back) back.remove(); };
+}
+// Reflect whether a per-investigation tool override is active on the composer's Tools button.
+function reflectInvestigationTools(){
+  const btn = $('#chatToolsBtn'); if(!btn) return;
+  const ov = Array.isArray(STATE.investigationTools);
+  btn.textContent = ov ? ('Tools ('+STATE.investigationTools.length+')') : 'Tools…';
+  btn.classList.toggle('primary', ov);
+  btn.classList.toggle('ghost', !ov);
 }
 function pyInstallPopup(missing){
   showModal('Install the Python data-science tools',
@@ -2843,6 +3076,7 @@ function drawSessions(ws, proc){
 async function selectSession(ws, proc, id){
   if(id===STATE.sessionId) return;
   STATE.sessionId = id;
+  STATE.investigationTools = null; reflectInvestigationTools();
   $('#chatHint').textContent = '';
   drawSessions(ws, proc);
   await loadChat(ws, proc);
@@ -2967,7 +3201,7 @@ function wirePairingControl(){
 function pairRequest(){
   const p = selectedPairing();
   if(!p || p.mode!=='pair') return null;
-  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined };
+  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined, tools: (p.secondaryTools&&p.secondaryTools.length)?p.secondaryTools:undefined };
 }
 function monitorRequest(){
   const p = selectedPairing();
@@ -2977,7 +3211,15 @@ function monitorRequest(){
 function subRequest(){
   const p = selectedPairing();
   if(!p || p.mode!=='subagent') return null;
-  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined, maxRounds: p.maxRounds || undefined, digestCap: p.digestCap || undefined };
+  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined, maxRounds: p.maxRounds || undefined, digestCap: p.digestCap || undefined, tools: (p.secondaryTools&&p.secondaryTools.length)?p.secondaryTools:undefined };
+}
+// The PRIMARY model's tool allowlist for this turn: the per-investigation "Configure tools"
+// override (if set), else the selected pairing's primaryTools, else undefined (= all tools).
+function primaryToolsForTurn(){
+  if(Array.isArray(STATE.investigationTools)) return STATE.investigationTools.length ? STATE.investigationTools : undefined;
+  const p = selectedPairing();
+  if(p && p.primaryTools && p.primaryTools.length) return p.primaryTools;
+  return undefined;
 }
 
 // ── partner roles (pair / monitor) + active-model roster ─────────────────────
@@ -3196,7 +3438,7 @@ async function sendChat(ws, proc){
     onErrorRestore: () => { box.value = msg; },
     fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined, subagent: subRequest() || undefined })
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined, subagent: subRequest() || undefined, tools: primaryToolsForTurn() })
     }),
   });
 }
@@ -3480,6 +3722,7 @@ function showView(v){
   if(v==='processes') return renderProcesses();
   if(v==='prompts') return renderPrompts();
   if(v==='pairings') return renderPairings();
+  if(v==='tools') return renderTools();
   if(v==='experiments') return renderExperiments();
   if(v==='sidecars') return renderSidecars();
   return renderConsole();
