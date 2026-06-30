@@ -350,7 +350,7 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                          variant). Only stop to report evidence-backed findings or to ask \
                          the operator a genuine decision."
                     };
-                    msgs.push(Msg::System(nudge.to_string()));
+                    msgs.push(Msg::User(nudge.to_string()));
                     auto_continues += 1;
                     continue;
                 }
@@ -430,7 +430,7 @@ pub async fn run_agent_streaming<M: AgentStep, T: ToolBox + ?Sized>(
                         // summarise from the evidence gathered so far.
                         return wrap_up(model, msgs, steps, round, sink).await;
                     }
-                    msgs.push(Msg::System(
+                    msgs.push(Msg::User(
                         "You just re-issued a tool call you already ran this session and got \
                          the same result — you are repeating yourself, not making progress. Do \
                          NOT run that query again. You already have this data: act on it. Call a \
@@ -456,7 +456,7 @@ async fn wrap_up<M: AgentStep>(
     round: usize,
     sink: &mut dyn FnMut(AgentEvent),
 ) -> Result<AgentRun, String> {
-    msgs.push(Msg::System(
+    msgs.push(Msg::User(
         "Stop investigating now and report your findings so far, based only on what you \
          have already gathered. Do not call any more tools — answer in clear prose, stating \
          what you found, your confidence, and what you'd recommend or check next."
@@ -812,6 +812,12 @@ fn wire_messages(msgs: &[Msg]) -> Vec<Value> {
         .map(|(i, m)| {
             let recent = i + KEEP_RECENT >= n;
             match m {
+                // A `system` message is only valid as the VERY FIRST message for strict chat
+                // templates (llama.cpp's Jinja templates for some models — e.g. Ornith — raise
+                // "System message must be at the beginning"). Any system directive injected
+                // mid-conversation (steer nudges, a forced wrap-up) is resent as a user turn so
+                // those templates accept it.
+                Msg::System(s) if i > 0 => json!({ "role": "user", "content": s }),
                 // Strip the model's own reasoning from every assistant turn we resend.
                 Msg::Assistant { text, tool_calls } => {
                     let stripped = text
@@ -1954,8 +1960,35 @@ mod tests {
         );
     }
 
-    /// Mock that always asks for the SAME tool call, but answers in prose once the
-    /// harness strips tools (the wrap-up summarisation step passes empty specs).
+    #[test]
+    fn wire_messages_downgrades_mid_conversation_system_to_user() {
+        // A leading system prompt must stay `system`; any system directive injected later
+        // (a steer nudge or a forced wrap-up) must be resent as a `user` turn so strict chat
+        // templates (e.g. llama.cpp / Ornith) don't raise "System message must be at the beginning".
+        let msgs = vec![
+            Msg::System("persona system prompt".into()),
+            Msg::User("investigate".into()),
+            Msg::Assistant {
+                text: Some("looking…".into()),
+                tool_calls: vec![],
+            },
+            // Mid-conversation directive — historically pushed as Msg::System.
+            Msg::System("Stop investigating now and report your findings so far.".into()),
+        ];
+        let wire = wire_messages(&msgs);
+        assert_eq!(wire[0]["role"], "system", "leading system prompt is preserved");
+        assert_eq!(wire[0]["content"], "persona system prompt");
+        assert_eq!(
+            wire[3]["role"], "user",
+            "a mid-conversation system directive must be resent as a user turn"
+        );
+        assert_eq!(
+            wire[3]["content"],
+            "Stop investigating now and report your findings so far."
+        );
+    }
+
+
     struct AlwaysSameCall {
         call: ToolCall,
         summary: String,
