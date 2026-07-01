@@ -346,3 +346,56 @@ NANOBPMN_JOURNAL=segmented NANOBPMN_DATA_DIR=$HOME/nano-data PORT=8080 ./nano-gw
 #   WORKERS=70 PROD_CONNS=160 MAXPAR=80 MAX_INFLIGHT=16000 TRANSPORT=stream
 # one loadgen per node IP → ~95k PI/s aggregate.
 ```
+
+---
+
+## Dispatcher parallelization A/B — and a corrected diagnosis (0.0.3-disp)
+
+Following the "next lever" above, we sharded the command-stream **dispatcher**:
+one `JoinSet` + `Semaphore` task per connection (dispatch/JSON work stolen
+across tokio workers) and serialize each job **once** (`ServerFrame::Job` as
+`Box<RawValue>`, dropping the old build-a-`Value`-then-re-serialize double pass).
+Commit `53291a6`.
+
+### Result: a measured wash
+
+Controlled **fresh-state** A/B on the same 3-node / 12-partition / RF=3 cluster
+(`70 160 80 16000` sweep, wiped data before each build, first run = fresh,
+second = warmed):
+
+| Build          | fresh tput | fresh p99 | warmed tput | warmed p99 |
+|----------------|-----------:|----------:|------------:|-----------:|
+| 0.0.3-shard    | 96.4k      | 2.1 s     | 97.7k       | 2.4 s      |
+| 0.0.3-disp     | 96.0k      | 2.1 s     | 97.7k       | 2.4 s      |
+
+Statistically identical in **both** throughput and latency. An earlier apparent
+"p99 39 s → 2 s" win was an **artifact of data accumulation**, not the code: each
+45 s sweep adds ~1.3M instances to the read-model SQLite shards, so successive
+sweeps on *either* build degrade latency. Fair A/B **requires fresh-launched
+state** (wipe `~/nano-data`, measure the first window).
+
+### The "100%-pinned main thread" was a `top -H` artifact
+
+The prior "one hot thread (engine-actor / command-stream `tokio` path)" reading
+came from `top -bH`, which showed the `nano-gw` **main thread** at 99.9%. That is
+wrong: the main thread is the parked `#[tokio::main]` `block_on` driver.
+
+- `strace -c -p <main-tid>` (no `-f`): **0 syscalls** in 3 s.
+- `/proc/<main-tid>/stat` utime+stime delta: **0%** CPU over 2 s.
+- `gdb` always catches it parked in `syscall()` (a blocking futex).
+
+So there is **no single-thread CPU wall**. Ground-truth per-thread CPU:
+tokio workers ~24% each (×16) + engine actors ~25% each — the node has **spare
+cores**. Whole-process `strace -c` under load shows the real signature:
+**70% futex** (121k calls / 3 s, ~19k contended) + heavy **`sendto`** (143k).
+
+### Corrected conclusion / next lever
+
+The ~100k PI/s/node ceiling is **coordination-bound**, not
+dispatch-CPU-bound: cross-thread lock/handoff contention (futex) around the
+single-writer engine actor plus the RF=3 replication round-trips — with CPU to
+spare. The dispatcher change didn't move the ceiling because the dispatcher was
+never the limiter. Real levers from here: reduce engine-actor cross-thread
+contention / batching on the replication path, or scale partitions-per-node to
+spread the single-writer actor further. It was kept for the cleaner architecture
+(dispatch CPU spread across cores, single serialization pass).
