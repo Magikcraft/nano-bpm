@@ -17,6 +17,59 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## 2026-07-01 — Ceiling diagnosed: the single per-node read-model exporter
+
+Follow-up to the ceiling hunt below. The earlier sweep proved the ~12k PI/s/node
+limit was **per-node and shared across a node's partitions**, but not *what* it
+was. This run instruments and isolates it.
+
+**The bottleneck is the read-model exporter.** Each node runs **one** exporter
+thread (`spawn_exporter`, `main.rs`) that funnels *every* partition's events into
+**one** `Mutex<Connection>` SQLite read store (`readstore.rs`). Completion
+recognition, the backpressure in-flight gauge, hot-state eviction, and
+`awaitCompletion` wakeups all flow through it — so its projection rate *is* the
+observed throughput. Adding partitions never helped because they all re-serialize
+here.
+
+Added `NANOBPMN_EXPORTER_PROFILE` (logs the exporter's rate / busy% / share of
+busy spent in `store.export` every 5 s) and an A/B on the read store's fsync mode
+via `NANOBPMN_READ_SYNC`. Same 3× `c2-standard-16` cluster (3 partitions, RF=3,
+pd-ssd), dedicated load box, 40 s steady window, build `0.0.3-walab`.
+
+| `synchronous` | **Agg tput** | Per node | Exporter busy | In `export` |
+|---|--:|--:|--:|--:|
+| FULL (old default) | **39 373** | 13.1k | ~100% | 99.6% |
+| NORMAL (WAL) | 38 272 | 12.8k | ~100% | 99.5% |
+| OFF (no fsync) | 39 587 | 13.2k | 92–100% | 99.6% |
+
+### It is CPU-bound on SQLite inserts, not fsync
+
+The exporter thread pins **one core at ~100%**, **99.6% of it inside
+`store.export`**, at **~250 000 events/s (~13k PI/s × ~19 events/PI)** — while the
+other 15 vCPU idle. Throughput is **flat within noise across all three fsync
+modes**: under flood the drain-everything batcher forms **huge batches (thousands
+to ~80 000 events)**, so per-commit fsync is amortized to ~16 commits per 5 s and
+becomes irrelevant. This is exactly why the earlier **tmpfs** run (fsync-free)
+*also* held at ~36k: the wall was never fsync, it was single-thread projection
+CPU. The "coordination-bound" label from the ceiling hunt resolves to **one
+saturated core**.
+
+### Outcome
+
+- **Shipped (`37c6cf5`): file-backed read store now runs `journal_mode=WAL` +
+  `synchronous=NORMAL`.** Correct and safe (the read model is derived and rebuilt
+  from the journal on boot), and it *does* help the **low-batch / light-load /
+  slow-disk** regime — a local single-node laptop A/B measured **+39%** (FULL
+  672 → NORMAL 933 PI/s) where small batches left fsync on the critical path. But
+  it does **not** lift the *flooded-cluster* ceiling, where batches amortize fsync
+  away.
+- **The real lever is per-partition sharding of the exporter + read store** (N
+  threads, N SQLite shards) so projection CPU scales with cores instead of pinning
+  one. This run is the empirical justification: relieve that single core and the
+  ~13k/node ceiling should rise.
+
+---
+
 ## 2026-07-01 — Ceiling hunt: dedicated load box + parameter sweep
 
 Build: `0.0.3-stress` (commit `21d954a`), release profile. Same 3× `c2-standard-16`
