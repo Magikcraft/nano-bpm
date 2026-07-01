@@ -58,7 +58,7 @@ use crate::backpressure::{
 use crate::engine_actor::EngineHandle;
 use crate::journal::{Commit, Journal, SharedWriter};
 use crate::partition::Partitions;
-use crate::readstore::ReadStore;
+use crate::readstore::{ReadModel, ReadStore};
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
@@ -90,9 +90,10 @@ const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
 #[derive(Clone)]
 pub struct ServerImpl {
     engine: Partitions,
-    /// The read model. All `search*`/`get*` queries are answered from here
-    /// (eventually consistent), never from hot engine state.
-    store: Arc<ReadStore>,
+    /// The read model — a per-partition sharded aggregate. All `search*`/`get*`
+    /// queries are answered from here (eventually consistent), never from hot
+    /// engine state.
+    store: Arc<ReadModel>,
     /// Notified whenever new jobs may have become activatable, so long-polling
     /// `activateJobs` requests can wake immediately instead of waiting out their
     /// full timeout.
@@ -268,7 +269,7 @@ impl ServerImpl {
     /// projected.
     pub fn new(
         mut journals: Vec<Journal>,
-        store: Arc<ReadStore>,
+        store: Arc<ReadModel>,
         topology: cluster::Topology,
     ) -> Self {
         assert!(!journals.is_empty(), "at least one partition is required");
@@ -528,12 +529,7 @@ fn parse_deploy_resources(
 
 impl Default for ServerImpl {
     fn default() -> Self {
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        build_server(
-            vec![Journal::in_memory()],
-            store,
-            cluster::Topology::single(1),
-        )
+        build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1))
     }
 }
 
@@ -595,69 +591,218 @@ impl ServerImpl {
 /// projected (the exporter watermark gates compaction), and only the suffix past
 /// `exported_position` needs replaying. No `reset()` — the projection is
 /// resumed, not rebuilt.
-fn catch_up_global_read_model(store: &ReadStore, recovery: &seglog::MultiSegRecovery) {
-    let mut pos = store.exported_position() as u64;
-    if pos > recovery.total_events {
-        // Store ahead of the log (truncated/corrupt): rebuild from what survives.
-        store.reset().expect("reset read store");
-        pos = recovery.first_index;
-    }
-    let skip = pos.saturating_sub(recovery.first_index) as usize;
-    if skip < recovery.events.len() {
-        let refs: Vec<&Event> = recovery.events[skip..].iter().collect();
-        store
-            .export(&refs)
-            .expect("catch up read model from segmented multi-partition journal");
+/// Catches a sharded read model up to a segmented multi-partition recovery. Each
+/// shard owns ONE partition and tracks that partition's projected event count, so
+/// catch-up demuxes the surviving events by their write tag and resumes each shard
+/// from its own persisted `exported_position` (accounting for the compacted prefix
+/// via `recovery.pp_base`). A shard behind the compacted prefix or ahead of the
+/// surviving tail (truncated/corrupt) is reset and rebuilt from what survives.
+fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::MultiSegRecovery) {
+    for (pid, shard) in shards {
+        let base_p = recovery.pp_base.get(*pid as usize).copied().unwrap_or(0);
+        let p_events: Vec<&Event> = recovery
+            .tagged
+            .iter()
+            .filter(|(tag, _)| tag == pid)
+            .map(|(_, e)| e)
+            .collect();
+        let mut projected = shard.exported_position() as u64;
+        if projected < base_p || projected > base_p + p_events.len() as u64 {
+            shard.reset().expect("reset read store shard");
+            projected = base_p;
+        }
+        let skip = (projected - base_p) as usize;
+        if skip < p_events.len() {
+            shard
+                .export(&p_events[skip..])
+                .expect("catch up read model shard from segmented multi-partition journal");
+        }
     }
 }
 
+/// Rebuilds a sharded read model from a legacy (non-segmented) full event log by
+/// resetting every shard and replaying each partition's events into its shard. A
+/// `ProcessDeployed` is partition-agnostic and its key belongs to the deployment
+/// partition (0), which a clustered peer may not own, so it is replayed into
+/// EVERY owned shard; other events route to `partition_of(key)`'s shard.
+fn rebuild_read_model_legacy(
+    shards: &[(u64, Arc<ReadStore>)],
+    events: &[Event],
+    num_partitions: usize,
+) {
+    let mut per_shard: std::collections::HashMap<u64, Vec<&Event>> =
+        shards.iter().map(|(p, _)| (*p, Vec::new())).collect();
+    for e in events {
+        if matches!(e, Event::ProcessDeployed { .. }) {
+            for bucket in per_shard.values_mut() {
+                bucket.push(e);
+            }
+            continue;
+        }
+        let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
+            .min(num_partitions.saturating_sub(1)) as u64;
+        if let Some(bucket) = per_shard.get_mut(&p) {
+            bucket.push(e);
+        }
+    }
+    for (pid, shard) in shards {
+        shard
+            .reset()
+            .expect("reset read store shard for legacy rebuild");
+        if let Some(evs) = per_shard.get(pid)
+            && !evs.is_empty()
+        {
+            shard
+                .export(evs)
+                .expect("rebuild read model shard from legacy journal");
+        }
+    }
+}
+
+/// Sibling shard db path for partition `pid`: `read-model.sqlite` becomes
+/// `read-model.p<pid>.sqlite`. For the single-partition path (`single`) the base
+/// path is used unchanged to preserve the existing on-disk file and its warm
+/// restart. `None` (in-memory) stays `None`.
+fn shard_db_path(db_path: Option<&Path>, pid: u64, single: bool) -> Option<std::path::PathBuf> {
+    let base = db_path?;
+    if single {
+        return Some(base.to_path_buf());
+    }
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "read-model".into());
+    let name = match base.extension() {
+        Some(ext) => format!("{stem}.p{pid}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.p{pid}"),
+    };
+    Some(base.with_file_name(name))
+}
+
+/// Opens one read-store shard per owned partition (file-backed when `db_path` is
+/// set, else in-memory) and wraps them in a [`ReadModel`]. Returns the model plus
+/// the shard handles paired with their partition ids (for boot catch-up).
+fn open_sharded_read_model(
+    db_path: Option<&Path>,
+    owned: &[u64],
+    single: bool,
+) -> (Arc<ReadModel>, Vec<(u64, Arc<ReadStore>)>) {
+    let shards: Vec<(u64, Arc<ReadStore>)> = owned
+        .iter()
+        .map(|&p| {
+            let path = shard_db_path(db_path, p, single);
+            let store = ReadStore::open(path.as_deref()).unwrap_or_else(|e| {
+                let at = path
+                    .as_deref()
+                    .map(|p| format!(" at {}", p.display()))
+                    .unwrap_or_default();
+                panic!(
+                    "failed to open read model shard{at} (is the file or its directory writable?): {e}"
+                )
+            });
+            (p, Arc::new(store))
+        })
+        .collect();
+    let model = Arc::new(ReadModel::from_shards(shards.clone()));
+    (model, shards)
+}
+
+/// A read-model shard paired with the export channel feeding it.
+type ShardChannel = (Arc<ReadStore>, mpsc::Receiver<Arc<Vec<Event>>>);
+
+/// Wires a per-partition sharded read model to its journals and spawns one
+/// exporter thread per shard, so read-model projection scales with cores instead
+/// of funnelling every partition through a single thread (opening #1). Each owned
+/// journal's events are routed to its partition's shard (in the shared-writer path
+/// via the per-partition exporter cell; otherwise via `persist()`), and the
+/// exporter must be wired before `ServerImpl::new` so a fresh journal's seed
+/// deployment is projected. Threads are spawned after so they can route hot-state
+/// eviction back to the owning partition.
 fn build_server(
     mut journals: Vec<Journal>,
-    store: Arc<ReadStore>,
+    store: Arc<ReadModel>,
     topology: cluster::Topology,
 ) -> ServerImpl {
-    let (tx, rx) = mpsc::channel::<Arc<Vec<Event>>>();
-    for journal in journals.iter_mut() {
-        journal.set_exporter(tx.clone());
+    let shards = store.shards();
+    let mut senders: std::collections::HashMap<u64, mpsc::Sender<Arc<Vec<Event>>>> =
+        std::collections::HashMap::with_capacity(shards.len());
+    let mut pending: Vec<ShardChannel> = Vec::with_capacity(shards.len());
+    for (pid, shard) in shards {
+        let (tx, rx) = mpsc::channel::<Arc<Vec<Event>>>();
+        senders.insert(pid, tx);
+        pending.push((shard, rx));
     }
-    drop(tx);
-    let server = ServerImpl::new(journals, store.clone(), topology);
-    spawn_exporter(
-        rx,
-        store,
-        server.engine.clone(),
-        server.instances_changed.clone(),
-        server.inflight.clone(),
-        server.activity.clone(),
-        #[cfg(feature = "console")]
-        server.trace_store.clone(),
-    );
+    for journal in journals.iter_mut() {
+        let pid = journal.partition_id();
+        if let Some(tx) = senders.get(&pid) {
+            journal.set_exporter(tx.clone());
+        } else {
+            debug_assert!(false, "journal partition {pid} has no read-model shard");
+        }
+    }
+    // The journals now hold the only senders (in the shared exporter cell or their
+    // own field); drop ours so each shard's receiver closes on server shutdown.
+    drop(senders);
+    let shard_count = pending.len().max(1);
+    // Split the history cap across shards so the TOTAL retained terminal set stays
+    // bounded by the configured maximum.
+    let history_cap = history_max_instances_from_env();
+    let per_shard_cap = if history_cap == 0 {
+        0
+    } else {
+        (history_cap / shard_count).max(1)
+    };
+    let server = ServerImpl::new(journals, store, topology);
+    for (shard, rx) in pending {
+        spawn_exporter(
+            rx,
+            shard,
+            per_shard_cap,
+            server.engine.clone(),
+            server.instances_changed.clone(),
+            server.inflight.clone(),
+            server.activity.clone(),
+            #[cfg(feature = "console")]
+            server.trace_store.clone(),
+        );
+    }
     server
 }
 
-/// Spawns the read-model exporter thread. It drains the channel (batching every
-/// queued command's events from every partition), projects the batch into the
-/// shared read store, then evicts any now-completed instances from hot engine
-/// state — routed back to each instance's owning partition by its key. The
-/// thread exits when the channel closes (all `ServerImpl` clones and every
-/// journal are dropped). Events arrive as `Arc<Vec<Event>>` shared with the
-/// command thread, so projecting them costs no deep copy of the 50 KB payloads.
+/// Convenience for the in-memory / test paths: one in-memory shard per journal
+/// partition.
+fn build_server_in_memory(journals: Vec<Journal>, topology: cluster::Topology) -> ServerImpl {
+    let owned: Vec<u64> = journals.iter().map(|j| j.partition_id()).collect();
+    let store = Arc::new(ReadModel::in_memory_partitions(&owned));
+    build_server(journals, store, topology)
+}
+
+/// Spawns one read-model exporter thread for a single partition's shard. It
+/// drains the shard's channel (batching queued commands' events), projects the
+/// batch into the shard's [`ReadStore`], then evicts any now-completed instances
+/// from hot engine state — routed back to the instance's owning partition by its
+/// key. With per-partition sharding there is one such thread per owned partition,
+/// so projection (the former single-thread ceiling) scales with cores. The thread
+/// exits when the channel closes (all `ServerImpl` clones and every journal are
+/// dropped). Events arrive as `Arc<Vec<Event>>` shared with the command thread, so
+/// projecting them costs no deep copy of the payloads.
 fn spawn_exporter(
     rx: mpsc::Receiver<Arc<Vec<Event>>>,
     store: Arc<ReadStore>,
+    history_cap: usize,
     engine: Partitions,
     instances_changed: Arc<tokio::sync::Notify>,
     inflight: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
     #[cfg(feature = "console")] trace_store: Arc<console::trace::TraceStore>,
 ) {
-    // Read-model history cap: how many terminal (Completed/Terminated) instances
-    // to retain before the oldest are evicted (with their variables/jobs/etc.).
-    // 0 = unbounded (default). Bounds read-model memory to the working set so a
-    // long-running engine does not climb indefinitely as completed instances
-    // accumulate. Pruned in this thread (the single SQLite writer), throttled by
-    // accumulated completions so the transaction cost is amortized.
-    let history_cap = history_max_instances_from_env();
+    // Read-model history cap (per shard): how many terminal (Completed/Terminated)
+    // instances to retain before the oldest are evicted (with their
+    // variables/jobs/etc.). 0 = unbounded (default). Bounds read-model memory to
+    // the working set so a long-running engine does not climb indefinitely as
+    // completed instances accumulate. Pruned in this thread (the shard's single
+    // SQLite writer), throttled by accumulated completions so the transaction cost
+    // is amortized.
     let prune_threshold = (history_cap / 4).clamp(64, 4096);
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
@@ -8021,17 +8166,10 @@ async fn main() {
 
     let server = match journal_path {
         Some(journal_path) => {
-            // Persistent run: the read store is a derived projection of the
-            // journal(s), so reconcile it against the log before serving.
-            let store = Arc::new(ReadStore::open(db_path.as_deref()).unwrap_or_else(|e| {
-                let at = db_path
-                    .as_deref()
-                    .map(|p| format!(" at {}", p.display()))
-                    .unwrap_or_default();
-                panic!(
-                    "failed to open read model{at} (is the file or its directory writable?): {e}"
-                )
-            }));
+            // Persistent run: the read model is a per-partition sharded projection
+            // of the journal(s), so reconcile every shard against the log before
+            // serving. Each branch opens its shards (file-backed under `db_path`)
+            // and yields the assembled `ReadModel`.
             let partitions = partition_count_from_env();
             let topology = cluster::Topology::from_env(partitions as u64);
             let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
@@ -8039,12 +8177,14 @@ async fn main() {
             // path: the shared seal state plus the global partition count that
             // sizes the per-partition compaction watermark vector.
             let mut multi_seg: Option<(Arc<seglog::SegShared>, u64)> = None;
-            let (journals, recovered) = if topology.is_single_node() && partitions == 1 {
+            let (journals, recovered, store) = if topology.is_single_node() && partitions == 1 {
                 // Single partition: the bounded-disk segmented journal (snapshot
                 // + segment rotation + compaction) unless explicitly disabled, in
                 // which case the legacy single-file journal is used. Either way we
                 // warm-start by replaying only the events the read store has not
                 // yet projected.
+                let (read_model, shards) = open_sharded_read_model(db_path.as_deref(), &[0], true);
+                let shard = Arc::clone(&shards[0].1);
                 if seglog::segmented_enabled() {
                     let dir = journal_path
                         .parent()
@@ -8059,36 +8199,36 @@ async fn main() {
                     // compacted before `first_index` were already projected (the
                     // exporter watermark gates compaction), so the store is never
                     // behind the compacted prefix.
-                    let mut pos = store.exported_position() as u64;
+                    let mut pos = shard.exported_position() as u64;
                     if pos > recovery.total_events {
                         // Store ahead of the log (truncated/corrupt): rebuild from
                         // whatever survives.
-                        store.reset().expect("reset read store");
+                        shard.reset().expect("reset read store");
                         pos = recovery.first_index;
                     }
                     let skip = pos.saturating_sub(recovery.first_index) as usize;
                     if skip < recovery.events.len() {
                         let refs: Vec<&Event> = recovery.events[skip..].iter().collect();
-                        store
+                        shard
                             .export(&refs)
                             .expect("catch up read model from segmented journal");
                     }
                     let recovered = !journal.is_fresh();
-                    (vec![journal], recovered)
+                    (vec![journal], recovered, read_model)
                 } else {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    let mut pos = store.exported_position();
+                    let mut pos = shard.exported_position();
                     if pos > events.len() {
                         // The store is ahead of the log (truncated/corrupt journal):
                         // rebuild from scratch.
-                        store.reset().expect("reset read store");
+                        shard.reset().expect("reset read store");
                         pos = 0;
                     }
                     if pos < events.len() {
                         let refs: Vec<&Event> = events[pos..].iter().collect();
-                        store
+                        shard
                             .export(&refs)
                             .expect("catch up read model from journal");
                     }
@@ -8096,7 +8236,7 @@ async fn main() {
                         panic!("failed to open journal {}: {e}", journal_path.display())
                     });
                     let recovered = !journal.is_fresh();
-                    (vec![journal], recovered)
+                    (vec![journal], recovered, read_model)
                 }
             } else if topology.is_single_node() {
                 // Multi-partition: ONE shared group-commit WAL for every
@@ -8129,7 +8269,9 @@ async fn main() {
                                 )
                             });
                     multi_seg = Some((Arc::clone(&recovery.shared), partitions as u64));
-                    catch_up_global_read_model(&store, &recovery);
+                    let (read_model, shards) =
+                        open_sharded_read_model(db_path.as_deref(), &owned, false);
+                    catch_up_read_model(&shards, &recovery);
                     let recovered = !recovery.fresh;
                     let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
                         recovery.engines.into_iter().collect();
@@ -8141,7 +8283,7 @@ async fn main() {
                             Journal::from_engine_shared(p, engine, !recovered, &shared)
                         })
                         .collect();
-                    (journals, recovered)
+                    (journals, recovered, read_model)
                 } else {
                     // Legacy single-file multi-partition path: the read model is
                     // rebuilt from scratch because the runtime exporter interleaves
@@ -8154,15 +8296,10 @@ async fn main() {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    store
-                        .reset()
-                        .expect("reset read store for multi-partition rebuild");
-                    if !events.is_empty() {
-                        let refs: Vec<&Event> = events.iter().collect();
-                        store
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                    let owned: Vec<u64> = (0..partitions as u64).collect();
+                    let (read_model, shards) =
+                        open_sharded_read_model(db_path.as_deref(), &owned, false);
+                    rebuild_read_model_legacy(&shards, &events, partitions);
 
                     // Split the shared log into each partition's own events by the
                     // owning partition encoded in every event's key. A key whose
@@ -8187,7 +8324,7 @@ async fn main() {
                         .enumerate()
                         .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
                         .collect();
-                    (journals, recovered)
+                    (journals, recovered, read_model)
                 }
             } else {
                 // Clustered: this node owns only a SUBSET of the cluster's
@@ -8227,7 +8364,9 @@ async fn main() {
                                 )
                             });
                     multi_seg = Some((Arc::clone(&recovery.shared), partitions as u64));
-                    catch_up_global_read_model(&store, &recovery);
+                    let (read_model, shards) =
+                        open_sharded_read_model(db_path.as_deref(), &owned, false);
+                    catch_up_read_model(&shards, &recovery);
                     let recovered = !recovery.fresh;
                     let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
                         recovery.engines.into_iter().collect();
@@ -8240,7 +8379,7 @@ async fn main() {
                             Journal::from_engine_shared(p, engine, !recovered, &shared)
                         })
                         .collect();
-                    (journals, recovered)
+                    (journals, recovered, read_model)
                 } else {
                     // Legacy clustered path: this node owns only a SUBSET of the
                     // cluster's partitions (`partition_id % num_nodes == node_id`).
@@ -8253,15 +8392,13 @@ async fn main() {
                     let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
                         panic!("failed to read journal {}: {e}", journal_path.display())
                     });
-                    store
-                        .reset()
-                        .expect("reset read store for clustered rebuild");
-                    if !events.is_empty() {
-                        let refs: Vec<&Event> = events.iter().collect();
-                        store
-                            .export(&refs)
-                            .expect("catch up read model from journal");
-                    }
+                    let (read_model, shards) =
+                        open_sharded_read_model(db_path.as_deref(), &owned, false);
+                    // The read model demuxes exactly like the engines below:
+                    // `ProcessDeployed` (partition-agnostic, keyed to the deployment
+                    // partition a peer may not own) into every owned shard; other
+                    // events to `partition_of(key)`'s shard.
+                    rebuild_read_model_legacy(&shards, &events, partitions);
                     // Demultiplex the node's log into its owned partitions by the
                     // partition id encoded in every key. Any event for a partition
                     // this node does not own (a stray from a re-sharded layout) is
@@ -8304,7 +8441,7 @@ async fn main() {
                             Journal::from_events_shared(*p, evs, &shared)
                         })
                         .collect();
-                    (journals, recovered)
+                    (journals, recovered, read_model)
                 }
             };
 
@@ -8415,11 +8552,11 @@ async fn main() {
                             tracing::warn!("multi-partition snapshot write failed: {e}");
                             continue;
                         }
-                        let exported = store.exported_position() as u64;
-                        let removed = seglog::compact_multi(&shared, &covered, exported);
+                        let exported = store.exported_watermarks(num_partitions as usize);
+                        let removed = seglog::compact_multi(&shared, &covered, &exported);
                         if removed > 0 {
                             tracing::debug!(
-                                "multi-partition journal compaction removed {removed} sealed segment(s) (exported {exported})"
+                                "multi-partition journal compaction removed {removed} sealed segment(s) (exported {exported:?})"
                             );
                         }
                     }
@@ -8434,8 +8571,6 @@ async fn main() {
         }
         None => {
             tracing::info!("no journal configured; running in-memory (state is not persisted)");
-            let store =
-                Arc::new(ReadStore::open(db_path.as_deref()).expect("open in-memory read store"));
             let partitions = partition_count_from_env();
             let topology = cluster::Topology::from_env(partitions as u64);
             let journals: Vec<Journal> = if topology.is_single_node() {
@@ -8449,6 +8584,9 @@ async fn main() {
                     .map(|p| Journal::in_memory_partition(*p))
                     .collect()
             };
+            let owned: Vec<u64> = journals.iter().map(|j| j.partition_id()).collect();
+            let single = owned.len() == 1 && owned[0] == 0;
+            let (store, _shards) = open_sharded_read_model(db_path.as_deref(), &owned, single);
             build_server(journals, store, topology)
         }
     };
@@ -8859,8 +8997,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        build_server(journals, store, topology)
+        build_server_in_memory(journals, topology)
     }
 
     #[test]
@@ -8974,8 +9111,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node0 = build_server(journals, store, topology);
+        let node0 = build_server_in_memory(journals, topology);
 
         // The peer has no definition yet.
         assert!(
@@ -9050,8 +9186,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         // Publishing at node 1 fans out to node 0, whose message-start
         // subscription fires and creates a new instance on partition 0.
@@ -9102,8 +9237,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -9214,8 +9348,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -9320,8 +9453,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         // The job lives on a partition node 1 does NOT own — it must forward.
         let owner = node1
@@ -9369,8 +9501,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         let owner = node1
             .remote_owner_of(instance_key)
@@ -9413,8 +9544,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         assert_eq!(
             node1.remote_owner_of(instance),
@@ -9501,8 +9631,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         assert_eq!(
             node1.remote_owner_of(task_key),
@@ -9616,8 +9745,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node0 = build_server(journals, store, topology);
+        let node0 = build_server_in_memory(journals, topology);
 
         use apis::cluster::GetTopologyResponse as Resp;
         let t = match node0.get_topology_impl().await.unwrap() {
@@ -9728,8 +9856,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node0 = build_server(journals, store, topology);
+        let node0 = build_server_in_memory(journals, topology);
 
         use apis::process_instance::CreateProcessInstanceResponse as R;
         let resp = node0
@@ -9784,8 +9911,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         // node 1 owns no demo job locally; it must pull from node 0.
         let local = node1
@@ -9873,8 +9999,7 @@ mod clustered_startup_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        let node1 = build_server(journals, store, topology);
+        let node1 = build_server_in_memory(journals, topology);
 
         // Long polling disabled (requestTimeout < 0): the only way this returns a
         // job is by aggregating from node 0 in the same pass.
@@ -9938,8 +10063,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -10095,8 +10219,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -10192,8 +10315,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -10359,8 +10481,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -10521,8 +10642,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let node0 = build_node(0);
         let node1 = build_node(1);
@@ -10748,8 +10868,7 @@ mod clustered_startup_tests {
                 .iter()
                 .map(|p| Journal::in_memory_partition(*p))
                 .collect();
-            let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-            build_server(journals, store, topology)
+            build_server_in_memory(journals, topology)
         };
         let mut node0 = build_node(0);
         let mut node1 = build_node(1);
@@ -11990,8 +12109,7 @@ mod subscription_placement_tests {
             .iter()
             .map(|p| Journal::in_memory_partition(*p))
             .collect();
-        let store = Arc::new(ReadStore::open(None).expect("open in-memory read store"));
-        build_server(journals, store, topology)
+        build_server_in_memory(journals, topology)
     }
 
     /// A process whose only wait state is a message intermediate catch keyed on

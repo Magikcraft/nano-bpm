@@ -768,6 +768,16 @@ pub struct MultiSegRecovery {
     pub shared: Arc<SegShared>,
     /// All surviving events, ascending, spanning global `[first_index, total_events)`.
     pub events: Vec<Event>,
+    /// Surviving events paired with the GLOBAL partition that produced each write
+    /// (the write tag), in global log order. Drives the sharded read model's
+    /// per-partition boot catch-up: shard `p` resumes from the events tagged `p`
+    /// past its own persisted `exported_position` (see [`Self::pp_base`]).
+    pub tagged: Vec<(u64, Event)>,
+    /// Per-partition cumulative event counts BEFORE the first surviving event
+    /// (i.e. the counts compacted away), indexed by global partition id. A shard's
+    /// persisted `exported_position` minus `pp_base[p]` is how many surviving
+    /// tagged events it has already projected.
+    pub pp_base: Vec<u64>,
     /// Absolute (global) index of the first surviving event.
     pub first_index: u64,
     /// Absolute (global) count of all events ever durably appended.
@@ -952,6 +962,8 @@ pub fn recover_multi(
         fresh,
         shared,
         events,
+        tagged,
+        pp_base,
         first_index,
         total_events,
         engines,
@@ -959,17 +971,29 @@ pub fn recover_multi(
 }
 
 /// Deletes every sealed segment that BOTH the read model and every partition's
-/// snapshot no longer need: `seg.end <= exported_position` (read model has
-/// projected all of it — valid because the shared writer feeds the exporter in
-/// log order) AND for every partition `p`, `covered[p] >= seg.per_partition_end[p]`
-/// (each partition's snapshot subsumes its events in the segment). `covered` is
-/// indexed by global partition id (0 for partitions that never snapshotted).
+/// snapshot no longer need: for every partition `p`, `exported[p] >=
+/// seg.per_partition_end[p]` (that partition's read-model shard has projected all
+/// of the segment's events — each shard consumes only its partition's events, in
+/// log order) AND `covered[p] >= seg.per_partition_end[p]` (each partition's
+/// snapshot subsumes its events in the segment). Both `exported` and `covered`
+/// are indexed by global partition id (0 for partitions that never advanced).
+///
+/// The per-partition export gate replaces the earlier single global
+/// `exported_position` scalar: with a sharded read model (one exporter thread +
+/// store per partition) the shards advance independently, so a global sum could
+/// pass while a lagging shard still needs a segment's events — deleting it would
+/// lose data on that shard's boot re-projection.
+///
 /// Removes each segment's per-partition sidecar with it. Returns the count removed.
-pub fn compact_multi(shared: &SegShared, covered: &[u64], exported_position: u64) -> usize {
+pub fn compact_multi(shared: &SegShared, covered: &[u64], exported: &[u64]) -> usize {
     let mut sealed = shared.sealed.lock().expect("sealed lock");
     let mut removed = 0usize;
     while let Some(seg) = sealed.first() {
-        let export_ok = seg.end <= exported_position;
+        let export_ok = seg
+            .per_partition_end
+            .iter()
+            .enumerate()
+            .all(|(p, end)| exported.get(p).copied().unwrap_or(0) >= *end);
         let snap_ok = seg.per_partition_end.len() <= covered.len()
             && seg
                 .per_partition_end
@@ -1266,13 +1290,19 @@ mod tests {
             // Below partition 1's watermark: retained (the snapshot for p1 does
             // not yet subsume its events in the sealed segment).
             let held_back = [covered0, covered1.saturating_sub(1)];
-            assert_eq!(compact_multi(&seg, &held_back, u64::MAX), 0);
+            assert_eq!(compact_multi(&seg, &held_back, &[u64::MAX; 2]), 0);
             assert_eq!(seg.sealed.lock().unwrap().len(), 1);
 
             // With every partition's watermark met AND the read model past the
             // segment: compacted away.
             let covered = [covered0, covered1];
-            assert_eq!(compact_multi(&seg, &covered, u64::MAX), 1);
+            // Snapshot subsumes the segment for every partition, but p1's
+            // read-model shard has not yet projected its events in the segment:
+            // the per-partition export gate keeps it.
+            let exported_lag = [u64::MAX, covered1.saturating_sub(1)];
+            assert_eq!(compact_multi(&seg, &covered, &exported_lag), 0);
+            assert_eq!(seg.sealed.lock().unwrap().len(), 1);
+            assert_eq!(compact_multi(&seg, &covered, &[u64::MAX; 2]), 1);
             assert!(seg.sealed.lock().unwrap().is_empty());
 
             (key0, key1)

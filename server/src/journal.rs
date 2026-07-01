@@ -16,6 +16,7 @@
 //! only durable business facts keeps the log small and gives a clean recovery
 //! semantic — after a restart, workers simply re-activate.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -37,14 +38,16 @@ use crate::varspill::VarSpillStore;
 /// newline-terminated, serialized bytes for one command's events, the number of
 /// events they encode (so the segmented writer can track absolute positions),
 /// plus a one-shot sender signalled once those bytes are fsynced to disk.
-/// Shared cell holding the read-model exporter sender for a segmented shared
-/// writer. The writer thread and every shared-backed [`Journal`] hold an `Arc`
-/// clone; a shared-backed [`Journal::set_exporter`] drops the sender in, and the
-/// writer forwards each committed command's events through it in fsync (log)
-/// order (see [`forward_shared_export`]). Wrapped in `Option` so the same code
-/// paths cover the non-shared journals (which forward from `persist()` and leave
-/// this `None`).
-type ExporterCell = Arc<Mutex<Option<Sender<Arc<Vec<Event>>>>>>;
+/// Shared cell holding the read-model exporter senders for a segmented shared
+/// writer, keyed by global partition id. The writer thread and every
+/// shared-backed [`Journal`] hold an `Arc` clone; a shared-backed
+/// [`Journal::set_exporter`] registers its partition's sender, and the writer
+/// forwards each committed command's events through the matching partition's
+/// sender in fsync (log) order (see [`forward_shared_export`]). Sharding the map
+/// by partition lets each owned partition drive its own read-store shard +
+/// exporter thread, so projection scales with cores. Empty for the non-shared
+/// journals (which forward from `persist()` and leave this untouched).
+type ExporterCell = Arc<Mutex<HashMap<u64, Sender<Arc<Vec<Event>>>>>>;
 
 struct WriteRequest {
     bytes: Vec<u8>,
@@ -193,7 +196,18 @@ const MAX_GROUP_BATCH: usize = 8192;
 /// with no wired exporter cell is an ordering bug: the exporter must be wired
 /// before any shared write is served; we debug-assert and skip (boot catch-up
 /// covers everything written before the wire, so this can only be a real bug).
-fn forward_shared_export(exporter: &Option<ExporterCell>, events_arc: Option<Arc<Vec<Event>>>) {
+/// Forwards a shared-writer-backed command's events to the read-model exporter
+/// shard for `partition` (if wired) in fsync/log order. A no-op when `events_arc`
+/// is `None` (the non-shared paths forward from `persist()` instead). An
+/// `events_arc` present with no wired exporter sender for the partition is an
+/// ordering bug: every owned partition's exporter must be wired before any shared
+/// write is served; we debug-assert and skip (boot catch-up covers everything
+/// written before the wire, so this can only be a real bug).
+fn forward_shared_export(
+    exporter: &Option<ExporterCell>,
+    partition: u64,
+    events_arc: Option<Arc<Vec<Event>>>,
+) {
     let Some(events) = events_arc else { return };
     if events.is_empty() {
         return;
@@ -202,10 +216,10 @@ fn forward_shared_export(exporter: &Option<ExporterCell>, events_arc: Option<Arc
         debug_assert!(false, "shared write with no exporter cell wired");
         return;
     };
-    if let Some(tx) = cell.lock().unwrap().as_ref() {
+    if let Some(tx) = cell.lock().unwrap().get(&partition) {
         let _ = tx.send(events);
     } else {
-        debug_assert!(false, "shared write before exporter was set");
+        debug_assert!(false, "shared write before exporter was set for partition");
     }
 }
 
@@ -300,11 +314,11 @@ fn writer_loop(
                 // The receiver is gone for fire-and-forget writes (the background
                 // tick and startup seeding never await their commit); that's fine.
                 let _ = req.ack.send(());
-                // Forward to the read-model exporter in log (fsync) order for the
-                // shared multi-partition path, keeping `exported_position` a true
-                // global prefix. `None` events_arc means this journal forwards via
-                // `persist()` instead (single-partition / in-memory / legacy).
-                forward_shared_export(&exporter, req.events_arc);
+                // Forward to the read-model exporter shard for this write's
+                // partition in log (fsync) order. `None` events_arc means this
+                // journal forwards via `persist()` instead (single-partition /
+                // in-memory / legacy).
+                forward_shared_export(&exporter, req.partition, req.events_arc);
             }
 
             // Size-based segment seal (no-op in the legacy single-file path,
@@ -480,7 +494,7 @@ fn writer_loop_async(
             crate::metrics::inflight_sub(batch.len());
             for req in batch {
                 let _ = req.ack.send(());
-                forward_shared_export(&exporter, req.events_arc);
+                forward_shared_export(&exporter, req.partition, req.events_arc);
             }
 
             if unsynced_bytes >= flush.max_bytes || last_fsync.elapsed() >= flush.interval {
@@ -696,7 +710,7 @@ impl SharedWriter {
         let shared = Arc::clone(&recovery.shared);
         let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let exporter: ExporterCell = Arc::new(Mutex::new(None));
+        let exporter: ExporterCell = Arc::new(Mutex::new(HashMap::new()));
         spawn_writer(seg_active, rx, Some(Arc::clone(&exporter)))
             .expect("spawn shared journal writer thread");
         Ok((
@@ -1209,7 +1223,7 @@ impl Journal {
     /// `persist()` does not also forward (which would double-project).
     pub fn set_exporter(&mut self, exporter: Sender<Arc<Vec<Event>>>) {
         if let Some(cell) = self.shared_exporter.as_ref() {
-            *cell.lock().unwrap() = Some(exporter);
+            cell.lock().unwrap().insert(self.partition_id, exporter);
         } else {
             self.exporter = Some(exporter);
         }

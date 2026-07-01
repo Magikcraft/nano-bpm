@@ -19,12 +19,13 @@
 //! A non-persistent (`:memory:`) store backs the engine's in-memory mode so
 //! reads still work while nothing is persisted.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
     DEFAULT_JOB_RETRIES, Event, IncidentKind, IncidentState, JobState, Key, ProcessInstanceState,
-    UserTaskState, Value,
+    UserTaskState, Value, partition_of,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -675,6 +676,203 @@ impl ReadStore {
     }
 }
 
+/// A sharded read model: one [`ReadStore`] per owned partition, presenting the
+/// single-store query API by routing point lookups to the owning partition's
+/// shard and merging scans/counts across shards. This is opening #1 — the read
+/// model was the per-node throughput ceiling because ONE exporter thread +
+/// `Mutex<Connection>` projected every partition's events on a single core;
+/// sharding by partition lets projection (and the read store's SQLite writer)
+/// scale with cores.
+///
+/// Invariants: each shard only ever sees its own partition's events (the shared
+/// journal writer routes by partition and boot catch-up demuxes by partition),
+/// so a shard's `exported_position` is exactly its partition's projected event
+/// count. Process definitions are replicated to every owned partition under the
+/// same (partition-0) key, so any shard answers a definition query.
+pub struct ReadModel {
+    /// Shards indexed positionally; `slot_by_partition` maps a global partition
+    /// id to its index here.
+    shards: Vec<Arc<ReadStore>>,
+    slot_by_partition: HashMap<u64, usize>,
+}
+
+impl ReadModel {
+    /// Builds a read model from `(global_partition_id, shard)` pairs. Requires at
+    /// least one shard (a node always owns at least one partition).
+    pub fn from_shards(shards: Vec<(u64, Arc<ReadStore>)>) -> Self {
+        assert!(!shards.is_empty(), "read model needs at least one shard");
+        let mut slot_by_partition = HashMap::with_capacity(shards.len());
+        let mut list = Vec::with_capacity(shards.len());
+        for (pid, store) in shards {
+            slot_by_partition.insert(pid, list.len());
+            list.push(store);
+        }
+        Self {
+            shards: list,
+            slot_by_partition,
+        }
+    }
+
+    /// A single in-memory shard for partition 0 — the trivial (single-partition /
+    /// test) case.
+    pub fn single_in_memory() -> Self {
+        Self::from_shards(vec![(
+            0,
+            Arc::new(ReadStore::open(None).expect("open in-memory read store")),
+        )])
+    }
+
+    /// In-memory shards, one per partition in `owned`.
+    pub fn in_memory_partitions(owned: &[u64]) -> Self {
+        let shards = owned
+            .iter()
+            .map(|&p| {
+                (
+                    p,
+                    Arc::new(ReadStore::open(None).expect("open in-memory read store")),
+                )
+            })
+            .collect();
+        Self::from_shards(shards)
+    }
+
+    /// The shards paired with their global partition ids, for wiring exporter
+    /// threads and gathering per-partition compaction watermarks.
+    pub fn shards(&self) -> Vec<(u64, Arc<ReadStore>)> {
+        let mut out = vec![None; self.shards.len()];
+        for (&pid, &idx) in &self.slot_by_partition {
+            out[idx] = Some((pid, Arc::clone(&self.shards[idx])));
+        }
+        out.into_iter().flatten().collect()
+    }
+
+    /// Number of shards (owned partitions).
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    fn shard_for(&self, key: Key) -> Option<&ReadStore> {
+        self.slot_by_partition
+            .get(&partition_of(key))
+            .map(|&i| self.shards[i].as_ref())
+    }
+
+    // --- point lookups: route to the key's owning partition shard ---
+
+    pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
+        self.shard_for(key)?.process_instance(key)
+    }
+
+    pub fn incident(&self, key: Key) -> Option<IncidentRow> {
+        self.shard_for(key)?.incident(key)
+    }
+
+    pub fn variable(&self, key: Key) -> Option<VariableRow> {
+        self.shard_for(key)?.variable(key)
+    }
+
+    pub fn instance_variables(&self, instance_key: Key) -> Vec<VariableRow> {
+        self.shard_for(instance_key)
+            .map(|s| s.instance_variables(instance_key))
+            .unwrap_or_default()
+    }
+
+    // --- definitions: replicated to every owned partition under the same key ---
+
+    pub fn process_definitions(&self) -> Vec<ProcessDefinitionRow> {
+        // Every shard holds every definition (replicated on deploy); read from
+        // the first shard, falling back if it has none yet (mid-catch-up).
+        for s in &self.shards {
+            let defs = s.process_definitions();
+            if !defs.is_empty() {
+                return defs;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn process_definition_xml(&self, key: Key) -> Option<String> {
+        for s in &self.shards {
+            if let Some(xml) = s.process_definition_xml(key) {
+                return Some(xml);
+            }
+        }
+        None
+    }
+
+    // --- scans: concatenate across shards (partition-disjoint) ---
+
+    pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.process_instances())
+            .collect()
+    }
+
+    pub fn jobs(&self) -> Vec<JobRow> {
+        self.shards.iter().flat_map(|s| s.jobs()).collect()
+    }
+
+    pub fn user_tasks(&self) -> Vec<UserTaskRow> {
+        self.shards.iter().flat_map(|s| s.user_tasks()).collect()
+    }
+
+    pub fn incidents(&self) -> Vec<IncidentRow> {
+        self.shards.iter().flat_map(|s| s.incidents()).collect()
+    }
+
+    pub fn variables(&self) -> Vec<VariableRow> {
+        self.shards.iter().flat_map(|s| s.variables()).collect()
+    }
+
+    // --- counts: sum across shards ---
+
+    pub fn active_instance_count(&self) -> usize {
+        self.shards.iter().map(|s| s.active_instance_count()).sum()
+    }
+
+    pub fn process_instance_count(&self) -> i64 {
+        self.shards.iter().map(|s| s.process_instance_count()).sum()
+    }
+
+    /// Sum of every shard's `exported_position`. Monotonic across all shards, so
+    /// it is a valid change cursor for the console's instance stream. NOTE: this
+    /// is NOT the compaction watermark — segment deletion uses the per-partition
+    /// vector from [`ReadModel::exported_watermarks`] (a global sum could pass
+    /// while a lagging shard still needs the segment).
+    pub fn exported_position(&self) -> usize {
+        self.shards.iter().map(|s| s.exported_position()).sum()
+    }
+
+    /// Per-partition exported watermarks indexed by global partition id (length
+    /// `num_partitions`; non-owned partitions stay 0). Feeds
+    /// [`crate::seglog::compact_multi`]'s per-partition export gate.
+    pub fn exported_watermarks(&self, num_partitions: usize) -> Vec<u64> {
+        let mut v = vec![0u64; num_partitions];
+        for (&pid, &idx) in &self.slot_by_partition {
+            if (pid as usize) < num_partitions {
+                v[pid as usize] = self.shards[idx].exported_position() as u64;
+            }
+        }
+        v
+    }
+
+    // --- paged: single-shard pushes down to SQL; multi merges + slices ---
+
+    pub fn process_instances_page(&self, limit: i64, offset: i64) -> Vec<ProcessInstanceRow> {
+        if self.shards.len() == 1 {
+            return self.shards[0].process_instances_page(limit, offset);
+        }
+        let mut all = self.process_instances();
+        // Newest-first by key (keys are monotonic per partition), matching the
+        // single-store `ORDER BY key DESC`.
+        all.sort_by_key(|b| std::cmp::Reverse(b.key));
+        let start = offset.max(0) as usize;
+        let take = limit.max(0) as usize;
+        all.into_iter().skip(start).take(take).collect()
+    }
+}
+
 fn map_instance(r: &rusqlite::Row) -> rusqlite::Result<ProcessInstanceRow> {
     let tags_str: String = r.get(8)?;
     let tags = if tags_str.is_empty() {
@@ -1283,7 +1481,11 @@ mod writability_tests {
                 .unwrap();
             (mode, sync)
         };
-        assert_eq!(mode.to_lowercase(), "wal", "read store must use WAL journal");
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "read store must use WAL journal"
+        );
         assert_eq!(sync, 1, "read store must use synchronous=NORMAL (1)");
         drop(store);
         std::fs::remove_file(&path).ok();
