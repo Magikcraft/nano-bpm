@@ -324,10 +324,20 @@ impl ToolBox for AnalysisTools {
                 target, and workerCounts to price specific pool sizes. Each result gives the \
                 fitted arrivalPerSec, serviceMs, offeredLoadErlangs, the observed p50/p99 wait \
                 (the status quo), a recommendedWorkers count, and a predictions curve (always \
-                including 1 worker) showing predictedP99WaitMs + utilization per pool size. \
-                Note: worker count is deployment config, not a BPMN property, so DON'T try to \
-                model scaling by editing the model (e.g. cloning the task) — quantify it here, \
-                then recommend the staffing change."
+                including 1 worker). Each prediction gives predictedUtilization plus the full \
+                predicted QUEUE-WAIT envelope: predictedWaitMs {mean,p50,p95,p99}, and the \
+                distribution parameters waitProbability (Erlang-C: chance a job queues) + \
+                waitDecayPerMs (exponential tail rate). TO GET THE NEW *PROCESS* PERFORMANCE \
+                ENVELOPE (end-to-end p50/p95/p99), roll these per-job waits up yourself with \
+                query_traces / run_python: the jobs table has every instance's per-job queue_ms \
+                & service_ms in seq order and instances.duration_ms is the recorded e2e, so a \
+                first-order projection is new_e2e[i] = duration_ms[i] − Σ over scaled jobs in i \
+                of (recorded queue_ms − predictedWaitMs.mean), then quantile_cont(new_e2e, {0.5, \
+                0.95,0.99}); this assumes the scaled task sits on the instance's critical path \
+                (true for a sequential bottleneck, optimistic on a non-critical parallel branch \
+                — state the assumption). Note: worker count is deployment config, not a BPMN \
+                property, so DON'T try to model scaling by editing the model (e.g. cloning the \
+                task) — quantify it here, then recommend the staffing change."
                 .into(),
             parameters: json!({
                 "type": "object",

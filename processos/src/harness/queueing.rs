@@ -132,14 +132,79 @@ pub struct JobLoad {
 /// this job type at the fitted load. `stable` is false when the pool cannot keep
 /// up (ρ ≥ 1); an unstable pool has no finite wait, so `predicted_p99_wait_ms` is
 /// omitted.
+/// The full predicted queue-wait envelope for a job type at a given pool size,
+/// derived analytically from the fitted M/M/c waiting-time distribution
+/// `P(Wq > t) = C·exp(−(c−a)/s · t)`. `mean` is the expected wait; the quantiles
+/// are the envelope the process inherits. All in ms.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PredictedWait {
+    pub mean_ms: u64,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+}
+
+/// A single what-if point: what a pool of `workers` is predicted to deliver for
+/// this job type at the fitted load. `stable` is false when the pool cannot keep
+/// up (ρ ≥ 1); an unstable pool has no finite wait, so `predictedWaitMs` (and the
+/// distribution parameters) are omitted.
+///
+/// `waitProbability` (Erlang-C, the chance a job queues at all) and
+/// `waitDecayPerMs` (the exponential tail rate) are the two parameters that fully
+/// describe the wait distribution, handed out so a caller can compose its OWN
+/// downstream envelope (e.g. substitute a sampled wait into each recorded
+/// instance's critical path with query_traces / run_python).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScalingPoint {
     pub workers: u32,
     pub stable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub predicted_p99_wait_ms: Option<u64>,
     pub predicted_utilization: f64,
+    /// The predicted queue-wait envelope (mean + p50/p95/p99), ms. None if unstable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicted_wait_ms: Option<PredictedWait>,
+    /// Erlang-C: P(an arriving job must queue) at this pool size, in [0,1].
+    pub wait_probability: f64,
+    /// Exponential tail rate of the wait distribution, per ms: a predicted quantile
+    /// is `wait_prob > 1−q ? ln(waitProbability/(1−q)) / waitDecayPerMs : 0`. None
+    /// if unstable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_decay_per_ms: Option<f64>,
+}
+
+/// The predicted queue-wait distribution for `c` M/M/c servers at arrival rate
+/// `lambda` (per sec) and service time `s` (sec): the Erlang-C wait probability,
+/// the exponential decay rate (per sec), the mean wait and the p50/p95/p99
+/// envelope, all derived from `P(Wq > t) = C·exp(−(c−a)/s · t)`. `None` when the
+/// pool is unstable (c ≤ a) and no finite wait exists.
+fn predicted_wait(c: u32, lambda: f64, s: f64) -> Option<(f64, f64, PredictedWait)> {
+    let a = lambda * s; // Erlangs
+    if (c as f64) <= a {
+        return None; // unstable — unbounded wait
+    }
+    let cc = erlang_c(c, a);
+    let decay_per_s = (c as f64 - a) / s; // per second
+                                          // Quantile of the wait: with prob (1−C) the wait is zero; the rest is an
+                                          // exponential tail. So the q-quantile is zero until q passes (1−C).
+    let quantile_ms = |q: f64| -> u64 {
+        if cc <= 1.0 - q {
+            0
+        } else {
+            (((cc / (1.0 - q)).ln() / decay_per_s) * 1000.0)
+                .max(0.0)
+                .round() as u64
+        }
+    };
+    // Mean wait Wq = C / (cμ − λ) = C·s/(c−a) seconds.
+    let mean_ms = ((cc * s / (c as f64 - a)) * 1000.0).max(0.0).round() as u64;
+    let env = PredictedWait {
+        mean_ms,
+        p50_ms: quantile_ms(0.50),
+        p95_ms: quantile_ms(0.95),
+        p99_ms: quantile_ms(0.99),
+    };
+    Some((cc, decay_per_s / 1000.0, env))
 }
 
 /// A per-job-type worker-scaling answer: the fitted load, a recommended pool for
@@ -226,14 +291,23 @@ pub fn scale_job(load: &JobLoad, target_p99_wait_ms: u64, worker_counts: &[u32])
 
     let predictions = counts
         .into_iter()
-        .map(|c| {
-            let wait = p99_wait_ms(c, lambda, s);
-            ScalingPoint {
+        .map(|c| match predicted_wait(c, lambda, s) {
+            Some((wait_prob, decay_per_ms, env)) => ScalingPoint {
                 workers: c,
-                stable: wait.is_some(),
-                predicted_p99_wait_ms: wait.map(|w| w.round() as u64),
+                stable: true,
                 predicted_utilization: offered / c as f64,
-            }
+                predicted_wait_ms: Some(env),
+                wait_probability: wait_prob,
+                wait_decay_per_ms: Some(decay_per_ms),
+            },
+            None => ScalingPoint {
+                workers: c,
+                stable: false,
+                predicted_utilization: offered / c as f64,
+                predicted_wait_ms: None,
+                wait_probability: 1.0, // an unstable pool always queues
+                wait_decay_per_ms: None,
+            },
         })
         .collect();
 
@@ -445,18 +519,27 @@ mod tests {
         // One worker cannot keep up with 5 Erlangs of load: unstable, no finite wait.
         let one = out.predictions.iter().find(|p| p.workers == 1).unwrap();
         assert!(!one.stable);
-        assert!(one.predicted_p99_wait_ms.is_none());
-        // Adding workers monotonically cuts the predicted tail.
+        assert!(one.predicted_wait_ms.is_none());
+        assert!(one.wait_decay_per_ms.is_none());
+        // Adding workers monotonically cuts the predicted p99 tail.
         let stable: Vec<u64> = out
             .predictions
             .iter()
-            .filter_map(|p| p.predicted_p99_wait_ms)
+            .filter_map(|p| p.predicted_wait_ms.as_ref().map(|w| w.p99_ms))
             .collect();
         for w in stable.windows(2) {
             assert!(
                 w[1] <= w[0],
                 "wait should not grow with more workers: {stable:?}"
             );
+        }
+        // The envelope is internally ordered: mean/p50 <= p95 <= p99.
+        for p in out
+            .predictions
+            .iter()
+            .filter_map(|p| p.predicted_wait_ms.as_ref())
+        {
+            assert!(p.p50_ms <= p.p95_ms && p.p95_ms <= p.p99_ms);
         }
     }
 

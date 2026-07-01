@@ -551,7 +551,11 @@ property: when the bottleneck is UNDER-PROVISIONING — a high queue_ms tail, a 
 adding a parallel path (that changes behaviour, not staffing). Call `scale_workers` (optionally with \
 jobType / targetP99WaitMs / workerCounts): it fits an M/M/c model to the recorded arrival rate and \
 service time and predicts the p99 queue-wait at each pool size — the infrastructure what-if simulate \
-structurally cannot run — then recommend the staffing number it returns. When a measured \
+structurally cannot run — then recommend the staffing number it returns. To project the NEW \
+whole-PROCESS envelope after scaling, roll the tool's per-job predictedWaitMs up to end-to-end \
+yourself with query_traces / run_python: new_e2e[i] = instances.duration_ms[i] − Σ over scaled jobs \
+in instance i of (recorded jobs.queue_ms − predictedWaitMs.mean), then quantile_cont(new_e2e, \
+{0.5,0.95,0.99}) — a critical-path first-order estimate (state that assumption). When a measured \
 (Level-2) change is available, prefer it: reordering or \
 parallelising EXISTING tasks, or adding a retry on an existing one, scores at full fidelity with no \
 mock needed. To choose between \
