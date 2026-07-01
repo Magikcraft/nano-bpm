@@ -19,8 +19,8 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -37,9 +37,28 @@ use crate::varspill::VarSpillStore;
 /// newline-terminated, serialized bytes for one command's events, the number of
 /// events they encode (so the segmented writer can track absolute positions),
 /// plus a one-shot sender signalled once those bytes are fsynced to disk.
+/// Shared cell holding the read-model exporter sender for a segmented shared
+/// writer. The writer thread and every shared-backed [`Journal`] hold an `Arc`
+/// clone; a shared-backed [`Journal::set_exporter`] drops the sender in, and the
+/// writer forwards each committed command's events through it in fsync (log)
+/// order (see [`forward_shared_export`]). Wrapped in `Option` so the same code
+/// paths cover the non-shared journals (which forward from `persist()` and leave
+/// this `None`).
+type ExporterCell = Arc<Mutex<Option<Sender<Arc<Vec<Event>>>>>>;
+
 struct WriteRequest {
     bytes: Vec<u8>,
     events: usize,
+    /// Global partition id that produced these events (0 on the single-partition
+    /// path). Lets the shared multi-partition writer attribute each write to a
+    /// partition's cumulative count for per-partition seal boundaries.
+    partition: u64,
+    /// The command's events, shared by `Arc`. `Some` only for a journal backed by
+    /// the shared multi-partition writer with a wired exporter cell: the writer
+    /// forwards them to the read-model exporter in fsync (log) order, so
+    /// `exported_position` stays a true global prefix. `None` everywhere else
+    /// (those paths forward from `persist()` directly).
+    events_arc: Option<Arc<Vec<Event>>>,
     ack: oneshot::Sender<()>,
 }
 
@@ -85,6 +104,11 @@ impl Commit {
 /// The engine plus its durable event log.
 pub struct Journal {
     engine: Engine,
+    /// Global partition id this journal's engine owns (0 for single-partition).
+    /// Tags each durable write so the shared multi-partition writer can track
+    /// per-partition cumulative counts, and selects this partition's covered
+    /// count out of a seal boundary.
+    partition_id: u64,
     /// `None` for an in-memory (non-persistent) journal; otherwise the channel to
     /// the background writer thread that owns the log file.
     writer: Option<Sender<WriterMsg>>,
@@ -103,6 +127,13 @@ pub struct Journal {
     /// refcount bump — the 50 KB variable payloads are never deep-copied on the
     /// single command thread.
     exporter: Option<Sender<Arc<Vec<Event>>>>,
+    /// For a journal backed by the shared multi-partition writer: the writer's
+    /// exporter cell. `set_exporter` stores the exporter here instead of in
+    /// `self.exporter`, so the SHARED WRITER forwards events to the read model in
+    /// log order (making `exported_position` a true global prefix) and
+    /// `persist()` does not double-project. `None` for every other path (which
+    /// forward from `persist()`).
+    shared_exporter: Option<ExporterCell>,
     /// `true` when the journal started with no prior log, so the host knows it
     /// should seed any initial deployments.
     fresh: bool,
@@ -156,7 +187,34 @@ const MAX_GROUP_BATCH: usize = 8192;
 /// advanced past the durable log — so the process is aborted rather than risk
 /// acknowledging or serving non-durable state (mirrors the previous
 /// panic-on-I/O-error contract).
-fn writer_loop(mut seg: ActiveSegment, rx: Receiver<WriterMsg>, linger: Duration) {
+/// Forwards a shared-writer-backed command's events to the read-model exporter
+/// (if wired) in fsync/log order. A no-op when `events_arc` is `None` (the
+/// non-shared paths forward from `persist()` instead). An `events_arc` present
+/// with no wired exporter cell is an ordering bug: the exporter must be wired
+/// before any shared write is served; we debug-assert and skip (boot catch-up
+/// covers everything written before the wire, so this can only be a real bug).
+fn forward_shared_export(exporter: &Option<ExporterCell>, events_arc: Option<Arc<Vec<Event>>>) {
+    let Some(events) = events_arc else { return };
+    if events.is_empty() {
+        return;
+    }
+    let Some(cell) = exporter else {
+        debug_assert!(false, "shared write with no exporter cell wired");
+        return;
+    };
+    if let Some(tx) = cell.lock().unwrap().as_ref() {
+        let _ = tx.send(events);
+    } else {
+        debug_assert!(false, "shared write before exporter was set");
+    }
+}
+
+fn writer_loop(
+    mut seg: ActiveSegment,
+    rx: Receiver<WriterMsg>,
+    linger: Duration,
+    exporter: Option<ExporterCell>,
+) {
     loop {
         let idle_start = Instant::now();
         let Ok(first) = rx.recv() else { break };
@@ -212,9 +270,14 @@ fn writer_loop(mut seg: ActiveSegment, rx: Receiver<WriterMsg>, linger: Duration
         if !batch.is_empty() {
             let mut buf = Vec::new();
             let mut events: u64 = 0;
+            let num_partitions = seg.shared().partitions();
+            let mut deltas = vec![0u64; num_partitions];
             for req in &batch {
                 buf.extend_from_slice(&req.bytes);
                 events += req.events as u64;
+                if num_partitions > 0 && (req.partition as usize) < num_partitions {
+                    deltas[req.partition as usize] += req.events as u64;
+                }
             }
 
             let fsync_start = Instant::now();
@@ -224,6 +287,12 @@ fn writer_loop(mut seg: ActiveSegment, rx: Receiver<WriterMsg>, linger: Duration
                 );
                 std::process::abort();
             }
+            // Advance per-partition cumulative counts BEFORE any seal, so the
+            // sealed boundary's per-partition end matches the bytes just written
+            // (no-op on the legacy/single-partition path).
+            if num_partitions > 0 {
+                seg.shared().add_partition_events(&deltas);
+            }
             crate::metrics::record_commit(batch.len(), fsync_start.elapsed(), buf.len());
             crate::metrics::inflight_sub(batch.len());
 
@@ -231,6 +300,11 @@ fn writer_loop(mut seg: ActiveSegment, rx: Receiver<WriterMsg>, linger: Duration
                 // The receiver is gone for fire-and-forget writes (the background
                 // tick and startup seeding never await their commit); that's fine.
                 let _ = req.ack.send(());
+                // Forward to the read-model exporter in log (fsync) order for the
+                // shared multi-partition path, keeping `exported_position` a true
+                // global prefix. `None` events_arc means this journal forwards via
+                // `persist()` instead (single-partition / in-memory / legacy).
+                forward_shared_export(&exporter, req.events_arc);
             }
 
             // Size-based segment seal (no-op in the legacy single-file path,
@@ -275,6 +349,7 @@ fn writer_loop_async(
     rx: Receiver<WriterMsg>,
     linger: Duration,
     flush: AsyncFlush,
+    exporter: Option<ExporterCell>,
 ) {
     let mut last_fsync = Instant::now();
     let mut unsynced_bytes: usize = 0;
@@ -377,15 +452,23 @@ fn writer_loop_async(
         if !batch.is_empty() {
             let mut buf = Vec::new();
             let mut events: u64 = 0;
+            let num_partitions = seg.shared().partitions();
+            let mut deltas = vec![0u64; num_partitions];
             for req in &batch {
                 buf.extend_from_slice(&req.bytes);
                 events += req.events as u64;
+                if num_partitions > 0 && (req.partition as usize) < num_partitions {
+                    deltas[req.partition as usize] += req.events as u64;
+                }
             }
             if let Err(e) = seg.write_all(&buf, events) {
                 tracing::error!(
                     "journal write failed: {e}; aborting to avoid serving non-durable state"
                 );
                 std::process::abort();
+            }
+            if num_partitions > 0 {
+                seg.shared().add_partition_events(&deltas);
             }
             unsynced_bytes += buf.len();
             unsynced_writes += batch.len();
@@ -397,6 +480,7 @@ fn writer_loop_async(
             crate::metrics::inflight_sub(batch.len());
             for req in batch {
                 let _ = req.ack.send(());
+                forward_shared_export(&exporter, req.events_arc);
             }
 
             if unsynced_bytes >= flush.max_bytes || last_fsync.elapsed() >= flush.interval {
@@ -534,15 +618,19 @@ fn async_flush_from_env() -> AsyncFlush {
 /// commit loop from `NANOBPMN_DURABILITY`. Shared by [`SharedWriter::open`],
 /// [`Journal::open_partition`] and the segmented path so all honour the same
 /// durability configuration.
-fn spawn_writer(seg: ActiveSegment, rx: Receiver<WriterMsg>) -> io::Result<JoinHandle<()>> {
+fn spawn_writer(
+    seg: ActiveSegment,
+    rx: Receiver<WriterMsg>,
+    exporter: Option<ExporterCell>,
+) -> io::Result<JoinHandle<()>> {
     let linger = journal_linger_from_env();
     let mode = durability_mode_from_env();
     let flush = async_flush_from_env();
     thread::Builder::new()
         .name("nanobpmn-journal-writer".into())
         .spawn(move || match mode {
-            DurabilityMode::Sync => writer_loop(seg, rx, linger),
-            DurabilityMode::Async => writer_loop_async(seg, rx, linger, flush),
+            DurabilityMode::Sync => writer_loop(seg, rx, linger, exporter),
+            DurabilityMode::Async => writer_loop_async(seg, rx, linger, flush, exporter),
         })
 }
 
@@ -567,6 +655,14 @@ fn spawn_writer(seg: ActiveSegment, rx: Receiver<WriterMsg>) -> io::Result<JoinH
 /// long as any partition journal (holding a cloned sender) is alive.
 pub struct SharedWriter {
     tx: Sender<WriterMsg>,
+    /// Segmented seal/boundary state when this is the bounded-disk
+    /// multi-partition writer; `None` for the legacy single-file shared log.
+    seg: Option<Arc<SegShared>>,
+    /// Exporter cell shared with the writer thread: the read-model exporter
+    /// sender is dropped in here (via a shared-backed [`Journal::set_exporter`])
+    /// so the writer forwards events in fsync/log order. `None` for the legacy
+    /// path (which forwards from `persist()`).
+    exporter: Option<ExporterCell>,
 }
 
 impl SharedWriter {
@@ -577,14 +673,52 @@ impl SharedWriter {
         let shared = SegShared::legacy(path.as_ref().to_path_buf());
         let seg = ActiveSegment::open(shared)?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        spawn_writer(seg, rx).expect("spawn shared journal writer thread");
-        Ok(Self { tx })
+        spawn_writer(seg, rx, None).expect("spawn shared journal writer thread");
+        Ok(Self {
+            tx,
+            seg: None,
+            exporter: None,
+        })
+    }
+
+    /// Opens (or recovers) the bounded-disk **segmented multi-partition** shared
+    /// log rooted at directory `dir`, sized to `num_partitions`. Rebuilds every
+    /// owned partition's engine from the combined snapshot + surviving tail (see
+    /// [`crate::seglog::recover_multi`]) and spawns the segment-aware writer with
+    /// an exporter cell so the read model is fed a single global prefix in log
+    /// order. Returns the writer plus the per-partition recovery.
+    pub fn open_segmented(
+        dir: impl AsRef<Path>,
+        owned: &[u64],
+        num_partitions: u64,
+    ) -> io::Result<(Self, crate::seglog::MultiSegRecovery)> {
+        let recovery = crate::seglog::recover_multi(dir.as_ref(), owned, num_partitions as usize)?;
+        let shared = Arc::clone(&recovery.shared);
+        let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
+        let (tx, rx) = mpsc::channel::<WriterMsg>();
+        let exporter: ExporterCell = Arc::new(Mutex::new(None));
+        spawn_writer(seg_active, rx, Some(Arc::clone(&exporter)))
+            .expect("spawn shared journal writer thread");
+        Ok((
+            Self {
+                tx,
+                seg: Some(shared),
+                exporter: Some(exporter),
+            },
+            recovery,
+        ))
     }
 
     /// A fresh sender into the shared writer, for one partition's [`Journal`].
     /// The writer thread lives until every such sender is dropped.
     fn sender(&self) -> Sender<WriterMsg> {
         self.tx.clone()
+    }
+
+    /// The segmented seal state, if this is the bounded-disk multi-partition
+    /// writer (used to drive per-partition snapshot/rotate and compaction).
+    pub fn seg_shared(&self) -> Option<Arc<SegShared>> {
+        self.seg.clone()
     }
 }
 
@@ -600,10 +734,12 @@ impl Journal {
     pub fn in_memory_partition(partition_id: u64) -> Self {
         Self {
             engine: Engine::with_partition(partition_id),
+            partition_id,
             writer: None,
             writer_thread: None,
             seg: None,
             exporter: None,
+            shared_exporter: None,
             fresh: true,
             spill: None,
             cold: None,
@@ -622,10 +758,12 @@ impl Journal {
         };
         Self {
             engine,
+            partition_id,
             writer: None,
             writer_thread: None,
             seg: None,
             exporter: None,
+            shared_exporter: None,
             fresh: false,
             spill: None,
             cold: None,
@@ -639,10 +777,12 @@ impl Journal {
     pub fn in_memory_from_snapshot(snapshot: nanobpmn_engine_core::EngineSnapshot) -> Self {
         Self {
             engine: Engine::from_snapshot(snapshot),
+            partition_id: 0,
             writer: None,
             writer_thread: None,
             seg: None,
             exporter: None,
+            shared_exporter: None,
             fresh: false,
             spill: None,
             cold: None,
@@ -694,14 +834,17 @@ impl Journal {
         let shared = SegShared::legacy(path.to_path_buf());
         let seg_active = ActiveSegment::open(shared)?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let writer_thread = spawn_writer(seg_active, rx).expect("spawn journal writer thread");
+        let writer_thread =
+            spawn_writer(seg_active, rx, None).expect("spawn journal writer thread");
 
         Ok(Self {
             engine,
+            partition_id,
             writer: Some(tx),
             writer_thread: Some(writer_thread),
             seg: None,
             exporter: None,
+            shared_exporter: None,
             fresh,
             spill: None,
             cold: None,
@@ -720,14 +863,17 @@ impl Journal {
         let shared = Arc::clone(&recovery.shared);
         let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let writer_thread = spawn_writer(seg_active, rx).expect("spawn journal writer thread");
+        let writer_thread =
+            spawn_writer(seg_active, rx, None).expect("spawn journal writer thread");
 
         let journal = Self {
             engine,
+            partition_id: 0,
             writer: Some(tx),
             writer_thread: Some(writer_thread),
             seg: Some(shared),
             exporter: None,
+            shared_exporter: None,
             fresh,
             spill: None,
             cold: None,
@@ -755,10 +901,40 @@ impl Journal {
         };
         Self {
             engine,
+            partition_id,
             writer: Some(shared.sender()),
             writer_thread: None,
-            seg: None,
+            seg: shared.seg.clone(),
             exporter: None,
+            shared_exporter: shared.exporter.clone(),
+            fresh,
+            spill: None,
+            cold: None,
+        }
+    }
+
+    /// Builds a partition journal that persists through a segmented
+    /// [`SharedWriter`] from an already-reconstructed `engine` (the bounded-disk
+    /// multi-partition recovery path). Unlike [`Journal::from_events_shared`],
+    /// which replays this partition's full event history, the engine here was
+    /// rebuilt from a combined snapshot + surviving-tail replay by
+    /// [`crate::seglog::recover_multi`]. Inherits the writer's segmented seal
+    /// state and exporter cell so snapshots/compaction and read-model forwarding
+    /// work for this partition.
+    pub fn from_engine_shared(
+        partition_id: u64,
+        engine: Engine,
+        fresh: bool,
+        shared: &SharedWriter,
+    ) -> Self {
+        Self {
+            engine,
+            partition_id,
+            writer: Some(shared.sender()),
+            writer_thread: None,
+            seg: shared.seg.clone(),
+            exporter: None,
+            shared_exporter: shared.exporter.clone(),
             fresh,
             spill: None,
             cold: None,
@@ -1025,8 +1201,18 @@ impl Journal {
 
     /// Wires the read-model exporter channel. Set before any command is applied
     /// (including demo seeding) so every journaled event is projected.
+    ///
+    /// For a journal backed by a **segmented shared writer** the exporter is
+    /// dropped into the writer's cell instead of `self.exporter`, so the writer
+    /// forwards events to the read model in fsync (log) order — keeping
+    /// `exported_position` a true global prefix across partitions — and
+    /// `persist()` does not also forward (which would double-project).
     pub fn set_exporter(&mut self, exporter: Sender<Arc<Vec<Event>>>) {
-        self.exporter = Some(exporter);
+        if let Some(cell) = self.shared_exporter.as_ref() {
+            *cell.lock().unwrap() = Some(exporter);
+        } else {
+            self.exporter = Some(exporter);
+        }
     }
 
     /// Evicts a batch of completed instances in a single pass over hot state.
@@ -1086,7 +1272,13 @@ impl Journal {
         // Forward to the read-model exporter in command order (the actor applies
         // commands serially). Independent of disk persistence, so the in-memory
         // journal still feeds an in-memory read store. `Arc::clone` is cheap.
-        if let Some(exporter) = self.exporter.as_ref() {
+        //
+        // A segmented shared-writer-backed journal does NOT forward here: its
+        // writer forwards in fsync (log) order via the exporter cell (see
+        // `set_exporter`), so `exported_position` stays a true global prefix
+        // across partitions. Forwarding here too would double-project.
+        let shared_backed = self.shared_exporter.is_some();
+        if !shared_backed && let Some(exporter) = self.exporter.as_ref() {
             let _ = exporter.send(Arc::clone(events));
         }
 
@@ -1103,9 +1295,15 @@ impl Journal {
 
         let (ack, rx) = oneshot::channel();
         let events_count = events.len();
+        // Only the segmented shared-writer path needs the events Arc (for
+        // log-order exporter forwarding) and partition tagging; everything else
+        // leaves `events_arc` `None` to avoid an extra refcount/clone.
+        let events_arc = shared_backed.then(|| Arc::clone(events));
         match writer.send(WriterMsg::Write(WriteRequest {
             bytes,
             events: events_count,
+            partition: self.partition_id,
+            events_arc,
             ack,
         })) {
             Ok(()) => {
@@ -1310,6 +1508,11 @@ impl Journal {
         self.seg.is_some()
     }
 
+    /// The global partition id this journal's engine owns (0 for single-partition).
+    pub fn partition_id(&self) -> u64 {
+        self.partition_id
+    }
+
     /// Captures the engine snapshot and seals (rotates) the active segment at the
     /// exact boundary the snapshot covers, returning `(snapshot, covered_events)`
     /// — the absolute count of events the snapshot subsumes. `None` for a journal
@@ -1330,7 +1533,16 @@ impl Journal {
             return None;
         }
         let info = reply_rx.blocking_recv().ok()?;
-        Some((snap, info.end))
+        // On the multi-partition path the seal carries per-partition boundaries;
+        // this journal's covered count is its own partition's cumulative total.
+        // On the single-partition path `per_partition_end` is empty and the whole
+        // log belongs to partition 0, so `info.end` is the covered count.
+        let covered = info
+            .per_partition_end
+            .get(self.partition_id as usize)
+            .copied()
+            .unwrap_or(info.end);
+        Some((snap, covered))
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {

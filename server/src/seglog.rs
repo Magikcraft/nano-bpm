@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nanobpmn_engine_core::{Engine, EngineSnapshot, Event};
+use nanobpmn_engine_core::{Engine, EngineSnapshot, Event, partition_of};
 
 /// The active segment keeps the historical journal name so an existing
 /// single-file data dir is adopted unchanged.
@@ -47,6 +47,14 @@ const SEG_SUFFIX: &str = ".jsonl";
 const SNAP_PREFIX: &str = "snapshot.";
 const SNAP_SUFFIX: &str = ".bin";
 const HEAD_NAME: &str = "journal.head";
+/// Combined per-partition snapshot for the multi-partition shared-WAL path.
+const MULTI_SNAP_NAME: &str = "msnapshot.bin";
+/// Per-partition head: the active segment's per-partition cumulative start counts
+/// (recovers `per_partition_active_start` when every sealed segment is compacted).
+const PPHEAD_NAME: &str = "journal.pphead";
+/// Per-sealed-segment sidecar suffix carrying that segment's per-partition
+/// cumulative START counts (its `end` counts are derived by demuxing on recovery).
+const PP_META_SUFFIX: &str = ".ppmeta";
 
 /// Default seal threshold for the active segment (128 MiB). Tunable via
 /// `NANOBPMN_JOURNAL_SEGMENT_BYTES`; `0` disables size-based sealing (segments
@@ -101,13 +109,24 @@ pub struct SealedSeg {
     /// Absolute index one past this segment's last event (== next segment start).
     pub end: u64,
     pub path: PathBuf,
+    /// Per-partition cumulative event count at this segment's END, indexed by
+    /// global partition id. Empty for the single-partition (legacy) path. Used
+    /// by multi-partition compaction: a segment is deletable only once every
+    /// partition `p`'s snapshot covers `per_partition_end[p]`.
+    pub per_partition_end: Vec<u64>,
 }
 
 /// The boundary produced by sealing the active segment: the absolute event
-/// count it now covers (`== next segment start`).
-#[derive(Clone, Copy, Debug)]
+/// count it now covers (`== next segment start`), plus (multi-partition only)
+/// the per-partition cumulative counts at that boundary.
+#[derive(Clone, Debug)]
 pub struct SealInfo {
     pub end: u64,
+    /// Per-partition cumulative event count at the seal boundary, indexed by
+    /// global partition id. Empty for the single-partition (legacy) path. The
+    /// snapshot maintenance tick reads this partition's entry as its snapshot's
+    /// covered count.
+    pub per_partition_end: Vec<u64>,
 }
 
 /// State shared between the writer thread (which seals segments) and the
@@ -128,6 +147,16 @@ pub struct SegShared {
     pub sealed: Mutex<Vec<SealedSeg>>,
     /// Active-segment seal threshold in bytes (`u64::MAX` disables it).
     pub segment_bytes: u64,
+    /// Per-partition cumulative event count across all segments (sealed +
+    /// active), indexed by global partition id. Advanced by the writer per
+    /// batch. Empty for the single-partition (legacy) path — its presence is
+    /// what makes the writer track partitions and seal-time sidecars.
+    pub per_partition_total: Vec<AtomicU64>,
+    /// Per-partition cumulative count at the ACTIVE segment's first event
+    /// (advanced on each seal), indexed by global partition id. Persisted to
+    /// [`PPHEAD_NAME`] so `base_p` is recoverable when every sealed segment has
+    /// been compacted away. Empty for the single-partition path.
+    pub per_partition_active_start: Vec<AtomicU64>,
 }
 
 impl SegShared {
@@ -147,6 +176,8 @@ impl SegShared {
             active_start: AtomicU64::new(0),
             sealed: Mutex::new(Vec::new()),
             segment_bytes: u64::MAX,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
         })
     }
 
@@ -157,6 +188,48 @@ impl SegShared {
 
     fn head_path(&self) -> PathBuf {
         self.dir.join(HEAD_NAME)
+    }
+
+    /// Number of partitions this log tracks (0 for the single-partition legacy
+    /// path, which does no per-partition bookkeeping).
+    pub fn partitions(&self) -> usize {
+        self.per_partition_total.len()
+    }
+
+    /// Advances the per-partition cumulative counts by `deltas` (indexed by
+    /// global partition id). A no-op for the legacy path (empty vectors).
+    pub fn add_partition_events(&self, deltas: &[u64]) {
+        for (slot, delta) in self.per_partition_total.iter().zip(deltas) {
+            if *delta != 0 {
+                slot.fetch_add(*delta, Ordering::Release);
+            }
+        }
+    }
+
+    /// Snapshot of the current per-partition cumulative totals.
+    fn per_partition_totals(&self) -> Vec<u64> {
+        self.per_partition_total
+            .iter()
+            .map(|c| c.load(Ordering::Acquire))
+            .collect()
+    }
+
+    /// Snapshot of the per-partition active-segment start counts.
+    fn per_partition_starts(&self) -> Vec<u64> {
+        self.per_partition_active_start
+            .iter()
+            .map(|c| c.load(Ordering::Acquire))
+            .collect()
+    }
+
+    fn pp_meta_path(&self, start: u64) -> PathBuf {
+        self.dir.join(format!(
+            "{SEG_PREFIX}{start:020}{SEG_SUFFIX}{PP_META_SUFFIX}"
+        ))
+    }
+
+    fn pphead_path(&self) -> PathBuf {
+        self.dir.join(PPHEAD_NAME)
     }
 }
 
@@ -183,6 +256,12 @@ impl ActiveSegment {
             file,
             bytes,
         })
+    }
+
+    /// Access to the shared seal/boundary state, for the writer loop to bump
+    /// per-partition counters and consult segment boundaries.
+    pub fn shared(&self) -> &Arc<SegShared> {
+        &self.shared
     }
 
     /// Appends a group-committed batch of `events` (already serialized to
@@ -220,13 +299,25 @@ impl ActiveSegment {
 
         let start = self.shared.active_start.load(Ordering::Acquire);
         let end = self.shared.total_events.load(Ordering::Acquire);
+        // Per-partition boundary counts (empty on the single-partition path).
+        let per_partition_end = self.shared.per_partition_totals();
+        let per_partition_start = self.shared.per_partition_starts();
 
         // An empty active segment has nothing to seal; just report the boundary.
         if end == start {
-            return Ok(SealInfo { end });
+            return Ok(SealInfo {
+                end,
+                per_partition_end,
+            });
         }
 
         let sealed_path = self.shared.sealed_name(start);
+        // Persist this segment's per-partition START counts (its END is derived
+        // by demuxing on recovery) BEFORE the rename is made durable, so a
+        // surviving segment always has its sidecar for `base_p` recovery.
+        if !per_partition_start.is_empty() {
+            write_pp_meta(&self.shared.pp_meta_path(start), &per_partition_start);
+        }
         fs::rename(&self.shared.active_path, &sealed_path)?;
 
         // Open a fresh active segment and make the rename durable.
@@ -239,6 +330,19 @@ impl ActiveSegment {
 
         self.shared.active_start.store(end, Ordering::Release);
         write_head(&self.shared.head_path(), end);
+        // Advance the per-partition active start to this seal's end and persist
+        // it, so `base_p` survives even once every sealed segment is compacted.
+        if !per_partition_end.is_empty() {
+            for (slot, v) in self
+                .shared
+                .per_partition_active_start
+                .iter()
+                .zip(&per_partition_end)
+            {
+                slot.store(*v, Ordering::Release);
+            }
+            write_pphead(&self.shared.pphead_path(), &per_partition_end);
+        }
 
         self.shared
             .sealed
@@ -248,9 +352,13 @@ impl ActiveSegment {
                 start,
                 end,
                 path: sealed_path,
+                per_partition_end: per_partition_end.clone(),
             });
 
-        Ok(SealInfo { end })
+        Ok(SealInfo {
+            end,
+            per_partition_end,
+        })
     }
 }
 
@@ -274,6 +382,48 @@ fn write_head(path: &Path, active_start: u64) {
 
 fn read_head(path: &Path) -> Option<u64> {
     fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+}
+
+/// Serializes a per-partition count vector as a compact comma-separated line.
+fn encode_counts(counts: &[u64]) -> String {
+    counts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn decode_counts(s: &str) -> Option<Vec<u64>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    s.split(',').map(|p| p.trim().parse::<u64>().ok()).collect()
+}
+
+/// Atomically writes a sealed segment's per-partition START counts sidecar.
+fn write_pp_meta(path: &Path, per_partition_start: &[u64]) {
+    let tmp = path.with_extension("ppmeta.tmp");
+    if fs::write(&tmp, encode_counts(per_partition_start).as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+fn read_pp_meta(path: &Path) -> Option<Vec<u64>> {
+    decode_counts(&fs::read_to_string(path).ok()?)
+}
+
+/// Atomically writes the active segment's per-partition start counts, so
+/// `base_p` is recoverable when every sealed segment has been compacted.
+fn write_pphead(path: &Path, per_partition_active_start: &[u64]) {
+    let tmp = path.with_extension("pphead.tmp");
+    if fs::write(&tmp, encode_counts(per_partition_active_start).as_bytes()).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+fn read_pphead(path: &Path) -> Option<Vec<u64>> {
+    decode_counts(&fs::read_to_string(path).ok()?)
 }
 
 /// A persisted snapshot: the engine's compact state plus the absolute event
@@ -388,6 +538,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
             start: *start,
             end,
             path: path.clone(),
+            per_partition_end: Vec::new(),
         });
         events.extend(seg_events);
         cursor = end;
@@ -430,6 +581,8 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         active_start: AtomicU64::new(active_start),
         sealed: Mutex::new(sealed),
         segment_bytes: segment_bytes_from_env(),
+        per_partition_total: Vec::new(),
+        per_partition_active_start: Vec::new(),
     });
 
     Ok((
@@ -491,6 +644,272 @@ pub fn compact(shared: &SegShared, watermark: u64) -> usize {
     while let Some(seg) = sealed.first() {
         if seg.end <= watermark {
             let _ = fs::remove_file(&seg.path);
+            sealed.remove(0);
+            removed += 1;
+        } else {
+            break;
+        }
+    }
+    if removed > 0 {
+        fsync_dir(&shared.dir);
+    }
+    removed
+}
+
+// ----------------------------------------------------------------------------
+// Multi-partition (shared-WAL) bounded-disk path.
+//
+// One shared log carries every partition's events, interleaved in commit order.
+// Positions (segment start/end, first_index, total_events, exported_position)
+// are GLOBAL event indices exactly as in the single-partition path, so the read
+// model stays a single global prefix. Compaction adds a per-partition SNAPSHOT
+// gate: a sealed segment is deletable only once every partition's snapshot
+// covers its own events within that segment. Per-partition counts are keyed by
+// GLOBAL partition id (a node owning a subset of partitions leaves the rest at
+// zero), which unifies single-node multi-partition and clustered.
+// ----------------------------------------------------------------------------
+
+/// One partition's entry in the combined snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultiSnapshotEntry {
+    partition: u64,
+    covered: u64,
+    engine: EngineSnapshot,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultiPersistedSnapshot {
+    entries: Vec<MultiSnapshotEntry>,
+}
+
+/// Persists the combined per-partition snapshot atomically (tmp + rename +
+/// fsync). `entries` is `(global_partition_id, covered_count, snapshot)` for
+/// every owned partition. Overwrites the previous combined snapshot.
+pub fn write_multi_snapshot(
+    dir: &Path,
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+) -> io::Result<()> {
+    let payload = MultiPersistedSnapshot {
+        entries: entries
+            .into_iter()
+            .map(|(partition, covered, engine)| MultiSnapshotEntry {
+                partition,
+                covered,
+                engine,
+            })
+            .collect(),
+    };
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let final_path = dir.join(MULTI_SNAP_NAME);
+    let tmp = dir.join(format!("{MULTI_SNAP_NAME}.tmp"));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &final_path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Loads the combined per-partition snapshot, as a map from global partition id
+/// to `(covered_count, snapshot)`. `None` when absent or unreadable.
+fn load_multi_snapshot(
+    dir: &Path,
+) -> Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>> {
+    let bytes = fs::read(dir.join(MULTI_SNAP_NAME)).ok()?;
+    let snap: MultiPersistedSnapshot = serde_json::from_slice(&bytes).ok()?;
+    Some(
+        snap.entries
+            .into_iter()
+            .map(|e| (e.partition, (e.covered, e.engine)))
+            .collect(),
+    )
+}
+
+/// The outcome of recovering a multi-partition segmented journal directory.
+pub struct MultiSegRecovery {
+    /// `false` when prior durable state was recovered.
+    pub fresh: bool,
+    /// The shared seal/boundary state to hand to the shared writer.
+    pub shared: Arc<SegShared>,
+    /// All surviving events, ascending, spanning global `[first_index, total_events)`.
+    pub events: Vec<Event>,
+    /// Absolute (global) index of the first surviving event.
+    pub first_index: u64,
+    /// Absolute (global) count of all events ever durably appended.
+    pub total_events: u64,
+    /// Rebuilt engine per OWNED partition, keyed by global partition id.
+    pub engines: Vec<(u64, Engine)>,
+}
+
+/// Recovers (or initialises) the multi-partition segmented journal in `dir` for
+/// the partitions in `owned` (global ids). `num_partitions` is the global
+/// partition count (sizes the per-partition vectors). Rebuilds each owned
+/// partition's engine from the combined snapshot + its surviving tail (or a full
+/// replay when there is no snapshot), and returns the shared state plus the
+/// surviving events for the caller's global read-model catch-up.
+pub fn recover_multi(
+    dir: &Path,
+    owned: &[u64],
+    num_partitions: usize,
+) -> io::Result<MultiSegRecovery> {
+    fs::create_dir_all(dir)?;
+    let active_path = dir.join(ACTIVE_NAME);
+    let sealed_files = list_sealed(dir)?;
+
+    // `base_p`: per-partition cumulative counts BEFORE the first surviving event
+    // (i.e. the count compacted away). For the first surviving sealed segment it
+    // is its sidecar; with no sealed segments it is the per-partition head; with
+    // nothing compacted it is zero.
+    let first_sealed_start = sealed_files.first().map(|(s, _)| *s);
+    let zeros = || vec![0u64; num_partitions];
+    let pp_base: Vec<u64> = match first_sealed_start {
+        Some(start) => read_pp_meta(&dir.join(format!(
+            "{SEG_PREFIX}{start:020}{SEG_SUFFIX}{PP_META_SUFFIX}"
+        )))
+        .filter(|v| v.len() == num_partitions)
+        .unwrap_or_else(zeros),
+        None => read_pphead(&dir.join(PPHEAD_NAME))
+            .filter(|v| v.len() == num_partitions)
+            .unwrap_or_else(zeros),
+    };
+
+    // Read every surviving sealed segment in order, tracking global indices and
+    // per-partition cumulative counts (from `pp_base`).
+    let first_index_opt = sealed_files.first().map(|(s, _)| *s);
+    let mut sealed: Vec<SealedSeg> = Vec::with_capacity(sealed_files.len());
+    let mut events: Vec<Event> = Vec::new();
+    let mut cursor = first_index_opt.unwrap_or(0);
+    let mut pp_running = pp_base.clone();
+    for (start, path) in &sealed_files {
+        let seg_events = read_segment_events(path)?;
+        let end = start + seg_events.len() as u64;
+        for e in &seg_events {
+            let p = (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1));
+            if p < pp_running.len() {
+                pp_running[p] += 1;
+            }
+        }
+        sealed.push(SealedSeg {
+            start: *start,
+            end,
+            path: path.clone(),
+            per_partition_end: pp_running.clone(),
+        });
+        events.extend(seg_events);
+        cursor = end;
+    }
+
+    // The active segment begins where the last sealed segment ended; with none,
+    // fall back to the persisted head (every sealed segment compacted), else 0.
+    let active_start = if sealed.is_empty() {
+        read_head(&dir.join(HEAD_NAME)).unwrap_or(0)
+    } else {
+        cursor
+    };
+    // Per-partition active start == last sealed end (== pp_running), or the
+    // per-partition head when no sealed segments survive.
+    let per_partition_active_start: Vec<u64> = if sealed.is_empty() {
+        pp_base.clone()
+    } else {
+        pp_running.clone()
+    };
+
+    let active_events = read_segment_events(&active_path)?;
+    let total_events = active_start + active_events.len() as u64;
+    let first_index = first_index_opt.unwrap_or(active_start);
+    // Per-partition totals = active start + active-segment per-partition counts.
+    let mut per_partition_total = per_partition_active_start.clone();
+    for e in &active_events {
+        let p = (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1));
+        if p < per_partition_total.len() {
+            per_partition_total[p] += 1;
+        }
+    }
+    events.extend(active_events);
+
+    let combined = load_multi_snapshot(dir);
+    let fresh = total_events == 0 && combined.is_none();
+
+    // Rebuild each owned partition's engine: snapshot + its surviving tail, or a
+    // full replay of its surviving events when there is no snapshot for it.
+    let engines: Vec<(u64, Engine)> = owned
+        .iter()
+        .map(|&p| {
+            let p_events: Vec<Event> = events
+                .iter()
+                .filter(|e| {
+                    (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1))
+                        == p as usize
+                })
+                .cloned()
+                .collect();
+            let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
+            let engine = match combined.as_ref().and_then(|m| m.get(&p)) {
+                Some((covered, snap)) => {
+                    let mut engine = Engine::from_snapshot(snap.clone());
+                    let skip = covered.saturating_sub(base_p) as usize;
+                    if skip < p_events.len() {
+                        engine.apply_replayed_events(p_events[skip..].iter().cloned());
+                    }
+                    engine
+                }
+                None => Engine::replay_partition(p, p_events),
+            };
+            (p, engine)
+        })
+        .collect();
+
+    let shared = Arc::new(SegShared {
+        dir: dir.to_path_buf(),
+        active_path,
+        total_events: AtomicU64::new(total_events),
+        active_start: AtomicU64::new(active_start),
+        sealed: Mutex::new(sealed),
+        segment_bytes: segment_bytes_from_env(),
+        per_partition_total: per_partition_total
+            .into_iter()
+            .map(AtomicU64::new)
+            .collect(),
+        per_partition_active_start: per_partition_active_start
+            .into_iter()
+            .map(AtomicU64::new)
+            .collect(),
+    });
+
+    Ok(MultiSegRecovery {
+        fresh,
+        shared,
+        events,
+        first_index,
+        total_events,
+        engines,
+    })
+}
+
+/// Deletes every sealed segment that BOTH the read model and every partition's
+/// snapshot no longer need: `seg.end <= exported_position` (read model has
+/// projected all of it — valid because the shared writer feeds the exporter in
+/// log order) AND for every partition `p`, `covered[p] >= seg.per_partition_end[p]`
+/// (each partition's snapshot subsumes its events in the segment). `covered` is
+/// indexed by global partition id (0 for partitions that never snapshotted).
+/// Removes each segment's per-partition sidecar with it. Returns the count removed.
+pub fn compact_multi(shared: &SegShared, covered: &[u64], exported_position: u64) -> usize {
+    let mut sealed = shared.sealed.lock().expect("sealed lock");
+    let mut removed = 0usize;
+    while let Some(seg) = sealed.first() {
+        let export_ok = seg.end <= exported_position;
+        let snap_ok = seg.per_partition_end.len() <= covered.len()
+            && seg
+                .per_partition_end
+                .iter()
+                .enumerate()
+                .all(|(p, end)| covered.get(p).copied().unwrap_or(0) >= *end);
+        if export_ok && snap_ok {
+            let _ = fs::remove_file(&seg.path);
+            let _ = fs::remove_file(shared.pp_meta_path(seg.start));
             sealed.remove(0);
             removed += 1;
         } else {
@@ -721,6 +1140,154 @@ mod tests {
         );
 
         drop(journal);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end multi-partition bounded-disk cycle: two partitions share one
+    /// segmented WAL; a snapshot of every partition + a combined snapshot lets
+    /// per-partition compaction drop the sealed prefix, and a reopen restores
+    /// every partition's instances from the combined snapshot.
+    #[test]
+    fn multi_partition_snapshot_compaction_and_recovery() {
+        let dir = temp_dir("multi-roundtrip");
+        // Keep the exporter receiver alive so shared writes have a wired cell.
+        let (tx, _rx) = std::sync::mpsc::channel::<Arc<Vec<Event>>>();
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2).expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            assert!(recovery.fresh);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone());
+            j1.set_exporter(tx.clone());
+
+            // Deploy on partition 0, replicate the definition in-memory to p1.
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            assert_eq!(nanobpmn_engine_core::partition_of(key1), 1);
+
+            // Snapshot each partition (each seals the shared active segment; only
+            // the first seal produces a non-empty sealed segment).
+            let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            assert_eq!(seg.sealed.lock().unwrap().len(), 1);
+
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+
+            // Below partition 1's watermark: retained (the snapshot for p1 does
+            // not yet subsume its events in the sealed segment).
+            let held_back = [covered0, covered1.saturating_sub(1)];
+            assert_eq!(compact_multi(&seg, &held_back, u64::MAX), 0);
+            assert_eq!(seg.sealed.lock().unwrap().len(), 1);
+
+            // With every partition's watermark met AND the read model past the
+            // segment: compacted away.
+            let covered = [covered0, covered1];
+            assert_eq!(compact_multi(&seg, &covered, u64::MAX), 1);
+            assert!(seg.sealed.lock().unwrap().is_empty());
+
+            (key0, key1)
+        };
+
+        // Reopen: both partitions restore purely from the combined snapshot (the
+        // sealed prefix was compacted off disk).
+        let recovery = recover_multi(&dir, &[0, 1], 2).expect("reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&0].instance(key0).is_some(),
+            "partition 0 instance restored from snapshot"
+        );
+        assert!(
+            engines[&1].instance(key1).is_some(),
+            "partition 1 instance restored from snapshot"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Multi-partition recovery fuses the combined snapshot with the surviving
+    /// tail: instances created AFTER the snapshot boundary (uncompacted) are
+    /// replayed on top of the per-partition snapshots.
+    #[test]
+    fn multi_partition_recovery_fuses_snapshot_and_tail() {
+        let dir = temp_dir("multi-tail");
+        let (tx, _rx) = std::sync::mpsc::channel::<Arc<Vec<Event>>>();
+
+        let (pre0, post1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2).expect("open multi");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone());
+            j1.set_exporter(tx.clone());
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            // Pre-snapshot instance on partition 0.
+            let (e0, _) = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let pre0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+
+            let (snap0, covered0) = j0.snapshot_and_rotate().expect("snapshot p0");
+            let (snap1, covered1) = j1.snapshot_and_rotate().expect("snapshot p1");
+            write_multi_snapshot(&dir, vec![(0, covered0, snap0), (1, covered1, snap1)])
+                .expect("write combined snapshot");
+
+            // Post-snapshot instance on partition 1 (lands in the fresh active
+            // tail, not covered by any snapshot).
+            let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let post1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+
+            (pre0, post1)
+        };
+
+        let recovery = recover_multi(&dir, &[0, 1], 2).expect("reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&0].instance(pre0).is_some(),
+            "pre-snapshot instance from snapshot"
+        );
+        assert!(
+            engines[&1].instance(post1).is_some(),
+            "post-snapshot instance from the surviving tail"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

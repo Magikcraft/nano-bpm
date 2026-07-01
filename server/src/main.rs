@@ -588,6 +588,29 @@ impl ServerImpl {
 /// globally unique). The exporter must be set before `ServerImpl::new` so the
 /// seed deployment is projected; the thread is spawned after so it can route
 /// hot-state eviction back to the owning partition.
+/// Catches the read model up to a segmented multi-partition recovery's global
+/// log tail. The shared writer feeds the exporter in log (fsync) order, so a
+/// single `exported_position` is a true global prefix: the surviving events span
+/// `[first_index, total_events)`, everything before `first_index` was already
+/// projected (the exporter watermark gates compaction), and only the suffix past
+/// `exported_position` needs replaying. No `reset()` — the projection is
+/// resumed, not rebuilt.
+fn catch_up_global_read_model(store: &ReadStore, recovery: &seglog::MultiSegRecovery) {
+    let mut pos = store.exported_position() as u64;
+    if pos > recovery.total_events {
+        // Store ahead of the log (truncated/corrupt): rebuild from what survives.
+        store.reset().expect("reset read store");
+        pos = recovery.first_index;
+    }
+    let skip = pos.saturating_sub(recovery.first_index) as usize;
+    if skip < recovery.events.len() {
+        let refs: Vec<&Event> = recovery.events[skip..].iter().collect();
+        store
+            .export(&refs)
+            .expect("catch up read model from segmented multi-partition journal");
+    }
+}
+
 fn build_server(
     mut journals: Vec<Journal>,
     store: Arc<ReadStore>,
@@ -7954,6 +7977,10 @@ async fn main() {
             let partitions = partition_count_from_env();
             let topology = cluster::Topology::from_env(partitions as u64);
             let mut seg_shared: Option<Arc<seglog::SegShared>> = None;
+            // Bounded-disk state for the single-node multi-partition segmented
+            // path: the shared seal state plus the global partition count that
+            // sizes the per-partition compaction watermark vector.
+            let mut multi_seg: Option<(Arc<seglog::SegShared>, u64)> = None;
             let (journals, recovered) = if topology.is_single_node() && partitions == 1 {
                 // Single partition: the bounded-disk segmented journal (snapshot
                 // + segment rotation + compaction) unless explicitly disabled, in
@@ -8023,51 +8050,87 @@ async fn main() {
                 // namespace). Events are tagged by partition via their keys, so
                 // the single log is demultiplexed back to the owning partition on
                 // replay.
-                //
-                // The read model is rebuilt from scratch: the runtime exporter
-                // interleaves partitions in projection order, which need not match
-                // the shared log's commit order, so the single `exported_position`
-                // cursor can't track it incrementally. Projection is
-                // order-independent across the (independent) partitions, and the
-                // boot-time deployment on partition 0 is written first, so a full
-                // replay in log order is correct.
-                let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
-                    panic!("failed to read journal {}: {e}", journal_path.display())
-                });
-                store
-                    .reset()
-                    .expect("reset read store for multi-partition rebuild");
-                if !events.is_empty() {
-                    let refs: Vec<&Event> = events.iter().collect();
+                if seglog::segmented_enabled() {
+                    // Bounded-disk segmented path: per-partition snapshots +
+                    // segment rotation + compaction gated by the exporter
+                    // watermark AND every partition's snapshot. The writer feeds
+                    // the read model in log order, so `exported_position` stays a
+                    // true global prefix and boot catch-up is incremental (no
+                    // reset).
+                    let dir = journal_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let owned: Vec<u64> = (0..partitions as u64).collect();
+                    let (shared, recovery) =
+                        SharedWriter::open_segmented(&dir, &owned, partitions as u64)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "failed to open segmented multi-partition journal at {}: {e}",
+                                    dir.display()
+                                )
+                            });
+                    multi_seg = Some((Arc::clone(&recovery.shared), partitions as u64));
+                    catch_up_global_read_model(&store, &recovery);
+                    let recovered = !recovery.fresh;
+                    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+                        recovery.engines.into_iter().collect();
+                    let journals: Vec<Journal> = (0..partitions as u64)
+                        .map(|p| {
+                            let engine = engines
+                                .remove(&p)
+                                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                            Journal::from_engine_shared(p, engine, !recovered, &shared)
+                        })
+                        .collect();
+                    (journals, recovered)
+                } else {
+                    // Legacy single-file multi-partition path: the read model is
+                    // rebuilt from scratch because the runtime exporter interleaves
+                    // partitions in projection order (not the log's commit order),
+                    // so the single `exported_position` cursor can't track it
+                    // incrementally. Projection is order-independent across the
+                    // (independent) partitions, and the boot-time deployment on
+                    // partition 0 is written first, so a full replay in log order
+                    // is correct.
+                    let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                        panic!("failed to read journal {}: {e}", journal_path.display())
+                    });
                     store
-                        .export(&refs)
-                        .expect("catch up read model from journal");
-                }
+                        .reset()
+                        .expect("reset read store for multi-partition rebuild");
+                    if !events.is_empty() {
+                        let refs: Vec<&Event> = events.iter().collect();
+                        store
+                            .export(&refs)
+                            .expect("catch up read model from journal");
+                    }
 
-                // Split the shared log into each partition's own events by the
-                // owning partition encoded in every event's key. A key whose
-                // partition is out of range (e.g. a log from a larger partition
-                // layout) falls back to partition 0 so replay never panics.
-                let mut per_partition: Vec<Vec<Event>> =
-                    (0..partitions).map(|_| Vec::new()).collect();
-                for event in events {
-                    let p = nanobpmn_engine_core::partition_of(event.max_key()) as usize;
-                    per_partition[p.min(partitions - 1)].push(event);
-                }
+                    // Split the shared log into each partition's own events by the
+                    // owning partition encoded in every event's key. A key whose
+                    // partition is out of range (e.g. a log from a larger partition
+                    // layout) falls back to partition 0 so replay never panics.
+                    let mut per_partition: Vec<Vec<Event>> =
+                        (0..partitions).map(|_| Vec::new()).collect();
+                    for event in events {
+                        let p = nanobpmn_engine_core::partition_of(event.max_key()) as usize;
+                        per_partition[p.min(partitions - 1)].push(event);
+                    }
 
-                let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to open shared journal {}: {e}",
-                        journal_path.display()
-                    )
-                });
-                let recovered = per_partition.iter().any(|evs| !evs.is_empty());
-                let journals: Vec<Journal> = per_partition
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
-                    .collect();
-                (journals, recovered)
+                    let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
+                        panic!(
+                            "failed to open shared journal {}: {e}",
+                            journal_path.display()
+                        )
+                    });
+                    let recovered = per_partition.iter().any(|evs| !evs.is_empty());
+                    let journals: Vec<Journal> = per_partition
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, evs)| Journal::from_events_shared(i as u64, evs, &shared))
+                        .collect();
+                    (journals, recovered)
+                }
             } else {
                 // Clustered: this node owns only a SUBSET of the cluster's
                 // partitions (`partition_id % num_nodes == node_id`). Its journal
@@ -8199,6 +8262,66 @@ async fn main() {
                 });
                 tracing::info!(
                     "segmented journal enabled (snapshot/compaction every {:?})",
+                    interval
+                );
+            }
+
+            // Bounded-disk maintenance for the single-node multi-partition
+            // segmented path: each tick snapshots EVERY owned partition (sealing
+            // the shared active segment at each snapshot boundary), writes one
+            // combined snapshot, then compacts sealed segments below BOTH the
+            // exporter watermark and every partition's snapshot boundary.
+            if let Some((shared, num_partitions)) = multi_seg.clone()
+                && let Some(interval) = seglog::snapshot_interval_from_env()
+            {
+                let handles: Vec<EngineHandle> = server.engine.all().to_vec();
+                let store = server.store.clone();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    // Skip the immediate first tick.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        // Snapshot each owned partition; a `None` (writer gone)
+                        // aborts this tick so compaction never runs on a partial
+                        // watermark set.
+                        let mut entries: Vec<(u64, u64, nanobpmn_engine_core::EngineSnapshot)> =
+                            Vec::with_capacity(handles.len());
+                        let mut covered = vec![0u64; num_partitions as usize];
+                        let mut ok = true;
+                        for handle in &handles {
+                            let pid = handle.with(|journal| journal.partition_id()).await;
+                            match handle.with(|journal| journal.snapshot_and_rotate()).await {
+                                Some((snap, covered_p)) => {
+                                    if (pid as usize) < covered.len() {
+                                        covered[pid as usize] = covered_p;
+                                    }
+                                    entries.push((pid, covered_p, snap));
+                                }
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !ok {
+                            continue;
+                        }
+                        if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
+                            tracing::warn!("multi-partition snapshot write failed: {e}");
+                            continue;
+                        }
+                        let exported = store.exported_position() as u64;
+                        let removed = seglog::compact_multi(&shared, &covered, exported);
+                        if removed > 0 {
+                            tracing::debug!(
+                                "multi-partition journal compaction removed {removed} sealed segment(s) (exported {exported})"
+                            );
+                        }
+                    }
+                });
+                tracing::info!(
+                    "segmented multi-partition journal enabled (snapshot/compaction every {:?}, {num_partitions} partitions)",
                     interval
                 );
             }
