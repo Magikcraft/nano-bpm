@@ -140,11 +140,12 @@ pub struct Journal {
     /// `true` when the journal started with no prior log, so the host knows it
     /// should seed any initial deployments.
     fresh: bool,
-    /// Optional disk-backed store for spilled instance variables, with the hot
-    /// budget (max resident spillable instances) above which the engine sheds the
-    /// oldest backlog's variables to disk. `None` keeps every payload resident
-    /// (the original behaviour).
-    spill: Option<(Arc<VarSpillStore>, usize)>,
+    /// Optional disk-backed variable spill. Sheds the variables of the oldest
+    /// *active* backlog instances to disk (rehydrated on job activation), bounding
+    /// the RAM held by a large active backlog. `None` keeps every payload resident
+    /// (the original behaviour). The [`VarSpillTrigger`] decides *when* to shed —
+    /// a fixed instance-count budget, or adaptively under real RAM pressure.
+    spill: Option<VarSpill>,
     /// Optional cold spill: evicts whole *dormant* instances (control state and
     /// all) to the same disk-backed store, keeping only a slim resident routing
     /// index ([`ColdIndex`]) so an event can rehydrate the owning instance on
@@ -172,6 +173,48 @@ struct ColdSpill {
     low_water: u64,
 }
 
+/// Variable-spill state held by a [`Journal`]: the shared disk store and the
+/// policy that decides *when* the oldest active-backlog variables are shed.
+struct VarSpill {
+    store: Arc<VarSpillStore>,
+    trigger: VarSpillTrigger,
+}
+
+/// When variable spill sheds an active instance's variables to disk.
+enum VarSpillTrigger {
+    /// Fixed instance-count budget, evaluated on every command. Simple and
+    /// deterministic, but a *count* is a poor proxy for *bytes* (512 tiny-var
+    /// instances is trivial RAM; 512 large-var instances is not), so it must be
+    /// tuned conservatively and can throttle throughput needlessly.
+    Budget(usize),
+    /// Adaptive: shed only under real RAM pressure. The precise scan runs on the
+    /// periodic sweep gated on resident bytes (`high_water`/`low_water`), so below
+    /// the high-water mark spill is a no-op and throughput is unconstrained —
+    /// memory is only reclaimed when it actually explodes. The per-command path
+    /// stays free except for `hard_cap`, an instance-count backstop that forces a
+    /// shed if the resident set blows up *between* the 500 ms sweeps (a
+    /// create-flood), bounding worst-case memory without an RSS read per command.
+    /// `hard_cap == 0` disables the backstop (rely solely on the sweep).
+    Adaptive {
+        high_water: u64,
+        low_water: u64,
+        hard_cap: usize,
+    },
+}
+
+impl VarSpillTrigger {
+    /// The resident spill-candidate count above which the *per-command* path
+    /// sheds. `Budget` sheds at its budget; `Adaptive` sheds only at its emergency
+    /// `hard_cap` (its normal trigger is the RSS sweep). `None` means the
+    /// per-command path never sheds.
+    fn per_command_cap(&self) -> Option<usize> {
+        match self {
+            VarSpillTrigger::Budget(budget) => Some(*budget),
+            VarSpillTrigger::Adaptive { hard_cap, .. } => (*hard_cap != 0).then_some(*hard_cap),
+        }
+    }
+}
+
 /// Upper bound on how many writes one group-commit batch will accumulate before
 /// forcing the fsync, regardless of the linger window. Bounds worst-case commit
 /// latency and the staging buffer when offered load is very high.
@@ -184,6 +227,12 @@ const MAX_GROUP_BATCH: usize = 8192;
 /// bounding memory overshoot to at most this many commands' worth of newly
 /// spillable variables.
 const SPILL_CHECK_INTERVAL: u32 = 256;
+
+/// How many instances' variables the adaptive RAM-pressure sweep sheds per batch
+/// before re-measuring resident bytes. Keeps the shed responsive to the
+/// watermark (stop as soon as we drop under `low_water`) without re-reading RSS —
+/// an epoch-advance + stat — after every single instance.
+const VAR_SPILL_SWEEP_BATCH: usize = 512;
 
 /// The background journal writer: blocks for the next request, drains every
 /// other request already queued, then **group-commits** the whole batch in a
@@ -1017,7 +1066,35 @@ impl Journal {
     /// resident); leaving the spill unset keeps the original all-resident
     /// behaviour.
     pub fn set_spill(&mut self, store: Arc<VarSpillStore>, budget: usize) {
-        self.spill = Some((store, budget));
+        self.spill = Some(VarSpill {
+            store,
+            trigger: VarSpillTrigger::Budget(budget),
+        });
+    }
+
+    /// Wires *adaptive* variable spill onto `store`: instead of a fixed budget,
+    /// the oldest active-backlog variables are shed only when resident memory
+    /// crosses `high_water` bytes, and only until it falls back under
+    /// `low_water` — so below the mark throughput is unconstrained and spill
+    /// fires purely to cap a memory explosion. The RSS check runs on the periodic
+    /// sweep ([`maybe_var_spill_pressure`](Journal::maybe_var_spill_pressure));
+    /// `hard_cap` is a per-command instance-count backstop for a runaway between
+    /// sweeps (0 disables it). Set before serving.
+    pub fn set_var_spill_adaptive(
+        &mut self,
+        store: Arc<VarSpillStore>,
+        high_water: u64,
+        low_water: u64,
+        hard_cap: usize,
+    ) {
+        self.spill = Some(VarSpill {
+            store,
+            trigger: VarSpillTrigger::Adaptive {
+                high_water,
+                low_water,
+                hard_cap,
+            },
+        });
     }
 
     /// Wires cold spill onto the same disk-backed `store`. Once the engine's
@@ -1268,8 +1345,8 @@ impl Journal {
     /// tiers share one [`VarSpillStore`] (one file, one WAL), so either handle
     /// reaches the same `spill` and `cold` tables.
     fn spill_store(&self) -> Option<Arc<VarSpillStore>> {
-        if let Some((store, _)) = self.spill.as_ref() {
-            return Some(Arc::clone(store));
+        if let Some(vs) = self.spill.as_ref() {
+            return Some(Arc::clone(&vs.store));
         }
         self.cold.as_ref().map(|c| Arc::clone(&c.store))
     }
@@ -1395,26 +1472,32 @@ impl Journal {
         Ok((events, commit))
     }
 
-    /// Sheds the oldest backlog's variables to the spill store when the resident
-    /// spillable set exceeds the hot budget. The variables are already durable in
-    /// the journal, so a spill write that is later lost is reconstructable — it is
-    /// a cache, not a system of record, which makes the exact shed timing a soft
+    /// Per-command variable-spill check. Sheds the oldest backlog's variables to
+    /// the spill store when the resident spill-candidate set exceeds the mode's
+    /// per-command cap (the fixed budget in `Budget` mode, or the emergency
+    /// `hard_cap` in `Adaptive` mode). The variables are already durable in the
+    /// journal, so a spill write that is later lost is reconstructable — it is a
+    /// cache, not a system of record, which makes the exact shed timing a soft
     /// bound we can amortise.
     ///
     /// Hot-path cost: an O(1) resident-count guard skips everything while the
-    /// whole resident set fits the budget (the steady state). Once persistently
-    /// over budget, the precise O(N) spillable scan/shed runs only once every
-    /// [`SPILL_CHECK_INTERVAL`] commands rather than on every apply, so a deep
-    /// backlog no longer pays an O(N) scan per command (which was quadratic in the
-    /// backlog and drove congestion collapse).
+    /// whole resident set fits the cap (the steady state — and in `Adaptive` mode
+    /// the normal case, since its real trigger is the RSS sweep). Once
+    /// persistently over the cap, the precise O(N) spillable scan/shed runs only
+    /// once every [`SPILL_CHECK_INTERVAL`] commands rather than on every apply, so
+    /// a deep backlog no longer pays an O(N) scan per command (which was quadratic
+    /// in the backlog and drove congestion collapse).
     fn maybe_spill(&mut self) {
-        let Some((_, budget)) = self.spill.as_ref() else {
+        let Some(cap) = self
+            .spill
+            .as_ref()
+            .and_then(|vs| vs.trigger.per_command_cap())
+        else {
             return;
         };
-        let budget = *budget;
         // O(1) fast path: spill candidates are a subset of resident instances, so
-        // when the resident set already fits the budget nothing can be over it.
-        if self.engine.resident_instance_count() <= budget {
+        // when the resident set already fits the cap nothing can be over it.
+        if self.engine.resident_instance_count() <= cap {
             self.spill_check_skip = 0;
             return;
         }
@@ -1424,22 +1507,102 @@ impl Journal {
             return;
         }
         self.spill_check_skip = SPILL_CHECK_INTERVAL;
+        self.shed_variables(cap);
+    }
+
+    /// Sheds the oldest spill-candidate instances' variables to disk until the
+    /// resident spill-candidate count is back down to `target`. Returns how many
+    /// instances were shed. Shared by the per-command cap check and the adaptive
+    /// RAM-pressure sweep so the two triggers never diverge on *how* they shed.
+    fn shed_variables(&mut self, target: usize) -> usize {
         let resident = self.engine.resident_spillable_count();
-        if resident <= budget {
+        if resident <= target {
+            return 0;
+        }
+        let Some(store) = self.spill.as_ref().map(|vs| Arc::clone(&vs.store)) else {
+            return 0;
+        };
+        let over = resident - target;
+        let mut shed = 0;
+        for key in self.engine.spillable_instances(over) {
+            if let Some(vars) = self.engine.spill_variables(key) {
+                if store.put(key, &vars).is_err() {
+                    // Spill failed: keep the payload resident rather than lose it.
+                    self.engine.rehydrate_variables(key, vars);
+                } else {
+                    shed += 1;
+                }
+            }
+        }
+        shed
+    }
+
+    /// Adaptive variable spill — the RAM-pressure tier. Run on the periodic sweep
+    /// (alongside [`maybe_cold_spill`](Journal::maybe_cold_spill), and *before* it:
+    /// shedding an instance's variables keeps it live and is cheaper than evicting
+    /// the whole instance). Only active in [`Adaptive`](VarSpillTrigger::Adaptive)
+    /// mode; a no-op otherwise (`Budget`/off self-regulate per command).
+    ///
+    /// When resident memory crosses `high_water`, it sheds the oldest
+    /// active-backlog variables in batches — compacting and purging between
+    /// batches so the reading reflects the shed — until resident memory falls
+    /// under `low_water`, or until a batch stops reducing RSS (variables are not
+    /// the memory driver, so further shedding would only thrash). Below the mark
+    /// it is a single cheap RSS read, so a workload that never pressures RAM runs
+    /// entirely spill-free.
+    pub fn maybe_var_spill_pressure(&mut self) {
+        let (high, low) = match self.spill.as_ref().map(|vs| &vs.trigger) {
+            Some(VarSpillTrigger::Adaptive {
+                high_water,
+                low_water,
+                ..
+            }) if *high_water > 0 => (*high_water, *low_water),
+            _ => return,
+        };
+        let Some(resident) = crate::memory::resident_bytes() else {
+            return;
+        };
+        if (resident as u64) < high {
             return;
         }
-        let store = match self.spill.as_ref() {
-            Some((store, _)) => Arc::clone(store),
-            None => return,
-        };
-        let over = resident - budget;
-        for key in self.engine.spillable_instances(over) {
-            if let Some(vars) = self.engine.spill_variables(key)
-                && store.put(key, &vars).is_err()
-            {
-                // Spill failed: keep the payload resident rather than lose it.
-                self.engine.rehydrate_variables(key, vars);
+        let mut total = 0usize;
+        let mut prev = resident as u64;
+        loop {
+            let resident_candidates = self.engine.resident_spillable_count();
+            if resident_candidates == 0 {
+                break;
             }
+            let target = resident_candidates.saturating_sub(VAR_SPILL_SWEEP_BATCH);
+            let shed = self.shed_variables(target);
+            total += shed;
+            if shed == 0 {
+                break;
+            }
+            // Compact + purge so the resident reading reflects the shed, then
+            // re-check against the low-water mark.
+            self.engine.shrink();
+            let _ = crate::memory::purge();
+            let now = match crate::memory::resident_bytes() {
+                Some(now) => now as u64,
+                None => break,
+            };
+            if now < low {
+                break;
+            }
+            // A full batch shed but RSS did not drop: variables are not the memory
+            // driver here (e.g. tiny payloads, RAM held by control state), so
+            // shedding more would only thrash the backlog for no relief. Stop and
+            // let cold spill / backpressure own it. Prevents a too-low watermark
+            // from spilling the entire active backlog every sweep.
+            if now >= prev {
+                break;
+            }
+            prev = now;
+        }
+        if total > 0 {
+            tracing::info!(
+                "variable spill (adaptive): shed {total} instance(s)' variables under RAM pressure"
+            );
         }
     }
 
@@ -1489,8 +1652,8 @@ impl Journal {
         let mut activated = self
             .engine
             .activate_jobs(&job_type, worker, max_jobs, timeout, now);
-        if let Some((store, _)) = self.spill.as_ref() {
-            let store = Arc::clone(store);
+        if let Some(vs) = self.spill.as_ref() {
+            let store = Arc::clone(&vs.store);
             for job in activated.iter_mut() {
                 if !self.engine.is_variables_spilled(job.instance_key) {
                     continue;
@@ -1844,6 +2007,73 @@ mod tests {
         assert!(
             store.take(b).is_some(),
             "a live instance's spill row is untouched"
+        );
+    }
+
+    #[test]
+    fn adaptive_spill_keeps_everything_resident_below_pressure() {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        // Adaptive with an unreachable high-water and the per-command backstop
+        // disabled (hard_cap 0): below RAM pressure nothing should ever spill, so
+        // the workload runs at full throughput with every payload resident.
+        journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, 0);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("payload".to_string()));
+
+        let mut keys = Vec::new();
+        for _ in 0..3 {
+            let (events, _) = journal
+                .apply_command(Command::create_instance_with("demo", vars.clone()))
+                .unwrap();
+            keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+        }
+        // Even a forced per-command scan is a no-op: the adaptive trigger only
+        // sheds on the RSS sweep (or the hard-cap backstop, here disabled).
+        journal.force_spill_scan();
+        assert_eq!(
+            journal.engine.resident_spillable_count(),
+            3,
+            "no instance spills below the memory watermark"
+        );
+        for k in &keys {
+            assert!(!journal.engine.is_variables_spilled(*k));
+        }
+    }
+
+    #[test]
+    fn adaptive_hard_cap_backstop_sheds_down_to_the_cap() {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        // Unreachable high-water (so the RSS sweep never fires in the test), but a
+        // hard_cap of 1: the per-command backstop must keep at most 1 resident
+        // spill candidate even without RAM pressure — the inter-sweep OOM guard.
+        journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, 1);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("payload".to_string()));
+
+        for _ in 0..3 {
+            let (_events, _commit) = journal
+                .apply_command(Command::create_instance_with("demo", vars.clone()))
+                .unwrap();
+        }
+        journal.force_spill_scan();
+        assert_eq!(
+            journal.engine.resident_spillable_count(),
+            1,
+            "the hard-cap backstop sheds the backlog down to hard_cap"
         );
     }
 }

@@ -384,13 +384,40 @@ impl ServerImpl {
             match varspill::VarSpillStore::open(path.as_deref()) {
                 Ok(store) => {
                     let store = Arc::new(store);
-                    if let Some((_, budget)) = var_cfg {
+                    if let Some((_, cfg)) = var_cfg {
                         for journal in journals.iter_mut() {
-                            journal.set_spill(Arc::clone(&store), budget);
+                            match &cfg {
+                                VarSpillCfg::Budget(budget) => {
+                                    journal.set_spill(Arc::clone(&store), *budget);
+                                }
+                                VarSpillCfg::Adaptive {
+                                    high,
+                                    low,
+                                    hard_cap,
+                                } => {
+                                    journal.set_var_spill_adaptive(
+                                        Arc::clone(&store),
+                                        *high,
+                                        *low,
+                                        *hard_cap,
+                                    );
+                                }
+                            }
                         }
-                        tracing::info!(
-                            "variable spill: on, hot budget {budget} instance(s){location}"
-                        );
+                        match &cfg {
+                            VarSpillCfg::Budget(budget) => tracing::info!(
+                                "variable spill: on (fixed budget), hot budget {budget} instance(s){location}"
+                            ),
+                            VarSpillCfg::Adaptive {
+                                high,
+                                low,
+                                hard_cap,
+                            } => tracing::info!(
+                                "variable spill: on (adaptive), high-water {:.0} MiB / low-water {:.0} MiB, hard-cap {hard_cap} instance(s){location}",
+                                *high as f64 / (1024.0 * 1024.0),
+                                *low as f64 / (1024.0 * 1024.0),
+                            ),
+                        }
                     }
                     if let Some((high, low)) = cold_cfg {
                         for journal in journals.iter_mut() {
@@ -1191,6 +1218,19 @@ fn idle_purge_quiescence_from_env() -> Option<Duration> {
     }
 }
 
+/// The resolved variable-spill mode (see [`spill_from_env`]).
+enum VarSpillCfg {
+    /// Legacy fixed instance-count budget, checked per command.
+    Budget(usize),
+    /// Adaptive: RSS-watermark driven on the periodic sweep, with a per-command
+    /// instance-count backstop (`hard_cap`) for runaways between sweeps.
+    Adaptive {
+        high: u64,
+        low: u64,
+        hard_cap: usize,
+    },
+}
+
 /// Resolves the variable-spill configuration from the environment, or `None` to
 /// keep every payload resident.
 ///
@@ -1200,32 +1240,62 @@ fn idle_purge_quiescence_from_env() -> Option<Duration> {
 /// (no data dir): the spill store would fall back to an in-memory SQLite db,
 /// doubling the payload footprint with no RAM saving.
 ///
-/// - `NANOBPMN_VAR_SPILL` unset: on iff a persistent data path exists.
+/// - `NANOBPMN_VAR_SPILL` unset: **adaptive** iff a persistent data path exists.
 /// - `NANOBPMN_VAR_SPILL=0`/`off`/`false`/`none`/`disabled`/`no`: forced off.
-/// - `NANOBPMN_VAR_SPILL=1`/`on`/`true`/`yes`: forced on (even in-memory — for tests).
-/// - `NANOBPMN_VAR_SPILL_BUDGET=<n>`: hot budget (max resident spillable instances
-///   before the oldest backlog is shed); default 512.
+/// - `NANOBPMN_VAR_SPILL=adaptive`/`auto`/`dynamic`: adaptive (RSS-watermark) mode.
+/// - `NANOBPMN_VAR_SPILL=1`/`on`/`true`/`yes`: forced on in the legacy fixed-budget
+///   mode (even in-memory — for tests).
+/// - `NANOBPMN_VAR_SPILL_BUDGET=<n>`: fixed-mode hot budget (max resident spillable
+///   instances before the oldest backlog is shed); default 512.
+/// - `NANOBPMN_VAR_SPILL_MB=<n>`: adaptive high-water in MiB (default 384); the
+///   sweep sheds variables until resident memory falls under `low = high * 7/8`.
+/// - `NANOBPMN_VAR_SPILL_HARDCAP=<n>`: adaptive per-command instance-count backstop
+///   for a runaway between sweeps (default 262144; 0 disables it).
 /// - The store is co-located with the read-model db (`<dir>/var-spill.sqlite`)
 ///   when persistent, else in-memory.
-fn spill_from_env() -> Option<(Option<PathBuf>, usize)> {
+fn spill_from_env() -> Option<(Option<PathBuf>, VarSpillCfg)> {
     let (_, db) = resolve_data_paths();
-    let enabled = match std::env::var("NANOBPMN_VAR_SPILL").ok().as_deref() {
+    // (on, adaptive): whether spill is enabled, and if so whether it is the
+    // adaptive RSS-watermark mode (vs the legacy fixed-budget mode).
+    let (on, adaptive) = match std::env::var("NANOBPMN_VAR_SPILL").ok().as_deref() {
         Some("0") | Some("off") | Some("false") | Some("none") | Some("disabled") | Some("no") => {
-            false
+            (false, false)
         }
-        Some("1") | Some("on") | Some("true") | Some("yes") => true,
-        // Unset / unrecognised: default on only when a persistent path exists.
-        _ => db.is_some(),
+        Some("adaptive") | Some("auto") | Some("dynamic") => (true, true),
+        Some("1") | Some("on") | Some("true") | Some("yes") => (true, false),
+        // Unset / unrecognised: default to adaptive only when a persistent path
+        // exists (an in-memory spill store would double the payload footprint).
+        _ => (db.is_some(), db.is_some()),
     };
-    if !enabled {
+    if !on {
         return None;
     }
-    let budget = std::env::var("NANOBPMN_VAR_SPILL_BUDGET")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(512);
     let path = db.map(|db| db.with_file_name("var-spill.sqlite"));
-    Some((path, budget))
+    let cfg = if adaptive {
+        let high_mb = std::env::var("NANOBPMN_VAR_SPILL_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(384);
+        let high = high_mb * 1024 * 1024;
+        let low = high / 8 * 7;
+        let hard_cap = std::env::var("NANOBPMN_VAR_SPILL_HARDCAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(262_144);
+        VarSpillCfg::Adaptive {
+            high,
+            low,
+            hard_cap,
+        }
+    } else {
+        let budget = std::env::var("NANOBPMN_VAR_SPILL_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(512);
+        VarSpillCfg::Budget(budget)
+    };
+    Some((path, cfg))
 }
 
 /// Resolves the cold-spill configuration: the resident-byte high-/low-water marks
@@ -6486,10 +6556,13 @@ impl ServerImpl {
         let Some(handle) = self.engine_handle_for(p) else {
             return (false, Vec::new());
         };
-        // One read on the leader: cold-spill + what (if anything) is due now. Only
-        // the leader runs this gate; followers never propose, so this is safe.
+        // One read on the leader: variable/cold spill + what (if anything) is due
+        // now. Only the leader runs this gate; followers never propose, so safe.
         let (timers_due, jobs_due) = handle
             .with(move |journal| {
+                // Shed active-backlog variables first (cheaper, instance stays
+                // live), then whole dormant instances — both gated on RAM pressure.
+                journal.maybe_var_spill_pressure();
                 journal.maybe_cold_spill();
                 let state = journal.engine().state();
                 let timers_due = state.timers.values().any(|t| t.due_at <= now);
@@ -8689,8 +8762,10 @@ async fn main() {
                         handle.with(move |journal| {
                             let (fired, _commit) = journal.trigger_timers(now);
                             let expired = journal.expire_jobs(now);
-                            // Shed dormant instances to disk if hot RAM is over the
-                            // high-water mark (cheap no-op below it / when unset).
+                            // Shed to disk if hot RAM is over the high-water mark
+                            // (cheap no-op below it / when unset): active-backlog
+                            // variables first, then whole dormant instances.
+                            journal.maybe_var_spill_pressure();
                             journal.maybe_cold_spill();
                             // A fired timer may advance a token into an off-partition
                             // message catch: surface those follow-ups for routing.
