@@ -77,7 +77,27 @@ before the cores or disk saturate.
 Because throughput is coordination-bound per node with cores half-idle,
 **scaling *up* (bigger machines) is not expected to help** — the extra cores would
 sit idle. **Scaling *out* (more nodes) is the lever**: the cluster was linear at
-~12k PI/s/node (3 nodes → 36k), so ~6 nodes → ~72k, etc. (Next test.)
+~12k PI/s/node (3 nodes → 36k, 6 nodes → 65k — see below).
+
+### Scale-out check: 6 nodes
+
+Doubled the cluster to **6× `c2-standard-16`** (6 partitions, RF=3), load box
+running **6 `loadgen` procs, one per gateway**, same baseline config
+(`MI=6000/node`):
+
+| Cluster | Nodes | Parts | **Agg tput** | per-node | p50 | Node idle | Loadbox idle |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| 3-node | 3 | 3 | 36 258 | 12.1k | 333 ms | 47% | 80% |
+| **6-node** | 6 | 6 | **64 923** | 10.8k | 348 ms | 41% | 45% |
+
+**~1.8× throughput for 2× nodes** — near-linear, confirming the scale-out thesis.
+Both nodes (41% idle) and the load box (45% idle) still had headroom, so the small
+sublinearity is distributed-coordination overhead: with 6 partitions, create
+placement forwards 5/6 of instances to a peer owner (vs 2/3 at 3 nodes). Latency
+stayed healthy (p50 348 ms). Extrapolates to ~12 nodes → ~130k PI/s. (The single
+load box is now ~55% used driving 6 gateways; pushing further needs a second load
+box.)
+
 
 ### Tuning takeaways (users)
 
