@@ -663,7 +663,26 @@ fn spawn_exporter(
         .name("nanobpmn-exporter".into())
         .spawn(move || {
             let mut since_prune = 0usize;
-            while let Ok(first) = rx.recv() {
+            // Exporter profiling (NANOBPMN_EXPORTER_PROFILE): every 5 s log the
+            // projection rate, busy%, and — critically — the share of busy time
+            // spent inside `store.export` (the single SQLite writer). If busy≈100%
+            // and export dominates, this per-node thread is the throughput ceiling
+            // and sharding it (openings #1/#2) is the lever; if busy≪100%, the
+            // exporter is starved and the ceiling is upstream.
+            let profile = std::env::var_os("NANOBPMN_EXPORTER_PROFILE").is_some();
+            let mut p_idle = std::time::Duration::ZERO;
+            let mut p_busy = std::time::Duration::ZERO;
+            let mut p_export = std::time::Duration::ZERO;
+            let mut p_events: u64 = 0;
+            let mut p_batches: u64 = 0;
+            let mut p_window = std::time::Instant::now();
+            loop {
+                let before_recv = std::time::Instant::now();
+                let Ok(first) = rx.recv() else { break };
+                if profile {
+                    p_idle += before_recv.elapsed();
+                }
+                let before_batch = std::time::Instant::now();
                 let mut batch = vec![first];
                 while let Ok(next) = rx.try_recv() {
                     batch.push(next);
@@ -687,6 +706,7 @@ fn spawn_exporter(
                     .iter()
                     .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
                     .count();
+                let before_export = std::time::Instant::now();
                 let completed = match store.export(&refs) {
                     Ok(keys) => keys,
                     Err(e) => {
@@ -694,6 +714,11 @@ fn spawn_exporter(
                         continue;
                     }
                 };
+                if profile {
+                    p_export += before_export.elapsed();
+                    p_events += refs.len() as u64;
+                    p_batches += 1;
+                }
                 // Update the in-flight backpressure gauge: +created, −terminal.
                 // Single-writer (this thread), so a plain load/store is race-free
                 // for the value and saturates at zero defensively.
@@ -752,6 +777,39 @@ fn spawn_exporter(
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!("history retention prune failed: {e}"),
+                    }
+                }
+                if profile {
+                    p_busy += before_batch.elapsed();
+                    let window = p_window.elapsed();
+                    if window >= std::time::Duration::from_secs(5) {
+                        let total = p_busy + p_idle;
+                        let busy_pct = if total.is_zero() {
+                            0.0
+                        } else {
+                            p_busy.as_secs_f64() / total.as_secs_f64() * 100.0
+                        };
+                        let export_pct = if p_busy.is_zero() {
+                            0.0
+                        } else {
+                            p_export.as_secs_f64() / p_busy.as_secs_f64() * 100.0
+                        };
+                        let eps = p_events as f64 / window.as_secs_f64();
+                        let avg_batch = if p_batches > 0 {
+                            p_events as f64 / p_batches as f64
+                        } else {
+                            0.0
+                        };
+                        tracing::info!(
+                            "exporter: {eps:.0} events/s, busy {busy_pct:.1}% (export {export_pct:.1}% of busy), \
+                             {p_batches} batches/window, avg {avg_batch:.0} events/batch"
+                        );
+                        p_idle = std::time::Duration::ZERO;
+                        p_busy = std::time::Duration::ZERO;
+                        p_export = std::time::Duration::ZERO;
+                        p_events = 0;
+                        p_batches = 0;
+                        p_window = std::time::Instant::now();
                     }
                 }
             }

@@ -289,6 +289,23 @@ impl ReadStore {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
         };
+        // The read store is a *derived* projection: on boot it is rebuilt from the
+        // journal (the source of truth) by replaying events past `exported_position`,
+        // so its own fsync durability is not load-bearing. For a file-backed store we
+        // therefore run WAL + `synchronous=NORMAL`: this removes the per-commit fsync
+        // media barrier from the exporter's hot loop (the single per-node projection
+        // thread all partitions funnel through) while still surviving app crashes; an
+        // OS/power loss at worst rewinds the projection, which boot catch-up rebuilds.
+        // A tie in these numbers is the read-model exporter's throughput ceiling, so
+        // this is the cheapest lever on it. `synchronous` can be overridden via
+        // `NANOBPMN_READ_SYNC` (e.g. FULL to restore the old durability, OFF to
+        // isolate fsync cost in a spike). In-memory stores skip this (no journal file).
+        if path.is_some() {
+            let sync = std::env::var("NANOBPMN_READ_SYNC").unwrap_or_else(|_| "NORMAL".into());
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "synchronous", &sync)?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -1246,6 +1263,32 @@ mod writability_tests {
         // Re-open (schema already matches) still validates writability.
         ReadStore::open(Some(&path)).expect("existing writable db re-opens");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_backed_store_runs_in_wal_mode() {
+        // The read model is a derived projection rebuilt from the journal, so it
+        // runs WAL + synchronous=NORMAL to keep the exporter's per-commit fsync off
+        // the projection hot path. Lock that in so a future change can't silently
+        // revert to the default (DELETE journal + synchronous=FULL) durability.
+        let path = scratch_db();
+        let store = ReadStore::open(Some(&path)).expect("open file-backed db");
+        let (mode, sync): (String, i64) = {
+            let conn = store.conn.lock().unwrap();
+            let mode = conn
+                .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap();
+            let sync = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+                .unwrap();
+            (mode, sync)
+        };
+        assert_eq!(mode.to_lowercase(), "wal", "read store must use WAL journal");
+        assert_eq!(sync, 1, "read store must use synchronous=NORMAL (1)");
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[cfg(unix)]
