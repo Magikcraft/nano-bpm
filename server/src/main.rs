@@ -1218,6 +1218,81 @@ fn idle_purge_quiescence_from_env() -> Option<Duration> {
     }
 }
 
+/// Fallback spill high-water in MiB when the process's memory limit can't be
+/// detected (non-Linux dev boxes, or an unlimited cgroup with no `/proc`).
+const DEFAULT_SPILL_MB: u64 = 384;
+/// Default spill high-water as a percentage of the detected memory limit. Leaves
+/// headroom for non-jemalloc allocations (stacks, mmaps, page cache charged to
+/// the cgroup) before the OOM killer would engage.
+const SPILL_LIMIT_FRACTION_PCT: u64 = 65;
+/// Never auto-derive a high-water below this — on a tiny limit a sub-100 MiB
+/// watermark would thrash against the engine's own baseline working set.
+const MIN_SPILL_HIGH_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Reads `MemTotal` from `/proc/meminfo` in bytes, or `None` off Linux.
+fn read_meminfo_total_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+/// Detects the memory limit this process is subject to, in bytes: the cgroup
+/// limit when running under one (v2 `memory.max`, else v1
+/// `memory.limit_in_bytes`), capped by host `MemTotal`. Returns `None` when no
+/// limit can be read (non-Linux). A cgroup that reports "unlimited" (v2 `max`,
+/// or a v1 near-`u64::MAX` sentinel) falls back to `MemTotal` via the cap, so a
+/// container sees its own limit while a bare-metal node sees host RAM.
+fn detect_memory_limit_bytes() -> Option<u64> {
+    let mut cgroup: Option<u64> = None;
+    // cgroup v2
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let s = s.trim();
+        if s != "max"
+            && let Ok(v) = s.parse::<u64>()
+        {
+            cgroup = Some(v);
+        }
+    }
+    // cgroup v1
+    if cgroup.is_none()
+        && let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        && let Ok(v) = s.trim().parse::<u64>()
+    {
+        cgroup = Some(v);
+    }
+    let mem_total = read_meminfo_total_bytes();
+    match (cgroup, mem_total) {
+        // A cgroup can report the host max (or a near-u64 sentinel) as its
+        // limit; capping by MemTotal turns "unlimited" into host RAM.
+        (Some(c), Some(m)) => Some(c.min(m)),
+        (Some(c), None) => Some(c),
+        (None, Some(m)) => Some(m),
+        (None, None) => None,
+    }
+}
+
+/// Computes the default spill high-water from a detected memory `limit`: a fixed
+/// fraction of the limit, floored at [`MIN_SPILL_HIGH_BYTES`] and never above the
+/// limit itself. Pure so it can be unit-tested without touching the filesystem.
+fn spill_default_from_limit(limit_bytes: u64) -> u64 {
+    let frac = limit_bytes / 100 * SPILL_LIMIT_FRACTION_PCT;
+    frac.max(MIN_SPILL_HIGH_BYTES).min(limit_bytes)
+}
+
+/// The default spill high-water in bytes when no explicit `*_MB` override is set:
+/// RAM-relative when a memory limit can be detected, else [`DEFAULT_SPILL_MB`].
+fn default_spill_high_bytes() -> u64 {
+    match detect_memory_limit_bytes() {
+        Some(limit) => spill_default_from_limit(limit),
+        None => DEFAULT_SPILL_MB * 1024 * 1024,
+    }
+}
+
 /// The resolved variable-spill mode (see [`spill_from_env`]).
 enum VarSpillCfg {
     /// Legacy fixed instance-count budget, checked per command.
@@ -1247,7 +1322,9 @@ enum VarSpillCfg {
 ///   mode (even in-memory — for tests).
 /// - `NANOBPMN_VAR_SPILL_BUDGET=<n>`: fixed-mode hot budget (max resident spillable
 ///   instances before the oldest backlog is shed); default 512.
-/// - `NANOBPMN_VAR_SPILL_MB=<n>`: adaptive high-water in MiB (default 384); the
+/// - `NANOBPMN_VAR_SPILL_MB=<n>`: adaptive high-water in MiB; overrides the
+///   default, which is RAM-relative (~65% of the detected cgroup/host memory
+///   limit, floored at 128 MiB, or 384 MiB when no limit can be detected). The
 ///   sweep sheds variables until resident memory falls under `low = high * 7/8`.
 /// - `NANOBPMN_VAR_SPILL_HARDCAP=<n>`: adaptive per-command instance-count backstop
 ///   for a runaway between sweeps (default 262144; 0 disables it).
@@ -1272,12 +1349,12 @@ fn spill_from_env() -> Option<(Option<PathBuf>, VarSpillCfg)> {
     }
     let path = db.map(|db| db.with_file_name("var-spill.sqlite"));
     let cfg = if adaptive {
-        let high_mb = std::env::var("NANOBPMN_VAR_SPILL_MB")
+        let high = std::env::var("NANOBPMN_VAR_SPILL_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(384);
-        let high = high_mb * 1024 * 1024;
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or_else(default_spill_high_bytes);
         let low = high / 8 * 7;
         let hard_cap = std::env::var("NANOBPMN_VAR_SPILL_HARDCAP")
             .ok()
@@ -1313,7 +1390,9 @@ fn spill_from_env() -> Option<(Option<PathBuf>, VarSpillCfg)> {
 /// - `NANOBPMN_COLD_SPILL` unset: on iff a persistent data path exists.
 /// - `NANOBPMN_COLD_SPILL=0`/`off`/`false`/`none`/`disabled`/`no`: forced off.
 /// - `NANOBPMN_COLD_SPILL=1`/`on`/`true`/`yes`: forced on (even in-memory — tests).
-/// - `NANOBPMN_COLD_SPILL_MB=<n>`: high-water in MiB (default 384). The sweep
+/// - `NANOBPMN_COLD_SPILL_MB=<n>`: high-water in MiB; overrides the default,
+///   which is RAM-relative (~65% of the detected cgroup/host memory limit,
+///   floored at 128 MiB, or 384 MiB when no limit can be detected). The sweep
 ///   stops once resident memory falls under `low = high * 7/8`.
 fn cold_spill_from_env() -> Option<(u64, u64)> {
     let (_, db) = resolve_data_paths();
@@ -1327,12 +1406,12 @@ fn cold_spill_from_env() -> Option<(u64, u64)> {
     if !enabled {
         return None;
     }
-    let high_mb = std::env::var("NANOBPMN_COLD_SPILL_MB")
+    let high = std::env::var("NANOBPMN_COLD_SPILL_MB")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(384);
-    let high = high_mb * 1024 * 1024;
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or_else(default_spill_high_bytes);
     let low = high / 8 * 7;
     Some((high, low))
 }
@@ -9056,6 +9135,27 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod clustered_startup_tests {
     use super::*;
+
+    #[test]
+    fn spill_default_scales_with_memory_limit() {
+        // 65% of the limit, above the floor.
+        let limit = 8 * 1024 * 1024 * 1024; // 8 GiB
+        assert_eq!(spill_default_from_limit(limit), limit / 100 * 65);
+
+        // 200 MiB -> 65% = 130 MiB, still above the 128 MiB floor.
+        let small = 200 * 1024 * 1024;
+        assert_eq!(spill_default_from_limit(small), small / 100 * 65);
+
+        // 100 MiB -> 65% = 65 MiB, floored to 128 MiB but capped at the limit.
+        let tiny = 100 * 1024 * 1024;
+        assert_eq!(spill_default_from_limit(tiny), tiny);
+
+        // Large host: watermark is a big fraction, so spill stays dormant under
+        // a normal working set.
+        let big = 64 * 1024 * 1024 * 1024; // 64 GiB
+        assert_eq!(spill_default_from_limit(big), big / 100 * 65);
+        assert!(spill_default_from_limit(big) > MIN_SPILL_HIGH_BYTES);
+    }
 
     /// Builds an in-memory clustered `ServerImpl` for `node_id` of a 2-node,
     /// 4-partition cluster (node 0 owns partitions 0 & 2; node 1 owns 1 & 3),

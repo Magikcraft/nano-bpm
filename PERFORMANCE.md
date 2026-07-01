@@ -500,11 +500,14 @@ backpressure instead — the correct layering.
   all deployments — full throughput until real memory pressure. Use `on`
   (fixed budget) only when you want a hard, deterministic resident-count cap;
   `off` only when payloads are tiny and RAM is ample.
-- **`NANOBPMN_VAR_SPILL_MB`** (adaptive high-water, default 384): raise it on
-  large-RAM nodes so spill only engages on a genuine explosion (the 384 default
-  is conservative — chosen for small containers; on a 64 GB node a multi-GB
-  watermark keeps spill fully dormant under normal load). Low-water is `7/8` of
-  high.
+- **`NANOBPMN_VAR_SPILL_MB`** (adaptive high-water): defaults to a **RAM-relative**
+  value — ~65% of the detected cgroup/host memory limit (floored at 128 MiB;
+  384 MiB when no limit can be detected). This self-corrects across
+  environments: a 512 MiB container gets a ~333 MiB watermark, a 64 GB node gets
+  a ~41 GB watermark (so spill stays fully dormant under normal load and only
+  engages on a genuine explosion). Set it explicitly only to override the
+  auto-derived value. Low-water is `7/8` of high. `NANOBPMN_COLD_SPILL_MB`
+  behaves identically for cold spill.
 
 ### Large-payload memory test (adaptive spill actually constraining an explosion)
 
