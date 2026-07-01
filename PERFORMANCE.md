@@ -456,3 +456,52 @@ move a coordination-bound ceiling that adding cores did not.
 - **Spill on/off** (`NANOBPMN_VAR_SPILL`): keep **on** for OOM safety under
   large/stalled backlogs. Disabling trades ~100 MB RSS for a few % throughput
   only when variables are tiny and completion is fast — not safe in general.
+
+## Adaptive variable spill (RAM-pressure driven) — now the default
+
+Variable spill's fixed **instance-count** budget is a poor proxy for bytes, so
+its default had to be conservative (512) — spilling even when RAM is fine. New
+**adaptive** mode (default in persistent mode) sheds active-backlog variables
+only when resident memory actually crosses a watermark, mirroring the existing
+cold-spill tier:
+
+- Gated on `resident_bytes()` high/low watermarks (`NANOBPMN_VAR_SPILL_MB`,
+  default 384) on the 500 ms maintenance sweep, run *before* cold spill (shed
+  variables first — instance stays live — then evict whole dormant instances).
+- **Below the mark: a single cheap RSS read → zero spill, max throughput.**
+- Above it: shed oldest active-backlog variables in batches until under
+  low-water — but **stop early if a batch doesn't reduce RSS** (variables aren't
+  the memory driver), so a too-low watermark can't thrash the backlog.
+- Per-command instance-count backstop (`NANOBPMN_VAR_SPILL_HARDCAP`, default
+  262144) bounds a create-flood runaway *between* sweeps without an RSS read per
+  command.
+- `NANOBPMN_VAR_SPILL=on` keeps the legacy fixed-budget mode; `off` disables.
+
+### Result — GCP 3-node / 12-partition / RF=3, `110 224 112 32000`
+
+| Mode                                   | tput (PI/s/node) | node RSS      |
+|----------------------------------------|-----------------:|---------------|
+| fixed budget 512 (`on`)                | ~110k            | ~340–397 MB   |
+| adaptive, watermark 4096 MiB (unreached) | ~110.6k        | grows freely  |
+| adaptive, watermark 384 MiB (default)  | ~110.7k          | ~320–370 MB   |
+
+Adaptive costs **nothing** below pressure (identical throughput to fixed
+budget), and at the default 384 MiB watermark — which this workload's ~370 MB
+working set sits right at — the progress-check let the one node that crossed it
+shed a few times **harmlessly** (tiny variables aren't the RSS driver, so it
+stopped immediately) with **no throughput dip**. The mechanism that actually
+*constrains* RAM is exercised when variables are the memory driver (large
+payloads); for a tiny-variable flood, RAM is bounded by cold spill +
+backpressure instead — the correct layering.
+
+### Tuning guidance (updated)
+
+- **`NANOBPMN_VAR_SPILL`**: `adaptive` (default) is the right choice for almost
+  all deployments — full throughput until real memory pressure. Use `on`
+  (fixed budget) only when you want a hard, deterministic resident-count cap;
+  `off` only when payloads are tiny and RAM is ample.
+- **`NANOBPMN_VAR_SPILL_MB`** (adaptive high-water, default 384): raise it on
+  large-RAM nodes so spill only engages on a genuine explosion (the 384 default
+  is conservative — chosen for small containers; on a 64 GB node a multi-GB
+  watermark keeps spill fully dormant under normal load). Low-water is `7/8` of
+  high.
