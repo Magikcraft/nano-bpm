@@ -399,3 +399,60 @@ never the limiter. Real levers from here: reduce engine-actor cross-thread
 contention / batching on the replication path, or scale partitions-per-node to
 spread the single-writer actor further. It was kept for the cleaner architecture
 (dispatch CPU spread across cores, single serialization pass).
+
+## Raising the per-node ceiling: profile-guided serial-path fixes (0.0.3-cache)
+
+Since the ceiling is coordination/serial-bound with CPU to spare (above), the
+lever is to make the **per-command serial path cheaper**, not to add cores. A
+symbolized release build (`strip=false debug=line-tables-only`) + `perf record
+-g --call-graph dwarf` on a live node under load surfaced two concrete costs:
+
+1. **Engine `maybe_spill` was O(N) per command.** `Journal::maybe_spill` called
+   `resident_spillable_count()` — a full scan of the resident instance map —
+   on **every** `apply_command`, *before* the budget check (self ~4.9%). Under a
+   deep backlog that is O(N) per command / O(N²) aggregate and feeds congestion
+   collapse. (The doc comment claimed a "cheap one-counter read"; the O(1)
+   counter never existed.)
+
+2. **Exporter re-parsed SQL per event.** The read-model exporter (the node's #1
+   CPU thread group) used `Connection::execute` / `query_row`, recompiling the
+   SQL text on every projected event. Its top self-time symbols were pure
+   SQLite parsing (`sqlite3RunParser` 2.3% + `yy_reduce` 2.2% + `sqlite3GetToken`
+   1.2%), not `sqlite3VdbeExec`.
+
+### Fixes (durability + memory-bound preserved)
+
+- **`maybe_spill` → O(1) hot path.** Added `Engine::resident_instance_count()`
+  (O(1) `len()`). Spill candidates are a subset of resident instances, so when
+  the resident set already fits the budget the scan is skipped entirely. When
+  *persistently* over budget, the precise scan/shed is amortized across
+  `SPILL_CHECK_INTERVAL` (256) commands (spill is a **soft** bound — variables
+  stay durable in the journal — so bounded-late shedding is safe; the first
+  over-budget command still sheds eagerly).
+- **Exporter → `prepare_cached`.** A small `CachedSql` trait routes the hot
+  projection statements through `prepare_cached`, compiling each SQL string once
+  per connection. Same SQL, same params, plans reused.
+
+### Result — GCP 3-node / 12-partition / RF=3, spill **on**, `110 224 112 32000`
+
+| Build          | tput (avg of runs)      | node RSS under load |
+|----------------|-------------------------|---------------------|
+| 0.0.3-disp     | ~100.7k PI/s/node       | ~313–353 MB         |
+| 0.0.3-cache    | ~109.9k PI/s/node       | ~373–397 MB         |
+
+**+9% throughput** while keeping RF=3 durability and variable spill active. The
+~+50 MB RSS is the bounded amortization overshoot plus the larger in-flight
+backlog at higher throughput — no runaway; spill still sheds under real
+pressure. Both fixes are on the single-writer serial path, which is why they
+move a coordination-bound ceiling that adding cores did not.
+
+### Tuning guidance
+
+- **Variable spill budget** (`NANOBPMN_VAR_SPILL_BUDGET`, default 512): the max
+  resident instances carrying variables before shedding to disk. Raise it when
+  the active backlog is large but variables are small (keeps them resident,
+  avoids spill I/O); lower it when variables are large and RAM is tight. The
+  scan is now O(1) while under budget, so a generous budget is cheap.
+- **Spill on/off** (`NANOBPMN_VAR_SPILL`): keep **on** for OOM safety under
+  large/stalled backlogs. Disabling trades ~100 MB RSS for a few % throughput
+  only when variables are tiny and completion is fast — not safe in general.
