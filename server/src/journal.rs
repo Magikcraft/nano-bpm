@@ -154,6 +154,13 @@ pub struct Journal {
     /// low-throughput counterpart to variable spill: where variable spill bounds a
     /// large *active* backlog, cold spill bounds a large *parked* one.
     cold: Option<ColdSpill>,
+    /// Countdown that amortises the O(N) spillable scan in [`maybe_spill`]. While
+    /// the resident set stays over the spill budget, the precise scan/shed runs
+    /// only once every [`SPILL_CHECK_INTERVAL`] commands instead of on every
+    /// apply; between runs the hot path is O(1). Reset to zero whenever the
+    /// resident set drops back within budget so the next overflow is caught
+    /// immediately.
+    spill_check_skip: u32,
 }
 
 /// Cold-spill state held by a [`Journal`]: the shared disk store, the resident
@@ -169,6 +176,14 @@ struct ColdSpill {
 /// forcing the fsync, regardless of the linger window. Bounds worst-case commit
 /// latency and the staging buffer when offered load is very high.
 const MAX_GROUP_BATCH: usize = 8192;
+
+/// How many commands the journal skips between precise spillable scans while the
+/// resident set stays over the spill budget. Variable spill is a soft memory
+/// bound (payloads stay durable in the journal), so amortising the O(N) scan
+/// across this many applies keeps the hot path O(1) under a deep backlog while
+/// bounding memory overshoot to at most this many commands' worth of newly
+/// spillable variables.
+const SPILL_CHECK_INTERVAL: u32 = 256;
 
 /// The background journal writer: blocks for the next request, drains every
 /// other request already queued, then **group-commits** the whole batch in a
@@ -757,6 +772,7 @@ impl Journal {
             fresh: true,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         }
     }
 
@@ -781,6 +797,7 @@ impl Journal {
             fresh: false,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         }
     }
 
@@ -800,6 +817,7 @@ impl Journal {
             fresh: false,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         }
     }
 
@@ -862,6 +880,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         })
     }
 
@@ -891,6 +910,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         };
         Ok((journal, recovery))
     }
@@ -924,6 +944,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         }
     }
 
@@ -952,6 +973,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            spill_check_skip: 0,
         }
     }
 
@@ -1374,20 +1396,43 @@ impl Journal {
     }
 
     /// Sheds the oldest backlog's variables to the spill store when the resident
-    /// spillable set exceeds the hot budget. Cheap when within budget (one
-    /// counter read); only a genuinely growing backlog pays the spill writes.
-    /// The variables are already durable in the journal, so a spill write that
-    /// is later lost is reconstructable — it is a cache, not a system of record.
+    /// spillable set exceeds the hot budget. The variables are already durable in
+    /// the journal, so a spill write that is later lost is reconstructable — it is
+    /// a cache, not a system of record, which makes the exact shed timing a soft
+    /// bound we can amortise.
+    ///
+    /// Hot-path cost: an O(1) resident-count guard skips everything while the
+    /// whole resident set fits the budget (the steady state). Once persistently
+    /// over budget, the precise O(N) spillable scan/shed runs only once every
+    /// [`SPILL_CHECK_INTERVAL`] commands rather than on every apply, so a deep
+    /// backlog no longer pays an O(N) scan per command (which was quadratic in the
+    /// backlog and drove congestion collapse).
     fn maybe_spill(&mut self) {
-        let Some((store, budget)) = self.spill.as_ref() else {
+        let Some((_, budget)) = self.spill.as_ref() else {
             return;
         };
-        let resident = self.engine.resident_spillable_count();
-        if resident <= *budget {
+        let budget = *budget;
+        // O(1) fast path: spill candidates are a subset of resident instances, so
+        // when the resident set already fits the budget nothing can be over it.
+        if self.engine.resident_instance_count() <= budget {
+            self.spill_check_skip = 0;
             return;
         }
-        let store = Arc::clone(store);
-        let over = resident - *budget;
+        // Over the cheap bound: amortise the precise scan/shed across commands.
+        if self.spill_check_skip > 0 {
+            self.spill_check_skip -= 1;
+            return;
+        }
+        self.spill_check_skip = SPILL_CHECK_INTERVAL;
+        let resident = self.engine.resident_spillable_count();
+        if resident <= budget {
+            return;
+        }
+        let store = match self.spill.as_ref() {
+            Some((store, _)) => Arc::clone(store),
+            None => return,
+        };
+        let over = resident - budget;
         for key in self.engine.spillable_instances(over) {
             if let Some(vars) = self.engine.spill_variables(key)
                 && store.put(key, &vars).is_err()
@@ -1396,6 +1441,16 @@ impl Journal {
                 self.engine.rehydrate_variables(key, vars);
             }
         }
+    }
+
+    /// Test-only: force an immediate, un-throttled spill scan. Production spills
+    /// are amortised (see [`maybe_spill`]/[`SPILL_CHECK_INTERVAL`]), so tests that
+    /// assert on the fully-shed state drive it deterministically through here
+    /// instead of depending on the amortisation cadence.
+    #[cfg(test)]
+    fn force_spill_scan(&mut self) {
+        self.spill_check_skip = 0;
+        self.maybe_spill();
     }
 
     /// Activates jobs **without** journaling: activation locks are volatile lease
@@ -1771,6 +1826,10 @@ mod tests {
             keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
         }
         let (a, b) = (keys[0], keys[1]);
+        // The first over-budget command sheds eagerly; subsequent shedding is
+        // amortised, so drive the scan deterministically to reach the fully-shed
+        // state this test asserts on.
+        journal.force_spill_scan();
         assert!(journal.engine.is_variables_spilled(a), "a spilled");
         assert!(journal.engine.is_variables_spilled(b), "b spilled");
 

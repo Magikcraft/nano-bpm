@@ -284,6 +284,16 @@ impl Engine {
             .count()
     }
 
+    /// Total resident instances, regardless of spillability. O(1). Spill
+    /// candidates are a strict subset of this set, so a host can use it as a
+    /// cheap upper bound: when the whole resident set already fits the spill
+    /// budget, [`resident_spillable_count`](Engine::resident_spillable_count) is
+    /// guaranteed to as well, letting the host skip that O(N) scan on the hot
+    /// command path.
+    pub fn resident_instance_count(&self) -> usize {
+        self.state.instances.len()
+    }
+
     /// Whether `instance` (keyed `key`) may have its variables spilled, given the
     /// set of instances that hold an async-resumable token (`guarded`). Shared by
     /// [`spillable_instances`](Engine::spillable_instances) and
