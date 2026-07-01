@@ -416,7 +416,7 @@ impl ReadStore {
             }
             project(&tx, event)?;
         }
-        tx.execute(
+        tx.cexecute(
             "UPDATE meta SET v = v + ?1 WHERE k = 'exported_position'",
             params![events.len() as i64],
         )?;
@@ -972,6 +972,36 @@ fn json_value(value: &Value) -> String {
 /// so the autoincrement variable keys are assigned deterministically on a rebuild
 /// (a `VariablesUpdated`/`ProcessInstanceCreated` event carries an unordered map).
 /// An already-known name keeps its key and has its value overwritten.
+/// Prepared-statement caching for the projection hot path. Plain
+/// `Connection::execute` / `query_row` recompile the SQL text on every call; the
+/// exporter runs one statement per projected event, so under load that
+/// (re)parsing dominated a CPU profile (`sqlite3RunParser` / `sqlite3GetToken` /
+/// `yy_reduce` were the exporter's top self-time symbols). Routing the hot
+/// statements through `prepare_cached` compiles each SQL string once per
+/// connection and reuses the cached plan, keeping only bytecode execution on the
+/// per-event path. Semantics are identical — same SQL, same params.
+trait CachedSql {
+    fn cexecute<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize>;
+    fn cquery_row<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl CachedSql for rusqlite::Connection {
+    fn cexecute<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn cquery_row<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
 fn upsert_variables(
     tx: &rusqlite::Transaction,
     instance_key: Key,
@@ -984,7 +1014,7 @@ fn upsert_variables(
     let mut entries: Vec<(&String, &Value)> = variables.iter().collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     for (name, value) in entries {
-        tx.execute(
+        tx.cexecute(
             "INSERT INTO variables (instance_key, scope_key, name, value, \
              process_definition_id, process_definition_key) VALUES (?1, ?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(scope_key, name) DO UPDATE SET value = excluded.value",
@@ -1006,7 +1036,7 @@ fn upsert_variables(
 /// when the instance is unknown (it always precedes its jobs/incidents in the
 /// event order, so this is only a safety net).
 fn instance_def(tx: &rusqlite::Transaction, instance_key: Key) -> (String, String) {
-    tx.query_row(
+    tx.cquery_row(
         "SELECT process_definition_id, process_definition_key FROM process_instances WHERE key = ?1",
         params![instance_key as i64],
         |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1020,7 +1050,7 @@ fn instance_def(tx: &rusqlite::Transaction, instance_key: Key) -> (String, Strin
 /// The deployed version of the definition behind an instance (defaults to 1
 /// when the instance row is not yet present).
 fn instance_version(tx: &rusqlite::Transaction, instance_key: Key) -> i32 {
-    tx.query_row(
+    tx.cquery_row(
         "SELECT version FROM process_instances WHERE key = ?1",
         params![instance_key as i64],
         |r| r.get(0),
@@ -1048,7 +1078,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             // The verbatim BPMN XML rides on the deploy event (engine state) and
             // is projected here so getProcessDefinitionXML / the console diagram
             // can serve it by key without querying the engine actor.
-            tx.execute(
+            tx.cexecute(
                 "INSERT INTO process_definitions (process_id, key, version, xml) VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT(process_id) DO UPDATE SET key = excluded.key, version = excluded.version, xml = excluded.xml",
                 params![process.id, *process_definition_key as i64, version, process.xml],
@@ -1076,7 +1106,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 .unwrap_or_else(|| ("-1".to_string(), 0));
             // Serialize tags as comma-separated string for storage
             let tags_str = tags.join(",");
-            tx.execute(
+            tx.cexecute(
                 "INSERT INTO process_instances (key, process_id, process_definition_id, \
                  process_definition_key, version, state, start_date_ms, has_incident, tags, business_id) \
                  VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
@@ -1102,7 +1132,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE process_instances SET state = ?2 WHERE key = ?1",
                 params![
                     *instance_key as i64,
@@ -1112,7 +1142,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE process_instances SET state = ?2, has_incident = 0 WHERE key = ?1",
                 params![
                     *instance_key as i64,
@@ -1121,7 +1151,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             )?;
             // Close any incident still active on the terminated instance, so it
             // no longer surfaces as open in incident search.
-            tx.execute(
+            tx.cexecute(
                 "UPDATE incidents SET state = ?2 WHERE instance_key = ?1 AND state = ?3",
                 params![
                     *instance_key as i64,
@@ -1140,7 +1170,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
-            tx.execute(
+            tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9) \
@@ -1166,7 +1196,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             deadline,
             ..
         } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4 WHERE key = ?1",
                 params![
                     *job_key as i64,
@@ -1178,7 +1208,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         }
 
         Event::JobLockExpired { job_key, .. } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL \
                  WHERE key = ?1 AND state = ?3",
                 params![
@@ -1197,7 +1227,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             } else {
                 JobState::Failed
             };
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET state = ?2, retries = ?3, worker = NULL, deadline_ms = NULL \
                  WHERE key = ?1",
                 params![*job_key as i64, job_state_code(state), retries],
@@ -1205,21 +1235,21 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         }
 
         Event::JobErrorThrown { job_key, .. } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
                 params![*job_key as i64, job_state_code(JobState::Errored)],
             )?;
         }
 
         Event::JobCompleted { job_key, .. } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
                 params![*job_key as i64, job_state_code(JobState::Completed)],
             )?;
         }
 
         Event::JobCanceled { job_key, .. } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
                 params![*job_key as i64, job_state_code(JobState::Canceled)],
             )?;
@@ -1228,7 +1258,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         Event::JobRetriesUpdated {
             job_key, retries, ..
         } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE jobs SET retries = ?2 WHERE key = ?1",
                 params![*job_key as i64, retries],
             )?;
@@ -1251,7 +1281,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             let version = instance_version(tx, *instance_key);
             let groups = serde_json::to_string(candidate_groups).unwrap_or_else(|_| "[]".into());
             let users = serde_json::to_string(candidate_users).unwrap_or_else(|_| "[]".into());
-            tx.execute(
+            tx.cexecute(
                 "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
                  state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
                  priority, created_at_ms, process_definition_id, process_definition_key, \
@@ -1283,7 +1313,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             assignee,
             ..
         } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE user_tasks SET assignee = ?2 WHERE key = ?1",
                 params![*user_task_key as i64, assignee],
             )?;
@@ -1300,32 +1330,32 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         } => {
             if let Some(groups) = candidate_groups {
                 let json = serde_json::to_string(groups).unwrap_or_else(|_| "[]".into());
-                tx.execute(
+                tx.cexecute(
                     "UPDATE user_tasks SET candidate_groups = ?2 WHERE key = ?1",
                     params![*user_task_key as i64, json],
                 )?;
             }
             if let Some(users) = candidate_users {
                 let json = serde_json::to_string(users).unwrap_or_else(|_| "[]".into());
-                tx.execute(
+                tx.cexecute(
                     "UPDATE user_tasks SET candidate_users = ?2 WHERE key = ?1",
                     params![*user_task_key as i64, json],
                 )?;
             }
             if let Some(due) = due_date {
-                tx.execute(
+                tx.cexecute(
                     "UPDATE user_tasks SET due_date = ?2 WHERE key = ?1",
                     params![*user_task_key as i64, due],
                 )?;
             }
             if let Some(follow_up) = follow_up_date {
-                tx.execute(
+                tx.cexecute(
                     "UPDATE user_tasks SET follow_up_date = ?2 WHERE key = ?1",
                     params![*user_task_key as i64, follow_up],
                 )?;
             }
             if let Some(p) = priority {
-                tx.execute(
+                tx.cexecute(
                     "UPDATE user_tasks SET priority = ?2 WHERE key = ?1",
                     params![*user_task_key as i64, p],
                 )?;
@@ -1333,7 +1363,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         }
 
         Event::UserTaskCompleted { user_task_key, .. } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE user_tasks SET state = ?2 WHERE key = ?1",
                 params![
                     *user_task_key as i64,
@@ -1343,7 +1373,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         }
 
         Event::UserTaskCanceled { user_task_key, .. } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE user_tasks SET state = ?2 WHERE key = ?1",
                 params![
                     *user_task_key as i64,
@@ -1363,7 +1393,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             created_at,
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
-            tx.execute(
+            tx.cexecute(
                 "INSERT INTO incidents (key, instance_key, element_instance_key, element_id, kind, \
                  state, reason, job_key, created_at_ms, process_definition_id, process_definition_key) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
@@ -1382,7 +1412,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     def_key,
                 ],
             )?;
-            tx.execute(
+            tx.cexecute(
                 "UPDATE process_instances SET has_incident = 1 WHERE key = ?1",
                 params![*instance_key as i64],
             )?;
@@ -1395,7 +1425,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             resolved_at: _,
             operation_reference: _,
         } => {
-            tx.execute(
+            tx.cexecute(
                 "UPDATE incidents SET state = ?2 WHERE key = ?1",
                 params![
                     *incident_key as i64,
@@ -1403,7 +1433,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 ],
             )?;
             // `hasIncident` reflects only still-active incidents.
-            let active: i64 = tx.query_row(
+            let active: i64 = tx.cquery_row(
                 "SELECT COUNT(*) FROM incidents WHERE instance_key = ?1 AND state = ?2",
                 params![
                     *instance_key as i64,
@@ -1411,13 +1441,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 ],
                 |r| r.get(0),
             )?;
-            tx.execute(
+            tx.cexecute(
                 "UPDATE process_instances SET has_incident = ?2 WHERE key = ?1",
                 params![*instance_key as i64, i64::from(active > 0)],
             )?;
             // A recoverable job-incident returns its parked job to the pool.
             if let Some(job_key) = job_key {
-                tx.execute(
+                tx.cexecute(
                     "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
                     params![*job_key as i64, job_state_code(JobState::Created)],
                 )?;
