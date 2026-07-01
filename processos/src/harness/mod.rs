@@ -26,7 +26,7 @@ mod hypothesize;
 pub(crate) mod llm;
 mod production;
 mod prompts;
-mod queueing;
+pub(crate) mod queueing;
 mod rank;
 mod replay;
 mod replay_rank;

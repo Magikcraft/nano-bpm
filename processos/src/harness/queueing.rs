@@ -107,6 +107,154 @@ pub struct StaffingPlan {
     pub utilization: f64,
 }
 
+/// The measured per-job-type load, fitted from a recorded trace dataset (the
+/// `jobs` table): the observation window and arrival count give λ, the mean
+/// `service_ms` gives S, and the observed queue-wait quantiles anchor the
+/// prediction to what history actually paid.
+#[derive(Debug, Clone)]
+pub struct JobLoad {
+    pub job_type: String,
+    /// Number of recorded activations of this job type in the window.
+    pub samples: u64,
+    /// Observation window the arrivals were counted over (dataset span), ms.
+    pub window_ms: u64,
+    /// Mean service (busy) time per job, ms.
+    pub service_ms: u64,
+    /// Observed median queue-wait in history, ms (the status-quo baseline).
+    pub observed_p50_wait_ms: u64,
+    /// Observed p99 queue-wait in history, ms (the tail the scaling targets).
+    pub observed_p99_wait_ms: u64,
+    /// Recorded job failures for this type (context for the bottleneck).
+    pub failures: u64,
+}
+
+/// A single what-if point: what a pool of `workers` is predicted to deliver for
+/// this job type at the fitted load. `stable` is false when the pool cannot keep
+/// up (ρ ≥ 1); an unstable pool has no finite wait, so `predicted_p99_wait_ms` is
+/// omitted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScalingPoint {
+    pub workers: u32,
+    pub stable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicted_p99_wait_ms: Option<u64>,
+    pub predicted_utilization: f64,
+}
+
+/// A per-job-type worker-scaling answer: the fitted load, a recommended pool for
+/// the p99 target, and a curve of explicit what-if points (including the implied
+/// single-worker status quo) so the trade "N workers ⇒ p99 wait Y" is legible.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobScaling {
+    pub job_type: String,
+    pub samples: u64,
+    /// Mean arrival rate fitted from the window: `samples / (window_ms/1000)`.
+    pub arrival_per_sec: f64,
+    pub service_ms: u64,
+    /// Offered load in Erlangs (`λ·S`) — the pool must exceed this to be stable.
+    pub offered_load_erlangs: f64,
+    pub observed_p50_wait_ms: u64,
+    pub observed_p99_wait_ms: u64,
+    pub failures: u64,
+    /// The p99 queue-wait target the recommendation holds (ms).
+    pub target_p99_wait_ms: u64,
+    /// Minimum workers that hold the target (and keep ρ < 1).
+    pub recommended_workers: u32,
+    /// Predicted p99 wait at `recommended_workers`, ms.
+    pub recommended_p99_wait_ms: u64,
+    /// Predicted utilization at `recommended_workers`.
+    pub recommended_utilization: f64,
+    /// What-if points at explicit worker counts (status quo + asks + recommendation).
+    pub predictions: Vec<ScalingPoint>,
+    /// Why the load could not be fitted (no window / arrivals / service time); when
+    /// set, the numeric fields are best-effort defaults and predictions are empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Evaluate a worker-scaling what-if for one job type from its fitted load. This
+/// is the infrastructure change the logic-faithful replay engine structurally
+/// cannot model: the replay plays back the recorded timeline, so adding workers
+/// changes nothing there — here we re-derive the queue-wait from an M/M/c model
+/// fitted to the recorded arrival rate and service time.
+///
+/// `target_p99_wait_ms` is the tail the recommendation holds. `worker_counts` are
+/// extra explicit what-if points; the curve always also includes 1 (the implied
+/// single-worker status quo) and the recommended count, so the answer contrasts
+/// "do nothing" against "right-size". Pure and deterministic.
+pub fn scale_job(load: &JobLoad, target_p99_wait_ms: u64, worker_counts: &[u32]) -> JobScaling {
+    let window_s = load.window_ms as f64 / 1000.0;
+    let fittable = window_s > 0.0 && load.samples > 0 && load.service_ms > 0;
+    if !fittable {
+        return JobScaling {
+            job_type: load.job_type.clone(),
+            samples: load.samples,
+            arrival_per_sec: 0.0,
+            service_ms: load.service_ms,
+            offered_load_erlangs: 0.0,
+            observed_p50_wait_ms: load.observed_p50_wait_ms,
+            observed_p99_wait_ms: load.observed_p99_wait_ms,
+            failures: load.failures,
+            target_p99_wait_ms,
+            recommended_workers: 1,
+            recommended_p99_wait_ms: 0,
+            recommended_utilization: 0.0,
+            predictions: Vec::new(),
+            note: Some(
+                "insufficient signal to fit the queueing model (need an observation window, \
+                 recorded arrivals, and a non-zero service time)"
+                    .to_string(),
+            ),
+        };
+    }
+
+    let lambda = load.samples as f64 / window_s;
+    let s = load.service_ms as f64 / 1000.0;
+    let offered = lambda * s;
+    let plan = min_workers_for_p99(lambda, load.service_ms, target_p99_wait_ms);
+
+    // The curve always contrasts the single-worker status quo with the ask(s) and
+    // the recommendation, de-duplicated and ordered.
+    let mut counts: Vec<u32> = Vec::with_capacity(worker_counts.len() + 2);
+    counts.push(1);
+    counts.push(plan.workers);
+    counts.extend(worker_counts.iter().copied().filter(|&c| c > 0));
+    counts.sort_unstable();
+    counts.dedup();
+
+    let predictions = counts
+        .into_iter()
+        .map(|c| {
+            let wait = p99_wait_ms(c, lambda, s);
+            ScalingPoint {
+                workers: c,
+                stable: wait.is_some(),
+                predicted_p99_wait_ms: wait.map(|w| w.round() as u64),
+                predicted_utilization: offered / c as f64,
+            }
+        })
+        .collect();
+
+    JobScaling {
+        job_type: load.job_type.clone(),
+        samples: load.samples,
+        arrival_per_sec: lambda,
+        service_ms: load.service_ms,
+        offered_load_erlangs: offered,
+        observed_p50_wait_ms: load.observed_p50_wait_ms,
+        observed_p99_wait_ms: load.observed_p99_wait_ms,
+        failures: load.failures,
+        target_p99_wait_ms,
+        recommended_workers: plan.workers,
+        recommended_p99_wait_ms: plan.p99_wait_ms,
+        recommended_utilization: plan.utilization,
+        predictions,
+        note: None,
+    }
+}
+
 /// Minimum number of M/M/c servers that holds the p99 queue-wait at or below
 /// `target_p99_wait_ms`, given arrival rate (per sec) and mean service time (ms).
 /// Always returns a stable pool (ρ < 1). A search cap guards against runaway, though
@@ -254,6 +402,70 @@ mod tests {
         let plan = min_workers_for_p99(0.0, 500, 100);
         assert_eq!(plan.workers, 1);
         assert_eq!(plan.p99_wait_ms, 0);
+    }
+
+    fn load(job: &str, samples: u64, window_ms: u64, service_ms: u64) -> JobLoad {
+        JobLoad {
+            job_type: job.into(),
+            samples,
+            window_ms,
+            service_ms,
+            observed_p50_wait_ms: 51_600,
+            observed_p99_wait_ms: 5_469_000,
+            failures: 189,
+        }
+    }
+
+    #[test]
+    fn scaling_recommends_a_stable_pool_that_meets_the_target() {
+        // A single worker is nowhere near enough: λ=10/s, S=500ms => a=5 Erlangs.
+        let l = load("credit-check", 100_000, 10_000_000, 500);
+        let out = scale_job(&l, 1000, &[]);
+        assert!(out.note.is_none());
+        assert!((out.arrival_per_sec - 10.0).abs() < 1e-6);
+        assert!((out.offered_load_erlangs - 5.0).abs() < 1e-6);
+        // Must right-size above the offered load and actually hold the target.
+        assert!(out.recommended_workers as f64 > out.offered_load_erlangs);
+        assert!(out.recommended_p99_wait_ms <= 1000);
+        assert!(out.recommended_utilization < 1.0);
+    }
+
+    #[test]
+    fn scaling_curve_contrasts_the_single_worker_status_quo() {
+        let l = load("credit-check", 100_000, 10_000_000, 500);
+        let out = scale_job(&l, 1000, &[8]);
+        // The curve always includes the single-worker status quo, the ask, and the
+        // recommendation, ordered and de-duplicated.
+        assert_eq!(out.predictions.first().unwrap().workers, 1);
+        assert!(out.predictions.iter().any(|p| p.workers == 8));
+        assert!(out
+            .predictions
+            .iter()
+            .any(|p| p.workers == out.recommended_workers));
+        // One worker cannot keep up with 5 Erlangs of load: unstable, no finite wait.
+        let one = out.predictions.iter().find(|p| p.workers == 1).unwrap();
+        assert!(!one.stable);
+        assert!(one.predicted_p99_wait_ms.is_none());
+        // Adding workers monotonically cuts the predicted tail.
+        let stable: Vec<u64> = out
+            .predictions
+            .iter()
+            .filter_map(|p| p.predicted_p99_wait_ms)
+            .collect();
+        for w in stable.windows(2) {
+            assert!(
+                w[1] <= w[0],
+                "wait should not grow with more workers: {stable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_notes_an_unfittable_job() {
+        // No service time => cannot fit; returns a note and no predictions.
+        let out = scale_job(&load("notify", 50, 10_000, 0), 1000, &[2, 4]);
+        assert!(out.note.is_some());
+        assert!(out.predictions.is_empty());
     }
 
     #[test]

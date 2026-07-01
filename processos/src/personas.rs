@@ -545,7 +545,13 @@ occur (a broken gateway, a condition on the wrong element, or a duplicated path)
 mockWorkers for those job types; instead FIX THE STRUCTURE — note that this engine only evaluates flow \
 conditions on an exclusive (XOR) gateway, so branch conditions belong on a `<bpmn:exclusiveGateway>`, \
 never on a service task's or event's outgoing flows (run analyze_model and heed any \
-`condition-on-non-gateway` warning). When a measured \
+`condition-on-non-gateway` warning). Worker COUNT / concurrency is DEPLOYMENT CONFIG, not a BPMN \
+property: when the bottleneck is UNDER-PROVISIONING — a high queue_ms tail, a growing backlog, or \
+`worker exhausted retries` incidents — do NOT try to model 'more workers' by cloning the task or \
+adding a parallel path (that changes behaviour, not staffing). Call `scale_workers` (optionally with \
+jobType / targetP99WaitMs / workerCounts): it fits an M/M/c model to the recorded arrival rate and \
+service time and predicts the p99 queue-wait at each pool size — the infrastructure what-if simulate \
+structurally cannot run — then recommend the staffing number it returns. When a measured \
 (Level-2) change is available, prefer it: reordering or \
 parallelising EXISTING tasks, or adding a retry on an existing one, scores at full fidelity with no \
 mock needed. To choose between \
@@ -673,7 +679,9 @@ The agent has escape hatches it often forgets — when it is stuck on an UNREACH
 is usually to change a constraint, not to keep reasoning: query_traces (the only way to actually \
 run SQL); simulate/compare_variants with mockWorkers (mock a job OUTPUT, or mock a job FAILURE \
 with \"throwError\":\"<CODE>\" to exercise an error/timeout boundary that is otherwise never \
-reached); edit_model (add or change tasks, gateways, boundary events); validate_model (fast \
+reached); scale_workers (for an under-provisioning/queue bottleneck, quantify the workers a job \
+type needs — the infra what-if simulate cannot run); edit_model (add or change tasks, gateways, \
+boundary events); validate_model (fast \
 static check of BPMN XML before deploying).\n\
 \n\
 Respond with ONLY a JSON object and nothing else:\n\

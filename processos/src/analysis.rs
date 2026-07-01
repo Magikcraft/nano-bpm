@@ -245,6 +245,66 @@ impl Analysis {
             rows: out,
         })
     }
+
+    /// Fit the per-job-type load the queueing model needs, straight from the `jobs`
+    /// table: the arrival count and the dataset span (for λ), the mean `service_ms`
+    /// (for S), and the observed queue-wait quantiles (the status-quo tail the
+    /// scaling is measured against). `job_type` filters to one type; `None` fits
+    /// every type. Ordered worst-tail first. This is the measured input to
+    /// [`crate::harness::queueing::scale_job`].
+    pub fn job_loads(
+        &self,
+        job_type: Option<&str>,
+    ) -> Result<Vec<crate::harness::queueing::JobLoad>, String> {
+        // A single observation window (the whole-dataset job span) makes arrival
+        // rates comparable across job types.
+        let sql = "\
+            WITH win AS (SELECT (max(started_at) - min(started_at)) AS span_ms FROM jobs) \
+            SELECT job_type, \
+                   count(*) AS samples, \
+                   (SELECT span_ms FROM win) AS window_ms, \
+                   CAST(round(avg(service_ms)) AS BIGINT) AS avg_service_ms, \
+                   CAST(round(quantile_cont(queue_ms, 0.5)) AS BIGINT) AS p50_wait_ms, \
+                   CAST(round(quantile_cont(queue_ms, 0.99)) AS BIGINT) AS p99_wait_ms, \
+                   COALESCE(sum(failures), 0) AS failures \
+            FROM jobs \
+            WHERE (? IS NULL OR job_type = ?) \
+            GROUP BY job_type \
+            ORDER BY p99_wait_ms DESC NULLS LAST";
+
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| format!("prepare job_loads: {e}"))?;
+        let mut rows = stmt
+            .query(params![job_type, job_type])
+            .map_err(|e| format!("execute job_loads: {e}"))?;
+
+        // Non-null BIGINT columns read as i64; a job type with only null service/queue
+        // (never happens for a real service task) clamps to 0 and is flagged unfittable
+        // downstream. NUM-safe: negatives clamp to 0.
+        let as_u64 = |v: i64| -> u64 { v.max(0) as u64 };
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| format!("job_loads row: {e}"))? {
+            let job_type: String = row.get(0).map_err(|e| format!("job_type: {e}"))?;
+            let samples: i64 = row.get(1).map_err(|e| format!("samples: {e}"))?;
+            let window_ms: i64 = row.get(2).map_err(|e| format!("window_ms: {e}"))?;
+            let service_ms: Option<i64> = row.get(3).map_err(|e| format!("service_ms: {e}"))?;
+            let p50: Option<i64> = row.get(4).map_err(|e| format!("p50: {e}"))?;
+            let p99: Option<i64> = row.get(5).map_err(|e| format!("p99: {e}"))?;
+            let failures: i64 = row.get(6).map_err(|e| format!("failures: {e}"))?;
+            out.push(crate::harness::queueing::JobLoad {
+                job_type,
+                samples: as_u64(samples),
+                window_ms: as_u64(window_ms),
+                service_ms: as_u64(service_ms.unwrap_or(0)),
+                observed_p50_wait_ms: as_u64(p50.unwrap_or(0)),
+                observed_p99_wait_ms: as_u64(p99.unwrap_or(0)),
+                failures: as_u64(failures),
+            });
+        }
+        Ok(out)
+    }
 }
 
 const SCHEMA: &str = "\
@@ -453,6 +513,33 @@ mod tests {
         assert_eq!(r.rows[0][0], "9");
         let p99: f64 = r.rows[0][2].parse().unwrap();
         assert!(p99 > 50_000.0, "09:00 p99 should be large, got {p99}");
+    }
+
+    #[test]
+    fn job_loads_fits_arrival_and_service_from_the_jobs_table() {
+        // Two credit-check jobs 1s apart, each 1000ms service (see `trace`).
+        let traces = vec![
+            trace("1", MON_2024, 50_000),
+            trace("2", MON_2024 + 1000, 60_000),
+        ];
+        let a = Analysis::build(&traces).expect("build");
+
+        let all = a.job_loads(None).expect("job_loads");
+        assert_eq!(all.len(), 1);
+        let cc = &all[0];
+        assert_eq!(cc.job_type, "credit-check");
+        assert_eq!(cc.samples, 2);
+        assert_eq!(cc.window_ms, 1000); // span between the two started_at
+        assert_eq!(cc.service_ms, 1000); // mean service
+        assert!(
+            cc.observed_p99_wait_ms >= 59_000,
+            "p99 wait should sit near the larger recorded wait, got {}",
+            cc.observed_p99_wait_ms
+        );
+
+        // The filter isolates one job type; an unknown one yields nothing.
+        assert_eq!(a.job_loads(Some("credit-check")).unwrap().len(), 1);
+        assert!(a.job_loads(Some("nope")).unwrap().is_empty());
     }
 
     #[test]

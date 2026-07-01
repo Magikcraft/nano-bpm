@@ -309,6 +309,50 @@ impl ToolBox for AnalysisTools {
                 .into(),
             parameters: json!({ "type": "object", "properties": {} }),
         });
+        specs.push(ToolSpec {
+            name: "scale_workers".into(),
+            description: "INFRASTRUCTURE WHAT-IF — answer \"how many workers does a job type \
+                need, and what queue-wait would N workers deliver?\" This is the one experiment \
+                simulate/compare_variants CANNOT run: those replay the recorded TIMELINE, so \
+                adding workers changes nothing there. This instead fits an M/M/c queueing model \
+                to the RECORDED load (per-job arrival rate from the trace window + measured mean \
+                service time) and predicts the p99 queue-wait at different pool sizes. Reach for \
+                it when the bottleneck is UNDER-PROVISIONING (high queue_ms / a growing backlog / \
+                'worker exhausted retries' incidents) — i.e. the fix is operational scaling, not \
+                a model-structure change. With no args it sizes every job type to hold p99 \
+                queue-wait <= 1000ms; pass jobType to focus one, targetP99WaitMs to set the tail \
+                target, and workerCounts to price specific pool sizes. Each result gives the \
+                fitted arrivalPerSec, serviceMs, offeredLoadErlangs, the observed p50/p99 wait \
+                (the status quo), a recommendedWorkers count, and a predictions curve (always \
+                including 1 worker) showing predictedP99WaitMs + utilization per pool size. \
+                Note: worker count is deployment config, not a BPMN property, so DON'T try to \
+                model scaling by editing the model (e.g. cloning the task) — quantify it here, \
+                then recommend the staffing change."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "jobType": {
+                        "type": "string",
+                        "description": "Focus on one job type (jobs.job_type). Omit to size every \
+                            job type in the dataset (worst queue tail first)."
+                    },
+                    "targetP99WaitMs": {
+                        "type": "integer",
+                        "description": "The p99 QUEUE-wait target (ms) the recommendation must \
+                            hold. Default 1000. Lower = more workers."
+                    },
+                    "workerCounts": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "Explicit pool sizes to price (e.g. [2,4,8,16]) — the \
+                            predictions curve returns each one's predicted p99 wait and \
+                            utilization. The status-quo single worker and the recommendation are \
+                            always included."
+                    }
+                }
+            }),
+        });
         if self.python.is_some() {
             specs.push(ToolSpec {
                 name: "run_python".into(),
@@ -680,6 +724,44 @@ impl ToolBox for AnalysisTools {
             "discover_flow" => {
                 let v = crate::conformance::discover_flow(&self.analysis)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise flow: {e}"))
+            }
+            "scale_workers" => {
+                let job_type = args.get("jobType").and_then(|v| v.as_str());
+                let target = args
+                    .get("targetP99WaitMs")
+                    .and_then(|v| v.as_u64())
+                    .filter(|&t| t > 0)
+                    .unwrap_or(1000);
+                let worker_counts: Vec<u32> = args
+                    .get("workerCounts")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter(|&n| n > 0 && n <= u32::MAX as u64)
+                            .map(|n| n as u32)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let loads = self.analysis.job_loads(job_type)?;
+                if loads.is_empty() {
+                    let which = job_type
+                        .map(|j| format!("job type '{j}' has"))
+                        .unwrap_or_else(|| "no job types have".to_string());
+                    return Err(format!(
+                        "scale_workers: {which} no recorded jobs to fit a queueing model from"
+                    ));
+                }
+                let scaled: Vec<_> = loads
+                    .iter()
+                    .map(|l| crate::harness::queueing::scale_job(l, target, &worker_counts))
+                    .collect();
+                serde_json::to_string(&json!({
+                    "targetP99WaitMs": target,
+                    "model": "M/M/c fitted from recorded arrival rate and service time",
+                    "jobs": scaled,
+                }))
+                .map_err(|e| format!("serialise scaling: {e}"))
             }
             "run_python" => {
                 let py = self

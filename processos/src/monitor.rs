@@ -178,6 +178,9 @@ fix is usually to change a constraint, not to keep reasoning:\n\
 SQL in prose does nothing).\n\
 - simulate / compare_variants with mockWorkers: mock a job's OUTPUT, or mock a job FAILURE with \
 \"throwError\":\"<CODE>\" to exercise an error/timeout boundary that is otherwise never reached.\n\
+- scale_workers: for an UNDER-PROVISIONING bottleneck (high queue_ms, backlog, 'worker exhausted \
+retries'), quantify how many workers a job type needs and the p99 queue-wait at each pool size — \
+the infra what-if simulate CANNOT run. Do NOT model scaling by cloning the task in the BPMN.\n\
 - edit_model: add or change tasks, gateways, and boundary events.\n\
 - validate_model: fast static check of BPMN XML before deploying (surface errors early).\n\
 \n\
