@@ -1286,8 +1286,22 @@ impl Journal {
             return Commit::ready();
         };
 
+        // The shared multi-partition segmented writer records each event line
+        // with its GLOBAL write-partition tag (`<partition>\t<json>`), so
+        // recovery can demultiplex by the partition that actually produced the
+        // write rather than by the event's key. This matters for a clustered
+        // node's durable replicated `ProcessDeployed`: it is journaled under the
+        // node's first-owned partition but keyed to the deployment partition (0),
+        // which a node not owning partition 0 could not otherwise route back. The
+        // single-partition / legacy / in-memory paths keep the bare `<json>` line
+        // format (their reader does not expect a tag).
+        let tagged = shared_backed;
         let mut bytes = Vec::new();
         for event in events.iter() {
+            if tagged {
+                bytes.extend_from_slice(self.partition_id.to_string().as_bytes());
+                bytes.push(b'\t');
+            }
             let line = serde_json::to_string(event).expect("event serializes");
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');

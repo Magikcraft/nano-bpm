@@ -286,6 +286,41 @@ impl Engine {
         }
     }
 
+    /// Like [`install_deployment`](Self::install_deployment) but applies each
+    /// `ProcessDeployed` **only when it is newer** than the definition already
+    /// registered for its process id (absent, or a strictly lower version).
+    ///
+    /// Used by segmented multi-partition recovery to replay a partition-agnostic
+    /// deployment (a durable replicated copy, keyed to the deployment partition)
+    /// into a partition that may already hold that definition from its own
+    /// snapshot at an equal or newer version. Because compaction and per-partition
+    /// snapshots advance on independent watermarks, an *older* surviving durable
+    /// copy could otherwise regress the definition; the version guard makes the
+    /// replay idempotent and monotonic. Key generation is advanced exactly as in
+    /// [`install_deployment`](Self::install_deployment).
+    pub fn install_deployment_if_newer(&mut self, events: &[Event]) {
+        for event in events {
+            let max_key = event.max_key();
+            if state::partition_of(max_key) == self.partition_id {
+                self.next_local = self.next_local.max(state::local_of(max_key));
+            }
+            if let Event::ProcessDeployed {
+                process, version, ..
+            } = event
+            {
+                let newer = self
+                    .state
+                    .processes
+                    .get(&process.id)
+                    .map(|d| *version > d.version)
+                    .unwrap_or(true);
+                if newer {
+                    state::apply(&mut self.state, event);
+                }
+            }
+        }
+    }
+
     /// Creates a fresh process instance and queues its start event for
     /// activation. Shared by `CreateInstance`, message-start correlation, and
     /// timer-start firing.

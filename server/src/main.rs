@@ -8147,61 +8147,107 @@ async fn main() {
                     topology.node_id,
                     partitions,
                 );
-                let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
-                    panic!("failed to read journal {}: {e}", journal_path.display())
-                });
-                store
-                    .reset()
-                    .expect("reset read store for clustered rebuild");
-                if !events.is_empty() {
-                    let refs: Vec<&Event> = events.iter().collect();
+                if seglog::segmented_enabled() {
+                    // Bounded-disk segmented clustered path: like the single-node
+                    // multi-partition path, but this node owns only a SUBSET of
+                    // partitions. The shared writer tags every write with its
+                    // GLOBAL partition id, so recovery demultiplexes by the
+                    // partition that produced the write — which is how a durable
+                    // replicated `ProcessDeployed` (journaled under this node's
+                    // first-owned partition but keyed to the deployment partition)
+                    // is routed back and re-installed across the node's partitions.
+                    let dir = journal_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let (shared, recovery) =
+                        SharedWriter::open_segmented(&dir, &owned, partitions as u64)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "failed to open segmented clustered journal at {}: {e}",
+                                    dir.display()
+                                )
+                            });
+                    multi_seg = Some((Arc::clone(&recovery.shared), partitions as u64));
+                    catch_up_global_read_model(&store, &recovery);
+                    let recovered = !recovery.fresh;
+                    let mut engines: std::collections::HashMap<u64, nanobpmn_engine_core::Engine> =
+                        recovery.engines.into_iter().collect();
+                    let journals: Vec<Journal> = owned
+                        .iter()
+                        .map(|&p| {
+                            let engine = engines
+                                .remove(&p)
+                                .unwrap_or_else(|| nanobpmn_engine_core::Engine::with_partition(p));
+                            Journal::from_engine_shared(p, engine, !recovered, &shared)
+                        })
+                        .collect();
+                    (journals, recovered)
+                } else {
+                    // Legacy clustered path: this node owns only a SUBSET of the
+                    // cluster's partitions (`partition_id % num_nodes == node_id`).
+                    // Its journal file therefore holds only its own partitions'
+                    // events; rebuild its read model from them and open one engine
+                    // actor per owned partition (each keyed by its GLOBAL partition
+                    // id so keys stay globally unique across the cluster).
+                    // Partitions owned by peers are reached by forwarding (handled
+                    // by the routing seam), not replayed here.
+                    let events = Journal::read_events(&journal_path).unwrap_or_else(|e| {
+                        panic!("failed to read journal {}: {e}", journal_path.display())
+                    });
                     store
-                        .export(&refs)
-                        .expect("catch up read model from journal");
-                }
-                // Demultiplex the node's log into its owned partitions by the
-                // partition id encoded in every key. Any event for a partition
-                // this node does not own (a stray from a re-sharded layout) is
-                // dropped — its owner replays it from its own journal.
-                //
-                // `ProcessDeployed` is the exception: a deployment definition is
-                // partition-agnostic (it mints no instance state and arms no
-                // subscriptions) and its key belongs to the deployment partition
-                // (0), which a peer node does not own. So every `ProcessDeployed`
-                // is replayed into *every* owned partition, reconstructing the
-                // definition cluster-wide from a single durable copy (see
-                // `Journal::install_deployment_durable`). Start subscriptions /
-                // timers keep their partition-0 keys and demux normally, so they
-                // are only ever rebuilt on the deployment partition's owner.
-                let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
-                    owned.iter().map(|p| (*p, Vec::new())).collect();
-                for event in events {
-                    if matches!(event, Event::ProcessDeployed { .. }) {
-                        for bucket in per_owned.values_mut() {
-                            bucket.push(event.clone());
+                        .reset()
+                        .expect("reset read store for clustered rebuild");
+                    if !events.is_empty() {
+                        let refs: Vec<&Event> = events.iter().collect();
+                        store
+                            .export(&refs)
+                            .expect("catch up read model from journal");
+                    }
+                    // Demultiplex the node's log into its owned partitions by the
+                    // partition id encoded in every key. Any event for a partition
+                    // this node does not own (a stray from a re-sharded layout) is
+                    // dropped — its owner replays it from its own journal.
+                    //
+                    // `ProcessDeployed` is the exception: a deployment definition is
+                    // partition-agnostic (it mints no instance state and arms no
+                    // subscriptions) and its key belongs to the deployment partition
+                    // (0), which a peer node does not own. So every `ProcessDeployed`
+                    // is replayed into *every* owned partition, reconstructing the
+                    // definition cluster-wide from a single durable copy (see
+                    // `Journal::install_deployment_durable`). Start subscriptions /
+                    // timers keep their partition-0 keys and demux normally, so they
+                    // are only ever rebuilt on the deployment partition's owner.
+                    let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
+                        owned.iter().map(|p| (*p, Vec::new())).collect();
+                    for event in events {
+                        if matches!(event, Event::ProcessDeployed { .. }) {
+                            for bucket in per_owned.values_mut() {
+                                bucket.push(event.clone());
+                            }
+                            continue;
                         }
-                        continue;
+                        let p = nanobpmn_engine_core::partition_of(event.max_key());
+                        if let Some(bucket) = per_owned.get_mut(&p) {
+                            bucket.push(event);
+                        }
                     }
-                    let p = nanobpmn_engine_core::partition_of(event.max_key());
-                    if let Some(bucket) = per_owned.get_mut(&p) {
-                        bucket.push(event);
-                    }
+                    let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
+                        panic!(
+                            "failed to open shared journal {}: {e}",
+                            journal_path.display()
+                        )
+                    });
+                    let recovered = per_owned.values().any(|evs| !evs.is_empty());
+                    let journals: Vec<Journal> = owned
+                        .iter()
+                        .map(|p| {
+                            let evs = per_owned.remove(p).unwrap_or_default();
+                            Journal::from_events_shared(*p, evs, &shared)
+                        })
+                        .collect();
+                    (journals, recovered)
                 }
-                let shared = SharedWriter::open(&journal_path).unwrap_or_else(|e| {
-                    panic!(
-                        "failed to open shared journal {}: {e}",
-                        journal_path.display()
-                    )
-                });
-                let recovered = per_owned.values().any(|evs| !evs.is_empty());
-                let journals: Vec<Journal> = owned
-                    .iter()
-                    .map(|p| {
-                        let evs = per_owned.remove(p).unwrap_or_default();
-                        Journal::from_events_shared(*p, evs, &shared)
-                    })
-                    .collect();
-                (journals, recovered)
             };
 
             let server = build_server(journals, store, topology);

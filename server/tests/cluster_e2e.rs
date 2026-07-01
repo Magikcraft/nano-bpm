@@ -116,13 +116,29 @@ impl Node {
     /// Boots node `node_id` of a cluster whose member base URLs are `nodes`,
     /// listening on the matching pre-reserved port, with its own data directory.
     fn boot(data_dir: &PathBuf, node_id: u32, nodes: &str, port: u16) -> Self {
+        Self::boot_with(data_dir, node_id, nodes, port, &[])
+    }
+
+    /// Like [`boot`](Self::boot) but sets additional environment variables (e.g.
+    /// `NANOBPMN_JOURNAL_SEGMENTED=1` for the bounded-disk path).
+    fn boot_with(
+        data_dir: &PathBuf,
+        node_id: u32,
+        nodes: &str,
+        port: u16,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         std::fs::create_dir_all(data_dir).expect("create node data dir");
-        let mut child = Command::new(SERVER_BIN)
-            .env("NANOBPMN_DATA_DIR", data_dir)
+        let mut cmd = Command::new(SERVER_BIN);
+        cmd.env("NANOBPMN_DATA_DIR", data_dir)
             .env("NANOBPMN_NODES", nodes)
             .env("NANOBPMN_NODE_ID", node_id.to_string())
             .env("NANOBPMN_PARTITIONS", NUM_PARTITIONS.to_string())
-            .env("PORT", port.to_string())
+            .env("PORT", port.to_string());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -134,14 +150,14 @@ impl Node {
     }
 
     /// Polls a wired route until the node answers HTTP, so callers never race the
-    /// bind/serve startup window.
+    /// bind/serve startup window. Probes `/topology`, which is served locally and
+    /// never forwards to a peer, so a node reboots readily even when its peer is
+    /// down.
     fn wait_until_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Some((status, _)) =
-                try_request(self.port, "GET", &path("/process-instances/0"), None)
-            {
-                assert_eq!(status, 404, "unexpected readiness probe status");
+            if let Some((status, _)) = try_request(self.port, "GET", &path("/topology"), None) {
+                assert_eq!(status, 200, "unexpected readiness probe status");
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -370,6 +386,76 @@ fn a_worker_at_one_gateway_drains_jobs_from_the_whole_cluster() {
     assert!(
         from_node0 && from_node1,
         "drained jobs must span both nodes' partitions, got {completed_partitions:?}"
+    );
+}
+
+/// Bounded-disk clustered recovery: with the segmented journal enabled, a node
+/// that does NOT own the deployment partition (node 1 owns 1 & 3) must recover a
+/// replicated `ProcessDeployed` — and the instances that reference it — purely
+/// from its own on-disk journal after an independent restart, with its peer
+/// down. This exercises the segmented clustered boot path (`recover_multi` +
+/// write-tag demux + the version-guarded deployment broadcast).
+#[test]
+fn segmented_node_recovers_replicated_deployment_after_restart() {
+    let scratch = ScratchDir::new();
+    let seg: &[(&str, &str)] = &[("NANOBPMN_JOURNAL_SEGMENTED", "1")];
+
+    let p0 = reserve_port();
+    let p1 = reserve_port();
+    let nodes = format!("http://127.0.0.1:{p0},http://127.0.0.1:{p1}");
+    let dir0 = scratch.path.join("node0");
+    let dir1 = scratch.path.join("node1");
+
+    let node0 = Node::boot_with(&dir0, 0, &nodes, p0, seg);
+    let node1 = Node::boot_with(&dir1, 1, &nodes, p1, seg);
+
+    // Both nodes must see the replicated demo definition before we proceed.
+    for node in [&node0, &node1] {
+        let (status, body) = node.request_until(
+            "POST",
+            &path("/process-definitions/search"),
+            Some("{}"),
+            |status, body| status == 200 && body_has_demo(body),
+        );
+        assert_eq!(status, 200, "definition search failed: {body}");
+        assert!(body_has_demo(&body), "demo never replicated: {body}");
+    }
+
+    // Create instances until at least one lands on a partition node 1 owns
+    // (1 or 3), so we have durable node-1 state that depends on the replicated
+    // definition.
+    let mut node1_instance: Option<u64> = None;
+    for _ in 0..(NUM_PARTITIONS * 4) {
+        let key = create_via(&node0);
+        if partition_of(key) % 2 == 1 {
+            node1_instance = Some(key);
+            break;
+        }
+    }
+    let node1_instance = node1_instance.expect("an instance must land on a node-1 partition");
+
+    // Bring the WHOLE cluster down, then reboot ONLY node 1 (its peer stays
+    // down), so nothing can re-replicate the definition to it: it must recover
+    // the definition and the instance from its own segmented journal alone.
+    drop(node0);
+    drop(node1);
+    let node1 = Node::boot_with(&dir1, 1, &nodes, p1, seg);
+
+    let (status, body) = node1.request("POST", &path("/process-definitions/search"), Some("{}"));
+    assert_eq!(status, 200, "post-restart definition search failed: {body}");
+    assert!(
+        body_has_demo(&body),
+        "node 1 lost the replicated demo definition across a segmented restart: {body}"
+    );
+
+    let (istatus, ibody) = node1.request(
+        "GET",
+        &path(&format!("/process-instances/{node1_instance}")),
+        None,
+    );
+    assert_eq!(
+        istatus, 200,
+        "node 1 lost instance {node1_instance} across a segmented restart: {ibody}"
     );
 }
 

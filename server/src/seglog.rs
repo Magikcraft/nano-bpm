@@ -481,6 +481,38 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
+/// Reads a segment/log file written by the shared multi-partition writer, where
+/// each line is `<partition>\t<event-json>` — the GLOBAL partition that produced
+/// the write (see [`crate::journal::Journal::persist`]). Returns each event with
+/// its write-partition tag.
+///
+/// Tolerates a bare `<event-json>` line (no tab): it falls back to the event's
+/// key partition, so a directory written by the pre-tag multi-partition format
+/// still recovers with the same demux behaviour it had then.
+fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
+    let mut events = Vec::new();
+    if path.exists() {
+        for line in BufReader::new(File::open(path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let (tag, json) = match line.split_once('\t') {
+                Some((t, rest)) => (t.parse::<u64>().ok(), rest),
+                None => (None, line.as_str()),
+            };
+            let event: Event = serde_json::from_str(json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let tag = tag.unwrap_or_else(|| {
+                (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1))
+                    as u64
+            });
+            events.push((tag, event));
+        }
+    }
+    Ok(events)
+}
+
 /// Loads the latest valid persisted snapshot in `dir`, if any.
 fn load_latest_snapshot(dir: &Path) -> Option<(EngineSnapshot, u64)> {
     let mut best: Option<(u64, PathBuf)> = None;
@@ -777,17 +809,22 @@ pub fn recover_multi(
     };
 
     // Read every surviving sealed segment in order, tracking global indices and
-    // per-partition cumulative counts (from `pp_base`).
+    // per-partition cumulative counts (keyed by each write's GLOBAL partition
+    // TAG, from `pp_base`). Demultiplexing by the persisted write tag — not the
+    // event's key partition — is what lets a clustered node route its durable
+    // replicated `ProcessDeployed` (written under its first-owned partition but
+    // keyed to the deployment partition) back to the partition that produced it.
     let first_index_opt = sealed_files.first().map(|(s, _)| *s);
     let mut sealed: Vec<SealedSeg> = Vec::with_capacity(sealed_files.len());
-    let mut events: Vec<Event> = Vec::new();
+    // Surviving events with their write-partition tag, in global log order.
+    let mut tagged: Vec<(u64, Event)> = Vec::new();
     let mut cursor = first_index_opt.unwrap_or(0);
     let mut pp_running = pp_base.clone();
     for (start, path) in &sealed_files {
-        let seg_events = read_segment_events(path)?;
+        let seg_events = read_segment_events_tagged(path, num_partitions)?;
         let end = start + seg_events.len() as u64;
-        for e in &seg_events {
-            let p = (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1));
+        for (tag, _) in &seg_events {
+            let p = (*tag as usize).min(num_partitions.saturating_sub(1));
             if p < pp_running.len() {
                 pp_running[p] += 1;
             }
@@ -798,7 +835,7 @@ pub fn recover_multi(
             path: path.clone(),
             per_partition_end: pp_running.clone(),
         });
-        events.extend(seg_events);
+        tagged.extend(seg_events);
         cursor = end;
     }
 
@@ -817,37 +854,58 @@ pub fn recover_multi(
         pp_running.clone()
     };
 
-    let active_events = read_segment_events(&active_path)?;
+    let active_events = read_segment_events_tagged(&active_path, num_partitions)?;
     let total_events = active_start + active_events.len() as u64;
     let first_index = first_index_opt.unwrap_or(active_start);
     // Per-partition totals = active start + active-segment per-partition counts.
     let mut per_partition_total = per_partition_active_start.clone();
-    for e in &active_events {
-        let p = (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1));
+    for (tag, _) in &active_events {
+        let p = (*tag as usize).min(num_partitions.saturating_sub(1));
         if p < per_partition_total.len() {
             per_partition_total[p] += 1;
         }
     }
-    events.extend(active_events);
+    tagged.extend(active_events);
+
+    // `events` (untagged, global order) drives the caller's read-model catch-up.
+    let events: Vec<Event> = tagged.iter().map(|(_, e)| e.clone()).collect();
+
+    // Replicated `ProcessDeployed` broadcast set: a durable deployment copy whose
+    // write tag differs from its key partition (a clustered peer journaled it
+    // under its first-owned partition, keyed to the deployment partition). It is
+    // partition-agnostic, so every owned partition OTHER than the one that
+    // produced it needs it installed. Applied version-guarded on recovery so an
+    // older surviving copy never regresses a newer snapshot-held definition. In
+    // single-node mode a deployment's tag equals its key partition, so this set
+    // is empty and nothing is broadcast.
+    let broadcast: Vec<(u64, Event)> = tagged
+        .iter()
+        .filter(|(tag, e)| {
+            matches!(e, Event::ProcessDeployed { .. })
+                && *tag
+                    != (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1))
+                        as u64
+        })
+        .cloned()
+        .collect();
 
     let combined = load_multi_snapshot(dir);
     let fresh = total_events == 0 && combined.is_none();
 
     // Rebuild each owned partition's engine: snapshot + its surviving tail, or a
-    // full replay of its surviving events when there is no snapshot for it.
+    // full replay of its surviving events when there is no snapshot for it. Demux
+    // by the write TAG (not the key partition). Then install any replicated
+    // deployment broadcast produced under a DIFFERENT partition.
     let engines: Vec<(u64, Engine)> = owned
         .iter()
         .map(|&p| {
-            let p_events: Vec<Event> = events
+            let p_events: Vec<Event> = tagged
                 .iter()
-                .filter(|e| {
-                    (partition_of(e.max_key()) as usize).min(num_partitions.saturating_sub(1))
-                        == p as usize
-                })
-                .cloned()
+                .filter(|(tag, _)| *tag == p)
+                .map(|(_, e)| e.clone())
                 .collect();
             let base_p = pp_base.get(p as usize).copied().unwrap_or(0);
-            let engine = match combined.as_ref().and_then(|m| m.get(&p)) {
+            let mut engine = match combined.as_ref().and_then(|m| m.get(&p)) {
                 Some((covered, snap)) => {
                     let mut engine = Engine::from_snapshot(snap.clone());
                     let skip = covered.saturating_sub(base_p) as usize;
@@ -858,6 +916,17 @@ pub fn recover_multi(
                 }
                 None => Engine::replay_partition(p, p_events),
             };
+            // Install partition-agnostic replicated deployments produced under
+            // another partition (skips those this partition already replayed as
+            // its own tagged events). Version-guarded so it is monotonic.
+            let broadcast_for_p: Vec<Event> = broadcast
+                .iter()
+                .filter(|(tag, _)| *tag != p)
+                .map(|(_, e)| e.clone())
+                .collect();
+            if !broadcast_for_p.is_empty() {
+                engine.install_deployment_if_newer(&broadcast_for_p);
+            }
             (p, engine)
         })
         .collect();
@@ -1286,6 +1355,88 @@ mod tests {
         assert!(
             engines[&1].instance(post1).is_some(),
             "post-snapshot instance from the surviving tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Clustered recovery: a node owning partitions {1,2} (NOT the deployment
+    /// partition 0) journals a single durable replicated `ProcessDeployed` under
+    /// its first-owned partition (1), keyed to partition 0. On recovery, the
+    /// write TAG routes it back to partition 1, and the version-guarded broadcast
+    /// re-installs the partition-agnostic definition into partition 2, so both
+    /// partitions can restore instances that reference it.
+    #[test]
+    fn clustered_replicated_deployment_recovers_across_owned_partitions() {
+        let dir = temp_dir("cluster-deploy");
+        let (tx, _rx) = std::sync::mpsc::channel::<Arc<Vec<Event>>>();
+
+        // Mint a deployment on partition 0 (the definition's home) to obtain the
+        // partition-0-keyed `ProcessDeployed` events a peer node would receive.
+        let deploy_events: Vec<Event> = {
+            let mut p0 = crate::journal::Journal::in_memory_partition(0);
+            let (evs, _) = p0.apply_command(Command::DeployProcess(demo())).unwrap();
+            evs.iter().cloned().collect()
+        };
+        assert!(deploy_events.iter().all(|e| partition_of(e.max_key()) == 0));
+
+        let (inst1, inst2) = {
+            // This node owns {1,2}; the shared segmented WAL spans a 3-partition
+            // cluster.
+            let (writer, recovery) = crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3)
+                .expect("open clustered");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j2 = crate::journal::Journal::from_engine_shared(
+                2,
+                engines.remove(&2).unwrap(),
+                true,
+                &writer,
+            );
+            j1.set_exporter(tx.clone());
+            j2.set_exporter(tx.clone());
+
+            // Durable copy on the first-owned partition (tagged 1, keyed 0);
+            // in-memory on the rest. Dropping the writer at block end flushes it.
+            let _ = j1.install_deployment_durable(&deploy_events);
+            j2.install_deployment(&deploy_events);
+
+            let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            let inst1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (e2, _) = j2.apply_command(Command::create_instance("demo")).unwrap();
+            let inst2 = e2.iter().find_map(|e| e.instance_key()).unwrap();
+            assert_eq!(partition_of(inst1), 1);
+            assert_eq!(partition_of(inst2), 2);
+
+            // Flush the detached writer deterministically: a rotate is a writer
+            // barrier (blocks until every prior write is fsynced). We seal but do
+            // NOT write a combined snapshot, so recovery rebuilds by full replay —
+            // exercising the broadcast as partition 2's SOLE definition source.
+            let _ = j1.snapshot_and_rotate().expect("flush via rotate");
+
+            (inst1, inst2)
+        };
+
+        // Reopen as the same clustered node: both partitions must restore the
+        // definition (p1 from its tagged durable copy, p2 from the broadcast) and
+        // their instances.
+        let recovery = recover_multi(&dir, &[1, 2], 3).expect("reopen clustered");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&1].instance(inst1).is_some(),
+            "partition 1 instance restored"
+        );
+        assert!(
+            engines[&2].instance(inst2).is_some(),
+            "partition 2 instance restored (definition arrived via broadcast)"
         );
 
         let _ = fs::remove_dir_all(&dir);
