@@ -425,9 +425,11 @@ pub enum ServerFrame {
         heartbeat_ms: u64,
     },
     /// A pushed activated job (consumes one job-delivery credit). `job` is the
-    /// same shape as a REST `ActivatedJobResult`.
+    /// same shape as a REST `ActivatedJobResult`, carried as a pre-serialized raw
+    /// JSON value so the hot dispatch path serializes each job exactly once (no
+    /// intermediate `serde_json::Value` tree) and the writer emits it verbatim.
     Job {
-        job: Value,
+        job: Box<serde_json::value::RawValue>,
     },
     /// Ack/result for a create/complete/fail/throwError, correlated by `corr`.
     #[serde(rename_all = "camelCase")]
@@ -1789,15 +1791,38 @@ async fn dispatch_jobs(server: &ServerImpl, registry: &Arc<Registry>) {
     if by_conn.is_empty() {
         return;
     }
+    // Fan the per-connection work out across the runtime's worker threads rather
+    // than polling it all on this single dispatcher task. Each connection is still
+    // one task (credit/socket-room accounting stays race-free per pass), but the
+    // synchronous CPU between awaits — job JSON serialization, frame push — now
+    // spreads across cores instead of pinning the dispatcher thread (profiling
+    // showed one core at 100% while the engine actors and workers had headroom).
+    // A semaphore keeps the in-flight activation count bounded exactly as the old
+    // `buffer_unordered` did, so completions are not swamped in the engine mailbox.
     let concurrency = dispatch_concurrency();
-    futures_util::stream::iter(
-        by_conn
-            .into_iter()
-            .map(|(conn, work)| dispatch_to_connection(server, conn, work)),
-    )
-    .buffer_unordered(concurrency)
-    .for_each(|_| async {})
-    .await;
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut set = tokio::task::JoinSet::new();
+    for (conn, work) in by_conn {
+        let server = server.clone();
+        let sem = sem.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            dispatch_to_connection(&server, conn, work).await;
+        });
+    }
+    while set.join_next().await.is_some() {}
+}
+
+/// Serializes an activated job exactly once — directly to a raw JSON value,
+/// skipping the intermediate `serde_json::Value` tree the old path allocated —
+/// and enqueues it to the connection. The writer then emits the raw bytes
+/// verbatim, so a job is serialized once total on the hot dispatch path. Returns
+/// whether the outbound buffer accepted it.
+fn send_job<T: serde::Serialize>(conn: &Connection, job: &T) -> bool {
+    match serde_json::value::to_raw_value(job) {
+        Ok(job) => conn.send(ServerFrame::Job { job }),
+        Err(_) => false,
+    }
 }
 
 /// Services one connection for a dispatch pass: leases and pushes jobs for each of
@@ -1854,8 +1879,7 @@ async fn dispatch_to_connection(
                 )
                 .await;
             for job in local {
-                let value = serde_json::to_value(&job).unwrap_or(Value::Null);
-                if conn.send(ServerFrame::Job { job: value }) {
+                if send_job(&conn, &job) {
                     pushed += 1;
                 }
             }
@@ -1888,8 +1912,7 @@ async fn dispatch_to_connection(
                         )
                         .await;
                     for job in jobs {
-                        let value = serde_json::to_value(&job).unwrap_or(Value::Null);
-                        if conn.send(ServerFrame::Job { job: value }) {
+                        if send_job(&conn, &job) {
                             pushed += 1;
                             remaining = remaining.saturating_sub(1);
                         }
@@ -1972,8 +1995,7 @@ async fn dispatch_to_connection(
                         .await
                 };
                 for job in jobs {
-                    let value = serde_json::to_value(&job).unwrap_or(Value::Null);
-                    if conn.send(ServerFrame::Job { job: value }) {
+                    if send_job(&conn, &job) {
                         pushed += 1;
                     }
                 }
@@ -2481,7 +2503,9 @@ mod asyncapi_spec_guard {
                 submission_credits: 1,
                 heartbeat_ms: 1,
             },
-            ServerFrame::Job { job: json!({}) },
+            ServerFrame::Job {
+                job: serde_json::value::to_raw_value(&json!({})).unwrap(),
+            },
             ServerFrame::CommandResult {
                 corr: 1,
                 status: 200,
