@@ -271,3 +271,78 @@ curl -s -F resources=@test-job-process.bpmn http://localhost:8080/v2/deployments
 BASE_URL=http://localhost:8080 PDK=<key> WORKERS=256 PROD_CONNS=64 MAXPAR=4 \
 MAX_INFLIGHT=6000 TRANSPORT=stream DURATION_S=1800 ./loadgen
 ```
+
+## 2026-07-01 — Sharding shipped: exporter ceiling lifted 2.4× (~13k → ~31k/node)
+
+The payoff for the diagnosis above. The read-model exporter + read store are now
+**sharded per partition** (`4b7e24e`): a node owning *N* partitions gets *N*
+`ReadStore` shards (each its own `read-model.p<pid>.sqlite`) and *N* exporter
+threads, routed by partition. The single `Mutex<Connection>` that pinned one core
+is gone. Projection CPU now scales with owned-partition count instead of
+funnelling every partition through one thread.
+
+### Environment
+
+- Same GCP shape: **3× `c2-standard-16`** (16 vCPU / 64 GB, pd-ssd), us-central1-a,
+  Debian 12, build `0.0.3-shard`. Segmented multi-partition journal (durable,
+  60 s snapshot/compaction). Dedicated **`nano-loadbox`** (4th `c2-standard-16`)
+  ran all `loadgen` — nothing co-located on the nodes.
+- **Key change vs the earlier runs: 12 partitions instead of 3**, RF=3. With 3
+  nodes that is **4 owned partitions → 4 shards → 4 exporter threads per node**.
+  (The prior 3-partition topology gave only 1 shard/node — no parallelism to gain
+  from sharding; the high partition count is what exercises it.)
+
+### Results
+
+| Topology | Agg tput | Per node | Bottleneck |
+|---|--:|--:|---|
+| 3 part / 1 shard/node (pre-sharding) | ~39k | ~13k | 1 exporter core @ 100% |
+| **12 part / 4 shards/node (sharded)** | **~89–96k** | **~30–32k** | engine-actor / stream serialization |
+
+- Clean plateau **~95k PI/s aggregate**; 60 s sustained window **~89k**
+  (`producedRate ≈ tput ≈ 29.5k/node` — the cluster completes what it is fed).
+  Pushing more producers (PPN 2–3, up to 9 loadgen procs) did **not** exceed the
+  plateau while the loadbox stayed near-idle (load avg ~2/16), so the ceiling is
+  the cluster, not the client.
+- **2.4× per-node throughput** over the exporter-bound ceiling, on identical
+  hardware.
+
+### The exporter is no longer the wall
+
+Under load, `perf` + per-thread sampling on a node show the former **single
+100%-pinned exporter is gone**: `nanobpm-exporter` threads now sit at modest CPU
+alongside `nanobpmn-journal-writer` and the `nanobpmn-engine` actors. At the new
+ceiling the node runs at **~65% CPU (≈35% idle), only ~3% iowait**, with **one
+hot thread** (engine-actor / command-stream `tokio` path, dominated by TCP
+`sendmsg` syscalls) as the next serialization point — **not** the exporter and
+**not** disk. So the sharding change did exactly what the diagnosis predicted:
+relieved the projection core, and the ceiling moved on.
+
+### Memory & disk
+
+- **RSS flat at ~300–330 MB/node** despite each node now holding **4 shard SQLite
+  DBs** instead of one — sharding did not inflate memory.
+- Segmented journal still bounds the durable log (live `journal.jsonl` truncates
+  each 60 s cycle into a small `msnapshot.bin`); read-model growth is now spread
+  across the per-partition `read-model.p*.sqlite` shards.
+
+### Next lever
+
+The new ceiling is the **single-writer engine actor / command-stream path** (~35%
+node CPU still idle, 3% iowait — a software-serial limit, not hardware). Options
+to push further: shard/parallelise the command-stream dispatch, reduce per-event
+TCP syscall overhead (batch stream frames), or scale partitions-per-node higher
+to spread engine-actor work. Memory and disk remain non-constraints.
+
+### Reproduce (delta from the run above)
+
+```bash
+# Build 0.0.3-shard; launch each node with 12 partitions, RF=3:
+NANOBPMN_NODES='http://<ip0>:8080,http://<ip1>:8080,http://<ip2>:8080' \
+NANOBPMN_NODE_ID=N NANOBPMN_RF=3 NANOBPMN_PARTITIONS=12 \
+NANOBPMN_JOURNAL=segmented NANOBPMN_DATA_DIR=$HOME/nano-data PORT=8080 ./nano-gw
+
+# From a dedicated load box, drive all three gateways (sweet spot):
+#   WORKERS=70 PROD_CONNS=160 MAXPAR=80 MAX_INFLIGHT=16000 TRANSPORT=stream
+# one loadgen per node IP → ~95k PI/s aggregate.
+```
