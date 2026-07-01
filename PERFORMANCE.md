@@ -505,3 +505,43 @@ backpressure instead — the correct layering.
   is conservative — chosen for small containers; on a 64 GB node a multi-GB
   watermark keeps spill fully dormant under normal load). Low-water is `7/8` of
   high.
+
+### Large-payload memory test (adaptive spill actually constraining an explosion)
+
+To prove adaptive spill does what it claims when variables *are* the RAM driver,
+the load generator was extended with a `VAR_BYTES` knob that injects a large
+`blob` string into every created instance's variables. Test: 3× c2-standard-16
+(64 GB), 12 partitions RF=3, a **backlog-building** load (only 8 job workers so
+completions lag creation, `MAX_INFLIGHT=32000`, 20 KB payload/instance, 60 s).
+Fewer workers means tens of thousands of instances sit in-flight holding their
+20 KB blobs — the memory explosion we want to bound. RSS sampled via
+`/proc/<pid>/status` VmRSS across the run.
+
+| Mode | Peak RSS/node | var-spill.sqlite | Agg throughput |
+|---|---|---|---|
+| `VAR_SPILL=adaptive`, MB=500 | **~390–500 MB** (held at watermark) | 222 MB spilled | 12,351 PI/s |
+| `VAR_SPILL=off` (cold spill on) | ~390–490 MB | — | 12,357 PI/s |
+| `VAR_SPILL=off` + `COLD_SPILL=off` | **~740–790 MB** (climbing with backlog) | — | 12,387 PI/s |
+
+Findings:
+
+- **Adaptive var spill fires correctly under real pressure.** Logs show
+  `variable spill (adaptive): shed 512 instance(s)' variables under RAM
+  pressure` in repeated 512-instance batches; 222 MB of variables moved to
+  `var-spill.sqlite` and RSS was held at the 500 MB watermark instead of
+  climbing.
+- **Layering confirmed.** With var spill `off` but cold spill on, cold spill
+  alone still bounds RSS (~490 MB) because instances waiting on a job worker
+  count as *dormant* and get shed whole. Only with **both** off does RSS grow
+  unbounded with the in-flight backlog (~790 MB peak and still rising when the
+  run ended; it settled back as the drain completed the backlog).
+- **Zero throughput cost — again.** All three modes delivered ~12.35k PI/s
+  aggregate. Spill runs on the 500 ms maintenance sweep off the hot path, so
+  even actively shedding 222 MB it cost nothing measurable. The throughput here
+  is lower than the ceiling runs purely because this test deliberately
+  starves job completion (8 workers) to build the backlog.
+
+**Takeaway:** the engine's memory is bounded by the *combination* of cold spill
+(whole dormant instances) and adaptive var spill (active instances' variables),
+each covering a case the other cannot. Under a large-payload flood the resident
+set tracks the configured watermark rather than the in-flight backlog size.
