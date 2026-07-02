@@ -23,8 +23,8 @@
 //! into `Remote` and routes those commands over the network, without disturbing
 //! the engine core or the local fast path.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use nanobpmn_engine_core::{Key, partition_of};
 
@@ -176,6 +176,25 @@ impl PartitionRouter {
     }
 }
 
+/// Create-admission backpressure for the read-model exporter queue. Holds the
+/// per-shard byte budget and one `Arc<AtomicU64>` gauge per **local** partition,
+/// in ascending-partition order (aligned with [`PartitionRouter::local_handles`]
+/// by index). The writer increments a gauge when it forwards a command's events;
+/// the exporter thread decrements it once projected. [`Partitions::for_create`]
+/// reads them to steer a create away from a saturated shard, and
+/// [`Partitions::exporter_all_saturated`] reports when every local shard is at
+/// budget (the create-admission shed condition).
+struct ExporterBackpressure {
+    /// Per-shard queued-bytes budget.
+    budget: u64,
+    /// One gauge per local partition, indexed like `local_handles()`.
+    gauges: Vec<Arc<AtomicU64>>,
+    /// Round-robin cursor for steering creates across shards with headroom,
+    /// independent of `next_create` so steering and plain balancing don't
+    /// interfere. Relaxed: it only needs to spread, not be exact.
+    steer: AtomicUsize,
+}
+
 /// A cloneable router over one engine actor per partition.
 ///
 /// Cheap to clone (it shares the underlying [`PartitionRouter`] and the
@@ -201,6 +220,11 @@ pub struct Partitions {
     /// Distinct from `next_create` (which balances among local handles once a
     /// create lands locally). Relaxed: spread, not exact.
     next_place: Arc<AtomicUsize>,
+    /// Read-model exporter-queue backpressure, wired once at startup (after the
+    /// engine exists) via [`set_exporter_backpressure`](Self::set_exporter_backpressure).
+    /// `None`-until-set (and stays unset when the feature is off), so the create
+    /// fast path pays only a cheap `OnceLock::get` when it is disabled.
+    exporter_bp: Arc<OnceLock<ExporterBackpressure>>,
 }
 
 impl Partitions {
@@ -212,6 +236,7 @@ impl Partitions {
             next_create: Arc::new(AtomicUsize::new(0)),
             next_activate: Arc::new(AtomicUsize::new(0)),
             next_place: Arc::new(AtomicUsize::new(0)),
+            exporter_bp: Arc::new(OnceLock::new()),
         }
     }
 
@@ -225,6 +250,7 @@ impl Partitions {
             next_create: Arc::new(AtomicUsize::new(0)),
             next_activate: Arc::new(AtomicUsize::new(0)),
             next_place: Arc::new(AtomicUsize::new(0)),
+            exporter_bp: Arc::new(OnceLock::new()),
         }
     }
 
@@ -306,13 +332,70 @@ impl Partitions {
     /// id order, so this is byte-identical to the pre-cluster round-robin; in a
     /// multi-node cluster each node creates only on its own partitions (the hot
     /// path needs no cross-node forwarding — clients spread across gateways).
+    ///
+    /// When exporter-queue backpressure is wired, this **steers** the create to a
+    /// local shard whose export queue still has headroom (round-robin among those
+    /// under budget), so a single saturated shard stops attracting new creates and
+    /// its resident backlog drains rather than growing. If every local shard is at
+    /// budget it falls back to plain round-robin; the create-admission shed gate
+    /// (see [`exporter_all_saturated`](Self::exporter_all_saturated)) rejects in
+    /// that case, so the writer is never blocked.
     pub fn for_create(&self) -> &EngineHandle {
         let locals = self.router.local_handles();
         if locals.len() == 1 {
             return &locals[0];
         }
+        if let Some(bp) = self.exporter_bp.get() {
+            // Steer to the first shard with headroom, scanning round-robin from a
+            // rotating start so load spreads evenly across the unsaturated shards.
+            debug_assert_eq!(bp.gauges.len(), locals.len());
+            let n = locals.len();
+            let start = bp.steer.fetch_add(1, Ordering::Relaxed) % n;
+            for off in 0..n {
+                let i = (start + off) % n;
+                if bp.gauges[i].load(Ordering::Relaxed) < bp.budget {
+                    return &locals[i];
+                }
+            }
+            // Every shard saturated: fall through to plain round-robin (the
+            // create is about to be shed by admission control anyway).
+        }
         let i = self.next_create.fetch_add(1, Ordering::Relaxed) % locals.len();
         &locals[i]
+    }
+
+    /// Wires read-model exporter-queue backpressure. Called once at startup after
+    /// the engine actors exist. `gauges` are one queued-bytes gauge per local
+    /// partition in the same ascending-partition order as
+    /// [`PartitionRouter::local_handles`], sharing the `Arc`s the writer
+    /// increments and the exporter thread decrements; `budget` is the per-shard
+    /// byte budget. A no-op (logs a bug in debug) if called twice.
+    pub fn set_exporter_backpressure(&self, gauges: Vec<Arc<AtomicU64>>, budget: u64) {
+        debug_assert_eq!(
+            gauges.len(),
+            self.router.local_handles().len(),
+            "one exporter gauge per local partition"
+        );
+        let set = self.exporter_bp.set(ExporterBackpressure {
+            budget,
+            gauges,
+            steer: AtomicUsize::new(0),
+        });
+        debug_assert!(set.is_ok(), "exporter backpressure set twice");
+    }
+
+    /// Whether every local shard's exporter queue is at or above budget — the
+    /// create-admission shed condition. `false` when backpressure is disabled
+    /// (unbounded) or any shard still has headroom. Cheap relaxed loads; no
+    /// engine round-trip.
+    pub fn exporter_all_saturated(&self) -> bool {
+        match self.exporter_bp.get() {
+            None => false,
+            Some(bp) => bp
+                .gauges
+                .iter()
+                .all(|g| g.load(Ordering::Relaxed) >= bp.budget),
+        }
     }
 
     /// Cluster-wide create *placement*: round-robins over **every** partition in
@@ -452,6 +535,45 @@ mod tests {
         assert!(parts.is_single());
         assert_eq!(parts.len(), 1);
         assert_eq!(parts.activate_start(), 0);
+    }
+
+    #[test]
+    fn for_create_steers_away_from_saturated_exporter_shards() {
+        let parts = spawn_partitions(4);
+        let gauges: Vec<Arc<AtomicU64>> = (0..4).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let budget = 1000u64;
+        parts.set_exporter_backpressure(gauges.clone(), budget);
+
+        // Saturate shards 0, 1, 3; only shard 2 has headroom. Every create must
+        // land on shard 2 regardless of the round-robin cursor.
+        gauges[0].store(budget, Ordering::Relaxed);
+        gauges[1].store(budget + 500, Ordering::Relaxed);
+        gauges[3].store(budget, Ordering::Relaxed);
+        assert!(!parts.exporter_all_saturated());
+        for _ in 0..12 {
+            assert!(
+                std::ptr::eq(parts.for_create(), &parts.all()[2]),
+                "creates must steer to the only shard under budget"
+            );
+        }
+
+        // With every shard at budget, all-saturated reports true and for_create
+        // falls back to plain round-robin (a valid handle; admission sheds it).
+        gauges[2].store(budget, Ordering::Relaxed);
+        assert!(parts.exporter_all_saturated());
+        let _ = parts.for_create();
+
+        // Draining a shard below budget clears the shed condition.
+        gauges[2].store(0, Ordering::Relaxed);
+        assert!(!parts.exporter_all_saturated());
+        assert!(std::ptr::eq(parts.for_create(), &parts.all()[2]));
+    }
+
+    #[test]
+    fn exporter_all_saturated_is_false_when_unwired() {
+        // No backpressure wired -> unbounded -> never sheds.
+        let parts = spawn_partitions(4);
+        assert!(!parts.exporter_all_saturated());
     }
 
     #[test]

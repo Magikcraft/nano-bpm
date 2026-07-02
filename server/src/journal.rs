@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -47,7 +48,25 @@ use crate::varspill::VarSpillStore;
 /// by partition lets each owned partition drive its own read-store shard +
 /// exporter thread, so projection scales with cores. Empty for the non-shared
 /// journals (which forward from `persist()` and leave this untouched).
-type ExporterCell = Arc<Mutex<HashMap<u64, Sender<Arc<Vec<Event>>>>>>;
+///
+/// The value pairs each partition's sender with its exporter-queue byte gauge
+/// (`Arc<AtomicU64>`): the writer increments it by each forwarded command's
+/// serialized size before the send, and the exporter thread decrements it after
+/// the batch is projected. The create-admission path reads the same gauge to
+/// steer creates away from — and, once every local shard is saturated, shed —
+/// so the resident exporter backlog stays bounded under a large-variable flood
+/// (see `ExporterBackpressure`).
+type ExporterCell = Arc<Mutex<HashMap<u64, (Sender<ExportBatch>, Arc<AtomicU64>)>>>;
+
+/// A read-model export item handed to an exporter thread: a command's events
+/// plus `bytes`, an estimate of their resident cost (the serialized journal
+/// bytes for those events) used to account the exporter queue's size for
+/// backpressure. `bytes` is `0` on the non-shared (in-memory / legacy
+/// single-file) path, which does not participate in exporter-queue accounting.
+pub struct ExportBatch {
+    pub events: Arc<Vec<Event>>,
+    pub bytes: u32,
+}
 
 struct WriteRequest {
     bytes: Vec<u8>,
@@ -129,7 +148,7 @@ pub struct Journal {
     /// shared with the command's caller via `Arc`, so forwarding them costs only a
     /// refcount bump — the 50 KB variable payloads are never deep-copied on the
     /// single command thread.
-    exporter: Option<Sender<Arc<Vec<Event>>>>,
+    exporter: Option<Sender<ExportBatch>>,
     /// For a journal backed by the shared multi-partition writer: the writer's
     /// exporter cell. `set_exporter` stores the exporter here instead of in
     /// `self.exporter`, so the SHARED WRITER forwards events to the read model in
@@ -271,6 +290,7 @@ fn forward_shared_export(
     exporter: &Option<ExporterCell>,
     partition: u64,
     events_arc: Option<Arc<Vec<Event>>>,
+    bytes: u32,
 ) {
     let Some(events) = events_arc else { return };
     if events.is_empty() {
@@ -280,8 +300,12 @@ fn forward_shared_export(
         debug_assert!(false, "shared write with no exporter cell wired");
         return;
     };
-    if let Some(tx) = cell.lock().unwrap().get(&partition) {
-        let _ = tx.send(events);
+    if let Some((tx, queued)) = cell.lock().unwrap().get(&partition) {
+        // Account the queued bytes BEFORE the send so the create-admission gauge
+        // never lags behind a queue the exporter has not yet drained; the
+        // exporter subtracts the same amount once the batch is projected.
+        queued.fetch_add(bytes as u64, Ordering::Relaxed);
+        let _ = tx.send(ExportBatch { events, bytes });
     } else {
         debug_assert!(false, "shared write before exporter was set for partition");
     }
@@ -381,8 +405,10 @@ fn writer_loop(
                 // Forward to the read-model exporter shard for this write's
                 // partition in log (fsync) order. `None` events_arc means this
                 // journal forwards via `persist()` instead (single-partition /
-                // in-memory / legacy).
-                forward_shared_export(&exporter, req.partition, req.events_arc);
+                // in-memory / legacy). The serialized size (`req.bytes.len()`) is
+                // the exporter-queue byte estimate for backpressure accounting.
+                let export_bytes = req.bytes.len().min(u32::MAX as usize) as u32;
+                forward_shared_export(&exporter, req.partition, req.events_arc, export_bytes);
             }
 
             // Size-based segment seal (no-op in the legacy single-file path,
@@ -558,7 +584,8 @@ fn writer_loop_async(
             crate::metrics::inflight_sub(batch.len());
             for req in batch {
                 let _ = req.ack.send(());
-                forward_shared_export(&exporter, req.partition, req.events_arc);
+                let export_bytes = req.bytes.len().min(u32::MAX as usize) as u32;
+                forward_shared_export(&exporter, req.partition, req.events_arc, export_bytes);
             }
 
             if unsynced_bytes >= flush.max_bytes || last_fsync.elapsed() >= flush.interval {
@@ -1320,9 +1347,17 @@ impl Journal {
     /// forwards events to the read model in fsync (log) order — keeping
     /// `exported_position` a true global prefix across partitions — and
     /// `persist()` does not also forward (which would double-project).
-    pub fn set_exporter(&mut self, exporter: Sender<Arc<Vec<Event>>>) {
+    ///
+    /// `queued` is the partition's exporter-queue byte gauge, wired into the
+    /// shared cell so the writer can account each forwarded command's size for
+    /// create-admission backpressure. It is unused on the non-shared path (which
+    /// does not participate in exporter-queue accounting; `bytes` is always 0
+    /// there).
+    pub fn set_exporter(&mut self, exporter: Sender<ExportBatch>, queued: Arc<AtomicU64>) {
         if let Some(cell) = self.shared_exporter.as_ref() {
-            cell.lock().unwrap().insert(self.partition_id, exporter);
+            cell.lock()
+                .unwrap()
+                .insert(self.partition_id, (exporter, queued));
         } else {
             self.exporter = Some(exporter);
         }
@@ -1392,7 +1427,13 @@ impl Journal {
         // across partitions. Forwarding here too would double-project.
         let shared_backed = self.shared_exporter.is_some();
         if !shared_backed && let Some(exporter) = self.exporter.as_ref() {
-            let _ = exporter.send(Arc::clone(events));
+            // Non-shared path (in-memory / legacy single-file): forward with a
+            // zero byte estimate — this path has no exporter-queue backpressure
+            // gauge, so it never accounts (and never sheds) here.
+            let _ = exporter.send(ExportBatch {
+                events: Arc::clone(events),
+                bytes: 0,
+            });
         }
 
         let Some(writer) = self.writer.as_ref() else {

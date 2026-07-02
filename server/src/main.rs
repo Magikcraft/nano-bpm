@@ -56,7 +56,7 @@ use crate::backpressure::{
     AdaptiveController, Backpressure, BackpressureSetting, parse_backpressure_setting,
 };
 use crate::engine_actor::EngineHandle;
-use crate::journal::{Commit, Journal, SharedWriter};
+use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
 use crate::partition::Partitions;
 use crate::readstore::{ReadModel, ReadStore};
 
@@ -734,8 +734,10 @@ fn open_sharded_read_model(
     (model, shards)
 }
 
-/// A read-model shard paired with the export channel feeding it.
-type ShardChannel = (Arc<ReadStore>, mpsc::Receiver<Arc<Vec<Event>>>);
+/// A read-model shard paired with the export channel feeding it and the
+/// partition's exporter-queue byte gauge (shared with the writer, which
+/// increments it, and the create-admission path, which reads it).
+type ShardChannel = (Arc<ReadStore>, mpsc::Receiver<ExportBatch>, Arc<AtomicU64>);
 
 /// Wires a per-partition sharded read model to its journals and spawns one
 /// exporter thread per shard, so read-model projection scales with cores instead
@@ -751,18 +753,27 @@ fn build_server(
     topology: cluster::Topology,
 ) -> ServerImpl {
     let shards = store.shards();
-    let mut senders: std::collections::HashMap<u64, mpsc::Sender<Arc<Vec<Event>>>> =
+    let mut senders: std::collections::HashMap<u64, (mpsc::Sender<ExportBatch>, Arc<AtomicU64>)> =
         std::collections::HashMap::with_capacity(shards.len());
     let mut pending: Vec<ShardChannel> = Vec::with_capacity(shards.len());
+    // Per-partition exporter-queue byte gauges: one `Arc<AtomicU64>` shared by
+    // the writer (increments on forward), the exporter thread (decrements after
+    // projection), and the create-admission path (reads to steer/shed). Keyed by
+    // partition for wiring; collected in ascending-partition order below for the
+    // steering vector.
+    let mut gauges: std::collections::HashMap<u64, Arc<AtomicU64>> =
+        std::collections::HashMap::with_capacity(pending.capacity());
     for (pid, shard) in shards {
-        let (tx, rx) = mpsc::channel::<Arc<Vec<Event>>>();
-        senders.insert(pid, tx);
-        pending.push((shard, rx));
+        let (tx, rx) = mpsc::channel::<ExportBatch>();
+        let queued = Arc::new(AtomicU64::new(0));
+        gauges.insert(pid, queued.clone());
+        senders.insert(pid, (tx, queued.clone()));
+        pending.push((shard, rx, queued));
     }
     for journal in journals.iter_mut() {
         let pid = journal.partition_id();
-        if let Some(tx) = senders.get(&pid) {
-            journal.set_exporter(tx.clone());
+        if let Some((tx, queued)) = senders.get(&pid) {
+            journal.set_exporter(tx.clone(), queued.clone());
         } else {
             debug_assert!(false, "journal partition {pid} has no read-model shard");
         }
@@ -790,8 +801,34 @@ fn build_server(
             high_bytes / 1024 / 1024
         ),
     }
+    // Exporter-queue backpressure (adaptive by default): the per-shard byte
+    // budget the create path holds the resident export backlog under. `None`
+    // disables it (unbounded queue — the pre-backpressure behaviour).
+    let exporter_queue_high = match exporter_queue_from_env() {
+        ExporterQueueCfg::Off => None,
+        ExporterQueueCfg::PerShard(high) => Some(high),
+        ExporterQueueCfg::Adaptive { total_high_bytes } => Some(clamp_exporter_queue_per_shard(
+            (total_high_bytes / shard_count as u64).max(1),
+        )),
+    };
+    match exporter_queue_high {
+        None => tracing::info!("exporter-queue backpressure: off (unbounded)"),
+        Some(high) => tracing::info!(
+            "exporter-queue backpressure: {} MiB/shard budget ({shard_count} shard(s))",
+            high / 1024 / 1024
+        ),
+    }
     let server = ServerImpl::new(journals, store, topology);
-    for (shard, rx) in pending {
+    // Wire the exporter-queue gauges into the create-admission path (steer +
+    // shed) once the engine exists. Ordered by ascending partition id to match
+    // `Partitions::local_handles`, which `for_create` steers over by index.
+    if let Some(high) = exporter_queue_high {
+        let mut ordered: Vec<u64> = gauges.keys().copied().collect();
+        ordered.sort_unstable();
+        let local_gauges: Vec<Arc<AtomicU64>> = ordered.iter().map(|p| gauges[p].clone()).collect();
+        server.engine.set_exporter_backpressure(local_gauges, high);
+    }
+    for (shard, rx, queued) in pending {
         // Adaptive (disk-pressure) retention prunes in a dedicated per-shard
         // thread so eviction does not compete for CPU with projection inside the
         // saturated exporter thread. `Off`/`Fixed` need no such thread.
@@ -801,6 +838,7 @@ fn build_server(
         spawn_exporter(
             rx,
             shard,
+            queued,
             shard_retention,
             server.engine.clone(),
             server.instances_changed.clone(),
@@ -830,9 +868,11 @@ fn build_server_in_memory(journals: Vec<Journal>, topology: cluster::Topology) -
 /// exits when the channel closes (all `ServerImpl` clones and every journal are
 /// dropped). Events arrive as `Arc<Vec<Event>>` shared with the command thread, so
 /// projecting them costs no deep copy of the payloads.
+#[allow(clippy::too_many_arguments)]
 fn spawn_exporter(
-    rx: mpsc::Receiver<Arc<Vec<Event>>>,
+    rx: mpsc::Receiver<ExportBatch>,
     store: Arc<ReadStore>,
+    queued: Arc<AtomicU64>,
     retention: ShardRetention,
     engine: Partitions,
     instances_changed: Arc<tokio::sync::Notify>,
@@ -880,12 +920,15 @@ fn spawn_exporter(
                 while let Ok(next) = rx.try_recv() {
                     batch.push(next);
                 }
+                // Total resident bytes this batch accounts for in the exporter
+                // queue gauge (0 on the non-shared path). Released once projected.
+                let batch_bytes: u64 = batch.iter().map(|b| b.bytes as u64).sum();
                 // Signal liveness to the idle-purge tick: a batch means at least
                 // one durable command was applied since the last check.
                 activity.fetch_add(1, Ordering::Relaxed);
                 // Borrow every command's events as a flat slice of references —
                 // the payloads stay in their original `Arc`s, never copied here.
-                let refs: Vec<&Event> = batch.iter().flat_map(|events| events.iter()).collect();
+                let refs: Vec<&Event> = batch.iter().flat_map(|b| b.events.iter()).collect();
                 // Tier-A trace projection (process-optimization design doc §3).
                 // Folded here because the exporter is the single ordered point all
                 // events flow through, and it is already off the command-commit/ack
@@ -904,9 +947,19 @@ fn spawn_exporter(
                     Ok(keys) => keys,
                     Err(e) => {
                         tracing::error!("read-model export failed: {e}");
+                        // The batch is dropped regardless, so release its queue
+                        // accounting to keep the create-admission gauge honest.
+                        if batch_bytes > 0 {
+                            queued.fetch_sub(batch_bytes, Ordering::Relaxed);
+                        }
                         continue;
                     }
                 };
+                // Projected: this batch no longer occupies the exporter queue, so
+                // release its bytes from the create-admission backpressure gauge.
+                if batch_bytes > 0 {
+                    queued.fetch_sub(batch_bytes, Ordering::Relaxed);
+                }
                 if profile {
                     p_export += before_export.elapsed();
                     p_events += refs.len() as u64;
@@ -1489,6 +1542,98 @@ fn retention_from_env() -> RetentionCfg {
             0 => RetentionCfg::Off,
             cap => RetentionCfg::Fixed(cap),
         },
+    }
+}
+
+/// The resolved exporter-queue backpressure policy (see
+/// [`exporter_queue_from_env`]).
+enum ExporterQueueCfg {
+    /// Unbounded exporter queue — the pre-backpressure behaviour.
+    Off,
+    /// Adaptive: the total resident export backlog is held near
+    /// `total_high_bytes`, split evenly across shards.
+    Adaptive { total_high_bytes: u64 },
+    /// Explicit per-shard byte budget (`NANOBPMN_EXPORTER_QUEUE_MB`).
+    PerShard(u64),
+}
+
+/// Fallback exporter-queue budget (total, across shards) in MiB when adaptive
+/// mode is selected but the memory limit can't be detected (non-Linux dev box).
+const DEFAULT_EXPORTER_QUEUE_MB: u64 = 512;
+/// Adaptive exporter-queue budget as a percentage of the detected memory limit.
+/// The queue is a transient buffer smoothing projection bursts, not durable
+/// state, so it takes a small slice of RAM well below the spill watermark.
+const EXPORTER_QUEUE_LIMIT_FRACTION_PCT: u64 = 6;
+/// Never auto-derive a per-shard exporter-queue budget above this. Caps the
+/// worst-case resident backlog on very large boxes so "adaptive" still means
+/// bounded, not "a couple of GB per shard".
+const MAX_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 512 * 1024 * 1024;
+/// Never auto-derive a per-shard budget below this — too small a queue sheds on
+/// every micro-burst and needlessly caps throughput.
+const MIN_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The default adaptive exporter-queue budget (total, across all shards) when no
+/// explicit `NANOBPMN_EXPORTER_QUEUE_MB` override is set: a small fraction of the
+/// detected memory limit, else [`DEFAULT_EXPORTER_QUEUE_MB`]. The per-shard slice
+/// (computed by the caller as `total / shard_count`) is clamped to
+/// `[MIN_EXPORTER_QUEUE_PER_SHARD_BYTES, MAX_EXPORTER_QUEUE_PER_SHARD_BYTES]`.
+fn default_exporter_queue_high_bytes() -> u64 {
+    match detect_memory_limit_bytes() {
+        Some(limit) => (limit / 100 * EXPORTER_QUEUE_LIMIT_FRACTION_PCT)
+            .max(DEFAULT_EXPORTER_QUEUE_MB * 1024 * 1024),
+        None => DEFAULT_EXPORTER_QUEUE_MB * 1024 * 1024,
+    }
+}
+
+/// Clamps a resolved per-shard exporter-queue budget to sane bounds, so both the
+/// adaptive split and an explicit override stay in a range that bounds memory
+/// without shedding on every micro-burst.
+fn clamp_exporter_queue_per_shard(high: u64) -> u64 {
+    high.clamp(
+        MIN_EXPORTER_QUEUE_PER_SHARD_BYTES,
+        MAX_EXPORTER_QUEUE_PER_SHARD_BYTES,
+    )
+}
+
+/// Resolves the exporter-queue backpressure policy from the environment.
+///
+/// The read-model exporter is fed by an in-memory queue of committed events
+/// awaiting projection. Under a large-variable flood that outruns the single
+/// SQLite writer, that queue — holding a full copy of each event's variables —
+/// is the dominant RAM balloon (independent of variable spill, which sheds the
+/// engine's copy, not the exporter's). This bounds the queue's resident size by
+/// steering creates away from a saturated shard and shedding once every local
+/// shard is at budget, so memory tracks the watermark instead of the backlog.
+///
+/// **Adaptive by default** (RAM-relative, self-sizing to the box):
+/// - `NANOBPMN_EXPORTER_QUEUE=off`/`0`/`none`: unbounded (pre-backpressure).
+/// - `NANOBPMN_EXPORTER_QUEUE=adaptive`/`auto`/`dynamic` (or unset): per-shard
+///   budget = [`EXPORTER_QUEUE_LIMIT_FRACTION_PCT`]% of the detected memory limit
+///   split across shards, clamped to
+///   `[MIN..MAX]_EXPORTER_QUEUE_PER_SHARD_BYTES`.
+/// - `NANOBPMN_EXPORTER_QUEUE_MB=<n>`: explicit **per-shard** budget in MiB
+///   (also clamped), overriding the adaptive default.
+fn exporter_queue_from_env() -> ExporterQueueCfg {
+    let mode = std::env::var("NANOBPMN_EXPORTER_QUEUE")
+        .ok()
+        .map(|v| v.trim().to_ascii_lowercase());
+    match mode.as_deref() {
+        Some("off") | Some("0") | Some("none") | Some("false") => ExporterQueueCfg::Off,
+        _ => {
+            // An explicit per-shard MB override wins in any non-off mode.
+            if let Some(mb) = std::env::var("NANOBPMN_EXPORTER_QUEUE_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+            {
+                return ExporterQueueCfg::PerShard(clamp_exporter_queue_per_shard(
+                    mb * 1024 * 1024,
+                ));
+            }
+            ExporterQueueCfg::Adaptive {
+                total_high_bytes: default_exporter_queue_high_bytes(),
+            }
+        }
     }
 }
 
@@ -7736,6 +7881,20 @@ impl ServerImpl {
                      configured backlog limit of {backlog_limit}. Retry after a backoff."
                 ));
             }
+        }
+        // Exporter-queue backpressure: shed once every local read-model shard's
+        // export queue is at budget, so the resident backlog of committed-but-
+        // unprojected events (each holding a full copy of its variables) stays
+        // bounded under a large-variable flood. `for_create` steers to a shard
+        // with headroom first, so this only fires when the whole node is
+        // saturated — never blocking the shared journal writer. A shed create is
+        // never journaled, so durability/at-least-once are intact.
+        if self.engine.exporter_all_saturated() {
+            return Some(
+                "Admission control: all read-model export queues are at capacity. \
+                 Retry after a backoff."
+                    .to_string(),
+            );
         }
         None
     }

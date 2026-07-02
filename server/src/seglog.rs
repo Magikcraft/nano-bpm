@@ -1244,7 +1244,7 @@ mod tests {
     fn multi_partition_snapshot_compaction_and_recovery() {
         let dir = temp_dir("multi-roundtrip");
         // Keep the exporter receiver alive so shared writes have a wired cell.
-        let (tx, _rx) = std::sync::mpsc::channel::<Arc<Vec<Event>>>();
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
 
         let (key0, key1) = {
             let (writer, recovery) =
@@ -1265,8 +1265,8 @@ mod tests {
                 true,
                 &writer,
             );
-            j0.set_exporter(tx.clone());
-            j1.set_exporter(tx.clone());
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
             // Deploy on partition 0, replicate the definition in-memory to p1.
             let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
     #[test]
     fn multi_partition_recovery_fuses_snapshot_and_tail() {
         let dir = temp_dir("multi-tail");
-        let (tx, _rx) = std::sync::mpsc::channel::<Arc<Vec<Event>>>();
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
 
         let (pre0, post1) = {
             let (writer, recovery) =
@@ -1351,8 +1351,8 @@ mod tests {
                 true,
                 &writer,
             );
-            j0.set_exporter(tx.clone());
-            j1.set_exporter(tx.clone());
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
             let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
             j1.install_deployment(&deploy_events);
@@ -1399,7 +1399,7 @@ mod tests {
     #[test]
     fn clustered_replicated_deployment_recovers_across_owned_partitions() {
         let dir = temp_dir("cluster-deploy");
-        let (tx, _rx) = std::sync::mpsc::channel::<Arc<Vec<Event>>>();
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
 
         // Mint a deployment on partition 0 (the definition's home) to obtain the
         // partition-0-keyed `ProcessDeployed` events a peer node would receive.
@@ -1429,8 +1429,8 @@ mod tests {
                 true,
                 &writer,
             );
-            j1.set_exporter(tx.clone());
-            j2.set_exporter(tx.clone());
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j2.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
 
             // Durable copy on the first-owned partition (tagged 1, keyed 0);
             // in-memory on the rest. Dropping the writer at block end flushes it.
