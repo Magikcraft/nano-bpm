@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
@@ -279,15 +278,6 @@ pub struct VariableRow {
 /// with engine writes.
 pub struct ReadStore {
     conn: Mutex<Connection>,
-    /// O(1) cache of `process_instances` row count (active + terminal). A live
-    /// `SELECT COUNT(*)` scans the whole table, and adaptive retention needs this
-    /// count on the exporter's hot path (every prune check); running the scan
-    /// there stalls the single exporter thread as the table grows, backing its
-    /// unbounded event channel up into a multi-gigabyte RSS spike. Seeded by one
-    /// COUNT at open, then maintained incrementally: +1 per projected
-    /// `ProcessInstanceCreated` (keys are minted once, so inserts are never
-    /// duplicated) and −evicted per prune.
-    count: AtomicI64,
 }
 
 impl ReadStore {
@@ -319,10 +309,8 @@ impl ReadStore {
         }
         let store = Self {
             conn: Mutex::new(conn),
-            count: AtomicI64::new(0),
         };
         store.ensure_schema()?;
-        store.reseed_count();
         // A persistent store whose schema already matched is opened without any
         // write so far, so a read-only file (or directory) would not surface
         // until the first exporter batch — where it logs "attempt to write a
@@ -408,18 +396,7 @@ impl ReadStore {
             )?;
         }
         self.ensure_schema()?;
-        self.reseed_count();
         Ok(())
-    }
-
-    /// Re-seeds the O(1) `count` cache from a live `COUNT(*)`. Called once at
-    /// open and after a schema reset (both off the hot path).
-    fn reseed_count(&self) {
-        let conn = self.conn.lock().expect("read store poisoned");
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM process_instances", [], |r| r.get(0))
-            .unwrap_or(0);
-        self.count.store(n.max(0), Ordering::Relaxed);
     }
 
     /// Projects a batch of consecutive journal `events` into the store in one
@@ -432,15 +409,11 @@ impl ReadStore {
         let mut conn = self.conn.lock().expect("read store poisoned");
         let tx = conn.transaction()?;
         let mut completed = Vec::new();
-        let mut created = 0i64;
         for &event in events {
             if let Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } = event
             {
                 completed.push(*instance_key);
-            }
-            if matches!(event, Event::ProcessInstanceCreated { .. }) {
-                created += 1;
             }
             project(&tx, event)?;
         }
@@ -449,13 +422,6 @@ impl ReadStore {
             params![events.len() as i64],
         )?;
         tx.commit()?;
-        // Maintain the O(1) row-count cache: each projected create inserts exactly
-        // one new `process_instances` row (keys are minted once, so the
-        // `ON CONFLICT(key)` upsert never adds a duplicate); completions/
-        // terminations only flip state.
-        if created != 0 {
-            self.count.fetch_add(created, Ordering::Relaxed);
-        }
         Ok(completed)
     }
 
@@ -541,8 +507,6 @@ impl ReadStore {
         // is best-effort: a concurrent reader can hold it back, and that is fine —
         // the next sweep retries.
         let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
-        // Keep the O(1) row-count cache in step with the deletions.
-        self.count.fetch_sub(evicted as i64, Ordering::Relaxed);
         Ok(evicted)
     }
 
@@ -574,12 +538,20 @@ impl ReadStore {
         (file, live)
     }
 
-    /// Total number of process instances (active + terminal) in this shard.
-    /// Used to derive a per-instance byte estimate for adaptive retention. Reads
-    /// the O(1) cached counter (maintained by `export`/prune) rather than
-    /// scanning the table, so it is safe to call on the exporter's hot path.
+    /// Total number of process instances (active + terminal) in this shard, via
+    /// a live `COUNT(*)`. This is O(rows), so the adaptive-retention caller must
+    /// only invoke it when a shard is over its byte budget (never on the
+    /// below-budget ramp) and throttle it in time — a naive event-count proxy is
+    /// unsafe here because projection is idempotent/re-delivered, so counting
+    /// `ProcessInstanceCreated` events over-counts the deduplicated rows and
+    /// inflates the keep target until pruning silently evicts nothing.
     pub fn instance_count(&self) -> usize {
-        self.count.load(Ordering::Relaxed).max(0) as usize
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n.max(0) as usize)
+        .unwrap_or(0)
     }
 
     /// The number of non-terminal (Active) process instances currently in the
@@ -1728,7 +1700,7 @@ mod definition_xml_tests {
         // max_keep == 0 disables pruning.
         assert_eq!(store.prune_terminal_instances(0, 0).unwrap(), 0);
         assert!(store.process_instance(1).is_some());
-        // O(1) count cache tracks inserts: 5 terminal + 2 active = 7.
+        // COUNT(*) over all instances: 5 terminal + 2 active = 7.
         assert_eq!(store.instance_count(), 7);
 
         // Batched: with a delete cap of 1, only the oldest terminal beyond the

@@ -846,10 +846,21 @@ fn spawn_exporter(
         ShardRetention::Fixed(cap) => (cap / 4).clamp(64, 4096),
         _ => 2048,
     };
+    // Adaptive retention needs an accurate row count (via COUNT(*)) to size its
+    // keep target, but that scan is O(rows); running it every prune_threshold
+    // completions stalls the exporter as the table grows. Bound its frequency in
+    // wall time (independent of the completion rate) and only ever run it — and
+    // the prune — when the shard is actually over its byte budget.
+    let adaptive_min_interval = std::time::Duration::from_millis(500);
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
         .spawn(move || {
             let mut since_prune = 0usize;
+            // Last time the adaptive-retention path ran its COUNT(*)+prune (see
+            // `adaptive_min_interval`). Starts far enough in the past that the
+            // first over-budget sweep is not throttled.
+            let mut last_adaptive_check =
+                std::time::Instant::now() - adaptive_min_interval;
             // Exporter profiling (NANOBPMN_EXPORTER_PROFILE): every 5 s log the
             // projection rate, busy%, and — critically — the share of busy time
             // spent inside `store.export` (the single SQLite writer). If busy≈100%
@@ -962,10 +973,19 @@ fn spawn_exporter(
                         ShardRetention::Off => 0,
                         ShardRetention::Fixed(cap) => cap,
                         ShardRetention::Adaptive { high_bytes } => {
+                            // Cheap first (reads the DB header): the below-budget
+                            // ramp must never pay for a COUNT(*) or a prune.
                             let (file_bytes, live_bytes) = store.db_page_stats();
-                            let rows = store.instance_count() as u64;
-                            adaptive_keep_target(high_bytes, file_bytes, live_bytes, rows)
-                                .unwrap_or(0)
+                            if file_bytes < high_bytes
+                                || last_adaptive_check.elapsed() < adaptive_min_interval
+                            {
+                                0
+                            } else {
+                                last_adaptive_check = std::time::Instant::now();
+                                let rows = store.instance_count() as u64;
+                                adaptive_keep_target(high_bytes, file_bytes, live_bytes, rows)
+                                    .unwrap_or(0)
+                            }
                         }
                     };
                     if target_keep != 0 {
