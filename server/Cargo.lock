@@ -1323,6 +1323,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "mime_guess",
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",

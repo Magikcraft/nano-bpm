@@ -771,20 +771,31 @@ fn build_server(
     // own field); drop ours so each shard's receiver closes on server shutdown.
     drop(senders);
     let shard_count = pending.len().max(1);
-    // Split the history cap across shards so the TOTAL retained terminal set stays
-    // bounded by the configured maximum.
-    let history_cap = history_max_instances_from_env();
-    let per_shard_cap = if history_cap == 0 {
-        0
-    } else {
-        (history_cap / shard_count).max(1)
+    // Read-model retention (opt-in): split the budget across shards so the TOTAL
+    // retained history stays bounded by the configured maximum.
+    let shard_retention = match retention_from_env() {
+        RetentionCfg::Off => ShardRetention::Off,
+        RetentionCfg::Fixed(cap) => ShardRetention::Fixed((cap / shard_count).max(1)),
+        RetentionCfg::Adaptive { total_high_bytes } => ShardRetention::Adaptive {
+            high_bytes: (total_high_bytes / shard_count as u64).max(1),
+        },
     };
+    match shard_retention {
+        ShardRetention::Off => {}
+        ShardRetention::Fixed(cap) => tracing::info!(
+            "read-model retention: fixed, {cap} terminal instance(s)/shard ({shard_count} shard(s))"
+        ),
+        ShardRetention::Adaptive { high_bytes } => tracing::info!(
+            "read-model retention: adaptive, {} MiB/shard budget ({shard_count} shard(s))",
+            high_bytes / 1024 / 1024
+        ),
+    }
     let server = ServerImpl::new(journals, store, topology);
     for (shard, rx) in pending {
         spawn_exporter(
             rx,
             shard,
-            per_shard_cap,
+            shard_retention,
             server.engine.clone(),
             server.instances_changed.clone(),
             server.inflight.clone(),
@@ -816,21 +827,25 @@ fn build_server_in_memory(journals: Vec<Journal>, topology: cluster::Topology) -
 fn spawn_exporter(
     rx: mpsc::Receiver<Arc<Vec<Event>>>,
     store: Arc<ReadStore>,
-    history_cap: usize,
+    retention: ShardRetention,
     engine: Partitions,
     instances_changed: Arc<tokio::sync::Notify>,
     inflight: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
     #[cfg(feature = "console")] trace_store: Arc<console::trace::TraceStore>,
 ) {
-    // Read-model history cap (per shard): how many terminal (Completed/Terminated)
-    // instances to retain before the oldest are evicted (with their
-    // variables/jobs/etc.). 0 = unbounded (default). Bounds read-model memory to
-    // the working set so a long-running engine does not climb indefinitely as
+    // Read-model history retention (per shard): how many terminal
+    // (Completed/Terminated) instances to retain before the oldest are evicted
+    // (with their variables/jobs/etc.). Bounds the read model to the working set
+    // so a long-running engine's on-disk store does not climb indefinitely as
     // completed instances accumulate. Pruned in this thread (the shard's single
     // SQLite writer), throttled by accumulated completions so the transaction cost
-    // is amortized.
-    let prune_threshold = (history_cap / 4).clamp(64, 4096);
+    // is amortized. `Off` = unbounded (default); `Fixed` caps by instance count;
+    // `Adaptive` prunes under disk pressure to hold the store near a byte budget.
+    let prune_threshold = match retention {
+        ShardRetention::Fixed(cap) => (cap / 4).clamp(64, 4096),
+        _ => 2048,
+    };
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
         .spawn(move || {
@@ -940,15 +955,27 @@ fn spawn_exporter(
                 // History retention: once enough instances have reached a terminal
                 // state since the last sweep, cap the retained terminal set so the
                 // read model tracks the working set rather than cumulative
-                // throughput. Disabled (no-op) when history_cap == 0.
-                if history_cap != 0 && since_prune >= prune_threshold {
+                // throughput. Disabled (no-op) when retention is `Off`.
+                if since_prune >= prune_threshold {
                     since_prune = 0;
-                    match store.prune_terminal_instances(history_cap) {
-                        Ok(n) if n > 0 => {
-                            tracing::debug!("history retention: evicted {n} terminal instances")
+                    let target_keep = match retention {
+                        ShardRetention::Off => 0,
+                        ShardRetention::Fixed(cap) => cap,
+                        ShardRetention::Adaptive { high_bytes } => {
+                            let (file_bytes, live_bytes) = store.db_page_stats();
+                            let rows = store.instance_count() as u64;
+                            adaptive_keep_target(high_bytes, file_bytes, live_bytes, rows)
+                                .unwrap_or(0)
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("history retention prune failed: {e}"),
+                    };
+                    if target_keep != 0 {
+                        match store.prune_terminal_instances(target_keep) {
+                            Ok(n) if n > 0 => {
+                                tracing::debug!("history retention: evicted {n} terminal instances")
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("history retention prune failed: {e}"),
+                        }
                     }
                 }
                 if profile {
@@ -1290,6 +1317,130 @@ fn default_spill_high_bytes() -> u64 {
     match detect_memory_limit_bytes() {
         Some(limit) => spill_default_from_limit(limit),
         None => DEFAULT_SPILL_MB * 1024 * 1024,
+    }
+}
+
+/// Fallback read-model retention budget in MiB when adaptive mode is selected but
+/// the data-dir filesystem capacity can't be detected (non-Unix, or no data dir).
+const DEFAULT_HISTORY_MB: u64 = 8192;
+/// Adaptive read-model retention budget as a percentage of the data-dir
+/// filesystem capacity. Leaves headroom for the journal, the WAL, the
+/// variable-spill store, and the OS before the disk fills (an ENOSPC would abort
+/// the node to preserve durability — see the journal write-failure path).
+const HISTORY_DISK_FRACTION_PCT: u64 = 60;
+
+/// Total filesystem capacity (bytes) of the volume holding `path`, via
+/// `statvfs`, or `None` when it can't be read.
+#[cfg(unix)]
+fn detect_disk_capacity_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `st` is zeroed then filled by statvfs; `c` is a valid NUL-terminated
+    // path pointer that outlives the call. We check the return code before use.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    Some(st.f_blocks as u64 * st.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn detect_disk_capacity_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// The default read-model retention byte budget (total, across all shards) when
+/// no explicit `NANOBPMN_HISTORY_RETENTION_MB` override is set: a fraction of the
+/// data-dir filesystem capacity, else [`DEFAULT_HISTORY_MB`].
+fn default_history_high_bytes() -> u64 {
+    let (_, db) = resolve_data_paths();
+    let cap = db
+        .as_deref()
+        .and_then(|p| p.parent())
+        .and_then(detect_disk_capacity_bytes);
+    match cap {
+        Some(bytes) => {
+            (bytes / 100 * HISTORY_DISK_FRACTION_PCT).max(DEFAULT_HISTORY_MB * 1024 * 1024)
+        }
+        None => DEFAULT_HISTORY_MB * 1024 * 1024,
+    }
+}
+
+/// Resolved read-model history retention policy (see [`retention_from_env`]).
+enum RetentionCfg {
+    /// No pruning — history grows with cumulative throughput (the default).
+    Off,
+    /// Cap the retained terminal set at a fixed total instance count.
+    Fixed(usize),
+    /// Prune terminal instances under disk pressure so the read-model store's
+    /// total on-disk size tracks `total_high_bytes` instead of growing without
+    /// bound.
+    Adaptive { total_high_bytes: u64 },
+}
+
+/// Per-shard slice of a [`RetentionCfg`], handed to each exporter thread.
+#[derive(Clone, Copy)]
+enum ShardRetention {
+    Off,
+    Fixed(usize),
+    Adaptive { high_bytes: u64 },
+}
+
+/// Computes the adaptive-retention keep target (number of terminal instances to
+/// retain) for a shard, or `None` to prune nothing. Triggers only once the
+/// allocated file (`file_bytes`) reaches the budget; sizes the target from live
+/// data so pruned pages are reused and the file plateaus near `high_bytes`
+/// rather than growing. Pure, so it can be unit-tested without a live store.
+fn adaptive_keep_target(
+    high_bytes: u64,
+    file_bytes: u64,
+    live_bytes: u64,
+    rows: u64,
+) -> Option<usize> {
+    if file_bytes < high_bytes {
+        return None;
+    }
+    let per = (live_bytes / rows.max(1)).max(1);
+    Some(((high_bytes / 8 * 7) / per).max(1) as usize)
+}
+
+/// Resolves the read-model retention policy from the environment.
+///
+/// Retention bounds the *read model* (projected completed-instance history),
+/// which is otherwise unbounded and — under sustained high throughput — the
+/// dominant disk consumer (the journal is compacted independently). It is
+/// **off by default** (byte-for-byte today's behaviour: full history retained).
+///
+/// - `NANOBPMN_HISTORY_RETENTION=adaptive`/`auto`/`dynamic`: disk-pressure-driven
+///   pruning. The store's total on-disk size is held near
+///   `NANOBPMN_HISTORY_RETENTION_MB` (default: [`HISTORY_DISK_FRACTION_PCT`]% of
+///   the data-dir filesystem capacity, or [`DEFAULT_HISTORY_MB`] MiB when the
+///   capacity can't be detected). Opt-in.
+/// - Otherwise: the legacy fixed cap via `NANOBPMN_HISTORY_MAX_INSTANCES`
+///   (unset/`0` = unbounded, the default; `>0` = cap the terminal set at that
+///   many instances).
+fn retention_from_env() -> RetentionCfg {
+    match std::env::var("NANOBPMN_HISTORY_RETENTION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("adaptive") | Some("auto") | Some("dynamic") => {
+            let high = std::env::var("NANOBPMN_HISTORY_RETENTION_MB")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or_else(default_history_high_bytes);
+            RetentionCfg::Adaptive {
+                total_high_bytes: high,
+            }
+        }
+        _ => match history_max_instances_from_env() {
+            0 => RetentionCfg::Off,
+            cap => RetentionCfg::Fixed(cap),
+        },
     }
 }
 
@@ -9135,6 +9286,24 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod clustered_startup_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_keep_target_triggers_and_sizes_from_live_data() {
+        let high = 1024 * 1024 * 1024; // 1 GiB budget
+        // Under budget: prune nothing.
+        assert_eq!(adaptive_keep_target(high, high - 1, high / 2, 1000), None);
+        // At/over budget: keep ~7/8 of the budget worth of instances at the
+        // observed per-instance size. Here live=512 MiB over 1000 rows =>
+        // ~512 KiB/instance; 7/8 GiB / that ~= 1750.
+        let per = (high / 2) / 1000;
+        let expect = ((high / 8 * 7) / per) as usize;
+        assert_eq!(
+            adaptive_keep_target(high, high, high / 2, 1000),
+            Some(expect)
+        );
+        // Never returns 0 (which would mean "unbounded"): floors at 1.
+        assert_eq!(adaptive_keep_target(high, high, high, 1), Some(1));
+    }
 
     #[test]
     fn spill_default_scales_with_memory_limit() {

@@ -479,6 +479,43 @@ impl ReadStore {
 
     // --- queries used by the search/get handlers ---
 
+    /// The on-disk size of this shard's SQLite database in bytes, as
+    /// `(file_bytes, live_bytes)`: `file_bytes` is the total allocated file
+    /// (`page_count × page_size`, including freelist pages SQLite keeps for
+    /// reuse and does not return to the OS without `VACUUM`); `live_bytes`
+    /// excludes the freelist (`(page_count − freelist_count) × page_size`) and
+    /// tracks the actual data. The adaptive retention watermark triggers on
+    /// `file_bytes` (when the file stops fitting the budget) and sizes its keep
+    /// target from `live_bytes` (a stable per-instance estimate), so pruned
+    /// pages are reused by new inserts and the file plateaus instead of growing.
+    pub fn db_page_stats(&self) -> (u64, u64) {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let page_count: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let freelist: i64 = conn
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(4096);
+        let ps = page_size.max(0) as u64;
+        let file = page_count.max(0) as u64 * ps;
+        let live = (page_count - freelist).max(0) as u64 * ps;
+        (file, live)
+    }
+
+    /// Total number of process instances (active + terminal) in this shard.
+    /// Used to derive a per-instance byte estimate for adaptive retention.
+    pub fn instance_count(&self) -> usize {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    }
+
     /// The number of non-terminal (Active) process instances currently in the
     /// read model. Used once at startup to seed the in-flight backpressure gauge
     /// after a journal replay, so the watermark reflects recovered work.

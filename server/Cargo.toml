@@ -54,6 +54,11 @@ flate2 = "1.1.9"
 # in the lock as a transitive flate2 dep, so promoting it is offline-safe.
 crc32fast = "1"
 base64 = "0.22.1"
+# Unix filesystem stats (statvfs) for the disk-relative adaptive read-model
+# retention watermark. Unix-only; the feature falls back to a fixed default off
+# Unix (e.g. MSVC).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # jemalloc as the global allocator. Unlike the system allocator (macOS libmalloc,
 # Linux glibc), it returns freed memory to the OS on a decay schedule and exposes
