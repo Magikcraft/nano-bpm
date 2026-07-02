@@ -441,23 +441,49 @@ impl ReadStore {
     ///
     /// Terminal instances are ordered by `key`, which is monotonic in creation
     /// order, so the most recently created terminal instances are retained.
-    pub fn prune_terminal_instances(&self, max_keep: usize) -> rusqlite::Result<usize> {
+    ///
+    /// `max_delete` bounds a single sweep to the *oldest* `max_delete` terminal
+    /// instances beyond `max_keep` (0 = unbounded). This is essential when a
+    /// store that has grown well past budget first crosses the retention
+    /// watermark: pruning the entire backlog in one transaction would build a
+    /// multi-gigabyte WAL and block this shard's single exporter thread for
+    /// seconds, during which the unbounded exporter channel backs up with events
+    /// and process RSS explodes. Bounding each sweep keeps every prune transaction
+    /// small and quick so the exporter stays responsive; a backlog is worked down
+    /// gently across successive sweeps, while steady-state sweeps (only a
+    /// prune-threshold's worth of new completions exceed `max_keep`) delete a
+    /// small batch and the store holds flat. After a non-empty sweep the WAL is
+    /// checkpoint-truncated so it does not accumulate the freed pages.
+    pub fn prune_terminal_instances(
+        &self,
+        max_keep: usize,
+        max_delete: usize,
+    ) -> rusqlite::Result<usize> {
         if max_keep == 0 {
             return Ok(0);
         }
         let mut conn = self.conn.lock().expect("read store poisoned");
         let tx = conn.transaction()?;
-        // Materialize the keys to evict: every terminal instance EXCEPT the most
-        // recent `max_keep` (LIMIT -1 OFFSET n = "all rows after the first n").
+        // Materialize the keys to evict: of the terminal instances beyond the most
+        // recent `max_keep` (inner `LIMIT -1 OFFSET max_keep` = "all but the newest
+        // max_keep"), take the OLDEST `max_delete` of them (outer `ORDER BY key ASC
+        // LIMIT`). `max_delete == 0` => `LIMIT -1` (unbounded).
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _evict(key INTEGER PRIMARY KEY);
              DELETE FROM _evict;",
         )?;
+        let del_limit: i64 = if max_delete == 0 {
+            -1
+        } else {
+            max_delete as i64
+        };
         let evicted = tx.execute(
             "INSERT INTO _evict(key) \
-             SELECT key FROM process_instances WHERE state IN (1, 2) \
-             ORDER BY key DESC LIMIT -1 OFFSET ?1",
-            params![max_keep as i64],
+             SELECT key FROM ( \
+               SELECT key FROM process_instances WHERE state IN (1, 2) \
+               ORDER BY key DESC LIMIT -1 OFFSET ?1 \
+             ) ORDER BY key ASC LIMIT ?2",
+            params![max_keep as i64, del_limit],
         )?;
         if evicted == 0 {
             tx.commit()?;
@@ -474,6 +500,12 @@ impl ReadStore {
             [],
         )?;
         tx.commit()?;
+        // Return the WAL's freed pages to a bounded size. Without this the WAL
+        // grows with each prune (hundreds of MB observed) and never shrinks while
+        // the store is under load, inflating both disk and mapped memory. TRUNCATE
+        // is best-effort: a concurrent reader can hold it back, and that is fine —
+        // the next sweep retries.
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         Ok(evicted)
     }
 
@@ -1660,13 +1692,21 @@ mod definition_xml_tests {
         }
 
         // max_keep == 0 disables pruning.
-        assert_eq!(store.prune_terminal_instances(0).unwrap(), 0);
+        assert_eq!(store.prune_terminal_instances(0, 0).unwrap(), 0);
         assert!(store.process_instance(1).is_some());
 
-        // Keep the 2 newest terminal instances (keys 4, 5); evict keys 1,2,3.
-        let evicted = store.prune_terminal_instances(2).unwrap();
-        assert_eq!(evicted, 3);
+        // Batched: with a delete cap of 1, only the oldest terminal beyond the
+        // cap (key 1) is evicted this sweep; keys 2,3 remain until later sweeps.
+        assert_eq!(store.prune_terminal_instances(2, 1).unwrap(), 1);
         assert!(store.process_instance(1).is_none());
+        assert!(store.process_instance(2).is_some());
+        assert!(store.process_instance(3).is_some());
+
+        // Unbounded (max_delete == 0): evict the remaining overflow (keys 2, 3),
+        // keeping the 2 newest terminal instances (keys 4, 5).
+        let evicted = store.prune_terminal_instances(2, 0).unwrap();
+        assert_eq!(evicted, 2);
+        assert!(store.process_instance(2).is_none());
         assert!(store.process_instance(3).is_none());
         assert!(store.process_instance(4).is_some());
         assert!(store.process_instance(5).is_some());
@@ -1676,7 +1716,7 @@ mod definition_xml_tests {
         assert_eq!(store.active_instance_count(), 2);
 
         // Re-pruning at the same cap is a no-op (nothing beyond the cap).
-        assert_eq!(store.prune_terminal_instances(2).unwrap(), 0);
+        assert_eq!(store.prune_terminal_instances(2, 0).unwrap(), 0);
     }
 
     #[test]

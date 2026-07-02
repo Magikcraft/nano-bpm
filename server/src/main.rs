@@ -969,7 +969,7 @@ fn spawn_exporter(
                         }
                     };
                     if target_keep != 0 {
-                        match store.prune_terminal_instances(target_keep) {
+                        match store.prune_terminal_instances(target_keep, PRUNE_BATCH_MAX) {
                             Ok(n) if n > 0 => {
                                 tracing::debug!("history retention: evicted {n} terminal instances")
                             }
@@ -1386,6 +1386,14 @@ enum ShardRetention {
     Fixed(usize),
     Adaptive { high_bytes: u64 },
 }
+
+/// Upper bound on terminal instances evicted per prune sweep (per shard). Keeps
+/// each prune transaction small and quick so the exporter thread never blocks
+/// long enough for its unbounded event channel to back up (which manifested as a
+/// multi-gigabyte RSS spike when a store first crossed budget with a large
+/// backlog). A backlog is worked down across successive sweeps; steady-state
+/// sweeps delete far fewer than this cap.
+const PRUNE_BATCH_MAX: usize = 16_384;
 
 /// Computes the adaptive-retention keep target (number of terminal instances to
 /// retain) for a shard, or `None` to prune nothing. Triggers only once the
