@@ -548,3 +548,75 @@ Findings:
 (whole dormant instances) and adaptive var spill (active instances' variables),
 each covering a case the other cannot. Under a large-payload flood the resident
 set tracks the configured watermark rather than the in-flight backlog size.
+
+## 2026-07-02 — Read-model retention: bounding history disk without a throughput hit
+
+`NANOBPMN_HISTORY_RETENTION=adaptive` caps the sharded read-model (SQLite
+projection of completed instances) at a per-shard byte budget by evicting the
+oldest *terminal* instances. The first cut evicted inline in the exporter
+thread and did **not** hold the budget under sustained over-budget load — shard
+files grew to ~6 GB each (25 GB datadir) against a 1500 MB budget.
+
+### Root cause (data-backed)
+
+Prune was serialized behind projection in the **single saturated exporter
+thread**. That thread runs the SQLite projection inserts at the single-writer
+ceiling (~232k events/s ≈ 29k PI/s/node in the blob phase). Inline prune got
+only one bounded sweep per multi-second export batch, so it evicted ~4k rows/s
+while inserts ran ~7k rows/s/shard → rows crept up monotonically (4.3M → 8.4M),
+freelist stayed flat (~1300 pages, freed pages instantly reused). The old
+`OFFSET keep_target` scan (~2M index walks/sweep) made each sweep costlier and
+starved projection further.
+
+### Fix (commit `c8e1daa`)
+
+1. **Cheaper cursor prune** (`prune_oldest_terminal`): delete oldest terminal
+   via `ORDER BY key ASC LIMIT batch` — walks the PK index from the oldest key,
+   O(batch) not O(keep_target), no OFFSET. Keys are monotonic so oldest terminal
+   = earliest completed = correct to evict first.
+2. **Decoupled per-shard pruner thread** (`spawn_adaptive_pruner`): one thread
+   per shard with its **own** 2nd SQLite connection on a 200 ms timer. Small
+   delete txns interleave with the exporter's inserts at SQLite's write-lock
+   granularity (busy_timeout makes each side wait, not error). Hysteresis holds
+   `live` between `7/8·budget` and `budget`; `MAX_DELETES_PER_WAKE=65536` bounds
+   the lock-hold so projection is never starved.
+
+### Result — GCP 3-node / 12-partition / RF=3, 3-phase soak
+
+Soak: steady 780 s @110w → blob 240 s @16w/50 KB payload → steady 780 s.
+Budget 1500 MB/shard, 4 shards/node. Sampled node-0 (owns p0,3,6,9).
+
+| Metric | Before (inline prune) | After (`c8e1daa`) |
+|---|---|---|
+| Read-model file/shard | grew to ~6 GB (unbounded) | **plateaus ~1500–1600 MB** |
+| Terminal rows/shard | climbed 4.3M → 8.4M | **plateaus ~4.66M** |
+| Freelist | flat ~1300 pages | **grows (pruner outpaces inserts)** |
+| Datadir (read-model) | ~25 GB | **~6 GB (4×1.5 GB)** |
+| OOM | none (avail ≥51 G) | none (avail ≥42 G) |
+
+Read-model files held rock-steady at budget across the entire blob burst and
+the whole second steady phase — the disk overshoot is fixed.
+
+### Still open (separate subsystems, not read-model retention)
+
+- **Transient RSS 8–17 GB under the over-budget blob burst**, idle floor
+  ~8.7 GB (vs ~800 MB after below-budget soaks). This run retained 4.66M
+  terminal instances + a 3.2 GB `var-spill.sqlite` + a 4.5 GB `msnapshot.bin`;
+  RSS oscillates down when background maintenance settles, so it is not a leak,
+  but engine hot-state + snapshot memory is the next lever.
+- **Journal-segment accumulation** (~400 sealed segments, ~20 GB) built during
+  the burst — segmented-journal compaction lag, independent of the read model.
+- **Disk is not *reclaimed*** by prune: SQLite keeps freed pages in-file as
+  freelist (no VACUUM), so `file_bytes` sticks at the worst-burst watermark
+  while `live_bytes` tracks the budget. Shrinking the file would need
+  `auto_vacuum=INCREMENTAL` + `incremental_vacuum` or an offline VACUUM — a
+  deferred decision.
+
+### Tuning guidance (users)
+
+- `NANOBPMN_HISTORY_RETENTION=adaptive` + `NANOBPMN_HISTORY_RETENTION_MB=<n>`
+  caps **live** read-model data per shard near `<n>` MB. Budget is per shard;
+  a node owning K partitions uses up to `K × <n>` MB of live history.
+- The on-disk file settles at the worst-burst high-watermark (freelist is
+  retained and reused), so size the disk for peak, not steady-state, or plan an
+  offline VACUUM during a maintenance window.
