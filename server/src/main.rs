@@ -8459,13 +8459,31 @@ const REST_LOG_BODY_PREVIEW: usize = 4096;
 /// unauthenticated alongside the REST API; scrape it while benchmarking to see
 /// how many writes share each fsync.
 async fn metrics_handler() -> Response {
+    let mut body = metrics::gather();
+    // jemalloc memory decomposition: resident (≈RSS) vs allocated (true live
+    // heap). A large resident−allocated gap = allocator-retained dirty pages
+    // (reclaimable), not live data — the key signal for diagnosing RSS balloons.
+    if let Some(m) = memory::stats() {
+        use std::fmt::Write as _;
+        let _ = write!(
+            body,
+            "# HELP nanobpm_jemalloc_bytes jemalloc memory accounting by kind.\n\
+             # TYPE nanobpm_jemalloc_bytes gauge\n\
+             nanobpm_jemalloc_bytes{{kind=\"allocated\"}} {}\n\
+             nanobpm_jemalloc_bytes{{kind=\"active\"}} {}\n\
+             nanobpm_jemalloc_bytes{{kind=\"resident\"}} {}\n\
+             nanobpm_jemalloc_bytes{{kind=\"mapped\"}} {}\n\
+             nanobpm_jemalloc_bytes{{kind=\"retained\"}} {}\n",
+            m.allocated, m.active, m.resident, m.mapped, m.retained,
+        );
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header(
             http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )
-        .body(Body::from(metrics::gather()))
+        .body(Body::from(body))
         .expect("metrics response builds")
 }
 

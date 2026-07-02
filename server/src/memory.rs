@@ -72,6 +72,27 @@ mod imp {
         epoch::advance().ok()?;
         stats::resident::read().ok()
     }
+
+    /// A snapshot of jemalloc's memory accounting, for decomposing RSS into
+    /// **genuinely live** bytes vs allocator-retained slack. Reads all fields
+    /// after a single epoch advance so they are mutually consistent.
+    pub fn stats() -> Option<super::MemStats> {
+        use tikv_jemalloc_ctl::{epoch, stats};
+        epoch::advance().ok()?;
+        Some(super::MemStats {
+            // Bytes requested by the app and not yet freed (true live heap).
+            allocated: stats::allocated::read().ok()? as u64,
+            // Bytes in active pages (allocated rounded up to page/bin size).
+            active: stats::active::read().ok()? as u64,
+            // Physical pages jemalloc holds (≈ process anon RSS).
+            resident: stats::resident::read().ok()? as u64,
+            // Virtual address space mapped by jemalloc.
+            mapped: stats::mapped::read().ok()? as u64,
+            // Pages jemalloc has released back to the OS but keeps mapped
+            // (returned; counts toward VIRT/mapped, not RSS).
+            retained: stats::retained::read().ok()? as u64,
+        })
+    }
 }
 
 #[cfg(target_env = "msvc")]
@@ -83,6 +104,21 @@ mod imp {
     pub fn resident_bytes() -> Option<usize> {
         None
     }
+    pub fn stats() -> Option<super::MemStats> {
+        None
+    }
 }
 
-pub use imp::{enable_background_thread, purge, resident_bytes};
+/// jemalloc memory accounting (bytes). The key diagnostic is `resident` (≈ RSS)
+/// vs `allocated` (true live heap): a large gap means the balloon is
+/// allocator-retained dirty pages (reclaimable by purge/decay), not live data.
+#[derive(Debug, Clone, Copy)]
+pub struct MemStats {
+    pub allocated: u64,
+    pub active: u64,
+    pub resident: u64,
+    pub mapped: u64,
+    pub retained: u64,
+}
+
+pub use imp::{enable_background_thread, purge, resident_bytes, stats};
