@@ -792,6 +792,12 @@ fn build_server(
     }
     let server = ServerImpl::new(journals, store, topology);
     for (shard, rx) in pending {
+        // Adaptive (disk-pressure) retention prunes in a dedicated per-shard
+        // thread so eviction does not compete for CPU with projection inside the
+        // saturated exporter thread. `Off`/`Fixed` need no such thread.
+        if let ShardRetention::Adaptive { high_bytes } = shard_retention {
+            spawn_adaptive_pruner(shard.clone(), high_bytes);
+        }
         spawn_exporter(
             rx,
             shard,
@@ -846,21 +852,10 @@ fn spawn_exporter(
         ShardRetention::Fixed(cap) => (cap / 4).clamp(64, 4096),
         _ => 2048,
     };
-    // Adaptive retention needs an accurate row count (via COUNT(*)) to size its
-    // keep target, but that scan is O(rows); running it every prune_threshold
-    // completions stalls the exporter as the table grows. Bound its frequency in
-    // wall time (independent of the completion rate) and only ever run it — and
-    // the prune — when the shard is actually over its byte budget.
-    let adaptive_min_interval = std::time::Duration::from_millis(500);
     std::thread::Builder::new()
         .name("nanobpmn-exporter".into())
         .spawn(move || {
             let mut since_prune = 0usize;
-            // Last time the adaptive-retention path ran its COUNT(*)+prune (see
-            // `adaptive_min_interval`). Starts far enough in the past that the
-            // first over-budget sweep is not throttled.
-            let mut last_adaptive_check =
-                std::time::Instant::now() - adaptive_min_interval;
             // Exporter profiling (NANOBPMN_EXPORTER_PROFILE): every 5 s log the
             // projection rate, busy%, and — critically — the share of busy time
             // spent inside `store.export` (the single SQLite writer). If busy≈100%
@@ -963,30 +958,16 @@ fn spawn_exporter(
                         }
                     }
                 }
-                // History retention: once enough instances have reached a terminal
-                // state since the last sweep, cap the retained terminal set so the
-                // read model tracks the working set rather than cumulative
-                // throughput. Disabled (no-op) when retention is `Off`.
+                // History retention: for the count-capped `Fixed` policy this
+                // runs inline (low volume, small cap, cheap). The disk-pressure
+                // `Adaptive` policy is pruned by a dedicated per-shard thread
+                // (see `spawn_adaptive_pruner`) so its eviction never competes for
+                // CPU with projection inside this saturated writer thread.
                 if since_prune >= prune_threshold {
                     since_prune = 0;
                     let target_keep = match retention {
-                        ShardRetention::Off => 0,
+                        ShardRetention::Off | ShardRetention::Adaptive { .. } => 0,
                         ShardRetention::Fixed(cap) => cap,
-                        ShardRetention::Adaptive { high_bytes } => {
-                            // Cheap first (reads the DB header): the below-budget
-                            // ramp must never pay for a COUNT(*) or a prune.
-                            let (file_bytes, live_bytes) = store.db_page_stats();
-                            if file_bytes < high_bytes
-                                || last_adaptive_check.elapsed() < adaptive_min_interval
-                            {
-                                0
-                            } else {
-                                last_adaptive_check = std::time::Instant::now();
-                                let rows = store.instance_count() as u64;
-                                adaptive_keep_target(high_bytes, file_bytes, live_bytes, rows)
-                                    .unwrap_or(0)
-                            }
-                        }
                     };
                     if target_keep != 0 {
                         match store.prune_terminal_instances(target_keep, PRUNE_BATCH_MAX) {
@@ -1034,6 +1015,63 @@ fn spawn_exporter(
             }
         })
         .expect("spawn read-model exporter thread");
+}
+
+/// Spawns the decoupled adaptive-retention pruner for one shard (opening #1
+/// follow-up). Disk-pressure pruning is expensive relative to a single insert
+/// (it must find and delete the oldest terminal instances), and the exporter
+/// thread is already saturated projecting events at the single-writer ceiling —
+/// so pruning inline there loses the race and the store grows past budget. This
+/// thread owns a *second* SQLite connection to the same shard file and evicts on
+/// its own timer; its small delete transactions interleave with the exporter's
+/// inserts at SQLite's write-lock granularity, giving eviction a fair share of
+/// the writer regardless of the export backlog. Exits when the store is dropped.
+fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
+    // Hold live data between `low_bytes` and `high_bytes` (7/8 hysteresis, matching
+    // the former keep-target). Small per-batch/per-wake bounds keep each write-lock
+    // acquisition short so the exporter is never starved; the wake cadence lets the
+    // pruner run many small batches per second while remaining idle-cheap.
+    let low_bytes = high_bytes / 8 * 7;
+    const BATCH: usize = 4_096;
+    const MAX_DELETES_PER_WAKE: usize = 65_536;
+    let interval = std::time::Duration::from_millis(200);
+    let mut conn = match store.prune_connection() {
+        Ok(Some(c)) => c,
+        // In-memory store (tests): a second connection is a distinct database, so
+        // there is nothing to prune here.
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("adaptive pruner: cannot open prune connection: {e}");
+            return;
+        }
+    };
+    std::thread::Builder::new()
+        .name("nanobpmn-pruner".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                // The store is dropped on shutdown; nothing else holds a strong ref
+                // to *this* shard once the server is gone. Use the weak-count as the
+                // exit signal: when the ServerImpl/ReadModel drop their Arc we stop.
+                if Arc::strong_count(&store) <= 1 {
+                    break;
+                }
+                match ReadStore::adaptive_prune_once(
+                    &mut conn,
+                    high_bytes,
+                    low_bytes,
+                    BATCH,
+                    MAX_DELETES_PER_WAKE,
+                ) {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!("adaptive retention: evicted {n} terminal instances")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("adaptive retention prune failed: {e}"),
+                }
+            }
+        })
+        .expect("spawn read-model pruner thread");
 }
 
 impl AsRef<ServerImpl> for ServerImpl {
@@ -1414,24 +1452,6 @@ enum ShardRetention {
 /// backlog). A backlog is worked down across successive sweeps; steady-state
 /// sweeps delete far fewer than this cap.
 const PRUNE_BATCH_MAX: usize = 16_384;
-
-/// Computes the adaptive-retention keep target (number of terminal instances to
-/// retain) for a shard, or `None` to prune nothing. Triggers only once the
-/// allocated file (`file_bytes`) reaches the budget; sizes the target from live
-/// data so pruned pages are reused and the file plateaus near `high_bytes`
-/// rather than growing. Pure, so it can be unit-tested without a live store.
-fn adaptive_keep_target(
-    high_bytes: u64,
-    file_bytes: u64,
-    live_bytes: u64,
-    rows: u64,
-) -> Option<usize> {
-    if file_bytes < high_bytes {
-        return None;
-    }
-    let per = (live_bytes / rows.max(1)).max(1);
-    Some(((high_bytes / 8 * 7) / per).max(1) as usize)
-}
 
 /// Resolves the read-model retention policy from the environment.
 ///
@@ -9314,24 +9334,6 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod clustered_startup_tests {
     use super::*;
-
-    #[test]
-    fn adaptive_keep_target_triggers_and_sizes_from_live_data() {
-        let high = 1024 * 1024 * 1024; // 1 GiB budget
-        // Under budget: prune nothing.
-        assert_eq!(adaptive_keep_target(high, high - 1, high / 2, 1000), None);
-        // At/over budget: keep ~7/8 of the budget worth of instances at the
-        // observed per-instance size. Here live=512 MiB over 1000 rows =>
-        // ~512 KiB/instance; 7/8 GiB / that ~= 1750.
-        let per = (high / 2) / 1000;
-        let expect = ((high / 8 * 7) / per) as usize;
-        assert_eq!(
-            adaptive_keep_target(high, high, high / 2, 1000),
-            Some(expect)
-        );
-        // Never returns 0 (which would mean "unbounded"): floors at 1.
-        assert_eq!(adaptive_keep_target(high, high, high, 1), Some(1));
-    }
 
     #[test]
     fn spill_default_scales_with_memory_limit() {

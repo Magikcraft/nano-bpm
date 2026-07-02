@@ -20,7 +20,7 @@
 //! reads still work while nothing is persisted.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
@@ -270,6 +270,73 @@ pub struct VariableRow {
     pub process_definition_key: String,
 }
 
+/// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header:
+/// `file_bytes = page_count × page_size` (the whole allocated file, freelist
+/// included) and `live_bytes = (page_count − freelist_count) × page_size` (the
+/// pages holding actual data). All three PRAGMAs are O(1) header reads, so this
+/// is cheap enough for the pruner's hot loop.
+fn page_stats(conn: &Connection) -> (u64, u64) {
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let freelist: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap_or(4096);
+    let ps = page_size.max(0) as u64;
+    let file = page_count.max(0) as u64 * ps;
+    let live = (page_count - freelist).max(0) as u64 * ps;
+    (file, live)
+}
+
+/// Evicts up to `batch` of the **oldest** terminal instances (and their child
+/// rows) in a single small transaction, returning how many were deleted.
+///
+/// Unlike [`ReadStore::prune_terminal_instances`] this takes no keep-count and
+/// does **no `OFFSET` scan**: `ORDER BY key ASC LIMIT batch` walks the primary
+/// key index from the oldest key, and since the oldest instances are the ones
+/// that completed long ago it collects a full batch after scanning ~`batch`
+/// rows (plus any still-active stragglers). That makes each sweep O(batch)
+/// rather than O(keep_target), so the decoupled pruner can outpace inserts even
+/// while the exporter saturates the writer. Operates on a caller-owned
+/// connection (the pruner's second connection to the shard) so it never blocks
+/// the exporter's mutex; the two serialize only at SQLite's write lock, briefly,
+/// per small batch.
+fn prune_oldest_terminal(conn: &mut Connection, batch: usize) -> rusqlite::Result<usize> {
+    if batch == 0 {
+        return Ok(0);
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS _evict(key INTEGER PRIMARY KEY);
+         DELETE FROM _evict;",
+    )?;
+    let evicted = tx.execute(
+        "INSERT INTO _evict(key) \
+         SELECT key FROM process_instances WHERE state IN (1, 2) \
+         ORDER BY key ASC LIMIT ?1",
+        params![batch as i64],
+    )?;
+    if evicted == 0 {
+        tx.commit()?;
+        return Ok(0);
+    }
+    for table in ["variables", "jobs", "incidents", "user_tasks"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE instance_key IN (SELECT key FROM _evict)"),
+            [],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM process_instances WHERE key IN (SELECT key FROM _evict)",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(evicted)
+}
+
 /// The read model. Wraps a single SQLite connection behind a mutex: SQLite
 /// serializes writes anyway, and this keeps the projection (exporter thread) and
 /// the queries (request handlers) on one shared database — including for the
@@ -278,6 +345,11 @@ pub struct VariableRow {
 /// with engine writes.
 pub struct ReadStore {
     conn: Mutex<Connection>,
+    /// The shard's on-disk path (None for `:memory:`). Retained so the decoupled
+    /// adaptive pruner can open its own second connection to the same WAL file and
+    /// evict on an independent schedule, rather than competing for CPU with
+    /// projection inside the single exporter thread.
+    path: Option<PathBuf>,
 }
 
 impl ReadStore {
@@ -309,6 +381,7 @@ impl ReadStore {
         }
         let store = Self {
             conn: Mutex::new(conn),
+            path: path.map(|p| p.to_path_buf()),
         };
         store.ensure_schema()?;
         // A persistent store whose schema already matched is opened without any
@@ -517,25 +590,67 @@ impl ReadStore {
     /// (`page_count × page_size`, including freelist pages SQLite keeps for
     /// reuse and does not return to the OS without `VACUUM`); `live_bytes`
     /// excludes the freelist (`(page_count − freelist_count) × page_size`) and
-    /// tracks the actual data. The adaptive retention watermark triggers on
-    /// `file_bytes` (when the file stops fitting the budget) and sizes its keep
-    /// target from `live_bytes` (a stable per-instance estimate), so pruned
-    /// pages are reused by new inserts and the file plateaus instead of growing.
+    /// tracks the actual data. Adaptive retention keeps `live_bytes` near its
+    /// budget by evicting old terminal instances; `file_bytes` stays at the
+    /// high-watermark (freed pages are reused, not returned to the OS) and so
+    /// plateaus rather than growing without bound.
     pub fn db_page_stats(&self) -> (u64, u64) {
         let conn = self.conn.lock().expect("read store poisoned");
-        let page_count: i64 = conn
-            .query_row("PRAGMA page_count", [], |r| r.get(0))
-            .unwrap_or(0);
-        let freelist: i64 = conn
-            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-            .unwrap_or(0);
-        let page_size: i64 = conn
-            .query_row("PRAGMA page_size", [], |r| r.get(0))
-            .unwrap_or(4096);
-        let ps = page_size.max(0) as u64;
-        let file = page_count.max(0) as u64 * ps;
-        let live = (page_count - freelist).max(0) as u64 * ps;
-        (file, live)
+        page_stats(&conn)
+    }
+
+    /// Opens a second connection to this shard's database file for the decoupled
+    /// adaptive pruner (see [`prune_oldest_terminal`]). Returns `Ok(None)` for an
+    /// in-memory store (a second connection would be a distinct empty database),
+    /// so the caller keeps pruning inline in that case. WAL mode lets this
+    /// connection's small delete transactions interleave with the exporter's
+    /// insert transactions at SQLite's write-lock granularity; `busy_timeout`
+    /// makes each side wait for the lock rather than erroring under contention.
+    pub fn prune_connection(&self) -> rusqlite::Result<Option<Connection>> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(None);
+        };
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Some(conn))
+    }
+
+    /// Runs one adaptive-prune wake on the pruner's own `conn`. Cheap when under
+    /// budget: a single O(1) `page_stats` read and return. When `live_bytes`
+    /// reaches `high_bytes`, evicts the oldest terminal instances in `batch`
+    /// chunks until `live_bytes` falls to `low_bytes` (hysteresis prevents
+    /// per-insert thrashing), or `max_deletes` rows have been evicted this wake
+    /// (bounds how long the write lock is held away from the exporter), or no
+    /// terminal instances remain. Returns the number evicted; checkpoint-truncates
+    /// the WAL if it deleted anything so freed pages do not accumulate there.
+    pub fn adaptive_prune_once(
+        conn: &mut Connection,
+        high_bytes: u64,
+        low_bytes: u64,
+        batch: usize,
+        max_deletes: usize,
+    ) -> rusqlite::Result<usize> {
+        let (_, live) = page_stats(conn);
+        if live < high_bytes {
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        while total < max_deletes {
+            let (_, live) = page_stats(conn);
+            if live <= low_bytes {
+                break;
+            }
+            let want = batch.min(max_deletes - total);
+            let evicted = prune_oldest_terminal(conn, want)?;
+            if evicted == 0 {
+                break;
+            }
+            total += evicted;
+        }
+        if total > 0 {
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
+        Ok(total)
     }
 
     /// Total number of process instances (active + terminal) in this shard, via
@@ -1728,6 +1843,71 @@ mod definition_xml_tests {
 
         // Re-pruning at the same cap is a no-op (nothing beyond the cap).
         assert_eq!(store.prune_terminal_instances(2, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn adaptive_prune_once_evicts_oldest_terminal_in_bounded_batches() {
+        // File-backed so the pruner can open its own second connection.
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-pruner-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        // 5 terminal (keys 1..=5) + 2 active (100, 101).
+        for k in 1..=5u64 {
+            let created = created_event(k);
+            let done = Event::ProcessInstanceCompleted { instance_key: k };
+            store.export(&[&created, &done]).unwrap();
+        }
+        for k in [100u64, 101] {
+            store.export(&[&created_event(k)]).unwrap();
+        }
+        let mut conn = store.prune_connection().unwrap().expect("file-backed");
+
+        // Under budget (huge high-water): a cheap no-op, evicts nothing.
+        assert_eq!(
+            ReadStore::adaptive_prune_once(&mut conn, u64::MAX, u64::MAX, 4096, 4096).unwrap(),
+            0
+        );
+        assert_eq!(store.instance_count(), 7);
+
+        // Over budget (high=low=1 forces eviction), capped at 2 deletes this wake:
+        // the OLDEST two terminal (keys 1, 2) go first.
+        assert_eq!(
+            ReadStore::adaptive_prune_once(&mut conn, 1, 1, 4096, 2).unwrap(),
+            2
+        );
+        assert!(store.process_instance(1).is_none());
+        assert!(store.process_instance(2).is_none());
+        assert!(store.process_instance(3).is_some());
+        assert_eq!(store.instance_count(), 5);
+
+        // Next wake with a generous cap drains the remaining terminal (3,4,5)…
+        assert_eq!(
+            ReadStore::adaptive_prune_once(&mut conn, 1, 1, 4096, 4096).unwrap(),
+            3
+        );
+        // …but never the active instances.
+        assert!(store.process_instance(100).is_some());
+        assert!(store.process_instance(101).is_some());
+        assert_eq!(store.active_instance_count(), 2);
+        assert_eq!(store.instance_count(), 2);
+
+        // Nothing terminal left: a no-op even while "over budget".
+        assert_eq!(
+            ReadStore::adaptive_prune_once(&mut conn, 1, 1, 4096, 4096).unwrap(),
+            0
+        );
+
+        drop(conn);
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[test]
