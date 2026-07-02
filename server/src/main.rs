@@ -161,6 +161,23 @@ pub struct ServerImpl {
     /// clean retry signal. Durability/at-least-once are unaffected (a shed create
     /// is never journaled).
     admission_max_create_queue: usize,
+    /// Memory-pressure admission watermark in bytes (0 = off). When set,
+    /// `createProcessInstance` is shed (503 `RESOURCE_EXHAUSTED`) while the
+    /// process's resident memory (`mem_pressure_bytes`, sampled by a background
+    /// tick) is at or above this value, so the transient live heap of in-flight
+    /// large-variable payloads — request bodies, event serialization, journal
+    /// write buffers, replication and exporter batches — can drain before more
+    /// creates are admitted. This bounds the RSS balloon a worker-starved
+    /// large-payload burst produces (measured 12–16 GB) at the cost of burst
+    /// throughput, trading throughput for a steady memory ceiling. Default is a
+    /// fraction of the detected cgroup/host memory limit; `NANOBPMN_MEM_WATERMARK_MB`
+    /// overrides it and `NANOBPMN_MEM_WATERMARK=off` disables it. Durability and
+    /// at-least-once are unaffected: a shed create is never journaled.
+    mem_watermark_bytes: u64,
+    /// Cached resident-memory sample (bytes) refreshed by a background tick every
+    /// ~250 ms, so the hot admission path reads one relaxed atomic instead of
+    /// advancing jemalloc's stats epoch per create. Zero until the first sample.
+    mem_pressure_bytes: Arc<AtomicU64>,
     /// Command-stream uplinks to this node's cluster peers, built from the
     /// [`Topology`]. Empty for a single-node cluster (zero overhead). The
     /// forwarding seam consults it to reach a partition's owning node.
@@ -362,6 +379,13 @@ impl ServerImpl {
                 "admission control: on, max create-queue depth {admission_max_create_queue}"
             );
         }
+        let mem_watermark_bytes = mem_watermark_bytes_from_env();
+        if mem_watermark_bytes > 0 {
+            tracing::info!(
+                "admission control: memory-pressure watermark {:.0} MiB (shed creates above)",
+                mem_watermark_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
 
         // Optional spill tiers, sharing one disk-backed store (one file, one WAL,
         // one durability story). Variable spill sheds the variables of a large
@@ -482,6 +506,8 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             admission_max_backlog,
             admission_max_create_queue,
+            mem_watermark_bytes,
+            mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1321,6 +1347,55 @@ fn admission_max_create_queue_from_env() -> usize {
     std::env::var("NANOBPMN_ADMISSION_MAX_CREATE_QUEUE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Default memory-pressure admission watermark as a percentage of the detected
+/// memory limit. Higher than the spill high-water (65%): spill should engage
+/// first to offload resting variables to disk, and this last-resort create-shed
+/// only bites when live memory keeps climbing past that toward an OOM. Leaves
+/// ~20% headroom for non-jemalloc RSS (thread stacks, SQLite page cache, kernel
+/// socket buffers) before the OOM killer would engage.
+const MEM_WATERMARK_FRACTION_PCT: u64 = 80;
+/// Never auto-derive a watermark below this — on a tiny limit a sub-256 MiB
+/// ceiling would shed against the engine's own baseline working set.
+const MIN_MEM_WATERMARK_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Computes the default memory-pressure watermark from a detected memory
+/// `limit`: a fixed fraction of the limit, floored at [`MIN_MEM_WATERMARK_BYTES`]
+/// and never above the limit itself. Pure so it can be unit-tested without
+/// touching the filesystem.
+fn mem_watermark_default_from_limit(limit_bytes: u64) -> u64 {
+    let frac = limit_bytes / 100 * MEM_WATERMARK_FRACTION_PCT;
+    frac.max(MIN_MEM_WATERMARK_BYTES).min(limit_bytes)
+}
+
+/// Resolves the memory-pressure admission watermark in bytes, or `0` (off).
+///
+/// - `NANOBPMN_MEM_WATERMARK=off` (or `0`): disabled.
+/// - `NANOBPMN_MEM_WATERMARK_MB=<n>`: explicit watermark in MiB (clamped to a
+///   floor of [`MIN_MEM_WATERMARK_BYTES`]).
+/// - unset / `adaptive` / `on`: [`MEM_WATERMARK_FRACTION_PCT`]% of the detected
+///   cgroup/host memory limit, or off when no limit can be read (e.g. non-Linux,
+///   where `memory::stats` is unavailable anyway).
+fn mem_watermark_bytes_from_env() -> u64 {
+    if let Ok(mb) = std::env::var("NANOBPMN_MEM_WATERMARK_MB")
+        && let Ok(n) = mb.trim().parse::<u64>()
+    {
+        if n == 0 {
+            return 0;
+        }
+        return (n.saturating_mul(1024 * 1024)).max(MIN_MEM_WATERMARK_BYTES);
+    }
+    if let Ok(v) = std::env::var("NANOBPMN_MEM_WATERMARK") {
+        let v = v.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "off" | "0" | "false" | "no") {
+            return 0;
+        }
+        // "on"/"adaptive"/anything else falls through to the adaptive default.
+    }
+    detect_memory_limit_bytes()
+        .map(mem_watermark_default_from_limit)
         .unwrap_or(0)
 }
 
@@ -7896,6 +7971,28 @@ impl ServerImpl {
                     .to_string(),
             );
         }
+        // Memory-pressure gate: shed while resident memory is at/above the
+        // watermark, so the transient live heap of in-flight large-variable
+        // payloads (request bodies, event serialization, journal write buffers,
+        // replication and exporter batches) can drain before more creates are
+        // admitted. This is the last-resort rail beyond variable-spill: spill
+        // offloads resting variables to disk, but the payloads still flow as full
+        // live copies through ingest -> journal -> replication -> projection, and
+        // a worker-starved large-payload burst can pile those up faster than they
+        // drain (measured 12-16 GB RSS). Reads one cached atomic (refreshed by the
+        // mem-pressure tick) so the hot path never touches jemalloc's stats epoch.
+        // A shed create is never journaled, so durability/at-least-once are intact.
+        if self.mem_watermark_bytes > 0 {
+            let resident = self.mem_pressure_bytes.load(Ordering::Relaxed);
+            if resident >= self.mem_watermark_bytes {
+                return Some(format!(
+                    "Admission control: resident memory {} MiB at or above the \
+                     configured watermark of {} MiB. Retry after a backoff.",
+                    resident / (1024 * 1024),
+                    self.mem_watermark_bytes / (1024 * 1024),
+                ));
+            }
+        }
         None
     }
 
@@ -8675,7 +8772,9 @@ fn gateway_usage() -> String {
          PORT                  TCP port to listen on (default 8080)\n  \
          NANOBPMN_DATA_DIR     Directory for the journal + read-model database\n  \
          NANOBPMN_PARTITIONS   Partition count for the engine\n  \
-         NANOBPMN_IDLE_PURGE_MS  Idle memory-purge interval ms (0 = off)\n",
+         NANOBPMN_IDLE_PURGE_MS  Idle memory-purge interval ms (0 = off)\n  \
+         NANOBPMN_MEM_WATERMARK_MB  Shed creates above this resident MiB (off, or a\n                        \
+         fraction of detected RAM when unset; NANOBPMN_MEM_WATERMARK=off disables)\n",
         name = GATEWAY_NAME,
         ver = env!("NANOBPM_VERSION"),
     )
@@ -9131,6 +9230,25 @@ async fn main() {
     // subscription opens a fired timer advances a token into (no-op single-node).
     let tick_server = server.clone();
 
+    // Memory-pressure sampler: refresh the cached resident-memory gauge the
+    // admission path reads, so `admission_shed` never advances jemalloc's stats
+    // epoch per create. Captured here (before `server` is moved into the router)
+    // and only armed when a watermark is set; ~250 ms catches a large-payload
+    // burst's climb at negligible overhead.
+    if server.mem_watermark_bytes > 0 {
+        let pressure = server.mem_pressure_bytes.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Some(bytes) = memory::resident_bytes() {
+                    pressure.store(bytes as u64, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
     // The unified bidirectional command stream (WebSocket) shares the engine via a
     // clone of `server` and a registry of connections; a single dispatcher pushes
     // jobs and the existing periodic tick reclaims expired leases.
@@ -9531,6 +9649,29 @@ mod clustered_startup_tests {
         let big = 64 * 1024 * 1024 * 1024; // 64 GiB
         assert_eq!(spill_default_from_limit(big), big / 100 * 65);
         assert!(spill_default_from_limit(big) > MIN_SPILL_HIGH_BYTES);
+    }
+
+    #[test]
+    fn mem_watermark_default_scales_with_memory_limit() {
+        // 80% of the limit, above the floor.
+        let limit = 8 * 1024 * 1024 * 1024; // 8 GiB
+        assert_eq!(
+            mem_watermark_default_from_limit(limit),
+            limit / 100 * MEM_WATERMARK_FRACTION_PCT
+        );
+
+        // 64 GiB host: 80% = ~51 GiB, well above the floor and below the limit,
+        // so a normal working set never sheds while a runaway burst does.
+        let big = 64 * 1024 * 1024 * 1024;
+        let wm = mem_watermark_default_from_limit(big);
+        assert_eq!(wm, big / 100 * MEM_WATERMARK_FRACTION_PCT);
+        assert!(wm > MIN_MEM_WATERMARK_BYTES);
+        assert!(wm < big);
+
+        // Tiny limit: 80% below the 256 MiB floor -> floored, but never above
+        // the limit itself.
+        let tiny = 128 * 1024 * 1024; // 128 MiB
+        assert_eq!(mem_watermark_default_from_limit(tiny), tiny);
     }
 
     /// Builds an in-memory clustered `ServerImpl` for `node_id` of a 2-node,
