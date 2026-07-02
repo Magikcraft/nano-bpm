@@ -63,6 +63,25 @@ impl Value {
         }
     }
 
+    /// A cheap O(n) estimate of this value's heap payload in bytes. Counts string
+    /// and key bytes plus a small fixed per-node overhead; the exact allocator
+    /// footprint is not needed — this is only a size proxy proportional to the
+    /// payload, used to meter in-flight create payloads for byte-aware admission
+    /// control. Scalars fold to a small constant; strings/lists/maps recurse.
+    pub fn approx_bytes(&self) -> u64 {
+        match self {
+            Value::Null | Value::Bool(_) | Value::Int(_) | Value::Double(_) => 8,
+            Value::Str(s) => 16 + s.len() as u64,
+            Value::List(items) => 16 + items.iter().map(Value::approx_bytes).sum::<u64>(),
+            Value::Map(entries) => {
+                16 + entries
+                    .iter()
+                    .map(|(k, v)| k.len() as u64 + v.approx_bytes())
+                    .sum::<u64>()
+            }
+        }
+    }
+
     /// Builds a numeric value, narrowing to [`Value::Int`] when the number is a
     /// finite integer and to [`Value::Null`] when it is not finite (FEEL has no
     /// infinity/NaN). This keeps integral arithmetic results rendering cleanly.
@@ -1197,3 +1216,31 @@ impl std::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+#[cfg(test)]
+mod approx_bytes_tests {
+    use super::Value;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn approx_bytes_scales_with_string_payload() {
+        // Scalars fold to a small constant.
+        assert_eq!(Value::Null.approx_bytes(), 8);
+        assert_eq!(Value::Int(42).approx_bytes(), 8);
+        assert_eq!(Value::Bool(true).approx_bytes(), 8);
+
+        // A string's estimate tracks its byte length (plus fixed overhead).
+        let blob = "x".repeat(50_000);
+        let v = Value::Str(blob.clone());
+        assert_eq!(v.approx_bytes(), 16 + blob.len() as u64);
+
+        // Nested map/list sum their members' bytes, so a large payload dominates.
+        let mut m = BTreeMap::new();
+        m.insert("payload".to_string(), Value::Str(blob.clone()));
+        m.insert("n".to_string(), Value::Int(1));
+        let map = Value::Map(m);
+        let got = map.approx_bytes();
+        assert!(got >= blob.len() as u64, "map estimate {got} covers the blob");
+        assert!(got < blob.len() as u64 + 200, "no runaway overhead: {got}");
+    }
+}

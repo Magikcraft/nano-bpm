@@ -178,6 +178,26 @@ pub struct ServerImpl {
     /// ~250 ms, so the hot admission path reads one relaxed atomic instead of
     /// advancing jemalloc's stats epoch per create. Zero until the first sample.
     mem_pressure_bytes: Arc<AtomicU64>,
+    /// Lock-free gauge of the payload bytes of creates currently in the
+    /// submit→apply window (incremented by a create's estimated variable-payload
+    /// size when it is submitted to the engine thread, decremented the instant it
+    /// is applied). This is the *precise, proactive* memory rail: with
+    /// completion-priority, worker-starved creates pile up in the engine's `Low`
+    /// (creation) mailbox — an unbounded queue of closures each capturing a full
+    /// copy of its variables — so under a large-payload flood this queue is the
+    /// dominant live-heap balloon. The count-based `processing`/`backlog` gates
+    /// permit gigabytes here when payloads are large; this byte gauge bounds it
+    /// directly, independent of payload size. Zero when idle.
+    pipeline_bytes: Arc<AtomicU64>,
+    /// In-flight create-payload byte watermark (0 = off). When set,
+    /// `createProcessInstance` is shed (503 `RESOURCE_EXHAUSTED`) once
+    /// `pipeline_bytes` is at or above it, bounding the engine-mailbox balloon
+    /// under a worker-starved large-payload burst *before* it inflates resident
+    /// memory — a tighter, payload-specific bound than the coarse
+    /// `mem_watermark_bytes` OOM backstop. Adaptive by default (a small fraction
+    /// of the detected memory limit); `NANOBPMN_PIPELINE_BYTES_MB` overrides,
+    /// `off` disables. Durability is unaffected: a shed create is never journaled.
+    pipeline_bytes_watermark: u64,
     /// Command-stream uplinks to this node's cluster peers, built from the
     /// [`Topology`]. Empty for a single-node cluster (zero overhead). The
     /// forwarding seam consults it to reach a partition's owning node.
@@ -273,6 +293,27 @@ impl<'a> ProcessingGuard<'a> {
 impl Drop for ProcessingGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// RAII meter for the in-flight create-payload byte gauge: adds `bytes` on entry
+/// and subtracts the same on drop, so every exit path (success, error, or a
+/// dropped/cancelled request future) releases its bytes exactly once. Held across
+/// the same submit→apply window as [`ProcessingGuard`], so the gauge measures the
+/// payload bytes resident in the engine's creation mailbox rather than how long a
+/// client blocks for completion.
+struct ByteGuard<'a>(&'a AtomicU64, u64);
+
+impl<'a> ByteGuard<'a> {
+    fn enter(gauge: &'a AtomicU64, bytes: u64) -> Self {
+        gauge.fetch_add(bytes, Ordering::Relaxed);
+        ByteGuard(gauge, bytes)
+    }
+}
+
+impl Drop for ByteGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::Relaxed);
     }
 }
 
@@ -384,6 +425,15 @@ impl ServerImpl {
             tracing::info!(
                 "admission control: memory-pressure watermark {:.0} MiB (shed creates above)",
                 mem_watermark_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
+
+        let pipeline_bytes_watermark = pipeline_bytes_watermark_from_env();
+        if pipeline_bytes_watermark > 0 {
+            tracing::info!(
+                "admission control: in-flight create-payload watermark {:.0} MiB \
+                 (shed creates above)",
+                pipeline_bytes_watermark as f64 / (1024.0 * 1024.0),
             );
         }
 
@@ -508,6 +558,8 @@ impl ServerImpl {
             admission_max_create_queue,
             mem_watermark_bytes,
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
+            pipeline_bytes: Arc::new(AtomicU64::new(0)),
+            pipeline_bytes_watermark,
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1399,6 +1451,59 @@ fn mem_watermark_bytes_from_env() -> u64 {
         .unwrap_or(0)
 }
 
+/// Default in-flight create-payload watermark as a percentage of the detected
+/// memory limit. Small: this bounds only the *transient* submit→apply payload
+/// backlog (the engine `Low`-mailbox balloon), not the resting working set, so a
+/// few percent of RAM is ample headroom for healthy large-payload flow (which
+/// drains through submit→apply in tens of µs and never accumulates) while capping
+/// a worker-starved burst well below the coarse `mem_watermark` OOM backstop.
+const PIPELINE_BYTES_FRACTION_PCT: u64 = 8;
+/// Never auto-derive a watermark below this — a sub-512 MiB ceiling would shed
+/// against legitimate concurrent large-payload flow on a small host.
+const MIN_PIPELINE_BYTES: u64 = 512 * 1024 * 1024;
+/// Never auto-derive a watermark above this — beyond a few GB of *in-flight*
+/// create payload the coarse `mem_watermark` OOM rail is the right backstop.
+const MAX_PIPELINE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Computes the default in-flight create-payload watermark from a detected memory
+/// `limit`: [`PIPELINE_BYTES_FRACTION_PCT`]% of the limit, clamped to
+/// `[MIN_PIPELINE_BYTES, MAX_PIPELINE_BYTES]` and never above the limit itself.
+/// Pure so it can be unit-tested without touching the environment.
+fn pipeline_bytes_watermark_default_from_limit(limit_bytes: u64) -> u64 {
+    let frac = limit_bytes / 100 * PIPELINE_BYTES_FRACTION_PCT;
+    frac.clamp(MIN_PIPELINE_BYTES, MAX_PIPELINE_BYTES)
+        .min(limit_bytes)
+}
+
+/// Resolves the in-flight create-payload admission watermark in bytes, or `0`
+/// (off).
+///
+/// - `NANOBPMN_PIPELINE_BYTES=off` (or `0`): disabled.
+/// - `NANOBPMN_PIPELINE_BYTES_MB=<n>`: explicit watermark in MiB (0 disables).
+/// - unset / `adaptive` / `on`: [`PIPELINE_BYTES_FRACTION_PCT`]% of the detected
+///   cgroup/host memory limit, or off when no limit can be read (e.g. non-Linux,
+///   where the metering still runs but never sheds).
+fn pipeline_bytes_watermark_from_env() -> u64 {
+    if let Ok(mb) = std::env::var("NANOBPMN_PIPELINE_BYTES_MB")
+        && let Ok(n) = mb.trim().parse::<u64>()
+    {
+        if n == 0 {
+            return 0;
+        }
+        return n.saturating_mul(1024 * 1024);
+    }
+    if let Ok(v) = std::env::var("NANOBPMN_PIPELINE_BYTES") {
+        let v = v.trim().to_ascii_lowercase();
+        if matches!(v.as_str(), "off" | "0" | "false" | "no") {
+            return 0;
+        }
+        // "on"/"adaptive"/anything else falls through to the adaptive default.
+    }
+    detect_memory_limit_bytes()
+        .map(pipeline_bytes_watermark_default_from_limit)
+        .unwrap_or(0)
+}
+
 /// How many terminal (Completed/Terminated) process instances the read model
 /// retains before the oldest are evicted with all their dependent rows
 /// (variables, jobs, incidents, user tasks). Bounds read-model memory to the
@@ -2049,7 +2154,9 @@ impl ServerImpl {
         let tags_for_response = tags_vec.clone();
         let business_id_for_response = business_id_str.clone();
         let outcome: Result<CreateOk, Box<Resp>> = {
+            let payload_bytes = engine_vars_bytes(&variables);
             let _processing = ProcessingGuard::enter(&self.processing);
+            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
             self.engine
                 .for_create()
                 .with_low(move |engine| {
@@ -4246,7 +4353,9 @@ impl ServerImpl {
                     },
                 )
         } else {
+            let payload_bytes = engine_vars_bytes(&variables);
             let _processing = ProcessingGuard::enter(&self.processing);
+            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
             self.engine
                 .for_create()
                 .with_low(move |engine| {
@@ -7182,7 +7291,9 @@ impl ServerImpl {
             (nanobpmn_engine_core::Key, bool, Vec<Event>, Commit),
             (u16, String),
         > = {
+            let payload_bytes = engine_vars_bytes(&variables);
             let _processing = ProcessingGuard::enter(&self.processing);
+            let _bytes = ByteGuard::enter(&self.pipeline_bytes, payload_bytes);
             self.engine
                 .for_create()
                 .with_low(move |engine| {
@@ -7971,6 +8082,25 @@ impl ServerImpl {
                     .to_string(),
             );
         }
+        // In-flight create-payload gate: shed once the estimated payload bytes of
+        // creates in the submit→apply window are at/above the watermark. This is
+        // the precise, proactive memory rail — it bounds the engine `Low`-mailbox
+        // balloon (an unbounded queue of creation closures each holding a full
+        // copy of its variables) under a worker-starved large-payload burst
+        // *before* those copies inflate resident memory, so it bites far earlier
+        // and more cheaply than the coarse resident-memory backstop below. A shed
+        // create is never journaled, so durability/at-least-once are intact.
+        if self.pipeline_bytes_watermark > 0 {
+            let bytes = self.pipeline_bytes.load(Ordering::Relaxed);
+            if bytes >= self.pipeline_bytes_watermark {
+                return Some(format!(
+                    "Admission control: in-flight create payload {} MiB at or above the \
+                     configured watermark of {} MiB. Retry after a backoff.",
+                    bytes / (1024 * 1024),
+                    self.pipeline_bytes_watermark / (1024 * 1024),
+                ));
+            }
+        }
         // Memory-pressure gate: shed while resident memory is at/above the
         // watermark, so the transient live heap of in-flight large-variable
         // payloads (request bodies, event serialization, journal write buffers,
@@ -8452,6 +8582,15 @@ fn peer_detail(res: &crate::peer::PeerResult) -> String {
         .unwrap_or_else(|| format!("peer returned status {}", res.status))
 }
 
+/// Cheap O(n) byte-size proxy for a create's engine-`Value` variable map, used to
+/// meter in-flight create payloads for byte-aware admission control. Sums each
+/// key's length plus its value's [`Value::approx_bytes`].
+fn engine_vars_bytes(vars: &std::collections::HashMap<String, Value>) -> u64 {
+    vars.iter()
+        .map(|(k, v)| k.len() as u64 + v.approx_bytes())
+        .sum()
+}
+
 /// Converts a JSON value into the engine [`Value`] tree, preserving numbers
 /// (integral vs. decimal), lists and objects so FEEL can operate on them.
 pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
@@ -8774,7 +8913,9 @@ fn gateway_usage() -> String {
          NANOBPMN_PARTITIONS   Partition count for the engine\n  \
          NANOBPMN_IDLE_PURGE_MS  Idle memory-purge interval ms (0 = off)\n  \
          NANOBPMN_MEM_WATERMARK_MB  Shed creates above this resident MiB (off, or a\n                        \
-         fraction of detected RAM when unset; NANOBPMN_MEM_WATERMARK=off disables)\n",
+         fraction of detected RAM when unset; NANOBPMN_MEM_WATERMARK=off disables)\n  \
+         NANOBPMN_PIPELINE_BYTES_MB  Shed creates above this in-flight create-payload\n                        \
+         MiB (adaptive fraction of RAM when unset; NANOBPMN_PIPELINE_BYTES=off disables)\n",
         name = GATEWAY_NAME,
         ver = env!("NANOBPM_VERSION"),
     )
@@ -9235,16 +9376,23 @@ async fn main() {
     // epoch per create. Captured here (before `server` is moved into the router)
     // and only armed when a watermark is set; ~250 ms catches a large-payload
     // burst's climb at negligible overhead.
-    if server.mem_watermark_bytes > 0 {
+    if server.mem_watermark_bytes > 0 || server.pipeline_bytes_watermark > 0 {
         let pressure = server.mem_pressure_bytes.clone();
+        let pipeline = server.pipeline_bytes.clone();
+        let sample_resident = server.mem_watermark_bytes > 0;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if let Some(bytes) = memory::resident_bytes() {
+                if sample_resident
+                    && let Some(bytes) = memory::resident_bytes()
+                {
                     pressure.store(bytes as u64, Ordering::Relaxed);
                 }
+                // Publish the in-flight create-payload gauge for observability
+                // (off the hot path); the gate itself reads the atomic directly.
+                metrics::set_pipeline_bytes(pipeline.load(Ordering::Relaxed));
             }
         });
     }
@@ -9672,6 +9820,34 @@ mod clustered_startup_tests {
         // the limit itself.
         let tiny = 128 * 1024 * 1024; // 128 MiB
         assert_eq!(mem_watermark_default_from_limit(tiny), tiny);
+    }
+
+    #[test]
+    fn pipeline_bytes_watermark_default_scales_and_clamps() {
+        // 64 GiB host: 8% = ~5.1 GiB, clamped to the 8 GiB ceiling? No — 8% of
+        // 64 GiB is 5.12 GiB, within [512 MiB, 8 GiB], so it passes through.
+        let big = 64 * 1024 * 1024 * 1024;
+        let wm = pipeline_bytes_watermark_default_from_limit(big);
+        assert_eq!(wm, big / 100 * PIPELINE_BYTES_FRACTION_PCT);
+        assert!((MIN_PIPELINE_BYTES..=MAX_PIPELINE_BYTES).contains(&wm));
+        // Far below the coarse OOM watermark (80% of RAM), so the two rails are
+        // ordered: the precise byte gate bites well before the resident backstop.
+        assert!(wm < mem_watermark_default_from_limit(big));
+
+        // Huge host: 8% would exceed the 8 GiB ceiling -> clamped down.
+        let huge = 256 * 1024 * 1024 * 1024; // 256 GiB
+        assert_eq!(pipeline_bytes_watermark_default_from_limit(huge), MAX_PIPELINE_BYTES);
+
+        // Small host: 8% below the 512 MiB floor -> floored up, but never above
+        // the limit itself.
+        let small = 2 * 1024 * 1024 * 1024; // 2 GiB, 8% = 160 MiB < floor
+        let wsmall = pipeline_bytes_watermark_default_from_limit(small);
+        assert_eq!(wsmall, MIN_PIPELINE_BYTES);
+        assert!(wsmall <= small);
+
+        // Tiny limit below the floor -> capped at the limit, never above it.
+        let tiny = 128 * 1024 * 1024; // 128 MiB
+        assert_eq!(pipeline_bytes_watermark_default_from_limit(tiny), tiny);
     }
 
     /// Builds an in-memory clustered `ServerImpl` for `node_id` of a 2-node,

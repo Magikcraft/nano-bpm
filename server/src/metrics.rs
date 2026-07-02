@@ -37,6 +37,10 @@ struct Metrics {
     bytes_total: IntCounter,
     /// Writes enqueued but not yet fsynced — the live commit-pipeline depth.
     inflight: IntGauge,
+    /// In-flight create-payload bytes in the submit→apply window (the engine
+    /// creation-mailbox balloon). Published by the mem-pressure sampler tick; the
+    /// byte-aware admission gate sheds creates when this crosses its watermark.
+    pipeline_bytes: IntGauge,
     /// Cumulative wall time the writer thread spent blocked in `recv` with no
     /// work (idle). Paired with `writer_busy_seconds`, a delta-scrape gives the
     /// writer's duty cycle: `busy / (busy + idle)`. If idle ≈ 0 the single
@@ -121,6 +125,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let pipeline_bytes = IntGauge::new(
+        "nanobpm_pipeline_bytes",
+        "In-flight create-payload bytes (engine creation-mailbox balloon).",
+    )
+    .expect("valid gauge");
+
     let writer_idle_seconds = prometheus::Counter::new(
         "nanobpm_journal_writer_idle_seconds",
         "Cumulative wall time the journal writer thread was idle (blocked in recv).",
@@ -194,6 +204,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(writes_total.clone())))
         .and(registry.register(Box::new(bytes_total.clone())))
         .and(registry.register(Box::new(inflight.clone())))
+        .and(registry.register(Box::new(pipeline_bytes.clone())))
         .and(registry.register(Box::new(writer_idle_seconds.clone())))
         .and(registry.register(Box::new(writer_busy_seconds.clone())))
         .and(registry.register(Box::new(stream_frames_total.clone())))
@@ -213,6 +224,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         writes_total,
         bytes_total,
         inflight,
+        pipeline_bytes,
         writer_idle_seconds,
         writer_busy_seconds,
         stream_frames_total,
@@ -263,6 +275,12 @@ pub fn inflight_inc() {
 /// `n` durable writes were fsynced and acknowledged (pipeline depth -n).
 pub fn inflight_sub(n: usize) {
     METRICS.inflight.sub(n as i64);
+}
+
+/// Publishes the current in-flight create-payload byte gauge (called from the
+/// mem-pressure sampler tick, off the hot path).
+pub fn set_pipeline_bytes(bytes: u64) {
+    METRICS.pipeline_bytes.set(bytes as i64);
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
