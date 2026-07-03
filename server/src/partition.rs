@@ -472,6 +472,22 @@ impl Partitions {
         self.router.local_for(PartitionId(0))
     }
 
+    /// Sum of resident variable-payload bytes across every local partition — the
+    /// attribution gauge for the burst RSS balloon (does the resident instance
+    /// variable footprint track the jemalloc live-heap peak, or is the balloon
+    /// in-flight pipeline copies instead?). Runs the O(N) scan on each engine
+    /// thread at `Low` priority so it never preempts completion work; awaited
+    /// only by the ~1 Hz mem-pressure sampler, off the hot path.
+    pub async fn resident_variable_bytes_total(&self) -> u64 {
+        let mut total = 0u64;
+        for h in self.all() {
+            total += h
+                .with_low(|j: &mut crate::journal::Journal| j.resident_variable_bytes())
+                .await;
+        }
+        total
+    }
+
     /// All partition handles, for operations that must fan out (job activation,
     /// message correlation, timer ticks, eviction, idle compaction).
     pub fn all(&self) -> &[EngineHandle] {

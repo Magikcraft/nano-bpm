@@ -9479,8 +9479,10 @@ async fn main() {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut tick: u64 = 0;
             loop {
                 interval.tick().await;
+                tick = tick.wrapping_add(1);
                 if sample_resident
                     && let Some(bytes) = memory::resident_bytes()
                 {
@@ -9492,6 +9494,12 @@ async fn main() {
                 // Publish the resident export-backlog gauge (in-flight pipeline
                 // attribution for the RSS balloon); a cheap relaxed sum.
                 metrics::set_exporter_queue_bytes(engine.exporter_queued_bytes_total());
+                // Publish the resident variable-payload gauge (~1 Hz): an O(N)
+                // per-partition scan at Low priority, decisive attribution of the
+                // burst balloon (resident variables vs in-flight pipeline copies).
+                if tick.is_multiple_of(4) {
+                    metrics::set_resident_var_bytes(engine.resident_variable_bytes_total().await);
+                }
             }
         });
     }

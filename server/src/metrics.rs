@@ -75,6 +75,8 @@ struct Metrics {
     raft_log_entries: IntGauge,
     /// Resident read-model export backlog bytes (forwarded but not yet projected).
     exporter_queue_bytes: IntGauge,
+    /// Approx resident instance variable-payload bytes (burst-balloon attribution).
+    resident_var_bytes: IntGauge,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -223,6 +225,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let resident_var_bytes = IntGauge::new(
+        "nanobpm_resident_var_bytes",
+        "Approx resident instance variable-payload bytes across all local partitions (burst-balloon attribution).",
+    )
+    .expect("valid gauge");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -243,6 +251,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_log_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
+        .and(registry.register(Box::new(resident_var_bytes.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -266,6 +275,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_log_bytes,
         raft_log_entries,
         exporter_queue_bytes,
+        resident_var_bytes,
     }
 });
 
@@ -330,6 +340,16 @@ pub fn raft_log_delta(entries_delta: i64, bytes_delta: i64) {
 /// share of the RSS balloon.
 pub fn set_exporter_queue_bytes(bytes: u64) {
     METRICS.exporter_queue_bytes.set(bytes as i64);
+}
+
+/// Publishes the aggregate resident instance variable-payload byte gauge (summed
+/// across local partitions), sampled off the hot path. The decisive attribution
+/// gauge for the burst RSS balloon: compare its peak against
+/// `nanobpm_jemalloc_bytes{kind="allocated"}` — a match means the resident
+/// instance variables ARE the balloon, a large shortfall means the balloon is
+/// in-flight pipeline copies, not resident variables.
+pub fn set_resident_var_bytes(bytes: u64) {
+    METRICS.resident_var_bytes.set(bytes as i64);
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the

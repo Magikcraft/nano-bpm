@@ -294,6 +294,26 @@ impl Engine {
         self.state.instances.len()
     }
 
+    /// Total approximate heap bytes of variables held resident by instances in
+    /// this partition (spilled instances hold an empty map, so they contribute
+    /// ~0). O(N) over the resident set — call it off the hot path (the 250ms
+    /// mem-pressure sampler). This is the decisive attribution gauge for the
+    /// burst balloon: if the cluster-wide sum tracks the jemalloc live-heap
+    /// peak, the resident instance variables ARE the balloon; if it stays far
+    /// below, the balloon is in-flight pipeline copies, not resident variables.
+    pub fn resident_variable_bytes(&self) -> u64 {
+        self.state
+            .instances
+            .values()
+            .map(|i| {
+                i.variables
+                    .values()
+                    .map(crate::model::Value::approx_bytes)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
     /// Whether `instance` (keyed `key`) may have its variables spilled, given the
     /// set of instances that hold an async-resumable token (`guarded`). Shared by
     /// [`spillable_instances`](Engine::spillable_instances) and

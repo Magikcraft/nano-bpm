@@ -1567,6 +1567,14 @@ impl Journal {
     /// once every [`SPILL_CHECK_INTERVAL`] commands rather than on every apply, so
     /// a deep backlog no longer pays an O(N) scan per command (which was quadratic
     /// in the backlog and drove congestion collapse).
+    /// Approximate resident variable-payload bytes held by this partition's
+    /// instances (spilled instances contribute ~0). Attribution gauge for the
+    /// burst RSS balloon — see [`Engine::resident_variable_bytes`]. O(N); called
+    /// off the hot path by the mem-pressure sampler.
+    pub fn resident_variable_bytes(&self) -> u64 {
+        self.engine.resident_variable_bytes()
+    }
+
     fn maybe_spill(&mut self) {
         let Some(cap) = self
             .spill
