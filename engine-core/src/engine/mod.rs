@@ -90,6 +90,22 @@ pub struct Engine {
     /// snapshot, so it never affects replay/snapshot determinism. Defaults to
     /// `false` — the strict single-node/RF=1 behaviour is unchanged.
     lenient_completion: bool,
+    /// When `true`, runtime event application ([`Engine::emit`]) records the
+    /// instances whose variables changed into [`Engine::dirty_vars`] and terminal
+    /// evictions into [`Engine::forgotten_vars`], so a host can checkpoint just
+    /// the delta into an authoritative durable variable store and write a lean
+    /// (control-only) snapshot. Off by default (the full-variable snapshot path is
+    /// unchanged); set by the host from `NANOBPMN_LEAN_SNAPSHOT`. Not part of the
+    /// snapshot — it is pure host-side bookkeeping and never affects determinism.
+    track_dirty_vars: bool,
+    /// Instances whose process-level variables changed since the last
+    /// [`drain_dirty_vars`](Engine::drain_dirty_vars) (i.e. since the last
+    /// snapshot checkpoint). Only populated when [`track_dirty_vars`] is set.
+    dirty_vars: HashSet<Key>,
+    /// Instances evicted (terminal) since the last checkpoint, whose durable
+    /// variable rows must be deleted from the store. Only populated when
+    /// [`track_dirty_vars`] is set.
+    forgotten_vars: HashSet<Key>,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -147,6 +163,9 @@ impl Engine {
             now: 0,
             start_dispatch_rr: 0,
             lenient_completion: false,
+            track_dirty_vars: false,
+            dirty_vars: HashSet::new(),
+            forgotten_vars: HashSet::new(),
         }
     }
 
@@ -242,6 +261,9 @@ impl Engine {
             now: 0,
             start_dispatch_rr: 0,
             lenient_completion: false,
+            track_dirty_vars: false,
+            dirty_vars: HashSet::new(),
+            forgotten_vars: HashSet::new(),
         }
     }
 
@@ -2465,6 +2487,16 @@ impl Engine {
 
     /// Applies an event and records it in the command's event log.
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
+        if self.track_dirty_vars {
+            match &event {
+                Event::ProcessInstanceCreated { instance_key, .. }
+                | Event::VariablesUpdated { instance_key, .. } => {
+                    self.dirty_vars.insert(*instance_key);
+                    self.forgotten_vars.remove(instance_key);
+                }
+                _ => {}
+            }
+        }
         state::apply(&mut self.state, &event);
         log.push(event);
     }

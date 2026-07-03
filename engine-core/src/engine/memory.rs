@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// The variable upserts produced by [`Engine::drain_dirty_vars`]: each dirty,
+/// resident (non-spilled) instance's key paired with a cheap `Arc` clone of its
+/// current variable map, for the host to serialize into the durable var store.
+pub type VarUpserts = Vec<(Key, Arc<HashMap<String, Value>>)>;
+
 impl Engine {
     /// Captures a complete, compact snapshot of this engine: the materialized
     /// [`State`] (already pruned of terminal instances) plus the scalar
@@ -40,10 +45,103 @@ impl Engine {
             now: snapshot.now,
             start_dispatch_rr: snapshot.start_dispatch_rr,
             lenient_completion: false,
+            track_dirty_vars: false,
+            dirty_vars: std::collections::HashSet::new(),
+            forgotten_vars: std::collections::HashSet::new(),
         }
     }
 
-    /// Replays a tail of recorded events **onto an already-restored engine** (e.g.
+    // --- Lean (control-only) snapshot support: authoritative durable var store ---
+    //
+    // When lean-snapshot mode is enabled the periodic snapshot carries only
+    // control state (no variable payloads); variables live in a host-owned
+    // authoritative durable store, written incrementally at each checkpoint from
+    // the dirty set below. See `server/src/varstore.rs` for the store and the
+    // consistency contract with recovery.
+
+    /// Enables/disables dirty-variable tracking (host-side bookkeeping for lean
+    /// snapshots). When first enabled on a live engine, call
+    /// [`mark_all_dirty`](Engine::mark_all_dirty) so the next checkpoint fully
+    /// populates the durable store from a full-variable snapshot deployment.
+    pub fn set_track_dirty_vars(&mut self, on: bool) {
+        self.track_dirty_vars = on;
+    }
+
+    /// Whether dirty-variable tracking is on.
+    pub fn tracks_dirty_vars(&self) -> bool {
+        self.track_dirty_vars
+    }
+
+    /// Marks every live instance's variables dirty, so the next
+    /// [`drain_dirty_vars`](Engine::drain_dirty_vars) writes the whole live
+    /// working set to the durable store. Used on the first checkpoint after
+    /// enabling lean mode on a pre-existing (full-snapshot) deployment, and after
+    /// a recovery that rebuilt state from a full snapshot rather than the store.
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty_vars = self.state.instances.keys().copied().collect();
+        self.forgotten_vars.clear();
+    }
+
+    /// Drains the accumulated variable delta since the last checkpoint: the
+    /// current variable maps of instances whose variables changed (upserts) and
+    /// the keys of instances that reached a terminal state (forgets). Clears both
+    /// sets. Spilled instances are **skipped** in the upserts — their authoritative
+    /// payload is written through to the store at spill time, and their in-state
+    /// map is an empty placeholder — so draining must not overwrite the store with
+    /// that placeholder. Variable maps are returned as cheap `Arc` clones (a
+    /// refcount bump, not a deep copy); the deep read happens off the engine
+    /// thread when the host serializes them into the store.
+    pub fn drain_dirty_vars(&mut self) -> (VarUpserts, Vec<Key>) {
+        let mut upserts = Vec::with_capacity(self.dirty_vars.len());
+        for key in self.dirty_vars.drain() {
+            if let Some(instance) = self.state.instances.get(&key) {
+                if instance.variables_spilled {
+                    continue;
+                }
+                upserts.push((key, Arc::clone(&instance.variables)));
+            }
+        }
+        let forgets: Vec<Key> = self.forgotten_vars.drain().collect();
+        (upserts, forgets)
+    }
+
+    /// A control-only clone of this engine's state for a lean snapshot: identical
+    /// to [`snapshot`](Engine::snapshot) but with every instance's variables
+    /// replaced by an empty placeholder, so the serialized snapshot carries no
+    /// variable payloads. The omitted variables are restored on recovery from the
+    /// authoritative durable store (see [`install_variables`](Engine::install_variables)).
+    /// The `Arc::clone` of the variables in the underlying `state.clone()` is a
+    /// cheap refcount bump; emptying them in the clone drops that reference so the
+    /// serializer never walks the payloads.
+    #[cfg(feature = "serde")]
+    pub fn snapshot_control_only(&self) -> EngineSnapshot {
+        let mut state = self.state.clone();
+        for instance in state.instances.values_mut() {
+            if !instance.variables.is_empty() {
+                instance.variables = Arc::new(HashMap::new());
+            }
+        }
+        EngineSnapshot {
+            state,
+            partition_id: self.partition_id,
+            next_local: self.next_local,
+            num_partitions: self.num_partitions,
+            now: self.now,
+            start_dispatch_rr: self.start_dispatch_rr,
+        }
+    }
+
+    /// Installs variables restored from the authoritative durable store onto a
+    /// recovered instance (control state came from a lean snapshot + journal
+    /// tail). Clears the spilled flag: after recovery the payload is resident.
+    /// A no-op if the instance is not present (already terminal/evicted).
+    pub fn install_variables(&mut self, key: Key, variables: HashMap<String, Value>) {
+        if let Some(instance) = self.state.instances.get_mut(&key) {
+            instance.variables = Arc::new(variables);
+            instance.variables_spilled = false;
+        }
+    }
+
     /// one rebuilt via [`Engine::from_snapshot`]). Each event is applied through
     /// the same applier as runtime/replay, and this partition's local key
     /// generator is advanced past every replayed key it owns — identical to the
@@ -126,6 +224,12 @@ impl Engine {
             .collect();
         if terminal.is_empty() {
             return 0;
+        }
+        if self.track_dirty_vars {
+            for key in &terminal {
+                self.dirty_vars.remove(key);
+                self.forgotten_vars.insert(*key);
+            }
         }
         for key in &terminal {
             self.state.instances.remove(key);

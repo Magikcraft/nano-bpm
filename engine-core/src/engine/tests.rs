@@ -4321,3 +4321,81 @@ fn inline_call_activities_rejects_unknown_and_cyclic_callees() {
         .unwrap_err()
         .contains("cycle"));
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
+    use crate::model::Value;
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine.set_track_dirty_vars(true);
+
+    // Create two instances with variables -> both dirty.
+    let mut v = std::collections::HashMap::new();
+    v.insert("amount".to_string(), Value::Int(50));
+    let a = engine
+        .apply_command(Command::create_instance_with("order", v.clone()))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let b = engine
+        .apply_command(Command::create_instance_with("order", v.clone()))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let (upserts, forgets) = engine.drain_dirty_vars();
+    let keys: std::collections::HashSet<Key> = upserts.iter().map(|(k, _)| *k).collect();
+    assert_eq!(keys, [a, b].into_iter().collect());
+    assert!(forgets.is_empty());
+    // Draining clears the set.
+    let (again, _) = engine.drain_dirty_vars();
+    assert!(again.is_empty());
+
+    // A spilled instance is skipped in the upserts (spill write-through owns it).
+    let mut v2 = std::collections::HashMap::new();
+    v2.insert("k".to_string(), Value::Int(1));
+    engine
+        .apply_command(Command::SetVariables {
+            scope_key: a,
+            variables: v2,
+        })
+        .unwrap();
+    let _ = engine.spill_variables(a); // a is now spilled
+    let (upserts, _) = engine.drain_dirty_vars();
+    assert!(
+        !upserts.iter().any(|(k, _)| *k == a),
+        "spilled instance must not appear in checkpoint upserts"
+    );
+
+    // Lean snapshot carries empty variable maps; a full one carries payloads.
+    let lean = engine.snapshot_control_only();
+    assert!(lean
+        .state
+        .instances
+        .values()
+        .all(|i| i.variables.is_empty()));
+    let full = engine.snapshot();
+    assert!(full
+        .state
+        .instances
+        .get(&b)
+        .is_some_and(|i| !i.variables.is_empty()));
+
+    // Restoring variables from the store onto a lean-recovered engine.
+    let mut recovered = Engine::from_snapshot(lean);
+    let mut restored = std::collections::HashMap::new();
+    restored.insert("amount".to_string(), Value::Int(99));
+    recovered.install_variables(b, restored);
+    assert_eq!(
+        recovered
+            .instance(b)
+            .and_then(|i| i.variables.get("amount")),
+        Some(&Value::Int(99))
+    );
+}
