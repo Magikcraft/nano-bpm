@@ -1420,6 +1420,113 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Lean-snapshot recovery: with an authoritative var store wired, the
+    /// periodic checkpoint captures a **control-only** snapshot (no variables) and
+    /// writes the variable delta to the store. Recovery must fuse the control
+    /// snapshot + the store's variables + the journal tail so the restored
+    /// variables exactly match a full replay — including a `SetVariables` applied
+    /// AFTER the checkpoint (which merges onto the store's base on replay).
+    #[test]
+    fn lean_snapshot_recovery_matches_full_replay() {
+        use nanobpmn_engine_core::Value;
+        use std::collections::HashMap;
+
+        let dir = temp_dir("lean-roundtrip");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        // Authoritative, boot-surviving store. In-process the same Arc models the
+        // durable store surviving the journal reopen.
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+
+        let key = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            assert!(recovery.fresh);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            // Lean mode: the store is authoritative for variables on both journals.
+            j0.set_varstore(Arc::clone(&varstore));
+            j1.set_varstore(Arc::clone(&varstore));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            // Create with initial variables, then merge a second batch — all
+            // BEFORE the checkpoint (so they live only in the store + control
+            // snapshot, never in a variable-bearing snapshot).
+            let mut init = HashMap::new();
+            init.insert("a".to_string(), Value::Int(1i64));
+            let (e0, _) = j0
+                .apply_command(Command::create_instance_with("demo", init))
+                .unwrap();
+            let key = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let mut pre = HashMap::new();
+            pre.insert("b".to_string(), Value::Int(2i64));
+            let _ = j0.apply_command(Command::set_variables(key, pre)).unwrap();
+
+            // Lean checkpoint on both partitions: drain + control-only snapshot +
+            // seal, then persist the delta to the store BEFORE writing the snapshot.
+            let mut entries = Vec::new();
+            for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
+                let (snap, covered, upserts, forgets) =
+                    j.snapshot_and_rotate_lean().expect("lean checkpoint");
+                let ups: Vec<(nanobpmn_engine_core::Key, &HashMap<String, Value>)> =
+                    upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
+                entries.push((pid, covered, snap));
+            }
+            write_multi_snapshot(&dir, entries).expect("write lean snapshot");
+
+            // Post-checkpoint variable merge: lands in the fresh active tail (NOT
+            // covered by the snapshot, NOT yet in the store's checkpoint) — the
+            // merge-onto-base case recovery must get right.
+            let mut post = HashMap::new();
+            post.insert("c".to_string(), Value::Int(3i64));
+            let _ = j0.apply_command(Command::set_variables(key, post)).unwrap();
+
+            key
+        };
+
+        // Reopen: control from the lean snapshot, variables installed from the
+        // store, then the tail `SetVariables` merged on top.
+        let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let inst = engines[&0].instance(key).expect("instance restored");
+        assert_eq!(
+            inst.variables.get("a"),
+            Some(&Value::Int(1i64)),
+            "create-time variable from the store"
+        );
+        assert_eq!(
+            inst.variables.get("b"),
+            Some(&Value::Int(2i64)),
+            "pre-checkpoint merge from the store"
+        );
+        assert_eq!(
+            inst.variables.get("c"),
+            Some(&Value::Int(3i64)),
+            "post-checkpoint merge from the journal tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Clustered recovery: a node owning partitions {1,2} (NOT the deployment
     /// partition 0) journals a single durable replicated `ProcessDeployed` under
     /// its first-owned partition (1), keyed to partition 0. On recovery, the
