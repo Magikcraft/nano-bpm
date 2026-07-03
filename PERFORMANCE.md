@@ -711,3 +711,54 @@ the ones already identified:
    pinning all variables via `Arc`-clone during the burst.
 3. Optionally, make leased-job instances spillable (spill the variables, rehydrate
    on job completion/return) so the activated-but-incomplete backlog is reclaimable.
+
+## 2026-07-03 — Fix 1b: lean (control-only) snapshot + authoritative durable var-store
+
+### Change (commits be94879, 48cafeb, 9e8e538, 9904105; deployed sha ac7266cf6f30674c, `NANOBPMN_LEAN_SNAPSHOT=1`)
+Split variables out of the periodic snapshot into a new authoritative, boot-surviving
+`VarStore` (SQLite WAL, `<datadir>/var-store.sqlite`). The engine tracks a dirty-var
+set; each checkpoint drains the delta + captures a **control-only** `EngineSnapshot`
+(empty variable maps) on the engine thread, then writes the delta to the var-store
+off-thread **before** the (variable-less) snapshot file. Recovery installs variables
+from the store between `from_snapshot` and the journal-tail replay (install-before-tail
+so post-snapshot `VariablesUpdated` merges onto the store base). Unified with var-spill:
+spill write-through / rehydrate / terminal-forget all target the var-store. Compaction
+gated on `min(exported, var_position)`. Only the segmented multi-partition paths honour
+the flag; other boot paths keep full snapshots. 144 tests, clippy zero.
+
+### Result A — mechanism confirmed on disk (fresh 3-node RF=3 P=12, ~/soakB.sh)
+- **Snapshot file is now control-only: `msnapshot.bin` = 355 MB** (was multi-GB with
+  variable payloads inline). Variables live in **`var-store.sqlite` ≈ 4.95 GB (+843 MB WAL)**.
+  The variable payload is decisively evicted from the snapshot.
+- Pipeline gauges stay flat: `journal_inflight`=0, `pipeline_bytes`=0 through the burst
+  (the 17 GB snapshot `Vec<u8>` transient, already killed by streaming, stays gone).
+
+### Result B — blob soak (0-var warm 60s / 50KB blob 16w-starved 180s / recover 90s)
+| Phase | Agg tput | p99 | Peak RSS/node | Notes |
+|-------|----------|-----|---------------|-------|
+| A warm (0-var, 110w) | ~110k PI/s | 2.81 s | ~420 MB | unchanged |
+| B blob (50KB, 16w) | ~3.3k PI/s | **82–91 s** | 4.5–5.7 GB (var ~2.6–3.4 GB) | see below |
+| C recover (110w) | ~48k PI/s | 12.5 s | — | drains cleanly |
+
+### Result C — tiny-var in-flight envelope (1KB, 110w, 60s, lean on) — regression guard
+- **Agg 84.9k PI/s, p99 3.72 s, peak RSS 267 MB/node, idle floor ~140 MB → PASS**,
+  identical to the 84.5k pre-lean baseline. No in-flight regression from lean mode.
+
+### Honest verdict: lean snapshot works, but did NOT move phase-B p99
+- Phase-B p99 was ~82–91 s vs the ~55 s streaming baseline — **no improvement** (and
+  possibly worse this run; under 16-worker starvation p99 is dominated by queue depth,
+  not the snapshot fsync, so run-to-run variance is large). The hoped-for "snapshot
+  stall → 19 s" win did **not** materialise. Peak RSS is unchanged (~4.5–5.7 GB, still
+  the non-spillable resident-variable population from Fix 2, which lean does not touch).
+- **New cost:** variables are now double-written (journal segment + var-store), adding
+  ~5 GB store + an **843 MB unbounded WAL** during the burst.
+
+### Follow-ups
+1. **var-store WAL grows unbounded** (843 MB) under the burst — add a periodic
+   `wal_checkpoint(TRUNCATE)` (off the hot path) so the store doesn't balloon disk.
+2. The dominant phase-B stall is the **non-spillable activated-but-incomplete instance
+   backlog + queue depth**, not the snapshot — i.e. the real lever remains **admission
+   backpressure** (saturation-driven) and/or **spillable leased-job variables**, per the
+   Fix 2 takeaway. Lean snapshot is a prerequisite (bounds the on-thread clone + snapshot
+   fsync) but not itself the p99 fix.
+3. Re-evaluate the var-store double-write vs a controlled A/B once WAL checkpointing lands.
