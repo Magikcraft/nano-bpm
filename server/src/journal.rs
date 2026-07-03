@@ -1956,7 +1956,7 @@ impl Journal {
     /// — the absolute count of events the snapshot subsumes. `None` for a journal
     /// that is not segmented (or whose writer is gone).
     ///
-    /// Must run **on the engine actor thread** (e.g. via `EngineHandle::with`):
+    /// Must run **on the engine actor thread** (e.g. via `DeepthiHandle::with`):
     /// the snapshot reflects every command applied so far, and routing the rotate
     /// through the same ordered writer channel — after the writes those commands
     /// already enqueued — makes the sealed boundary line up exactly with the

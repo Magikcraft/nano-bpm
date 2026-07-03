@@ -1,4 +1,13 @@
+//! # Deepthi — the single-writer engine actor
+//!
 //! A single-writer command actor that owns the durable [`Journal`].
+//!
+//! Named for **Deepthi Akkoorath**, whose work on concurrency and distributed
+//! consensus — including a randomized simulation framework for reliably
+//! reproducing concurrent-interaction bugs in the core consensus algorithm — is
+//! the inspiration for this subsystem. The actor model here descends from Erlang:
+//! a single owner, a serial mailbox, and isolation instead of shared-memory
+//! locks. Artists sign their work.
 //!
 //! The engine is a single writer, so every mutation must be serialized. The
 //! previous design wrapped the [`Journal`] in a `std::sync::RwLock` shared across
@@ -13,7 +22,7 @@
 //! Zeebe's per-partition `StreamProcessor` actor: a single owner, a serial
 //! command queue, and tokio workers that only ever park on an async `await`
 //! (never on a blocking lock). Serde-heavy request decode / response encode is
-//! done by the caller *around* [`EngineHandle::with`], so the 50 KB variable
+//! done by the caller *around* [`DeepthiHandle::with`], so the 50 KB variable
 //! payloads are converted in parallel across cores rather than serially on the
 //! engine thread.
 
@@ -69,7 +78,7 @@ struct Mailbox {
 struct MailboxInner {
     hi: VecDeque<Job>,
     lo: VecDeque<Job>,
-    /// Live [`EngineHandle`] count. When it hits zero with both queues drained,
+    /// Live [`DeepthiHandle`] count. When it hits zero with both queues drained,
     /// the consumer loop exits (mirrors an mpsc channel disconnect).
     producers: usize,
 }
@@ -124,11 +133,11 @@ impl Mailbox {
 /// A cloneable handle to the engine actor. All engine mutation and engine-state
 /// reads go through here; the [`Journal`] lives on a single dedicated thread, so
 /// no async task ever blocks a tokio worker on a contended lock.
-pub struct EngineHandle {
+pub struct DeepthiHandle {
     mb: Arc<Mailbox>,
 }
 
-impl Clone for EngineHandle {
+impl Clone for DeepthiHandle {
     fn clone(&self) -> Self {
         self.mb
             .inner
@@ -141,7 +150,7 @@ impl Clone for EngineHandle {
     }
 }
 
-impl Drop for EngineHandle {
+impl Drop for DeepthiHandle {
     fn drop(&mut self) {
         let mut g = self.mb.inner.lock().expect("engine mailbox poisoned");
         g.producers -= 1;
@@ -154,9 +163,9 @@ impl Drop for EngineHandle {
     }
 }
 
-impl EngineHandle {
+impl DeepthiHandle {
     /// Spawns the engine thread that owns `journal` and returns a handle to it.
-    /// The thread runs until every [`EngineHandle`] clone is dropped (the channel
+    /// The thread runs until every [`DeepthiHandle`] clone is dropped (the channel
     /// closes), then drops the [`Journal`] — flushing its writer thread. The
     /// thread is detached: durability never depends on a clean shutdown because
     /// callers `await` each command's [`Commit`](crate::journal::Commit) before
@@ -252,7 +261,7 @@ impl EngineHandle {
 
     /// Runs `f` on the engine thread at [`Priority::High`] and awaits its result.
     /// This is the default for every completion-side and read command; only
-    /// instance creation uses [`with_low`](EngineHandle::with_low). The closure
+    /// instance creation uses [`with_low`](DeepthiHandle::with_low). The closure
     /// receives exclusive `&mut Journal`. Keep `f` cheap: do serde-heavy request
     /// decode and response encode on the caller side (before/after the call) so
     /// they run in parallel off the single engine thread.
@@ -264,7 +273,7 @@ impl EngineHandle {
         self.with_priority(Priority::High, f).await
     }
 
-    /// Like [`with`](EngineHandle::with) but at [`Priority::Low`] — the engine
+    /// Like [`with`](DeepthiHandle::with) but at [`Priority::Low`] — the engine
     /// services it only when no completion-side work is queued. Used by the
     /// instance-create path so a flood of creates cannot starve completion and
     /// run the active-instance backlog away into congestion collapse.

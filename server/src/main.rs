@@ -15,7 +15,7 @@ mod coldspill;
 mod falcon;
 #[cfg(feature = "console")]
 mod console;
-mod engine_actor;
+mod deepthi;
 mod journal;
 mod memory;
 mod metrics;
@@ -57,7 +57,7 @@ use crate::backpressure::{
     AdaptiveController, Backpressure, BackpressureSetting, SlaMode, parse_backpressure_setting,
     parse_sla_mode,
 };
-use crate::engine_actor::EngineHandle;
+use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
 use crate::partition::Partitions;
 use crate::readstore::{ReadModel, ReadStore};
@@ -79,9 +79,9 @@ const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
 /// The single type that implements every generated API trait.
 ///
 /// It owns an embedded [`Engine`] (the `engine-core` crate), wrapped in a
-/// durable [`Journal`], driven through a single-writer [`EngineHandle`] actor.
+/// durable [`Journal`], driven through a single-writer [`DeepthiHandle`] actor.
 /// The engine is a single writer, so every mutating command is serialized onto
-/// the actor's dedicated thread (see [`engine_actor`]); read-only
+/// the actor's dedicated thread (see [`deepthi`]); read-only
 /// `search*`/`get*` projections are answered from the [`ReadStore`] and never
 /// touch the engine thread, so they run concurrently across cores. Most
 /// operations are still 501 stubs (see the generated `stub_impls` module); a
@@ -226,7 +226,7 @@ pub struct ServerImpl {
     /// can apply the replicated log; they are NOT part of the read-model / serving
     /// path (reads and job dispatch always go to the leader's owned actor). Empty
     /// unless per-partition Raft is enabled with RF>1 — zero overhead otherwise.
-    raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, EngineHandle>>>,
+    raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, DeepthiHandle>>>,
     /// Whether the job activation lock is replicated through Raft.
     ///
     /// `true` (the default, from `NANOBPMN_REPLICATE_ACTIVATION`) is the original
@@ -538,12 +538,12 @@ impl ServerImpl {
         // command latency — a representative single sample of engine load that
         // sizes the create-admission watermark applied across all partitions.
         let owned_count = journals.len();
-        let handles: Vec<EngineHandle> = journals
+        let handles: Vec<DeepthiHandle> = journals
             .into_iter()
             .enumerate()
             .map(|(i, journal)| {
                 let ctrl = if i == 0 { controller.take() } else { None };
-                EngineHandle::spawn(journal, ctrl)
+                DeepthiHandle::spawn(journal, ctrl)
             })
             .collect();
         // Build peer uplinks before `topology` is consumed by the engine. A
@@ -6708,7 +6708,7 @@ impl ServerImpl {
     /// / serving path. Seeded with the current deployments so it can apply creates
     /// of already-deployed processes; later deploys fan in via
     /// [`Self::install_into_raft_replicas`].
-    async fn replica_engine_for(&self, p: u64) -> EngineHandle {
+    async fn replica_engine_for(&self, p: u64) -> DeepthiHandle {
         if let Some(h) = self.raft_replicas.lock().unwrap().get(&p) {
             return h.clone();
         }
@@ -6721,7 +6721,7 @@ impl ServerImpl {
         if !seed.is_empty() {
             journal.install_deployment(&seed);
         }
-        let handle = EngineHandle::spawn(journal, None);
+        let handle = DeepthiHandle::spawn(journal, None);
         self.raft_replicas
             .lock()
             .unwrap()
@@ -6753,7 +6753,7 @@ impl ServerImpl {
     /// replicates `p`). `None` if this node neither owns nor replicates `p`. Used
     /// by the serving paths to reach a partition this node leads after a failover
     /// even though it does not statically own it.
-    fn engine_handle_for(&self, p: u64) -> Option<EngineHandle> {
+    fn engine_handle_for(&self, p: u64) -> Option<DeepthiHandle> {
         if let Some(h) = self.engine.local_for_partition(p) {
             return Some(h.clone());
         }
@@ -6840,7 +6840,7 @@ impl ServerImpl {
     /// every replica. A no-op (and zero overhead) when this node hosts no replica
     /// actors, i.e. single-node, RF=1, or Raft disabled.
     async fn install_into_raft_replicas(&self, events: &Arc<Vec<Event>>) {
-        let handles: Vec<EngineHandle> = {
+        let handles: Vec<DeepthiHandle> = {
             let map = self.raft_replicas.lock().unwrap();
             if map.is_empty() {
                 return;
@@ -7093,7 +7093,7 @@ impl ServerImpl {
     /// [`activated_job_result`] off the engine thread.
     async fn activate_on(
         &self,
-        handle: &EngineHandle,
+        handle: &DeepthiHandle,
         job_type: &str,
         worker: &str,
         want: usize,
@@ -7142,7 +7142,7 @@ impl ServerImpl {
     /// by value so it can be awaited inside a `join_all` over the led partitions.
     async fn activate_on_local(
         &self,
-        handle: EngineHandle,
+        handle: DeepthiHandle,
         job_type: &str,
         worker: &str,
         want: usize,
@@ -9463,7 +9463,7 @@ async fn main() {
             if let Some((shared, num_partitions)) = multi_seg.clone()
                 && let Some(interval) = seglog::snapshot_interval_from_env()
             {
-                let handles: Vec<EngineHandle> = server.engine.all().to_vec();
+                let handles: Vec<DeepthiHandle> = server.engine.all().to_vec();
                 let store = server.store.clone();
                 let lean = varstore.is_some();
                 let varstore = varstore.clone();
@@ -10182,11 +10182,11 @@ mod clustered_startup_tests {
         // no engine actor for). Round-robining `for_create` many times must only
         // ever return one of this node's own handles.
         let node0 = clustered_node(0);
-        let owned: Vec<*const EngineHandle> =
+        let owned: Vec<*const DeepthiHandle> =
             node0.engine.all().iter().map(|h| h as *const _).collect();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..16 {
-            let h = node0.engine.for_create() as *const EngineHandle;
+            let h = node0.engine.for_create() as *const DeepthiHandle;
             assert!(
                 owned.contains(&h),
                 "for_create returned a handle this node does not own"
@@ -11251,7 +11251,7 @@ mod clustered_startup_tests {
             RaftPartition::bootstrap_member(
                 0,
                 0,
-                EngineHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
                 node0.raft_transport(),
                 None,
             )
@@ -11264,7 +11264,7 @@ mod clustered_startup_tests {
             RaftPartition::bootstrap_member(
                 1,
                 0,
-                EngineHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
                 node1.raft_transport(),
                 None,
             )

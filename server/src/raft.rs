@@ -13,7 +13,7 @@
 //! itself, so commit is immediate and the network layer is never exercised.
 //!
 //! Deliberately **additive**: this does not yet replace the server's
-//! [`EngineHandle`](crate::engine_actor::EngineHandle) write path.
+//! [`DeepthiHandle`](crate::deepthi::DeepthiHandle) write path.
 //!
 //! # Milestone B: crash-durable log (done)
 //!
@@ -42,7 +42,7 @@
 //! Leader routing: host the Raft groups in the server, carry the
 //! [`RaftTransport`](crate::raft_net::RaftTransport) over the Falcon protocol, and
 //! route client writes to the partition leader — replacing the additive
-//! [`EngineHandle`](crate::engine_actor::EngineHandle) write path.
+//! [`DeepthiHandle`](crate::deepthi::DeepthiHandle) write path.
 
 // This Raft subsystem (raft / raft_logstore / raft_net) is built up across
 // stage-3 milestones and is deliberately *additive*: it is fully exercised by
@@ -68,7 +68,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::engine_actor::EngineHandle;
+use crate::deepthi::DeepthiHandle;
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport};
 
@@ -269,7 +269,7 @@ struct StoredSnapshot {
 
 /// Metadata held by the Raft state machine: the last applied log id and
 /// membership. The materialized engine state itself lives on the partition's
-/// [`EngineHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
+/// [`DeepthiHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
 /// captured on demand for snapshots, so the state machine retains no event
 /// history of its own.
 struct SmMeta {
@@ -279,7 +279,7 @@ struct SmMeta {
 }
 
 /// The Raft state machine for one partition. Committed commands are applied to
-/// the partition's [`EngineHandle`] — the *same* single-writer engine actor the
+/// the partition's [`DeepthiHandle`] — the *same* single-writer engine actor the
 /// rest of the server reads, dispatches jobs from, and runs timers on — so the
 /// replicated log and the served state share one materialized copy. Wrapped in
 /// an `Arc` so openraft can share it with the snapshot builder.
@@ -287,14 +287,14 @@ pub struct PartitionStateMachine {
     /// The partition's engine actor: `apply` forwards each committed command to
     /// it. Held outside the metadata `Mutex` so `apply` can `.await` the engine
     /// round-trip without holding a std lock across the await point.
-    engine: EngineHandle,
+    engine: DeepthiHandle,
     inner: Mutex<SmMeta>,
     snapshot_idx: AtomicU64,
     current_snapshot: Mutex<Option<StoredSnapshot>>,
 }
 
 impl PartitionStateMachine {
-    fn new(engine: EngineHandle, partition_id: u64) -> Self {
+    fn new(engine: DeepthiHandle, partition_id: u64) -> Self {
         Self {
             engine,
             inner: Mutex::new(SmMeta {
@@ -637,7 +637,7 @@ impl RaftPartition {
         node_id: NodeId,
         partition_id: u64,
         addr: String,
-        engine: EngineHandle,
+        engine: DeepthiHandle,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(
             Config {
@@ -679,7 +679,7 @@ impl RaftPartition {
         node_id: NodeId,
         partition_id: u64,
         addr: String,
-        engine: EngineHandle,
+        engine: DeepthiHandle,
         log_dir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(
@@ -732,7 +732,7 @@ impl RaftPartition {
     pub async fn bootstrap_member(
         node_id: NodeId,
         partition_id: u64,
-        engine: EngineHandle,
+        engine: DeepthiHandle,
         transport: Arc<dyn RaftTransport>,
         log_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
@@ -866,7 +866,7 @@ mod tests {
             0,
             0,
             "http://self".into(),
-            EngineHandle::spawn(Journal::in_memory_partition(0), None),
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
         )
         .await
         .expect("bootstrap single-voter raft");
@@ -914,7 +914,7 @@ mod tests {
     async fn snapshot_captures_compact_state_and_installs_into_a_fresh_replica() {
         // A source state machine accrues live state directly through its engine
         // actor (the same effect `apply` has), then snapshots it.
-        let src = EngineHandle::spawn(Journal::in_memory_partition(0), None);
+        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), None);
         src.with(|j| {
             let _ = j
                 .apply_command_at(deploy_command(), 1)
@@ -949,7 +949,7 @@ mod tests {
 
         // A brand-new, empty replica installs the snapshot and ends up with
         // byte-for-byte identical engine state — the cross-node catch-up path.
-        let dst = EngineHandle::spawn(Journal::in_memory_partition(0), None);
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), None);
         let mut dst_sm: Arc<PartitionStateMachine> =
             Arc::new(PartitionStateMachine::new(dst.clone(), 0));
         dst_sm
@@ -992,7 +992,7 @@ mod tests {
                 0,
                 0,
                 "http://self".into(),
-                EngineHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
                 &log_dir,
             )
             .await
@@ -1017,7 +1017,7 @@ mod tests {
                 0,
                 0,
                 "http://self".into(),
-                EngineHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
                 &log_dir,
             )
             .await
@@ -1077,7 +1077,7 @@ mod tests {
             let p = RaftPartition::bootstrap_member(
                 id,
                 0,
-                EngineHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
                 transport.clone(),
                 None,
             )

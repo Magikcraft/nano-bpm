@@ -1,7 +1,7 @@
 //! Multi-partition routing over a set of single-writer engine actors.
 //!
 //! Following Zeebe, a node may run several partitions, each its own
-//! single-writer [`EngineHandle`] (a dedicated engine thread + journal). Keys
+//! single-writer [`DeepthiHandle`] (a dedicated engine thread + journal). Keys
 //! carry their owning partition in their high bits (see
 //! [`nanobpmn_engine_core::partition_of`]), so a command that targets an
 //! existing key routes to exactly one partition, while a fresh
@@ -29,7 +29,7 @@ use std::sync::{Arc, OnceLock};
 use nanobpmn_engine_core::{Key, partition_of};
 
 use crate::cluster::Topology;
-use crate::engine_actor::EngineHandle;
+use crate::deepthi::DeepthiHandle;
 
 /// Identifies a partition by its id — the value encoded in the high bits of
 /// every [`Key`] it mints (see [`nanobpmn_engine_core::partition_of`]).
@@ -49,7 +49,7 @@ pub struct NodeId(pub u32);
 #[allow(dead_code)] // Remote's NodeId is read by the stage-1 forwarding layer
 pub enum Location<'a> {
     /// The partition is owned by this node; here is its engine actor.
-    Local(&'a EngineHandle),
+    Local(&'a DeepthiHandle),
     /// The partition is owned by a remote node; forward to it (its base URL is
     /// [`Topology::peer_addr`]).
     Remote(NodeId),
@@ -66,7 +66,7 @@ enum Owner {
 /// Maps each [`PartitionId`] to its current [`Location`].
 ///
 /// A node owns a subset of the cluster's partitions ([`Topology::local_partitions`])
-/// and holds an [`EngineHandle`] for each; the rest resolve `Remote(NodeId)`. The
+/// and holds an [`DeepthiHandle`] for each; the rest resolve `Remote(NodeId)`. The
 /// router is the single resolution point for all command routing, so the gateway
 /// forwarding layer only has to handle the [`Location::Remote`] arm — the local
 /// fast path and the engine core are untouched. In a single-node cluster every
@@ -74,7 +74,7 @@ enum Owner {
 pub struct PartitionRouter {
     /// Engine actors for the partitions this node owns, in ascending partition-id
     /// order. `local[i]` is referenced by an `Owner::Local(i)` slot.
-    local: Vec<EngineHandle>,
+    local: Vec<DeepthiHandle>,
     /// One entry per partition id (`owners[p]` owns partition `p`): `Local(i)`
     /// when this node owns it, `Remote(node)` otherwise.
     owners: Vec<Owner>,
@@ -87,7 +87,7 @@ pub struct PartitionRouter {
 impl PartitionRouter {
     /// Builds a single-node router that owns every partition locally.
     /// `handles[i]` becomes the owner of [`PartitionId`] `i`. Must be non-empty.
-    fn single_node(handles: Vec<EngineHandle>) -> Self {
+    fn single_node(handles: Vec<DeepthiHandle>) -> Self {
         assert!(!handles.is_empty(), "at least one partition is required");
         let owners = (0..handles.len()).map(Owner::Local).collect();
         let topology = Topology::single(handles.len() as u64);
@@ -103,7 +103,7 @@ impl PartitionRouter {
     /// [`Topology::local_partitions`]; every other partition resolves to the
     /// `Remote` node that owns it. A single-node topology is equivalent to
     /// [`single_node`](Self::single_node).
-    fn from_topology(topology: Topology, local_handles: Vec<EngineHandle>) -> Self {
+    fn from_topology(topology: Topology, local_handles: Vec<DeepthiHandle>) -> Self {
         let owned = topology.local_partitions();
         assert_eq!(
             owned.len(),
@@ -149,7 +149,7 @@ impl PartitionRouter {
     /// through [`resolve`](Self::resolve) and unwraps the local case; a `Remote`
     /// slot is unreachable while running as a single process (stage 1 migrates
     /// the affected call sites to handle [`Location::Remote`] explicitly).
-    fn local_for(&self, p: PartitionId) -> &EngineHandle {
+    fn local_for(&self, p: PartitionId) -> &DeepthiHandle {
         match self.resolve(p) {
             Location::Local(h) => h,
             Location::Remote(_) => {
@@ -165,7 +165,7 @@ impl PartitionRouter {
     /// All engine actors owned by this node (in partition-id order). Used by the
     /// operations that fan out locally: job activation, message correlation,
     /// timer ticks, eviction, idle compaction.
-    fn local_handles(&self) -> &[EngineHandle] {
+    fn local_handles(&self) -> &[DeepthiHandle] {
         &self.local
     }
 
@@ -230,7 +230,7 @@ pub struct Partitions {
 impl Partitions {
     /// Wraps one engine actor per partition for a single-node cluster.
     /// `handles[i]` owns partition id `i`. Must be non-empty.
-    pub fn new(handles: Vec<EngineHandle>) -> Self {
+    pub fn new(handles: Vec<DeepthiHandle>) -> Self {
         Self {
             router: Arc::new(PartitionRouter::single_node(handles)),
             next_create: Arc::new(AtomicUsize::new(0)),
@@ -244,7 +244,7 @@ impl Partitions {
     /// are the engine actors for this node's owned partitions, in ascending
     /// partition-id order (matching [`Topology::local_partitions`]); every other
     /// partition resolves to the remote node that owns it.
-    pub fn with_topology(topology: Topology, local_handles: Vec<EngineHandle>) -> Self {
+    pub fn with_topology(topology: Topology, local_handles: Vec<DeepthiHandle>) -> Self {
         Self {
             router: Arc::new(PartitionRouter::from_topology(topology, local_handles)),
             next_create: Arc::new(AtomicUsize::new(0)),
@@ -265,7 +265,7 @@ impl Partitions {
     /// operation addressed by *global partition id* (e.g. evicting a completed
     /// instance by its key's partition) — unlike indexing [`all`](Self::all),
     /// which is the compacted slice of owned handles, not indexed by global id.
-    pub fn local_for_partition(&self, p: u64) -> Option<&EngineHandle> {
+    pub fn local_for_partition(&self, p: u64) -> Option<&DeepthiHandle> {
         match self.router.resolve(PartitionId(p)) {
             Location::Local(h) => Some(h),
             Location::Remote(_) => None,
@@ -294,7 +294,7 @@ impl Partitions {
     /// whose partition is out of range (malformed input) falls back to
     /// partition 0 so a bad key surfaces as a clean engine "not found" rather
     /// than a panic.
-    pub fn by_key(&self, key: Key) -> &EngineHandle {
+    pub fn by_key(&self, key: Key) -> &DeepthiHandle {
         self.router.local_for(PartitionId(partition_of(key)))
     }
 
@@ -340,7 +340,7 @@ impl Partitions {
     /// budget it falls back to plain round-robin; the create-admission shed gate
     /// (see [`exporter_all_saturated`](Self::exporter_all_saturated)) rejects in
     /// that case, so the writer is never blocked.
-    pub fn for_create(&self) -> &EngineHandle {
+    pub fn for_create(&self) -> &DeepthiHandle {
         let locals = self.router.local_handles();
         if locals.len() == 1 {
             return &locals[0];
@@ -468,7 +468,7 @@ impl Partitions {
     /// journaled here, then replicated in-memory to the others (so every
     /// partition can instantiate the definition). Partition 0 also owns the
     /// single copy of each message-start / timer-start subscription.
-    pub fn deploy_partition(&self) -> &EngineHandle {
+    pub fn deploy_partition(&self) -> &DeepthiHandle {
         self.router.local_for(PartitionId(0))
     }
 
@@ -490,7 +490,7 @@ impl Partitions {
 
     /// All partition handles, for operations that must fan out (job activation,
     /// message correlation, timer ticks, eviction, idle compaction).
-    pub fn all(&self) -> &[EngineHandle] {
+    pub fn all(&self) -> &[DeepthiHandle] {
         self.router.local_handles()
     }
 
@@ -501,7 +501,7 @@ impl Partitions {
         self.router
             .local_handles()
             .iter()
-            .map(EngineHandle::pending_low)
+            .map(DeepthiHandle::pending_low)
             .sum()
     }
 }
@@ -515,7 +515,7 @@ mod tests {
 
     fn spawn_partitions(n: u64) -> Partitions {
         let handles = (0..n)
-            .map(|i| EngineHandle::spawn(Journal::in_memory_partition(i), None))
+            .map(|i| DeepthiHandle::spawn(Journal::in_memory_partition(i), None))
             .collect();
         Partitions::new(handles)
     }
@@ -617,9 +617,9 @@ mod tests {
         };
         let owned = topology.local_partitions();
         assert_eq!(owned, vec![0, 2]);
-        let handles: Vec<EngineHandle> = owned
+        let handles: Vec<DeepthiHandle> = owned
             .iter()
-            .map(|p| EngineHandle::spawn(Journal::in_memory_partition(*p), None))
+            .map(|p| DeepthiHandle::spawn(Journal::in_memory_partition(*p), None))
             .collect();
         let parts = Partitions::with_topology(topology, handles);
 

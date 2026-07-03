@@ -299,7 +299,7 @@ await-completion durable across reconnect/failover — a parity advantage over Z
 - **One partition, no replication.** Topology is hardcoded: `clusterSize 1, partitionsCount 1,
   replicationFactor 1`, a single broker (node 0) leading partition 1 (main.rs:1130-1152).
 - **Gateway and broker are fused** in one process; the engine actor is a single-writer command
-  queue that explicitly "mirrors Zeebe's per-partition `StreamProcessor`" (engine_actor.rs).
+  queue that explicitly "mirrors Zeebe's per-partition `StreamProcessor`" (deepthi.rs).
 - **Durability without fault tolerance:** append-only journal, group-commit + fsync, replay on
   restart (journal.rs). RF=1 means a node loss is an outage, not data loss-on-quorum.
 - **Volatile leases:** activation locks are *not* journaled; a crash forfeits all locks and

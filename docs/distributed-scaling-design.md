@@ -28,8 +28,10 @@ document is the plan for that.
 
 nanobpmn already implements Zeebe-style partitioning (`server/src/partition.rs`):
 
-- Each partition is an **independent single-writer engine actor** (`EngineHandle`) — its
-  own engine thread + journal stream.
+- Each partition is an **independent single-writer engine actor** (`DeepthiHandle`) — its
+  own engine thread + journal stream. The engine actor is named **Deepthi**, for
+  Deepthi Akkoorath, whose distributed-systems and concurrency work inspired it
+  (see `server/src/deepthi.rs`).
 - **Keys embed their owning partition in their high bits** (`partition_of(key)`), so any
   command that targets an existing key routes deterministically to exactly one partition
   (`Partitions::by_key`).
@@ -131,7 +133,7 @@ it.
 
 Today the resolution points are `Partitions::by_key`, `for_create`, `deploy_partition`,
 `activate_start`, and `all()`. Stage 0 routes each of these through a `Resolve(partition) ->
-Location::{Local(EngineHandle), Remote(NodeId)}` seam, where `Location` is always `Local`
+Location::{Local(DeepthiHandle), Remote(NodeId)}` seam, where `Location` is always `Local`
 until stage 1 introduces remote nodes.
 
 ## 9. Open questions for later stages
