@@ -762,3 +762,43 @@ the flag; other boot paths keep full snapshots. 144 tests, clippy zero.
    Fix 2 takeaway. Lean snapshot is a prerequisite (bounds the on-thread clone + snapshot
    fsync) but not itself the p99 fix.
 3. Re-evaluate the var-store double-write vs a controlled A/B once WAL checkpointing lands.
+
+---
+
+## ADR 0012 — Terminal-state / exporter-lag decoupling (deployed + soaked)
+
+**Change.** Drop a terminal (Completed/Terminated) instance's variables in
+`state::apply`, and forget its durable var-store row in `emit()`, so terminal
+memory is reclaimed **on completion** rather than waiting for exporter-driven
+eviction. Corrected diagnosis: leased-job instances were already spillable; the
+non-spillable residue was terminal instances pinned in heap until export.
+
+**Deploy.** 3-node GCP cluster (c2-standard-16), RF=3, 12 partitions, sha
+`15f5239f4d6cff96`, lean snapshots on, `NANOBPMN_VAR_SPILL=adaptive`.
+
+**Blob soak (soakB: warm 60s / 50 KB blob burst, 16 workers, 180s / recover 90s).**
+
+| Phase | tput (agg/node) | p50 | p99 |
+|-------|-----------------|-----|-----|
+| A warm  | ~36 k | 0.67 s | 2.84 s |
+| B blob  | ~2.2 k | 6.2 s | 16.0 s |
+| C recover | ~19 k | 1.6 s | 7.9 s |
+
+**Memory — the decisive result.** `nanobpm_resident_var_bytes` (the resident
+instance-variable gauge):
+
+- **Peak single-node resident var = 131 MB** across the whole run (was
+  ~2.5–3.3 GB during burst, ~4.35 GB residue that "stayed for minutes after load
+  stopped").
+- **Post-load: var = 0 on every node immediately** (within the first idle
+  samples), and the exporter queue drained to 0. Resident variable memory no
+  longer tracks exporter lag.
+
+No panics. Transient `read-model export failed: database is locked` (SQLite WAL
+contention in the exporter path) observed at the B→C boundary — pre-existing,
+idempotent/retried, unrelated to this change; the exporter fully caught up
+afterward. Read contract remains eventually consistent (matches Camunda 8).
+
+**Verdict.** The resident-variable balloon is eliminated. Spill/backpressure can
+now bound the live working set; terminal state is no longer a memory liability
+gated on a downstream reader.

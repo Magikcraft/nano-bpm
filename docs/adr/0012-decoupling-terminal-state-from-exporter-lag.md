@@ -1,6 +1,10 @@
 # ADR 0012 — Decoupling terminal-state memory reclamation from exporter lag
 
-Status: **Accepted — implementing.**
+Status: **Accepted — implemented + validated.** Deployed to the 3-node GCP
+cluster (sha `15f5239f4d6cff96`) and soak-validated: peak single-node resident
+variable memory dropped from ~4.35 GB (residue that persisted for minutes after
+load) to **131 MB**, and reaches **0 immediately** post-load, independent of
+exporter position. See `PERFORMANCE.md` (ADR 0012 soak section) for the numbers.
 Date: 2026-07-03.
 Relates to: ADR 0003 (write-path durability tiers), `docs/performance-comparison.md`,
 `PERFORMANCE.md` (Fix 1a/1b/2), `engine-core/src/engine/memory.rs`,
