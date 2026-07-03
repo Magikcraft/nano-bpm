@@ -620,3 +620,45 @@ the whole second steady phase — the disk overshoot is fixed.
 - The on-disk file settles at the worst-burst high-watermark (freelist is
   retained and reused), so size the disk for peak, not steady-state, or plan an
   offline VACUUM during a maintenance window.
+
+## 2026-07-03 — Snapshot streaming: the 17 GB burst RSS balloon was the snapshot Vec<u8>
+
+### Problem
+Under a worker-starved flood of large (50 KB) variable payloads, per-node RSS
+transiently ballooned to ~17 GB (25% of a 64 GB box) even though resident
+instance variables were only ~4 GB and every pipeline queue gauge
+(`nanobpm_journal_inflight_bytes`, `nanobpm_pipeline_bytes`,
+`nanobpm_exporter_queue_bytes`) read ≤ ~0.3 GB. ~12 GB was unaccounted, and the
+per-node RSS peaks rotated every ~60 s — the periodic snapshot tick.
+
+### Root cause (code + A/B)
+`seglog::write_multi_snapshot` / `write_snapshot` serialized the whole snapshot
+into an intermediate `serde_json::to_vec` `Vec<u8>` before `write_all` +
+`sync_all`. The snapshot shares the live variables by `Arc` (the clone is cheap),
+but `to_vec` **materializes every resident 50 KB payload into JSON at once** — a
+multi-GB buffer, held across the multi-second serialize+fsync, for all owned
+partitions accumulated together. An A/B that stretched the snapshot interval past
+the burst dropped peak RSS 17 → 12 GB, confirming ~5 GB+ was the snapshot
+transient.
+
+### Fix (commit 7b1f7ad)
+Stream the JSON straight to the file through a `BufWriter` with
+`serde_json::to_writer`, eliminating the intermediate `Vec<u8>`. No format
+change, no throughput change (snapshotting is background work).
+
+### Result (fresh 3-node RF=3 c2-standard-16 cluster, ~/soakB.sh blob burst)
+- Peak RSS/node: **17 GB → ~4–7 GB** across two fresh runs, now bounded to
+  `resident_var_bytes + ~1.3 GB` overhead (`allocated` tracks `resident`; the
+  ~12 GB unaccounted transient is gone). Decisive memory win.
+- Phase-A steady (0-var): unchanged, ~37–38k loadgen-proc, p99 2.75 s.
+- Phase-B blob-burst tail latency: p99 still ~55 s (vs 60 s baseline, 19 s with
+  snapshots fully off). **Streaming fixes MEMORY but not the p99 stall.**
+
+### Open follow-up: the p99 stall is the clone + snapshot fsync, not the buffer
+Since streaming removed the buffer but left p99 ~unchanged, the 60 s phase-B
+stall is the on-engine-thread `Engine::snapshot()` = `state.clone()` (runs via
+`handle.with` = High priority on the single engine thread) and/or the still
+same-sized snapshot-file `sync_all` competing with journal fsync. Next lever
+(Fix 1b): exclude journal-durable variables from the snapshot and rehydrate on
+recovery — shrinks the on-thread clone AND the on-disk file/fsync. Bigger change
+(touches the recovery path); pending direction.
