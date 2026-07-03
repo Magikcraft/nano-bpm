@@ -32,7 +32,7 @@
 //! it is recoverable when *all* sealed segments have been compacted away).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -636,15 +636,19 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
         covered_events,
         engine: snap,
     };
-    let bytes =
-        serde_json::to_vec(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let final_path = dir.join(format!("{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}"));
     let tmp = dir.join(format!(
         "{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}.tmp"
     ));
     {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&bytes)?;
+        // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
+        // first; see `write_multi_snapshot` for why the intermediate buffer is
+        // a multi-GB transient under a large backlog.
+        let f = File::create(&tmp)?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer(&mut w, &payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let f = w.into_inner()?;
         f.sync_all()?;
     }
     fs::rename(&tmp, &final_path)?;
@@ -731,13 +735,21 @@ pub fn write_multi_snapshot(
             })
             .collect(),
     };
-    let bytes =
-        serde_json::to_vec(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let final_path = dir.join(MULTI_SNAP_NAME);
     let tmp = dir.join(format!("{MULTI_SNAP_NAME}.tmp"));
     {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&bytes)?;
+        // Stream the JSON straight to the file through a BufWriter instead of
+        // materialising the whole snapshot into a `Vec<u8>` first: under a large
+        // active backlog that intermediate buffer is multi-GB (all resident
+        // variable payloads serialized at once) and was a major driver of the
+        // transient RSS balloon during the 60s snapshot tick. The snapshots
+        // share the live variables by Arc, so only this serialization ever
+        // duplicated them.
+        let f = File::create(&tmp)?;
+        let mut w = BufWriter::new(f);
+        serde_json::to_writer(&mut w, &payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let f = w.into_inner()?;
         f.sync_all()?;
     }
     fs::rename(&tmp, &final_path)?;
