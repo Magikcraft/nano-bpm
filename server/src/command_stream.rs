@@ -819,6 +819,30 @@ async fn reader_loop(
     }
 }
 
+/// Decide whether a `CreateInstance` takes the fire-and-forget **spawn** path
+/// (returns `true`) or the inline **serialized** path (`false`).
+///
+/// Spawning lets the reader loop read the next frame immediately, giving a
+/// producer connection concurrent proposes through the Raft Batcher — but each
+/// spawned task pins its variables payload before the engine's admission rails
+/// can see it, so an unbounded spawn rate is a per-connection memory balloon.
+///
+/// We only spawn when all three hold:
+/// - `!awaiting`: `awaitCompletion` creates must stay inline (the completion wait
+///   reads this node's read store).
+/// - `credit_before > 0`: the connection held a real submission credit — i.e. it
+///   is operating *within* its granted window. A client that ignores credits and
+///   over-sends drives `submission_outstanding` non-positive; those creates fall
+///   to the inline path, which awaits the commit and blocks the connection's
+///   reader, applying TCP backpressure to just that misbehaving socket and
+///   bounding its spawned-task balloon to ~one window. Self-enforcing flow
+///   control — no 503, no retry, no herd, and compliant producers are untouched.
+/// - `raft_active`: the spawn path only exists under Raft; single-node creates are
+///   already inline (and thus naturally serialized) below.
+fn should_spawn_fire_and_forget(awaiting: bool, credit_before: i64, raft_active: bool) -> bool {
+    !awaiting && credit_before > 0 && raft_active
+}
+
 /// Dispatches one client frame. Engine-bound writes are awaited inline so a single
 /// connection's commands keep arrival order at the journal; `awaitCompletion`
 /// spawns a detached task so a long wait does not block the connection's intake.
@@ -933,7 +957,19 @@ async fn handle_client_frame(
             // Raft Batcher. `awaitCompletion` creates stay on the inline path below
             // (the completion wait must read this node's read store). The non-Raft
             // single-node fast path is likewise unchanged.
-            if !awaiting && !server.raft_registry().is_empty() {
+            //
+            // Self-enforcing credit window: only spawn while the connection is
+            // *within* its granted submission window (`before > 0` — it held a real
+            // credit). A client that ignores the window and over-sends drives
+            // `submission_outstanding` non-positive; those creates fall through to
+            // the inline path below, which awaits the commit and so blocks this
+            // connection's reader — TCP backpressure fills the offending socket's
+            // buffer and throttles it to the engine's commit rate. That bounds the
+            // per-connection balloon of spawned create tasks (each pinning its
+            // variables payload before `admission_shed`/`pipeline_bytes` can see
+            // it) to ~one window, without a 503, a retry, or a herd, and without
+            // touching compliant producers or other connections.
+            if should_spawn_fire_and_forget(awaiting, before, !server.raft_registry().is_empty()) {
                 let server = server.clone();
                 let conn = conn.clone();
                 tokio::spawn(async move {
@@ -2290,6 +2326,35 @@ mod fair_plan_tests {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn fire_and_forget_spawns_only_within_the_credit_window() {
+        // Compliant producer under Raft: held a credit (before > 0) -> spawn the
+        // concurrent fire-and-forget path.
+        assert!(should_spawn_fire_and_forget(false, 4, true));
+        assert!(
+            should_spawn_fire_and_forget(false, 1, true),
+            "the last credit (before == 1) still spawns"
+        );
+
+        // Over-budget: the client ignored the window and over-sent, so the credit
+        // went non-positive. Fall to the inline (serialized) path so the reader
+        // blocks and TCP backpressure throttles just this socket.
+        assert!(
+            !should_spawn_fire_and_forget(false, 0, true),
+            "no credit held (before == 0) must not spawn"
+        );
+        assert!(
+            !should_spawn_fire_and_forget(false, -5, true),
+            "deeply over-budget must not spawn"
+        );
+
+        // awaitCompletion always stays inline (completion wait needs local reads).
+        assert!(!should_spawn_fire_and_forget(true, 4, true));
+
+        // Single-node (no Raft): the spawn path does not apply; creates are inline.
+        assert!(!should_spawn_fire_and_forget(false, 4, false));
+    }
 
     fn test_connection(id: ConnId) -> Arc<Connection> {
         let (tx, _rx) = mpsc::channel::<ServerFrame>(1);
