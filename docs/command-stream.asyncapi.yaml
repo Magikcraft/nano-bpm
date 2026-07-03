@@ -141,8 +141,30 @@ components:
       name: createInstance
       title: Create process instance
       summary: Start a process instance (consumes one submission credit).
+      description: >
+        Consumes one submission credit. When the credit window is exhausted the
+        server withholds credits (backpressure without `503`/retry) and the
+        client waits for a `submissionCredits` replenishment before sending the
+        frame. Clients MAY bound this wait locally — see the
+        `x-nano-client-options.submitTimeoutMs` extension — but the timeout is a
+        purely client-side guard: no timeout value is carried on the wire and the
+        server never sees it.
       payload:
         $ref: '#/components/schemas/CreateInstance'
+      x-nano-client-options:
+        submitTimeoutMs:
+          type: integer
+          minimum: 0
+          description: >
+            Client-only. Maximum time in milliseconds a client waits for a
+            submission credit before abandoning the create with a local
+            timeout error (the Node client throws `SubmissionTimeoutError`).
+            NOT a wire field — it is never serialized into the `createInstance`
+            frame and the server is unaware of it. Omit to wait indefinitely
+            for intake capacity (the default). On timeout the client removes its
+            queued waiter (no credit slot leaks) and sends nothing; treat the
+            timeout as an admission-backpressure signal and back off rather than
+            retrying in a tight loop.
     CompleteJob:
       name: completeJob
       title: Complete job

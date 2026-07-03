@@ -33,6 +33,13 @@ export interface CommandStreamClientOptions {
   maxReconnectDelayMs?: number;
   /** Override the connect timeout in ms. Default `10_000`. */
   connectTimeoutMs?: number;
+  /**
+   * Default maximum time in ms to wait for a server submission credit on
+   * `createInstance`/`createInstanceAndAwait` before rejecting with
+   * {@link SubmissionTimeoutError}. Per-request `submitTimeoutMs` overrides this.
+   * Omit (default `undefined`) to wait indefinitely for intake capacity.
+   */
+  submitTimeoutMs?: number;
 }
 
 /** A command rejected by the server (non-2xx `commandResult`). */
@@ -51,6 +58,24 @@ export class ConnectionClosedError extends Error {
   constructor(message = 'command stream connection closed') {
     super(message);
     this.name = 'ConnectionClosedError';
+  }
+}
+
+/**
+ * Thrown by `createInstance`/`createInstanceAndAwait` when no server submission
+ * credit is granted within the requested `submitTimeoutMs` window. On the command
+ * stream, admission backpressure is expressed by the server *withholding
+ * submission credits* (no `503`, no retry) — so a create call otherwise waits
+ * indefinitely for intake capacity. This turns that stall into a typed rejection.
+ * Treat it as "the server is backpressured" and back off; do NOT tight-loop
+ * retry, which would defeat the credit window's purpose.
+ */
+export class SubmissionTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(
+      `create submission stalled: no server submission credit within ${timeoutMs}ms (server is applying admission backpressure)`,
+    );
+    this.name = 'SubmissionTimeoutError';
   }
 }
 
@@ -84,6 +109,14 @@ export interface CreateInstanceRequest {
   processDefinitionId?: string;
   processDefinitionKey?: string;
   variables?: Record<string, unknown>;
+  /**
+   * Maximum time in ms to wait for a server submission credit before rejecting
+   * with {@link SubmissionTimeoutError}. Overrides the client-wide
+   * `submitTimeoutMs`. Omit (or use the default `undefined`) to wait
+   * indefinitely — the historical behaviour, where the create stalls until the
+   * server replenishes credits. A negative value is treated as "wait forever".
+   */
+  submitTimeoutMs?: number;
 }
 
 export interface AwaitOptions {
@@ -320,13 +353,32 @@ export class CommandStreamClient extends EventEmitter {
 
   // ----- submission-credit gating -------------------------------------------
 
-  private async acquireSubmissionCredit(): Promise<void> {
+  private acquireSubmissionCredit(timeoutMs?: number): Promise<void> {
     if (this.submissionCredits > 0) {
       this.submissionCredits -= 1;
-      return;
+      return Promise.resolve();
     }
-    await new Promise<void>((resolve) => this.submissionWaiters.push(resolve));
-    this.submissionCredits -= 1;
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        this.submissionCredits -= 1;
+        resolve();
+      };
+      this.submissionWaiters.push(waiter);
+      if (timeoutMs !== undefined && timeoutMs >= 0) {
+        timer = setTimeout(() => {
+          const idx = this.submissionWaiters.indexOf(waiter);
+          if (idx >= 0) this.submissionWaiters.splice(idx, 1);
+          reject(new SubmissionTimeoutError(timeoutMs));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+    });
+  }
+
+  private resolveSubmitTimeout(req: CreateInstanceRequest): number | undefined {
+    return req.submitTimeoutMs ?? this.opts.submitTimeoutMs;
   }
 
   private releaseSubmissionWaiters(): void {
@@ -341,11 +393,13 @@ export class CommandStreamClient extends EventEmitter {
   /**
    * Starts a process instance. Consumes one submission credit; if the window is
    * exhausted, the call waits until the server replenishes credits (backpressure
-   * without retries). Resolves with the create ack (carrying the
-   * `processInstanceKey`) or rejects with a {@link CommandError}.
+   * without retries), or — when `submitTimeoutMs` is set — rejects with a
+   * {@link SubmissionTimeoutError} once that window elapses. Resolves with the
+   * create ack (carrying the `processInstanceKey`) or rejects with a
+   * {@link CommandError}.
    */
   async createInstance(req: CreateInstanceRequest): Promise<CreateInstanceResult> {
-    await this.acquireSubmissionCredit();
+    await this.acquireSubmissionCredit(this.resolveSubmitTimeout(req));
     const corr = this.nextCorr();
     const body = await this.sendCommand(corr, {
       type: 'createInstance',
@@ -366,7 +420,7 @@ export class CommandStreamClient extends EventEmitter {
     req: CreateInstanceRequest,
     await_?: AwaitOptions,
   ): Promise<{ ack: CreateInstanceResult; completion: InstanceCompletedFrame }> {
-    await this.acquireSubmissionCredit();
+    await this.acquireSubmissionCredit(this.resolveSubmitTimeout(req));
     const corr = this.nextCorr();
     const completion = this.registerAwait(corr);
     const body = await this.sendCommand(corr, {

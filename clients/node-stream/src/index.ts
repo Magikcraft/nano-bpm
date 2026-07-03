@@ -16,6 +16,7 @@ export {
   type CommandStreamClientOptions,
   commandStreamUrl,
   ConnectionClosedError,
+  SubmissionTimeoutError,
   type AwaitOptions,
   type CreateInstanceRequest,
   type CreateInstanceResult,

@@ -106,6 +106,31 @@ the window is exhausted the call waits for the server to replenish credits
 `reconnect`, `close`, and `error` events, and reconnects automatically (replaying
 job subscriptions) unless `reconnect: false`.
 
+#### Bounding the credit wait (`submitTimeoutMs`)
+
+By default a `createInstance` under sustained backpressure waits **indefinitely**
+for the server to replenish credits. To fail fast instead, set a `submitTimeoutMs`
+— per request, or client-wide as a default:
+
+```ts
+// Client-wide default; per-request wins when both are set.
+const client = new CommandStreamClient({ baseUrl, worker, submitTimeoutMs: 2_000 });
+
+try {
+  await client.createInstance({ processDefinitionId: 'order', submitTimeoutMs: 500 });
+} catch (err) {
+  if (err instanceof SubmissionTimeoutError) {
+    // Server is applying admission backpressure — back off, do NOT tight-loop retry.
+  }
+}
+```
+
+`submitTimeoutMs` is a **client-side** guard: it bounds only how long the client
+waits for a credit and is never sent to the server (nothing changes on the wire).
+On timeout the call rejects with `SubmissionTimeoutError`, the abandoned waiter is
+removed so no credit slot leaks, and no `createInstance` command is sent. Treat it
+as a backpressure signal and back off rather than retrying in a tight loop.
+
 ### Reconnect recovery
 
 If a socket drops after a `createInstance(awaitCompletion)` ack but before the
