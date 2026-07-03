@@ -818,7 +818,9 @@ deliberately orthogonal — pick each axis independently for your workload.
 | **High throughput under worker over-provisioning** | `NANOBPMN_REPLICATE_ACTIVATION=0` (leader-local) or `=digest` | Keep the activation lease off the Raft log (~3× activation throughput). `digest` adds a best-effort lease broadcast so failover redelivery is narrowed. All modes stay at-least-once. |
 | **Even job drain across nodes** | `NANOBPMN_ACTIVATION_FAIRNESS=1` or `=2` | `1` rotates+quota-splits the lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog so the deepest node drains fastest. |
 | **A producer that outpaces the workers** | leave backpressure on (default **Adaptive**), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | Adaptive (AIMD) sizes the in-flight watermark from measured latency and sheds excess creates with `503 RESOURCE_EXHAUSTED`, so the producer converges to the drain rate. |
+| **Behaviour at the saturation ceiling** | `NANOBPMN_SLA_MODE=latency` (default) or `=admission` | `latency` preserves end-to-end speed by shedding admission (**time-to-complete SLA**). `admission` keeps admitting instances and lets latency grow (**start-every-process SLA**); the memory-safety rails still guard against OOM in both modes. |
 | **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS`, `NANOBPMN_HISTORY_MAX_INSTANCES`, `NANOBPMN_VAR_SPILL*` | Idle-purge compacts hot state and returns freed arenas to the OS. Cap retained completed instances to bound read-model growth. |
+| **Bounded var-store WAL on disk** | `NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS` (default `30`, `0`/`off` disables) | Periodically runs `wal_checkpoint(TRUNCATE)` on the durable var-store so its `-wal` file can't grow without bound under a sustained large-payload write load. |
 
 ### Recommended profiles
 

@@ -54,6 +54,73 @@ pub fn parse_backpressure_setting(raw: Option<&str>) -> BackpressureSetting {
     }
 }
 
+/// Which service-level objective the operator wants the engine to honour when it
+/// reaches its saturation ceiling (memory / processing capacity). This selects
+/// the *behavioural characteristic* at the edge of the performance envelope; it
+/// does **not** relax the memory-safety rails (create-queue, in-flight payload,
+/// resident-memory watermarks) that exist to keep the node from OOMing — those
+/// are survival guards active in every mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlaMode {
+    /// **Preserve end-to-end latency** (default). At the ceiling, shed new
+    /// `createProcessInstance` calls (`503 RESOURCE_EXHAUSTED`) so accepted
+    /// instances keep completing fast. This is the "time-to-complete SLA": a
+    /// client that outpaces the drain rate is told to back off rather than
+    /// letting its already-running instances slow down. Enforced by the AIMD
+    /// concurrency limiter and the active-backlog admission gate.
+    Latency,
+    /// **Preserve admission** (accept latency). At the ceiling, keep admitting
+    /// new instances and let end-to-end latency grow instead of rejecting work.
+    /// This is the "start-every-process SLA": the latency-preservation gates (the
+    /// AIMD concurrency limiter and the active-backlog gate) are suppressed, so
+    /// creates are admitted until a genuine memory-safety rail bites. Terminal
+    /// state now frees on completion (ADR 0012) and live variables spill to disk,
+    /// so far more instances start before that hard rail is reached.
+    Admission,
+}
+
+impl SlaMode {
+    /// Whether latency-preservation gates (AIMD concurrency shed + active-backlog
+    /// shed) should reject admission. `true` in [`SlaMode::Latency`], `false` in
+    /// [`SlaMode::Admission`] (which prefers admitting and accepts the latency).
+    /// Memory-safety rails ignore this and always apply.
+    pub fn sheds_for_latency(&self) -> bool {
+        matches!(self, SlaMode::Latency)
+    }
+
+    /// Human-readable description for the startup log.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            SlaMode::Latency => {
+                "latency (preserve end-to-end latency; shed admission at the ceiling)"
+            }
+            SlaMode::Admission => {
+                "admission (preserve admission; accept higher latency at the ceiling)"
+            }
+        }
+    }
+}
+
+/// Pure resolver for `NANOBPMN_SLA_MODE` (split out so it is unit-testable without
+/// the process environment). Defaults to [`SlaMode::Latency`] — the historical
+/// behaviour — and fails safe to it for any unrecognised value (never silently
+/// drop latency protection):
+/// - `None` (unset), `latency`, `preserve-latency`, `time-to-complete` → `Latency`;
+/// - `admission`, `preserve-admission`, `accept-latency`, `start-every-process`,
+///   `throughput` → `Admission`;
+/// - anything else → `Latency`.
+pub fn parse_sla_mode(raw: Option<&str>) -> SlaMode {
+    let Some(raw) = raw else {
+        return SlaMode::Latency;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "latency" | "preserve-latency" | "time-to-complete" | "complete" => SlaMode::Latency,
+        "admission" | "preserve-admission" | "accept-latency" | "start-every-process"
+        | "start" | "throughput" => SlaMode::Admission,
+        _ => SlaMode::Latency,
+    }
+}
+
 /// Runtime backpressure handle held by the server and queried by the create
 /// handler. Cheap to clone; the adaptive limit lives behind an `Arc<AtomicUsize>`
 /// the engine thread writes and request handlers read.
@@ -317,6 +384,41 @@ mod tests {
                 "{raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn sla_mode_defaults_to_latency() {
+        assert_eq!(parse_sla_mode(None), SlaMode::Latency);
+        for raw in ["latency", "preserve-latency", "time-to-complete", " Latency ", ""] {
+            assert_eq!(parse_sla_mode(Some(raw)), SlaMode::Latency, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn sla_mode_admission_aliases() {
+        for raw in [
+            "admission",
+            "preserve-admission",
+            "accept-latency",
+            "start-every-process",
+            "throughput",
+            " Admission ",
+        ] {
+            assert_eq!(parse_sla_mode(Some(raw)), SlaMode::Admission, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn sla_mode_unrecognised_fails_safe_to_latency() {
+        for raw in ["garbage", "fast", "0"] {
+            assert_eq!(parse_sla_mode(Some(raw)), SlaMode::Latency, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn sla_mode_sheds_for_latency_only_in_latency_mode() {
+        assert!(SlaMode::Latency.sheds_for_latency());
+        assert!(!SlaMode::Admission.sheds_for_latency());
     }
 
     #[test]

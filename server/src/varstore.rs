@@ -66,6 +66,28 @@ pub fn lean_snapshot_enabled() -> bool {
     )
 }
 
+/// The interval between truncating WAL checkpoints of the durable var-store,
+/// from `NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS` (default 30s; `0`/`off` disables).
+/// Bounds the `-wal` file's disk growth under a sustained write load (see
+/// [`VarStore::checkpoint_wal`]). Driven from the maintenance loop, never the hot
+/// engine thread.
+pub fn wal_checkpoint_interval() -> Option<std::time::Duration> {
+    match std::env::var("NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS") {
+        Ok(v) => {
+            let t = v.trim();
+            if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "false") {
+                return None;
+            }
+            match t.parse::<u64>() {
+                Ok(0) => None,
+                Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+                Err(_) => Some(std::time::Duration::from_secs(30)),
+            }
+        }
+        Err(_) => Some(std::time::Duration::from_secs(30)),
+    }
+}
+
 impl VarStore {
     /// Opens (creating if absent) the authoritative variable store at `path`, or
     /// an in-memory store when `path` is `None` (tests / ephemeral runs).
@@ -215,6 +237,27 @@ impl VarStore {
         out
     }
 
+    /// Forces a **truncating** WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`):
+    /// flushes the write-ahead log's committed pages back into the main database
+    /// file and then resets the `-wal` file to zero length.
+    ///
+    /// Why this is needed. The store runs in `journal_mode=WAL` with
+    /// `synchronous=NORMAL`, and it is written continuously (every snapshot tick
+    /// plus each spill eviction) while recovery/`load_all` may read concurrently.
+    /// SQLite's automatic checkpoint moves pages into the db file but never
+    /// *shrinks* the `-wal` file, and a long-lived reader can pin the checkpoint
+    /// so the WAL only grows — observed climbing to ~843 MB during a large-payload
+    /// soak. A periodic truncating checkpoint (driven off-thread from the
+    /// maintenance loop, never the hot engine thread) bounds that disk growth. It
+    /// is a no-op cost when the WAL is already small.
+    ///
+    /// A `SQLITE_BUSY` from a concurrent reader is not fatal — the WAL is simply
+    /// truncated on a later tick — so callers should log-and-continue on error.
+    pub fn checkpoint_wal(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("var store poisoned");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
     /// Number of instances currently held. Test/observability helper.
     pub fn len(&self) -> usize {
         let conn = self.conn.lock().expect("var store poisoned");
@@ -305,6 +348,40 @@ mod tests {
         let all = store.load_all();
         assert_eq!(all.get(&3).and_then(|m| m.get("data")), Some(&Value::Str("durable".into())));
         assert_eq!(store.position(0), 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wal_checkpoint_truncates_and_preserves_contents() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varstore-wal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vars.sqlite");
+        let wal = dir.join("vars.sqlite-wal");
+        let store = VarStore::open(Some(&path)).unwrap();
+        // Write enough distinct instances to grow the WAL past its initial size.
+        for i in 0..500i64 {
+            let v = vars(&format!("payload-{i}"));
+            store.checkpoint(0, i as u64, &[(i as Key, &v)], &[]).unwrap();
+        }
+        let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(before > 0, "WAL should have grown from the writes");
+
+        store.checkpoint_wal().expect("truncating checkpoint succeeds");
+
+        // TRUNCATE resets the -wal file to zero length; contents survive (they were
+        // flushed into the main db file).
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(after < before, "WAL should shrink after TRUNCATE: {before} -> {after}");
+        assert_eq!(store.len(), 500, "all rows survive the checkpoint");
+        assert_eq!(
+            store.get(499).and_then(|m| m.get("data").cloned()),
+            Some(Value::Str("payload-499".into()))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

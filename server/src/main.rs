@@ -54,7 +54,8 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, Backpressure, BackpressureSetting, parse_backpressure_setting,
+    AdaptiveController, Backpressure, BackpressureSetting, SlaMode, parse_backpressure_setting,
+    parse_sla_mode,
 };
 use crate::engine_actor::EngineHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -120,6 +121,15 @@ pub struct ServerImpl {
     /// per-command latency); a fixed watermark or fully-off are selectable via
     /// `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`. See [`crate::backpressure`].
     backpressure: Backpressure,
+    /// Behaviour selected at the saturation ceiling (`NANOBPMN_SLA_MODE`).
+    /// [`SlaMode::Latency`] (default) sheds admission to preserve end-to-end
+    /// latency; [`SlaMode::Admission`] suppresses the latency-preservation gates
+    /// (the AIMD concurrency limiter and the active-backlog gate) to keep
+    /// admitting instances, accepting higher latency. It never relaxes the
+    /// memory-safety rails (create-queue, in-flight-payload, resident-memory
+    /// watermarks), which guard against OOM in both modes. See
+    /// [`crate::backpressure::SlaMode`].
+    sla_mode: SlaMode,
     /// Lock-free gauge of in-flight (Active) process instances, maintained by the
     /// read-model exporter (+1 per `ProcessInstanceCreated`, −1 per terminal
     /// event). This is the *active backlog*; it is kept for observability and
@@ -409,6 +419,9 @@ impl ServerImpl {
         };
         tracing::info!("backpressure: {}", backpressure.describe());
 
+        let sla_mode = parse_sla_mode(std::env::var("NANOBPMN_SLA_MODE").ok().as_deref());
+        tracing::info!("SLA mode at ceiling: {}", sla_mode.describe());
+
         let admission_max_backlog = admission_max_backlog_from_env();
         if admission_max_backlog > 0 {
             tracing::info!(
@@ -560,6 +573,7 @@ impl ServerImpl {
             dispatch_wake: Arc::new(tokio::sync::Notify::new()),
             instances_changed: Arc::new(tokio::sync::Notify::new()),
             backpressure,
+            sla_mode,
             // Seed the gauge from the read model so a journal-replay restart
             // accounts for instances still in flight; a fresh/in-memory store
             // reports zero. The exporter maintains it from here on.
@@ -2041,20 +2055,27 @@ impl ServerImpl {
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
 
-        // Backpressure: reject new work once the engine's request-processing
-        // concurrency is at or above the current limit. The gated quantity is the
-        // number of creates being *applied right now* (the `processing` gauge),
-        // not the active backlog — so a no-drain burst is absorbed (it converges
-        // to client concurrency, like Zeebe/Camunda) and we shed only when the
-        // single engine thread genuinely can't keep up. Memory under a large
-        // backlog is bounded independently by the variable-spill tier. The 503
-        // carries a `RESOURCE_EXHAUSTED` title that the client SDK reads as a
-        // backpressure signal and answers with a retry backoff. The limit is
-        // either a fixed watermark or an adaptive AIMD value sized from measured
-        // latency; reading it (and the gauge) is a relaxed atomic load, so this
-        // check costs no engine round-trip — a small race against concurrent
-        // creates is irrelevant for an approximate limit.
-        if let Some(limit) = self.backpressure.current_limit() {
+        // Backpressure (latency-preservation gate): reject new work once the
+        // engine's request-processing concurrency is at or above the current
+        // limit. The gated quantity is the number of creates being *applied right
+        // now* (the `processing` gauge), not the active backlog — so a no-drain
+        // burst is absorbed (it converges to client concurrency, like
+        // Zeebe/Camunda) and we shed only when the single engine thread genuinely
+        // can't keep up. Memory under a large backlog is bounded independently by
+        // the variable-spill tier. The 503 carries a `RESOURCE_EXHAUSTED` title
+        // that the client SDK reads as a backpressure signal and answers with a
+        // retry backoff. The limit is either a fixed watermark or an adaptive AIMD
+        // value sized from measured latency; reading it (and the gauge) is a
+        // relaxed atomic load, so this check costs no engine round-trip — a small
+        // race against concurrent creates is irrelevant for an approximate limit.
+        //
+        // Suppressed in `SlaMode::Admission`: that mode preferentially admits
+        // instances and accepts higher latency, so it does not shed on the
+        // latency-driven concurrency limit (the memory-safety rails in
+        // `admission_shed` still apply and keep the node from OOMing).
+        if self.sla_mode.sheds_for_latency()
+            && let Some(limit) = self.backpressure.current_limit()
+        {
             let processing = self.processing.load(Ordering::Relaxed);
             if self.backpressure.should_shed(processing) {
                 return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
@@ -8117,8 +8138,14 @@ impl ServerImpl {
     }
 
     /// Read access to the create-side backpressure controller for the stream's
-    /// submission-credit policy.
+    /// submission-credit policy. Honours the SLA mode: in
+    /// [`SlaMode::Admission`](crate::backpressure::SlaMode::Admission) the
+    /// latency-driven concurrency limit does not withhold submission credit
+    /// (admission is preferred over latency); the memory-safety rails still apply.
     pub(crate) fn submission_pressure(&self) -> bool {
+        if !self.sla_mode.sheds_for_latency() {
+            return false;
+        }
         let processing = self.processing.load(Ordering::Relaxed);
         self.backpressure.should_shed(processing)
     }
@@ -8131,14 +8158,24 @@ impl ServerImpl {
         self.inflight.load(Ordering::Relaxed) as i64
     }
 
-    /// Active-backlog / create-queue admission gate. When either
-    /// `NANOBPMN_ADMISSION_MAX_BACKLOG` or `NANOBPMN_ADMISSION_MAX_CREATE_QUEUE` is
-    /// set (> 0), returns `Some(reason)` once the corresponding signal is at or
-    /// above its limit, signalling the create should be shed; `None` when both are
-    /// off or have headroom. Relaxed atomic loads — no engine round-trip; an
-    /// approximate bound is fine. The create-queue gate fires first under overload
-    /// (completion-priority diverts the pile-up there); the active-backlog gate is
-    /// the complementary memory bound for worker-starved workloads.
+    /// Admission gate combining several signals. Returns `Some(reason)` once any
+    /// active signal is at/above its limit (the create should be shed); `None`
+    /// when all have headroom. Relaxed atomic loads — no engine round-trip; an
+    /// approximate bound is fine.
+    ///
+    /// The signals split into two classes by [`SlaMode`](crate::backpressure::SlaMode):
+    /// - **Latency-preservation gate** — the active-backlog limit
+    ///   (`NANOBPMN_ADMISSION_MAX_BACKLOG`). Suppressed in `SlaMode::Admission`
+    ///   (that mode prefers admitting instances over bounding latency).
+    /// - **Memory-safety rails** — the create-queue depth
+    ///   (`NANOBPMN_ADMISSION_MAX_CREATE_QUEUE`, bounding the pre-apply mailbox of
+    ///   variable-carrying closures), the exporter-queue saturation gate, the
+    ///   in-flight create-payload watermark, and the resident-memory watermark.
+    ///   These guard against OOM and therefore apply in **both** SLA modes — even
+    ///   "start every process" cannot outrun physical memory + disk. Terminal
+    ///   state now frees on completion (ADR 0012) and live variables spill to
+    ///   disk, so in admission mode these rails bite far later than the
+    ///   latency gate would have.
     pub(crate) fn admission_shed(&self) -> Option<String> {
         let cq_limit = self.admission_max_create_queue;
         if cq_limit > 0 {
@@ -8151,7 +8188,7 @@ impl ServerImpl {
             }
         }
         let backlog_limit = self.admission_max_backlog;
-        if backlog_limit > 0 {
+        if self.sla_mode.sheds_for_latency() && backlog_limit > 0 {
             let backlog = self.inflight.load(Ordering::Relaxed);
             if backlog >= backlog_limit {
                 return Some(format!(
@@ -9434,6 +9471,12 @@ async fn main() {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
                     ticker.tick().await;
+                    // Periodic truncating WAL checkpoint of the durable var-store:
+                    // SQLite's auto-checkpoint never shrinks the `-wal` file, so a
+                    // sustained write load grows it unbounded (~843 MB observed).
+                    // Truncate it off this maintenance thread on its own cadence.
+                    let wal_interval = varstore::wal_checkpoint_interval();
+                    let mut last_wal_truncate = std::time::Instant::now();
                     loop {
                         ticker.tick().await;
                         // Snapshot each owned partition; a `None` (writer gone)
@@ -9524,6 +9567,19 @@ async fn main() {
                             tracing::debug!(
                                 "multi-partition journal compaction removed {removed} sealed segment(s) (exported {exported:?})"
                             );
+                        }
+
+                        // Bound the durable var-store WAL: truncate it back to zero
+                        // on its own cadence so a sustained write load can't grow it
+                        // without limit. A `SQLITE_BUSY` from a concurrent reader is
+                        // harmless — the next tick retries.
+                        if let (Some(vs), Some(wal_every)) = (&varstore, wal_interval)
+                            && last_wal_truncate.elapsed() >= wal_every
+                        {
+                            if let Err(e) = vs.checkpoint_wal() {
+                                tracing::debug!("var-store WAL checkpoint(TRUNCATE) skipped: {e}");
+                            }
+                            last_wal_truncate = std::time::Instant::now();
                         }
                     }
                 });

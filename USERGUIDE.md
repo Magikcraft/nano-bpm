@@ -359,6 +359,7 @@ workload.
 | **High throughput with many workers** | `NANOBPMN_REPLICATE_ACTIVATION=0` or `=digest` | Keep the job-activation lease off the replication log (~3× activation throughput). Still at-least-once. |
 | **Even job drain across nodes** | `NANOBPMN_ACTIVATION_FAIRNESS=1` or `=2` | Spread the activation budget across nodes; `2` also drains the deepest backlog fastest. |
 | **A producer that outpaces workers** | leave backpressure on (default), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | The engine sizes the in-flight watermark from measured latency and sheds excess creates with `503`, so the producer converges to the drain rate. |
+| **Behaviour at the saturation ceiling** | `NANOBPMN_SLA_MODE=latency` (default) or `=admission` | `latency` keeps accepted instances fast by shedding admission (time-to-complete SLA); `admission` keeps admitting and lets latency grow (start-every-process SLA). OOM-safety rails apply in both. |
 | **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS`, `NANOBPMN_HISTORY_MAX_INSTANCES` | Idle-purge returns freed memory to the OS; cap retained completed instances to bound read-model growth. |
 
 **Recommended profiles:**
