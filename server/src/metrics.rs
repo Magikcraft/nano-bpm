@@ -73,6 +73,8 @@ struct Metrics {
     raft_log_bytes: IntGauge,
     /// Count of uncompacted Raft log entries in memory across all owned partitions.
     raft_log_entries: IntGauge,
+    /// Resident read-model export backlog bytes (forwarded but not yet projected).
+    exporter_queue_bytes: IntGauge,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -215,6 +217,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let exporter_queue_bytes = IntGauge::new(
+        "nanobpm_exporter_queue_bytes",
+        "Resident read-model export backlog bytes (events forwarded but not yet projected, all shards).",
+    )
+    .expect("valid gauge");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -234,6 +242,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_completions_total.clone())))
         .and(registry.register(Box::new(raft_log_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
+        .and(registry.register(Box::new(exporter_queue_bytes.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -256,6 +265,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_completions_total,
         raft_log_bytes,
         raft_log_entries,
+        exporter_queue_bytes,
     }
 });
 
@@ -313,6 +323,13 @@ pub fn set_pipeline_bytes(bytes: u64) {
 pub fn raft_log_delta(entries_delta: i64, bytes_delta: i64) {
     METRICS.raft_log_entries.add(entries_delta);
     METRICS.raft_log_bytes.add(bytes_delta);
+}
+
+/// Publishes the aggregate resident read-model export-backlog byte gauge (summed
+/// across shards), sampled off the hot path to attribute the in-flight pipeline
+/// share of the RSS balloon.
+pub fn set_exporter_queue_bytes(bytes: u64) {
+    METRICS.exporter_queue_bytes.set(bytes as i64);
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the

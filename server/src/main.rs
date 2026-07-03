@@ -9474,6 +9474,7 @@ async fn main() {
     if server.mem_watermark_bytes > 0 || server.pipeline_bytes_watermark > 0 {
         let pressure = server.mem_pressure_bytes.clone();
         let pipeline = server.pipeline_bytes.clone();
+        let engine = server.engine.clone();
         let sample_resident = server.mem_watermark_bytes > 0;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -9488,6 +9489,9 @@ async fn main() {
                 // Publish the in-flight create-payload gauge for observability
                 // (off the hot path); the gate itself reads the atomic directly.
                 metrics::set_pipeline_bytes(pipeline.load(Ordering::Relaxed));
+                // Publish the resident export-backlog gauge (in-flight pipeline
+                // attribution for the RSS balloon); a cheap relaxed sum.
+                metrics::set_exporter_queue_bytes(engine.exporter_queued_bytes_total());
             }
         });
     }

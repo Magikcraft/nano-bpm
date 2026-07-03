@@ -384,6 +384,18 @@ impl Partitions {
         debug_assert!(set.is_ok(), "exporter backpressure set twice");
     }
 
+    /// Sum of every local shard's exporter-queue byte gauge — the resident
+    /// read-model export backlog (events forwarded to exporter threads but not yet
+    /// projected). `0` when backpressure is disabled. A cheap relaxed sum with no
+    /// engine round-trip; sampled for the `nanobpm_exporter_queue_bytes` gauge to
+    /// attribute the in-flight pipeline share of the RSS balloon.
+    pub fn exporter_queued_bytes_total(&self) -> u64 {
+        match self.exporter_bp.get() {
+            None => 0,
+            Some(bp) => bp.gauges.iter().map(|g| g.load(Ordering::Relaxed)).sum(),
+        }
+    }
+
     /// Whether every local shard's exporter queue is at or above budget — the
     /// create-admission shed condition. `false` when backpressure is disabled
     /// (unbounded) or any shard still has headroom. Cheap relaxed loads; no
