@@ -33,6 +33,7 @@ mod readstore;
 mod seglog;
 mod stub_impls;
 mod varspill;
+mod varstore;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
