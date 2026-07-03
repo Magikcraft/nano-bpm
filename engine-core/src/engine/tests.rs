@@ -221,6 +221,108 @@ fn variable_spill_selects_only_job_parked_instances() {
 }
 
 #[test]
+fn leased_job_instance_is_still_spillable() {
+    // Regression pin (ADR 0012): activating (leasing) a job to a worker keeps
+    // the job indexed in `jobs_by_instance` and only adds it to `activated_jobs`,
+    // so the instance remains a spill candidate. The worker already holds a copy
+    // of the variables from activation; rehydration on completion/redelivery
+    // restores them. (Corrects the prior claim that `is_spillable` excludes
+    // leased jobs.)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("k".to_string(), Value::Int(7));
+    let events = engine
+        .apply_command(Command::create_instance_with("order", vars))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.resident_spillable_count(), 1);
+
+    let jobs = engine.activate_jobs("payment", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1, "one job activated");
+    assert!(
+        engine.state().activated_jobs.contains(&jobs[0].key),
+        "the job is leased"
+    );
+    assert_eq!(
+        engine.resident_spillable_count(),
+        1,
+        "a leased-job instance is still spillable"
+    );
+    assert_eq!(engine.spillable_instances(10), vec![key]);
+}
+
+#[test]
+fn completing_an_instance_drops_its_variables_from_hot_state() {
+    // ADR 0012: a terminal instance's variables are never read from hot state
+    // again, so completion drops the payload immediately (heap reclaimed without
+    // waiting for exporter-driven eviction). The instance shell remains resident
+    // (queryable) until eviction, but carries no variables.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("k".to_string(), Value::Int(7));
+    let events = engine
+        .apply_command(Command::create_instance_with("order", vars))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(!engine.instance(key).unwrap().variables.is_empty());
+
+    // Run the single service task to completion.
+    complete_one(&mut engine, "payment");
+
+    let instance = engine.instance(key).expect("shell still resident");
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Completed,
+        "instance is terminal"
+    );
+    assert!(
+        instance.variables.is_empty(),
+        "a completed instance holds no variables in hot state"
+    );
+    assert_eq!(
+        engine.resident_variable_bytes(),
+        0,
+        "terminal instance contributes no resident variable bytes"
+    );
+}
+
+#[test]
+fn terminating_an_instance_drops_its_variables_from_hot_state() {
+    // ADR 0012: cancellation (→ Terminated) also drops the payload.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("k".to_string(), Value::Int(7));
+    let events = engine
+        .apply_command(Command::create_instance_with("order", vars))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(!engine.instance(key).unwrap().variables.is_empty());
+
+    engine
+        .apply_command(Command::cancel_instance(key))
+        .expect("cancel");
+
+    let instance = engine.instance(key).expect("shell still resident");
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Terminated
+    );
+    assert!(
+        instance.variables.is_empty(),
+        "a terminated instance holds no variables in hot state"
+    );
+}
+
+#[test]
 fn cold_spill_round_trips_a_job_parked_instance() {
     // Snapshotting a job-parked instance lifts it (and its job) entirely out
     // of hot state; rehydrating restores it so the job is activatable and the
@@ -1128,19 +1230,32 @@ fn should_merge_message_variables_on_correlation() {
         .unwrap();
     let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
 
-    engine.correlate_message(
+    let fired = engine.correlate_message(
         "payment-received",
         "A",
         vars(&[("amount", Value::Int(42))]),
         0,
     );
 
-    // The message payload is merged into the correlated instance's variables.
-    assert_eq!(
-        engine.state().instances[&instance_key]
-            .variables
-            .get("amount"),
-        Some(&Value::Int(42))
+    // The message payload is merged into the instance — the merge is carried on
+    // the durable `VariablesUpdated` event (the exporter's source of truth). The
+    // instance then runs to completion, which drops its hot-state variables
+    // (ADR 0012), so the merged value is asserted on the event, not hot state.
+    let merged = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::VariablesUpdated {
+                instance_key: k,
+                variables,
+            } if *k == instance_key => variables.get("amount").cloned(),
+            _ => None,
+        })
+        .expect("correlation emits a VariablesUpdated carrying the payload");
+    assert_eq!(merged, Value::Int(42));
+    assert!(engine.is_completed(instance_key));
+    assert!(
+        engine.state().instances[&instance_key].variables.is_empty(),
+        "a completed instance holds no variables in hot state (ADR 0012)"
     );
 }
 
@@ -3331,20 +3446,23 @@ fn should_create_an_instance_when_a_message_start_correlates() {
     // The matching message creates and runs a fresh instance to completion,
     // seeding it with the message's variables.
     let fired = engine.correlate_message("order-placed", "", vars(&[("amount", Value::Int(7))]), 0);
-    let instance_key = fired
+    let (instance_key, seeded) = fired
         .iter()
         .find_map(|e| match e {
-            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            Event::ProcessInstanceCreated {
+                instance_key,
+                variables,
+                ..
+            } => Some((*instance_key, variables.get("amount").cloned())),
             _ => None,
         })
         .unwrap();
-    assert_eq!(
-        engine.state().instances[&instance_key]
-            .variables
-            .get("amount"),
-        Some(&Value::Int(7))
-    );
+    // The instance is seeded with the message's variables (carried on the
+    // durable ProcessInstanceCreated event) and runs to completion, which drops
+    // its hot-state variables (ADR 0012).
+    assert_eq!(seeded, Some(Value::Int(7)));
     assert!(engine.is_completed(instance_key));
+    assert!(engine.state().instances[&instance_key].variables.is_empty());
 }
 
 #[test]
@@ -3431,10 +3549,14 @@ fn dispatch_start_instance_mints_the_instance_locally() {
         })
         .unwrap();
 
-    let instance_key = fired
+    let (instance_key, seeded) = fired
         .iter()
         .find_map(|e| match e {
-            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            Event::ProcessInstanceCreated {
+                instance_key,
+                variables,
+                ..
+            } => Some((*instance_key, variables.get("amount").cloned())),
             _ => None,
         })
         .expect("the dispatch mints an instance");
@@ -3443,11 +3565,12 @@ fn dispatch_start_instance_mints_the_instance_locally() {
         2,
         "the instance is minted in the target partition's namespace"
     );
+    // The dispatched variables seed the instance (carried on the durable
+    // ProcessInstanceCreated event); the instance then completes and drops its
+    // hot-state variables (ADR 0012), so the seed is asserted on the event.
     assert_eq!(
-        target.state().instances[&instance_key]
-            .variables
-            .get("amount"),
-        Some(&Value::Int(9)),
+        seeded,
+        Some(Value::Int(9)),
         "the dispatched variables seed the instance"
     );
 }

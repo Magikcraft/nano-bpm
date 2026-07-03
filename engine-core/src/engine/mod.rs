@@ -2494,6 +2494,17 @@ impl Engine {
                     self.dirty_vars.insert(*instance_key);
                     self.forgotten_vars.remove(instance_key);
                 }
+                // A terminal instance drops its variables in `state::apply`
+                // (ADR 0012). Mirror that in the durable store: forget the
+                // payload so a snapshot taken before exporter-driven eviction
+                // cannot resurrect it on recovery. Ordering is deliberate — this
+                // wins over any dirty mark from the same command's earlier
+                // `VariablesUpdated` (e.g. job-output merge then completion).
+                Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } => {
+                    self.dirty_vars.remove(instance_key);
+                    self.forgotten_vars.insert(*instance_key);
+                }
                 _ => {}
             }
         }

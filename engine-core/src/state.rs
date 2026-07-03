@@ -1090,6 +1090,17 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::ProcessInstanceCompleted { instance_key } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
+                // A terminal instance's variables are never read from hot state
+                // again — workers are done, the exporter projects from events,
+                // and recovery replays the journal + durable store. Drop the
+                // payload now to reclaim heap immediately, decoupling
+                // terminal-state memory from exporter-driven eviction (ADR 0012).
+                // The instance shell stays resident until eviction so status
+                // queries still resolve during the read-model projection gap.
+                if !instance.variables.is_empty() {
+                    instance.variables = Arc::new(HashMap::new());
+                }
+                instance.variables_spilled = false;
             }
         }
 
@@ -1110,6 +1121,12 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance.active.clear();
                 instance.scopes.clear();
                 instance.incidents.clear();
+                // Drop the variable payload on the terminal transition — see
+                // `ProcessInstanceCompleted` above (ADR 0012).
+                if !instance.variables.is_empty() {
+                    instance.variables = Arc::new(HashMap::new());
+                }
+                instance.variables_spilled = false;
             }
         }
 
