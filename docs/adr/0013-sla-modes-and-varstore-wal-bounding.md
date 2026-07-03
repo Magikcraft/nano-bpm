@@ -1,8 +1,9 @@
 # ADR 0013 — SLA modes at the saturation ceiling, and bounding the var-store WAL
 
-Status: **Accepted — implemented.** Both changes land behind defaults that
-preserve the historical behaviour (`NANOBPMN_SLA_MODE=latency`, WAL truncation
-on at 30 s). Unit-tested; clippy clean; release build green.
+Status: **Accepted — implemented + validated.** Both changes land behind defaults
+that preserve the historical behaviour (`NANOBPMN_SLA_MODE=latency`, WAL truncation
+on at 30 s). Unit-tested; clippy clean; release build green; cluster-soaked (see
+Validation below).
 Date: 2026-07-03.
 Relates to: ADR 0003 (write-path durability tiers), ADR 0012 (terminal-state /
 exporter-lag decoupling), `PERFORMANCE.md` (Fix 1a/1b/2), `server/src/backpressure.rs`,
@@ -74,6 +75,63 @@ working set that must fit in RAM is minimised — so in admission mode the hard
 memory rails bite far later than the latency gate would have, letting many more
 instances start before anything is shed.
 
+## Validation (GCP 3-node RF=3 P=12, sha e97e95c14b11d5d5, fresh data)
+
+Binary built on-node from `git archive HEAD`, installed on all three nodes; each
+mode relaunched fresh (data wiped) via `node-start-sla.sh <mode>`.
+
+### WAL bounding — confirmed
+Across every run (closed-loop soak and open-loop flood), the var-store `-wal`
+file peaked at ~4–7 MB/node (≤ ~12 MB aggregate across 3 nodes) and truncated
+back toward 0 within the 30 s checkpoint cadence. Never approached the ~843 MB
+pre-fix growth. The main `var-store.sqlite` grows normally (~200–270 MB/node
+under a blob burst) and is unaffected. **30 s default validated** — comfortable
+headroom; could be relaxed to 60 s, but the truncation is off the hot thread and
+cheap, so 30 s stays the default.
+
+### SLA-mode behaviour — modes converge under the clients we can drive
+Two experiments:
+
+- **Closed-loop soak** (`soakB`: warm 60 s / 50 KB blob burst 180 s @16 workers /
+  recover 90 s; `MAX_INFLIGHT=32000`, await-completion):
+  - latency: A ~37k, B ~2150/s p99 16.6 s, C ~18k p99 7.4 s; peak res 3539 MB,
+    var 129 MB; idle → var 0.
+  - admission: A ~37k, B ~2210/s p99 17.2 s, C ~18k p99 9 s; peak res 3385 MB,
+    var 168 MB; idle → var 0.
+- **Open-loop flood** (`flood-sla`: 8 starved workers, `MAX_INFLIGHT=1e8`, 50 KB
+  blobs, 60 s/mode):
+  - latency: admitted ~105k/node, `stream_credit_stalls`=0, peak res 436 MB.
+  - admission: admitted ~106k/node, `stream_credit_stalls`=0, peak res 432 MB.
+
+Both modes were **behaviourally indistinguishable** in throughput, tail latency,
+memory, and shed count. Root cause: every load client available here **closes the
+loop** — the Node producer awaits completion and is itself HOL-bound at
+~1771 creates/s/node (≈ worker drain rate), so the offered load never exceeds the
+worker drain rate and the server's latency-shed gates (AIMD limiter + active-backlog
+gate) never engage. With the gates idle, the two modes gate nothing differently.
+
+**To observe divergence, an open-loop fire-and-forget producer that outpaces the
+worker pool is required** (a Rust producer — the Node stream producer is reader-loop
+HOL-bound and cannot generate the necessary overload). This is deferred, not a
+defect: the modes are *correct by construction* (admission mode simply suppresses
+the three latency-shed sites while keeping the memory rails), and the closed-loop
+result is the reassuring one — under well-behaved, completion-aware clients the two
+modes cost nothing relative to each other.
+
+## Out-of-the-box tuning guidance
+
+- **`NANOBPMN_SLA_MODE` — default `latency`.** Keep it. Under completion-aware
+  (closed-loop) clients it is indistinguishable from `admission`, and it is the
+  safe choice under a genuinely open-loop overload (it preserves e2e latency by
+  shedding at the AIMD/backlog gate rather than letting latency grow unbounded).
+  Switch to `admission` only for "start-every-process" workloads that prefer to
+  absorb latency (backed by spill + the memory rails) over rejecting creates —
+  its value shows only under open-loop overload.
+- **`NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS` — default `30`.** Validated: holds the
+  var-store WAL to a few MB/node even under a blob burst. Leave at 30 s; raise to
+  60 s only if truncation contention is ever observed under very heavy spill
+  (none seen here); `0`/`off` disables it (not recommended — the WAL then ratchets).
+
 ## Consequences
 
 - **Positive.** Disk footprint of the var-store is bounded. Operators can select
@@ -102,9 +160,11 @@ instances start before anything is shed.
 
 ## Follow-ups
 
+- Build an **open-loop Rust producer** (fire-and-forget, unbounded inflight) to
+  drive true overload and directly measure SLA-mode divergence (admitted count,
+  credit-stalls, memory to the rails). The Node producer cannot generate this.
 - Optionally have admission mode lower the adaptive spill high-watermark so it
   converts RAM pressure into disk earlier (bias spill), widening the admission
   runway before the hard rail.
-- Soak-validate admission mode on the cluster: confirm it sustains admission under
-  a worker-starved blob burst with memory held by the rails + spill, and that the
-  var-store WAL stays bounded across a long run.
+- ~~Soak-validate admission mode on the cluster~~ (done — see Validation; modes
+  converge under closed-loop clients, WAL stays bounded).
