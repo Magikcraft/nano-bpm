@@ -9041,7 +9041,41 @@ async fn main() {
             // path: the shared seal state plus the global partition count that
             // sizes the per-partition compaction watermark vector.
             let mut multi_seg: Option<(Arc<seglog::SegShared>, u64)> = None;
-            let (journals, recovered, store) = if topology.is_single_node() && partitions == 1 {
+            // Lean-snapshot mode: an authoritative durable variable store sited
+            // next to the journal. Opened BEFORE recovery so `recover_multi` can
+            // install each instance's variables from it between `from_snapshot`
+            // and the tail replay (the lean snapshot itself carries no variables).
+            // Only the segmented multi-partition paths honour it; other boot paths
+            // keep full snapshots and leave this `None`.
+            let varstore: Option<Arc<varstore::VarStore>> = if varstore::lean_snapshot_enabled()
+                && seglog::segmented_enabled()
+            {
+                let dir = journal_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let path = dir.join("var-store.sqlite");
+                match varstore::VarStore::open(Some(&path)) {
+                    Ok(vs) => {
+                        tracing::info!(
+                            "lean snapshots enabled: authoritative var store at {} ({} instance(s))",
+                            path.display(),
+                            vs.len()
+                        );
+                        Some(Arc::new(vs))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to open var store at {}: {e}; falling back to full snapshots",
+                            path.display()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let (mut journals, recovered, store) = if topology.is_single_node() && partitions == 1 {
                 // Single partition: the bounded-disk segmented journal (snapshot
                 // + segment rotation + compaction) unless explicitly disabled, in
                 // which case the legacy single-file journal is used. Either way we
@@ -9125,7 +9159,7 @@ async fn main() {
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
                     let owned: Vec<u64> = (0..partitions as u64).collect();
                     let (shared, recovery) =
-                        SharedWriter::open_segmented(&dir, &owned, partitions as u64)
+                        SharedWriter::open_segmented(&dir, &owned, partitions as u64, varstore.as_deref())
                             .unwrap_or_else(|e| {
                                 panic!(
                                     "failed to open segmented multi-partition journal at {}: {e}",
@@ -9220,7 +9254,7 @@ async fn main() {
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
                     let (shared, recovery) =
-                        SharedWriter::open_segmented(&dir, &owned, partitions as u64)
+                        SharedWriter::open_segmented(&dir, &owned, partitions as u64, varstore.as_deref())
                             .unwrap_or_else(|e| {
                                 panic!(
                                     "failed to open segmented clustered journal at {}: {e}",
@@ -9309,6 +9343,19 @@ async fn main() {
                 }
             };
 
+            // Lean-snapshot wiring: make the durable var store authoritative for
+            // every owned partition's journal (enables engine dirty-var tracking,
+            // routes spill write-through / rehydrate / terminal-forget through the
+            // store). Only the segmented multi-partition boot paths set both
+            // `varstore` and `multi_seg`; the other paths keep full snapshots.
+            if let Some(vs) = &varstore
+                && multi_seg.is_some()
+            {
+                for journal in &mut journals {
+                    journal.set_varstore(Arc::clone(vs));
+                }
+            }
+
             let server = build_server(journals, store, topology);
 
             // The read model now has every completed instance, so shed them from
@@ -9381,6 +9428,8 @@ async fn main() {
             {
                 let handles: Vec<EngineHandle> = server.engine.all().to_vec();
                 let store = server.store.clone();
+                let lean = varstore.is_some();
+                let varstore = varstore.clone();
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
@@ -9393,19 +9442,63 @@ async fn main() {
                         let mut entries: Vec<(u64, u64, nanobpmn_engine_core::EngineSnapshot)> =
                             Vec::with_capacity(handles.len());
                         let mut covered = vec![0u64; num_partitions as usize];
+                        // Per-partition durable-variable position. `u64::MAX` means
+                        // "no variable constraint" (non-lean, or a partition this
+                        // node does not own); a lean checkpoint sets it to the
+                        // covered boundary once this partition's variables are
+                        // durable, gating compaction on the var store too.
+                        let mut var_position = vec![u64::MAX; num_partitions as usize];
                         let mut ok = true;
                         for handle in &handles {
                             let pid = handle.with(|journal| journal.partition_id()).await;
-                            match handle.with(|journal| journal.snapshot_and_rotate()).await {
-                                Some((snap, covered_p)) => {
-                                    if (pid as usize) < covered.len() {
-                                        covered[pid as usize] = covered_p;
+                            if let Some(vs) = &varstore {
+                                // Lean path: drain this partition's variable delta,
+                                // capture a control-only snapshot, seal — all on the
+                                // engine thread — then persist the delta to the
+                                // authoritative store off-thread BEFORE the snapshot
+                                // is written, so the store never lags the lean
+                                // snapshot that omits those variables.
+                                match handle
+                                    .with(|journal| journal.snapshot_and_rotate_lean())
+                                    .await
+                                {
+                                    Some((snap, covered_p, upserts, forgets)) => {
+                                        let ups: Vec<(nanobpmn_engine_core::Key, &_)> = upserts
+                                            .iter()
+                                            .map(|(k, v)| (*k, v.as_ref()))
+                                            .collect();
+                                        if let Err(e) =
+                                            vs.checkpoint(pid, covered_p, &ups, &forgets)
+                                        {
+                                            tracing::warn!(
+                                                "var store checkpoint failed (partition {pid}): {e}"
+                                            );
+                                            ok = false;
+                                            break;
+                                        }
+                                        if (pid as usize) < covered.len() {
+                                            covered[pid as usize] = covered_p;
+                                            var_position[pid as usize] = covered_p;
+                                        }
+                                        entries.push((pid, covered_p, snap));
                                     }
-                                    entries.push((pid, covered_p, snap));
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
                                 }
-                                None => {
-                                    ok = false;
-                                    break;
+                            } else {
+                                match handle.with(|journal| journal.snapshot_and_rotate()).await {
+                                    Some((snap, covered_p)) => {
+                                        if (pid as usize) < covered.len() {
+                                            covered[pid as usize] = covered_p;
+                                        }
+                                        entries.push((pid, covered_p, snap));
+                                    }
+                                    None => {
+                                        ok = false;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -9417,7 +9510,16 @@ async fn main() {
                             continue;
                         }
                         let exported = store.exported_watermarks(num_partitions as usize);
-                        let removed = seglog::compact_multi(&shared, &covered, &exported);
+                        // Compaction may delete a sealed segment only once every
+                        // partition has projected it (read model) AND, in lean mode,
+                        // its variables are durable in the var store — hence the
+                        // per-partition min of the two watermarks.
+                        let gate: Vec<u64> = exported
+                            .iter()
+                            .zip(var_position.iter())
+                            .map(|(e, v)| (*e).min(*v))
+                            .collect();
+                        let removed = seglog::compact_multi(&shared, &covered, &gate);
                         if removed > 0 {
                             tracing::debug!(
                                 "multi-partition journal compaction removed {removed} sealed segment(s) (exported {exported:?})"
@@ -9426,8 +9528,9 @@ async fn main() {
                     }
                 });
                 tracing::info!(
-                    "segmented multi-partition journal enabled (snapshot/compaction every {:?}, {num_partitions} partitions)",
-                    interval
+                    "segmented multi-partition journal enabled (snapshot/compaction every {:?}, {num_partitions} partitions{})",
+                    interval,
+                    if lean { ", lean snapshots" } else { "" }
                 );
             }
 

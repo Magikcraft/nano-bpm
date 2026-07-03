@@ -54,6 +54,18 @@ pub struct VarStore {
     conn: Mutex<Connection>,
 }
 
+/// Whether lean (control-only) snapshots backed by the authoritative
+/// [`VarStore`] are enabled, from `NANOBPMN_LEAN_SNAPSHOT` (default off).
+/// Only the bounded-disk segmented multi-partition paths honour it.
+pub fn lean_snapshot_enabled() -> bool {
+    matches!(
+        std::env::var("NANOBPMN_LEAN_SNAPSHOT")
+            .unwrap_or_default()
+            .trim(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
 impl VarStore {
     /// Opens (creating if absent) the authoritative variable store at `path`, or
     /// an in-memory store when `path` is `None` (tests / ephemeral runs).
@@ -125,6 +137,40 @@ impl VarStore {
                 .execute(params![partition as i64, position as i64])?;
         }
         tx.commit()
+    }
+
+    /// Writes through a single instance's current variable map outside the
+    /// checkpoint cycle — used when variable spill evicts an instance's payload
+    /// from hot RAM. The row must be durable *before* the payload leaves memory
+    /// (the store is now the only copy the recovery path reads), so spill calls
+    /// this at eviction. It does not advance the partition position: the row may
+    /// be ahead of the last checkpoint, which recovery tolerates (the journal
+    /// tail past the checkpoint re-applies any newer change).
+    pub fn put_current(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(vars).expect("variables serialize to JSON");
+        let conn = self.conn.lock().expect("var store poisoned");
+        conn.execute(
+            "INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)",
+            params![key as i64, json],
+        )?;
+        Ok(())
+    }
+
+    /// Reads an instance's current variable map **non-destructively** (unlike the
+    /// spill cache's `take`): the store is authoritative, so rehydrating a spilled
+    /// instance on job activation must leave the durable row in place for the next
+    /// recovery. `None` if the instance is absent.
+    pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
+        let conn = self.conn.lock().expect("var store poisoned");
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT vars FROM vars WHERE key = ?1",
+                params![key as i64],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()?;
+        serde_json::from_str(&json?).ok()
     }
 
     /// The last checkpointed event position for `partition` (0 if never

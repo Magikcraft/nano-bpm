@@ -27,13 +27,26 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, ProcessInstance, State,
+    ActivatedJob, Command, Engine, EngineError, Event, Incident, Key, ProcessInstance, State, Value,
 };
 use tokio::sync::oneshot;
 
 use crate::coldspill::ColdIndex;
 use crate::seglog::{ActiveSegment, SegShared};
 use crate::varspill::VarSpillStore;
+use crate::varstore::VarStore;
+
+/// The result of a lean-snapshot checkpoint (see
+/// [`Journal::snapshot_and_rotate_lean`]): the control-only snapshot, the event
+/// count it covers, the changed instances' current variable maps to upsert into
+/// the durable var store (cheap `Arc` clones — the deep read happens off the
+/// engine thread), and the terminal instances' keys to delete from it.
+type LeanCheckpoint = (
+    nanobpmn_engine_core::EngineSnapshot,
+    u64,
+    Vec<(Key, Arc<HashMap<String, Value>>)>,
+    Vec<Key>,
+);
 
 /// A durable-write request handed to the background journal writer: the
 /// newline-terminated, serialized bytes for one command's events, the number of
@@ -174,6 +187,13 @@ pub struct Journal {
     /// low-throughput counterpart to variable spill: where variable spill bounds a
     /// large *active* backlog, cold spill bounds a large *parked* one.
     cold: Option<ColdSpill>,
+    /// The authoritative durable variable store, when lean-snapshot mode is on.
+    /// Under lean mode the periodic snapshot carries only control state; every
+    /// live instance's current variables live here instead. Variable spill
+    /// write-through, job-activation rehydration, terminal forget, and the
+    /// periodic checkpoint all target this store. `None` keeps the classic
+    /// full-variable snapshot (and the destructive [`VarSpillStore`] spill cache).
+    varstore: Option<Arc<VarStore>>,
     /// Countdown that amortises the O(N) spillable scan in [`maybe_spill`]. While
     /// the resident set stays over the spill budget, the precise scan/shed runs
     /// only once every [`SPILL_CHECK_INTERVAL`] commands instead of on every
@@ -819,8 +839,10 @@ impl SharedWriter {
         dir: impl AsRef<Path>,
         owned: &[u64],
         num_partitions: u64,
+        varstore: Option<&VarStore>,
     ) -> io::Result<(Self, crate::seglog::MultiSegRecovery)> {
-        let recovery = crate::seglog::recover_multi(dir.as_ref(), owned, num_partitions as usize)?;
+        let recovery =
+            crate::seglog::recover_multi(dir.as_ref(), owned, num_partitions as usize, varstore)?;
         let shared = Arc::clone(&recovery.shared);
         let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
@@ -871,6 +893,7 @@ impl Journal {
             fresh: true,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         }
     }
@@ -896,6 +919,7 @@ impl Journal {
             fresh: false,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         }
     }
@@ -916,6 +940,7 @@ impl Journal {
             fresh: false,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         }
     }
@@ -979,6 +1004,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         })
     }
@@ -1009,6 +1035,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         };
         Ok((journal, recovery))
@@ -1043,6 +1070,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         }
     }
@@ -1072,6 +1100,7 @@ impl Journal {
             fresh,
             spill: None,
             cold: None,
+            varstore: None,
             spill_check_skip: 0,
         }
     }
@@ -1120,6 +1149,28 @@ impl Journal {
             store,
             trigger: VarSpillTrigger::Budget(budget),
         });
+    }
+
+    /// Wires the authoritative durable variable store (lean-snapshot mode) and
+    /// enables engine dirty-variable tracking so the periodic checkpoint can write
+    /// just the delta. Under lean mode the snapshot carries only control state;
+    /// variable spill write-through, job-activation rehydration and terminal
+    /// forget all target this store instead of the destructive spill cache. Set
+    /// before serving.
+    pub fn set_varstore(&mut self, store: Arc<VarStore>) {
+        self.engine.set_track_dirty_vars(true);
+        // Seed the dirty set with every currently-resident instance so the FIRST
+        // lean checkpoint writes the full current variable state into the store.
+        // This migrates a deployment booting from a pre-existing full snapshot
+        // (var store empty) and is a harmless idempotent re-write on a normal
+        // lean restart (recovery already installed the same maps).
+        self.engine.mark_all_dirty();
+        self.varstore = Some(store);
+    }
+
+    /// Whether lean-snapshot mode (authoritative durable var store) is wired.
+    pub fn has_varstore(&self) -> bool {
+        self.varstore.is_some()
     }
 
     /// Wires *adaptive* variable spill onto `store`. The oldest active-backlog
@@ -1603,18 +1654,29 @@ impl Journal {
         if resident <= target {
             return 0;
         }
-        let Some(store) = self.spill.as_ref().map(|vs| Arc::clone(&vs.store)) else {
+        // Lean mode: spill write-through targets the authoritative durable store
+        // (the row must be durable before the payload leaves RAM, since the store
+        // is the only copy recovery reads). Classic mode uses the destructive
+        // spill cache.
+        let varstore = self.varstore.clone();
+        let spill_store = self.spill.as_ref().map(|vs| Arc::clone(&vs.store));
+        if varstore.is_none() && spill_store.is_none() {
             return 0;
-        };
+        }
         let over = resident - target;
         let mut shed = 0;
         for key in self.engine.spillable_instances(over) {
             if let Some(vars) = self.engine.spill_variables(key) {
-                if store.put(key, &vars).is_err() {
+                let ok = if let Some(vstore) = varstore.as_ref() {
+                    vstore.put_current(key, &vars).is_ok()
+                } else {
+                    spill_store.as_ref().unwrap().put(key, &vars).is_ok()
+                };
+                if ok {
+                    shed += 1;
+                } else {
                     // Spill failed: keep the payload resident rather than lose it.
                     self.engine.rehydrate_variables(key, vars);
-                } else {
-                    shed += 1;
                 }
             }
         }
@@ -1771,13 +1833,24 @@ impl Journal {
         let mut activated = self
             .engine
             .activate_jobs(&job_type, worker, max_jobs, timeout, now);
-        if let Some(vs) = self.spill.as_ref() {
-            let store = Arc::clone(&vs.store);
+        // Rehydrate any spilled variables the activated jobs need. In lean mode
+        // the authoritative store is read **non-destructively** (`get`) — the row
+        // must survive for the next recovery; the spilled flag is cleared so the
+        // instance is resident again and the next checkpoint keeps its (unchanged)
+        // row. Classic mode `take`s from the destructive spill cache.
+        if self.varstore.is_some() || self.spill.is_some() {
+            let varstore = self.varstore.clone();
+            let spill_store = self.spill.as_ref().map(|vs| Arc::clone(&vs.store));
             for job in activated.iter_mut() {
                 if !self.engine.is_variables_spilled(job.instance_key) {
                     continue;
                 }
-                if let Some(vars) = store.take(job.instance_key) {
+                let restored = if let Some(vstore) = varstore.as_ref() {
+                    vstore.get(job.instance_key)
+                } else {
+                    spill_store.as_ref().and_then(|s| s.take(job.instance_key))
+                };
+                if let Some(vars) = restored {
                     let vars = Arc::new(vars);
                     self.engine
                         .rehydrate_variables(job.instance_key, Arc::clone(&vars));
@@ -1908,6 +1981,38 @@ impl Journal {
             .copied()
             .unwrap_or(info.end);
         Some((snap, covered))
+    }
+
+    /// The lean-snapshot counterpart of
+    /// [`snapshot_and_rotate`](Journal::snapshot_and_rotate): drains this
+    /// partition's variable delta since the last checkpoint (the current maps of
+    /// instances whose variables changed, plus the keys of instances that reached
+    /// a terminal state), captures a **control-only** snapshot (empty variable
+    /// maps), and seals the active segment at the covered boundary — all on the
+    /// engine actor thread, so the delta, snapshot and seal describe the same
+    /// point. The caller writes the delta to the durable var store and the lean
+    /// snapshot to disk (both off the engine thread). Returns
+    /// `(lean_snapshot, covered_events, upserts, forgets)`, or `None` if not
+    /// segmented / the writer is gone. Only meaningful when a var store is wired
+    /// ([`set_varstore`](Journal::set_varstore)); the drain is empty otherwise.
+    pub fn snapshot_and_rotate_lean(&mut self) -> Option<LeanCheckpoint> {
+        self.seg.as_ref()?;
+        // Drain BEFORE the snapshot/seal so the delta reflects exactly the state
+        // the control-only snapshot captures.
+        let (upserts, forgets) = self.engine.drain_dirty_vars();
+        let snap = self.engine.snapshot_control_only();
+        let writer = self.writer.as_ref()?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
+            return None;
+        }
+        let info = reply_rx.blocking_recv().ok()?;
+        let covered = info
+            .per_partition_end
+            .get(self.partition_id as usize)
+            .copied()
+            .unwrap_or(info.end);
+        Some((snap, covered, upserts, forgets))
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {

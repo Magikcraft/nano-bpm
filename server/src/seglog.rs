@@ -808,6 +808,7 @@ pub fn recover_multi(
     dir: &Path,
     owned: &[u64],
     num_partitions: usize,
+    varstore: Option<&crate::varstore::VarStore>,
 ) -> io::Result<MultiSegRecovery> {
     fs::create_dir_all(dir)?;
     let active_path = dir.join(ACTIVE_NAME);
@@ -918,6 +919,16 @@ pub fn recover_multi(
     // full replay of its surviving events when there is no snapshot for it. Demux
     // by the write TAG (not the key partition). Then install any replicated
     // deployment broadcast produced under a DIFFERENT partition.
+    //
+    // Lean-snapshot recovery: when a `varstore` is supplied the combined snapshot
+    // is control-only (no variable payloads), so the authoritative durable store
+    // holds every live instance's variables as of the snapshot boundary. Load
+    // them once and install them onto each from-snapshot engine *before* replaying
+    // its tail, so the tail's variable merges/creates apply on the correct base
+    // (installing after the tail would regress instances the tail updated). The
+    // full-replay branch needs no install — it reconstructs variables from the
+    // surviving `ProcessInstanceCreated`/`VariablesUpdated` events directly.
+    let stored_vars = varstore.map(|vs| vs.load_all());
     let engines: Vec<(u64, Engine)> = owned
         .iter()
         .map(|&p| {
@@ -930,6 +941,13 @@ pub fn recover_multi(
             let mut engine = match combined.as_ref().and_then(|m| m.get(&p)) {
                 Some((covered, snap)) => {
                     let mut engine = Engine::from_snapshot(snap.clone());
+                    if let Some(all) = stored_vars.as_ref() {
+                        for (key, vars) in all {
+                            if partition_of(*key) == p {
+                                engine.install_variables(*key, vars.clone());
+                            }
+                        }
+                    }
                     let skip = covered.saturating_sub(base_p) as usize;
                     if skip < p_events.len() {
                         engine.apply_replayed_events(p_events[skip..].iter().cloned());
@@ -1260,7 +1278,7 @@ mod tests {
 
         let (key0, key1) = {
             let (writer, recovery) =
-                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2).expect("open multi");
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None).expect("open multi");
             let seg = Arc::clone(&recovery.shared);
             assert!(recovery.fresh);
             let mut engines: std::collections::HashMap<u64, Engine> =
@@ -1322,7 +1340,7 @@ mod tests {
 
         // Reopen: both partitions restore purely from the combined snapshot (the
         // sealed prefix was compacted off disk).
-        let recovery = recover_multi(&dir, &[0, 1], 2).expect("reopen multi");
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
         assert!(!recovery.fresh);
         let engines: std::collections::HashMap<u64, Engine> =
             recovery.engines.into_iter().collect();
@@ -1348,7 +1366,7 @@ mod tests {
 
         let (pre0, post1) = {
             let (writer, recovery) =
-                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2).expect("open multi");
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None).expect("open multi");
             let mut engines: std::collections::HashMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
@@ -1386,7 +1404,7 @@ mod tests {
             (pre0, post1)
         };
 
-        let recovery = recover_multi(&dir, &[0, 1], 2).expect("reopen multi");
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
         assert!(!recovery.fresh);
         let engines: std::collections::HashMap<u64, Engine> =
             recovery.engines.into_iter().collect();
@@ -1425,7 +1443,7 @@ mod tests {
         let (inst1, inst2) = {
             // This node owns {1,2}; the shared segmented WAL spans a 3-partition
             // cluster.
-            let (writer, recovery) = crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3)
+            let (writer, recovery) = crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3, None)
                 .expect("open clustered");
             let mut engines: std::collections::HashMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
@@ -1468,7 +1486,7 @@ mod tests {
         // Reopen as the same clustered node: both partitions must restore the
         // definition (p1 from its tagged durable copy, p2 from the broadcast) and
         // their instances.
-        let recovery = recover_multi(&dir, &[1, 2], 3).expect("reopen clustered");
+        let recovery = recover_multi(&dir, &[1, 2], 3, None).expect("reopen clustered");
         assert!(!recovery.fresh);
         let engines: std::collections::HashMap<u64, Engine> =
             recovery.engines.into_iter().collect();
