@@ -662,3 +662,52 @@ same-sized snapshot-file `sync_all` competing with journal fsync. Next lever
 (Fix 1b): exclude journal-durable variables from the snapshot and rehydrate on
 recovery — shrinks the on-thread clone AND the on-disk file/fsync. Bigger change
 (touches the recovery path); pending direction.
+
+## 2026-07-03 — Memory-driven adaptive var-spill (Fix 2), and why spill alone can't bound the burst
+
+### Change (commit 812ba57 / deployed sha e07e70dede58d773)
+Rewrote the adaptive var-spill trigger to be **purely memory-driven**: fire on
+jemalloc `resident >= high_water` or live system-available `< reserve`, reclaim
+toward `low_water` (or `floor` under a reserve breach). Removed the old
+instance-count growth co-trigger (`prev_count`, `VAR_SPILL_GROWTH_SHIFT`) — count
+is a poor proxy for bytes — and the noisy per-batch `now >= prev_rss` RSS-delta
+bail (mis-fired under concurrent inbound allocation). Added a single up-front
+byte-based futile-shed guard (`VAR_SPILL_MIN_RELIEF_DIVISOR`): skip when resident
+variable bytes are a small fraction of the overshoot.
+
+### Result (fresh 3-node RF=3 cluster, VAR_SPILL_MB=700 to force spill)
+- **Phase-A small-payload edge: NO regression.** 37–38k loadgen-proc, p50 655 ms,
+  p99 2.78 s — identical to baseline. The futile-shed guard correctly avoids
+  thrashing when variables aren't the driver.
+- **Spill fires as designed:** 883 sweeps on node-0 during the burst, each
+  shedding ~1000–1400 instances to the SQLite store (tens of GB shed cumulatively).
+- **But peak burst memory is UNCHANGED: ~6–6.7 GB/node** (same as the
+  streaming-fix run). Spill did not pin memory to the 700 MB watermark.
+
+### Why: the balloon is in NON-SPILLABLE instances
+`resident_var_bytes` held flat at ~4.35–4.85 GB/node throughout the burst **and
+stayed there for minutes after the load stopped** (cluster idle, ji=0). The 1 Hz
+gauge is live (pipeline/exporter gauges in the same loop read 0), so this is real
+resident variable memory that never drained. Each spill sweep shed only
+~1387/partition then hit `candidates == 0` — i.e. the bulk of the resident
+variables live in instances that are **not spillable**.
+
+`Engine::is_spillable` requires an un-leased job in `jobs_by_instance`
+(`!jobs.is_empty()`). Instances whose single job has been **activated/leased** (to
+a worker, or buffered by the stream dispatcher) — or that are otherwise between
+states — are excluded, because their variables may be needed to service the
+in-flight job. Under the burst the dispatcher activates far more jobs than the 16
+workers complete, so a large population sits "activated, not yet completed",
+holding its 50 KB payload resident and invisible to spill. This backlog does not
+drain promptly after load stops.
+
+### Takeaway
+Fix 2 is correct and safe (ships, no small-payload regression) but **variable
+spill is necessary-not-sufficient** for this workload. The remaining levers are
+the ones already identified:
+1. **Admission backpressure** to bound inflow (don't activate/admit faster than
+   the system can drain) — the saturation-driven mechanism, not spill.
+2. **Fix 1b lean/control-only snapshot** so the ~20 s off-thread snapshot stops
+   pinning all variables via `Arc`-clone during the burst.
+3. Optionally, make leased-job instances spillable (spill the variables, rehydrate
+   on job completion/return) so the activated-but-incomplete backlog is reclaimable.
