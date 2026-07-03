@@ -122,3 +122,19 @@ pub struct MemStats {
 }
 
 pub use imp::{enable_background_thread, purge, resident_bytes, stats};
+
+/// Live system memory available to userspace, in bytes, read fresh from
+/// `/proc/meminfo` (`MemAvailable`). Unlike the boot-time memory *limit*, this
+/// tracks real-time pressure from every tenant on the box, so the adaptive spill
+/// can react when *other* processes eat into free RAM. Returns `None` off Linux
+/// (no `/proc/meminfo`), where callers fall back to their resident-byte guard.
+pub fn available_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}

@@ -465,14 +465,18 @@ impl ServerImpl {
                                     journal.set_spill(Arc::clone(&store), *budget);
                                 }
                                 VarSpillCfg::Adaptive {
+                                    floor,
                                     high,
                                     low,
+                                    reserve,
                                     hard_cap,
                                 } => {
                                     journal.set_var_spill_adaptive(
                                         Arc::clone(&store),
+                                        *floor,
                                         *high,
                                         *low,
+                                        *reserve,
                                         *hard_cap,
                                     );
                                 }
@@ -483,13 +487,20 @@ impl ServerImpl {
                                 "variable spill: on (fixed budget), hot budget {budget} instance(s){location}"
                             ),
                             VarSpillCfg::Adaptive {
+                                floor,
                                 high,
                                 low,
+                                reserve,
                                 hard_cap,
                             } => tracing::info!(
-                                "variable spill: on (adaptive), high-water {:.0} MiB / low-water {:.0} MiB, hard-cap {hard_cap} instance(s){location}",
+                                "variable spill: on (adaptive-hybrid), floor {:.0} MiB \
+                                 (spill when the backlog grows above it), pressure high-water \
+                                 {:.0} MiB / low-water {:.0} MiB, reserve {:.0} MiB free, \
+                                 hard-cap {hard_cap} instance(s){location}",
+                                *floor as f64 / (1024.0 * 1024.0),
                                 *high as f64 / (1024.0 * 1024.0),
                                 *low as f64 / (1024.0 * 1024.0),
+                                *reserve as f64 / (1024.0 * 1024.0),
                             ),
                         }
                     }
@@ -1543,9 +1554,27 @@ const DEFAULT_SPILL_MB: u64 = 384;
 /// headroom for non-jemalloc allocations (stacks, mmaps, page cache charged to
 /// the cgroup) before the OOM killer would engage.
 const SPILL_LIMIT_FRACTION_PCT: u64 = 65;
+/// Adaptive-hybrid **floor** (burst budget) as a percentage of the detected
+/// memory limit: the resident level a large-payload burst may reach before the
+/// hybrid spill starts reclaiming a *growing* backlog. Well below the 65 %
+/// pressure high-water so a runaway is bounded to ~this budget (steady memory
+/// pressure) long before the OOM guard would engage, while a workload whose
+/// resident set stays under it never spills at all.
+const SPILL_FLOOR_FRACTION_PCT: u64 = 10;
+/// Adaptive-hybrid **reserve** as a percentage of the detected memory limit: the
+/// amount of live system-available memory the sweep tries to keep free. When
+/// free memory falls below this (e.g. another tenant is eating RAM), spill
+/// reclaims to the floor regardless of the backlog trend. A safety guard for
+/// constrained/multi-tenant boxes; on a big dedicated box the growth signal
+/// bounds the burst long before free memory gets this low.
+const SPILL_RESERVE_FRACTION_PCT: u64 = 12;
 /// Never auto-derive a high-water below this — on a tiny limit a sub-100 MiB
 /// watermark would thrash against the engine's own baseline working set.
 const MIN_SPILL_HIGH_BYTES: u64 = 128 * 1024 * 1024;
+/// Never auto-derive a floor below this — a sub-256 MiB burst budget would spill
+/// a trivial working set and thrash. The floor is also always clamped below the
+/// low-water mark so the two bands never invert.
+const MIN_SPILL_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Reads `MemTotal` from `/proc/meminfo` in bytes, or `None` off Linux.
 fn read_meminfo_total_bytes() -> Option<u64> {
@@ -1609,6 +1638,43 @@ fn default_spill_high_bytes() -> u64 {
         Some(limit) => spill_default_from_limit(limit),
         None => DEFAULT_SPILL_MB * 1024 * 1024,
     }
+}
+
+/// Computes the adaptive-hybrid spill *floor* (burst budget) from a detected
+/// memory `limit`: [`SPILL_FLOOR_FRACTION_PCT`] of it, floored at
+/// [`MIN_SPILL_FLOOR_BYTES`] and clamped strictly below `low` so the floor and
+/// pressure bands never invert. Pure, for unit tests.
+fn spill_floor_from_limit(limit_bytes: u64, low: u64) -> u64 {
+    let frac = limit_bytes / 100 * SPILL_FLOOR_FRACTION_PCT;
+    let floor = frac.max(MIN_SPILL_FLOOR_BYTES);
+    // Keep the floor under the low-water mark (at most half of it) so a growth
+    // reclaim to the floor always sits below the pressure band.
+    floor.min(low / 2).max(1)
+}
+
+/// The default hybrid floor in bytes given the resolved `low`-water mark:
+/// RAM-relative when a memory limit is detected, else a fraction of the fallback
+/// default, always clamped below `low`.
+fn default_spill_floor_bytes(low: u64) -> u64 {
+    match detect_memory_limit_bytes() {
+        Some(limit) => spill_floor_from_limit(limit, low),
+        None => (DEFAULT_SPILL_MB * 1024 * 1024 / 4).min(low / 2).max(1),
+    }
+}
+
+/// The default hybrid reserve (system-available-memory floor) in bytes:
+/// [`SPILL_RESERVE_FRACTION_PCT`] of the detected limit, or `0` (guard disabled)
+/// when no limit can be read.
+fn default_spill_reserve_bytes() -> u64 {
+    match detect_memory_limit_bytes() {
+        Some(limit) => spill_reserve_from_limit(limit),
+        None => 0,
+    }
+}
+
+/// Pure form of [`default_spill_reserve_bytes`] for unit tests.
+fn spill_reserve_from_limit(limit_bytes: u64) -> u64 {
+    limit_bytes / 100 * SPILL_RESERVE_FRACTION_PCT
 }
 
 /// Fallback read-model retention budget in MiB when adaptive mode is selected but
@@ -1821,11 +1887,15 @@ fn exporter_queue_from_env() -> ExporterQueueCfg {
 enum VarSpillCfg {
     /// Legacy fixed instance-count budget, checked per command.
     Budget(usize),
-    /// Adaptive: RSS-watermark driven on the periodic sweep, with a per-command
-    /// instance-count backstop (`hard_cap`) for runaways between sweeps.
+    /// Adaptive **hybrid**: shed on the periodic sweep only when it helps — a
+    /// growing backlog above the `floor` budget, or real memory pressure
+    /// (`high`/`reserve`) — with a per-command instance-count backstop
+    /// (`hard_cap`) for runaways between sweeps. See [`VarSpillTrigger::Adaptive`].
     Adaptive {
+        floor: u64,
         high: u64,
         low: u64,
+        reserve: u64,
         hard_cap: usize,
     },
 }
@@ -1841,15 +1911,23 @@ enum VarSpillCfg {
 ///
 /// - `NANOBPMN_VAR_SPILL` unset: **adaptive** iff a persistent data path exists.
 /// - `NANOBPMN_VAR_SPILL=0`/`off`/`false`/`none`/`disabled`/`no`: forced off.
-/// - `NANOBPMN_VAR_SPILL=adaptive`/`auto`/`dynamic`: adaptive (RSS-watermark) mode.
+/// - `NANOBPMN_VAR_SPILL=adaptive`/`auto`/`dynamic`: adaptive-hybrid mode.
 /// - `NANOBPMN_VAR_SPILL=1`/`on`/`true`/`yes`: forced on in the legacy fixed-budget
 ///   mode (even in-memory — for tests).
 /// - `NANOBPMN_VAR_SPILL_BUDGET=<n>`: fixed-mode hot budget (max resident spillable
 ///   instances before the oldest backlog is shed); default 512.
-/// - `NANOBPMN_VAR_SPILL_MB=<n>`: adaptive high-water in MiB; overrides the
-///   default, which is RAM-relative (~65% of the detected cgroup/host memory
-///   limit, floored at 128 MiB, or 384 MiB when no limit can be detected). The
-///   sweep sheds variables until resident memory falls under `low = high * 7/8`.
+/// - `NANOBPMN_VAR_SPILL_MB=<n>`: adaptive pressure high-water in MiB; overrides
+///   the default, which is RAM-relative (~65% of the detected cgroup/host memory
+///   limit, floored at 128 MiB, or 384 MiB when no limit can be detected). A
+///   stable set that merely brushes this cap is relaxed to `low = high * 7/8`.
+/// - `NANOBPMN_VAR_SPILL_FLOOR_MB=<n>`: adaptive-hybrid *floor* (burst budget) in
+///   MiB — the resident level a growing backlog may reach before spill reclaims
+///   to it. Default RAM-relative (~10% of the detected limit, floored at 256 MiB,
+///   always clamped below the low-water mark). Below the floor spill never fires.
+/// - `NANOBPMN_VAR_SPILL_RESERVE_MB=<n>`: adaptive-hybrid *reserve* in MiB — spill
+///   reclaims to the floor when live system-available memory drops below this,
+///   regardless of the backlog trend. Default ~12% of the detected limit; `0`
+///   disables the available-memory guard.
 /// - `NANOBPMN_VAR_SPILL_HARDCAP=<n>`: adaptive per-command instance-count backstop
 ///   for a runaway between sweeps (default 262144; 0 disables it).
 /// - The store is co-located with the read-model db (`<dir>/var-spill.sqlite`)
@@ -1880,13 +1958,26 @@ fn spill_from_env() -> Option<(Option<PathBuf>, VarSpillCfg)> {
             .map(|mb| mb * 1024 * 1024)
             .unwrap_or_else(default_spill_high_bytes);
         let low = high / 8 * 7;
+        let floor = std::env::var("NANOBPMN_VAR_SPILL_FLOOR_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .map(|mb| (mb * 1024 * 1024).min(low.saturating_sub(1)).max(1))
+            .unwrap_or_else(|| default_spill_floor_bytes(low));
+        let reserve = std::env::var("NANOBPMN_VAR_SPILL_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or_else(default_spill_reserve_bytes);
         let hard_cap = std::env::var("NANOBPMN_VAR_SPILL_HARDCAP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(262_144);
         VarSpillCfg::Adaptive {
+            floor,
             high,
             low,
+            reserve,
             hard_cap,
         }
     } else {
@@ -8915,7 +9006,11 @@ fn gateway_usage() -> String {
          NANOBPMN_MEM_WATERMARK_MB  Shed creates above this resident MiB (off, or a\n                        \
          fraction of detected RAM when unset; NANOBPMN_MEM_WATERMARK=off disables)\n  \
          NANOBPMN_PIPELINE_BYTES_MB  Shed creates above this in-flight create-payload\n                        \
-         MiB (adaptive fraction of RAM when unset; NANOBPMN_PIPELINE_BYTES=off disables)\n",
+         MiB (adaptive fraction of RAM when unset; NANOBPMN_PIPELINE_BYTES=off disables)\n  \
+         NANOBPMN_VAR_SPILL_FLOOR_MB  Adaptive-hybrid var-spill burst budget: spill a\n                        \
+         GROWING backlog above this resident MiB (adaptive ~10%% of RAM when unset)\n  \
+         NANOBPMN_VAR_SPILL_RESERVE_MB  Also spill when live system-available memory\n                        \
+         drops below this MiB (adaptive ~12%% of RAM when unset; 0 disables)\n",
         name = GATEWAY_NAME,
         ver = env!("NANOBPM_VERSION"),
     )
@@ -9797,6 +9892,34 @@ mod clustered_startup_tests {
         let big = 64 * 1024 * 1024 * 1024; // 64 GiB
         assert_eq!(spill_default_from_limit(big), big / 100 * 65);
         assert!(spill_default_from_limit(big) > MIN_SPILL_HIGH_BYTES);
+    }
+
+    #[test]
+    fn spill_floor_scales_and_stays_below_low() {
+        // 64 GiB host: floor ~10% (6.4 GiB) — well below the 65% pressure band and
+        // its 7/8 low-water, so a growth reclaim to the floor bounds a burst far
+        // under the OOM guard.
+        let big = 64 * 1024 * 1024 * 1024;
+        let high = spill_default_from_limit(big);
+        let low = high / 8 * 7;
+        let floor = spill_floor_from_limit(big, low);
+        assert_eq!(floor, big / 100 * SPILL_FLOOR_FRACTION_PCT);
+        assert!(floor < low, "floor must sit below the low-water band");
+        assert!(floor >= MIN_SPILL_FLOOR_BYTES);
+
+        // Tiny limit: the 10% fraction underflows the 256 MiB floor, but the
+        // clamp to low/2 keeps the two bands from inverting.
+        let tiny = 1024 * 1024 * 1024; // 1 GiB
+        let low_t = spill_default_from_limit(tiny) / 8 * 7;
+        let floor_t = spill_floor_from_limit(tiny, low_t);
+        assert!(floor_t <= low_t / 2);
+        assert!(floor_t >= 1);
+
+        // Reserve is a smaller fraction of the limit (the free-memory guard).
+        assert_eq!(
+            spill_reserve_from_limit(big),
+            big / 100 * SPILL_RESERVE_FRACTION_PCT
+        );
     }
 
     #[test]

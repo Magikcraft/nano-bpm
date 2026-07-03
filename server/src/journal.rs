@@ -197,6 +197,12 @@ struct ColdSpill {
 struct VarSpill {
     store: Arc<VarSpillStore>,
     trigger: VarSpillTrigger,
+    /// Last sweep's resident (non-cold) instance count, for the adaptive-hybrid
+    /// growth signal. `0` means "no baseline yet" (first sweep establishes it).
+    /// Immune to var-spill/rehydrate churn — var-spill keeps the instance
+    /// resident, only its variables move — so a rising count is a genuine
+    /// backlog explosion (creates outpacing completions), not spill bookkeeping.
+    prev_count: usize,
 }
 
 /// When variable spill sheds an active instance's variables to disk.
@@ -206,17 +212,27 @@ enum VarSpillTrigger {
     /// instances is trivial RAM; 512 large-var instances is not), so it must be
     /// tuned conservatively and can throttle throughput needlessly.
     Budget(usize),
-    /// Adaptive: shed only under real RAM pressure. The precise scan runs on the
-    /// periodic sweep gated on resident bytes (`high_water`/`low_water`), so below
-    /// the high-water mark spill is a no-op and throughput is unconstrained —
-    /// memory is only reclaimed when it actually explodes. The per-command path
-    /// stays free except for `hard_cap`, an instance-count backstop that forces a
-    /// shed if the resident set blows up *between* the 500 ms sweeps (a
-    /// create-flood), bounding worst-case memory without an RSS read per command.
-    /// `hard_cap == 0` disables the backstop (rely solely on the sweep).
+    /// Adaptive **hybrid**: shed only when it actually helps, deciding per sweep
+    /// from three live signals so a healthy large working set keeps full
+    /// throughput while a runaway explosion is bounded to a modest budget.
+    ///
+    /// - Below `floor` (the burst budget): never spill — full throughput.
+    /// - At/above `floor` with a *growing* active backlog (creates outpacing
+    ///   completions): reclaim to `floor`, bounding the runaway to ~budget.
+    /// - Real memory pressure (resident `>= high_water`, or live system
+    ///   available memory below `reserve`): reclaim (to `floor` on a `reserve`
+    ///   breach, else to `low_water`) regardless of trend — the OOM guard.
+    /// - At/above `floor` but *stable/draining*: no spill — a healthy working
+    ///   set uses free RAM.
+    ///
+    /// `hard_cap` is the per-command instance-count backstop for a create-flood
+    /// *between* the 500 ms sweeps (`0` disables it, relying solely on the
+    /// sweep). `reserve == 0` disables the live-available-memory guard.
     Adaptive {
+        floor: u64,
         high_water: u64,
         low_water: u64,
+        reserve: u64,
         hard_cap: usize,
     },
 }
@@ -252,6 +268,13 @@ const SPILL_CHECK_INTERVAL: u32 = 256;
 /// watermark (stop as soon as we drop under `low_water`) without re-reading RSS —
 /// an epoch-advance + stat — after every single instance.
 const VAR_SPILL_SWEEP_BATCH: usize = 512;
+
+/// The adaptive-hybrid "backlog is growing" threshold: the resident instance
+/// count must rise by at least `prev >> VAR_SPILL_GROWTH_SHIFT` (≈3%) between two
+/// 500 ms sweeps to count as a genuine explosion rather than steady-state jitter
+/// (creates ≈ completions). A real create-flood clears this by a wide margin;
+/// a healthy plateau does not, so its variables stay resident at full throughput.
+const VAR_SPILL_GROWTH_SHIFT: u32 = 5;
 
 /// The background journal writer: blocks for the next request, drains every
 /// other request already queued, then **group-commits** the whole batch in a
@@ -1096,31 +1119,47 @@ impl Journal {
         self.spill = Some(VarSpill {
             store,
             trigger: VarSpillTrigger::Budget(budget),
+            prev_count: 0,
         });
     }
 
-    /// Wires *adaptive* variable spill onto `store`: instead of a fixed budget,
-    /// the oldest active-backlog variables are shed only when resident memory
-    /// crosses `high_water` bytes, and only until it falls back under
-    /// `low_water` — so below the mark throughput is unconstrained and spill
-    /// fires purely to cap a memory explosion. The RSS check runs on the periodic
-    /// sweep ([`maybe_var_spill_pressure`](Journal::maybe_var_spill_pressure));
+    /// Wires *adaptive-hybrid* variable spill onto `store`. The oldest
+    /// active-backlog variables are shed only when it helps, decided per sweep
+    /// from three live signals (see [`VarSpillTrigger::Adaptive`]):
+    ///
+    /// - below `floor` (the burst budget): never spill — full throughput;
+    /// - at/above `floor` with a *growing* backlog: reclaim to `floor`, bounding
+    ///   a runaway explosion to ~budget;
+    /// - real pressure (resident `>= high_water`, or live system available
+    ///   memory below `reserve`): reclaim (to `floor` on a `reserve` breach, else
+    ///   to `low_water`) — the OOM guard;
+    /// - at/above `floor` but *stable/draining*: no spill — a healthy working set
+    ///   uses free RAM.
+    ///
+    /// The RSS/trend check runs on the periodic sweep
+    /// ([`maybe_var_spill_pressure`](Journal::maybe_var_spill_pressure));
     /// `hard_cap` is a per-command instance-count backstop for a runaway between
-    /// sweeps (0 disables it). Set before serving.
+    /// sweeps (0 disables it); `reserve == 0` disables the available-memory guard.
+    /// Set before serving.
     pub fn set_var_spill_adaptive(
         &mut self,
         store: Arc<VarSpillStore>,
+        floor: u64,
         high_water: u64,
         low_water: u64,
+        reserve: u64,
         hard_cap: usize,
     ) {
         self.spill = Some(VarSpill {
             store,
             trigger: VarSpillTrigger::Adaptive {
+                floor,
                 high_water,
                 low_water,
+                reserve,
                 hard_cap,
             },
+            prev_count: 0,
         });
     }
 
@@ -1592,22 +1631,57 @@ impl Journal {
     /// it is a single cheap RSS read, so a workload that never pressures RAM runs
     /// entirely spill-free.
     pub fn maybe_var_spill_pressure(&mut self) {
-        let (high, low) = match self.spill.as_ref().map(|vs| &vs.trigger) {
+        let (floor, high, low, reserve) = match self.spill.as_ref().map(|vs| &vs.trigger) {
             Some(VarSpillTrigger::Adaptive {
+                floor,
                 high_water,
                 low_water,
+                reserve,
                 ..
-            }) if *high_water > 0 => (*high_water, *low_water),
+            }) if *high_water > 0 => (*floor, *high_water, *low_water, *reserve),
             _ => return,
         };
         let Some(resident) = crate::memory::resident_bytes() else {
             return;
         };
-        if (resident as u64) < high {
+        let resident = resident as u64;
+
+        // Active-backlog trend: the resident (non-cold) instance count. Var-spill
+        // keeps the instance resident (only its variables move), so this is immune
+        // to spill/rehydrate churn — a rising count is creates outpacing
+        // completions (a genuine explosion), a flat count a healthy working set.
+        let count = self.engine.resident_instance_count();
+        let prev = self.spill.as_ref().map(|vs| vs.prev_count).unwrap_or(0);
+        if let Some(vs) = self.spill.as_mut() {
+            vs.prev_count = count;
+        }
+
+        // Below the burst-budget floor: never spill — full throughput. Also the
+        // first sweep only establishes the count baseline (prev == 0), so a big
+        // *stable* recovered backlog is not spilled on a spurious 0->N "growth".
+        if resident < floor || prev == 0 {
             return;
         }
+
+        // Real memory pressure: near the resident OOM cap, or live system
+        // available memory has fallen below the reserve (another tenant is eating
+        // free RAM). Relieve regardless of trend.
+        let avail_pressure =
+            reserve > 0 && crate::memory::available_bytes().is_some_and(|a| a < reserve);
+        let hard_pressure = resident >= high || avail_pressure;
+        // Backlog explosion: the live-instance count grew meaningfully this sweep.
+        let growing = count > prev.saturating_add(prev >> VAR_SPILL_GROWTH_SHIFT);
+        if !hard_pressure && !growing {
+            // Stable/draining large working set — let it use free RAM.
+            return;
+        }
+        // A growth trigger (or a reserve breach) reclaims all the way to the floor
+        // budget, bounding a runaway to ~floor; a stable set that merely brushed
+        // the resident OOM cap relaxes only to the low-water mark.
+        let target_low = if growing || avail_pressure { floor } else { low };
+
         let mut total = 0usize;
-        let mut prev = resident as u64;
+        let mut prev_rss = resident;
         loop {
             let resident_candidates = self.engine.resident_spillable_count();
             if resident_candidates == 0 {
@@ -1620,29 +1694,33 @@ impl Journal {
                 break;
             }
             // Compact + purge so the resident reading reflects the shed, then
-            // re-check against the low-water mark.
+            // re-check against the reclaim target.
             self.engine.shrink();
             let _ = crate::memory::purge();
             let now = match crate::memory::resident_bytes() {
                 Some(now) => now as u64,
                 None => break,
             };
-            if now < low {
+            if now < target_low {
                 break;
             }
             // A full batch shed but RSS did not drop: variables are not the memory
             // driver here (e.g. tiny payloads, RAM held by control state), so
             // shedding more would only thrash the backlog for no relief. Stop and
-            // let cold spill / backpressure own it. Prevents a too-low watermark
-            // from spilling the entire active backlog every sweep.
-            if now >= prev {
+            // let cold spill / backpressure own it. Prevents a too-low target from
+            // spilling the entire active backlog every sweep.
+            if now >= prev_rss {
                 break;
             }
-            prev = now;
+            prev_rss = now;
         }
         if total > 0 {
             tracing::info!(
-                "variable spill (adaptive): shed {total} instance(s)' variables under RAM pressure"
+                "variable spill (adaptive): shed {total} instance(s)' variables \
+                 (resident {} MiB -> target {} MiB, {} instance(s) live)",
+                resident / (1024 * 1024),
+                target_low / (1024 * 1024),
+                count,
             );
         }
     }
@@ -2060,7 +2138,7 @@ mod tests {
         // Adaptive with an unreachable high-water and the per-command backstop
         // disabled (hard_cap 0): below RAM pressure nothing should ever spill, so
         // the workload runs at full throughput with every payload resident.
-        journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, 0);
+        journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, u64::MAX, 0, 0);
 
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
@@ -2097,7 +2175,7 @@ mod tests {
         // Unreachable high-water (so the RSS sweep never fires in the test), but a
         // hard_cap of 1: the per-command backstop must keep at most 1 resident
         // spill candidate even without RAM pressure — the inter-sweep OOM guard.
-        journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, 1);
+        journal.set_var_spill_adaptive(Arc::clone(&store), u64::MAX, u64::MAX, u64::MAX, 0, 1);
 
         let _ = journal
             .apply_command(Command::DeployProcess(demo()))
