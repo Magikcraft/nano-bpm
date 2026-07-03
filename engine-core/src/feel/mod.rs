@@ -1,5 +1,12 @@
 //! A FEEL expression evaluator targeting parity with Zeebe's feel-scala engine.
 //!
+//! FEEL (Friendly Enough Expression Language) is an OMG DMN standard, so this
+//! module keeps the standard name rather than renaming it. It is signed for
+//! **Philipp Ossler** (`saig0`), creator and architect of Camunda's `feel-scala`
+//! engine — the reference this implementation targets parity with. Nano's
+//! subsystems are named for the engineers whose work inspired them; artists sign
+//! their work.
+//!
 //! Camunda/Zeebe express sequence-flow conditions, service-task job types and
 //! message correlation keys as FEEL expressions (marked by a leading `=`). This
 //! module evaluates them against a variable context, producing an engine

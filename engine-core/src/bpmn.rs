@@ -253,6 +253,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // defaulting to the element id). Nano has no DMN/script
                             // evaluator, but for trace generation and replay the
                             // step is faithfully a single job activation.
+                            //
+                            // When a native DMN decision engine is built, it is to
+                            // be signed for Sebastian Menski, creator of Camunda's
+                            // engine-dmn (see docs: engineer-signature naming).
                             "businessRuleTask" | "scriptTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
                                 if !self_closing {
