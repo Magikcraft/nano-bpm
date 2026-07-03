@@ -814,3 +814,72 @@ export function projectLogs(
   });
   return src;
 }
+
+// --- Config panel (server + IDE) -------------------------------------------
+
+export interface SlaOption {
+  id: string;
+  label: string;
+  tagline: string;
+  description: string;
+}
+export interface SlaModeConfig {
+  current: string;
+  description: string;
+  /** "NANOBPMN_SLA_MODE" when set explicitly, else "default". */
+  source: string;
+  options: SlaOption[];
+}
+export interface ServerParam {
+  key: string;
+  category: string;
+  label: string;
+  description: string;
+  default: string;
+  /** Current value from the process environment, or null when unset. */
+  value: string | null;
+}
+export interface ServerConfig {
+  slaMode: SlaModeConfig;
+  /** Parameters are set on startup via the environment; read-only for now. */
+  readOnly: boolean;
+  params: ServerParam[];
+}
+
+/** A required external toolchain and whether it is installed (deps preflight). */
+export interface ConfigDependency {
+  id: string;
+  name: string;
+  purpose: string;
+  bin: string;
+  present: boolean;
+  version: string | null;
+  installUrl: string;
+  /** Actionable install guidance, empty when the tool is present. */
+  hint: string;
+}
+export interface PackConfigField {
+  key: string;
+  label: string;
+  description: string | null;
+  env: string | null;
+  default: string | null;
+  value: string | null;
+}
+export interface LangPackConfig {
+  id: string;
+  displayName: string;
+  builtin: boolean;
+  detect: string[];
+  available: boolean;
+  configFields: PackConfigField[];
+}
+export interface IdeConfig {
+  dependencies: ConfigDependency[];
+  langPacks: LangPackConfig[];
+}
+
+export const configApi = {
+  server: () => getJson<ServerConfig>("/config/server"),
+  ide: () => getJson<IdeConfig>("/config/ide"),
+};

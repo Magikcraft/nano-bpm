@@ -36,6 +36,7 @@ use crate::ServerImpl;
 
 pub mod extensions;
 pub mod projects;
+pub mod config;
 pub mod trace;
 pub mod worker_export;
 pub mod workers;
@@ -95,6 +96,8 @@ pub fn router(server: ServerImpl) -> Router {
         )
         .route("/console/api/worker-sdk", get(worker_sdk_source))
         .route("/console/api/deno-types", get(deno_types_source))
+        .route("/console/api/config/server", get(config_server))
+        .route("/console/api/config/ide", get(config_ide))
         .route("/console/api/lib", get(lib_list).post(lib_file_create))
         .route(
             "/console/api/lib/file",
@@ -1954,6 +1957,21 @@ async fn project_get(Path(name): Path<String>) -> Response {
 /// `GET /console/api/extensions` — installed + built-in packs and trust state.
 async fn extensions_list() -> Response {
     Json(extensions_overview()).into_response()
+}
+
+/// `GET /console/api/config/server` — SLA mode + read-only env-parameter registry.
+async fn config_server() -> Response {
+    Json(config::server_config_json()).into_response()
+}
+
+/// `GET /console/api/config/ide` — toolchain dependencies + language-pack config.
+/// Probing toolchains shells out (`<bin> --version`), so run it off the async
+/// runtime's worker threads.
+async fn config_ide() -> Response {
+    match tokio::task::spawn_blocking(config::ide_config_json).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 /// `GET /console/api/extensions/marketplace` — packs on npm tagged `nano-ide-ext`,

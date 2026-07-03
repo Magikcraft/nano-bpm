@@ -88,6 +88,14 @@ impl SlaMode {
         matches!(self, SlaMode::Latency)
     }
 
+    /// Stable machine identifier (`latency` | `admission`) for APIs/UI.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SlaMode::Latency => "latency",
+            SlaMode::Admission => "admission",
+        }
+    }
+
     /// Human-readable description for the startup log.
     pub fn describe(&self) -> &'static str {
         match self {

@@ -69,6 +69,36 @@ pub struct Toolchain {
     /// Cross-compile target triples this toolchain offers.
     #[serde(default)]
     pub targets: Vec<String>,
+    /// Official, OS-aware install instructions for this toolchain, surfaced in the
+    /// IDE config panel when the `detect` probe fails. Empty for the built-in Deno
+    /// pack (whose runtime is reported separately as a first-class dependency).
+    #[serde(default)]
+    pub install_url: Option<String>,
+    /// One-line, actionable hint shown when the toolchain is missing.
+    #[serde(default)]
+    pub install_hint: Option<String>,
+}
+
+/// A configuration field a pack contributes to the IDE config panel. Read-only
+/// for now (surfaced for visibility); packs declare the knobs they honour so the
+/// panel can grow without console changes. `value` is resolved from the named
+/// environment variable when `env` is set.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigField {
+    /// Stable key within the pack.
+    pub key: String,
+    /// Human-facing label.
+    pub label: String,
+    /// What the field controls.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Environment variable this field reads its current value from, if any.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Documented default when unset.
+    #[serde(default)]
+    pub default: Option<String>,
 }
 
 /// A scaffold template a pack contributes.
@@ -104,6 +134,9 @@ pub struct ExtManifest {
     /// Whether this pack is bundled in the binary (cannot be removed).
     #[serde(default)]
     pub builtin: bool,
+    /// Config fields this pack contributes to the IDE config panel (read-only).
+    #[serde(default)]
+    pub config_fields: Vec<ConfigField>,
 }
 
 /// The built-in first-party packs — always available, offline, unremovable.
@@ -130,6 +163,15 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             app_dir: None,
             summary: None,
             builtin: true,
+            config_fields: vec![ConfigField {
+                key: "denoBin".into(),
+                label: "Deno binary".into(),
+                description: Some(
+                    "Path to the Deno runtime used to run embedded job workers. Auto-resolved from PATH / ~/.deno/bin when unset.".into(),
+                ),
+                env: Some("NANOBPMN_DENO_BIN".into()),
+                default: Some("deno (on PATH)".into()),
+            }],
         },
         ExtManifest {
             id: "rust".into(),
@@ -148,11 +190,16 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 run: vec!["cargo".into(), "run".into(), "--release".into()],
                 compile: vec!["cargo".into(), "build".into(), "--release".into()],
                 targets: vec![],
+                install_url: Some("https://www.rust-lang.org/tools/install".into()),
+                install_hint: Some(
+                    "`cargo` was not found. Install the Rust toolchain (see the link) so `cargo` is on PATH. Until then, Rust projects cannot run or compile.".into(),
+                ),
             },
             requires: vec![],
             app_dir: None,
             summary: None,
             builtin: true,
+            config_fields: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -168,6 +215,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             app_dir: None,
             summary: None,
             builtin: true,
+            config_fields: vec![],
         },
     ]
 }
