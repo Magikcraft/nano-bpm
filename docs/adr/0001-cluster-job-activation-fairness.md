@@ -7,10 +7,10 @@ Date: 2026-06-21.
 
 In a multi-node cluster a worker connects to **one** gateway, but that gateway can
 activate jobs from the **whole** cluster (every node aggregates peer-owned jobs over
-the command stream — see `docs/distributed-scaling-design.md`). The dispatcher,
+the Falcon protocol — see `docs/distributed-scaling-design.md`). The dispatcher,
 however, was **strictly local-first with a fixed peer order**:
 
-- `command_stream.rs::dispatch_to_connection` activates the gateway's **own**
+- `falcon.rs::dispatch_to_connection` activates the gateway's **own**
   partitions first (`activate_for_stream`), then pulls only the shortfall from peers
   in **fixed ascending node-id order** (`peer_nodes()` sorts).
 - The REST long-poll analog `main.rs::activate_jobs_impl` has the same shape.
@@ -213,7 +213,7 @@ _Not yet implemented._ To be recorded here against Stage 2 as the baseline.
   are likewise opt-in).
 - **Operational mitigation meanwhile:** spreading workers across gateways already evens
   activation without the flag; Stage 1 is for the single-gateway-attachment case.
-- **Known limitation — REST path not yet fair.** Stage 1 changes only the command-stream
+- **Known limitation — REST path not yet fair.** Stage 1 changes only the Falcon
   dispatcher (`dispatch_to_connection`). The REST long-poll activation
   (`activate_jobs_impl`) has the identical local-first / fixed-order bug and is a Stage-1
   follow-up. The benchmark uses the stream transport specifically to exercise the fixed
@@ -224,7 +224,7 @@ _Not yet implemented._ To be recorded here against Stage 2 as the baseline.
 
 ## References
 
-- Code: `server/src/command_stream.rs` (`fair_plan`, `fair_plan_weighted`,
+- Code: `server/src/falcon.rs` (`fair_plan`, `fair_plan_weighted`,
   `activation_mode`, `record_peer_backlog`, `dispatch_to_connection`),
   `server/src/main.rs` (`active_backlog`, `activate_from_peer` piggyback parse), env
   `NANOBPMN_ACTIVATION_FAIRNESS=1|2`.

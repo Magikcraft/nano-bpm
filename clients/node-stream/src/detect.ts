@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-import { commandStreamUrl } from './commandStreamClient.js';
+import { falconUrl } from './falconClient.js';
 import { parseServerFrame } from './frames.js';
 
 export interface DetectOptions {
@@ -11,8 +11,8 @@ export interface DetectOptions {
 }
 
 /**
- * Probes whether `baseUrl` speaks the nanobpmn command-stream protocol by
- * attempting the `/command-stream` WebSocket upgrade and waiting for a `welcome`
+ * Probes whether `baseUrl` speaks the nanobpmn Falcon protocol by
+ * attempting the `/falcon` WebSocket upgrade and waiting for a `welcome`
  * frame. Resolves `true` for nanobpmn, `false` for anything else (a Camunda
  * gateway rejects the upgrade / 404s, or never sends `welcome`).
  *
@@ -21,7 +21,7 @@ export interface DetectOptions {
  */
 export function detectNanobpm(baseUrl: string, opts: DetectOptions = {}): Promise<boolean> {
   const timeoutMs = opts.timeoutMs ?? 2000;
-  const url = commandStreamUrl(baseUrl);
+  const url = falconUrl(baseUrl);
   return new Promise<boolean>((resolve) => {
     let ws: WebSocket;
     try {

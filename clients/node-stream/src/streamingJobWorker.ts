@@ -1,4 +1,4 @@
-import { CommandStreamClient, CommandError, ConnectionClosedError } from './commandStreamClient.js';
+import { FalconClient, CommandError, ConnectionClosedError } from './falconClient.js';
 import { detectNanobpm } from './detect.js';
 
 /**
@@ -30,7 +30,7 @@ export interface ActivatedJob {
 
 /**
  * An activated job enriched with action methods. Structurally compatible with
- * the Camunda SDK's `EnrichedActivatedJob` for the methods the command stream
+ * the Camunda SDK's `EnrichedActivatedJob` for the methods the Falcon protocol
  * supports, so the same `jobHandler` runs on either transport.
  */
 export interface StreamJob extends ActivatedJob {
@@ -43,7 +43,7 @@ export interface StreamJob extends ActivatedJob {
   /** Leaves the job untouched; its lock expires and it is re-dispatched. */
   ignore(): JobActionReceipt;
   /**
-   * Not supported over the command stream (there is no cancel frame). Use the
+   * Not supported over the Falcon protocol (there is no cancel frame). Use the
    * REST client's process-instance cancellation instead.
    */
   cancelWorkflow(): Promise<JobActionReceipt>;
@@ -85,7 +85,7 @@ export interface StreamingJobWorkerOptions {
   /**
    * Transport selection:
    * - `'auto'` (default): probe the gateway; stream if it is nanobpmn, else poll.
-   * - `'stream'`: force the command stream (no probe).
+   * - `'stream'`: force the Falcon protocol (no probe).
    * - `'poll'`: force the Camunda REST polling worker.
    */
   transport?: 'auto' | 'stream' | 'poll';
@@ -116,7 +116,7 @@ export interface JobWorkerHandle {
 }
 
 /**
- * Creates a job worker that prefers the nanobpmn command stream and falls back
+ * Creates a job worker that prefers the nanobpmn Falcon protocol and falls back
  * to Camunda REST polling. With `transport: 'auto'` (the default) it probes the
  * gateway once: a nanobpmn server gets a streaming worker (server-pushed jobs,
  * credit flow control, no long-poll); anything else gets the Camunda SDK's
@@ -168,10 +168,10 @@ class PollingJobWorker implements JobWorkerHandle {
   }
 }
 
-/** A job worker backed by the nanobpmn command stream. */
+/** A job worker backed by the nanobpmn Falcon protocol. */
 export class StreamingJobWorker implements JobWorkerHandle {
   readonly transport = 'stream' as const;
-  private readonly client: CommandStreamClient;
+  private readonly client: FalconClient;
   private readonly jobType: string;
   private readonly maxParallelJobs: number;
   private stopped = false;
@@ -180,7 +180,7 @@ export class StreamingJobWorker implements JobWorkerHandle {
   constructor(private readonly options: StreamingJobWorkerOptions) {
     this.jobType = options.jobType;
     this.maxParallelJobs = options.maxParallelJobs ?? 10;
-    this.client = new CommandStreamClient({
+    this.client = new FalconClient({
       baseUrl: options.baseUrl,
       worker: options.worker,
       headers: options.headers,
@@ -278,7 +278,7 @@ export class StreamingJobWorker implements JobWorkerHandle {
         markActed();
         return Promise.reject(
           new Error(
-            'cancelWorkflow() is not supported over the command stream; cancel the process instance via the REST client.',
+            'cancelWorkflow() is not supported over the Falcon protocol; cancel the process instance via the REST client.',
           ),
         );
       },

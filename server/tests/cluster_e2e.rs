@@ -4,7 +4,7 @@
 //! cluster (node 0 owns partitions 0 & 2, node 1 owns 1 & 3) and then drives the
 //! whole cluster *through a single node*, exactly as the benchmark does (it points
 //! all load at one gateway). This proves the three forwarding seams end to end
-//! over the real command-stream WebSocket transport between the two processes:
+//! over the real falcon WebSocket transport between the two processes:
 //!
 //! * **create placement** — creates submitted to one gateway are round-robined
 //!   across every partition, so instances are minted on both nodes;
@@ -306,7 +306,7 @@ fn creates_at_one_gateway_are_placed_across_the_whole_cluster() {
     // Drive every create through node 0 only. Placement round-robins over all
     // four partitions, so instances must be minted on partitions node 0 owns
     // (0 & 2, in-process) AND partitions node 1 owns (1 & 3, forwarded over the
-    // command stream) — proving cross-node create forwarding.
+    // Falcon protocol) — proving cross-node create forwarding.
     let mut seen = [0usize; NUM_PARTITIONS as usize];
     for _ in 0..(NUM_PARTITIONS * 4) {
         let key = create_via(&node0);
@@ -460,13 +460,13 @@ fn segmented_node_recovers_replicated_deployment_after_restart() {
 }
 
 // ----------------------------------------------------------------------------
-// Command-stream create placement
+// Falcon create placement
 // ----------------------------------------------------------------------------
 
 /// A tiny blocking WebSocket text client — HTTP upgrade, masked client text
 /// frames (a zero mask is the identity transform, valid per RFC 6455), and a
 /// frame reader that skips non-text/control frames. Enough to drive
-/// `createInstance` over `/command-stream` and read each `commandResult`.
+/// `createInstance` over `/falcon` and read each `commandResult`.
 struct WsClient {
     stream: TcpStream,
 }
@@ -477,7 +477,7 @@ impl WsClient {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set read timeout");
-        let request = "GET /command-stream HTTP/1.1\r\n\
+        let request = "GET /falcon HTTP/1.1\r\n\
              Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\
@@ -584,7 +584,7 @@ fn stream_creates_at_one_gateway_are_placed_across_the_whole_cluster() {
     let scratch = ScratchDir::new();
     let (node0, node1) = boot_cluster(&scratch);
 
-    // Drive every create through node 0's COMMAND STREAM (fire-and-forget), the
+    // Drive every create through node 0's FALCON (fire-and-forget), the
     // path benchmark producers and the SDK use. Before stream-create placement
     // existed, all of these landed on node 0's own partitions only; the per-node
     // metrics then (correctly) showed every instance on one node. Placement must

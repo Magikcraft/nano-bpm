@@ -60,7 +60,7 @@ node ids, partitions, replication, data dirs). See the
 and flag reference, including [trace capture](#trace-capture) (`--capture`).
 
 Once a cluster is up, point any Camunda 8 v2 REST client (or the
-[`@nanobpmn/sdk`](#nodetypescript-sdk) command-stream client) at
+[`@nanobpmn/sdk`](#nodetypescript-sdk) Falcon client) at
 `http://127.0.0.1:8080/v2`, and open the console at
 `http://127.0.0.1:8080/console`.
 
@@ -508,17 +508,17 @@ a transient outage, so no operator action is needed.
 See [`docs/distributed-scaling-design.md`](docs/distributed-scaling-design.md) for
 the full design rationale.
 
-## Command stream (WebSocket)
+## Falcon protocol (WebSocket)
 
 Alongside the REST API, the server exposes a single **bidirectional WebSocket**
-at `GET /command-stream` that multiplexes the whole client lifecycle — process
+at `GET /falcon` that multiplexes the whole client lifecycle — process
 creation *and* the full job lifecycle — onto one persistent, credit-coordinated
 socket. It funnels to the same engine command path as the REST handlers, so it is
 purely a more efficient ingress: no per-request connection setup, no long-poll for
 jobs, and flow control by **credits** instead of `429`/`503` + client retry.
 
 Connect with an optional `worker` query parameter
-(`/command-stream?worker=my-worker`). Frames are **JSON text frames**, each a
+(`/falcon?worker=my-worker`). Frames are **JSON text frames**, each a
 tagged union with a camelCase `"type"`. On connect the server sends a `welcome`
 (initial submission window + heartbeat cadence) followed by a `submissionCredits`
 grant. Idle sockets exchange `heartbeat` frames every 15 s.
@@ -584,20 +584,20 @@ inline. The trade-off: a crash in the ~5 ms window re-activates the job after
 restart (its lock expires) — preserving **at-least-once** semantics (handlers must
 be idempotent, the standard BPMN worker contract). The REST API
 `/jobs/{key}/completion` endpoint still awaits fsync before replying; only the
-command stream pipelines.
+Falcon pipelines.
 
-See [`docs/command-stream-design.md`](docs/command-stream-design.md) for the full
+See [`docs/falcon-design.md`](docs/falcon-design.md) for the full
 design rationale,
-[`docs/command-stream.asyncapi.yaml`](docs/command-stream.asyncapi.yaml) for the
+[`docs/falcon.asyncapi.yaml`](docs/falcon.asyncapi.yaml) for the
 AsyncAPI 3.1 description of every frame, and
-`server/tests/command_stream_e2e.rs` for runnable examples.
+`server/tests/falcon_e2e.rs` for runnable examples.
 
 ### Node/TypeScript SDK
 
 [`clients/node-stream`](clients/node-stream) publishes **`@nanobpmn/sdk`**, a
 companion to `@camunda8/orchestration-cluster-api` that adds a typed
-command-stream client and a streaming job worker. The worker auto-detects the
-backend: it uses the command stream against nanobpmn and **falls back to Camunda
+Falcon client and a streaming job worker. The worker auto-detects the
+backend: it uses the Falcon protocol against nanobpmn and **falls back to Camunda
 REST polling** against a Camunda gateway, so the same handler code serves both.
 See [`clients/node-stream/README.md`](clients/node-stream/README.md).
 
@@ -660,7 +660,7 @@ each running or completed instance.
 ### Workers
 
 Author TypeScript job workers in the browser and run them as sandboxed **Deno**
-subprocesses over the command stream, with a live "Running" fleet view (status,
+subprocesses over the Falcon protocol, with a live "Running" fleet view (status,
 throughput, completed/failed, uptime, restarts) and streamed logs. **Running
 workers requires [Deno](https://deno.com) installed on the host** (see below); the
 tab still authors code without it. Selected workers can also be **exported as a
@@ -673,7 +673,7 @@ The worker editor is deliberately styled after the **integrated development
 environments of the early-to-mid 1990s** — Borland Delphi, Microsoft Visual
 Basic — where the wiring was invisible and you focused only on what *can't* be
 automatically connected. The BPMN model is the form; the engine binds tasks to
-job workers by type; the runtime, the command-stream transport, the retry/timeout
+job workers by type; the runtime, the Falcon transport, the retry/timeout
 plumbing, and dependency resolution are all handled for you. You write only the
 handler body. That ethos drives the code intelligence:
 
@@ -743,7 +743,7 @@ defineWorker({
 ```
 
 The supervisor runs one sandboxed `deno run` subprocess per enabled worker that
-speaks the command stream directly. **Deno is required to *run* workers** (in the
+speaks the Falcon protocol directly. **Deno is required to *run* workers** (in the
 console or as an exported app): install it from <https://deno.com> so the `deno`
 binary is on `PATH`, or point `NANOBPMN_DENO_BIN` at it. If Deno is not installed
 the Workers tab still authors and exports code, but starting a worker reports the

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { CommandStreamClient } from '../src/commandStreamClient.js';
+import { FalconClient } from '../src/falconClient.js';
 import { detectNanobpm } from '../src/detect.js';
 import { createStreamingJobWorker, JobActionReceipt, type JobWorkerHandle } from '../src/streamingJobWorker.js';
 
@@ -66,7 +66,7 @@ async function deployFixture(baseUrl: string): Promise<void> {
   if (!res.ok) throw new Error(`deploy failed: ${res.status} ${await res.text()}`);
 }
 
-describeIf('command stream integration (real server)', () => {
+describeIf('Falcon protocol integration (real server)', () => {
   let proc: ChildProcess;
   let dataDir: string;
   let baseUrl: string;
@@ -92,8 +92,8 @@ describeIf('command stream integration (real server)', () => {
     expect(await detectNanobpm(baseUrl)).toBe(true);
   });
 
-  it('creates an instance over the command stream', async () => {
-    const client = new CommandStreamClient({ baseUrl, worker: 'creator' });
+  it('creates an instance over the Falcon protocol', async () => {
+    const client = new FalconClient({ baseUrl, worker: 'creator' });
     await client.connect();
     try {
       const result = await client.createInstance({ processDefinitionId: PROCESS_ID });
@@ -118,7 +118,7 @@ describeIf('command stream integration (real server)', () => {
     });
     expect(worker.transport).toBe('stream');
 
-    const creator = new CommandStreamClient({ baseUrl, worker: 'creator' });
+    const creator = new FalconClient({ baseUrl, worker: 'creator' });
     await creator.connect();
     try {
       const { ack, completion } = await creator.createInstanceAndAwait(
@@ -136,7 +136,7 @@ describeIf('command stream integration (real server)', () => {
   });
 
   it('falls back to polling when the gateway is not nanobpmn', async () => {
-    // A plain HTTP server with no /command-stream upgrade stands in for Camunda.
+    // A plain HTTP server with no /falcon upgrade stands in for Camunda.
     const dummyPort = await freePort();
     const dummy = createServer((_req, res) => {
       res.statusCode = 404;

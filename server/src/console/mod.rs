@@ -344,8 +344,8 @@ async fn swagger_asset(
     serve_embedded(&format!("swagger/{path}"), accepts_gzip(&headers))
 }
 
-/// Serves the Command Stream Protocol reference (AsyncAPI) at `/asyncapi`. The
-/// page is generated at build time from `docs/command-stream.asyncapi.yaml`
+/// Serves the Falcon Protocol reference (AsyncAPI) at `/asyncapi`. The
+/// page is generated at build time from `docs/falcon.asyncapi.yaml`
 /// (see `console/scripts/copy-asyncapi.mjs`) into `dist/asyncapi/index.html`.
 async fn asyncapi_index(headers: HeaderMap) -> Response {
     serve_embedded("asyncapi/index.html", accepts_gzip(&headers))
@@ -572,7 +572,7 @@ async fn cluster_health(State(server): State<ServerImpl>) -> Json<ClusterHealthD
 
 /// Probes one peer's `GET {base_url}/v2/topology`, returning its reported
 /// `gatewayVersion` and the round-trip latency. Plain HTTP/1.1 (peers are
-/// TLS-less, like the command-stream uplink). Any transport error, non-2xx
+/// TLS-less, like the falcon uplink). Any transport error, non-2xx
 /// status, or timeout is mapped to a short human-readable string.
 async fn probe_peer(base_url: &str) -> Result<(Option<String>, Duration), String> {
     use http_body_util::BodyExt;
@@ -1403,7 +1403,7 @@ async fn model_delete(Path(name): Path<String>) -> Response {
 // A worker is a directory of source files under `workers/<name>/` (an entry
 // `worker.ts` plus optional helpers and a `deno.json`). The supervisor (see
 // `workers`) runs each enabled worker as a sandboxed Deno subprocess that speaks
-// the command stream. This API is workspace file CRUD plus start/stop and a live
+// the Falcon protocol. This API is workspace file CRUD plus start/stop and a live
 // log/metrics view; it never touches the engine data dir.
 
 /// Default `worker.ts` scaffold for a new worker. Imports the embedded SDK via

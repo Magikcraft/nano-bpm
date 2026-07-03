@@ -1,35 +1,35 @@
 import { describe, expect, it } from 'vitest';
 
-import { commandStreamUrl } from '../src/commandStreamClient.js';
+import { falconUrl } from '../src/falconClient.js';
 import { encodeClientFrame, parseServerFrame } from '../src/frames.js';
 
-describe('commandStreamUrl', () => {
-  it('maps an http REST base to a ws command-stream URL', () => {
-    expect(commandStreamUrl('http://localhost:8080')).toBe('ws://localhost:8080/command-stream');
+describe('falconUrl', () => {
+  it('maps an http REST base to a ws Falcon URL', () => {
+    expect(falconUrl('http://localhost:8080')).toBe('ws://localhost:8080/falcon');
   });
 
   it('strips a trailing /v2 REST prefix', () => {
-    expect(commandStreamUrl('http://localhost:8080/v2')).toBe('ws://localhost:8080/command-stream');
+    expect(falconUrl('http://localhost:8080/v2')).toBe('ws://localhost:8080/falcon');
   });
 
   it('maps https to wss and keeps a non-default host/port', () => {
-    expect(commandStreamUrl('https://gw.example.com:8443/v2')).toBe(
-      'wss://gw.example.com:8443/command-stream',
+    expect(falconUrl('https://gw.example.com:8443/v2')).toBe(
+      'wss://gw.example.com:8443/falcon',
     );
   });
 
   it('accepts an explicit ws base', () => {
-    expect(commandStreamUrl('ws://localhost:9999')).toBe('ws://localhost:9999/command-stream');
+    expect(falconUrl('ws://localhost:9999')).toBe('ws://localhost:9999/falcon');
   });
 
   it('appends the worker query param when provided', () => {
-    expect(commandStreamUrl('http://localhost:8080', 'my-worker')).toBe(
-      'ws://localhost:8080/command-stream?worker=my-worker',
+    expect(falconUrl('http://localhost:8080', 'my-worker')).toBe(
+      'ws://localhost:8080/falcon?worker=my-worker',
     );
   });
 
   it('tolerates trailing slashes', () => {
-    expect(commandStreamUrl('http://localhost:8080/')).toBe('ws://localhost:8080/command-stream');
+    expect(falconUrl('http://localhost:8080/')).toBe('ws://localhost:8080/falcon');
   });
 });
 

@@ -361,7 +361,7 @@ surface, but it **sharpens and constrains M3 rather than redefining it**:
 - **Public-surface-only, restated.** Per the exploration doc's footer, every
   Nano-side need is "a ProcessOS-driven extension to Nano's public surfaces, never
   an engine-core change." The `ClusterRunner` therefore *creates instances and
-  deploys over the public REST/command-stream*, and *reads over the T1 console
+  deploys over the public REST/falcon*, and *reads over the T1 console
   contract* — never engine-core, never the journal/read-DB.
 - **No auto-apply in M3.** The doc's safety spectrum (§0) plus its two deferred
   data investments — a **per-task side-effect/purity profile** and a **delayed
@@ -385,7 +385,7 @@ surface, but it **sharpens and constrains M3 rather than redefining it**:
    gateway — producer over the **v2 REST API** (`POST /v2/process-instances`,
    `/v2/deployments`) + workers over the **v2 job APIs**
    (`POST /v2/jobs/activation`, `POST /v2/jobs/{key}/completion`) or
-   `/command-stream`, reusing the perf-matrix load path. The science (a)
+   `/falcon`, reusing the perf-matrix load path. The science (a)
    lives in ProcessOS; the load-gen plumbing (b) is the documented integration
    boundary the perf-matrix already provides.
 

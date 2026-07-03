@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 # WebSocket *client* for the intra-cluster peer uplink: a node speaks the same
-# command-stream protocol it serves (axum's `ws` feature is server-only). Pinned
+# Falcon protocol it serves (axum's `ws` feature is server-only). Pinned
 # to the same tungstenite the server already pulls in via axum. No TLS — the
 # cluster mesh is a trusted private network; `ws://` only.
 tokio-tungstenite = "0.29"
@@ -42,7 +42,7 @@ mime_guess = { version = "2", optional = true }
 # Console-only HTTP client for the cluster-health probe: each node probes its
 # peers' always-on `GET /v2/topology` to report remote liveness/version/latency
 # in the Topology tab. hyper(-util) is already in the tree via axum, and peers
-# speak plain HTTP (no TLS — same as the command-stream uplink), so this adds no
+# speak plain HTTP (no TLS — same as the Falcon uplink), so this adds no
 # new TLS stack. serde_json (already a dependency) parses the probed
 # `gatewayVersion`.
 hyper = { version = "1", features = ["client", "http1"], optional = true }

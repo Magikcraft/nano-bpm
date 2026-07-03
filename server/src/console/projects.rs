@@ -63,11 +63,11 @@ pub const TEMPLATES: &[(&str, &str)] = &[
     ),
     (
         "throughput-stream",
-        "Throughput (command-stream) — same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
+        "Throughput (falcon) — same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
     ),
     (
         "rust-throughput",
-        "Throughput (Rust) — native pipelined command-stream (where stream beats REST)",
+        "Throughput (Rust) — native pipelined falcon (where stream beats REST)",
     ),
     (
         "gui-starter",
@@ -144,7 +144,7 @@ pub struct ProjectConfig {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    /// Gateway base URL the app deploys to and dials the command stream on. The
+    /// Gateway base URL the app deploys to and dials the Falcon protocol on. The
     /// REST API lives at `<deployTarget>/v2`. Default: `http://localhost:8080`.
     #[serde(default = "default_deploy_target")]
     pub deploy_target: String,
@@ -476,8 +476,8 @@ const DEMO_MAIN_TS: &str = r#"// Throughput (REST) — finds the ceiling using t
 // For 30 seconds it fires-and-forgets process-instance creates over REST
 // (POST /v2/process-instances, no awaiting completion) with a pool that ramps
 // every 2 seconds. The single "tick" worker drains the jobs. A/B this against
-// the "Throughput (command-stream)" demo, which runs identical logic through
-// @nanobpm/nano-sdk on the command stream.
+// the "Throughput (falcon)" demo, which runs identical logic through
+// @nanobpm/nano-sdk on the Falcon protocol.
 import { BASE_URL, deployAllResources, startWorkers } from "@lib/nano.ts";
 
 const PROCESS_ID = "throughput-demo";
@@ -584,19 +584,19 @@ instances are left parked), then reports the peak instances/sec and peak memory.
 2. Open this project and press **Run**. Watch the log console fill with per-second \
 rates; the final lines report the peak. It runs ~30s then drains and stops on its \
 own. Press **Stop** anytime to end early.\n\n\
-## A/B: command-stream vs REST\n\n\
-Pair this with **Throughput (command-stream)** (same benchmark via \
+## A/B: falcon vs REST\n\n\
+Pair this with **Throughput (falcon)** (same benchmark via \
 `@nanobpm/nano-sdk`). On a clean engine (30s ramp, fire-and-forget):\n\n\
-| Metric | REST (this demo) | Command-stream |\n\
+| Metric | REST (this demo) | Falcon |\n\
 |---|---|---|\n\
 | Peak instances/sec | **8,353** | 4,393 |\n\
 | Avg instances/sec | 7,593 | 2,753 |\n\
 | Created in 30s | 227,780 | 82,591 |\n\
 | Peak engine memory | 233 MB | **58 MB** |\n\n\
 REST wins raw throughput (pooled HTTP connections parallelise well); the \
-command stream uses ~4x less engine memory. Run each on a fresh engine \
+Falcon protocol uses ~4x less engine memory. Run each on a fresh engine \
 (`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
-> **Note:** in JavaScript/Deno there is no command-stream *throughput* win — \
+> **Note:** in JavaScript/Deno there is no falcon *throughput* win — \
 even across two processes (separate producer + worker) the SDK awaits one \
 create at a time over a single socket (~2–3k/s) while pooled REST fans out \
 across many connections (~20k/s). The stream's only JS benefit is ~4x lower \
@@ -612,7 +612,7 @@ or, equivalently:\n\n\
 }
 
 /// Stream variant deno.json: pulls the Nano SDK (drop-in C8 client) which
-/// auto-upgrades to the command stream against a Nano server.
+/// auto-upgrades to the Falcon protocol against a Nano server.
 const DEMO_STREAM_DENO_JSON: &str = r#"{
   "imports": {
     "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1",
@@ -624,10 +624,10 @@ const DEMO_STREAM_DENO_JSON: &str = r#"{
 }
 "#;
 
-/// The command-stream entrypoint: identical benchmark to the REST demo, but
+/// The falcon entrypoint: identical benchmark to the REST demo, but
 /// creation + the worker run through @nanobpm/nano-sdk, which upgrades to the
-/// command-stream protocol on Nano. A/B it against the REST demo.
-const DEMO_STREAM_MAIN_TS: &str = r#"// Throughput (command-stream) — same benchmark, run through @nanobpm/nano-sdk.
+/// falcon protocol on Nano. A/B it against the REST demo.
+const DEMO_STREAM_MAIN_TS: &str = r#"// Throughput (falcon) — same benchmark, run through @nanobpm/nano-sdk.
 //
 // Identical to the "Throughput (REST)" demo, except instance creation and the
 // "tick" worker go through the Nano SDK, which auto-upgrades to the command
@@ -669,7 +669,7 @@ async function creator(): Promise<void> {
   }
 }
 
-console.log("ramping process-instance creation for 30s (command stream)…\n");
+console.log("ramping process-instance creation for 30s (Falcon protocol)…\n");
 const t0 = performance.now();
 let lastCreated = 0;
 let peak = 0;
@@ -697,7 +697,7 @@ setTimeout(() => {
   running = false;
   clearInterval(ramp);
   clearInterval(tick);
-  console.log(`\n=== peak ${peak} instances/sec (command stream, fire-and-forget) ===`);
+  console.log(`\n=== peak ${peak} instances/sec (Falcon protocol, fire-and-forget) ===`);
   console.log(`=== ${created} instances created in 30s, ~${Math.round(created / 30)}/s average ===`);
   console.log(`=== peak engine memory ${peakMem.toFixed(0)}MB ===`);
   client.stopAllWorkers?.();
@@ -706,24 +706,24 @@ setTimeout(() => {
 "#;
 
 fn demo_stream_readme() -> String {
-    "# Throughput (command-stream)\n\n\
+    "# Throughput (falcon)\n\n\
 A/B partner to **Throughput (REST)**. Identical 30-second ramp benchmark, but \
 instance creation and the `tick` worker run through `@nanobpm/nano-sdk` — a \
-drop-in Camunda 8 client that upgrades to Nano's command-stream protocol. \
+drop-in Camunda 8 client that upgrades to Nano's falcon protocol. \
 Compare its peak instances/sec against the REST demo to see the wire-protocol \
 difference on the same engine.\n\n\
 ## Run it in the IDE\n\n\
 1. Make sure the engine is up (this console is the engine).\n\
 2. Open this project and press **Run**; compare the peak with the REST demo.\n\n\
-## A/B: command-stream vs REST\n\n\
+## A/B: falcon vs REST\n\n\
 On a clean engine (30s ramp, fire-and-forget):\n\n\
-| Metric | Command-stream (this demo) | REST |\n\
+| Metric | Falcon (this demo) | REST |\n\
 |---|---|---|\n\
 | Peak instances/sec | 4,393 | **8,353** |\n\
 | Avg instances/sec | 2,753 | 7,593 |\n\
 | Created in 30s | 82,591 | 227,780 |\n\
 | Peak engine memory | **58 MB** | 233 MB |\n\n\
-The command stream trades raw throughput for ~4x lower engine memory; REST \
+The Falcon protocol trades raw throughput for ~4x lower engine memory; REST \
 parallelises better over pooled HTTP connections. Run each on a fresh engine \
 (`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
 > **Note:** in JavaScript/Deno the stream does *not* win on throughput — even \
@@ -884,7 +884,7 @@ the IDE detects `cargo`).\n\n\
 `PROD_CONNS` (producer connections, default 256), `WORKER_CONNS` (drainer \
 connections, default 64), `DURATION_SECS` (default 15).\n\n\
 ## A/B (native, clean engine, async durability)\n\n\
-| Metric | REST | Command-stream |\n\
+| Metric | REST | Falcon |\n\
 |---|---|---|\n\
 | Peak instances/sec | ~20k | **~32k** |\n\
 | Engine memory | high | **~4x lower** |\n\n\

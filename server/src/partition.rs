@@ -416,7 +416,7 @@ impl Partitions {
     /// gateway spread `createProcessInstance` across the whole cluster — the
     /// stage-1 create-forwarding seam — rather than only its own partitions, so
     /// one client connection can drive every node. A remote placement is forwarded
-    /// to the owner over the command stream; a local one runs in-process via
+    /// to the owner over the Falcon protocol; a local one runs in-process via
     /// [`for_create`](Self::for_create).
     ///
     /// Single-node (and any node owning every partition) always returns `None`:

@@ -1,7 +1,7 @@
 asyncapi: 3.1.0
 
 info:
-  title: nanobpmn Command Stream
+  title: nanobpmn Falcon Protocol
   version: 1.0.0
   description: >
     Bidirectional WebSocket protocol for the nanobpmn gateway. A single
@@ -18,10 +18,10 @@ info:
     Every frame is a JSON object sent in a WebSocket **text** frame. The frame
     kind is carried in a `type` discriminator (camelCase). This document is a
     hand-maintained companion to the OpenAPI REST spec under `spec/`: the
-    command stream is a WebSocket endpoint and cannot be modeled by OpenAPI, so
+    Falcon protocol is a WebSocket endpoint and cannot be modeled by OpenAPI, so
     it is not part of code generation. It mirrors the Rust `ClientFrame` /
-    `ServerFrame` enums in `server/src/command_stream.rs` and the design notes in
-    `docs/command-stream-design.md`.
+    `ServerFrame` enums in `server/src/falcon.rs` and the design notes in
+    `docs/falcon-design.md`.
   contact:
     name: nanobpmn
   license:
@@ -32,7 +32,7 @@ defaultContentType: application/json
 servers:
   local:
     host: localhost:8080
-    pathname: /command-stream
+    pathname: /falcon
     protocol: ws
     description: >
       Default local gateway. Use `wss` behind TLS termination. The submission
@@ -40,9 +40,9 @@ servers:
       `NANOBPMN_STREAM_SUBMISSION_WINDOW` environment variable (default 256).
 
 channels:
-  commandStream:
-    address: /command-stream
-    title: Command stream
+  falcon:
+    address: /falcon
+    title: Falcon protocol
     description: >
       The single WebSocket channel. The server sends a `welcome` frame once on
       connect, then both peers exchange frames asynchronously until close.
@@ -84,7 +84,7 @@ operations:
   sendCommand:
     action: send
     channel:
-      $ref: '#/channels/commandStream'
+      $ref: '#/channels/falcon'
     title: Client frames (client → server)
     description: >
       Frames the client writes to the socket. `subscribe`/`jobCredits` drive the
@@ -93,19 +93,19 @@ operations:
       `awaitInstance` re-subscribes to a known instance's terminal outcome for
       reconnect recovery.
     messages:
-      - $ref: '#/channels/commandStream/messages/subscribe'
-      - $ref: '#/channels/commandStream/messages/jobCredits'
-      - $ref: '#/channels/commandStream/messages/createInstance'
-      - $ref: '#/channels/commandStream/messages/completeJob'
-      - $ref: '#/channels/commandStream/messages/failJob'
-      - $ref: '#/channels/commandStream/messages/throwError'
-      - $ref: '#/channels/commandStream/messages/awaitInstance'
-      - $ref: '#/channels/commandStream/messages/clientHeartbeat'
+      - $ref: '#/channels/falcon/messages/subscribe'
+      - $ref: '#/channels/falcon/messages/jobCredits'
+      - $ref: '#/channels/falcon/messages/createInstance'
+      - $ref: '#/channels/falcon/messages/completeJob'
+      - $ref: '#/channels/falcon/messages/failJob'
+      - $ref: '#/channels/falcon/messages/throwError'
+      - $ref: '#/channels/falcon/messages/awaitInstance'
+      - $ref: '#/channels/falcon/messages/clientHeartbeat'
 
   receiveEvent:
     action: receive
     channel:
-      $ref: '#/channels/commandStream'
+      $ref: '#/channels/falcon'
     title: Server frames (server → client)
     description: >
       Frames the server writes to the socket. `welcome` arrives once on connect.
@@ -114,13 +114,13 @@ operations:
       outcome; `submissionCredits` replenishes create capacity; `pressure`
       signals coarse fleet backpressure.
     messages:
-      - $ref: '#/channels/commandStream/messages/welcome'
-      - $ref: '#/channels/commandStream/messages/job'
-      - $ref: '#/channels/commandStream/messages/commandResult'
-      - $ref: '#/channels/commandStream/messages/instanceCompleted'
-      - $ref: '#/channels/commandStream/messages/submissionCredits'
-      - $ref: '#/channels/commandStream/messages/pressure'
-      - $ref: '#/channels/commandStream/messages/serverHeartbeat'
+      - $ref: '#/channels/falcon/messages/welcome'
+      - $ref: '#/channels/falcon/messages/job'
+      - $ref: '#/channels/falcon/messages/commandResult'
+      - $ref: '#/channels/falcon/messages/instanceCompleted'
+      - $ref: '#/channels/falcon/messages/submissionCredits'
+      - $ref: '#/channels/falcon/messages/pressure'
+      - $ref: '#/channels/falcon/messages/serverHeartbeat'
 
 components:
   messages:

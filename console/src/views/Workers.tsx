@@ -158,7 +158,7 @@ export default function Workers() {
           <h1 className="text-lg font-semibold">Embedded Workers</h1>
           <p className="text-xs text-zinc-500">
             Author TypeScript job workers and run them as sandboxed Deno processes over the
-            command stream.
+            Falcon.
           </p>
         </div>
         <div className="flex gap-1 rounded-lg bg-zinc-900 p-1 text-sm">

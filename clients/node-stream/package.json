@@ -1,7 +1,7 @@
 {
   "name": "@nanobpmn/sdk",
   "version": "0.1.0",
-  "description": "Streaming SDK for the nanobpmn command-stream WebSocket, layered on @camunda8/orchestration-cluster-api. Adds a credit-coordinated command stream and a streaming job worker that auto-detects nanobpmn and falls back to REST polling against Camunda.",
+  "description": "Streaming SDK for the nanobpmn Falcon WebSocket, layered on @camunda8/orchestration-cluster-api. Adds a credit-coordinated Falcon protocol and a streaming job worker that auto-detects nanobpmn and falls back to REST polling against Camunda.",
   "type": "module",
   "main": "dist/index.cjs",
   "module": "dist/index.js",

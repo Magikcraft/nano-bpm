@@ -136,7 +136,7 @@ rebuild the group as a fresh sole-voter group seeded from its replica engine.
   mode. A partition is "leaderless" when its group's `current_leader` is `None` or
   names a peer that is not `peer_reachable`. After `grace_ticks` consecutive
   leaderless passes (`NANOBPMN_LEADER_DURABLE_GRACE_TICKS`, default 3) the node
-  acts. The failure detector is `peer_reachable(node)` (a dialable command-stream
+  acts. The failure detector is `peer_reachable(node)` (a dialable Falcon
   uplink; `true` for self).
 - **Single-promoter safety.** `designated_successor(p)` is the first node in
   `replicas_of(p)` order (leader-first, deterministic) that is reachable. Every

@@ -45,8 +45,8 @@
 # nanobpmn is a superset of the Camunda Orchestration Cluster API. The topology
 # response gains an OPTIONAL `nano` object so SDK clients can detect, from a
 # single unauthenticated /v2/topology call, that they are talking to a nanobpmn
-# gateway (not stock Camunda) and may upgrade to the bidirectional command
-# stream (workers/producers over a single WebSocket) instead of REST long-poll.
+# gateway (not stock Camunda) and may upgrade to the bidirectional Falcon
+# protocol (workers/producers over a single WebSocket) instead of REST long-poll.
 #
 # `nano` is deliberately NOT marked `required`: its ABSENCE means a stock Camunda
 # gateway, its PRESENCE means nanobpmn. Generated as `Option<NanoEngineInfo>` in
@@ -58,11 +58,11 @@
       description: |
         Present only on nanobpmn gateways. Signals that this engine implements a
         superset of the Camunda Orchestration Cluster API and advertises the
-        streaming command-stream endpoint that clients may upgrade to.
+        streaming Falcon endpoint that clients may upgrade to.
       type: object
       required:
         - engine
-        - commandStreamPath
+        - falconPath
       properties:
         engine:
           description: Engine identifier. Always "nanobpmn".
@@ -72,13 +72,13 @@
           description: The nanobpmn gateway version.
           type: string
           example: 0.1.0
-        commandStreamPath:
+        falconPath:
           description: |
-            Path of the bidirectional command-stream WebSocket. Clients may
+            Path of the bidirectional Falcon WebSocket. Clients may
             upgrade to this endpoint to create instances and drain jobs over a
             single connection instead of REST long-poll.
           type: string
-          example: /command-stream
+          example: /falcon
 
 - file: cluster.yaml
   target: components.schemas.TopologyResponse.properties

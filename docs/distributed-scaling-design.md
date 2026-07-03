@@ -4,7 +4,7 @@
 > Grounded in: `server/src/partition.rs` (Partitions router), `server/src/main.rs`
 > (`correlate_message_everywhere`, `deploy_partition` / `replicate_deployment`,
 > `try_activate`, tick fan-out), `server/src/journal.rs` (shared group-commit WAL,
-> sync/async durability), `server/src/command_stream.rs` (credit dispatch, Pressure
+> sync/async durability), `server/src/falcon.rs` (credit dispatch, Pressure
 > frame), `engine-core/src/lib.rs` (`partition_of`, key encoding).
 
 ## 0. Context: the single-node envelope is characterised
@@ -75,8 +75,8 @@ become distributed-systems problems across nodes. Each is a concrete code site:
 
 ## 4. Two head-starts worth flagging
 
-- **The command stream is already your inter-node RPC.** Workers subscribe, creates flow,
-  credits + the **Pressure (red/green)** frame flow back (`command_stream.rs`). The same
+- **The Falcon protocol is already your inter-node RPC.** Workers subscribe, creates flow,
+  credits + the **Pressure (red/green)** frame flow back (`falcon.rs`). The same
   protocol can carry node→node command routing — likely **no second transport needed.**
 - **The shared-WAL work reverses direction cleanly.** We merged partitions onto one log to
   fix single-node fsync fragmentation; distributed, each node simply group-commits its own
@@ -97,7 +97,7 @@ This is the single biggest lift and the reason stage 0–1 must be designed lead
 ## 6. Distributed sensing — the adaptive envelope
 
 This was the original framing of the session. The primitive already exists: the
-dispatcher's **edge-triggered Pressure frame** broadcast over the command stream. Distributed
+dispatcher's **edge-triggered Pressure frame** broadcast over the Falcon protocol. Distributed
 sensing extends it to a **cluster-wide load signal**: each node publishes its envelope
 position from gauges we already instrumented —
 
@@ -117,7 +117,7 @@ Ordered so nothing is thrown away (each stage is independently shippable/testabl
 | Stage | Delivers | Key work |
 |-------|----------|----------|
 | **0. Partition addressing** | Foundation for both | A `PartitionRouter` indirection: key → current leader node. Today it resolves to "always local"; make it a seam. **Zero behaviour change single-node.** |
-| **1. Network transport (RF=1)** | **Throughput** | Run partitions in M processes; route commands to the owning node's command stream. Near-linear pi/s scaling. Each partition single-homed (node loss = that partition recovers from its journal). |
+| **1. Network transport (RF=1)** | **Throughput** | Run partitions in M processes; route commands to the owning node's Falcon. Near-linear pi/s scaling. Each partition single-homed (node loss = that partition recovers from its journal). |
 | **2. Fan-out fixes** | Throughput at scale | Subscription routing index (kills the §3.1 broadcast); distributed deployment (§3.2); start-event ownership (§3.3); real topology (§3.7). |
 | **3. Per-partition Raft (RF=3)** | **Fault tolerance** | Replace single-node replay with a replicated log; commit = quorum-ack; leader failover. sync/async durability becomes the local disk tier. |
 | **4. Distributed sensing** | Adaptive envelope | Cluster load signal + adaptive create placement + boundary shedding via the Pressure frame and admission gates. |

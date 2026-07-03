@@ -3,7 +3,7 @@
 //! Runs each enabled worker as a sandboxed **Deno** subprocess (one process per
 //! worker), independent of any browser. The worker code (`workers/<name>/worker.ts`)
 //! imports the embedded SDK (`.nanobpm/worker-sdk.ts`), which speaks the
-//! command-stream protocol and prints structured metric/status lines that this
+//! falcon protocol and prints structured metric/status lines that this
 //! supervisor parses. Everything here is feature-gated behind `console`; the
 //! base gateway build never spawns Deno and does not require it on PATH.
 //!
@@ -172,7 +172,7 @@ pub fn supervisor() -> &'static WorkerSupervisor {
 }
 
 /// Records the gateway's actually-bound port so spawned workers can dial the
-/// command stream on `127.0.0.1:<port>`. Called from `main` after bind.
+/// Falcon protocol on `127.0.0.1:<port>`. Called from `main` after bind.
 pub fn set_gateway_port(port: u16) {
     supervisor().gateway_port.store(port, Ordering::Relaxed);
 }

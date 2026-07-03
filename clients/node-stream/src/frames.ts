@@ -1,8 +1,8 @@
 /**
- * TypeScript mirror of the nanobpmn command-stream wire protocol.
+ * TypeScript mirror of the nanobpmn Falcon wire protocol.
  *
- * These types track `docs/command-stream.asyncapi.yaml` and the Rust
- * `ClientFrame` / `ServerFrame` enums in `server/src/command_stream.rs`. Every
+ * These types track `docs/falcon.asyncapi.yaml` and the Rust
+ * `ClientFrame` / `ServerFrame` enums in `server/src/falcon.rs`. Every
  * frame is a JSON object carried in a WebSocket **text** frame, discriminated by
  * a camelCase `type` field.
  *

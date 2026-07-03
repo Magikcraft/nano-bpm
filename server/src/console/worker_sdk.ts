@@ -2,7 +2,7 @@
 //
 // This file is written verbatim into <workspace>/.nanobpm/worker-sdk.ts by the
 // console worker supervisor and imported by each worker's `worker.ts`. It speaks
-// the nanobpmn command-stream protocol directly over Deno's native WebSocket
+// the nanobpmn Falcon protocol directly over Deno's native WebSocket
 // (no `ws`, no node:events) so a worker is a single self-contained Deno process.
 //
 // A worker file looks like:
@@ -68,11 +68,11 @@ function emit(prefix: string, payload: unknown): void {
   Deno.stdout.writeSync(new TextEncoder().encode(line));
 }
 
-function commandStreamUrl(baseUrl: string, worker?: string): string {
+function falconUrl(baseUrl: string, worker?: string): string {
   let base = baseUrl.replace(/\/+$/, "").replace(/\/v2$/, "");
   if (base.startsWith("http://")) base = "ws://" + base.slice("http://".length);
   else if (base.startsWith("https://")) base = "wss://" + base.slice("https://".length);
-  const url = new URL(base + "/command-stream");
+  const url = new URL(base + "/falcon");
   if (worker) url.searchParams.set("worker", worker);
   return url.toString();
 }
@@ -82,7 +82,7 @@ export function defineWorker(opts: WorkerOptions): void {
   const workerName = opts.worker ?? Deno.env.get("NANOBPMN_WORKER_NAME") ?? "embedded-worker";
   const maxParallel = opts.maxParallelJobs ?? 10;
   const timeoutMs = opts.timeoutMs ?? 60_000;
-  const url = commandStreamUrl(baseUrl, workerName);
+  const url = falconUrl(baseUrl, workerName);
 
   let corr = 0;
   const nextCorr = () => (corr = (corr + 1) >>> 0);

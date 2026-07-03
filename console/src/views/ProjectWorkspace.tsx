@@ -758,7 +758,7 @@ function ConfigModal({
       <input value={desc} onChange={(e) => setDesc(e.target.value)} className={inputCls} />
       <label className="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Deploy target</label>
       <input value={deployTarget} onChange={(e) => setDeployTarget(e.target.value)} className={inputCls} placeholder="http://localhost:8080" />
-      <p className="mt-1 text-[11px] text-zinc-600">REST API at &lt;target&gt;/v2; the command stream is dialled here too.</p>
+      <p className="mt-1 text-[11px] text-zinc-600">REST API at &lt;target&gt;/v2; the Falcon protocol is dialled here too.</p>
       <label className="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Entry point</label>
       <input value={main} onChange={(e) => setMain(e.target.value)} className={inputCls} placeholder="main.ts" />
       <label className="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Export platforms</label>

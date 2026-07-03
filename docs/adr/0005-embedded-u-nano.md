@@ -2,7 +2,7 @@
 
 Status: **Proposed — design/exploration only. No code changed by this document.**
 Date: 2026-06-28.
-Relates to: `docs/sdk-nano-decorator-design.md` (the runtime decorator), `docs/command-stream-design.md`,
+Relates to: `docs/sdk-nano-decorator-design.md` (the runtime decorator), `docs/falcon-design.md`,
 `engine-core/src/ffi.rs` (C-ABI surface), `engine-wasm/src/lib.rs` (μ-nano / `TestEngine`),
 `clients/node-stream/` (`@nanobpmn/sdk` streaming layer), `server/src/console/worker_sdk.ts`
 (Deno `defineWorker`), `processos/src/supervisor.rs` (spawn-an-engine model), the unified
@@ -17,7 +17,7 @@ code, tests them, deploys, and can have Deno cross-compile the application into 
 The end-state we want to enable is a **single application source** that can be:
 
 1. **Lift-and-shifted on disk** and run against a stock **Camunda 8** engine;
-2. The same source run against a **remote Nano** engine (auto-upgrading to the command stream);
+2. The same source run against a **remote Nano** engine (auto-upgrading to the Falcon protocol);
 3. Cross-compiled into a **self-contained native binary** that runs against Camunda or remote Nano;
 4. With one button — **"Embed Nano"** — cross-compiled into a self-contained native binary with
    **micro-nano embedded**: a single-node engine used *only by the application itself*, needing no
@@ -48,10 +48,10 @@ The driving question this ADR answers:
   generator fork). There are exactly **two seams**: a *transport* seam (detect via `/v2/topology`
   `nano` advertisement, then connect/migrate) and an *operation* seam (only `createProcessInstance`
   and the job worker's `activateJobs`/complete/fail upgrade). When connected to Camunda the client
-  is **byte-identical** to today; when connected to Nano it upgrades to the command stream.
+  is **byte-identical** to today; when connected to Nano it upgrades to the Falcon protocol.
 - **`@nanobpmn/sdk`** (`clients/node-stream/`) is explicitly "layered on top of
-  `@camunda8/orchestration-cluster-api`" and already implements the command-stream transport,
-  detection (`detectNanobpm` probes the `/command-stream` upgrade for a `welcome` frame), and a
+  `@camunda8/orchestration-cluster-api`" and already implements the Falcon transport,
+  detection (`detectNanobpm` probes the `/falcon` upgrade for a `welcome` frame), and a
   streaming job worker that *falls back to Camunda REST*.
 - **The worker authoring surface is already transport-agnostic.** `server/src/console/worker_sdk.ts`
   gives users `defineWorker({ type, handle })` over Deno's native WebSocket; the handler never names
@@ -64,8 +64,8 @@ The driving question this ADR answers:
 **Yes — one SDK surface, deployment mode chosen at build/embed time, no separate SDK.**
 
 The mechanism is the *decorator's existing two seams*, extended with a **third transport backend**:
-an **in-process embedded μ-nano** reached over a **loopback command stream**. The embedded engine
-**implements the command-stream protocol** (and the REST subset the app uses) over an in-memory /
+an **in-process embedded μ-nano** reached over a **loopback Falcon**. The embedded engine
+**implements the Falcon protocol** (and the REST subset the app uses) over an in-memory /
 localhost channel, so the *same* decorator code path that lights up for a remote Nano also lights up
 for the embedded engine. The user's application source is identical across all four modes; only the
 **transport binding** changes, and that binding is selected by the build.
@@ -78,12 +78,12 @@ one transport chokepoint. Embedded mode adds a transport implementation, not an 
 | Mode | Transport binding | Selected | Engine |
 | --- | --- | --- | --- |
 | Camunda | REST (stock SDK) | runtime: `/v2/topology` has no `nano` | external Camunda |
-| Nano (remote) | command-stream WS | runtime: `/v2/topology` advertises `nano` | external Nano gateway |
-| **Embedded** | **command-stream over loopback** | **compile time: "Embed Nano" build** | **in-process μ-nano.wasm** |
+| Nano (remote) | Falcon WS | runtime: `/v2/topology` advertises `nano` | external Nano gateway |
+| **Embedded** | **Falcon over loopback** | **compile time: "Embed Nano" build** | **in-process μ-nano.wasm** |
 
 The single switch the decorator already keys on is the `/v2/topology` `nano` advertisement. The
 embedded host **answers `/v2/topology` with the same `nano` field** (engine `nanobpmn`, a loopback
-`commandStreamPath`), so detection is *reused verbatim* — the client cannot tell embedded from
+`falconPath`), so detection is *reused verbatim* — the client cannot tell embedded from
 remote Nano except by the address it was told to bind to. This is the crux: **embedded μ-nano is
 "a Nano gateway that happens to live in the same process,"** not a new client API.
 
@@ -98,7 +98,7 @@ remote Nano except by the address it was told to bind to. This is the crux: **em
 │   │    • owns persistence: appends the event log to disk/SQLite (Deno FS), replays      │
 │   │      on boot (engine-core is event-sourced for exactly this)                        │
 │   │    • runs the timer tick + job-dispatch loop                                        │
-│   │    • serves the command-stream protocol + REST subset on a loopback transport       │
+│   │    • serves the Falcon protocol + REST subset on a loopback transport       │
 │   │    • answers /v2/topology with the `nano` advertisement                             │
 │   ├─ @camunda8/orchestration-cluster-api + nano runtime decorator (UNCHANGED)           │
 │   └─ App: process models + defineWorker(...) handlers (UNCHANGED source)                │
@@ -106,7 +106,7 @@ remote Nano except by the address it was told to bind to. This is the crux: **em
 ```
 
 The application's worker handlers and `createProcessInstance` calls go through the decorator's
-operation seam exactly as in remote mode; the seam routes them to the loopback command stream; the
+operation seam exactly as in remote mode; the seam routes them to the loopback Falcon; the
 host bridges loopback frames to the μ-nano FFI. For the app's own traffic this can collapse to
 **in-process function calls** (no socket, no serialization) while still optionally exposing a real
 localhost endpoint for external tooling / the cockpit.
@@ -141,7 +141,7 @@ binaries" goal.
    the journal via Deno FS/SQLite). This persistence layer is the single biggest piece of new work.
 2. **"The entire surface" is bounded by what embedded μ-nano implements.** The full Camunda gateway
    spec we ship has ~158 REST paths (191 generated handlers in `server/src/stub_impls.rs`); the
-   command stream covers the hot path (create + job lifecycle), but the rest (deployment, message
+   Falcon covers the hot path (create + job lifecycle), but the rest (deployment, message
    correlation, user-task completion, incident resolution, and especially the **query/search read
    API**) needs in-process handlers over the engine's snapshot. Embedded mode must implement the
    subset Nano supports and return a clear *"unsupported in embedded mode"* error for the remainder
@@ -169,7 +169,7 @@ binaries" goal.
 - **A. `deno compile` a Rust binary / FFI a native `cdylib`.** Deno can't link Rust; FFI needs a
   per-platform dylib, `--allow-ffi`, runtime extraction, and reintroduces Rust cross-compilation.
   Rejected in favour of WASM's single platform-neutral artifact.
-- **B. Embedded μ-nano.wasm + loopback command stream (this ADR).** One artifact, trivial
+- **B. Embedded μ-nano.wasm + loopback Falcon (this ADR).** One artifact, trivial
   cross-compile, and — critically — **reuses the decorator's existing transport/operation seams** so
   no new SDK is required.
 - **C. A separate `@nano/embedded` SDK.** Rejected: duplicates the worker/create surface, doubles the
@@ -182,14 +182,14 @@ binaries" goal.
   the topology-advertisement reuse.
 - **E1 — Durability**: host-owned event-log journal (file or SQLite) + replay-on-boot. Make-or-break.
 - **E2 — Runtime API surface**: extend the wasm exports for activate/complete/fail/correlate/query +
-  the timer/dispatch tick; bridge them to the command-stream + REST-subset handlers.
+  the timer/dispatch tick; bridge them to the Falcon + REST-subset handlers.
 - **E3 — `deno compile` packaging**: embed μ-nano.wasm as an asset; verify `--target` cross-compiles;
   wire the RAD-environment "Embed Nano" button to this build.
 - **E4 — Capability matrix**: enumerate which Camunda endpoints embedded mode supports; surface
   unsupported-endpoint diagnostics to the author at embed time.
 
 Dependency note: E0–E2 depend only on `engine-core`/`engine-wasm` (already wasm-clean) and the
-shipped command-stream protocol; the client side rides the decorator design unchanged.
+shipped Falcon protocol; the client side rides the decorator design unchanged.
 
 ## Open questions
 
@@ -198,8 +198,8 @@ shipped command-stream protocol; the client side rides the decorator design unch
 - **In-process vs loopback-socket**: collapse the app's own traffic to direct calls (fastest) while
   still exposing a localhost socket for external tooling — confirm the decorator can bind to an
   in-process channel without a real WS (see Appendix B.0).
-- **Build realization (c) at all?**: the loopback command-stream *server* is a deliberate cluster-free
-  TS re-implementation of `server/src/command_stream.rs` (frames reused, credits/correlation/dispatch
+- **Build realization (c) at all?**: the loopback Falcon *server* is a deliberate cluster-free
+  TS re-implementation of `server/src/falcon.rs` (frames reused, credits/correlation/dispatch
   re-written). Is push-based job delivery to *external* out-of-process consumers worth that code, or is
   the in-process path (a) + REST subset (b) sufficient for v1? (See Appendix B.0.)
 - **Persistence format**: reuse the server journal format or a simpler host-owned log? The server's
@@ -225,7 +225,7 @@ three independent layers:
   `TestEngine` currently exposes only `deploy`, `createInstance`, `completeJob`, `failJob`,
   `advanceTime`, `snapshot`, `events` — so most engine-core capability is **present in the core but
   not yet surfaced through wasm**; adding exports is cheap, mechanical glue).
-- **Transport** — in the *decorator* model, does the operation ride the command stream
+- **Transport** — in the *decorator* model, does the operation ride the Falcon protocol
   (`clients/node-stream/src/frames.ts`:
   `createInstance`/`completeJob`/`failJob`/`throwError`/`subscribe`/`awaitInstance`) or a REST call?
   **Note:** this column reflects the *remote* transport; in the default embedded realization (B.0(a))
@@ -238,10 +238,10 @@ host-side work (read model / feature) · ⬛ out of scope for embedded.
 | Camunda endpoint family | Core | μ-nano export | Transport | Embedded status |
 | --- | --- | --- | --- | --- |
 | **Deployment / Resource** (deploy BPMN/DMN/forms) | ✅ `DeployResources` | ✅ `deploy` | REST handler | 🟡 wrap `deploy` in a `/deployments` REST shim |
-| **Process instance — create** | ✅ | ✅ `createInstance` | command stream | ✅ rides the decorator hot path unchanged |
-| **Process instance — create+await result** | ✅ | 🟡 | command stream (`awaitInstance`) | 🟡 host correlates `instanceCompleted` |
+| **Process instance — create** | ✅ | ✅ `createInstance` | Falcon | ✅ rides the decorator hot path unchanged |
+| **Process instance — create+await result** | ✅ | 🟡 | Falcon (`awaitInstance`) | 🟡 host correlates `instanceCompleted` |
 | **Process instance — cancel** | ✅ `CancelInstance` | 🔴 not exposed | REST handler | 🟡 add wasm export + `/process-instances/{k}/cancellation` |
-| **Job — activate/complete/fail/throw** | ✅ | ✅ (complete/fail) | command stream | ✅ worker loop upgrades with zero app changes |
+| **Job — activate/complete/fail/throw** | ✅ | ✅ (complete/fail) | Falcon | ✅ worker loop upgrades with zero app changes |
 | **Job — update retries** | ✅ `UpdateJobRetries` | 🔴 | REST handler | 🟡 add export + `/jobs/{key}` |
 | **User task — assign/unassign/update/complete** | ✅ | 🔴 not exposed | REST handler | 🟡 core-complete; needs wasm exports + `/user-tasks/*` shims |
 | **Incident — resolve / update** | ✅ `ResolveIncident` | 🔴 | REST handler | 🟡 add export + `/incidents/{key}/resolution` |
@@ -259,7 +259,7 @@ host-side work (read model / feature) · ⬛ out of scope for embedded.
 | **Cluster / System / License / Setup / Authentication** | — | — | — | ⬛ out of scope (single node, no auth) |
 
 **Reading of the matrix.** The application *hot path* (create instance + job workers) is ✅ today —
-it is exactly what the command stream and decorator already cover, so those apps embed unchanged.
+it is exactly what the Falcon protocol and decorator already cover, so those apps embed unchanged.
 The *write* breadth (user tasks, incidents, messages, signals, variables, cancel) is **🟡: already
 modelled in `engine-core`**, blocked only on (a) mechanical `engine-wasm` exports and (b) thin
 in-process REST shims — no engine research required. The two genuine 🔴 features are **DMN decision
@@ -280,10 +280,10 @@ implementation** behind those seams — the *loopback adapter* — so the client
 remote-Nano path. The adapter is the contract between the embedded host (TS, around μ-nano.wasm) and
 the unchanged SDK.
 
-### B.0 Where the command-stream protocol comes from (the crux)
+### B.0 Where the Falcon protocol comes from (the crux)
 
-**The command-stream protocol is a *gateway* concern, not an *engine* concern.** It is implemented in
-`server/src/command_stream.rs` (~106 KB of axum/WebSocket framing, submission/job credit coordination,
+**The Falcon protocol is a *gateway* concern, not an *engine* concern.** It is implemented in
+`server/src/falcon.rs` (~106 KB of axum/WebSocket framing, submission/job credit coordination,
 correlation **and** intra-cluster routing — forwarding deploys to the partition-0 owner, cross-partition
 message correlation, leader cancellation, redirect). **`engine-core` has none of it** (no networking,
 no credits, no frames). So embedding the engine does *not* give you the protocol for free — something in
@@ -294,12 +294,12 @@ operation seam, and they differ precisely in *who* implements the protocol:
 | --- | --- | --- |
 | **(a) In-process direct** | **No protocol at all.** The decorator's operation seam calls `EmbeddedHost` methods directly (function calls); `createProcessInstance`/`activateJobs`/`completeJob` are bridged straight to engine-core FFI. No frames, no credits, no socket. | The app's own traffic in the single binary — the default, fastest embedded path. |
 | **(b) Loopback REST** | The host serves the **REST subset** (Appendix A) on a localhost origin; the client uses the decorator's *Camunda* (REST) transport path — no Nano upgrade, no stream. | Simplicity / external tooling that only needs REST; workers poll `activateJobs` against the in-process handler (cheap — no network). |
-| **(c) Loopback command-stream** | The host runs a **minimal TS re-implementation** of the command-stream *server* (frames + credits + correlation + job push), bridging to engine-core. It is **not** shared code with `server/src/command_stream.rs` — but it is bounded because *all* the cluster machinery (raft, partitions, forwarding, redirect, distributed backpressure) is absent, and it **reuses `clients/node-stream/src/frames.ts`** for encode/parse. | Out-of-process tooling/cockpit that expects the wire protocol, or when you want push-based job delivery over a real localhost socket. |
+| **(c) Loopback Falcon** | The host runs a **minimal TS re-implementation** of the Falcon *server* (frames + credits + correlation + job push), bridging to engine-core. It is **not** shared code with `server/src/falcon.rs` — but it is bounded because *all* the cluster machinery (raft, partitions, forwarding, redirect, distributed backpressure) is absent, and it **reuses `clients/node-stream/src/frames.ts`** for encode/parse. | Out-of-process tooling/cockpit that expects the wire protocol, or when you want push-based job delivery over a real localhost socket. |
 
-The honest consequence: **for the in-process case (a) the client never "speaks the command-stream
+The honest consequence: **for the in-process case (a) the client never "speaks the Falcon
 protocol to the embedded engine" — it speaks the *operation seam*, which the embedded transport
 satisfies with direct calls.** The wire protocol only reappears in (c), and only as a deliberate,
-cluster-free TS port — never by lifting `command_stream.rs` (which drags axum/tokio/raft/partitions and
+cluster-free TS port — never by lifting `falcon.rs` (which drags axum/tokio/raft/partitions and
 would defeat the "micro" goal) into wasm.
 
 Why the protocol's *value* mostly evaporates in-process: submission credits, push-vs-long-poll latency,
@@ -312,12 +312,12 @@ socket and no network latency, so (a) is both simpler and faster than reproducin
 1. **Topology advertisement.** Answer `GET /v2/topology` with the standard Camunda fields **plus**
    the `nano` block — extended with an explicit transport hint so the decorator picks the right
    realization instead of blindly trying a WebSocket:
-   `{ engine: "nanobpmn", version, embedded: true, transport: "in-process" | "command-stream",
-   commandStreamPath? }`. For (a)/(b) `transport` is `in-process` and there is **no**
-   `commandStreamPath`, so the decorator must *not* attempt the `/command-stream` upgrade (today's
+   `{ engine: "nanobpmn", version, embedded: true, transport: "in-process" | "Falcon",
+   falconPath? }`. For (a)/(b) `transport` is `in-process` and there is **no**
+   `falconPath`, so the decorator must *not* attempt the `/falcon` upgrade (today's
    `detectNanobpm` keys off the WS `welcome` frame — the decorator needs this hint to use the
-   in-process/REST realization without probing a socket). For (c) `transport` is `command-stream` with a
-   loopback `commandStreamPath`, and detection proceeds exactly as for remote Nano.
+   in-process/REST realization without probing a socket). For (c) `transport` is `Falcon` with a
+   loopback `falconPath`, and detection proceeds exactly as for remote Nano.
 2. **Operation-seam fulfilment.** Realization (a) implements `createProcessInstance` /
    `activateJobs` / `completeJob` / `failJob` / `throwError` as **direct `EmbeddedHost` calls** (see
    B.3) — the decorator already abstracts these two operations, so this is the natural integration
@@ -325,7 +325,7 @@ socket and no network latency, so (a) is both simpler and faster than reproducin
    protocol (`clients/node-stream/src/frames.ts`: client
    `subscribe`/`jobCredits`/`createInstance`/`completeJob`/`failJob`/`throwError`/`awaitInstance`/
    `heartbeat`; server `welcome`/`job`/`commandResult`/`instanceCompleted`/`submissionCredits`/
-   `pressure`/`heartbeat`) over the loopback socket, reusing the frame module so `CommandStreamClient`
+   `pressure`/`heartbeat`) over the loopback socket, reusing the frame module so `FalconClient`
    is unmodified; credit semantics may be generous (single node, no cluster to protect).
 3. **REST subset.** Answer the in-scope REST endpoints from Appendix A over the same loopback origin,
    so non-stream operations (deploy, user tasks, incidents, messages, signals, query) work through the
@@ -342,18 +342,18 @@ export interface EmbeddedEndpoint {
   readonly origin: string;
   /** REST handler: method + path + body  →  Camunda-shaped response (or 501 EMBEDDED_UNSUPPORTED). */
   fetch(req: Request): Promise<Response>;
-  /** Command-stream channel: a duplex of parsed frames, semantically identical to the WS. */
-  openCommandStream(headers?: Record<string, string>): CommandStreamChannel;
+  /** Falcon channel: a duplex of parsed frames, semantically identical to the WS. */
+  openFalcon(headers?: Record<string, string>): FalconChannel;
 }
 
-export interface CommandStreamChannel {
+export interface FalconChannel {
   send(frame: ClientFrame): void;          // createInstance / completeJob / failJob / throwError / subscribe / credits / heartbeat
   onFrame(cb: (f: ServerFrame) => void): void;  // welcome / job / commandResult / instanceCompleted / credits / pressure / heartbeat
   close(): void;
 }
 ```
 
-For realization (a) the SDK's `fetch` and the command-stream client are pointed at the in-process
+For realization (a) the SDK's `fetch` and the Falcon client are pointed at the in-process
 `EmbeddedEndpoint` (no real sockets); for (b) the host binds an actual `Deno.serve` on a loopback port
 and the existing `ws`/`fetch` paths are used untouched. The decorator does not know or care which.
 
@@ -393,7 +393,7 @@ Frame/command bridging rules:
   validation, tenant defaults, retry classification or response shaping — those live outside the seam
   (decorator §5), so the same app behaves identically in all four modes.
 - **One socket / one channel per client**: matches the decorator's threaded-worker assumption (the
-  command-stream channel lives on the main thread; thread workers proxy actions to it).
+  Falcon channel lives on the main thread; thread workers proxy actions to it).
 - **Advisory control frames degrade safely**: `pressure` may be a no-op on a single node; a worker that
   ignores it still works (as on remote Nano).
 - **Capability honesty**: any REST call outside Appendix A's ✅/🟡 set returns `501
@@ -425,7 +425,7 @@ import { CamundaClient } from "@camunda8/orchestration-cluster-api"; // + nano r
 const self = new CamundaClient({ restAddress: process.env.NANO_EMBEDDED_ORIGIN }); // e.g. "loopback://nano"
 
 // OUTER: the engine that orchestrates ME. Address comes from deployment config; may be
-// Camunda (REST) or a remote Nano (command stream) — the decorator detects which.
+// Camunda (REST) or a remote Nano (Falcon) — the decorator detects which.
 const orchestrator = new CamundaClient({ restAddress: process.env.CAMUNDA_REST_ADDRESS });
 
 // 1) Serve the OUTER orchestration's jobs — these only ever arrive on `orchestrator`.
@@ -467,7 +467,7 @@ Two cases warrant runtime introspection rather than relying on the handle:
 
    This requires the embedded host's topology advertisement to carry an **`embedded: true`**
    discriminator inside the `nano` block (extends the §"single switch" advertisement
-   `{ engine, version, commandStreamPath }`). Absent it, embedded is indistinguishable from a remote
+   `{ engine, version, falconPath }`). Absent it, embedded is indistinguishable from a remote
    single-node Nano — usually fine, but this flag is what lets a service *know it is talking to its
    own engine*.
 

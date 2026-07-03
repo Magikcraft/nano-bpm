@@ -1,7 +1,7 @@
 //! M3 — the **at-scale measurement** half of the ClusterRunner.
 //!
 //! The ClusterRunner has two halves: (a) *drive* concurrent load against a real
-//! Nano gateway (producer over the v2 REST API + workers over `/command-stream`,
+//! Nano gateway (producer over the v2 REST API + workers over `/falcon`,
 //! reusing the perf-matrix load path), and (b) *measure* the at-scale result. This
 //! module is (b): given the live traces a real run produced (read over the T1
 //! contract), it computes the signals the per-instance, sequential [`super::sim`]

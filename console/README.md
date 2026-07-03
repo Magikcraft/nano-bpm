@@ -90,7 +90,7 @@ and a toolbar:
   Selecting export platforms cross-compiles for them (this downloads the Deno
   runtime per target and can take a few minutes; progress streams to Output).
 - **Configure** — edits the deploy target (`<target>/v2` is the REST API the app
-  deploys to and dials the command stream on), the entry point, and the set of
+  deploys to and dials the Falcon protocol on), the entry point, and the set of
   export platforms.
 - **Export** — downloads the whole project as a `.zip` (add the compiled `dist/`
   binaries with the `?dist=true` option).

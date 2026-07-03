@@ -13,12 +13,12 @@ import {
   parseServerFrame,
 } from './frames.js';
 
-/** Options for {@link CommandStreamClient}. */
-export interface CommandStreamClientOptions {
+/** Options for {@link FalconClient}. */
+export interface FalconClientOptions {
   /**
    * Gateway base URL. Either an `http(s)://host:port` REST base (the `/v2`
    * suffix is stripped if present) or a `ws(s)://` URL. The client connects to
-   * `<base>/command-stream`.
+   * `<base>/falcon`.
    */
   baseUrl: string;
   /** Worker name recorded on the connection (passed as the `worker` query param). */
@@ -55,7 +55,7 @@ export class CommandError extends Error {
 
 /** Thrown when an in-flight command's socket closes before its result arrives. */
 export class ConnectionClosedError extends Error {
-  constructor(message = 'command stream connection closed') {
+  constructor(message = 'Falcon protocol connection closed') {
     super(message);
     this.name = 'ConnectionClosedError';
   }
@@ -125,7 +125,7 @@ export interface AwaitOptions {
 }
 
 /**
- * Typed events emitted by {@link CommandStreamClient}.
+ * Typed events emitted by {@link FalconClient}.
  *
  * - `job`     — a pushed {@link JobFrame} (one job-delivery credit consumed).
  * - `pressure`— a coarse {@link PressureFrame} fleet backpressure signal.
@@ -134,7 +134,7 @@ export interface AwaitOptions {
  * - `close`   — the socket closed (with code/reason).
  * - `error`   — a transport or protocol error.
  */
-export interface CommandStreamClientEvents {
+export interface FalconClientEvents {
   job: [JobFrame];
   pressure: [PressureFrame];
   welcome: [WelcomeFrame];
@@ -144,21 +144,21 @@ export interface CommandStreamClientEvents {
 }
 
 /**
- * A client for the nanobpmn command-stream WebSocket: one persistent,
+ * A client for the nanobpmn Falcon WebSocket: one persistent,
  * credit-coordinated socket multiplexing process creation and the full job
- * lifecycle. Mirrors `server/src/command_stream.rs`.
+ * lifecycle. Mirrors `server/src/falcon.rs`.
  *
  * The client gates `createInstance` on the server's **submission-credit window**
  * (backpressure without `503`/retry): when credits are exhausted, calls queue
  * until the server replenishes them. Job completions are unmetered and never
  * queue.
  */
-export class CommandStreamClient extends EventEmitter {
+export class FalconClient extends EventEmitter {
   private readonly url: string;
   private readonly opts: Required<
-    Pick<CommandStreamClientOptions, 'reconnect' | 'reconnectDelayMs' | 'maxReconnectDelayMs' | 'connectTimeoutMs'>
+    Pick<FalconClientOptions, 'reconnect' | 'reconnectDelayMs' | 'maxReconnectDelayMs' | 'connectTimeoutMs'>
   > &
-    CommandStreamClientOptions;
+    FalconClientOptions;
 
   private ws?: WebSocket;
   private corrSeq = 0;
@@ -173,7 +173,7 @@ export class CommandStreamClient extends EventEmitter {
   private closedByUser = false;
   private readyPromise?: Promise<void>;
 
-  constructor(options: CommandStreamClientOptions) {
+  constructor(options: FalconClientOptions) {
     super();
     this.opts = {
       reconnect: options.reconnect ?? true,
@@ -182,28 +182,28 @@ export class CommandStreamClient extends EventEmitter {
       connectTimeoutMs: options.connectTimeoutMs ?? 10_000,
       ...options,
     };
-    this.url = commandStreamUrl(options.baseUrl, options.worker);
+    this.url = falconUrl(options.baseUrl, options.worker);
   }
 
   // ----- typed event helpers (override EventEmitter for inference) -----------
 
-  override on<E extends keyof CommandStreamClientEvents>(
+  override on<E extends keyof FalconClientEvents>(
     event: E,
-    listener: (...args: CommandStreamClientEvents[E]) => void,
+    listener: (...args: FalconClientEvents[E]) => void,
   ): this {
     return super.on(event, listener as (...args: unknown[]) => void);
   }
 
-  override once<E extends keyof CommandStreamClientEvents>(
+  override once<E extends keyof FalconClientEvents>(
     event: E,
-    listener: (...args: CommandStreamClientEvents[E]) => void,
+    listener: (...args: FalconClientEvents[E]) => void,
   ): this {
     return super.once(event, listener as (...args: unknown[]) => void);
   }
 
-  override emit<E extends keyof CommandStreamClientEvents>(
+  override emit<E extends keyof FalconClientEvents>(
     event: E,
-    ...args: CommandStreamClientEvents[E]
+    ...args: FalconClientEvents[E]
   ): boolean {
     return super.emit(event, ...args);
   }
@@ -226,7 +226,7 @@ export class CommandStreamClient extends EventEmitter {
         if (!settled) {
           settled = true;
           ws.terminate();
-          reject(new Error(`command-stream connect timed out after ${this.opts.connectTimeoutMs}ms`));
+          reject(new Error(`Falcon connect timed out after ${this.opts.connectTimeoutMs}ms`));
         }
       }, this.opts.connectTimeoutMs);
 
@@ -646,15 +646,15 @@ function toCreateResult(body: unknown): CreateInstanceResult {
 }
 
 /**
- * Builds the `/command-stream` WebSocket URL from a REST or WS base. Strips a
+ * Builds the `/falcon` WebSocket URL from a REST or WS base. Strips a
  * trailing `/v2` (the REST prefix) and maps http(s) → ws(s).
  */
-export function commandStreamUrl(baseUrl: string, worker?: string): string {
+export function falconUrl(baseUrl: string, worker?: string): string {
   let base = baseUrl.replace(/\/+$/, '');
   base = base.replace(/\/v2$/, '');
   if (base.startsWith('http://')) base = `ws://${base.slice('http://'.length)}`;
   else if (base.startsWith('https://')) base = `wss://${base.slice('https://'.length)}`;
-  const url = new URL(`${base}/command-stream`);
+  const url = new URL(`${base}/falcon`);
   if (worker) url.searchParams.set('worker', worker);
   return url.toString();
 }

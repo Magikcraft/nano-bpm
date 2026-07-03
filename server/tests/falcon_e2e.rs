@@ -1,7 +1,7 @@
-//! End-to-end tests for the unified bidirectional command stream (WebSocket).
+//! End-to-end tests for the unified bidirectional Falcon protocol (WebSocket).
 //!
 //! Each test boots the *real* server binary on an ephemeral port over a throwaway
-//! journal, opens a WebSocket to `/command-stream`, and drives the full lifecycle
+//! journal, opens a WebSocket to `/falcon`, and drives the full lifecycle
 //! the stream is meant to carry: subscribe → job push → complete, and
 //! create-with-await → async `InstanceCompleted`. The client is a tiny,
 //! dependency-free RFC 6455 implementation (hardcoded handshake key, zero-masked
@@ -165,7 +165,7 @@ impl WsClient {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set read timeout");
 
-        let request = "GET /command-stream HTTP/1.1\r\n\
+        let request = "GET /falcon HTTP/1.1\r\n\
              Host: localhost\r\n\
              Upgrade: websocket\r\n\
              Connection: Upgrade\r\n\

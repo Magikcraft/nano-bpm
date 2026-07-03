@@ -263,7 +263,7 @@ layers:
    `slaMs`, `slaViolationCost` (cost-to-business), and, for LLM-backed tasks,
    candidate **model options with per-call $ + token + latency priors**.
 2. **Realization (truth):** workers report **actual** cost back on completion. The
-   command stream already carries `CompleteJob { variables }`; reserve a
+   Falcon already carries `CompleteJob { variables }`; reserve a
    structured `__cost` channel (usd / tokens / model / latency) so realized cost
    lands on the job event and into the trace (`elements[].job.cost` in §3). Expected
    vs realized is itself a signal the reasoner uses.

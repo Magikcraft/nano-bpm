@@ -1,12 +1,12 @@
 # @nanobpmn/sdk
 
-A streaming SDK for the **nanobpmn command stream**, layered on top of
+A streaming SDK for the **nanobpmn Falcon protocol**, layered on top of
 [`@camunda8/orchestration-cluster-api`](https://www.npmjs.com/package/@camunda8/orchestration-cluster-api).
 
-nanobpmn exposes a single bidirectional WebSocket at `GET /command-stream` that
+nanobpmn exposes a single bidirectional WebSocket at `GET /falcon` that
 multiplexes process creation *and* the full job lifecycle onto one persistent,
-credit-coordinated socket (see [`../../docs/command-stream-design.md`](../../docs/command-stream-design.md)
-and [`../../docs/command-stream.asyncapi.yaml`](../../docs/command-stream.asyncapi.yaml)).
+credit-coordinated socket (see [`../../docs/falcon-design.md`](../../docs/falcon-design.md)
+and [`../../docs/falcon.asyncapi.yaml`](../../docs/falcon.asyncapi.yaml)).
 This package gives Node/TypeScript apps a typed client for that stream and a job
 worker that **prefers the stream when talking to nanobpmn and falls back to
 Camunda REST polling otherwise** — so the same code path serves both backends.
@@ -55,10 +55,10 @@ await worker.stop();
 | `transport`        | Behaviour                                                                  |
 | ------------------ | -------------------------------------------------------------------------- |
 | `'auto'` (default) | Probe the gateway; **stream** if it is nanobpmn, otherwise **poll**.       |
-| `'stream'`         | Force the command stream (no probe).                                       |
+| `'stream'`         | Force the Falcon protocol (no probe).                                       |
 | `'poll'`           | Force the Camunda SDK polling worker (requires `camundaClient`).           |
 
-Detection is a single short-lived `/command-stream` WebSocket probe
+Detection is a single short-lived `/falcon` WebSocket probe
 (`detectNanobpm(baseUrl)`): nanobpmn answers with a `welcome` frame; a Camunda
 gateway rejects the upgrade.
 
@@ -81,12 +81,12 @@ before it is eligible for redelivery. The server also enforces this: a subscribe
 with a null or non-positive timeout is clamped to a 60 s lock, so a job is never
 leased with a zero lock (which would re-dispatch it before the worker completes).
 
-## Low-level command-stream client
+## Low-level Falcon client
 
 ```ts
-import { CommandStreamClient } from '@nanobpmn/sdk';
+import { FalconClient } from '@nanobpmn/sdk';
 
-const client = new CommandStreamClient({ baseUrl: 'http://localhost:8080', worker: 'creator' });
+const client = new FalconClient({ baseUrl: 'http://localhost:8080', worker: 'creator' });
 await client.connect();
 
 // Create and await terminal completion over the stream:
@@ -114,7 +114,7 @@ for the server to replenish credits. To fail fast instead, set a `submitTimeoutM
 
 ```ts
 // Client-wide default; per-request wins when both are set.
-const client = new CommandStreamClient({ baseUrl, worker, submitTimeoutMs: 2_000 });
+const client = new FalconClient({ baseUrl, worker, submitTimeoutMs: 2_000 });
 
 try {
   await client.createInstance({ processDefinitionId: 'order', submitTimeoutMs: 500 });

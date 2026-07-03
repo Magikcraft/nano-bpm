@@ -12,14 +12,14 @@
 mod backpressure;
 mod cluster;
 mod coldspill;
-mod command_stream;
+mod falcon;
 #[cfg(feature = "console")]
 mod console;
 mod engine_actor;
 mod journal;
 mod memory;
 mod metrics;
-// Intra-cluster peer uplink (command-stream client to peers). The forwarding
+// Intra-cluster peer uplink (falcon client to peers). The forwarding
 // seam that drives it (create-forward, by-key forward, broadcast) lands in the
 // following increments; the transport is integration-tested now.
 mod partition;
@@ -100,7 +100,7 @@ pub struct ServerImpl {
     /// `activateJobs` requests can wake immediately instead of waiting out their
     /// full timeout.
     jobs_available: Arc<tokio::sync::Notify>,
-    /// Permit-storing wake for the command-stream dispatcher. Unlike
+    /// Permit-storing wake for the falcon dispatcher. Unlike
     /// [`jobs_available`](Self::jobs_available) (a broadcast `notify_waiters`
     /// that drops signals arriving while the single dispatcher is mid-pass),
     /// this is signalled with `notify_one` so a job-available or credit-grant
@@ -209,7 +209,7 @@ pub struct ServerImpl {
     /// of the detected memory limit); `NANOBPMN_PIPELINE_BYTES_MB` overrides,
     /// `off` disables. Durability is unaffected: a shed create is never journaled.
     pipeline_bytes_watermark: u64,
-    /// Command-stream uplinks to this node's cluster peers, built from the
+    /// Falcon uplinks to this node's cluster peers, built from the
     /// [`Topology`]. Empty for a single-node cluster (zero overhead). The
     /// forwarding seam consults it to reach a partition's owning node.
     // Read by the forwarding handlers landing in the following increments
@@ -217,7 +217,7 @@ pub struct ServerImpl {
     #[allow(dead_code)]
     peers: peer::PeerSet,
     /// The Raft groups this node hosts (one per partition it replicates), empty
-    /// unless per-partition Raft is enabled. The command-stream handler dispatches
+    /// unless per-partition Raft is enabled. The falcon handler dispatches
     /// inbound RPCs through it; the write path proposes through it. An empty
     /// registry means the classic single-writer path is in force — zero overhead.
     raft: Arc<crate::raft::RaftRegistry>,
@@ -666,13 +666,13 @@ impl Default for ServerImpl {
 
 impl ServerImpl {
     /// The Raft groups this node hosts. Used to host a partition's group and, by
-    /// the command-stream handler and write path, to reach it.
+    /// the falcon handler and write path, to reach it.
     pub fn raft_registry(&self) -> &Arc<crate::raft::RaftRegistry> {
         &self.raft
     }
 
     /// A [`RaftTransport`](crate::raft_net::RaftTransport) that carries this
-    /// node's Raft RPCs to peers over the command stream. Built from the node's
+    /// node's Raft RPCs to peers over the Falcon protocol. Built from the node's
     /// existing peer uplinks, so a target Raft node id maps straight onto a peer.
     pub fn raft_transport(&self) -> Arc<dyn crate::raft_net::RaftTransport> {
         Arc::new(crate::raft_net::PeerTransport::new(self.peers.clone()))
@@ -680,7 +680,7 @@ impl ServerImpl {
 
     /// Peer-side of the Raft network: decode an inbound RPC, feed it to the local
     /// replica of `partition`, and return its serialized response. `Err((status,
-    /// message))` maps to the command-stream `CommandResult` status (400 malformed,
+    /// message))` maps to the falcon `CommandResult` status (400 malformed,
     /// 404 not hosted here, 500 dispatch failure).
     pub async fn dispatch_raft_rpc(
         &self,
@@ -2610,7 +2610,7 @@ impl ServerImpl {
                 // Record REST job completion
                 crate::metrics::record_job_completion("rest");
                 // REST API: await fsync before replying (synchronous durability).
-                // Contrast with command_stream::pipeline_job_command, which replies
+                // Contrast with falcon::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
                 commit.wait().await;
                 // Completing a job may advance the token into an off-partition
@@ -3044,7 +3044,7 @@ impl ServerImpl {
             && let Some(node) = self.read_route(key)
         {
             let (status, body) = self
-                .forward_get(node, crate::command_stream::ReadKind::ProcessInstance, key)
+                .forward_get(node, crate::falcon::ReadKind::ProcessInstance, key)
                 .await;
             return Ok(match (status, body) {
                 (200, Some(b)) => match serde_json::from_value(b) {
@@ -3202,11 +3202,11 @@ impl ServerImpl {
             last_completed_change_id: String::new(),
             // Advertise that this is a nanobpmn gateway (a superset of the Camunda
             // Orchestration Cluster API). Its presence lets SDK clients detect nano
-            // from a single /v2/topology call and upgrade to the command stream.
+            // from a single /v2/topology call and upgrade to the Falcon protocol.
             nano: Some(models::NanoEngineInfo {
                 engine: "nanobpmn".to_string(),
                 version: Some(version),
-                command_stream_path: "/command-stream".to_string(),
+                falcon_path: "/falcon".to_string(),
             }),
         };
 
@@ -3427,7 +3427,7 @@ impl ServerImpl {
     /// any they transitively produce) to the partition that must apply them. When
     /// the target partition is owned by **this** node it is applied locally and
     /// its follow-ups are folded back into the worklist; when it is owned by a
-    /// **peer**, the source event is forwarded over the command stream and the
+    /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
@@ -3552,7 +3552,7 @@ impl ServerImpl {
     }
 
     /// Forwards a cross-partition subscription follow-up `event` to the peer that
-    /// owns `target_partition`, over the command stream. The owner applies it and
+    /// owns `target_partition`, over the Falcon protocol. The owner applies it and
     /// drives its own pump for any further follow-ups. Best-effort: a delivery
     /// failure is logged and dropped (idempotent — the source command re-emits the
     /// event on replay; at RF=1 a lost open just leaves the instance parked until
@@ -3621,7 +3621,7 @@ impl ServerImpl {
     // A client may submit a by-key mutation (complete/fail/throwError a job,
     // cancel an instance, update retries, resolve an incident, set variables)
     // to ANY gateway. If the key's partition is owned by a peer, the gateway
-    // forwards the operation to that peer over the command stream; the peer
+    // forwards the operation to that peer over the Falcon protocol; the peer
     // applies it on its owning partition (durably) and answers. The `*_local`
     // methods below are the peer-side apply step (also reused by the in-crate
     // tests); the `forward_*` methods are the gateway-side uplink + response
@@ -3822,10 +3822,10 @@ impl ServerImpl {
     /// reconstructs the typed REST response from the status + body.
     pub(crate) fn read_by_key_local(
         &self,
-        kind: crate::command_stream::ReadKind,
+        kind: crate::falcon::ReadKind,
         key: u64,
     ) -> (u16, Option<serde_json::Value>) {
-        use crate::command_stream::ReadKind;
+        use crate::falcon::ReadKind;
         let body = match kind {
             ReadKind::ProcessInstance => self
                 .store
@@ -3859,7 +3859,7 @@ impl ServerImpl {
     async fn forward_get(
         &self,
         node: u32,
-        kind: crate::command_stream::ReadKind,
+        kind: crate::falcon::ReadKind,
         key: u64,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
@@ -3879,11 +3879,11 @@ impl ServerImpl {
     /// response.
     pub(crate) async fn apply_user_task_forwarded(
         &self,
-        op: crate::command_stream::UserTaskOp,
+        op: crate::falcon::UserTaskOp,
         user_task_key: &str,
         payload: Option<serde_json::Value>,
     ) -> (u16, Option<String>) {
-        use crate::command_stream::UserTaskOp;
+        use crate::falcon::UserTaskOp;
         let key = user_task_key.to_string();
         match op {
             UserTaskOp::Assign => {
@@ -3985,7 +3985,7 @@ impl ServerImpl {
     async fn forward_user_task(
         &self,
         node: u32,
-        op: crate::command_stream::UserTaskOp,
+        op: crate::falcon::UserTaskOp,
         user_task_key: u64,
         payload: Option<serde_json::Value>,
     ) -> (u16, String) {
@@ -4145,7 +4145,7 @@ impl ServerImpl {
 
     /// Stream-path forward of a `completeJob` to the peer that owns the job's
     /// partition. Unlike [`forward_complete_job`] (which builds a typed REST
-    /// response), this relays the peer's raw `(status, body)` so the command-stream
+    /// response), this relays the peer's raw `(status, body)` so the falcon
     /// handler can mirror it straight into a `CommandResult`. Used when a worker
     /// attached to this gateway completes a job that a peer owns (job aggregation).
     pub(crate) async fn forward_complete_job_stream(
@@ -4244,7 +4244,7 @@ impl ServerImpl {
                 // `{ jobs: [...], backlog: N }`; fall back to a bare jobs array for
                 // safety. The piggybacked backlog feeds Stage 2 fairness weighting.
                 if let Some(backlog) = body.get("backlog").and_then(|v| v.as_i64()) {
-                    crate::command_stream::record_peer_backlog(node, backlog);
+                    crate::falcon::record_peer_backlog(node, backlog);
                 }
                 let jobs_val = body.get("jobs").cloned().unwrap_or(body);
                 serde_json::from_value::<Vec<models::ActivatedJobResult>>(jobs_val)
@@ -4864,7 +4864,7 @@ impl ServerImpl {
             && let Some(node) = self.read_route(key)
         {
             let (status, body) = self
-                .forward_get(node, crate::command_stream::ReadKind::Incident, key)
+                .forward_get(node, crate::falcon::ReadKind::Incident, key)
                 .await;
             return Ok(match (status, body) {
                 (200, Some(b)) => match serde_json::from_value(b) {
@@ -5206,7 +5206,7 @@ impl ServerImpl {
             let (status, detail) = self
                 .forward_user_task(
                     node,
-                    crate::command_stream::UserTaskOp::Assign,
+                    crate::falcon::UserTaskOp::Assign,
                     user_task_key,
                     payload,
                 )
@@ -5311,7 +5311,7 @@ impl ServerImpl {
             let (status, detail) = self
                 .forward_user_task(
                     node,
-                    crate::command_stream::UserTaskOp::Complete,
+                    crate::falcon::UserTaskOp::Complete,
                     user_task_key,
                     payload,
                 )
@@ -5421,7 +5421,7 @@ impl ServerImpl {
                     let (status, body) = self
                         .forward_get(
                             node,
-                            crate::command_stream::ReadKind::UserTask,
+                            crate::falcon::ReadKind::UserTask,
                             user_task_key,
                         )
                         .await;
@@ -5487,7 +5487,7 @@ impl ServerImpl {
             let (status, detail) = self
                 .forward_user_task(
                     node,
-                    crate::command_stream::UserTaskOp::Unassign,
+                    crate::falcon::UserTaskOp::Unassign,
                     user_task_key,
                     None,
                 )
@@ -5577,7 +5577,7 @@ impl ServerImpl {
             let (status, detail) = self
                 .forward_user_task(
                     node,
-                    crate::command_stream::UserTaskOp::Update,
+                    crate::falcon::UserTaskOp::Update,
                     user_task_key,
                     payload,
                 )
@@ -5773,7 +5773,7 @@ impl ServerImpl {
             None => {
                 if let Some(node) = self.read_route(key) {
                     let (status, body) = self
-                        .forward_get(node, crate::command_stream::ReadKind::Variable, key)
+                        .forward_get(node, crate::falcon::ReadKind::Variable, key)
                         .await;
                     return Ok(match (status, body) {
                         (200, Some(b)) => match serde_json::from_value(b) {
@@ -5952,7 +5952,7 @@ impl ServerImpl {
         // authority. If this gateway owns partition 0, deploy locally (durable)
         // and broadcast the result to every peer so all nodes can instantiate the
         // process. Otherwise forward the whole deploy to the owner over the
-        // command stream and return its answer. Single-node always owns
+        // Falcon protocol and return its answer. Single-node always owns
         // partition 0, so this is the unchanged local path.
         if self.engine.topology().is_local(0) {
             let (processes, resource_names) = match parse_deploy_resources(&resources) {
@@ -6081,7 +6081,7 @@ impl ServerImpl {
 
     /// Runs a forwarded deploy on the partition-0 owner: parses, deploys locally,
     /// broadcasts to peers, and returns the deployment JSON. Invoked by the
-    /// `Deploy` command-stream frame handler. `Err` is `(status, detail)`.
+    /// `Deploy` falcon frame handler. `Err` is `(status, detail)`.
     pub async fn deploy_centralized(
         &self,
         resources: Vec<(String, String)>,
@@ -6102,7 +6102,7 @@ impl ServerImpl {
     /// partition) plus an in-memory copy on the rest. The restart demux replays
     /// the durable `ProcessDeployed` into every owned partition, so the
     /// definition survives this node's independent restart on all of them.
-    /// Invoked by the `InstallDeployment` command-stream frame handler.
+    /// Invoked by the `InstallDeployment` falcon frame handler.
     pub async fn install_replicated_deployment(&self, events: Vec<Event>) {
         let handles = self.engine.all();
         let events = Arc::new(events);
@@ -6123,7 +6123,7 @@ impl ServerImpl {
         durable.wait().await;
     }
 
-    /// Forwards a deploy to the partition-0 owner over the command stream and
+    /// Forwards a deploy to the partition-0 owner over the Falcon protocol and
     /// decodes its deployment JSON. Used when a gateway that does not own
     /// partition 0 receives an HTTP deploy. `Err` is `(status, detail)`.
     async fn forward_deploy(
@@ -6241,11 +6241,11 @@ impl ServerImpl {
 
     /// Env-gated (`NANOBPMN_RAFT`) per-partition Raft bootstrap. For every
     /// partition this node replicates, host a Raft group member whose RPCs ride
-    /// the command stream; then, for the partitions this node leads, form the
+    /// the Falcon protocol; then, for the partitions this node leads, form the
     /// group from its replica set. A no-op unless `NANOBPMN_RAFT` is set, so the
     /// default single-writer path is untouched.
     ///
-    /// Runs as a background task because the local command-stream endpoint isn't
+    /// Runs as a background task because the local falcon endpoint isn't
     /// serving until `main()` calls `axum::serve`, and peers may still be booting.
     /// A member that can't yet be reached is simply retried by openraft's network
     /// (an unreachable peer slows the group, never loses an entry), and the
@@ -6461,7 +6461,7 @@ impl ServerImpl {
         }
     }
 
-    /// Whether peer `node` is currently reachable (a live command-stream uplink can
+    /// Whether peer `node` is currently reachable (a live falcon uplink can
     /// be established). Used as the failure detector for leader-durable recovery: a
     /// node whose link cannot be dialed is treated as down. `true` for this node
     /// itself.
@@ -7346,10 +7346,10 @@ impl ServerImpl {
     }
 }
 
-/// Engine-facing helpers used by the WebSocket command stream (`command_stream`).
+/// Engine-facing helpers used by the WebSocket Falcon protocol (`falcon`).
 /// They mirror the core of the REST handlers above but return plain data instead
 /// of the generated response envelope, so the stream can build its own frames.
-/// They live here (not in `command_stream`) to keep all engine command issuing
+/// They live here (not in `falcon`) to keep all engine command issuing
 /// next to the REST handlers that share the same command path and `jobs_available`
 /// wake discipline.
 impl ServerImpl {
@@ -7482,13 +7482,13 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
-    /// Cluster-wide create *placement* for the command-stream create path, the
+    /// Cluster-wide create *placement* for the falcon create path, the
     /// stream sibling of the REST `create_process_instance` seam. Round-robins
     /// over every partition in the cluster and returns the remote node that owns
     /// the chosen one, or `None` when the placement is local (create here).
     ///
     /// Without this, a stream create only ever ran on the entry gateway's own
-    /// partitions (`for_create`), so a producer on a single command-stream
+    /// partitions (`for_create`), so a producer on a single falcon
     /// connection concentrated *every* instance on one node — while REST creates,
     /// which already use [`next_create_placement`](crate::partition::Partitions::next_create_placement),
     /// spread across the whole cluster. The per-node console metrics faithfully
@@ -7505,7 +7505,7 @@ impl ServerImpl {
         self.engine.next_create_placement()
     }
 
-    /// Command-stream sibling of [`forward_create`](Self::forward_create): forwards
+    /// Falcon sibling of [`forward_create`](Self::forward_create): forwards
     /// a **fire-and-forget** stream create to the peer that owns the placed
     /// partition (over the shared `ForwardCreate` seam, which the peer answers via
     /// [`create_forwarded`](Self::create_forwarded)) and returns the minted
@@ -8023,7 +8023,7 @@ impl ServerImpl {
     /// Stream `CompleteJob`: applies the command on the engine actor (establishing
     /// journal order) and returns the [`Commit`] WITHOUT awaiting durability.
     ///
-    /// The caller (`command_stream::pipeline_job_command`) awaits the commit in a
+    /// The caller (`falcon::pipeline_job_command`) awaits the commit in a
     /// detached task off the connection's read path, so multiple completions from
     /// many connections can be in flight at once, letting the journal's group-commit
     /// coalesce their fsyncs into larger batches. This **ack-before-fsync pipelining**
@@ -8035,7 +8035,7 @@ impl ServerImpl {
     /// commit handle. If the server crashes after replying `200` but before the fsync
     /// (~5ms window), the job re-activates on restart (lock expires), preserving
     /// at-least-once semantics. See README.md "Stream durability: ack-before-fsync
-    /// pipelining" and `command_stream::pipeline_job_command` for full rationale.
+    /// pipelining" and `falcon::pipeline_job_command` for full rationale.
     pub(crate) async fn complete_job_for_stream(
         &self,
         job_key: u64,
@@ -8269,14 +8269,14 @@ impl ServerImpl {
 
     /// Signals that new jobs may have become activatable. Wakes both the
     /// long-polling `activateJobs` REST waiters (broadcast) and the
-    /// command-stream dispatcher (permit-storing, so the wake survives an
+    /// falcon dispatcher (permit-storing, so the wake survives an
     /// in-flight dispatch pass).
     pub(crate) fn signal_jobs_available(&self) {
         self.jobs_available.notify_waiters();
         self.dispatch_wake.notify_one();
     }
 
-    /// Handle to the permit-storing dispatcher wake, so the command stream can
+    /// Handle to the permit-storing dispatcher wake, so the Falcon protocol can
     /// wake the dispatcher after a new subscription or credit grant without the
     /// signal being lost mid-pass.
     pub(crate) fn dispatch_wake_handle(&self) -> Arc<tokio::sync::Notify> {
@@ -8686,7 +8686,7 @@ fn from_object_map(
 }
 
 /// Converts an optional REST variables map into the plain JSON map carried over
-/// the command stream when a message is fanned out to cluster peers. Preserves
+/// the Falcon protocol when a message is fanned out to cluster peers. Preserves
 /// the original JSON exactly so the peer re-derives identical engine values.
 fn wire_variables(
     variables: Option<&std::collections::HashMap<String, types::Object>>,
@@ -9664,12 +9664,12 @@ async fn main() {
         });
     }
 
-    // The unified bidirectional command stream (WebSocket) shares the engine via a
+    // The unified bidirectional Falcon protocol (WebSocket) shares the engine via a
     // clone of `server` and a registry of connections; a single dispatcher pushes
     // jobs and the existing periodic tick reclaims expired leases.
-    let cs_registry = command_stream::Registry::new();
-    command_stream::spawn_dispatcher(server.clone(), cs_registry.clone());
-    let cs_router = command_stream::router(server.clone(), cs_registry);
+    let cs_registry = falcon::Registry::new();
+    falcon::spawn_dispatcher(server.clone(), cs_registry.clone());
+    let cs_router = falcon::router(server.clone(), cs_registry);
 
     // Clustered partition-0 owner: push the seeded/recovered deployment
     // definitions to every peer so the whole cluster can instantiate them,
@@ -9678,7 +9678,7 @@ async fn main() {
     server.spawn_seed_broadcast();
 
     // Env-gated (NANOBPMN_RAFT): bring up this node's per-partition Raft groups
-    // over the command stream and form the ones it leads. No-op by default.
+    // over the Falcon protocol and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
 
     // Leader-durable auto-recovery (ADR 0003): when the replication tier is
@@ -10247,11 +10247,11 @@ mod clustered_startup_tests {
 
     #[tokio::test]
     async fn deploy_broadcast_over_the_wire_reaches_a_peer() {
-        // Serve a real peer node (node 1) on an ephemeral command-stream endpoint.
+        // Serve a real peer node (node 1) on an ephemeral falcon endpoint.
         let node1 = clustered_node(1);
-        let registry = command_stream::Registry::new();
-        command_stream::spawn_dispatcher(node1.clone(), registry.clone());
-        let app = command_stream::router(node1.clone(), registry);
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(node1.clone(), registry.clone());
+        let app = falcon::router(node1.clone(), registry);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -10284,7 +10284,7 @@ mod clustered_startup_tests {
                 .is_err()
         );
 
-        // Broadcast node 0's seeded deployment to its peers over the command stream.
+        // Broadcast node 0's seeded deployment to its peers over the Falcon protocol.
         let events = node0
             .engine
             .deploy_partition()
@@ -10300,12 +10300,12 @@ mod clustered_startup_tests {
         assert!(!completed);
     }
 
-    /// Serves a node's command-stream endpoint on an ephemeral port and returns
+    /// Serves a node's falcon endpoint on an ephemeral port and returns
     /// its HTTP base URL, so a peer can forward to it exactly as in a cluster.
     async fn serve_node(server: &ServerImpl) -> String {
-        let registry = command_stream::Registry::new();
-        command_stream::spawn_dispatcher(server.clone(), registry.clone());
-        let app = command_stream::router(server.clone(), registry);
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(server.clone(), registry.clone());
+        let app = falcon::router(server.clone(), registry);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -10423,11 +10423,11 @@ mod clustered_startup_tests {
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
 
-        // Serve both nodes' command-stream endpoints on their pre-bound ports.
+        // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -10485,7 +10485,7 @@ mod clustered_startup_tests {
         // Message-start subscriptions live only on the deploy owner (node 0). The
         // round-robin start dispatcher must spread the created instances over the
         // WHOLE cluster, routing a StartInstanceDispatched to node 1 (which owns
-        // partitions 1 & 3) over the command stream so node 1 mints its share.
+        // partitions 1 & 3) over the Falcon protocol so node 1 mints its share.
         let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind node 0");
@@ -10534,11 +10534,11 @@ mod clustered_startup_tests {
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
 
-        // Serve both nodes' command-stream endpoints on their pre-bound ports.
+        // Serve both nodes' falcon endpoints on their pre-bound ports.
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -10879,12 +10879,12 @@ mod clustered_startup_tests {
         );
 
         // The response advertises that this is a nanobpmn gateway so SDK clients
-        // can detect the engine and upgrade to the command stream.
+        // can detect the engine and upgrade to the Falcon protocol.
         let nano = t
             .nano
             .expect("nanobpmn topology must advertise the `nano` object");
         assert_eq!(nano.engine, "nanobpmn");
-        assert_eq!(nano.command_stream_path, "/command-stream");
+        assert_eq!(nano.falcon_path, "/falcon");
         assert!(
             nano.version.is_some(),
             "nano advertises the gateway version"
@@ -11054,7 +11054,7 @@ mod clustered_startup_tests {
         //
         // node 0 owns partitions 0 & 2, seeds the demo, and parks a `demo-work`
         // job on one of its partitions. node 1 (a different gateway) pulls that
-        // job over the command stream (activate_from_peer) and completes it via
+        // job over the Falcon protocol (activate_from_peer) and completes it via
         // the stream-completion forward.
         let node0 = clustered_node(0);
         let (_instance, _) = node0
@@ -11188,10 +11188,10 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
-    async fn raft_rpcs_replicate_a_command_across_two_nodes_over_the_command_stream() {
-        // Proves the command-stream Raft binding: two served nodes host a 2-voter
+    async fn raft_rpcs_replicate_a_command_across_two_nodes_over_the_falcon() {
+        // Proves the falcon Raft binding: two served nodes host a 2-voter
         // Raft group for partition 0, carry AppendEntries/Vote RPCs over the real
-        // command stream (PeerTransport -> ClientFrame::Raft -> dispatch_raft_rpc),
+        // Falcon protocol (PeerTransport -> ClientFrame::Raft -> dispatch_raft_rpc),
         // and a command proposed on the leader commits via quorum and applies on
         // BOTH nodes.
         use std::collections::BTreeMap;
@@ -11231,20 +11231,20 @@ mod clustered_startup_tests {
         let node0 = build_node(0);
         let node1 = build_node(1);
 
-        // Serve both nodes' command-stream endpoints so the PeerTransport can reach
+        // Serve both nodes' falcon endpoints so the PeerTransport can reach
         // them. (Serve BEFORE bootstrapping voters so inbound RPCs are accepted as
         // soon as the group starts electing.)
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
         }
 
         // Host a Raft group for partition 0 on BOTH nodes, each driving its peer
-        // over its own PeerTransport (the production command-stream carrier). A
+        // over its own PeerTransport (the production falcon carrier). A
         // voter must be able to RECEIVE AppendEntries before the group forms, so
         // construct + register every member first, then initialize once.
         let part0 = Arc::new(
@@ -11274,7 +11274,7 @@ mod clustered_startup_tests {
         node1.raft_registry().insert(part1.clone());
 
         // Form the {0,1} group on node 0 and let it win the initial election —
-        // every Vote/AppendEntries to node 1 rides the real command stream.
+        // every Vote/AppendEntries to node 1 rides the real Falcon protocol.
         let mut members = BTreeMap::new();
         members.insert(0u64, BasicNode::new(peers[0].clone()));
         members.insert(1u64, BasicNode::new(peers[1].clone()));
@@ -11295,7 +11295,7 @@ mod clustered_startup_tests {
         );
 
         // Deploy a process by proposing through the leader: with RF=2 this commits
-        // only once node 1 acks the entry over the command stream.
+        // only once node 1 acks the entry over the Falcon protocol.
         let proc = ProcessBuilder::new("raft-demo")
             .start_event("s")
             .end_event("e")
@@ -11323,7 +11323,7 @@ mod clustered_startup_tests {
         assert!(target >= 1, "leader applied at least the deploy entry");
 
         // Node 1 converges to the same applied index — the entry replicated to and
-        // applied on the follower purely over the command-stream Raft binding.
+        // applied on the follower purely over the falcon Raft binding.
         let mut applied = false;
         for _ in 0..300 {
             let idx = part1
@@ -11341,7 +11341,7 @@ mod clustered_startup_tests {
         }
         assert!(
             applied,
-            "node 1 did not apply up to index {target} over the command stream"
+            "node 1 did not apply up to index {target} over the Falcon protocol"
         );
 
         part0.raft.shutdown().await.expect("clean shutdown node 0");
@@ -11353,7 +11353,7 @@ mod clustered_startup_tests {
         // L2a: the env-gated startup orchestration. Two served nodes (RF=2, so
         // each replicates all 4 partitions) run `raft_bootstrap`; afterwards every
         // partition must have formed its group and elected its owner as leader —
-        // entirely over the command stream, with the multi-process startup race
+        // entirely over the Falcon protocol, with the multi-process startup race
         // (a peer still booting when initialize runs) absorbed by retry.
         use crate::raft::RaftPartition;
 
@@ -11388,9 +11388,9 @@ mod clustered_startup_tests {
         let node1 = build_node(1);
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -11502,16 +11502,16 @@ mod clustered_startup_tests {
         node1.install_replicated_deployment(events.to_vec()).await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
         }
 
         // Both nodes bootstrap (building follower replica engine actors, seeded
-        // with the deployment) and form every group over the command stream.
+        // with the deployment) and form every group over the Falcon protocol.
         tokio::join!(node0.raft_bootstrap(), node1.raft_bootstrap());
 
         // Wait until node 0 leads its owned partitions (0 & 2).
@@ -11666,9 +11666,9 @@ mod clustered_startup_tests {
         node1.install_replicated_deployment(events.to_vec()).await;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -11834,9 +11834,9 @@ mod clustered_startup_tests {
             (node2.clone(), listeners.remove(0)),
         ];
         for (server, listener) in served {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -11960,7 +11960,7 @@ mod clustered_startup_tests {
 
     /// Boots a 3-node RF=3 cluster (3 partitions; node i owns partition i, every
     /// node replicates every partition) hosting the `intake` process, serves all
-    /// three over the real command stream, bootstraps the Raft groups, and waits
+    /// three over the real Falcon protocol, bootstraps the Raft groups, and waits
     /// until node 0 leads partition 0. Returns the three nodes. Used by the
     /// broadened failover tests below.
     async fn boot_rf3_intake_cluster() -> (ServerImpl, ServerImpl, ServerImpl) {
@@ -11992,7 +11992,7 @@ mod clustered_startup_tests {
     /// (ADR 0003). Both default off (plain `quorum` + fully-replicated activation).
     /// Per-node state is set directly because the env readers can't be used safely
     /// under parallel tests. Also returns the three serve-task handles (node order)
-    /// so a test can `abort()` a node's command-stream server to make it genuinely
+    /// so a test can `abort()` a node's falcon server to make it genuinely
     /// unreachable (the leader-durable failure detector keys on peer reachability).
     async fn boot_rf3_intake_cluster_cfg2(
         digest: bool,
@@ -12100,9 +12100,9 @@ mod clustered_startup_tests {
         ];
         let mut serve_handles = Vec::new();
         for (server, listener) in served {
-            let registry = command_stream::Registry::new();
-            command_stream::spawn_dispatcher(server.clone(), registry.clone());
-            let app = command_stream::router(server.clone(), registry);
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = falcon::router(server.clone(), registry);
             serve_handles.push(tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             }));
@@ -12793,7 +12793,7 @@ mod clustered_startup_tests {
         );
 
         // Broadcast the held lease to the followers (fire-and-forget over the
-        // command stream), then give it a moment to be recorded on the peers.
+        // Falcon protocol), then give it a moment to be recorded on the peers.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

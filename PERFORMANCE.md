@@ -313,7 +313,7 @@ Under load, `perf` + per-thread sampling on a node show the former **single
 100%-pinned exporter is gone**: `nanobpm-exporter` threads now sit at modest CPU
 alongside `nanobpmn-journal-writer` and the `nanobpmn-engine` actors. At the new
 ceiling the node runs at **~65% CPU (≈35% idle), only ~3% iowait**, with **one
-hot thread** (engine-actor / command-stream `tokio` path, dominated by TCP
+hot thread** (engine-actor / Falcon `tokio` path, dominated by TCP
 `sendmsg` syscalls) as the next serialization point — **not** the exporter and
 **not** disk. So the sharding change did exactly what the diagnosis predicted:
 relieved the projection core, and the ceiling moved on.
@@ -328,9 +328,9 @@ relieved the projection core, and the ceiling moved on.
 
 ### Next lever
 
-The new ceiling is the **single-writer engine actor / command-stream path** (~35%
+The new ceiling is the **single-writer engine actor / Falcon path** (~35%
 node CPU still idle, 3% iowait — a software-serial limit, not hardware). Options
-to push further: shard/parallelise the command-stream dispatch, reduce per-event
+to push further: shard/parallelise the Falcon dispatch, reduce per-event
 TCP syscall overhead (batch stream frames), or scale partitions-per-node higher
 to spread engine-actor work. Memory and disk remain non-constraints.
 
@@ -351,7 +351,7 @@ NANOBPMN_JOURNAL=segmented NANOBPMN_DATA_DIR=$HOME/nano-data PORT=8080 ./nano-gw
 
 ## Dispatcher parallelization A/B — and a corrected diagnosis (0.0.3-disp)
 
-Following the "next lever" above, we sharded the command-stream **dispatcher**:
+Following the "next lever" above, we sharded the Falcon **dispatcher**:
 one `JoinSet` + `Semaphore` task per connection (dispatch/JSON work stolen
 across tokio workers) and serialize each job **once** (`ServerFrame::Job` as
 `Box<RawValue>`, dropping the old build-a-`Value`-then-re-serialize double pass).
@@ -376,7 +376,7 @@ state** (wipe `~/nano-data`, measure the first window).
 
 ### The "100%-pinned main thread" was a `top -H` artifact
 
-The prior "one hot thread (engine-actor / command-stream `tokio` path)" reading
+The prior "one hot thread (engine-actor / Falcon `tokio` path)" reading
 came from `top -bH`, which showed the `nano-gw` **main thread** at 99.9%. That is
 wrong: the main thread is the parked `#[tokio::main]` `block_on` driver.
 

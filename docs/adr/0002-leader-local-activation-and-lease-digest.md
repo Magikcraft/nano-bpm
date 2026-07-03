@@ -18,7 +18,7 @@ notes completion is *by key alone, lock-holder-irrelevant*.
 Two problems followed from replicating the lease:
 
 1. **Throughput ceiling / over-provisioning dip.** Measured with the real
-   `ch2-workers` driver (one producer command-stream connection, 96 in-flight
+   `ch2-workers` driver (one producer Falcon connection, 96 in-flight
    fire-and-forget creates, worker ramp) on a 3-node RF=3 cluster: throughput
    peaked ~1425 jobs/s at 8 workers then **collapsed to ~196 jobs/s at 16
    workers** with a multi-second p99. More workers fragment activation into more
@@ -82,7 +82,7 @@ dependency**, as a *third* setting: `NANOBPMN_REPLICATE_ACTIVATION=digest`.
 
 Idea: the leader periodically broadcasts a **lease digest** to its followers as a
 **fire-and-forget async peer push** (no Raft consensus, no per-job round-trip) over
-the existing app-lane peer command stream. Followers keep a **soft lease table**. On
+the existing app-lane peer Falcon. Followers keep a **soft lease table**. On
 becoming leader, a node recovers any job it has heard a lease for — transitioning it
 `Created → Activated` until that lease's (digest-reported) deadline — so the normal
 leader-local expiry tick re-dispatches it only *after* the deadline rather than
@@ -178,7 +178,7 @@ Open design questions considered during the spike (choices resolved above):
 
 A/B with the **authoritative** `ch2-workers` driver
 (`~/workspace/nano-demo/scripts/ch2-workers.sh` → `driver/.../ch2_workers.rs`):
-one producer command-stream connection, 96 in-flight fire-and-forget creates, a
+one producer Falcon connection, 96 in-flight fire-and-forget creates, a
 worker ramp (`WS_STAGES`). Cluster: 3 nodes / 3 partitions / RF=3, `NANOBPMN_RAFT=1`,
 `NANOBPMN_DURABILITY=async`, the **release** binary (debug is ~3.5× slower).
 Validate cluster perf with **this** driver, not a REST-create + pipelined-complete
@@ -248,4 +248,4 @@ keeping Part A's steady-state throughput. Record here.
 - Driver: `~/workspace/nano-demo/scripts/ch2-workers.sh`,
   `driver/src/bin/ch2_workers.rs`.
 - Related: ADR 0001 (the peer piggyback channel Part B reuses),
-  `docs/distributed-scaling-design.md`, `docs/command-stream-design.md`.
+  `docs/distributed-scaling-design.md`, `docs/falcon-design.md`.

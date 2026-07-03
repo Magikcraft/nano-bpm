@@ -51,14 +51,14 @@ struct Metrics {
     /// the writer's CPU cost; if that dominates, the ceiling is CPU not fsync.
     writer_busy_seconds: prometheus::Counter,
 
-    // ---- Phase 2: command-stream and protocol metrics ----
-    /// Command-stream WebSocket frames processed, by frame type.
+    // ---- Phase 2: falcon and protocol metrics ----
+    /// Falcon WebSocket frames processed, by frame type.
     stream_frames_total: prometheus::IntCounterVec,
     /// How many times a streaming client stalled waiting for submission credits.
     stream_credit_stalls_total: IntCounter,
-    /// Active command-stream WebSocket connections.
+    /// Active falcon WebSocket connections.
     stream_connections_active: IntGauge,
-    /// Time spent processing each command-stream frame (read + apply + reply).
+    /// Time spent processing each falcon frame (read + apply + reply).
     stream_frame_processing_seconds: Histogram,
 
     /// Process instance creates, split by protocol (rest vs stream).
@@ -156,14 +156,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter");
 
-    // Phase 2: command-stream and protocol metrics
+    // Phase 2: falcon and protocol metrics
     use prometheus::IntCounterVec;
     use prometheus::Opts;
 
     let stream_frames_total = IntCounterVec::new(
         Opts::new(
             "nanobpm_stream_frames_total",
-            "Command-stream frames processed by type.",
+            "Falcon frames processed by type.",
         ),
         &["type"],
     )
@@ -177,14 +177,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
 
     let stream_connections_active = IntGauge::new(
         "nanobpm_stream_connections_active",
-        "Active command-stream WebSocket connections.",
+        "Active falcon WebSocket connections.",
     )
     .expect("valid gauge");
 
     let stream_frame_processing_seconds = Histogram::with_opts(
         HistogramOpts::new(
             "nanobpm_stream_frame_processing_seconds",
-            "Time to process each command-stream frame (read+apply+reply).",
+            "Time to process each falcon frame (read+apply+reply).",
         )
         .buckets(vec![
             0.00001, 0.00002, 0.00005, 0.0001, 0.0002, 0.0005, 0.001, 0.002, 0.005, 0.01,
@@ -393,9 +393,9 @@ pub fn gather() -> String {
     buf
 }
 
-// ---- Phase 2: command-stream and protocol metrics ----
+// ---- Phase 2: falcon and protocol metrics ----
 
-/// Records a command-stream frame processed (by frame type).
+/// Records a falcon frame processed (by frame type).
 pub fn record_stream_frame(frame_type: &str) {
     METRICS
         .stream_frames_total
@@ -408,17 +408,17 @@ pub fn record_stream_credit_stall() {
     METRICS.stream_credit_stalls_total.inc();
 }
 
-/// Command-stream connection opened (+1).
+/// Falcon connection opened (+1).
 pub fn stream_connection_inc() {
     METRICS.stream_connections_active.inc();
 }
 
-/// Command-stream connection closed (-1).
+/// Falcon connection closed (-1).
 pub fn stream_connection_dec() {
     METRICS.stream_connections_active.dec();
 }
 
-/// Records time spent processing one command-stream frame.
+/// Records time spent processing one falcon frame.
 pub fn record_stream_frame_processing(elapsed: Duration) {
     METRICS
         .stream_frame_processing_seconds

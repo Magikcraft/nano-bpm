@@ -232,7 +232,7 @@ You have two ways to drive the engine:
 - **REST API** (`/v2`) — the standard Camunda 8 v2 surface: deployments, process
   instances, jobs, incidents, messages, and search. See
   [Deploy processes and run instances](#deploy-processes-and-run-instances).
-- **Command stream** (`/command-stream`) — a single bidirectional WebSocket that
+- **Falcon protocol** (`/falcon`) — a single bidirectional WebSocket that
   multiplexes process creation *and* the full job lifecycle onto one persistent,
   flow-controlled socket. It hits the same engine path as REST but avoids
   per-request setup and long-polling, and uses **credits** for backpressure
@@ -241,9 +241,9 @@ You have two ways to drive the engine:
 ### Node / TypeScript SDK
 
 The **`@nanobpmn/sdk`** package is a companion to
-`@camunda8/orchestration-cluster-api` that adds a typed command-stream client and
+`@camunda8/orchestration-cluster-api` that adds a typed Falcon client and
 a streaming job worker. The worker **auto-detects the backend**: it uses the
-command stream against Nano and **falls back to Camunda REST polling** against a
+Falcon against Nano and **falls back to Camunda REST polling** against a
 Camunda gateway, so the same handler code runs on both.
 
 > **Throughput tip.** A single connection's commands are processed in arrival
@@ -255,7 +255,7 @@ Camunda gateway, so the same handler code runs on both.
 ## Deploy processes and run instances
 
 These are the everyday operations against the v2 REST API (all also available over
-the command stream).
+the Falcon protocol).
 
 - **Deploy a model** — `POST /v2/deployments` with the BPMN 2.0 XML. Deployment is
   **idempotent**: a byte-for-byte-identical redeploy reuses the current version; a

@@ -1,7 +1,12 @@
-# Job Streaming + Credit Dispatch — Design Proposal
+# The Falcon Protocol — Job Streaming + Credit Dispatch — Design Proposal
+
+> **The Falcon Protocol** is Nano's command stream. It is named for **Falko Menge**,
+> whose work on system optimisation is the genesis and inspiration for this
+> subsystem. Nano is a distillation of Camunda Engineering's expertise; its
+> subsystems are named for the engineers who created them. Artists sign their work.
 
 > NOTE: §1–12 describe the **job-only** SSE design (first iteration). §13 supersedes
-> the endpoint with a **unified bidirectional command stream** that also carries
+> the endpoint with a **unified bidirectional Falcon protocol** that also carries
 > `createProcessInstance` and the full job lifecycle. Read §13 for the current target;
 > §1–12 remain as the foundational dispatch/credit/lease reasoning it builds on.
 
@@ -167,7 +172,7 @@ endpoint(s), because they do not exist in the upstream Camunda spec. Concretely:
 
 ---
 
-## 13. Unified bidirectional command stream (supersedes the job-only endpoint)
+## 13. Unified bidirectional Falcon protocol (supersedes the job-only endpoint)
 
 ### 13.1 Rationale
 Putting only job push on a stream leaves `createProcessInstance` backpressure on a separate
@@ -193,7 +198,7 @@ Either way the endpoint is **not expressible in the OpenAPI REST spec** and live
 outside the generated rust-axum surface (see §13.8).
 
 ### 13.3 Endpoint
-Rename `/jobs/stream` → `/command-stream` (single bidirectional connection per client). It
+Rename `/jobs/stream` → `/falcon` (single bidirectional connection per client). It
 multiplexes two interaction patterns over one socket: **demand/push** (jobs) and
 **request/response** (create, complete, fail), correlated by `corr` id.
 
@@ -263,7 +268,7 @@ await-completion durable across reconnect/failover — a parity advantage over Z
   `deadline` expiry.
 
 ### 13.8 Spec / codegen impact (updates §11)
-- WebSocket/gRPC-bidi cannot be modeled in the OpenAPI REST spec, so `/command-stream` is
+- WebSocket/gRPC-bidi cannot be modeled in the OpenAPI REST spec, so `/falcon` is
   **hand-wired** in the server and lives entirely outside the generated rust-axum surface. At most
   add a documentation-only stub path via `spec-patches/` for discoverability; the framing types,
   the socket handler, and the demux/credit scheduler are all hand-written.
@@ -287,7 +292,7 @@ await-completion durable across reconnect/failover — a parity advantage over Z
 ## 14. Distributed load-balancing & fault tolerance — Camunda parity analysis
 
 > Compares nanobpmn's current single-node model against Zeebe/Camunda 8's distributed
-> architecture, to decide what parity is worth chasing alongside the command-stream work.
+> architecture, to decide what parity is worth chasing alongside the Falcon work.
 > Camunda mechanisms below are cited from the `camunda/camunda` monorepo.
 
 ### 14.0 Where nanobpmn stands today
@@ -305,7 +310,7 @@ parity question tractable: most of the per-partition semantics already match; th
 *multi-partition routing*, *replication/consensus*, and *gateway/broker separation*.
 
 ### 14.1 Existing parity wins (keep — do not regress)
-These already match Zeebe by design and the command-stream work must preserve them:
+These already match Zeebe by design and the Falcon work must preserve them:
 - **Engine actor = StreamProcessor.** Single serial writer per partition; the journal serializes
   commands. Identical concurrency model.
 - **At-least-once via lease/deadline reclaim.** Zeebe stores `deadline = now + timeout` in the
@@ -331,7 +336,7 @@ Keys embed the partition: 13-bit partitionId + 51-bit local key (`Protocol.java`
 **nanobpmn path:** run N independent engine actors + journals (N single-writer threads) behind
 the gateway — *partitioning is achievable on one node first*, then across nodes later. Adopt the
 partition-embedded key encoding now (cheap, future-proofs distribution). Route at the
-gateway/command-stream demux: round-robin creates, hash messages/businessId, pin deploy+timer to
+gateway/falcon demux: round-robin creates, hash messages/businessId, pin deploy+timer to
 partition 1. This is the single biggest parity lever and composes cleanly with the command
 stream (the demux already exists; it just gains a partition selector).
 
@@ -359,7 +364,7 @@ gossip (`BrokerTopologyManager.getLeaderForPartition`), routes each request to t
 leader, and retries the next partition on `PARTITION_LEADER_MISMATCH`/`RESOURCE_EXHAUSTED`. The
 `getTopology` endpoint already exists in nanobpmn's spec but returns the hardcoded single broker.
 
-**nanobpmn path:** the command stream makes this natural — the gateway terminates the worker/
+**nanobpmn path:** the Falcon protocol makes this natural — the gateway terminates the worker/
 client connections and fans frames to partition leaders. Single-node: gateway + N partitions in
 one process (no network). Multi-node later: gateway becomes a thin router + topology client. Make
 `getTopology` report real partition/leader state once partitioning lands, so standard Camunda
@@ -371,7 +376,7 @@ to every node); each partition leader pushes its own jobs; the gateway aggregate
 selection is **uniform random** within an `AggregatedRemoteStream` of identical-metadata streams;
 on failover streams re-register within ~1s (`ClientStreamServiceImpl.onServerJoined`).
 
-**Parity for nanobpmn's command stream:** when partitioned, a worker's `Subscribe` must fan out
+**Parity for nanobpmn's Falcon protocol:** when partitioned, a worker's `Subscribe` must fan out
 to **every partition**, and each partition pushes independently into the one client connection.
 **Decision: uniform random selection (matches Zeebe, see §6)** — partition-local, no global
 coordinator. Credit accounting must be **per-connection, not per-partition**, so a worker's

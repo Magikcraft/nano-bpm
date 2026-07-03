@@ -1,5 +1,10 @@
-//! Unified bidirectional command stream over WebSocket (§13 of
-//! `docs/command-stream-design.md`).
+//! # The Falcon Protocol
+//!
+//! Nano's Falcon protocol: a unified, bidirectional, credit-metered WebSocket
+//! (§13 of `docs/falcon-design.md`).
+//!
+//! Named for **Falko Menge**, whose work on system optimisation is the genesis
+//! and inspiration for this subsystem. Artists sign their work.
 //!
 //! One persistent socket per client multiplexes two interaction patterns over a
 //! single credit-coordinated window onto the one engine thread:
@@ -100,7 +105,7 @@ fn is_false(b: &bool) -> bool {
 
 /// Client → server frames.
 ///
-/// `Serialize` is derived so a node can act as a command-stream *client* to its
+/// `Serialize` is derived so a node can act as a falcon *client* to its
 /// cluster peers (the intra-cluster forwarding uplink), speaking the same wire
 /// protocol it serves.
 #[derive(Debug, Deserialize, Serialize)]
@@ -343,7 +348,7 @@ pub enum ClientFrame {
     /// **Intra-cluster only.** Carries one serialized Raft RPC (AppendEntries /
     /// Vote / InstallSnapshot) for `partition`'s replica group to the node hosting
     /// it. Answered by a `CommandResult` whose body is the serialized
-    /// `RaftRpcResponse` (200) or an error status. This is the command-stream
+    /// `RaftRpcResponse` (200) or an error status. This is the falcon
     /// transport for per-partition Raft (stage 3 leader routing).
     Raft {
         corr: u64,
@@ -413,7 +418,7 @@ pub enum UserTaskOp {
     Update,
 }
 ///
-/// `Deserialize` is derived so the peer uplink (a node acting as a command-stream
+/// `Deserialize` is derived so the peer uplink (a node acting as a falcon
 /// client to its cluster peers) can decode a peer's responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -512,7 +517,7 @@ impl Connection {
     }
 }
 
-/// Server-wide registry of command-stream connections and the job-type dispatch
+/// Server-wide registry of falcon connections and the job-type dispatch
 /// index. Lives outside `ServerImpl` (shared by the WS route and the dispatcher);
 /// the engine remains unaware of it.
 pub struct Registry {
@@ -637,7 +642,7 @@ struct ConnectParams {
     worker: Option<String>,
 }
 
-/// Builds the router carrying the `/command-stream` WebSocket endpoint, sharing
+/// Builds the router carrying the `/falcon` WebSocket endpoint, sharing
 /// the engine-backed [`ServerImpl`] and the [`Registry`].
 pub fn router(server: ServerImpl, registry: Arc<Registry>) -> Router {
     let state = CsState {
@@ -646,7 +651,7 @@ pub fn router(server: ServerImpl, registry: Arc<Registry>) -> Router {
         submission_window: submission_window_from_env(),
     };
     Router::new()
-        .route("/command-stream", get(ws_handler))
+        .route("/falcon", get(ws_handler))
         .with_state(state)
 }
 
@@ -1557,7 +1562,7 @@ async fn handle_client_frame(
 /// - **Error path:** Apply-time errors (job not found, not active) carry no commit
 ///   and are replied inline (synchronous failure, no durability concern).
 /// - **REST API:** The `/jobs/{key}/completion` REST endpoint still awaits fsync
-///   before replying; only the command stream pipelines.
+///   before replying; only the Falcon protocol pipelines.
 ///
 /// Analogous to Kafka `acks=1` or RabbitMQ async confirms. See README.md "Stream
 /// durability: ack-before-fsync pipelining" for full rationale.
@@ -2490,8 +2495,8 @@ mod fair_plan_weighted_tests {
     }
 }
 
-/// Drift guard: the public command-stream protocol is hand-documented in
-/// `docs/command-stream.asyncapi.yaml` (a WebSocket protocol can't be modelled
+/// Drift guard: the public falcon protocol is hand-documented in
+/// `docs/falcon.asyncapi.yaml` (a WebSocket protocol can't be modelled
 /// by OpenAPI, so it is not code-generated). These tests pin the spec to the
 /// `ClientFrame` / `ServerFrame` enums it claims to mirror, so the spec — and
 /// the `/asyncapi` docs generated from it — cannot silently drift out of sync.
@@ -2506,7 +2511,7 @@ mod asyncapi_spec_guard {
     /// The spec, embedded at compile time (repo `docs/`, two levels up from
     /// `server/src/`). If this path breaks, the spec moved and the docs pipeline
     /// (`console/scripts/copy-asyncapi.mjs`) needs the same update.
-    const SPEC: &str = include_str!("../../docs/command-stream.asyncapi.yaml");
+    const SPEC: &str = include_str!("../../docs/falcon.asyncapi.yaml");
 
     /// The public client→server frames. The many intra-cluster `ClientFrame`
     /// variants (deploy, raft, forwardCreate, getByKey, …) are deliberately NOT
@@ -2553,7 +2558,7 @@ mod asyncapi_spec_guard {
             .collect();
         assert_eq!(
             documented, expected,
-            "command-stream.asyncapi.yaml documents a different frame set than the public \
+            "falcon.asyncapi.yaml documents a different frame set than the public \
              protocol contract — update the spec (and PUBLIC_CLIENT/PUBLIC_SERVER if the \
              public protocol genuinely changed)."
         );

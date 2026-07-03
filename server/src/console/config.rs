@@ -84,7 +84,7 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
         "Admission & SLA",
         "Stream submission window",
         "auto",
-        "Per-connection command-stream submission-credit window (create intake metering).",
+        "Per-connection falcon submission-credit window (create intake metering).",
     ),
     // --- Memory & spill ------------------------------------------------------
     (

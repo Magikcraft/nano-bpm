@@ -183,7 +183,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             }],
             templates: vec![TemplateSpec {
                 id: "rust-throughput".into(),
-                label: "Throughput (Rust) — native pipelined command-stream A/B".into(),
+                label: "Throughput (Rust) — native pipelined falcon A/B".into(),
             }],
             toolchain: Toolchain {
                 detect: vec!["cargo".into(), "--version".into()],

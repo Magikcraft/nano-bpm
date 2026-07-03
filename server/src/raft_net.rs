@@ -13,7 +13,7 @@
 //!
 //! - [`LocalCluster`] dispatches in-process (used by the multi-voter tests here),
 //!   proving replication and commit across a real 3-voter group.
-//! - A command-stream-backed transport (a node sending [`RaftRpcRequest`] frames
+//! - A falcon-backed transport (a node sending [`RaftRpcRequest`] frames
 //!   to the peer that hosts the target replica) mounts the same `PartitionNetwork`
 //!   onto the cluster's existing WebSocket protocol; that binding lands with
 //!   leader routing, where the server actually hosts the Raft groups.
@@ -74,7 +74,7 @@ pub enum RaftRpcResponse {
 pub(crate) const RAFT_RPC_COMPRESS_THRESHOLD: usize = 1024;
 
 /// Encodes a serialized-JSON Raft RPC for the wire, compressing it (raw deflate,
-/// then base64 so it rides the JSON command-stream frame without escaping) only
+/// then base64 so it rides the JSON falcon frame without escaping) only
 /// when it is large enough to be worth it. Returns `(payload, compressed)`.
 /// Compression failures fall back to the raw JSON — never an error.
 pub(crate) fn encode_rpc_payload(json: String) -> (String, bool) {
@@ -134,7 +134,7 @@ impl std::error::Error for TransportError {}
 /// Carries a partition's Raft RPCs to a target replica. The single method routes
 /// `req` to the node hosting replica `target` of `partition` and returns its
 /// answer. Implementations: [`LocalCluster`] (in-process) and, with leader
-/// routing, a command-stream-backed carrier.
+/// routing, a falcon-backed carrier.
 pub trait RaftTransport: Send + Sync + 'static {
     fn send<'a>(
         &'a self,
@@ -145,7 +145,7 @@ pub trait RaftTransport: Send + Sync + 'static {
 }
 
 /// Feeds an inbound RPC into a local Raft instance and returns its response. The
-/// receiving half of any transport — the command-stream server handler will call
+/// receiving half of any transport — the falcon server handler will call
 /// this with the partition's hosted Raft once leader routing mounts the groups.
 pub async fn dispatch(
     raft: &openraft::Raft<RaftConfig>,
@@ -344,9 +344,9 @@ impl RaftTransport for LocalCluster {
 }
 
 /// The production transport: carries a partition's Raft RPCs to peer nodes over
-/// the cluster's existing command-stream WebSocket. The target [`NodeId`] is the
+/// the cluster's existing falcon WebSocket. The target [`NodeId`] is the
 /// cluster node id, so it maps straight onto the [`PeerSet`] uplink; the RPC is
-/// serialized into a [`crate::command_stream::ClientFrame::Raft`] frame and the
+/// serialized into a [`crate::falcon::ClientFrame::Raft`] frame and the
 /// peer answers with the serialized [`RaftRpcResponse`] in its `CommandResult`.
 #[derive(Clone)]
 pub struct PeerTransport {

@@ -4,10 +4,10 @@ import type { AddressInfo } from 'node:net';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { CommandStreamClient, SubmissionTimeoutError } from '../src/commandStreamClient.js';
+import { FalconClient, SubmissionTimeoutError } from '../src/falconClient.js';
 
 /**
- * Stands up a mock command stream that welcomes with a fixed number of
+ * Stands up a mock Falcon protocol that welcomes with a fixed number of
  * submission credits and (optionally) never replenishes them, so we can drive
  * the client's submit-timeout path deterministically without the gateway.
  */
@@ -48,7 +48,7 @@ describe('createInstance submit timeout', () => {
 
   it('rejects with SubmissionTimeoutError when no credit arrives in time', async () => {
     gw = await startMockGateway(0);
-    const client = new CommandStreamClient({ baseUrl: gw.baseUrl, worker: 'w', reconnect: false });
+    const client = new FalconClient({ baseUrl: gw.baseUrl, worker: 'w', reconnect: false });
     await client.connect();
 
     await expect(
@@ -60,7 +60,7 @@ describe('createInstance submit timeout', () => {
 
   it('honours the client-wide submitTimeoutMs default', async () => {
     gw = await startMockGateway(0);
-    const client = new CommandStreamClient({
+    const client = new FalconClient({
       baseUrl: gw.baseUrl,
       worker: 'w',
       reconnect: false,
@@ -77,7 +77,7 @@ describe('createInstance submit timeout', () => {
 
   it('does not leak credits: a granted credit still admits a later create', async () => {
     gw = await startMockGateway(1);
-    const client = new CommandStreamClient({ baseUrl: gw.baseUrl, worker: 'w', reconnect: false });
+    const client = new FalconClient({ baseUrl: gw.baseUrl, worker: 'w', reconnect: false });
     await client.connect();
     // Give the welcome credit a beat to register.
     await new Promise((r) => setTimeout(r, 20));

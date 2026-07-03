@@ -1,6 +1,6 @@
-// Generates the Command Stream Protocol reference (AsyncAPI) as a single
+// Generates the Falcon Protocol reference (AsyncAPI) as a single
 // self-contained, offline HTML page, rendered at build time directly from the
-// hand-maintained spec at ../docs/command-stream.asyncapi.yaml. Vite ships the
+// hand-maintained spec at ../docs/falcon.asyncapi.yaml. Vite ships the
 // result in dist/ (and the gateway embeds it) so /asyncapi works fully offline,
 // mirroring the Swagger UI pipeline for the REST API.
 //
@@ -16,7 +16,7 @@ import MarkdownIt from "markdown-it";
 const md = new MarkdownIt({ html: false, linkify: true, breaks: false });
 
 const root = process.cwd();
-const specPath = join(root, "..", "docs", "command-stream.asyncapi.yaml");
+const specPath = join(root, "..", "docs", "falcon.asyncapi.yaml");
 const outDir = join(root, "public", "asyncapi");
 const doc = yaml.load(readFileSync(specPath, "utf8"));
 
@@ -139,7 +139,7 @@ const html = `<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Nano BPM · Command Stream Protocol</title>
+    <title>Nano BPM · Falcon Protocol</title>
     <style>
       :root {
         --bg: #ffffff; --fg: #18181b; --muted: #71717a; --line: #e4e4e7;
@@ -204,7 +204,7 @@ const html = `<!doctype html>
     <div class="nbpm-bar">
       <span class="dot"></span>
       <strong>Nano BPM</strong>
-      <span class="muted" style="font-size: 0.85rem">Command Stream Protocol</span>
+      <span class="muted" style="font-size: 0.85rem">Falcon Protocol</span>
       <span class="spacer"></span>
       <a href="/">Home</a>
       <a href="/docs">Docs</a>
@@ -212,14 +212,14 @@ const html = `<!doctype html>
       <a href="/console">Web console</a>
     </div>
     <div class="wrap">
-      <h1>${esc(info.title ?? "Command Stream")}</h1>
+      <h1>${esc(info.title ?? "Falcon")}</h1>
       <div class="ver">AsyncAPI ${esc(doc.asyncapi ?? "")} · version ${esc(info.version ?? "")}</div>
       <div class="lead">${mdBlock(info.description)}</div>
       <div class="note">
-        Generated from <code>docs/command-stream.asyncapi.yaml</code> at build time.
-        The command stream is a WebSocket protocol (it cannot be modelled by OpenAPI);
+        Generated from <code>docs/falcon.asyncapi.yaml</code> at build time.
+        The Falcon protocol is a WebSocket protocol (it cannot be modelled by OpenAPI);
         the spec mirrors the <code>ClientFrame</code> / <code>ServerFrame</code> enums in
-        <code>server/src/command_stream.rs</code> and is enforced against them by a drift-guard test.
+        <code>server/src/falcon.rs</code> and is enforced against them by a drift-guard test.
       </div>
       <h2>Servers</h2>
       <ul class="servers">${servers}</ul>

@@ -1,10 +1,10 @@
-//! Peer uplink: a node acting as a command-stream **client** to its cluster
+//! Peer uplink: a node acting as a falcon **client** to its cluster
 //! peers.
 //!
 //! Stage 1 of the distributed-scaling design (`docs/distributed-scaling-design.md`)
 //! makes every node a gateway: a client connects to any one node, which forwards
 //! operations it does not own to the node that does. The forwarding transport is
-//! the existing command-stream WebSocket protocol — a gateway opens a
+//! the existing falcon WebSocket protocol — a gateway opens a
 //! [`PeerLink`] to each peer and drives that peer's engine over the same frames
 //! (`CreateInstance`, `CompleteJob`, …) a normal client would send, so no new
 //! node-to-node protocol or serialization is introduced.
@@ -30,7 +30,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cluster::Topology;
-use crate::command_stream::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
+use crate::falcon::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 
 /// Default ceiling on how long a forwarded request waits for its peer's
 /// `CommandResult` before giving up. Overridable via `NANOBPMN_PEER_TIMEOUT_MS`.
@@ -70,7 +70,7 @@ pub struct PeerResult {
 /// Outstanding forwarded requests awaiting a `CommandResult`, keyed by `corr`.
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<PeerResult>>>>;
 
-/// A live command-stream connection to one peer node.
+/// A live falcon connection to one peer node.
 ///
 /// Cheap to clone (shares the underlying socket writer and correlation table).
 /// Allocates its own `corr` space, independent of the peer's other clients.
@@ -89,7 +89,7 @@ pub struct PeerLink {
 }
 
 impl PeerLink {
-    /// Opens a command-stream client connection to `base_url` (a peer's HTTP base
+    /// Opens a falcon client connection to `base_url` (a peer's HTTP base
     /// URL, e.g. `http://10.0.0.2:8080`). The reader/writer tasks run until the
     /// socket closes, at which point the link is marked disconnected and every
     /// outstanding request fails with [`PeerError::Closed`].
@@ -118,7 +118,7 @@ impl PeerLink {
         })
     }
 
-    /// Opens one command-stream socket to `ws_url`, spawning its writer and reader
+    /// Opens one falcon socket to `ws_url`, spawning its writer and reader
     /// tasks. Returns the outbound sender; the reader resolves peer responses into
     /// `pending` and flips `connected` to false (failing every waiter) when the
     /// socket drops.
@@ -130,7 +130,7 @@ impl PeerLink {
         let (ws, _resp) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| PeerError::Connect(e.to_string()))?;
-        // Disable Nagle on the peer socket: the command stream carries small,
+        // Disable Nagle on the peer socket: the Falcon protocol carries small,
         // latency-sensitive request/response frames (notably Raft AppendEntries),
         // and Nagle + delayed-ACK adds ~40ms per round-trip, collapsing Raft
         // commit throughput. The raft/app RPCs are explicitly framed, so there is
@@ -383,7 +383,7 @@ impl PeerLink {
     /// Carries one Raft RPC (AppendEntries/Vote/InstallSnapshot, serialized to
     /// `rpc`) for `partition`'s replica group to this peer, which hosts a replica
     /// of that partition. Answered by a `CommandResult` whose body is the
-    /// serialized `RaftRpcResponse`. This is the command-stream binding of the
+    /// serialized `RaftRpcResponse`. This is the falcon binding of the
     /// per-partition Raft network (stage 3 leader routing).
     pub async fn raft_rpc(
         &self,
@@ -661,7 +661,7 @@ async fn route_server_frame(frame: ServerFrame, pending: &Pending) {
     }
 }
 
-/// The set of command-stream uplinks to a node's cluster peers, built from the
+/// The set of falcon uplinks to a node's cluster peers, built from the
 /// [`Topology`]. The forwarding seam asks it for the link to a partition's owning
 /// node; links are established lazily on first use and re-established
 /// transparently after a drop, so a peer that is briefly down does not need a
@@ -734,8 +734,8 @@ impl PeerSet {
     }
 }
 
-/// Maps a peer's HTTP base URL to its command-stream WebSocket URL.
-/// `http://h:p` → `ws://h:p/command-stream`, `https://…` → `wss://…`.
+/// Maps a peer's HTTP base URL to its falcon WebSocket URL.
+/// `http://h:p` → `ws://h:p/falcon`, `https://…` → `wss://…`.
 fn ws_url(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     let ws_base = if let Some(rest) = trimmed.strip_prefix("https://") {
@@ -746,10 +746,10 @@ fn ws_url(base_url: &str) -> String {
         // Assume a bare host:port is plaintext.
         format!("ws://{trimmed}")
     };
-    format!("{ws_base}/command-stream")
+    format!("{ws_base}/falcon")
 }
 
-/// The dedicated Raft-lane socket URL: the command-stream WS tagged `?raft=1`.
+/// The dedicated Raft-lane socket URL: the falcon WS tagged `?raft=1`.
 /// The tag lets the peer (and operators reading logs) tell the replication
 /// socket apart from app-forwarding sockets; functionally the server serves both
 /// identically, but isolating Raft RPCs on their own connection keeps them clear
@@ -792,24 +792,24 @@ mod tests {
     fn ws_url_maps_scheme_and_appends_path() {
         assert_eq!(
             ws_url("http://10.0.0.2:8080"),
-            "ws://10.0.0.2:8080/command-stream"
+            "ws://10.0.0.2:8080/falcon"
         );
         assert_eq!(
             ws_url("http://10.0.0.2:8080/"),
-            "ws://10.0.0.2:8080/command-stream"
+            "ws://10.0.0.2:8080/falcon"
         );
-        assert_eq!(ws_url("https://node:443"), "wss://node:443/command-stream");
-        assert_eq!(ws_url("host:9000"), "ws://host:9000/command-stream");
+        assert_eq!(ws_url("https://node:443"), "wss://node:443/falcon");
+        assert_eq!(ws_url("host:9000"), "ws://host:9000/falcon");
     }
 
-    /// Serves a real command-stream endpoint on an ephemeral port and returns its
+    /// Serves a real falcon endpoint on an ephemeral port and returns its
     /// HTTP base URL. Models a peer node: a `PeerLink` connects to it exactly as
     /// a forwarding gateway would in a cluster.
     async fn serve_peer() -> String {
         let server = crate::ServerImpl::default();
-        let registry = crate::command_stream::Registry::new();
-        crate::command_stream::spawn_dispatcher(server.clone(), registry.clone());
-        let app = crate::command_stream::router(server, registry);
+        let registry = crate::falcon::Registry::new();
+        crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+        let app = crate::falcon::router(server, registry);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -820,7 +820,7 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    /// The uplink drives a peer's engine over the command stream: a forwarded
+    /// The uplink drives a peer's engine over the Falcon protocol: a forwarded
     /// `createProcessInstance` runs on the peer and its `CommandResult` is mapped
     /// straight back. This is the transport every stage-1 forwarding op rides on.
     #[tokio::test]

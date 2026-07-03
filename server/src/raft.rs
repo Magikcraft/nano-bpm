@@ -2,7 +2,7 @@
 //! leader; a command commits when a quorum of the replica set has the log entry,
 //! then applies to the engine. This module wires [openraft] over our existing
 //! durable [`Journal`] (the state machine) and — in a later milestone — the
-//! command stream (the network).
+//! Falcon protocol (the network).
 //!
 //! # Milestone status (RF=1, single voter)
 //!
@@ -34,13 +34,13 @@
 //! [`RaftTransport`](crate::raft_net::RaftTransport) (see [`crate::raft_net`]).
 //! The transport is pluggable: the in-process
 //! [`LocalCluster`](crate::raft_net::LocalCluster) proves replication + commit
-//! across a real 3-voter group, and a command-stream-backed carrier mounts the
+//! across a real 3-voter group, and a falcon-backed carrier mounts the
 //! same network onto the cluster WebSocket once the server hosts the Raft groups.
 //!
 //! # Remaining
 //!
 //! Leader routing: host the Raft groups in the server, carry the
-//! [`RaftTransport`](crate::raft_net::RaftTransport) over the command stream, and
+//! [`RaftTransport`](crate::raft_net::RaftTransport) over the Falcon protocol, and
 //! route client writes to the partition leader — replacing the additive
 //! [`EngineHandle`](crate::engine_actor::EngineHandle) write path.
 
@@ -810,7 +810,7 @@ impl RaftPartition {
 }
 
 /// The set of Raft groups this node hosts, keyed by partition id. A node hosts a
-/// group for every partition it is a replica of; the command-stream handler looks
+/// group for every partition it is a replica of; the falcon handler looks
 /// up the target partition here to feed it an inbound RPC, and the write path
 /// looks up the partition to propose through its leader. Empty by default — only
 /// populated when per-partition Raft is enabled — so the non-Raft path is

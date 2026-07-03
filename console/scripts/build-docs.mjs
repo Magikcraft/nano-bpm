@@ -234,7 +234,7 @@ function shell(page) {
       <span class="sub">${subtitle}</span>
       <span class="spacer"></span>
       <a class="x" href="/swagger">REST API</a>
-      <a class="x" href="/asyncapi">Command stream</a>
+      <a class="x" href="/asyncapi">Falcon protocol</a>
       <a class="x" href="/console">Web console</a>
     </div>
     <div class="layout">

@@ -4,7 +4,7 @@
 > The client-SDK half (intelligent failover, accepting a redirect) is explicitly a
 > **later** step; this doc specifies the **Nano-side** functionality first.
 >
-> Grounded in: `server/src/command_stream.rs` (`ServerFrame::Pressure` /
+> Grounded in: `server/src/falcon.rs` (`ServerFrame::Pressure` /
 > `SubmissionCredits`, the connection `Registry`, cluster job-aggregation), `server/src/memory.rs`
 > (`resident_bytes`), `server/src/console/mod.rs` (`/console/api/cluster/metrics`,
 > `/console/api/cluster/health`, `build_local_metrics`), `server/src/peer.rs`
@@ -19,7 +19,7 @@ job activation aggregates from every node and routes completions back — UPDATE
 That is a correctness win, but it has an operational cost:
 
 - **All connection memory/CPU pressure lands on the one node clients happen to dial.**
-  Each long-lived command-stream (WS) or REST long-poll connection costs
+  Each long-lived Falcon (WS) or REST long-poll connection costs
   ~0.15–0.2 MB of resident memory plus serde/frame churn on the gateway role
   (UPDATE 81 measured node-0 settling ~200 MB above its peers purely from the gateway
   role, not owned state). A fleet of thousands of workers/producers all pointed at one
@@ -28,7 +28,7 @@ That is a correctness win, but it has an operational cost:
   client has no Nano-provided way to discover and move to a surviving node.
 
 We want a **worker/connection-balancing mode**: Nano senses per-node load, the nodes
-share that view, and an overloaded gateway uses the command stream to tell a subset of
+share that view, and an overloaded gateway uses the Falcon protocol to tell a subset of
 its connected workers/producers to **move** to a less-loaded node — and the same
 machinery gives clients the directory they need to **fail over** when a node disappears.
 
@@ -52,13 +52,13 @@ client can do. This is what makes the feature safe to build incrementally.
 | Capability | Where | Reuse |
 | --- | --- | --- |
 | Per-node resident memory | `memory::resident_bytes()` (jemalloc) | the primary pressure input |
-| Coarse pressure frame | `ServerFrame::Pressure { level, retryAfterMs }`, edge-triggered (command_stream.rs ~1419) | the precedent + transport for a finer signal |
+| Coarse pressure frame | `ServerFrame::Pressure { level, retryAfterMs }`, edge-triggered (falcon.rs ~1419) | the precedent + transport for a finer signal |
 | Submission flow control | `ServerFrame::SubmissionCredits` + backpressure AIMD | unchanged; orthogonal to *where* a client connects |
-| Connection registry / counts | command_stream.rs `Registry`, `nanobpm_stream_connections_active` | per-node connection-load input + the set of redirect candidates |
+| Connection registry / counts | falcon.rs `Registry`, `nanobpm_stream_connections_active` | per-node connection-load input + the set of redirect candidates |
 | Cluster metric aggregation | `/console/api/cluster/metrics` probes every peer's `/console/api/metrics` (resident bytes + connections) | the operator view; proves cross-node sensing already works |
 | Cluster health probe | `/console/api/cluster/health` (per-peer reachable/latency) | liveness input for failover/target selection |
-| Inter-node transport | `PeerLink` / `PeerSet` over the command stream | carries the pressure gossip + (optionally) admission checks |
-| Peer directory | `Topology` brokers + `/v2/topology` (now `nano`-flagged with `commandStreamPath`) | the failover/redirect target list clients consume |
+| Inter-node transport | `PeerLink` / `PeerSet` over the Falcon protocol | carries the pressure gossip + (optionally) admission checks |
+| Peer directory | `Topology` brokers + `/v2/topology` (now `nano`-flagged with `falconPath`) | the failover/redirect target list clients consume |
 
 The cluster-metrics endpoint already demonstrates that a node can read every peer's
 resident memory and connection count. The new work is to turn that *observation* into a
@@ -97,7 +97,7 @@ options:
   but it is an operator-poll path (console-feature only) and is O(N) per poller.
 - **(b) Piggyback gossip over the existing PeerLink** *(recommended)* — every node, on
   its pressure tick, pushes a tiny `NodePressure { nodeId, p, mem, conns, headroom,
-  ts }` record to each connected peer over the command stream it is *already* holding
+  ts }` record to each connected peer over the Falcon protocol it is *already* holding
   (`PeerSet`). Each node keeps a `last-known pressure` map (node → record, with the tick
   `ts` for staleness). Cost: one small frame per peer per tick; no new sockets (the
   dedicated Raft lane from UPDATE 49 stays separate).
@@ -156,17 +156,17 @@ Add one server frame (additive; older clients ignore unknown frames — opt-in b
 ```rust
 ServerFrame::Redirect {
     reason: String,        // "rebalance" | "draining" | "shutdown"
-    target: RedirectTarget // { nodeId, baseUrl, commandStreamPath }
+    target: RedirectTarget // { nodeId, baseUrl, falconPath }
     deadline_ms: u64,      // grace period to migrate before the node may hard-close
     scope: String,         // "connection" (this socket) — room for "all" later
 }
 ```
 
 `target` is built from `Topology`/`/v2/topology` broker data (host:port +
-`commandStreamPath` from the `nano` advertisement). Semantics for a cooperating client
+`falconPath` from the `nano` advertisement). Semantics for a cooperating client
 (SDK work, later):
 
-1. On `Redirect`, open a **new** command-stream/long-poll connection to `target`.
+1. On `Redirect`, open a **new** Falcon/long-poll connection to `target`.
 2. Re-subscribe (worker) / re-point creates (producer) on the new connection.
 3. Drain in-flight work on the old connection, then close it within `deadline_ms`.
 4. If the new connection fails, fall back to the topology directory (§6) and try the
@@ -189,7 +189,7 @@ The same node addressing data powers client failover when a node **disappears**
 (no `Redirect`, the connection just drops):
 
 - `/v2/topology` already lists every broker's host:port and (via the `nano`
-  advertisement) the `commandStreamPath`. A nano-aware SDK caches this on connect and
+  advertisement) the `falconPath`. A nano-aware SDK caches this on connect and
   refreshes periodically; on a dropped connection it dials the next healthy broker from
   the cache.
 - `/console/api/cluster/health` (or the gossiped liveness) tells the *server* which peers
@@ -201,17 +201,17 @@ advertised on a stable Camunda endpoint.
 
 ## 7. Protocol & surface changes
 
-- **command-stream**: add `ServerFrame::Redirect` (+ `RedirectTarget`) and document it in
-  `docs/command-stream.asyncapi.yaml` and `docs/command-stream-design.md`. Add the
+- **Falcon**: add `ServerFrame::Redirect` (+ `RedirectTarget`) and document it in
+  `docs/falcon.asyncapi.yaml` and `docs/falcon-design.md`. Add the
   per-tick `NodePressure` gossip frame to the **peer** protocol (internal; not a client
   frame).
 - **console**: surface per-node pressure `P` + its components, redirects-issued /
   accepted counters, and migration counts in the Metrics cluster section (builds on the
   existing cluster aggregation; nothing new to sense).
 - **`/v2/topology`**: no further change — the `nano` field added with this work already
-  advertises `commandStreamPath`, which is exactly what a redirect/failover target needs.
+  advertises `falconPath`, which is exactly what a redirect/failover target needs.
 - **No spec/generated change** for the client API: `Redirect` rides the existing
-  command-stream WS (not the OpenAPI surface), consistent with `Pressure` /
+  Falcon WS (not the OpenAPI surface), consistent with `Pressure` /
   `SubmissionCredits`.
 
 ## 8. Configuration (all opt-in; default OFF ⇒ byte-identical)

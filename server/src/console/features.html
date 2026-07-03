@@ -397,7 +397,7 @@
           <p>
             The execution engine (<code>engine-core</code>) is a
             zero-dependency Rust crate. Everything around it &mdash; gateway,
-            REST API, command stream, web console, modeler, explorer, embedded
+            REST API, Falcon protocol, web console, modeler, explorer, embedded
             workers, Swagger UI and Prometheus metrics &mdash; ships inside the
             same binary. There is nothing else to install, no Elasticsearch, no
             relational database, no message broker.
@@ -541,7 +541,7 @@
         <section class="feat" id="dynamic">
           <h2>Dynamic client/server architecture</h2>
           <p class="lede">
-            Workers attach over a bidirectional command stream and pull work via
+            Workers attach over a bidirectional Falcon protocol and pull work via
             a credit window. The server meters intake to match capacity, so
             adding workers &mdash; even far more than you need &mdash; never tips
             the system into collapse.
@@ -549,7 +549,7 @@
 
           <h3 id="no-collapse">Auto-scaling job stream &mdash; no over-provisioning collapse</h3>
           <p>
-            On the command-stream transport, each worker subscription has a
+            On the Falcon transport, each worker subscription has a
             credit window; the server grants credits and emits an explicit
             back-pressure signal (<code>Pressure</code> red/green) instead of
             dropping requests. The result: clients self-pace, in-flight work is
@@ -615,7 +615,7 @@
           <h2>Camunda-compatible API surface</h2>
           <p class="lede">
             Nano implements the Camunda Orchestration Cluster REST API and the
-            command-stream protocol. That compatibility is a research lever: it
+            Falcon protocol. That compatibility is a research lever: it
             lets Nano reuse the existing SDKs and tooling, and be evaluated
             head-to-head against a mature engine &mdash; without re-inventing a
             client ecosystem.
@@ -633,8 +633,8 @@
               experimenting.
             </li>
             <li>
-              <strong>Speaks the command stream</strong> &mdash; because those
-              SDKs use the command stream, they exercise Nano&rsquo;s auto-scaling
+              <strong>Speaks the Falcon protocol</strong> &mdash; because those
+              SDKs use the Falcon protocol, they exercise Nano&rsquo;s auto-scaling
               job-stream path directly &mdash; a convenient way to study that
               architecture under realistic load.
             </li>
@@ -665,7 +665,7 @@
             <li><strong>Embedded workers</strong> &mdash; author job workers in TypeScript (Deno runtime), use <code>npm:</code> libraries, run them headless inside the platform &mdash; no separate worker deployment.</li>
             <li><strong>Idempotent deployment</strong> &mdash; redeploying a byte-identical model is a no-op; it does not mint a new version.</li>
             <li><strong>Prometheus metrics + cluster dashboard</strong> &mdash; throughput, active instances, connected workers, per-node memory and health, on <a href="/metrics">/metrics</a> and in the console.</li>
-            <li><strong>Open command-stream protocol</strong> &mdash; the same bidirectional WebSocket protocol powers SDK workers, in-browser workers and inter-node forwarding.</li>
+            <li><strong>Open Falcon protocol</strong> &mdash; the same bidirectional WebSocket protocol powers SDK workers, in-browser workers and inter-node forwarding.</li>
             <li><strong>Offline &amp; self-contained</strong> &mdash; the console, Swagger UI and this page load zero external assets; everything works air-gapped.</li>
           </ul>
         </section>
