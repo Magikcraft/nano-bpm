@@ -493,14 +493,14 @@ impl ServerImpl {
                                 reserve,
                                 hard_cap,
                             } => tracing::info!(
-                                "variable spill: on (adaptive-hybrid), floor {:.0} MiB \
-                                 (spill when the backlog grows above it), pressure high-water \
-                                 {:.0} MiB / low-water {:.0} MiB, reserve {:.0} MiB free, \
+                                "variable spill: on (adaptive, memory-driven), pressure \
+                                 high-water {:.0} MiB / low-water {:.0} MiB, reserve {:.0} MiB \
+                                 free (reclaim to floor {:.0} MiB under reserve breach), \
                                  hard-cap {hard_cap} instance(s){location}",
-                                *floor as f64 / (1024.0 * 1024.0),
                                 *high as f64 / (1024.0 * 1024.0),
                                 *low as f64 / (1024.0 * 1024.0),
                                 *reserve as f64 / (1024.0 * 1024.0),
+                                *floor as f64 / (1024.0 * 1024.0),
                             ),
                         }
                     }
