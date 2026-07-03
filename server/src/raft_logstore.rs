@@ -125,6 +125,9 @@ struct Inner {
     log_file: File,
     /// All present (non-purged) log entries, keyed by index, for fast reads.
     log: BTreeMap<u64, Entry<RaftConfig>>,
+    /// Serialized byte footprint of `log` (kept in step with it), published to
+    /// the aggregate `nanobpm_raft_log_bytes` gauge for RSS-balloon attribution.
+    log_bytes: usize,
     last_purged: Option<LogId<NodeId>>,
     committed: Option<LogId<NodeId>>,
     vote: Option<Vote<NodeId>>,
@@ -220,6 +223,7 @@ impl RaftLogStore {
 
         // Replay the entry log into the in-memory index.
         let mut log = BTreeMap::new();
+        let mut log_bytes: usize = 0;
         let lpath = log_path(&dir);
         if lpath.exists() {
             let reader = BufReader::new(File::open(&lpath)?);
@@ -228,6 +232,7 @@ impl RaftLogStore {
                 if line.trim().is_empty() {
                     continue;
                 }
+                log_bytes += line.len() + 1;
                 let entry: Entry<RaftConfig> = serde_json::from_str(&line)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 log.insert(entry.log_id.index, entry);
@@ -241,11 +246,13 @@ impl RaftLogStore {
         let log_file = OpenOptions::new().create(true).append(true).open(&lpath)?;
 
         let mode = durability_mode_from_env();
+        let entries = log.len() as i64;
         let store = Self {
             inner: Arc::new(Mutex::new(Inner {
                 dir,
                 log_file,
                 log,
+                log_bytes,
                 last_purged: state.last_purged,
                 committed: state.committed,
                 vote,
@@ -255,6 +262,7 @@ impl RaftLogStore {
                 state_dirty: false,
             })),
         };
+        crate::metrics::raft_log_delta(entries, log_bytes as i64);
 
         // Async mode amortises fsync off the append critical path; a background
         // ticker bounds the unfsynced window even when the partition goes quiet
@@ -318,6 +326,8 @@ impl RaftLogStore {
             .map_err(io_err)?;
         // The atomic rewrite fsynced the whole log, so the async tail is clean.
         inner.unsynced_bytes = 0;
+        // Reconcile the byte footprint to the authoritative post-rewrite size.
+        inner.log_bytes = bytes.len();
         Ok(())
     }
 
@@ -412,6 +422,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             staged.push(entry);
         }
         // Append the serialized lines, then publish to the in-memory index.
+        let added = staged.len() as i64;
         inner.log_file.write_all(&bytes).map_err(io_err)?;
         match inner.mode {
             // Sync: fsync before acknowledging — a flushed entry is power-loss
@@ -433,6 +444,8 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         for entry in staged {
             inner.log.insert(entry.log_id.index, entry);
         }
+        inner.log_bytes += bytes.len();
+        crate::metrics::raft_log_delta(added, bytes.len() as i64);
         drop(inner);
         callback.log_io_completed(Ok(()));
         Ok(())
@@ -441,16 +454,29 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Remove everything from `log_id.index` onward (inclusive), then persist.
         let mut inner = self.inner.lock().unwrap();
+        let before_entries = inner.log.len() as i64;
+        let before_bytes = inner.log_bytes as i64;
         let _removed = inner.log.split_off(&log_id.index);
-        Self::rewrite_log(&mut inner)
+        Self::rewrite_log(&mut inner)?;
+        crate::metrics::raft_log_delta(
+            inner.log.len() as i64 - before_entries,
+            inner.log_bytes as i64 - before_bytes,
+        );
+        Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Drop everything up to and including `log_id.index`, keep the rest.
         let mut inner = self.inner.lock().unwrap();
+        let before_entries = inner.log.len() as i64;
+        let before_bytes = inner.log_bytes as i64;
         inner.last_purged = Some(log_id);
         inner.log = inner.log.split_off(&(log_id.index + 1));
         Self::rewrite_log(&mut inner)?;
+        crate::metrics::raft_log_delta(
+            inner.log.len() as i64 - before_entries,
+            inner.log_bytes as i64 - before_bytes,
+        );
         // Purge fires on snapshot (infrequent), so persist the marker durably now
         // and clear any deferred state — the rewrite already fsynced the log.
         inner.state_dirty = false;

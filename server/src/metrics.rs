@@ -65,6 +65,14 @@ struct Metrics {
     creates_total: prometheus::IntCounterVec,
     /// Job completions, split by protocol (rest vs stream).
     job_completions_total: prometheus::IntCounterVec,
+
+    /// Serialized bytes of all uncompacted Raft log entries currently held in the
+    /// in-memory log indexes, summed across every owned partition. Under a burst
+    /// this is byte-unbounded (snapshot policy counts entries, not bytes), so it
+    /// is a prime suspect for the RSS balloon.
+    raft_log_bytes: IntGauge,
+    /// Count of uncompacted Raft log entries in memory across all owned partitions.
+    raft_log_entries: IntGauge,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -196,6 +204,17 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let raft_log_bytes = IntGauge::new(
+        "nanobpm_raft_log_bytes",
+        "Serialized bytes of uncompacted in-memory Raft log entries (all partitions).",
+    )
+    .expect("valid gauge");
+    let raft_log_entries = IntGauge::new(
+        "nanobpm_raft_log_entries",
+        "Uncompacted in-memory Raft log entries (all partitions).",
+    )
+    .expect("valid gauge");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -213,6 +232,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
         .and(registry.register(Box::new(creates_total.clone())))
         .and(registry.register(Box::new(job_completions_total.clone())))
+        .and(registry.register(Box::new(raft_log_bytes.clone())))
+        .and(registry.register(Box::new(raft_log_entries.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -233,6 +254,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         stream_frame_processing_seconds,
         creates_total,
         job_completions_total,
+        raft_log_bytes,
+        raft_log_entries,
     }
 });
 
@@ -281,6 +304,15 @@ pub fn inflight_sub(n: usize) {
 /// mem-pressure sampler tick, off the hot path).
 pub fn set_pipeline_bytes(bytes: u64) {
     METRICS.pipeline_bytes.set(bytes as i64);
+}
+
+/// Adjusts the aggregate in-memory Raft-log gauges by a signed delta. Each
+/// partition's [`RaftLogStore`](crate::raft_logstore::RaftLogStore) reports the
+/// change to its own in-memory index on append/purge/truncate; the gauges sum
+/// across partitions to expose the total live Raft-log footprint.
+pub fn raft_log_delta(entries_delta: i64, bytes_delta: i64) {
+    METRICS.raft_log_entries.add(entries_delta);
+    METRICS.raft_log_bytes.add(bytes_delta);
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
