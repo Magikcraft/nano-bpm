@@ -18,6 +18,7 @@ const Metrics = lazy(() => import("./views/Metrics"));
 const Traces = lazy(() => import("./views/Traces"));
 const Extensions = lazy(() => import("./views/Extensions"));
 const Config = lazy(() => import("./views/Config"));
+const Credits = lazy(() => import("./views/Credits"));
 
 const navItems = [
   { to: "/projects", label: "Projects" },
@@ -84,8 +85,33 @@ export default function App() {
         </nav>
 
         <NavLink
+          to="/credits"
+          className={`mt-auto mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+            location.pathname.startsWith("/credits")
+              ? "bg-zinc-800 text-white"
+              : "text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200"
+          }`}
+          title="Credits"
+        >
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <rect x="2" y="4" width="20" height="16" rx="2" />
+            <path d="M7 4v16M17 4v16M2 8h5M2 12h5M2 16h5M17 8h5M17 12h5M17 16h5" />
+          </svg>
+          Credits
+        </NavLink>
+
+        <NavLink
           to="/config"
-          className={`mt-auto mb-3 mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+          className={`mb-3 mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
             location.pathname.startsWith("/config")
               ? "bg-zinc-800 text-white"
               : "text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200"
@@ -123,6 +149,7 @@ export default function App() {
             <Route path="/projects/:name" element={<ProjectWorkspace />} />
             <Route path="/extensions" element={<Extensions />} />
             <Route path="/config" element={<Config />} />
+            <Route path="/credits" element={<Credits />} />
             <Route path="/topology" element={<Topology />} />
             <Route path="/metrics" element={<Metrics />} />
             <Route path="/modeler" element={<Navigate to="/projects" replace />} />
