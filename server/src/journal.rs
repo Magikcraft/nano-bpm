@@ -420,6 +420,7 @@ fn writer_loop(
             }
             crate::metrics::record_commit(batch.len(), fsync_start.elapsed(), buf.len());
             crate::metrics::inflight_sub(batch.len());
+            crate::metrics::journal_inflight_sub(buf.len());
 
             for req in batch {
                 // The receiver is gone for fire-and-forget writes (the background
@@ -605,6 +606,7 @@ fn writer_loop_async(
             // process restart; the amortized fsync below upgrades it to
             // power-loss-durable.
             crate::metrics::inflight_sub(batch.len());
+            crate::metrics::journal_inflight_sub(buf.len());
             for req in batch {
                 let _ = req.ack.send(());
                 let export_bytes = req.bytes.len().min(u32::MAX as usize) as u32;
@@ -1502,6 +1504,7 @@ impl Journal {
 
         let (ack, rx) = oneshot::channel();
         let events_count = events.len();
+        let bytes_len = bytes.len();
         // Only the segmented shared-writer path needs the events Arc (for
         // log-order exporter forwarding) and partition tagging; everything else
         // leaves `events_arc` `None` to avoid an extra refcount/clone.
@@ -1515,6 +1518,7 @@ impl Journal {
         })) {
             Ok(()) => {
                 crate::metrics::inflight_inc();
+                crate::metrics::journal_inflight_add(bytes_len);
                 Commit(CommitInner::Pending(rx))
             }
             // The writer thread is gone (shutting down); treat as already settled

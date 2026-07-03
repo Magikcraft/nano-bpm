@@ -77,6 +77,8 @@ struct Metrics {
     exporter_queue_bytes: IntGauge,
     /// Approx resident instance variable-payload bytes (burst-balloon attribution).
     resident_var_bytes: IntGauge,
+    /// Serialized event bytes queued to the journal writer but not yet fsynced+acked.
+    journal_inflight_bytes: IntGauge,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -231,6 +233,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let journal_inflight_bytes = IntGauge::new(
+        "nanobpm_journal_inflight_bytes",
+        "Serialized event bytes queued to the background journal writer but not yet fsynced+acked (engine->writer in-flight; events_arc roughly doubles the true heap).",
+    )
+    .expect("valid gauge");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -252,6 +260,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_log_entries.clone())))
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
         .and(registry.register(Box::new(resident_var_bytes.clone())))
+        .and(registry.register(Box::new(journal_inflight_bytes.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -276,6 +285,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_log_entries,
         exporter_queue_bytes,
         resident_var_bytes,
+        journal_inflight_bytes,
     }
 });
 
@@ -350,6 +360,18 @@ pub fn set_exporter_queue_bytes(bytes: u64) {
 /// in-flight pipeline copies, not resident variables.
 pub fn set_resident_var_bytes(bytes: u64) {
     METRICS.resident_var_bytes.set(bytes as i64);
+}
+
+/// `n` serialized event bytes were handed to the journal writer (in-flight +n).
+pub fn journal_inflight_add(n: usize) {
+    METRICS.journal_inflight_bytes.add(n as i64);
+}
+
+/// `n` serialized event bytes were fsynced+acked by the journal writer (-n). The
+/// engine->writer in-flight byte gauge; a WHERE-in-the-pipeline attribution for
+/// the burst RSS balloon (does the journal write backlog hold the ~12 GB?).
+pub fn journal_inflight_sub(n: usize) {
+    METRICS.journal_inflight_bytes.sub(n as i64);
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
