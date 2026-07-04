@@ -4,12 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Nano Process OS</title>
+    <link rel="stylesheet" href="/assets/theme.css" />
+    <script src="/assets/theme.js"></script>
     <style>
+      /* Page-local aliases resolve through the --po-* design tokens
+         (/assets/theme.css) so the cinematic look survives light mode. */
       :root {
-        --violet: #a78bfa;
-        --sky: #38bdf8;
-        --ink: #e4e4e7;
-        --muted: #a1a1aa;
+        --violet: var(--po-accent-strong);
+        --sky: var(--po-info);
+        --ink: var(--po-text);
+        --muted: var(--po-text-muted);
       }
       * {
         box-sizing: border-box;
@@ -19,7 +23,7 @@
         margin: 0;
         height: 100%;
         overflow: hidden;
-        background: #08080a;
+        background: var(--po-app);
         color: var(--ink);
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
       }
@@ -37,8 +41,8 @@
         z-index: 1;
         pointer-events: none;
         background:
-          radial-gradient(60% 60% at 50% 38%, rgba(167, 139, 250, 0.13), transparent 70%),
-          radial-gradient(50% 50% at 70% 70%, rgba(56, 189, 248, 0.1), transparent 70%);
+          radial-gradient(60% 60% at 50% 38%, color-mix(in srgb, var(--violet) 13%, transparent), transparent 70%),
+          radial-gradient(50% 50% at 70% 70%, color-mix(in srgb, var(--sky) 10%, transparent), transparent 70%);
       }
       .wrap {
         position: relative;
@@ -62,7 +66,7 @@
         height: 0.85rem;
         border-radius: 9999px;
         background: linear-gradient(135deg, var(--violet), var(--sky));
-        box-shadow: 0 0 18px rgba(167, 139, 250, 0.6);
+        box-shadow: 0 0 18px color-mix(in srgb, var(--violet) 60%, transparent);
       }
       .mark .badge {
         font-size: 0.62rem;
@@ -71,9 +75,9 @@
         text-transform: uppercase;
         color: var(--violet);
         padding: 0.2rem 0.55rem;
-        border: 1px solid rgba(167, 139, 250, 0.4);
+        border: 1px solid color-mix(in srgb, var(--violet) 40%, transparent);
         border-radius: 9999px;
-        background: rgba(167, 139, 250, 0.08);
+        background: color-mix(in srgb, var(--violet) 8%, transparent);
       }
       h1 {
         font-size: clamp(2.6rem, 8vw, 4.8rem);
@@ -81,7 +85,7 @@
         margin: 0;
         font-weight: 700;
         letter-spacing: -0.03em;
-        background: linear-gradient(135deg, #ffffff 0%, var(--violet) 55%, var(--sky) 100%);
+        background: linear-gradient(135deg, var(--ink) 0%, var(--violet) 55%, var(--sky) 100%);
         -webkit-background-clip: text;
         background-clip: text;
         color: transparent;
@@ -115,17 +119,17 @@
         transform: translateY(-2px);
       }
       a.primary {
-        color: #1a0a2e;
+        color: var(--po-app);
         background: linear-gradient(135deg, var(--violet), var(--sky));
-        box-shadow: 0 8px 30px rgba(167, 139, 250, 0.3);
+        box-shadow: 0 8px 30px color-mix(in srgb, var(--violet) 30%, transparent);
       }
       a.ghost {
         color: var(--ink);
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid rgba(255, 255, 255, 0.14);
+        background: color-mix(in srgb, var(--po-text) 7.5%, transparent);
+        border: 1px solid color-mix(in srgb, var(--po-text) 21%, transparent);
       }
       a.ghost:hover {
-        background: rgba(255, 255, 255, 0.09);
+        background: color-mix(in srgb, var(--po-text) 13.5%, transparent);
       }
       .links {
         margin-top: 2rem;
@@ -150,13 +154,21 @@
         z-index: 2;
         text-align: center;
         font-size: 0.75rem;
-        color: #52525b;
+        color: var(--po-text-faint);
+      }
+      /* Theme switcher, tucked in the top-right corner above the field. */
+      #themeCorner {
+        position: fixed;
+        top: 1rem;
+        right: 1rem;
+        z-index: 3;
       }
     </style>
   </head>
   <body>
     <canvas id="field"></canvas>
     <div class="glow"></div>
+    <div id="themeCorner"></div>
 
     <div class="wrap">
       <div class="mark">
@@ -199,6 +211,34 @@
       const canvas = document.getElementById("field");
       const ctx = canvas.getContext("2d");
       let w, h, cx, cy, points, dpr;
+
+      // Field colours come from the --po-* design tokens so the constellation
+      // adapts when the theme flips: violet links + pale dots on the dark app
+      // surface, dark-ink links + dots on the light paper.
+      let linkRGB = "150, 130, 235";
+      let dotRGB = "180, 200, 245";
+      let linkAlpha = 0.18;
+      let dotAlpha = 0.85;
+
+      function tokenRGB(name) {
+        const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        const m = v.match(/^#([0-9a-fA-F]{6})$/);
+        if (!m) return null;
+        const n = parseInt(m[1], 16);
+        return ((n >> 16) & 255) + ", " + ((n >> 8) & 255) + ", " + (n & 255);
+      }
+
+      function readThemeColors() {
+        const light = document.documentElement.dataset.appearance === "light";
+        // Links carry the brand accent; dots follow the ink so light mode reads
+        // as dark-ink particles on paper rather than a washed-out glow.
+        linkRGB = tokenRGB("--po-accent-strong") || linkRGB;
+        dotRGB = tokenRGB("--po-text") || dotRGB;
+        linkAlpha = light ? 0.26 : 0.18;
+        dotAlpha = light ? 0.6 : 0.85;
+      }
+      readThemeColors();
+      window.addEventListener("processos:theme", readThemeColors);
 
       function resize() {
         dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -267,7 +307,7 @@
             const d = Math.hypot(dx, dy);
             if (d < link) {
               const t = 1 - d / link;
-              ctx.strokeStyle = `rgba(150, 130, 235, ${0.18 * t})`;
+              ctx.strokeStyle = `rgba(${linkRGB}, ${linkAlpha * t})`;
               ctx.lineWidth = dpr * 0.6;
               ctx.beginPath();
               ctx.moveTo(a.x, a.y);
@@ -281,7 +321,7 @@
         for (const p of points) {
           ctx.beginPath();
           ctx.arc(p.x, p.y, dpr * 1.6, 0, Math.PI * 2);
-          ctx.fillStyle = "rgba(180, 200, 245, 0.85)";
+          ctx.fillStyle = `rgba(${dotRGB}, ${dotAlpha})`;
           ctx.fill();
         }
 
@@ -291,6 +331,8 @@
       addEventListener("resize", resize);
       resize();
       frame();
+
+      if (window.poMountThemeToggle) poMountThemeToggle(document.getElementById("themeCorner"));
     </script>
   </body>
 </html>

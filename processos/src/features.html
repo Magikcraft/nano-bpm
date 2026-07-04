@@ -4,15 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Nano Process OS · Features</title>
+    <link rel="stylesheet" href="/assets/theme.css" />
+    <script src="/assets/theme.js"></script>
     <style>
+      /* Page-local aliases resolve through the --po-* design tokens
+         (/assets/theme.css) so the page follows light/dark/system. */
       :root {
-        --violet: #a78bfa;
-        --sky: #38bdf8;
-        --ink: #e4e4e7;
-        --muted: #a1a1aa;
-        --faint: #71717a;
-        --card: rgba(255, 255, 255, 0.035);
-        --border: rgba(255, 255, 255, 0.1);
+        --violet: var(--po-accent-strong);
+        --sky: var(--po-info);
+        --ink: var(--po-text);
+        --muted: var(--po-text-muted);
+        --faint: var(--po-text-faint);
+        --card: color-mix(in srgb, var(--po-text) 5%, transparent);
+        --border: color-mix(in srgb, var(--po-text) 15%, transparent);
       }
       * {
         box-sizing: border-box;
@@ -22,7 +26,7 @@
       }
       body {
         margin: 0;
-        background: #08080a;
+        background: var(--po-app);
         color: var(--ink);
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
         line-height: 1.6;
@@ -43,7 +47,7 @@
         align-items: center;
         gap: 0.7rem;
         padding: 0.9rem 1.4rem;
-        background: rgba(8, 8, 10, 0.82);
+        background: color-mix(in srgb, var(--po-app) 82%, transparent);
         backdrop-filter: blur(10px);
         border-bottom: 1px solid var(--border);
       }
@@ -52,7 +56,7 @@
         height: 0.8rem;
         border-radius: 9999px;
         background: linear-gradient(135deg, var(--violet), var(--sky));
-        box-shadow: 0 0 16px rgba(167, 139, 250, 0.6);
+        box-shadow: 0 0 16px color-mix(in srgb, var(--violet) 60%, transparent);
       }
       header.bar .brand {
         font-weight: 600;
@@ -79,15 +83,15 @@
         overflow: hidden;
         border-bottom: 1px solid var(--border);
         background:
-          radial-gradient(60% 120% at 50% 0%, rgba(167, 139, 250, 0.13), transparent 70%),
-          radial-gradient(50% 120% at 80% 0%, rgba(56, 189, 248, 0.1), transparent 70%);
+          radial-gradient(60% 120% at 50% 0%, color-mix(in srgb, var(--violet) 13%, transparent), transparent 70%),
+          radial-gradient(50% 120% at 80% 0%, color-mix(in srgb, var(--sky) 10%, transparent), transparent 70%);
       }
       .hero h1 {
         margin: 0;
         font-size: clamp(2rem, 6vw, 3.4rem);
         font-weight: 700;
         letter-spacing: -0.03em;
-        background: linear-gradient(135deg, #ffffff 0%, var(--violet) 55%, var(--sky) 100%);
+        background: linear-gradient(135deg, var(--ink) 0%, var(--violet) 55%, var(--sky) 100%);
         -webkit-background-clip: text;
         background-clip: text;
         color: transparent;
@@ -164,15 +168,15 @@
       }
       .pill.live {
         color: var(--violet);
-        border: 1px solid rgba(167, 139, 250, 0.45);
+        border: 1px solid color-mix(in srgb, var(--violet) 45%, transparent);
       }
       .pill.design {
         color: var(--sky);
-        border: 1px solid rgba(56, 189, 248, 0.4);
+        border: 1px solid color-mix(in srgb, var(--sky) 40%, transparent);
       }
       .pill.vision {
-        color: #fbbf24;
-        border: 1px solid rgba(251, 191, 36, 0.45);
+        color: var(--po-warn);
+        border: 1px solid color-mix(in srgb, var(--po-warn) 45%, transparent);
       }
       section.feat > .lede {
         color: var(--muted);
@@ -194,11 +198,11 @@
       code {
         font-family: ui-monospace, SFMono-Regular, monospace;
         font-size: 0.85em;
-        background: rgba(255, 255, 255, 0.06);
+        background: color-mix(in srgb, var(--po-text) 9%, transparent);
         border: 1px solid var(--border);
         border-radius: 0.35rem;
         padding: 0.05rem 0.35rem;
-        color: #c4b5fd;
+        color: var(--po-accent-soft);
       }
       .grid {
         display: grid;
@@ -233,10 +237,10 @@
         padding: 1.2rem 1.35rem 1.1rem;
         border-radius: 0.9rem;
         background:
-          radial-gradient(130% 150% at 0% 0%, rgba(167, 139, 250, 0.15), transparent 60%),
-          radial-gradient(130% 150% at 100% 100%, rgba(56, 189, 248, 0.12), transparent 62%),
+          radial-gradient(130% 150% at 0% 0%, color-mix(in srgb, var(--violet) 15%, transparent), transparent 60%),
+          radial-gradient(130% 150% at 100% 100%, color-mix(in srgb, var(--sky) 12%, transparent), transparent 62%),
           var(--card);
-        border: 1px solid rgba(167, 139, 250, 0.33);
+        border: 1px solid color-mix(in srgb, var(--violet) 33%, transparent);
         overflow: hidden;
       }
       .multiverse::before {
@@ -308,12 +312,12 @@
         transform: translateY(-1px);
       }
       a.primary {
-        color: #1a0a2e;
+        color: var(--po-app);
         background: linear-gradient(135deg, var(--violet), var(--sky));
       }
       a.ghost {
         color: var(--ink);
-        background: rgba(255, 255, 255, 0.05);
+        background: color-mix(in srgb, var(--po-text) 7.5%, transparent);
         border: 1px solid var(--border);
       }
     </style>
@@ -326,6 +330,7 @@
       <a class="navlink" href="/">Home</a>
       <a class="navlink" href="/console">Console</a>
       <a class="navlink" href="/harness">Harness</a>
+      <span id="barTheme" style="margin-left: 1.1rem"></span>
     </header>
 
     <div class="hero">
@@ -672,5 +677,8 @@
         <a class="btn ghost" href="/">Back to home</a>
       </div>
     </main>
+    <script>
+      if (window.poMountThemeToggle) poMountThemeToggle(document.getElementById("barTheme"));
+    </script>
   </body>
 </html>
