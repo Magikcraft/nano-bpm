@@ -457,17 +457,124 @@ a new class of question.
 
 ## 9. Distributed runtime and heterogeneity
 
-> DRAFTING NOTE. Points: **Falcon** bidirectional WebSocket protocol (additive
-> native protocol; contrast Zeebe's gRPC long‑poll `LongPollingActivateJobsHandler`
-> + broker fanout `RoundRobinActivateJobsHandler`, and the newer push
-> `StreamJobsHandler`/`ClientStreamer`). Leader‑local activation + lease digest
-> (ADR 0002). **Durability as a spectrum** (ADR 0003): Zeebe uses Atomix Raft with
-> fixed majority quorum (`SimpleVoteQuorum` = n/2+1) and *no configurable
-> durability tiers*; Nano adds a leader‑durable tier + app‑driven auto‑recovery,
-> separating local‑journal durability (`sync`/`async`) from replication durability.
-> Heterogeneous clusters: nodes hit throughput/memory ceilings independently;
-> placement + fairness + self‑protection make the cluster degrade gracefully
-> rather than as a monolith.
+If §6 is the control system, §9 is the machinery it runs on: how work is delivered
+over the wire, where a job's lease lives, how far durability is allowed to bend,
+and how a cluster of *unequal* nodes behaves when parts of it fill up. In each case
+the old paradigm made a sound, conservative choice; Nano, working under the
+drop-in constraint of §4, keeps the client-facing contract and revisits the choice
+underneath it.
+
+### 9.1 The wire: two generations of closing the loop
+
+Zeebe's own history is instructive, because it is already a story of the loop
+being closed incrementally. The first generation of job delivery is a gRPC
+**long-poll**: a worker calls `ActivateJobs` and the gateway holds the request
+open (`LongPollingActivateJobsHandler`) while fanning demand across partitions
+round-robin (`RoundRobinActivateJobsHandler`), returning when work appears. The
+second generation is **push**: the worker opens a job stream and the broker
+pushes jobs to it as they arrive (`StreamJobsHandler`,
+`transport/.../ClientStreamer`), removing the poll latency entirely. That
+progression — poll, then push — is the same instinct that animates §6: move the
+initiative toward the system, let the server hand out work as it becomes
+available.
+
+Falcon (defined in §6) takes that trajectory to its conclusion and adds the piece
+neither generation carries: a **single credit-metered window** that unifies push
+delivery *and* the write path (create/complete/fail) over one socket, so the same
+backpressure signal that governs job push also governs instance admission. It is
+an **additive native protocol**, not a replacement: a Nano cluster still speaks
+the full Camunda 8 gRPC/REST surface (§4), so an unmodified C8 client — long-poll
+or job-stream — works unchanged. Falcon is the "faster if you opt in" path, and
+its advantage is not merely a different framing but that admission and delivery
+share one credit account. Compatible by default; unified if you choose it.
+
+The choice of **WebSocket** rather than gRPC for that native path is deliberate
+and field-driven. gRPC is technically capable, but a decade of customer
+deployments surfaced recurring *operational* friction that had nothing to do with
+the protocol's semantics: HTTP/2-aware load balancers and proxies, TLS/ALPN
+negotiation, corporate network middleboxes, and a code-generation toolchain that
+each deployment had to keep working. A WebSocket rides ordinary HTTP(S) that every
+proxy, gateway, and firewall already understands, and needs no per-language stub
+generation to speak. Falcon trades gRPC's schema-tooling for a transport that
+tends to *just connect* through the infrastructure customers actually run — a
+choice made not for elegance but because the friction was real and repeatedly
+paid.
+
+### 9.2 Where the lease lives
+
+A job moves create → activate → complete. The subtle observation (ADR 0002) is
+that only two of those three record durable *progress*; **activation records a
+lease**, not progress — a `worker` and a `deadline`, whose sole cross-replica
+effect is the latch the completion guard reads. Yet under RF>1 the naïve design
+replicates all three, so every job costs **three quorum commits**, and, worse,
+per-worker activation fragments into many small commits that compete with the
+create/complete traffic that actually matters (measured: ~1425 jobs/s at 8 workers
+*collapsing* to ~196 at 16 as activation floods the commit budget).
+
+Because the system is **at-least-once by construction** — an overrun lease is
+reclaimed and the job redelivered, so workers are idempotent regardless —
+replicating the lease buys no correctness, only a narrower window of duplicate work
+on the rare event of leader failover. So Nano makes it optional
+(`NANOBPMN_REPLICATE_ACTIVATION`): in **leader-local** mode the lease lives in the
+leader's single-writer actor only, each job costs **two quorum commits instead of
+three**, and activation stops competing for the commit budget. Possession of the
+job key *is* the capability (keys are only ever minted by activation), so relaxing
+the replicated latch does not let a client complete a job it never held. The cost
+is stated honestly: a leader-local lease does not survive failover, so a new leader
+re-dispatches in-flight jobs immediately — a bounded, at-least-once-tolerable
+duplication, not a correctness loss. This is a choice Zeebe's uniform replicated
+lifecycle does not separate out, available to Nano only because it distinguishes
+*lease* from *progress*.
+
+### 9.3 Durability as a spectrum, not a constant
+
+Zeebe replicates every partition through Atomix Raft with a **fixed majority
+quorum** — `SimpleVoteQuorum.java:31` computes `members.size() / 2 + 1` — and
+exposes no operator knob to trade that quorum against latency. It is the correct
+conservative default: committed means durable on a majority, full stop. But it
+means every `create`/`complete` under RF=3 pays a synchronous cross-node quorum
+round-trip on the client's critical path — fine under concurrency (group commit
+amortizes to ~33k jobs/s at 64 workers) but a hard latency *floor* on
+low-concurrency work (~10 ms/job ≈ one quorum round-trip).
+
+Nano treats durability as **two orthogonal dials**, not one constant (ADR 0003):
+
+- **Local journal durability** — `NANOBPMN_DURABILITY=sync|async`: ack after
+  `fsync` (survives power loss, ~4 ms media barrier on the path) versus ack after
+  the page-cache write with amortized fsync (survives process crash via replay;
+  loses a bounded unfsynced tail on OS crash). This axis explicitly "mirrors
+  Zeebe's async-exporter model."
+- **Replication durability** — `NANOBPMN_REPLICATION=quorum|leader-durable`: the
+  Kafka `acks=all` vs `acks=1` model applied to the workflow command log. `quorum`
+  is today's behaviour; `leader-durable` acks on the leader's local durable append
+  and ships the log to followers in the background, tracking a committed-vs-
+  replicated watermark, taking the network round-trip off the critical path at the
+  cost of an un-replicated tail on simultaneous leader loss — the same *shape* of
+  window as the local `async` knob, but across the replication axis.
+
+Both bounded-loss modes are consistent with the at-least-once contract (a lost
+completion tail redelivers; a lost create tail is retried by an at-least-once
+producer) and neither is allowed to violate ordering or exactly-once *within* what
+it acks. The point is not that `leader-durable` is better — it is opt-in and
+default-off, and quorum remains the safe default — but that durability becomes a
+**position on a spectrum the operator chooses per workload**, rather than a single
+architectural constant.
+
+### 9.4 Heterogeneity: a cluster of unequal nodes
+
+The old paradigm's mental model is a fleet of interchangeable brokers. Nano
+assumes the opposite: nodes with different CPU, memory, and momentary load — a
+developer laptop beside a cloud VM, or simply nodes that filled up at different
+times. This is where §6's controllers pay off as a *distributed* system rather than
+a single valve. Each node senses its own throughput and memory ceilings
+independently (§8, §11); load is gossiped so placement can steer new creates toward
+the node most able to absorb them; a saturated owner sheds a forwarded create back
+to ingress for rerouting rather than queueing it; and backlog-weighted fairness
+keeps the drain equitable across the uneven fleet. The result is a cluster that
+degrades **gracefully and locally** — the busy node slows or sheds while the rest
+keep serving — rather than as a monolith that stalls when its weakest partition
+does. Heterogeneity stops being a failure mode to engineer away and becomes an
+operating assumption the control loop is built to exploit.
 
 ---
 
