@@ -327,6 +327,13 @@ impl Engine {
     /// Pure: it only moves an `Arc` out of the map. The host must persist the
     /// returned payload and rehydrate it (via [`Engine::rehydrate_variables`])
     /// before any command that reads this instance's variables.
+    ///
+    /// Only the **root** variable payload is shed — the dominant per-instance
+    /// cost of a job-parked backlog. Any non-root scope-local maps
+    /// (`scope_variables`: sub-process / multi-instance locals) stay resident;
+    /// they ride with the control snapshot and are typically small, and keeping
+    /// them in place means a rehydrate need only restore the root before the host
+    /// recomputes the merged view via [`Engine::element_variables`].
     pub fn spill_variables(&mut self, key: Key) -> Option<Arc<HashMap<String, Value>>> {
         let instance = self.state.instances.get_mut(&key)?;
         if instance.variables_spilled || instance.variables.is_empty() {
@@ -344,6 +351,24 @@ impl Engine {
             instance.variables = variables;
             instance.variables_spilled = false;
         }
+    }
+
+    /// The merged, scope-resolved variable view an activated job on
+    /// `element_instance_key` should carry: the element's own scope plus every
+    /// ancestor scope up to the (now-resident) root, nearer scopes shadowing
+    /// farther ones. The host recomputes this **after** rehydrating a spilled
+    /// instance's root variables, so a job on a nested scope (sub-process /
+    /// multi-instance body or child) regains its full view — the scope-local
+    /// bindings stay resident through a spill (only the root payload is shed),
+    /// but the merged snapshot handed to a worker must fold the freshly restored
+    /// root back in. For a flat (root-only) instance this returns the shared root
+    /// `Arc` unchanged, so the flat activation path is byte-identical.
+    pub fn element_variables(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Arc<HashMap<String, Value>> {
+        self.variables_for_element(instance_key, element_instance_key)
     }
 
     /// Picks up to `limit` *resident* spill candidates: `Active` instances that
@@ -411,10 +436,22 @@ impl Engine {
             .instances
             .values()
             .map(|i| {
-                i.variables
+                let root: u64 = i
+                    .variables
                     .values()
                     .map(crate::model::Value::approx_bytes)
-                    .sum::<u64>()
+                    .sum();
+                // Non-root scope-local maps (sub-process / MI-child locals) stay
+                // resident through a variable spill, so they count toward the
+                // resident footprint too — for a flat (root-only) instance this
+                // inner sum is zero and the flat gauge is unchanged.
+                let scoped: u64 = i
+                    .scope_variables
+                    .values()
+                    .flat_map(|m| m.values())
+                    .map(crate::model::Value::approx_bytes)
+                    .sum();
+                root + scoped
             })
             .sum()
     }

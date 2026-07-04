@@ -528,6 +528,90 @@ fn variable_spill_selects_only_job_parked_instances() {
 }
 
 #[test]
+fn spilling_a_nested_scope_instance_preserves_the_merged_job_view() {
+    // Regression (Part C spill): a variable spill sheds only the ROOT payload;
+    // the sub-process scope-local map stays resident. After the host rehydrates
+    // the root, `element_variables` must fold both back together so a job on the
+    // nested scope regains its full view (root `seed` + the sub-process-local
+    // `scoped`) — not the root-only payload read back from the spill store.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let eik = engine.pending_jobs()[0].element_instance_key;
+
+    // The full merged view before any spill: root + sub-process local.
+    let before = engine.element_variables(inst, eik);
+    assert_eq!(before.get("seed"), Some(&Value::Int(4)));
+    assert_eq!(before.get("scoped"), Some(&Value::Int(5)));
+
+    // Spill sheds only the root payload; the scope-local map stays resident.
+    let payload = engine.spill_variables(inst).expect("spillable");
+    assert!(engine.instance(inst).unwrap().variables.is_empty());
+    assert!(
+        !engine.instance(inst).unwrap().scope_variables.is_empty(),
+        "the sub-process scope-local map stays resident through a root spill"
+    );
+    // While spilled the root is gone, so a naive read is scope-only — exactly
+    // why the host rehydrates before it reads the worker's snapshot.
+    assert_eq!(engine.element_variables(inst, eik).get("seed"), None);
+
+    // Rehydrate the root; the merged view is whole again.
+    engine.rehydrate_variables(inst, payload);
+    let after = engine.element_variables(inst, eik);
+    assert_eq!(after.get("seed"), Some(&Value::Int(4)));
+    assert_eq!(after.get("scoped"), Some(&Value::Int(5)));
+}
+
+#[test]
+fn resident_variable_bytes_counts_scope_local_maps() {
+    // The resident-footprint gauge must include non-root scope-local maps, which
+    // stay resident through a variable spill. A nested-scope instance therefore
+    // reports MORE than the same root payload alone, and spilling the root leaves
+    // the scope-local bytes still attributed as resident.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    assert!(!engine.instance(inst).unwrap().scope_variables.is_empty());
+
+    let with_scope = engine.resident_variable_bytes();
+    assert!(with_scope > 0);
+
+    // After shedding the root, the scope-local bytes are still counted resident.
+    let _ = engine.spill_variables(inst).expect("spillable");
+    let scope_only = engine.resident_variable_bytes();
+    assert!(
+        scope_only > 0,
+        "scope-local maps stay resident and keep contributing bytes after a root spill"
+    );
+    assert!(
+        scope_only < with_scope,
+        "shedding the root payload reduces the resident footprint"
+    );
+}
+
+#[test]
 fn leased_job_instance_is_still_spillable() {
     // Regression pin (ADR 0012): activating (leasing) a job to a worker keeps
     // the job indexed in `jobs_by_instance` and only adds it to `activated_jobs`,
@@ -731,6 +815,49 @@ fn engine_snapshot_round_trips_state_and_key_generator() {
         "next minted key {k3} must not collide with a pre-snapshot key"
     );
     assert_ne!(k3, parked);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn engine_snapshot_round_trips_scope_variables_and_parents() {
+    // Part C snapshot compatibility: a nested-scope instance's scope tree
+    // (`scope_variables` + `scope_parents`) must survive a serialized snapshot
+    // round-trip so a node rebuilt from a snapshot serves the same merged view.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let eik = engine.pending_jobs()[0].element_instance_key;
+    // The sub-process scope is populated (input mapping created `scoped`).
+    assert!(!engine.instance(inst).unwrap().scope_variables.is_empty());
+    assert!(!engine.instance(inst).unwrap().scope_parents.is_empty());
+    let merged_before = engine.element_variables(inst, eik);
+
+    let serialized = serde_json::to_vec(&engine.snapshot()).expect("serializes");
+    let decoded: EngineSnapshot = serde_json::from_slice(&serialized).expect("deserializes");
+    let restored = Engine::from_snapshot(decoded);
+
+    assert_eq!(
+        restored.state(),
+        engine.state(),
+        "restored state (scope tree included) equals the source byte-for-byte"
+    );
+    // The merged scoped view is reproduced exactly on the restored engine.
+    assert_eq!(restored.element_variables(inst, eik), merged_before);
+    assert_eq!(
+        restored.element_variables(inst, eik).get("scoped"),
+        Some(&Value::Int(5))
+    );
 }
 
 #[test]
