@@ -4879,8 +4879,12 @@ fn input_mapping_merges_before_job_activation() {
         .iter()
         .find_map(|e| e.instance_key())
         .unwrap();
-    assert_eq!(io_var(&engine, inst, "y"), Some(Value::Int(2)));
-    // The activated job snapshots the mapped variable.
+    assert_eq!(
+        io_var(&engine, inst, "y"),
+        None,
+        "an input mapping creates a variable LOCAL to the activity scope, not at the instance root"
+    );
+    // The activated job still sees the mapped variable (its own scope shadows root).
     let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
     assert_eq!(job.variables.get("y"), Some(&Value::Int(2)));
 }
@@ -4973,11 +4977,61 @@ fn input_mapping_with_dotted_target_builds_nested_context() {
     let mut expected = std::collections::BTreeMap::new();
     expected.insert("id".to_string(), Value::Str("A1".to_string()));
     expected.insert("total".to_string(), Value::Int(12));
-    assert_eq!(io_var(&engine, inst, "order"), Some(Value::Map(expected)));
+    // The dotted input mapping builds its nested context LOCAL to the activity
+    // scope, seeded from the enclosing `order`, so the activated job sees the
+    // merged value while the root `order` keeps only its original members.
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(job.variables.get("order"), Some(&Value::Map(expected)));
+    let mut root_order = std::collections::BTreeMap::new();
+    root_order.insert("id".to_string(), Value::Str("A1".to_string()));
+    assert_eq!(io_var(&engine, inst, "order"), Some(Value::Map(root_order)));
+}
+
+#[test]
+fn input_mapped_local_variable_is_not_visible_to_a_later_activity() {
+    // `y = x + 1` is an input mapping on task `t`. Input mappings are LOCAL to the
+    // activity scope (Zeebe semantics), so `y` is dropped when `t` completes and
+    // is never visible at the root scope nor to the downstream task `u`'s job.
+    let def = ProcessBuilder::new("io-local")
+        .start_event("s")
+        .service_task("t", "work-t")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=x + 1".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .service_task("u", "work-u")
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "u")
+        .connect("u", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("x".to_string(), Value::Int(1));
+    let inst = engine
+        .apply_command(Command::create_instance_with("io-local", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    // `t`'s job sees the local `y`; complete it.
+    let job_t = engine.activate_jobs("work-t", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(job_t)).unwrap();
+    // `u` activates; its job must NOT see `y` (it was local to `t`).
+    let job_u = &engine.activate_jobs("work-u", "w", 1, 60_000, 0)[0];
+    assert_eq!(job_u.variables.get("y"), None);
+    assert_eq!(io_var(&engine, inst, "y"), None);
 }
 
 // --- FEEL timer expressions -------------------------------------------------
-
 #[test]
 fn feel_duration_timer_evaluates_variable() {
     // A timer intermediate catch whose timeDuration is a FEEL expression

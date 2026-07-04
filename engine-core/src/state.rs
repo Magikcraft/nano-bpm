@@ -964,6 +964,11 @@ pub fn apply(state: &mut State, event: &Event) {
                 // Drop any multi-instance child local overlay (a no-op for
                 // ordinary elements); a completed/cancelled child never needs it.
                 instance.element_locals.remove(element_instance_key);
+                // Zeebe drops an activity scope's local variables (e.g. those
+                // created by its input mappings) when the activity completes.
+                // A no-op for elements that never opened a scope.
+                instance.scope_parents.remove(element_instance_key);
+                instance.scope_variables.remove(element_instance_key);
             }
         }
 

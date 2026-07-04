@@ -2301,17 +2301,33 @@ impl Engine {
         ];
         let mut followups = Vec::new();
 
-        // Input mappings (zeebe:input): evaluate against the instance variables
-        // and merge the result before the element's job/subscription is created,
-        // so a later job activation snapshots the mapped values.
+        // Input mappings (zeebe:input): evaluate against the variables visible to
+        // the activating element and create the mapped values LOCAL to the
+        // element's own scope (Zeebe semantics) — visible to the element's job or
+        // inner flow, not propagated to the parent, and dropped when the element
+        // completes. A sub-process keeps its inputs at the root scope for now;
+        // hierarchical sub-process scoping lands in Part C phase 3.
         let inputs = self.io_inputs(instance_key, &element_id);
         if !inputs.is_empty() {
             let updates = self.eval_io_mappings(instance_key, &inputs);
             if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
+                if matches!(kind, Some(ElementKind::SubProcess { .. })) {
+                    events.push(Event::VariablesUpdated {
+                        instance_key,
+                        variables: updates,
+                    });
+                } else {
+                    events.push(Event::VariableScopeCreated {
+                        instance_key,
+                        scope_key: element_instance_key,
+                        parent_scope_key: scope,
+                    });
+                    events.push(Event::ScopedVariablesUpdated {
+                        instance_key,
+                        scope_key: element_instance_key,
+                        variables: updates,
+                    });
+                }
             }
         }
 
@@ -3042,21 +3058,23 @@ impl Engine {
                 variables: update.clone(),
             });
         }
-        // Output mappings (zeebe:output): evaluate against the instance variables
-        // (which already include any job/message result merged on completion, or
-        // a script task's result staged above) and merge the projected result
-        // before the outgoing flows are taken.
+        // Output mappings (zeebe:output): evaluate against the variables visible
+        // to this element instance — its own scope (including any input-mapped
+        // locals) layered over the enclosing scopes, plus any job/message result
+        // merged on completion, or a script task's result staged above — and merge
+        // the projected result (at the root scope) before the outgoing flows.
         let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
+            let visible = self.variables_for_element(instance_key, element_instance_key);
             let updates = match &script_update {
                 // The script result event is not applied to state until this
                 // step returns, so overlay it onto the eval context by hand.
                 Some(update) => {
-                    let mut vars = (*self.variables(instance_key)).clone();
+                    let mut vars = (*visible).clone();
                     vars.extend(update.clone());
                     self.eval_io_mappings_in(&vars, &outputs)
                 }
-                None => self.eval_io_mappings(instance_key, &outputs),
+                None => self.eval_io_mappings_in(&visible, &outputs),
             };
             if !updates.is_empty() {
                 events.push(Event::VariablesUpdated {
