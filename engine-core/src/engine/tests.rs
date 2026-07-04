@@ -6544,3 +6544,227 @@ fn destroying_a_scope_drops_its_local_variables() {
     assert!(!inst.scope_variables.contains_key(&child));
     assert!(!inst.scope_parents.contains_key(&child));
 }
+
+// ---------------------------------------------------------------------------
+// Zeebe variable-scope parity matrix (Part C phase: tests)
+//
+// Rounds out the ported Zeebe scope semantics beyond the single-level cases
+// above: deep (3-level) nesting with mid-level shadowing, parallel sibling
+// isolation, and local-write shadowing over an inherited root variable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deep_nesting_resolves_each_level_through_its_nearest_shadow_to_root() {
+    // root:   a=1, b=2, c=3
+    // middle: shadows b=20, adds d=40   (parent = root)
+    // leaf:   shadows c=300, adds e=500 (parent = middle)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[
+                ("a", Value::Int(1)),
+                ("b", Value::Int(2)),
+                ("c", Value::Int(3)),
+            ]),
+        },
+    );
+    let middle: Key = 910_001;
+    let leaf: Key = 910_002;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: middle,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: leaf,
+            parent_scope_key: middle,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: middle,
+            variables: vars(&[("b", Value::Int(20)), ("d", Value::Int(40))]),
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: leaf,
+            variables: vars(&[("c", Value::Int(300)), ("e", Value::Int(500))]),
+        },
+    );
+
+    let inst = engine.state.instances.get(&key).unwrap();
+
+    // The leaf sees: a from root, b from the middle shadow, c from its own
+    // shadow, d inherited from middle, e local.
+    let leaf_view = engine.visible_variables(inst, leaf);
+    assert_eq!(leaf_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(leaf_view.get("b"), Some(&Value::Int(20)));
+    assert_eq!(leaf_view.get("c"), Some(&Value::Int(300)));
+    assert_eq!(leaf_view.get("d"), Some(&Value::Int(40)));
+    assert_eq!(leaf_view.get("e"), Some(&Value::Int(500)));
+
+    // The middle sees its own shadow of b, root's c (NOT the leaf's), and never
+    // the leaf-local e.
+    let middle_view = engine.visible_variables(inst, middle);
+    assert_eq!(middle_view.get("b"), Some(&Value::Int(20)));
+    assert_eq!(middle_view.get("c"), Some(&Value::Int(3)));
+    assert_eq!(middle_view.get("e"), None);
+
+    // The root is untouched by any descendant shadow.
+    let root_view = engine.visible_variables(inst, key);
+    assert_eq!(root_view.get("b"), Some(&Value::Int(2)));
+    assert_eq!(root_view.get("c"), Some(&Value::Int(3)));
+    assert_eq!(root_view.get("d"), None);
+}
+
+#[test]
+fn parallel_sibling_scopes_are_isolated() {
+    // Two sibling scopes under the same root each shadow root `x` with a
+    // different value and add a private local. Neither sees the other's
+    // binding; the root is unchanged.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("x", Value::Int(1))]),
+        },
+    );
+    let left: Key = 920_001;
+    let right: Key = 920_002;
+    for sib in [left, right] {
+        apply_raw(
+            &mut engine,
+            Event::VariableScopeCreated {
+                instance_key: key,
+                scope_key: sib,
+                parent_scope_key: key,
+            },
+        );
+    }
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: left,
+            variables: vars(&[("x", Value::Int(10)), ("only_left", Value::Int(7))]),
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: right,
+            variables: vars(&[("x", Value::Int(20)), ("only_right", Value::Int(9))]),
+        },
+    );
+
+    let inst = engine.state.instances.get(&key).unwrap();
+    let left_view = engine.visible_variables(inst, left);
+    let right_view = engine.visible_variables(inst, right);
+
+    assert_eq!(left_view.get("x"), Some(&Value::Int(10)));
+    assert_eq!(left_view.get("only_left"), Some(&Value::Int(7)));
+    assert_eq!(
+        left_view.get("only_right"),
+        None,
+        "left cannot see the sibling's local"
+    );
+
+    assert_eq!(right_view.get("x"), Some(&Value::Int(20)));
+    assert_eq!(right_view.get("only_right"), Some(&Value::Int(9)));
+    assert_eq!(
+        right_view.get("only_left"),
+        None,
+        "right cannot see the sibling's local"
+    );
+
+    // Root's `x` is unchanged by either sibling's shadow.
+    assert_eq!(
+        engine.visible_variables(inst, key).get("x"),
+        Some(&Value::Int(1))
+    );
+}
+
+#[test]
+fn local_write_shadows_an_inherited_root_variable_until_the_scope_is_destroyed() {
+    // Zeebe input-mapping / `local=true` semantics: a local write of a name that
+    // exists only at root creates a child-scope SHADOW, leaving the root value
+    // intact; destroying the scope resurfaces the root value.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("x", Value::Int(1))]),
+        },
+    );
+    let child: Key = 930_001;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+
+    // local=true pins the write to the child scope even though `x` is a root var.
+    let writes = engine.propagate_variables(key, child, vars(&[("x", Value::Int(99))]), true);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, child);
+    for event in engine.propagated_updates(key, child, vars(&[("x", Value::Int(99))]), true) {
+        apply_raw(&mut engine, event);
+    }
+
+    let inst = engine.state.instances.get(&key).unwrap();
+    // Child shadows x=99; root still reads x=1.
+    assert_eq!(
+        engine.visible_variables(inst, child).get("x"),
+        Some(&Value::Int(99))
+    );
+    assert_eq!(
+        engine.visible_variables(inst, key).get("x"),
+        Some(&Value::Int(1))
+    );
+
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeDestroyed {
+            instance_key: key,
+            scope_key: child,
+        },
+    );
+    // The shadow is gone; the child key now resolves to root and reads x=1.
+    let inst = engine.state.instances.get(&key).unwrap();
+    assert_eq!(
+        engine.visible_variables(inst, key).get("x"),
+        Some(&Value::Int(1))
+    );
+    assert!(!inst.scope_variables.contains_key(&child));
+}
