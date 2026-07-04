@@ -9,12 +9,23 @@ import { credits } from "./creditsData";
 // the wider community whose contributions live on across the product.
 //
 // The scroll is driven imperatively (requestAnimationFrame over a scrollable
-// container) rather than a CSS transform, so the content is always visible
-// from the top — even when paused or when the OS requests reduced motion — and
-// the reader can scroll manually at any time.
+// container) rather than a CSS transform, so the reader can scroll manually at
+// any time and reduced-motion is honoured. Like a film end-roll, the content
+// begins *below* the viewport (a full-height top spacer) and rises up from the
+// bottom edge, giving the title card a beat to be read before it moves.
+//
+// An atmospheric ambient-electronic bed plays while the roll is open: "Impact
+// Prelude" by Kevin MacLeod (incompetech.com), Creative Commons BY 4.0 — hence
+// the attribution in the roll itself. It is best-effort (streamed, looped) and
+// muteable; browsers that block autoplay simply start silent until the toggle.
 
 const SPEEDS = [0.5, 1, 1.5, 2] as const;
 const PX_PER_SEC = 42;
+
+// "Impact Prelude" — Kevin MacLeod (incompetech.com), CC BY 4.0. Streamed as a
+// looping ambient bed; a plain <audio src> needs no CORS for playback.
+const MUSIC_URL =
+  "https://incompetech.com/music/royalty-free/mp3-royaltyfree/Impact%20Prelude.mp3";
 
 export default function Credits() {
   const reduced =
@@ -23,7 +34,10 @@ export default function Credits() {
 
   const [playing, setPlaying] = useState(!reduced);
   const [speed, setSpeed] = useState<number>(1);
+  const [musicOn, setMusicOn] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const spacerRef = useRef<HTMLDivElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
 
   // Keep the latest playing/speed in refs so the rAF loop (started once) reads
   // current values without re-subscribing.
@@ -35,6 +49,21 @@ export default function Credits() {
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
+
+    // Size the top spacer to a full viewport of the scroll container so the
+    // roll starts empty and the first card rises in from the bottom edge. For
+    // reduced motion (no auto-scroll), jump past the spacer so content is
+    // immediately readable at the top instead of showing an empty screen.
+    const sizeSpacer = () => {
+      if (spacerRef.current) {
+        spacerRef.current.style.height = `${el.clientHeight}px`;
+      }
+    };
+    sizeSpacer();
+    if (!playingRef.current) el.scrollTop = el.clientHeight;
+    const ro = new ResizeObserver(sizeSpacer);
+    ro.observe(el);
+
     let raf = 0;
     let last = performance.now();
     // Sub-pixel accumulator so slow speeds still advance smoothly.
@@ -51,7 +80,7 @@ export default function Credits() {
           if (max <= 0) {
             // content not measured yet; try again next frame
           } else if (el.scrollTop >= max - 1) {
-            el.scrollTop = 0; // loop the roll
+            el.scrollTop = 0; // loop the roll (back to the empty bottom-start)
           } else {
             el.scrollTop = Math.min(el.scrollTop + whole, max);
           }
@@ -60,8 +89,42 @@ export default function Credits() {
       raf = requestAnimationFrame(step);
     };
     raf = requestAnimationFrame(step);
-    return () => cancelAnimationFrame(raf);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
   }, []);
+
+  // Best-effort: try to start the ambient bed on mount (navigating here is a
+  // user gesture, which many browsers accept). If autoplay is blocked, the
+  // catch leaves it off and the ♪ control lets the reader start it.
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.volume = 0.55;
+    audio
+      .play()
+      .then(() => setMusicOn(true))
+      .catch(() => setMusicOn(false));
+    return () => {
+      audio.pause();
+    };
+  }, []);
+
+  const toggleMusic = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      audio.volume = 0.55;
+      audio
+        .play()
+        .then(() => setMusicOn(true))
+        .catch(() => setMusicOn(false));
+    } else {
+      audio.pause();
+      setMusicOn(false);
+    }
+  };
 
   const restart = () => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
@@ -76,6 +139,17 @@ export default function Credits() {
 
       {/* controls */}
       <div className="absolute right-4 top-4 z-20 flex items-center gap-2 text-xs">
+        <button
+          onClick={toggleMusic}
+          title={musicOn ? "Mute ambient music" : "Play ambient music"}
+          className={`rounded-md border px-3 py-1.5 ${
+            musicOn
+              ? "border-violet-600 bg-violet-500/30 text-violet-200"
+              : "border-zinc-700 bg-zinc-900/80 text-zinc-400 hover:bg-zinc-800"
+          }`}
+        >
+          {musicOn ? "♪ Music" : "♪ Muted"}
+        </button>
         <button
           onClick={() => setPlaying((p) => !p)}
           className="rounded-md border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-300 hover:bg-zinc-800"
@@ -105,31 +179,39 @@ export default function Credits() {
         </div>
       </div>
 
+      <audio ref={audioRef} src={MUSIC_URL} loop preload="none" />
+
       <div ref={scrollRef} className="h-full overflow-y-auto">
-        <div className="mx-auto flex w-full max-w-3xl flex-col items-center px-6 pb-40 text-center">
+        <div className="mx-auto flex w-full max-w-4xl flex-col items-center px-6 pb-40 text-center">
+          {/* Full-viewport spacer so the roll starts empty and the title card
+              rises up from the bottom edge (sized imperatively in the effect). */}
+          <div ref={spacerRef} aria-hidden="true" className="w-full shrink-0" />
+
           {/* Title card */}
           <div className="pt-16">
-            <div className="text-5xl font-semibold tracking-tight">nano BPM</div>
-            <div className="mt-3 text-sm uppercase tracking-[0.35em] text-violet-300">
+            <div className="text-7xl font-semibold tracking-tight sm:text-8xl">
+              nano BPM
+            </div>
+            <div className="mt-5 text-lg uppercase tracking-[0.35em] text-violet-300">
               An Advanced Research Prototype
             </div>
-            <p className="mx-auto mt-8 max-w-xl text-sm leading-relaxed text-zinc-400">
+            <p className="mx-auto mt-10 max-w-2xl text-xl leading-relaxed text-zinc-300">
               Nano is an Advanced Research Prototype, incorporating a decade of
               experience and expertise of Camunda Engineering.
             </p>
 
-            <div className="mx-auto mt-12 max-w-xl">
-              <p className="text-base italic leading-relaxed text-zinc-200">
+            <div className="mx-auto mt-16 max-w-2xl">
+              <p className="text-3xl italic leading-relaxed text-zinc-100 sm:text-4xl">
                 He aha te mea nui o te ao?
                 <br />
                 He tāngata, he tāngata, he tāngata
               </p>
-              <p className="mx-auto mt-5 max-w-lg text-sm leading-relaxed text-zinc-400">
+              <p className="mx-auto mt-7 max-w-xl text-xl leading-relaxed text-zinc-400">
                 What is the most precious thing in the world?
                 <br />
                 It is people, it is people, it is people
               </p>
-              <p className="mt-4 text-xs uppercase tracking-[0.25em] text-zinc-600">
+              <p className="mt-6 text-sm uppercase tracking-[0.25em] text-zinc-600">
                 Māori tikanga · New Zealand
               </p>
             </div>
@@ -181,12 +263,12 @@ export default function Credits() {
           <Gap />
 
           <Section title="The Camunda Engineering Community">
-            <p className="mb-6 max-w-lg text-xs leading-relaxed text-zinc-500">
+            <p className="mb-6 max-w-lg text-sm leading-relaxed text-zinc-500">
               {credits.counts.total} contributors across the Camunda platform,
               Zeebe, FEEL, and the bpmn-io modeling toolkit — everyone whose work
               Nano stands on.
             </p>
-            <div className="grid grid-cols-2 gap-x-10 gap-y-1.5 text-sm text-zinc-300 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-x-10 gap-y-2 text-lg text-zinc-300 sm:grid-cols-3">
               {credits.cast.map((n) => (
                 <div key={n} className="truncate">
                   {n}
@@ -198,15 +280,19 @@ export default function Credits() {
           <Gap />
 
           <div className="pt-8 text-center">
-            <div className="text-sm uppercase tracking-[0.3em] text-zinc-500">
+            <div className="text-base uppercase tracking-[0.3em] text-zinc-500">
               With gratitude
             </div>
-            <div className="mt-4 text-2xl font-semibold tracking-tight text-zinc-200">
+            <div className="mt-5 text-4xl font-semibold tracking-tight text-zinc-100">
               Camunda Engineering
             </div>
-            <div className="mt-8 text-xs text-zinc-600">
+            <div className="mx-auto mt-10 max-w-md text-sm text-zinc-600">
               Names are engraved inside the machine, the way the Macintosh and
               Amiga teams signed their cases.
+            </div>
+            <div className="mx-auto mt-8 max-w-md text-xs leading-relaxed text-zinc-700">
+              Music: “Impact Prelude” by Kevin MacLeod (incompetech.com) ·
+              Licensed under Creative Commons: By Attribution 4.0
             </div>
           </div>
         </div>
@@ -224,10 +310,10 @@ function Section({
 }) {
   return (
     <section className="flex w-full flex-col items-center">
-      <h2 className="mb-6 text-xs font-bold uppercase tracking-[0.3em] text-zinc-500">
+      <h2 className="mb-8 text-sm font-bold uppercase tracking-[0.3em] text-zinc-500">
         {title}
       </h2>
-      <div className="flex w-full flex-col items-center gap-5">{children}</div>
+      <div className="flex w-full flex-col items-center gap-7">{children}</div>
     </section>
   );
 }
@@ -235,10 +321,10 @@ function Section({
 function BigName({ name, sub }: { name: string; sub?: string }) {
   return (
     <div>
-      <div className="text-xl font-medium tracking-tight text-white">
+      <div className="text-3xl font-medium tracking-tight text-white sm:text-4xl">
         {name}
       </div>
-      {sub && <div className="mt-1 text-xs text-zinc-500">{sub}</div>}
+      {sub && <div className="mt-1.5 text-sm text-zinc-500">{sub}</div>}
     </div>
   );
 }
@@ -254,13 +340,13 @@ function NamedLine({
 }) {
   return (
     <div className="flex flex-col items-center">
-      <div className="text-xs font-semibold uppercase tracking-widest text-violet-300">
+      <div className="text-sm font-semibold uppercase tracking-widest text-violet-300">
         {lead}
       </div>
-      <div className="mt-1 text-xl font-medium tracking-tight text-white">
+      <div className="mt-1.5 text-3xl font-medium tracking-tight text-white sm:text-4xl">
         {name}
       </div>
-      {sub && <div className="mt-0.5 text-xs text-zinc-500">{sub}</div>}
+      {sub && <div className="mt-1 text-sm text-zinc-500">{sub}</div>}
     </div>
   );
 }
