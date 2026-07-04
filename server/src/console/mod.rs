@@ -1916,7 +1916,7 @@ async fn projects_list() -> Response {
         "projects": out,
         "denoAvailable": sup.deno_available(),
         "platforms": projects::PLATFORMS,
-        "templates": projects::TEMPLATES.iter().map(|(id, label)| serde_json::json!({"id": id, "label": label})).collect::<Vec<_>>(),
+        "templates": projects::project_templates(),
         "extensions": extensions_overview(),
     }))
     .into_response()

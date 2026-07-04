@@ -75,6 +75,40 @@ pub const TEMPLATES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The scaffolder's full template menu: the offline built-ins from [`TEMPLATES`]
+/// merged with templates contributed by installed extension packs. Built-ins win
+/// on id collision so a pack cannot silently shadow an offline scaffold.
+///
+/// Each entry carries a `source` discriminator (`"builtin"` or `"pack"`); pack
+/// entries also include a `pack` field with the contributing extension id, so
+/// the Console can render provenance in the New Project picker.
+pub fn project_templates() -> Vec<serde_json::Value> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<serde_json::Value> = TEMPLATES
+        .iter()
+        .map(|(id, label)| {
+            seen.insert((*id).to_string());
+            serde_json::json!({"id": id, "label": label, "source": "builtin"})
+        })
+        .collect();
+    for ext in super::extensions::all_extensions() {
+        if ext.builtin {
+            continue;
+        }
+        for t in &ext.templates {
+            if seen.insert(t.id.clone()) {
+                out.push(serde_json::json!({
+                    "id": t.id,
+                    "label": t.label,
+                    "source": "pack",
+                    "pack": ext.id,
+                }));
+            }
+        }
+    }
+    out
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1971,6 +2005,56 @@ mod tests {
         let dir = root.join("gdemo");
         assert!(dir.join("public/index.html").is_file());
         assert!(dir.join("main.ts").is_file());
+    }
+
+    #[test]
+    fn project_templates_merges_pack_templates_after_builtins() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = std::env::temp_dir().join(format!("nano-ext-tpl-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ext);
+        let pack = ext.join("nanobpm__app-embedded-nano");
+        std::fs::create_dir_all(pack.join("templates/embedded-starter")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"embedded-nano","kind":"app","displayName":"Embedded μ-nano app",
+                 "templates":[{"id":"embedded-starter","label":"Embedded engine"}]}"#,
+        )
+        .unwrap();
+        // Also drop a pack that shadows a built-in id; the built-in must win.
+        let shadow = ext.join("nanobpm__shadow");
+        std::fs::create_dir_all(shadow.join("templates/starter")).unwrap();
+        std::fs::write(
+            shadow.join("nano-ide.ext.json"),
+            r#"{"id":"shadow","kind":"app","displayName":"Shadow",
+                 "templates":[{"id":"starter","label":"Should not appear"}]}"#,
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let templates = project_templates();
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&ext);
+
+        // Built-ins come first, in order, each tagged source=builtin.
+        for (i, (id, _label)) in TEMPLATES.iter().enumerate() {
+            assert_eq!(templates[i]["id"].as_str(), Some(*id));
+            assert_eq!(templates[i]["source"].as_str(), Some("builtin"));
+        }
+        // The pack template appears exactly once, after the built-ins, with pack provenance.
+        let pack_hits: Vec<_> = templates
+            .iter()
+            .filter(|t| t["id"] == "embedded-starter")
+            .collect();
+        assert_eq!(pack_hits.len(), 1, "pack template should appear once");
+        assert_eq!(pack_hits[0]["source"].as_str(), Some("pack"));
+        assert_eq!(pack_hits[0]["pack"].as_str(), Some("embedded-nano"));
+        assert_eq!(pack_hits[0]["label"].as_str(), Some("Embedded engine"));
+        // The shadowing pack's `starter` must not have overridden the built-in
+        // (only one entry with id="starter", and its source is "builtin").
+        let starter_hits: Vec<_> = templates.iter().filter(|t| t["id"] == "starter").collect();
+        assert_eq!(starter_hits.len(), 1);
+        assert_eq!(starter_hits[0]["source"].as_str(), Some("builtin"));
     }
 
     #[test]
