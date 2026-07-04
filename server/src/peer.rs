@@ -317,6 +317,14 @@ impl PeerLink {
         self.send_oneway(ClientFrame::SetSlaMode { mode }).await
     }
 
+    /// Fire-and-forget this node's current create-load index to a peer (ADR 0014
+    /// `balanced`), so the peer's weighted placement can steer creates toward
+    /// nodes with headroom. See [`ClientFrame::PressureReport`].
+    pub async fn send_pressure(&self, node: u32, load: i64) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::PressureReport { node, load })
+            .await
+    }
+
     /// Forwards a `createProcessInstance` to this peer (it creates on one of its
     /// own partitions). `await_completion` is intentionally unsupported here —
     /// it resolves over an async `InstanceCompleted` frame, wired in a later

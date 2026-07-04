@@ -434,6 +434,55 @@ impl Partitions {
         }
     }
 
+    /// Number of partitions in the whole cluster (local + remote). Used by the
+    /// create-placement protection layer (ADR 0014) to bound its reroute loop and
+    /// to enumerate placement slots for load-aware weighting.
+    pub fn partition_count(&self) -> usize {
+        self.router.partition_count()
+    }
+
+    /// The remote node that owns global partition `p`, or `None` when this node
+    /// owns it (a local placement). Used by the create-placement protection layer
+    /// (ADR 0014) to enumerate the candidate owners of every placement slot.
+    pub fn owner_of(&self, p: u64) -> Option<u32> {
+        match self.router.resolve(PartitionId(p)) {
+            Location::Local(_) => None,
+            Location::Remote(NodeId(node)) => Some(node),
+        }
+    }
+
+    /// Advance and return the shared create-placement round-robin counter. Lets
+    /// the protection layer (ADR 0014) drive weighted / reroute placement off the
+    /// same cursor `next_create_placement` uses, so the two stay interleaved.
+    pub fn placement_counter(&self) -> usize {
+        self.next_place.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Blind-round-robin create placement that **skips** owners in `tried`
+    /// (ADR 0014 `protect` reroute). Probes forward from the shared placement
+    /// cursor over every partition; returns the first owner that is remote and not
+    /// yet tried, `None` when the sweep reaches a local slot or exhausts every
+    /// partition without an untried remote owner (the caller then creates
+    /// locally). Never reorders the base rotation for the un-rerouted first pick.
+    pub fn next_create_placement_avoiding(&self, tried: &[u32]) -> Option<u32> {
+        let n = self.router.partition_count();
+        if n <= 1 {
+            return None;
+        }
+        for _ in 0..n {
+            let p = self.next_place.fetch_add(1, Ordering::Relaxed) % n;
+            match self.router.resolve(PartitionId(p as u64)) {
+                Location::Local(_) => return None,
+                Location::Remote(NodeId(node)) => {
+                    if !tried.contains(&node) {
+                        return Some(node);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// The local-partition index at which the next job-activation pass should
     /// begin probing, chosen round-robin. A pass probes this node's owned
     /// partitions in wrap-around order from here, so activation load spreads

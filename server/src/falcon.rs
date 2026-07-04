@@ -410,6 +410,19 @@ pub enum ClientFrame {
     SetSlaMode {
         mode: String,
     },
+    /// Create-placement load gossip (ADR 0014 `balanced`): the sending node's
+    /// current composite create-load index, broadcast periodically to every peer
+    /// so their weighted placement can steer creates toward nodes with headroom.
+    /// `node` is the sender's node id; `load` is its
+    /// [`create_load_index`](crate::ServerImpl::create_load_index) (a shedding
+    /// node reports [`SHED_LOAD`](crate::placement::SHED_LOAD)). Fire-and-forget
+    /// (no `corr`), not re-broadcast: a stale/absent report is treated as full
+    /// headroom, and the reactive shed/reroute layer is the correctness backstop.
+    #[serde(rename_all = "camelCase")]
+    PressureReport {
+        node: u32,
+        load: i64,
+    },
 }
 
 /// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
@@ -902,6 +915,7 @@ async fn handle_client_frame(
         ClientFrame::LeaseDigest { .. } => "lease_digest",
         ClientFrame::Promote { .. } => "promote",
         ClientFrame::SetSlaMode { .. } => "set_sla_mode",
+        ClientFrame::PressureReport { .. } => "pressure_report",
     };
     crate::metrics::record_stream_frame(frame_type);
 
@@ -996,15 +1010,15 @@ async fn handle_client_frame(
                 tokio::spawn(async move {
                     if let Some(node) = server.stream_create_placement() {
                         match server
-                            .create_forwarded_stream(
+                            .create_forwarded_stream_rerouting(
                                 node,
-                                process_definition_id,
-                                process_definition_key,
-                                variables,
+                                process_definition_id.clone(),
+                                process_definition_key.clone(),
+                                variables.clone(),
                             )
                             .await
                         {
-                            Ok((instance_key, sync_completed)) => {
+                            Some(Ok((instance_key, sync_completed))) => {
                                 conn.send(ServerFrame::CommandResult {
                                     corr,
                                     status: 200,
@@ -1014,12 +1028,44 @@ async fn handle_client_frame(
                                     })),
                                 });
                             }
-                            Err((status, message)) => {
+                            Some(Err((status, message))) => {
                                 conn.send(ServerFrame::CommandResult {
                                     corr,
                                     status,
                                     body: Some(Value::String(message)),
                                 });
+                            }
+                            None => {
+                                // Whole cluster shed: create locally (this node
+                                // already passed its own admission gate).
+                                let vars = to_engine_vars(variables);
+                                match server
+                                    .create_for_stream(
+                                        process_definition_id,
+                                        process_definition_key,
+                                        vars,
+                                    )
+                                    .await
+                                {
+                                    Ok((instance_key, sync_completed)) => {
+                                        crate::metrics::record_create("stream");
+                                        conn.send(ServerFrame::CommandResult {
+                                            corr,
+                                            status: 200,
+                                            body: Some(serde_json::json!({
+                                                "processInstanceKey": instance_key.to_string(),
+                                                "processCompleted": sync_completed,
+                                            })),
+                                        });
+                                    }
+                                    Err((status, message)) => {
+                                        conn.send(ServerFrame::CommandResult {
+                                            corr,
+                                            status,
+                                            body: Some(Value::String(message)),
+                                        });
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -1054,15 +1100,15 @@ async fn handle_client_frame(
             }
             if !awaiting && let Some(node) = server.stream_create_placement() {
                 match server
-                    .create_forwarded_stream(
+                    .create_forwarded_stream_rerouting(
                         node,
-                        process_definition_id,
-                        process_definition_key,
-                        variables,
+                        process_definition_id.clone(),
+                        process_definition_key.clone(),
+                        variables.clone(),
                     )
                     .await
                 {
-                    Ok((instance_key, sync_completed)) => {
+                    Some(Ok((instance_key, sync_completed))) => {
                         conn.send(ServerFrame::CommandResult {
                             corr,
                             status: 200,
@@ -1073,12 +1119,39 @@ async fn handle_client_frame(
                         });
                         grant_submission_credit_if_clear(server, conn, 1);
                     }
-                    Err((status, message)) => {
+                    Some(Err((status, message))) => {
                         conn.send(ServerFrame::CommandResult {
                             corr,
                             status,
                             body: Some(Value::String(message)),
                         });
+                        grant_submission_credit_if_clear(server, conn, 1);
+                    }
+                    None => {
+                        let vars = to_engine_vars(variables);
+                        match server
+                            .create_for_stream(process_definition_id, process_definition_key, vars)
+                            .await
+                        {
+                            Ok((instance_key, sync_completed)) => {
+                                crate::metrics::record_create("stream");
+                                conn.send(ServerFrame::CommandResult {
+                                    corr,
+                                    status: 200,
+                                    body: Some(serde_json::json!({
+                                        "processInstanceKey": instance_key.to_string(),
+                                        "processCompleted": sync_completed,
+                                    })),
+                                });
+                            }
+                            Err((status, message)) => {
+                                conn.send(ServerFrame::CommandResult {
+                                    corr,
+                                    status,
+                                    body: Some(Value::String(message)),
+                                });
+                            }
+                        }
                         grant_submission_credit_if_clear(server, conn, 1);
                     }
                 }
@@ -1545,6 +1618,12 @@ async fn handle_client_frame(
             // re-broadcast (the originator already fanned out to every peer), so
             // there is no propagation loop. Fire-and-forget: no reply.
             server.apply_remote_sla_mode(&mode);
+        }
+        ClientFrame::PressureReport { node, load } => {
+            // A peer gossiped its current create-load index (ADR 0014 balanced).
+            // Record it for weighted placement. Fire-and-forget: no reply, no
+            // re-broadcast (each node gossips to every peer directly).
+            server.record_peer_pressure(node, load);
         }
     }
 

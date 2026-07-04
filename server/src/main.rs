@@ -25,6 +25,7 @@ mod metrics;
 mod partition;
 #[allow(dead_code)]
 mod peer;
+mod placement;
 mod query;
 mod raft;
 mod raft_logstore;
@@ -284,6 +285,22 @@ pub struct ServerImpl {
     /// a single leader. Empty (epoch 0 implied) unless leader-durable recovery has
     /// fired. Soft state, never journaled.
     promotion_epoch: Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>,
+    /// Cluster create-placement mode (`NANOBPMN_CREATE_PLACEMENT`, ADR 0014).
+    /// [`PlacementMode::Off`] (default) keeps blind round-robin placement with
+    /// forwarded creates ungated — byte-identical to the historical path.
+    /// [`PlacementMode::Protect`] gates a forwarded create on the receiving
+    /// owner's admission rails and reroutes it around a shedding owner;
+    /// [`PlacementMode::Balanced`] additionally makes placement load-aware,
+    /// weighting owners by a gossiped composite load index. No effect on a single
+    /// node (no peers to steer between / forward to).
+    placement_mode: crate::placement::PlacementMode,
+    /// Latest composite create-load index gossiped by each peer node, keyed by
+    /// node id (see [`placement`](crate::placement)). Populated only in
+    /// [`PlacementMode::Balanced`] by the pressure-gossip tick; weighted placement
+    /// reads it to steer creates toward nodes with headroom. A missing entry is
+    /// treated as full headroom (an unprobed peer still receives traffic). Empty
+    /// otherwise — zero overhead.
+    peer_pressure: Arc<std::sync::Mutex<std::collections::HashMap<u32, i64>>>,
     /// Tier-A execution-trace projection, folded off the engine event stream by
     /// the exporter thread (process-optimization design doc §3). In-memory and
     /// bounded; served under `/console/api/traces`. Console builds only.
@@ -454,6 +471,13 @@ impl ServerImpl {
             );
         }
 
+        let placement_mode = crate::placement::parse_placement_mode(
+            std::env::var("NANOBPMN_CREATE_PLACEMENT").ok().as_deref(),
+        );
+        if placement_mode != crate::placement::PlacementMode::Off {
+            tracing::info!("create placement: {}", placement_mode.describe());
+        }
+
         // Optional spill tiers, sharing one disk-backed store (one file, one WAL,
         // one durability story). Variable spill sheds the variables of a large
         // *active* (job-parked) backlog; cold spill sheds whole *dormant*
@@ -597,6 +621,8 @@ impl ServerImpl {
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             replication_mode,
             promotion_epoch: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            placement_mode,
+            peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(feature = "console")]
             trace_store: Arc::new(console::trace::TraceStore::from_env()),
         }
@@ -2193,7 +2219,34 @@ impl ServerImpl {
             // a led partition. Without this, a producer connected to one gateway
             // placed every instance on that node's led partitions only, starving
             // the rest of the cluster (RF>=2 create imbalance).
-            if let Some(node) = self.engine.next_create_placement() {
+            //
+            // With placement protection (ADR 0014) enabled the forward runs
+            // through the reroute loop: a saturated owner sheds the create back
+            // and it is re-placed onto an owner with headroom; `None` means fall
+            // through to a local Raft create.
+            if self.placement_mode.protects() {
+                let first = if self.placement_mode.balances() {
+                    self.next_create_placement_weighted(&[])
+                } else {
+                    self.engine.next_create_placement()
+                };
+                if let Some(resp) = self
+                    .forward_create_rerouting(
+                        first,
+                        by_id.clone(),
+                        by_key.clone(),
+                        wire_vars.clone(),
+                        tags_vec.clone(),
+                        business_id_str.clone(),
+                        await_completion,
+                        fetch_variables.cloned(),
+                        request_timeout,
+                    )
+                    .await
+                {
+                    return Ok(resp);
+                }
+            } else if let Some(node) = self.engine.next_create_placement() {
                 return Ok(self
                     .forward_create(
                         node,
@@ -2240,7 +2293,43 @@ impl ServerImpl {
         // through to the in-process create below. Placement is decided after the
         // node-local backpressure/admission gates above, which remain the
         // admission point for the whole request.
-        if let Some(node) = self.engine.next_create_placement() {
+        //
+        // With placement protection (ADR 0014) enabled the forward runs through
+        // the reroute loop: a saturated owner sheds the create back and it is
+        // re-placed onto an owner with headroom (weighted by gossiped load in
+        // `balanced`); `None` falls through to the local in-process create.
+        if self.placement_mode.protects() {
+            let wire_vars = match body {
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
+                    b.variables.as_ref()
+                }
+                models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(b) => {
+                    b.variables.as_ref()
+                }
+            }
+            .and_then(|m| wire_variables(Some(m)));
+            let first = if self.placement_mode.balances() {
+                self.next_create_placement_weighted(&[])
+            } else {
+                self.engine.next_create_placement()
+            };
+            if let Some(resp) = self
+                .forward_create_rerouting(
+                    first,
+                    by_id.clone(),
+                    by_key.clone(),
+                    wire_vars,
+                    tags_vec.clone(),
+                    business_id_str.clone(),
+                    await_completion,
+                    fetch_variables.cloned(),
+                    request_timeout,
+                )
+                .await
+            {
+                return Ok(resp);
+            }
+        } else if let Some(node) = self.engine.next_create_placement() {
             let wire_vars = match body {
                 models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(b) => {
                     b.variables.as_ref()
@@ -4437,6 +4526,16 @@ impl ServerImpl {
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
     ) -> Result<serde_json::Value, (u16, String)> {
+        // Placement protection (ADR 0014): a node that is saturated sheds the
+        // forwarded create back to the ingress node (503 with the placement-shed
+        // marker) so ingress can reroute it to an owner with headroom, instead of
+        // being overrun by work placed on it. This closes the gap where forwarded
+        // creates bypassed the owner's own admission gates. Off by default.
+        if self.placement_mode.protects()
+            && let Some(reason) = self.create_should_shed()
+        {
+            return Err((503, format!("{PLACEMENT_SHED_MARKER} {reason}")));
+        }
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
         type CreateOk = (String, i32, String, u64, bool, Vec<Event>, Commit);
@@ -4590,6 +4689,7 @@ impl ServerImpl {
     /// response. Used when this gateway's round-robin placement lands on a
     /// partition owned by another node.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn forward_create(
         &self,
         node: u32,
@@ -4603,58 +4703,229 @@ impl ServerImpl {
         request_timeout: Option<i64>,
     ) -> apis::process_instance::CreateProcessInstanceResponse {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => {
-                    link.forward_create(
-                        by_id,
-                        by_key,
-                        variables,
-                        tags,
-                        business_id,
-                        await_completion,
-                        fetch_variables,
-                        request_timeout,
-                    )
-                    .await
-                }
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
+        let outcome = self
+            .forward_create_once(
+                node,
+                by_id,
+                by_key,
+                variables,
+                tags,
+                business_id,
+                await_completion,
+                fetch_variables,
+                request_timeout,
+            )
+            .await;
+        match outcome {
+            ForwardCreateOutcome::Created(result) => {
+                Resp::Status200_TheProcessInstanceWasCreated(result)
+            }
+            ForwardCreateOutcome::Reject400(detail) => Resp::Status400_TheProvidedDataIsNotValid(
+                problem("Invalid create", 400, detail),
+            ),
+            // Without placement protection a peer never placement-sheds, so this
+            // is only reached defensively; surface it as a retryable error.
+            ForwardCreateOutcome::Shed(detail) => {
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    503,
+                    detail,
+                ))
+            }
+            ForwardCreateOutcome::Unreachable(detail) => {
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    502,
+                    detail,
+                ))
+            }
+            ForwardCreateOutcome::Error(status, detail) => {
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    status,
+                    detail,
+                ))
+            }
+        }
+    }
+
+    /// Forwards a `createProcessInstance` to peer `node` and classifies the
+    /// answer into a [`ForwardCreateOutcome`], distinguishing a rerouteable
+    /// **placement shed** (the peer is saturated, ADR 0014 `protect`) and an
+    /// unreachable peer from a terminal result. The ingress reroute loop uses the
+    /// `Shed`/`Unreachable` outcomes to re-place onto another owner;
+    /// [`forward_create`](Self::forward_create) maps the outcome straight to an
+    /// HTTP response for the non-protected path.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_create_once(
+        &self,
+        node: u32,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> ForwardCreateOutcome {
+        let res = match self.peer_link(node).await {
+            Ok(link) => {
+                link.forward_create(
+                    by_id,
+                    by_key,
+                    variables,
+                    tags,
+                    business_id,
+                    await_completion,
+                    fetch_variables,
+                    request_timeout,
+                )
+                .await
+            }
+            Err((_, m)) => return ForwardCreateOutcome::Unreachable(m),
+        };
         match res {
             Ok(r) if is_ok_status(r.status) => {
                 match r.body.and_then(|b| {
                     serde_json::from_value::<models::CreateProcessInstanceResult>(b).ok()
                 }) {
-                    Some(result) => Resp::Status200_TheProcessInstanceWasCreated(result),
-                    None => {
-                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                            "Peer error",
-                            500,
-                            "peer returned an unparseable create result".into(),
-                        ))
-                    }
+                    Some(result) => ForwardCreateOutcome::Created(result),
+                    None => ForwardCreateOutcome::Error(
+                        500,
+                        "peer returned an unparseable create result".into(),
+                    ),
                 }
             }
-            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "Invalid create",
-                400,
-                peer_detail(&r),
-            )),
-            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                500,
-                peer_detail(&r),
-            )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
+            Ok(r) if r.status == 400 => ForwardCreateOutcome::Reject400(peer_detail(&r)),
+            // The peer self-protected and shed this create back for rerouting
+            // (ADR 0014): a 503 tagged with the placement-shed marker.
+            Ok(r) if r.status == 503 => {
+                let detail = peer_detail(&r);
+                if detail.starts_with(PLACEMENT_SHED_MARKER) {
+                    ForwardCreateOutcome::Shed(detail)
+                } else {
+                    ForwardCreateOutcome::Error(503, detail)
+                }
+            }
+            Ok(r) => ForwardCreateOutcome::Error(500, peer_detail(&r)),
+            // A transport error AFTER the request was sent is ambiguous — the peer
+            // may have applied the create — so it is NOT rerouted (that would risk
+            // a duplicate instance); it surfaces as a retryable error instead.
+            Err(e) => ForwardCreateOutcome::Error(502, e.to_string()),
         }
+    }
+
+    /// Load-aware weighted create placement (ADR 0014 `balanced`). Enumerates
+    /// every partition's owner, weights each inversely to its gossiped composite
+    /// load (a shedding, or already-`tried`, owner gets weight 0 and is never
+    /// picked; an unprobed peer is treated as full headroom), and selects one via
+    /// the shared placement counter. Returns `Some(node)` to forward to a peer, or
+    /// `None` to create locally (a local slot won the weighting, or no eligible
+    /// remote owner remained).
+    fn next_create_placement_weighted(&self, tried: &[u32]) -> Option<u32> {
+        let n = self.engine.partition_count();
+        if n <= 1 {
+            return None;
+        }
+        let owners: Vec<Option<u32>> = (0..n as u64).map(|p| self.engine.owner_of(p)).collect();
+        let local_weight = crate::placement::placement_weight(self.create_load_index());
+        let weights: Vec<u128> = owners
+            .iter()
+            .map(|owner| match owner {
+                None => local_weight,
+                Some(node) if tried.contains(node) => 0,
+                Some(node) => {
+                    // A peer that has not gossiped yet is treated as full
+                    // headroom (load 0) so it still receives traffic; the
+                    // reactive shed/reroute layer corrects an over-optimistic
+                    // guess.
+                    crate::placement::placement_weight(self.peer_load(*node).unwrap_or(0))
+                }
+            })
+            .collect();
+        let counter = self.engine.placement_counter();
+        crate::placement::weighted_pick(&weights, counter).and_then(|i| owners[i])
+    }
+
+    /// Ingress reroute loop for create-placement protection (ADR 0014). Forwards
+    /// the create to `first`, and if the owner placement-sheds (or is
+    /// unreachable) re-places onto another owner — blind round-robin skipping
+    /// tried owners in `protect`, load-weighted in `balanced` — until a peer
+    /// accepts, a terminal result arrives, or every owner is exhausted. Returns
+    /// `Some(resp)` when the create is resolved remotely (success / 400 / error /
+    /// final shed), or `None` to fall through to a **local** create — either
+    /// because placement chose this node, or as the last-resort backstop when the
+    /// whole cluster shed (the ingress node already passed its own admission gate,
+    /// so a local create is the honest floor rather than a spurious 503).
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_create_rerouting(
+        &self,
+        first: Option<u32>,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        await_completion: bool,
+        fetch_variables: Option<Vec<String>>,
+        request_timeout: Option<i64>,
+    ) -> Option<apis::process_instance::CreateProcessInstanceResponse> {
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let mut tried: Vec<u32> = Vec::new();
+        let bound = self.engine.partition_count().max(1) + 1;
+        let mut target = first;
+        for _ in 0..bound {
+            let Some(node) = target else {
+                // Local placement (or exhausted) -> caller does a local create.
+                return None;
+            };
+            let outcome = self
+                .forward_create_once(
+                    node,
+                    by_id.clone(),
+                    by_key.clone(),
+                    variables.clone(),
+                    tags.clone(),
+                    business_id.clone(),
+                    await_completion,
+                    fetch_variables.clone(),
+                    request_timeout,
+                )
+                .await;
+            match outcome {
+                ForwardCreateOutcome::Created(result) => {
+                    return Some(Resp::Status200_TheProcessInstanceWasCreated(result));
+                }
+                ForwardCreateOutcome::Reject400(detail) => {
+                    return Some(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid create",
+                        400,
+                        detail,
+                    )));
+                }
+                ForwardCreateOutcome::Error(status, detail) => {
+                    return Some(
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Peer error",
+                            status,
+                            detail,
+                        )),
+                    );
+                }
+                // Rerouteable: the owner shed (saturated) or was unreachable.
+                ForwardCreateOutcome::Shed(_) | ForwardCreateOutcome::Unreachable(_) => {
+                    tried.push(node);
+                    target = if self.placement_mode.balances() {
+                        self.next_create_placement_weighted(&tried)
+                    } else {
+                        self.engine.next_create_placement_avoiding(&tried)
+                    };
+                }
+            }
+        }
+        // Every candidate shed: fall through to a local create (last resort).
+        None
     }
 
     /// Forwards a non-`await_completion` create to the current create-leader with
@@ -6623,6 +6894,47 @@ impl ServerImpl {
         }
     }
 
+    /// Fire-and-forget this node's current create-load index to every peer (ADR
+    /// 0004 `balanced` pressure gossip). A briefly unreachable peer simply keeps
+    /// the last value it received (or none, treated as full headroom) until the
+    /// next tick — acceptable for a routing hint that the reactive shed/reroute
+    /// layer already backstops.
+    async fn broadcast_pressure(&self, load: i64) {
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id;
+        for n in 0..topology.num_nodes() {
+            if n == me {
+                continue;
+            }
+            if let Ok(link) = self.peers.link(n).await {
+                link.send_pressure(me, load).await.ok();
+            }
+        }
+    }
+
+    /// Spawns the create-load gossip tick (ADR 0014 `balanced`). Every
+    /// [`placement_gossip_interval`] it broadcasts this node's composite
+    /// create-load index to its peers, so their weighted placement can steer
+    /// creates toward nodes with headroom. A no-op unless placement is in
+    /// `balanced` mode with real peers — zero overhead in every other
+    /// configuration (default `off`, `protect`, single node).
+    fn spawn_pressure_gossip(&self) {
+        if !self.placement_mode.balances() || !self.peers.has_peers() {
+            return;
+        }
+        let server = self.clone();
+        let interval = placement_gossip_interval();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let load = server.create_load_index();
+                server.broadcast_pressure(load).await;
+            }
+        });
+    }
+
     /// Apply an SLA mode switched on a PEER (inbound [`ClientFrame::SetSlaMode`]).
     /// Sets it locally only — we do not re-broadcast (the originator already fanned
     /// out to every peer), so there is no propagation loop. Fail-safe parse: any
@@ -7543,7 +7855,57 @@ impl ServerImpl {
         if !self.raft.is_empty() {
             return None;
         }
-        self.engine.next_create_placement()
+        if self.placement_mode.balances() {
+            self.next_create_placement_weighted(&[])
+        } else {
+            self.engine.next_create_placement()
+        }
+    }
+
+    /// Forwards a fire-and-forget stream create to `first`, rerouting it to
+    /// another owner if that owner placement-sheds (ADR 0014 `protect`/`balanced`).
+    /// Returns `Some(result)` when the create resolves on a peer (success, a
+    /// client rejection, or a non-shed error), or `None` to fall through to a
+    /// **local** create — placement chose this node, protection is off, or every
+    /// owner shed. Only the explicit placement-shed signal triggers a reroute, so
+    /// an ambiguous post-send transport error can never duplicate an instance.
+    pub(crate) async fn create_forwarded_stream_rerouting(
+        &self,
+        first: u32,
+        by_id: Option<String>,
+        by_key: Option<String>,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<Result<(nanobpmn_engine_core::Key, bool), (u16, String)>> {
+        if !self.placement_mode.protects() {
+            return Some(
+                self.create_forwarded_stream(first, by_id, by_key, variables)
+                    .await,
+            );
+        }
+        let mut tried: Vec<u32> = Vec::new();
+        let bound = self.engine.partition_count().max(1) + 1;
+        let mut node = first;
+        for _ in 0..bound {
+            match self
+                .create_forwarded_stream(node, by_id.clone(), by_key.clone(), variables.clone())
+                .await
+            {
+                Err((503, msg)) if msg.starts_with(PLACEMENT_SHED_MARKER) => {
+                    tried.push(node);
+                    let next = if self.placement_mode.balances() {
+                        self.next_create_placement_weighted(&tried)
+                    } else {
+                        self.engine.next_create_placement_avoiding(&tried)
+                    };
+                    match next {
+                        Some(n) => node = n,
+                        None => return None, // exhausted -> local create
+                    }
+                }
+                other => return Some(other),
+            }
+        }
+        None
     }
 
     /// Falcon sibling of [`forward_create`](Self::forward_create): forwards
@@ -8317,7 +8679,53 @@ impl ServerImpl {
         None
     }
 
-    /// Awaits a created instance reaching a terminal state for the stream's async
+    /// Composite "should this node shed an incoming create right now?" decision
+    /// for cluster create-placement protection (ADR 0014). Returns `Some(reason)`
+    /// when the node is saturated (either the create-side concurrency backpressure
+    /// via [`submission_pressure`](Self::submission_pressure) or any
+    /// [`admission_shed`](Self::admission_shed) rail is tripped), else `None`.
+    ///
+    /// It composes exactly the gates the ingress REST/stream paths already apply,
+    /// so an owner shedding a *forwarded* create matches what it would have done
+    /// to a *local* one — closing the "forwarded creates skip admission" gap. Used
+    /// by the receiving-peer create path (to shed back to the ingress node for
+    /// rerouting) and by [`create_load_index`](Self::create_load_index).
+    pub(crate) fn create_should_shed(&self) -> Option<String> {
+        if self.submission_pressure() {
+            return Some("Backpressure: create-processing concurrency at capacity.".to_string());
+        }
+        self.admission_shed()
+    }
+
+    /// This node's composite create-load index for load-aware placement (ADR
+    /// 0014, `PlacementMode::Balanced`). A shedding node reports
+    /// [`SHED_LOAD`](crate::placement::SHED_LOAD) (weight 0 — never placed on);
+    /// otherwise it reports its active backlog, so weighted placement steers
+    /// creates toward nodes with the shallowest backlog. Cheap: a couple of
+    /// relaxed atomic loads plus the admission-gate checks, no engine round-trip.
+    pub(crate) fn create_load_index(&self) -> i64 {
+        if self.create_should_shed().is_some() {
+            crate::placement::SHED_LOAD
+        } else {
+            self.active_backlog()
+        }
+    }
+
+    /// Record a peer's gossiped create-load index (ADR 0014 pressure gossip).
+    /// Overwrites the previous value for that node; weighted placement reads the
+    /// latest. Only invoked in `PlacementMode::Balanced`.
+    pub(crate) fn record_peer_pressure(&self, node: u32, load: i64) {
+        if let Ok(mut map) = self.peer_pressure.lock() {
+            map.insert(node, load);
+        }
+    }
+
+    /// The latest create-load index gossiped by peer `node`, or `None` if that
+    /// peer has not reported yet (treated by placement as full headroom).
+    pub(crate) fn peer_load(&self, node: u32) -> Option<i64> {
+        self.peer_pressure.lock().ok().and_then(|m| m.get(&node).copied())
+    }
+
     /// `InstanceCompleted` frame. Reuses the REST await path verbatim.
     pub(crate) async fn await_completion_for_stream(
         &self,
@@ -8773,6 +9181,29 @@ fn peer_detail(res: &crate::peer::PeerResult) -> String {
         .unwrap_or_else(|| format!("peer returned status {}", res.status))
 }
 
+/// Body prefix a receiving peer uses on the 503 it returns when it
+/// placement-sheds a forwarded create (ADR 0014 `protect`). The ingress node
+/// recognises it to distinguish a rerouteable placement shed from an ordinary
+/// 503, and reroutes the create to another owner instead of failing the client.
+const PLACEMENT_SHED_MARKER: &str = "PLACEMENT_SHED:";
+
+/// Classification of a forwarded-create attempt (ADR 0014). Lets the ingress
+/// reroute loop distinguish a rerouteable **placement shed** / unreachable owner
+/// from a terminal success, client rejection, or peer error.
+enum ForwardCreateOutcome {
+    /// The peer created the instance and returned its result.
+    Created(models::CreateProcessInstanceResult),
+    /// The peer rejected the request as invalid (400) — deterministic, no reroute.
+    Reject400(String),
+    /// The peer self-protected and shed this create for rerouting.
+    Shed(String),
+    /// The peer could not be reached (link/transport error) — reroute to another.
+    Unreachable(String),
+    /// Any other peer error; surfaced to the client as a 5xx.
+    Error(u16, String),
+}
+
+
 /// Cheap O(n) byte-size proxy for a create's engine-`Value` variable map, used to
 /// meter in-flight create payloads for byte-aware admission control. Sums each
 /// key's length plus its value's [`Value::approx_bytes`].
@@ -8979,6 +9410,19 @@ fn write_forward_retry_budget() -> std::time::Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(5000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Interval between create-load gossip broadcasts (ADR 0014 `balanced`), env
+/// `NANOBPMN_CREATE_PLACEMENT_GOSSIP_MS` (default 500ms). Short enough that a
+/// node's load hint stays fresh under a fast-moving workload, long enough that
+/// the fire-and-forget fan-out is negligible overhead.
+fn placement_gossip_interval() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_CREATE_PLACEMENT_GOSSIP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(500);
     std::time::Duration::from_millis(ms)
 }
 
@@ -9749,6 +10193,12 @@ async fn main() {
     // in every other configuration (single node / RF=1 / quorum mode).
     server.spawn_leader_durable_recovery();
 
+    // Create-load gossip (ADR 0014): in `balanced` placement mode, periodically
+    // broadcast this node's composite create-load index to peers so their
+    // weighted placement steers creates toward nodes with headroom. No-op unless
+    // NANOBPMN_CREATE_PLACEMENT=balanced with real peers.
+    server.spawn_pressure_gossip();
+
     // Self-contained single-node distribution: build the embedded web console
     // router (SPA + /console/api/*) before `server` is moved into the generated
     // router. Feature-gated; the default gateway build never includes it and the
@@ -10403,6 +10853,116 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(adopted, "peer should adopt the cluster-wide SLA switch");
+    }
+
+    #[test]
+    fn placement_avoiding_skips_tried_owners_then_falls_back_local() {
+        // On node 0 (owns 2 of 4 partitions), the only remote owner is node 1.
+        let node0 = clustered_node(0);
+        // Avoiding node 1 (the sole remote owner) must fall back to a local
+        // placement (`None`) rather than loop forever or return a tried owner.
+        for _ in 0..8 {
+            assert_eq!(node0.engine.next_create_placement_avoiding(&[1]), None);
+        }
+        // With nothing excluded, a full rotation still places on the remote owner.
+        let mut saw_remote = false;
+        for _ in 0..8 {
+            if node0.engine.next_create_placement_avoiding(&[]) == Some(1) {
+                saw_remote = true;
+            }
+        }
+        assert!(
+            saw_remote,
+            "without exclusions the remote owner is still a placement target"
+        );
+    }
+
+    #[test]
+    fn weighted_placement_steers_away_from_loaded_and_shedding_peers() {
+        let node0 = clustered_node(0);
+
+        // A shedding peer (SHED_LOAD) is never placed on: weighted placement
+        // returns a local slot every time.
+        node0.record_peer_pressure(1, crate::placement::SHED_LOAD);
+        for _ in 0..32 {
+            assert_eq!(
+                node0.next_create_placement_weighted(&[]),
+                None,
+                "a shedding peer must never receive a weighted placement"
+            );
+        }
+
+        // A healthy peer (load 0) receives a meaningful share of creates...
+        node0.record_peer_pressure(1, 0);
+        let healthy = (0..1_000)
+            .filter(|_| node0.next_create_placement_weighted(&[]) == Some(1))
+            .count();
+        assert!(healthy > 0, "a healthy peer must receive some creates");
+
+        // ...but a heavily-loaded peer receives strictly fewer than a healthy one,
+        // so creates are steered toward the node with headroom.
+        node0.record_peer_pressure(1, 100_000);
+        let loaded = (0..1_000)
+            .filter(|_| node0.next_create_placement_weighted(&[]) == Some(1))
+            .count();
+        assert!(
+            loaded < healthy,
+            "a loaded peer ({loaded}) must receive fewer creates than a healthy one ({healthy})"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_create_reroutes_around_a_shedding_owner() {
+        // A saturated owner, in `protect` mode, sheds a forwarded create back to
+        // the ingress node, which reroutes it to a node with headroom (here,
+        // itself) — so the client sees a successful create, never the owner's
+        // saturation. Without protection the forwarded create would be applied on
+        // the saturated owner regardless (the gap ADR 0014 closes).
+        let mut node1 = clustered_node(1);
+        // Force node 1 to shed every create via the resident-memory admission rail
+        // (watermark 1 byte, sampled resident well above it), and enable protection
+        // so it sheds *forwarded* creates back for rerouting.
+        node1.placement_mode = crate::placement::PlacementMode::Protect;
+        node1.mem_watermark_bytes = 1;
+        node1.mem_pressure_bytes.store(1 << 20, Ordering::Relaxed);
+        let node1_url = serve_node(&node1).await;
+
+        // node 0 is the deployment-partition owner (seeds `demo` on partition 0),
+        // the ingress the client hits, also in protect mode, pointing at node 1.
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused".into(), node1_url],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let mut node0 = build_server_in_memory(journals, topology);
+        node0.placement_mode = crate::placement::PlacementMode::Protect;
+
+        let body = models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+            models::ProcessInstanceCreationInstructionById::new("demo".to_string()),
+        );
+
+        // Drive enough creates that placement lands on node 1 several times; every
+        // one must succeed (200) — rerouted to node 0 when node 1 sheds — rather
+        // than surfacing node 1's 503.
+        for i in 0..8 {
+            let resp = node0
+                .create_process_instance_impl(&body)
+                .await
+                .expect("create returns a response");
+            assert!(
+                matches!(
+                    resp,
+                    apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(_)
+                ),
+                "create #{i} must succeed via reroute, got a non-200 response"
+            );
+        }
     }
 
     /// Serves a node's falcon endpoint on an ephemeral port and returns
