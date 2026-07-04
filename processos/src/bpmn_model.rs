@@ -51,6 +51,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::ScriptTask { .. } => "scriptTask",
         ElementKind::CallActivity { .. } => "callActivity",
         ElementKind::SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
         ElementKind::SignalBoundaryEvent { .. } => "signalBoundaryEvent",
@@ -1565,6 +1566,20 @@ fn emit_element(
             out.push_str(&format!(
                 "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
             ));
+        }
+        ElementKind::ScriptTask {
+            expression,
+            result_variable,
+        } => {
+            out.push_str(&format!("    <bpmn:scriptTask id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            out.push_str(&format!(
+                "        <zeebe:script expression=\"{}\" resultVariable=\"{}\"/>\n",
+                xml_escape(expression),
+                xml_escape(result_variable)
+            ));
+            out.push_str("      </bpmn:extensionElements>\n");
+            out.push_str("    </bpmn:scriptTask>\n");
         }
         ElementKind::CallActivity { called_process_id } => {
             out.push_str(&format!(
@@ -3228,6 +3243,26 @@ mod tests {
             xml.contains("signalEventDefinition"),
             "emits signalRef defs"
         );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_inline_script_task() {
+        // An inline-FEEL script task must round-trip: the serializer emits a
+        // <bpmn:scriptTask> with a <zeebe:script expression=.. resultVariable=..>,
+        // and the re-parse reproduces the exact ScriptTask structure.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Scripted")
+            .start_event("Start")
+            .script_task("Calc", "=a + b", "sum")
+            .end_event("Done")
+            .connect("Start", "Calc")
+            .connect("Calc", "Done")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(xml.contains("<bpmn:scriptTask "), "emits a script task");
+        assert!(xml.contains("<zeebe:script "), "emits the zeebe:script");
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
     }

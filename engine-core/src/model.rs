@@ -412,6 +412,20 @@ pub enum ElementKind {
     /// don't block a forward path) and as the inert demotion target for the
     /// surplus start events of a process that declares more than one.
     IntermediateThrowEvent,
+    /// A script task with an inline `zeebe:script` FEEL expression. On
+    /// activation the engine evaluates `expression` against the instance
+    /// variables (after any input mappings are applied), stores the result
+    /// under `result_variable`, and completes immediately — no job is created,
+    /// so the token passes straight through like an
+    /// [`IntermediateThrowEvent`]. A `scriptTask` that instead declares a
+    /// `zeebe:taskDefinition` is job-based and parses to a [`ServiceTask`].
+    ScriptTask {
+        /// The inline FEEL expression evaluated on activation (as authored,
+        /// typically with a leading `=`).
+        expression: String,
+        /// The variable name the expression's result is stored under.
+        result_variable: String,
+    },
     /// A call activity: invokes another process (`called_process_id`) and waits
     /// for it to complete before routing along its outgoing flow. Nano consumes
     /// call activities by **inline expansion** — [`ProcessDefinition::inline_call_activities`]
@@ -819,6 +833,25 @@ impl ProcessBuilder {
     /// [`ElementKind::IntermediateThrowEvent`]).
     pub fn intermediate_throw_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::IntermediateThrowEvent)
+    }
+
+    /// Adds an inline-FEEL script task (see [`ElementKind::ScriptTask`]): on
+    /// activation the engine evaluates `expression` against the instance
+    /// variables and stores the result under `result_variable`, then completes
+    /// immediately with no job.
+    pub fn script_task(
+        self,
+        id: impl Into<String>,
+        expression: impl Into<String>,
+        result_variable: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ScriptTask {
+                expression: expression.into(),
+                result_variable: result_variable.into(),
+            },
+        )
     }
 
     /// Adds a call activity invoking `called_process_id` (see

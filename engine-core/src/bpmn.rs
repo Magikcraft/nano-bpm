@@ -431,6 +431,23 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     }
                                 }
                             }
+                            "script" => {
+                                // zeebe:script expression="…" resultVariable="…"
+                                // inside a script task: an inline FEEL script the
+                                // engine evaluates on activation (no job). A
+                                // scriptTask carrying BOTH attributes becomes an
+                                // inline ScriptTask; one that instead declares a
+                                // zeebe:taskDefinition stays job-based (Service).
+                                if let Some(idx) = cur_service_task {
+                                    if let (Some(expr), Some(rv)) =
+                                        (attr(attrs, "expression"), attr(attrs, "resultVariable"))
+                                    {
+                                        acc.nodes[idx].script_expression = Some(expr.to_string());
+                                        acc.nodes[idx].script_result_variable =
+                                            Some(rv.to_string());
+                                    }
+                                }
+                            }
                             "assignmentDefinition" => {
                                 // zeebe:assignmentDefinition inside a user task.
                                 if let Some(idx) = cur_user_task {
@@ -784,6 +801,14 @@ struct NodeAcc {
     /// The raw `zeebe:taskDefinition` `retries` expression (literal or FEEL),
     /// resolved to a number at job creation; `None` for the default of 3.
     retries: Option<String>,
+    /// For a script task with an inline `zeebe:script`: the FEEL expression
+    /// evaluated on activation. Both this and `script_result_variable` set
+    /// makes the node an inline [`ScriptTask`](crate::model::ElementKind::ScriptTask)
+    /// instead of a job-based service task.
+    script_expression: Option<String>,
+    /// For a script task with an inline `zeebe:script`: the `resultVariable`
+    /// the expression's result is stored under.
+    script_result_variable: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -878,6 +903,8 @@ impl ProcessAcc {
             io: crate::model::IoMapping::default(),
             timer_expr: None,
             retries: None,
+            script_expression: None,
+            script_result_variable: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -1051,8 +1078,19 @@ impl ProcessAcc {
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
                 NodeKind::Service => {
-                    let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
-                    builder.service_task_with_priority(node.id, job_type, node.job_priority)
+                    // A scriptTask carrying an inline zeebe:script (expression +
+                    // resultVariable) is an inline-FEEL script task, evaluated on
+                    // activation with no job; otherwise it is an ordinary
+                    // job-based service task.
+                    if let (Some(expr), Some(rv)) = (
+                        node.script_expression.clone(),
+                        node.script_result_variable.clone(),
+                    ) {
+                        builder.script_task(node.id, expr, rv)
+                    } else {
+                        let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
+                        builder.service_task_with_priority(node.id, job_type, node.job_priority)
+                    }
                 }
                 NodeKind::User => builder.user_task_with(node.id, node.user_task),
                 NodeKind::IntermediateCatch => {
@@ -1657,6 +1695,66 @@ mod tests {
             def.element("work").unwrap().kind,
             ElementKind::ServiceTask {
                 job_type: "do-work".to_string(),
+                priority: None,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_zeebe_script_as_an_inline_script_task() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="scripted" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:scriptTask id="calc">
+      <bpmn:extensionElements>
+        <zeebe:script expression="=a + b" resultVariable="sum" />
+      </bpmn:extensionElements>
+    </bpmn:scriptTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="calc" />
+    <bpmn:sequenceFlow id="f2" sourceRef="calc" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        let def = &defs[0];
+        // A scriptTask carrying a zeebe:script becomes an inline ScriptTask, not
+        // a job-based service task; the expression is captured verbatim.
+        assert_eq!(
+            def.element("calc").unwrap().kind,
+            ElementKind::ScriptTask {
+                expression: "=a + b".to_string(),
+                result_variable: "sum".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_a_script_task_with_task_definition_as_a_job() {
+        // A scriptTask that declares a zeebe:taskDefinition (no zeebe:script) is
+        // job-based, exactly like a service task.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="scripted-job" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:scriptTask id="calc">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="run-script" />
+      </bpmn:extensionElements>
+    </bpmn:scriptTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="calc" />
+    <bpmn:sequenceFlow id="f2" sourceRef="calc" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        let def = &defs[0];
+        assert_eq!(
+            def.element("calc").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "run-script".to_string(),
                 priority: None,
             }
         );

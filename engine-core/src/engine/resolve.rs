@@ -79,6 +79,30 @@ impl Engine {
             .and_then(|e| e.retries.clone())
     }
 
+    /// Evaluates a script task's inline `zeebe:script` FEEL `expression` against
+    /// the instance variables, overlaid with any input mappings applied earlier
+    /// in the same activation (`overlay`), returning the result value to store
+    /// under the task's `resultVariable`. Returns `None` when the expression
+    /// cannot be evaluated (parse error, unresolved variable) — nano does not
+    /// raise an incident here, consistent with the other FEEL resolve helpers.
+    pub(crate) fn eval_script(
+        &self,
+        instance_key: Key,
+        expression: &str,
+        overlay: &HashMap<String, Value>,
+    ) -> Option<Value> {
+        let base = self.variables(instance_key);
+        if overlay.is_empty() {
+            crate::feel::eval(expression, &base).ok()
+        } else {
+            let mut ctx = (*base).clone();
+            for (k, v) in overlay {
+                ctx.insert(k.clone(), v.clone());
+            }
+            crate::feel::eval(expression, &ctx).ok()
+        }
+    }
+
     pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))

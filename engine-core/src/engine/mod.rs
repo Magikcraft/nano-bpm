@@ -2081,17 +2081,22 @@ impl Engine {
 
         // Input mappings (zeebe:input): evaluate against the instance variables
         // and merge the result before the element's job/subscription is created,
-        // so a later job activation snapshots the mapped values.
+        // so a later job activation snapshots the mapped values. The updates are
+        // also retained locally so a script task activating this step can see
+        // them (the event is not applied to state until the step returns).
         let inputs = self.io_inputs(instance_key, &element_id);
-        if !inputs.is_empty() {
+        let input_updates = if inputs.is_empty() {
+            HashMap::new()
+        } else {
             let updates = self.eval_io_mappings(instance_key, &inputs);
             if !updates.is_empty() {
                 events.push(Event::VariablesUpdated {
                     instance_key,
-                    variables: updates,
+                    variables: updates.clone(),
                 });
             }
-        }
+            updates
+        };
 
         match kind {
             // A service task creates a job and parks the token.
@@ -2253,6 +2258,29 @@ impl Engine {
                     instance_key,
                     element_id: start_event,
                     scope: element_instance_key,
+                });
+            }
+            // An inline-FEEL script task: evaluate the expression against the
+            // instance variables (plus any input mappings just applied this
+            // activation), store the result under resultVariable, then complete
+            // immediately — no job is created. Output mappings, if any, run at
+            // completion like every other activity.
+            Some(ElementKind::ScriptTask {
+                expression,
+                result_variable,
+            }) => {
+                if let Some(value) = self.eval_script(instance_key, &expression, &input_updates) {
+                    let mut variables = HashMap::new();
+                    variables.insert(result_variable, value);
+                    events.push(Event::VariablesUpdated {
+                        instance_key,
+                        variables,
+                    });
+                }
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
                 });
             }
             // Pass-through elements (events, exclusive gateway, parallel split)

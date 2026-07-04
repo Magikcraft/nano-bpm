@@ -1027,6 +1027,73 @@ fn missing_retries_declaration_defaults_to_three() {
     assert_eq!(job.retries, state::DEFAULT_JOB_RETRIES);
 }
 
+#[test]
+fn inline_script_task_evaluates_feel_and_writes_result_variable() {
+    // A zeebe:script script task evaluates its FEEL expression on activation,
+    // stores the result under resultVariable, and passes straight through with
+    // no job. A downstream service task parks the token so the result is still
+    // observable in hot state (ADR 0012 clears variables only on completion).
+    let def = ProcessBuilder::new("scripted")
+        .start_event("start")
+        .script_task("calc", "=a + b", "sum")
+        .service_task("work", "do-work")
+        .end_event("end")
+        .connect("start", "calc")
+        .connect("calc", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let events = engine
+        .apply_command(Command::create_instance_with(
+            "scripted",
+            vars(&[("a", Value::Int(2)), ("b", Value::Int(3))]),
+        ))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The script did not create a job; only the downstream service task did.
+    assert_eq!(engine.state().jobs.len(), 1);
+    let job = engine.state().jobs.values().next().unwrap();
+    assert_eq!(job.job_type, "do-work");
+
+    // The token advanced past the script (parked at the service task) and the
+    // computed result is present under the declared resultVariable.
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("sum"),
+        Some(&Value::Int(5))
+    );
+}
+
+#[test]
+fn inline_script_task_completes_the_instance_when_terminal() {
+    // A script task with no downstream work completes the instance immediately
+    // (pass-through), like an intermediate throw event.
+    let def = ProcessBuilder::new("scripted-end")
+        .start_event("start")
+        .script_task("calc", "=x * 2", "doubled")
+        .end_event("end")
+        .connect("start", "calc")
+        .connect("calc", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let events = engine
+        .apply_command(Command::create_instance_with(
+            "scripted-end",
+            vars(&[("x", Value::Int(21))]),
+        ))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.state().jobs.len(), 0);
+    assert!(engine.is_completed(key));
+}
+
 /// The cross-partition (Zeebe-style) placement protocol for an intermediate
 /// catch: the instance partition parks on an `Opening` record, the host routes
 /// `OpenMessageSubscription` to the message partition (`hash(correlation_key)`),
