@@ -989,24 +989,39 @@ Kuhn's revolutions do not begin at the center of a paradigm; they begin at its
 edges, where anomalies are felt first and most sharply. For a process engine the
 outermost edge is the **client boundary** — the SDKs, and the developers who build
 against them daily — and that is the vantage point from which this work was seen.
-Years spent building Camunda's client SDKs are years spent watching where the
-core's choices resurface as friction at the rim: the semantics a client must
-reproduce exactly (§4's honest tension — activation, correlation, FEEL, key
-types); the operational surface every integration has to accommodate (§2); and,
-most concretely, the ordinary daily need to run the engine locally to build and
-test against — where a heavyweight, JVM‑bound core is felt as *weight* in a way no
-SDK can paper over (§1, §8).
+Years spent building Camunda's client SDKs surfaced three strains in particular,
+felt long before they had a name.
 
-Nano's response is to take those edge‑observed anomalies and resolve them **at the
-core**, rather than absorbing them — once again — into the client layer. The
-local‑development footprint (§1, §8), the single ceiling decision (§5), and the
-self‑closing control loops (§6) are all core answers to friction that was
-diagnosed from the outside in. The anomaly is observed at the edge; the fix is
-made in the center — which is also why no customer running on the JVM would have
-*requested* a ground‑up Rust engine: the people best positioned to feel an anomaly
-are seldom the ones who own the core. That gap — between where a paradigm's strains
-are felt and where they can be repaired — is itself a Kuhnian observation about
-where revolutions come from.
+The first two are blunt: **size** — both the memory an engine holds and the bytes
+you must download to get one — and **startup speed**. A heavyweight, JVM‑bound core
+is felt as *weight* every time a developer wants one on their workstation to build
+and test against, in a way no SDK can paper over (§1, §8).
+
+The third is subtler and was the one that never resolved: **a client architecture
+cannot self‑optimize**. Developers would ask, constantly, how to size their client
+tier — how many workers, how many connections — and the honest answer was always
+"load‑test it," because nothing in the system could tell them. We tried to make the
+SDKs *adapt* to load on their own, and hit a wall inherent to the paradigm: the
+clients cannot talk to each other, so each adapts blind, with no picture of the
+fleet; and the only signal from the server is naive — a per‑request rejection —
+*and it has a cost*, because the sole way to discover you are being backpressured
+is to hit the server and be turned away, which is itself load. The feedback the
+client tier needed to size itself was both impoverished and expensive to obtain,
+and no amount of SDK cleverness could manufacture what the architecture withheld.
+
+Nano's response is to resolve these **at the core** rather than absorbing them,
+once again, into the client layer. Size and startup are answered by footprint: a
+small binary that idles at a few megabytes (§1, §8). The self‑optimization wall is
+answered structurally — Falcon makes the distributed clients and the cluster a
+single coherent system with one shared feedback loop (§6, §9, §10 row 3), so the
+fleet sizes *itself* from a rich, continuous, already‑in‑band signal instead of
+each client probing a naive endpoint blind. The anomaly is observed at the edge;
+the fix is made in the center — which is also why no customer running on the JVM
+would have *requested* a ground‑up Rust engine: the people best positioned to feel
+an anomaly are seldom the ones who own the core. That gap — between where a
+paradigm's strains are felt and where they can be repaired — is itself a Kuhnian
+observation about where revolutions come from.
+
 
 ### 13.2 The tyranny of success
 
