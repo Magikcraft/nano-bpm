@@ -6,6 +6,12 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "console"],
       "port": 5173
+    },
+    {
+      "name": "processos",
+      "runtimeExecutable": "./processos/target/debug/processos",
+      "runtimeArgs": [],
+      "port": 8090
     }
   ]
 }
