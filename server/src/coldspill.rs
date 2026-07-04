@@ -237,6 +237,8 @@ mod tests {
             variables_spilled: false,
             multi_instances: HashMap::new(),
             element_locals: HashMap::new(),
+            scope_parents: HashMap::new(),
+            scope_variables: HashMap::new(),
         }
     }
 

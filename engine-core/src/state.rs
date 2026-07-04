@@ -297,6 +297,22 @@ pub struct ProcessInstance {
     /// completes.
     #[cfg_attr(feature = "serde", serde(default))]
     pub element_locals: HashMap<Key, HashMap<String, Value>>,
+    /// Non-root variable scopes: each scope-owning element instance (embedded
+    /// sub-process, multi-instance body, multi-instance child) mapped to its
+    /// parent scope-owner. The root (process-instance) scope is implicit — its
+    /// key is the instance key and it is never present here. Empty for instances
+    /// with only the root scope. Together with `scope_variables` this is the
+    /// Zeebe-style hierarchical variable tree (Part C). `serde(default)` so
+    /// snapshots written before scoping deserialize as root-only.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scope_parents: HashMap<Key, Key>,
+    /// Local variables held directly by each non-root scope (keyed by the
+    /// scope-owning element instance). The root scope's variables live in
+    /// `variables`. A read resolves a name from the local scope upward to the
+    /// root (first hit wins); a write follows Zeebe variable propagation. Empty
+    /// for root-only instances, keeping the flat fast path unchanged.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scope_variables: HashMap<Key, HashMap<String, Value>>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying
@@ -856,6 +872,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     variables_spilled: false,
                     multi_instances: HashMap::new(),
                     element_locals: HashMap::new(),
+                    scope_parents: HashMap::new(),
+                    scope_variables: HashMap::new(),
                 },
             );
         }
@@ -869,6 +887,49 @@ pub fn apply(state: &mut State, event: &Event) {
                 for (k, v) in variables {
                     map.insert(k.clone(), v.clone());
                 }
+            }
+        }
+
+        Event::ScopedVariablesUpdated {
+            instance_key,
+            scope_key,
+            variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                // A write targeting the root scope lands in the shared `variables`
+                // Arc (the flat fast path); any other scope holds its own local map.
+                if *scope_key == 0 || *scope_key == *instance_key {
+                    let map = Arc::make_mut(&mut instance.variables);
+                    for (k, v) in variables {
+                        map.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    let map = instance.scope_variables.entry(*scope_key).or_default();
+                    for (k, v) in variables {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        Event::VariableScopeCreated {
+            instance_key,
+            scope_key,
+            parent_scope_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.scope_parents.insert(*scope_key, *parent_scope_key);
+                instance.scope_variables.entry(*scope_key).or_default();
+            }
+        }
+
+        Event::VariableScopeDestroyed {
+            instance_key,
+            scope_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.scope_parents.remove(scope_key);
+                instance.scope_variables.remove(scope_key);
             }
         }
 
@@ -1198,6 +1259,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     instance.variables = Arc::new(HashMap::new());
                 }
                 instance.variables_spilled = false;
+                instance.scope_variables.clear();
+                instance.scope_parents.clear();
             }
         }
 
@@ -1224,6 +1287,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     instance.variables = Arc::new(HashMap::new());
                 }
                 instance.variables_spilled = false;
+                instance.scope_variables.clear();
+                instance.scope_parents.clear();
             }
         }
 

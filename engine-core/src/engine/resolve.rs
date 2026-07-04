@@ -134,15 +134,155 @@ impl Engine {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return Arc::default();
         };
+        // Base: the hierarchical scoped view visible to this element (root scope
+        // fast-path returns the shared `variables` Arc unchanged). The MI child
+        // `element_locals` overlay is layered on top for backward compatibility
+        // until multi-instance moves onto real scopes (Part C phase 3).
+        let scope = self.variable_scope_of(instance, element_instance_key);
+        let base = self.visible_variables(instance, scope);
         match instance.element_locals.get(&element_instance_key) {
             Some(locals) if !locals.is_empty() => {
-                let mut merged = (*instance.variables).clone();
+                let mut merged = (*base).clone();
                 for (k, v) in locals {
                     merged.insert(k.clone(), v.clone());
                 }
                 Arc::new(merged)
             }
-            _ => Arc::clone(&instance.variables),
+            _ => base,
+        }
+    }
+
+    /// The variable scope that directly owns `key`'s variables: `key` itself when
+    /// it is a registered scope-owner (sub-process / multi-instance body or
+    /// child), otherwise the nearest enclosing scope recorded when the element
+    /// activated, defaulting to the root (process-instance) scope. Root-only
+    /// instances always resolve to the instance key.
+    pub(crate) fn variable_scope_of(
+        &self,
+        instance: &crate::state::ProcessInstance,
+        key: Key,
+    ) -> Key {
+        if key == 0 || key == instance.key {
+            return instance.key;
+        }
+        if instance.scope_parents.contains_key(&key) {
+            return key;
+        }
+        // `scopes` maps an active element instance to its enclosing sub-process
+        // scope-owner; walk to a registered scope, else fall back to root.
+        match instance.scopes.get(&key) {
+            Some(&enclosing) if instance.scope_parents.contains_key(&enclosing) => enclosing,
+            _ => instance.key,
+        }
+    }
+
+    /// The variables visible in `scope_key`, resolving each name from the scope
+    /// upward to the root (a local binding shadows an ancestor's). The root scope
+    /// with no child scopes is the hot path: it returns the shared `variables`
+    /// `Arc` directly (a refcount bump, no clone), preserving the flat engine's
+    /// job-activation cost. Only instances that actually opened a sub-scope pay
+    /// the merge.
+    pub(crate) fn visible_variables(
+        &self,
+        instance: &crate::state::ProcessInstance,
+        scope_key: Key,
+    ) -> Arc<HashMap<String, Value>> {
+        let is_root = scope_key == 0 || scope_key == instance.key;
+        if is_root || instance.scope_variables.is_empty() {
+            return Arc::clone(&instance.variables);
+        }
+        // Collect the scope chain leaf -> ... -> root, then merge root-first so
+        // nearer scopes overwrite (shadow) farther ones.
+        let mut chain: Vec<Key> = Vec::new();
+        let mut cur = scope_key;
+        loop {
+            chain.push(cur);
+            match instance.scope_parents.get(&cur) {
+                Some(&parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+        }
+        let mut merged = (*instance.variables).clone();
+        for scope in chain.iter().rev() {
+            if let Some(local) = instance.scope_variables.get(scope) {
+                for (k, v) in local {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Arc::new(merged)
+    }
+
+    /// Resolves Zeebe variable **propagation** for a merge of `variables` into
+    /// `target_scope`, returning the per-scope writes to emit (as
+    /// [`crate::Event::ScopedVariablesUpdated`]). With `local` true every value
+    /// lands in `target_scope`. Otherwise each name is written to the nearest
+    /// ancestor scope (from the target upward) that already defines it; a name
+    /// defined nowhere is created in the root scope. Root-only instances collapse
+    /// to a single root write, matching the flat engine.
+    // Wired into the variable-write sites (I/O mappings, job/message merges,
+    // SetVariables) in Part C phase 2; defined here with the scope machinery.
+    #[allow(dead_code)]
+    pub(crate) fn propagate_variables(
+        &self,
+        instance_key: Key,
+        target_scope: Key,
+        variables: HashMap<String, Value>,
+        local: bool,
+    ) -> Vec<(Key, HashMap<String, Value>)> {
+        if variables.is_empty() {
+            return Vec::new();
+        }
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return vec![(instance_key, variables)];
+        };
+        let root = instance.key;
+        let target = self.variable_scope_of(instance, target_scope);
+        // Fast path: local write, or a root-only instance — one scope, no walk.
+        if local {
+            return vec![(target, variables)];
+        }
+        if instance.scope_variables.is_empty() && instance.scope_parents.is_empty() {
+            return vec![(root, variables)];
+        }
+        let mut by_scope: HashMap<Key, HashMap<String, Value>> = HashMap::new();
+        for (name, value) in variables {
+            let dest = self.scope_defining(instance, target, &name).unwrap_or(root);
+            by_scope.entry(dest).or_default().insert(name, value);
+        }
+        by_scope.into_iter().collect()
+    }
+
+    /// The nearest scope (from `scope` upward to the root) that already defines
+    /// `name`, or `None` if no scope in the chain holds it.
+    #[allow(dead_code)]
+    fn scope_defining(
+        &self,
+        instance: &crate::state::ProcessInstance,
+        scope: Key,
+        name: &str,
+    ) -> Option<Key> {
+        let root = instance.key;
+        let mut cur = scope;
+        loop {
+            let holds = if cur == root {
+                instance.variables.contains_key(name)
+            } else {
+                instance
+                    .scope_variables
+                    .get(&cur)
+                    .is_some_and(|m| m.contains_key(name))
+            };
+            if holds {
+                return Some(cur);
+            }
+            if cur == root {
+                return None;
+            }
+            match instance.scope_parents.get(&cur) {
+                Some(&parent) if parent != cur => cur = parent,
+                _ => return None,
+            }
         }
     }
 

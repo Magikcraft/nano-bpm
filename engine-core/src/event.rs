@@ -50,6 +50,31 @@ pub enum Event {
         variables: HashMap<String, Value>,
     },
 
+    /// Variables were merged into a specific variable scope (Part C hierarchical
+    /// scoping). `scope_key` names the scope-owning element instance the values
+    /// land in; when it equals `instance_key` (or `0`) they land in the root
+    /// scope, matching [`Event::VariablesUpdated`]. The engine resolves Zeebe
+    /// variable propagation *before* emitting, so each event targets exactly one
+    /// scope and the applier is a plain merge.
+    ScopedVariablesUpdated {
+        instance_key: Key,
+        scope_key: Key,
+        variables: HashMap<String, Value>,
+    },
+    /// A non-root variable scope was opened (Part C). Registers `scope_key`
+    /// (a scope-owning element instance: sub-process, multi-instance body or
+    /// child) with its `parent_scope_key` in the instance's scope tree, so reads
+    /// resolve upward and local variables can be held against it.
+    VariableScopeCreated {
+        instance_key: Key,
+        scope_key: Key,
+        parent_scope_key: Key,
+    },
+    /// A non-root variable scope was closed (Part C): its local variables are
+    /// dropped and its tree entry removed. Emitted as the owning element instance
+    /// completes or is terminated.
+    VariableScopeDestroyed { instance_key: Key, scope_key: Key },
+
     /// An element instance entered `ACTIVATING`.
     ElementActivating {
         instance_key: Key,
@@ -576,6 +601,9 @@ impl Event {
         match self {
             Event::ProcessInstanceCreated { instance_key, .. }
             | Event::VariablesUpdated { instance_key, .. }
+            | Event::ScopedVariablesUpdated { instance_key, .. }
+            | Event::VariableScopeCreated { instance_key, .. }
+            | Event::VariableScopeDestroyed { instance_key, .. }
             | Event::ElementActivating { instance_key, .. }
             | Event::ElementActivated { instance_key, .. }
             | Event::ElementCompleting { instance_key, .. }

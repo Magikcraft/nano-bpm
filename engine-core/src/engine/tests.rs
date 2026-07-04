@@ -5646,3 +5646,195 @@ fn empty_input_collection_completes_the_multi_instance_body_immediately() {
         Some(&Value::List(vec![]))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Hierarchical variable scoping — machinery (Part C phase 1)
+// ---------------------------------------------------------------------------
+
+/// Applies a raw event straight to the engine's state (test-only shortcut for
+/// exercising the scope appliers/helpers without a driving command).
+fn apply_raw(engine: &mut Engine, event: Event) {
+    crate::state::apply(&mut engine.state, &event);
+}
+
+#[test]
+fn scoped_variable_resolution_walks_child_scope_to_root() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1)), ("b", Value::Int(2))]),
+        },
+    );
+    let child: Key = 900_001;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("b", Value::Int(20)), ("c", Value::Int(3))]),
+        },
+    );
+
+    let inst = engine.state.instances.get(&key).unwrap();
+    // The root scope sees only its own variables.
+    let root_view = engine.visible_variables(inst, key);
+    assert_eq!(root_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(root_view.get("b"), Some(&Value::Int(2)));
+    assert_eq!(root_view.get("c"), None);
+    // The child scope shadows `b`, adds local `c`, and inherits `a` from root.
+    let child_view = engine.visible_variables(inst, child);
+    assert_eq!(child_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(child_view.get("b"), Some(&Value::Int(20)));
+    assert_eq!(child_view.get("c"), Some(&Value::Int(3)));
+}
+
+#[test]
+fn variable_propagation_updates_nearest_defining_scope_else_root() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1))]),
+        },
+    );
+    let child: Key = 900_002;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("b", Value::Int(2))]),
+        },
+    );
+
+    // Non-local merge into the child: `a` is defined only at root -> root; `b`
+    // is defined locally -> child; `c` is new anywhere -> created at root.
+    let writes = engine.propagate_variables(
+        key,
+        child,
+        vars(&[
+            ("a", Value::Int(9)),
+            ("b", Value::Int(9)),
+            ("c", Value::Int(9)),
+        ]),
+        false,
+    );
+    let mut by_scope: std::collections::HashMap<Key, Vec<String>> =
+        std::collections::HashMap::new();
+    for (scope, map) in writes {
+        by_scope
+            .entry(scope)
+            .or_default()
+            .extend(map.keys().cloned());
+    }
+    for names in by_scope.values_mut() {
+        names.sort();
+    }
+    assert_eq!(
+        by_scope.get(&key),
+        Some(&vec!["a".to_string(), "c".to_string()])
+    );
+    assert_eq!(by_scope.get(&child), Some(&vec!["b".to_string()]));
+}
+
+#[test]
+fn local_variable_write_stays_in_the_target_scope() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1))]),
+        },
+    );
+    let child: Key = 900_003;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+
+    // A local write pins every value to the child scope even though `a` is
+    // defined at root (Zeebe `local=true` / input-mapping semantics).
+    let writes = engine.propagate_variables(key, child, vars(&[("a", Value::Int(9))]), true);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, child);
+    assert!(writes[0].1.contains_key("a"));
+}
+
+#[test]
+fn destroying_a_scope_drops_its_local_variables() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    let child: Key = 900_004;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("c", Value::Int(3))]),
+        },
+    );
+    assert!(engine
+        .state
+        .instances
+        .get(&key)
+        .unwrap()
+        .scope_variables
+        .contains_key(&child));
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeDestroyed {
+            instance_key: key,
+            scope_key: child,
+        },
+    );
+    let inst = engine.state.instances.get(&key).unwrap();
+    assert!(!inst.scope_variables.contains_key(&child));
+    assert!(!inst.scope_parents.contains_key(&child));
+}
