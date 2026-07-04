@@ -119,6 +119,30 @@ jobs:
       - name: Test
         run: npm test
 
+  nano-bernd-jvm:
+    name: 'io.github.jwulf:nano-bernd (JVM, Chicory)'
+    runs-on: ubuntu-24.04
+    needs: engine-wasm-ffi-dist
+    defaults:
+      run:
+        working-directory: clients/nano-bernd-jvm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Download engine-wasm-ffi artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-wasm-ffi
+          path: dist/engine-wasm-ffi/
+      - name: Sync wasm into resources
+        run: bash scripts/sync-wasm.sh
+      - name: Verify + test
+        run: mvn --batch-mode --no-transfer-progress verify
+
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04
