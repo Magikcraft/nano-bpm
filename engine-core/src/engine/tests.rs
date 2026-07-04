@@ -900,6 +900,92 @@ fn should_park_on_message_catch_then_correlate() {
         .any(|e| matches!(e, Event::MessageCorrelated { .. })));
 }
 
+#[test]
+fn feel_message_name_resolves_on_activation() {
+    // The message name is a FEEL expression referencing an instance variable;
+    // Zeebe evaluates it when the subscription opens (on activation).
+    let def = ProcessBuilder::new("await-payment")
+        .start_event("start")
+        .message_intermediate_catch_event("await", "=\"payment-\" + region", "orderId")
+        .end_event("end")
+        .connect("start", "await")
+        .connect("await", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let events = engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[
+                ("orderId", Value::Str("A".into())),
+                ("region", Value::Str("eu".into())),
+            ]),
+        ))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The subscription opened under the resolved name, not the raw expression.
+    let subs = engine.message_subscriptions();
+    assert_eq!(subs.len(), 1);
+    assert_eq!(subs[0].message_name, "payment-eu");
+    assert_eq!(subs[0].correlation_key, "A");
+
+    // A message for a different region does not correlate.
+    let fired = engine.correlate_message("payment-us", "A", HashMap::new(), 0);
+    assert!(!fired
+        .iter()
+        .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    assert!(!engine.is_completed(instance_key));
+
+    // The resolved name correlates and completes the instance.
+    let fired = engine.correlate_message("payment-eu", "A", HashMap::new(), 0);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::MessageCorrelated { .. })));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn feel_signal_name_resolves_on_activation() {
+    // The signal name is a FEEL expression referencing an instance variable,
+    // evaluated when the signal subscription opens (on activation).
+    let def = ProcessBuilder::new("await-signal")
+        .start_event("start")
+        .signal_intermediate_catch_event("await", "=\"clear-\" + zone")
+        .end_event("end")
+        .connect("start", "await")
+        .connect("await", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "await-signal",
+            vars(&[("zone", Value::Str("north".into()))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(engine.signal_subscriptions().len(), 1);
+
+    // A broadcast for a different zone does not correlate.
+    let fired = engine.broadcast_signal("clear-south", HashMap::new(), 0);
+    assert!(!fired
+        .iter()
+        .any(|e| matches!(e, Event::SignalCorrelated { .. })));
+    assert!(!engine.is_completed(key));
+
+    // The resolved name completes the instance.
+    let fired = engine.broadcast_signal("clear-north", HashMap::new(), 0);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::SignalCorrelated { .. })));
+    assert!(engine.is_completed(key));
+}
+
 /// The cross-partition (Zeebe-style) placement protocol for an intermediate
 /// catch: the instance partition parks on an `Opening` record, the host routes
 /// `OpenMessageSubscription` to the message partition (`hash(correlation_key)`),
@@ -3463,6 +3549,33 @@ fn should_create_an_instance_when_a_message_start_correlates() {
     assert_eq!(seeded, Some(Value::Int(7)));
     assert!(engine.is_completed(instance_key));
     assert!(engine.state().instances[&instance_key].variables.is_empty());
+}
+
+#[test]
+fn feel_message_start_name_resolves_at_deploy() {
+    // A message-start-event name expression is evaluated at deploy time against
+    // an empty context (Zeebe parity); the resolved value keys the subscription.
+    let def = ProcessBuilder::new("order-flow")
+        .message_start_event("start", "=\"order-\" + \"placed\"")
+        .end_event("end")
+        .connect("start", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    // The subscription is keyed by the resolved name, not the raw expression.
+    assert_eq!(engine.state().message_start_subscriptions.len(), 1);
+    assert!(engine
+        .state()
+        .message_start_subscriptions
+        .contains_key("order-placed"));
+
+    // A message under the resolved name creates an instance.
+    let fired = engine.correlate_message("order-placed", "", HashMap::new(), 0);
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })));
 }
 
 #[test]

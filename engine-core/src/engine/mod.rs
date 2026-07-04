@@ -503,6 +503,10 @@ impl Engine {
             );
             match start_kind {
                 Some(ElementKind::MessageStartEvent { message_name }) => {
+                    // Per Zeebe, a start-event name expression is evaluated at
+                    // deploy time against an empty context; a static name passes
+                    // through unchanged.
+                    let message_name = self.resolve_event_name(None, &message_name);
                     self.emit(
                         log,
                         Event::MessageStartSubscriptionCreated {
@@ -2177,6 +2181,9 @@ impl Engine {
                 correlation_key,
             }) => {
                 let subscription_key = self.mint_key();
+                // The message name may be a FEEL expression evaluated on
+                // activation against the instance variables (Zeebe parity).
+                let message_name = self.resolve_event_name(Some(instance_key), &message_name);
                 let correlation_value =
                     self.resolve_correlation_value(instance_key, &correlation_key);
                 let kind = state::MessageSubscriptionKind::IntermediateCatch;
@@ -2212,6 +2219,9 @@ impl Engine {
             // BroadcastSignal releases it.
             Some(ElementKind::SignalIntermediateCatchEvent { signal_name }) => {
                 let subscription_key = self.mint_key();
+                // The signal name may be a FEEL expression evaluated on
+                // activation against the instance variables (Zeebe parity).
+                let signal_name = self.resolve_event_name(Some(instance_key), &signal_name);
                 events.push(Event::SignalSubscriptionCreated {
                     subscription_key,
                     instance_key,

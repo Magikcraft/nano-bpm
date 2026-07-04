@@ -295,6 +295,10 @@ impl Engine {
             self.attached_message_boundaries(instance_key, element_id)
         {
             let subscription_key = self.mint_key();
+            // The message name may be a FEEL expression evaluated on activation
+            // (when the boundary subscription opens) against the instance
+            // variables (Zeebe parity).
+            let message_name = self.resolve_event_name(Some(instance_key), &message_name);
             let correlation_value = self.resolve_correlation_value(instance_key, &correlation_key);
             let kind = if interrupting {
                 state::MessageSubscriptionKind::InterruptingBoundary {
@@ -335,6 +339,10 @@ impl Engine {
             self.attached_signal_boundaries(instance_key, element_id)
         {
             let subscription_key = self.mint_key();
+            // The signal name may be a FEEL expression evaluated on activation
+            // (when the boundary subscription opens) against the instance
+            // variables (Zeebe parity).
+            let signal_name = self.resolve_event_name(Some(instance_key), &signal_name);
             let kind = if interrupting {
                 state::MessageSubscriptionKind::InterruptingBoundary {
                     boundary_element_id: boundary_id,

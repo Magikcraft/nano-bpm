@@ -21,6 +21,29 @@ impl Engine {
         crate::feel::eval_string(correlation_key, &vars).unwrap_or_default()
     }
 
+    /// Resolves a message or signal event `name` at subscription-open time.
+    ///
+    /// A static value (`"order canceled"`) is returned verbatim. A FEEL
+    /// expression (a leading `=`, e.g. `="order " + awaitingAction`) is
+    /// evaluated to a string against the instance variables, falling back to the
+    /// literal text when it cannot be evaluated (parse error, unresolved
+    /// variable, non-string result) — matching the error-tolerant behaviour of
+    /// the other `resolve_*` helpers, which have no incident path.
+    ///
+    /// `instance_key` is `None` for a message-start-event name, which Zeebe
+    /// evaluates at deploy time against an empty context; the catch/boundary
+    /// cases pass `Some(instance_key)` so the name is evaluated on activation.
+    pub(crate) fn resolve_event_name(&self, instance_key: Option<Key>, raw: &str) -> String {
+        let trimmed = raw.trim();
+        if !trimmed.starts_with('=') {
+            return raw.to_string();
+        }
+        let empty = HashMap::new();
+        let vars = instance_key.map(|k| self.variables(k));
+        let ctx: &HashMap<String, Value> = vars.as_deref().unwrap_or(&empty);
+        crate::feel::eval_string(trimmed, ctx).unwrap_or_else(|_| raw.to_string())
+    }
+
     pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))
