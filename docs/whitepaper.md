@@ -609,19 +609,42 @@ architectural constant.
 
 ### 9.4 Heterogeneity: a cluster of unequal nodes
 
-The old paradigm's mental model is a fleet of interchangeable brokers. Nano
-assumes the opposite: nodes with different CPU, memory, and momentary load — a
-developer laptop beside a cloud VM, or simply nodes that filled up at different
-times. This is where §6's controllers pay off as a *distributed* system rather than
-a single valve. Each node senses its own throughput and memory ceilings
-independently (§8, §11); load is gossiped so placement can steer new creates toward
-the node most able to absorb them; a saturated owner sheds a forwarded create back
-to ingress for rerouting rather than queueing it; and backlog-weighted fairness
-keeps the drain equitable across the uneven fleet. The result is a cluster that
-degrades **gracefully and locally** — the busy node slows or sheds while the rest
-keep serving — rather than as a monolith that stalls when its weakest partition
-does. Heterogeneity stops being a failure mode to engineer away and becomes an
-operating assumption the control loop is built to exploit.
+The old paradigm's mental model is a fleet of **interchangeable** brokers — and
+this is visible directly in the code, not merely in spirit. Zeebe places partitions
+with a `RoundRobinPartitionDistributor` that "distributes the partitions in a round
+robin fashion over the set of members," taking as input exactly the member set, the
+sorted partition ids, and the replication factor — and nothing else
+(`dynamic-config/.../RoundRobinPartitionDistributor.java`). Leader-election
+priorities are then assigned to spread leadership *evenly* across those members, the
+code's own comment stating the goal: "so that if node 0 dies, the leadership is
+evenly distributed on the rest of the followers" (`getPriorities`). No CPU, memory,
+or load signal enters the partitioning subsystem anywhere; the one refinement,
+`ZoneAwarePartitionDistributor`, spreads replicas across *failure domains* for fault
+tolerance while still treating the nodes within them as equals. Job fanout has the
+same shape — `RoundRobinActivateJobsHandler` cycles partitions in turn. This is a
+*coherent and correct* design for a homogeneous fleet: if every broker is the same,
+even distribution is optimal and a capacity signal would be noise. Zeebe does not
+assume nodes are heterogeneous — it assumes, reasonably for its era and target
+deployment, that they are interchangeable.
+
+Nano assumes the opposite, because its target environments are unequal by
+construction: a developer laptop beside a cloud VM, a node sharing a workstation
+with a memory-hungry local LLM, or simply nodes that filled up at different times
+under an uneven workload. This is where §6's controllers pay off as a *distributed*
+system rather than a single valve. Each node senses its own throughput and memory
+ceilings independently (§8, §11); per-node load is gossiped (ADR 0014) so placement
+steers new creates toward the node most able to absorb them — smooth *weighted*
+round-robin, where Zeebe's is plain round-robin; a saturated owner sheds a forwarded
+create back to ingress for rerouting rather than queueing it; and backlog-weighted
+fairness (ADR 0001) keeps the drain equitable across the uneven fleet. The result is
+a cluster that degrades **gracefully and locally** — the busy node slows or sheds
+while the rest keep serving — rather than as a monolith paced by its weakest member.
+The contrast is not that Zeebe is careless and Nano careful; it is that the two
+engines make *different assumptions about the fleet*, and Nano's assumption — nodes
+are unequal — is the one the new environments (local LLMs, laptops,
+counterfactual-replay fleets) actually present. Heterogeneity stops being a failure
+mode to engineer away and becomes an operating assumption the control loop is built
+to exploit.
 
 ---
 
