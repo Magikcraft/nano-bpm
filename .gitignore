@@ -3,6 +3,9 @@ build/
 generated/
 target/
 
+# CI-generated artifact tree for the FFI wasm (regenerated with `make engine-wasm-ffi-dist`).
+dist/
+
 # Generated stub trait implementations (produced by scripts/gen-stub-server.py).
 server/src/stub_impls.rs
 
