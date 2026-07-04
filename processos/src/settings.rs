@@ -70,6 +70,12 @@ pub struct LlmProfile {
     /// supplies `--host`, `--port` and the model flag; these are appended verbatim.
     #[serde(default)]
     pub sidecar_args: Option<String>,
+    /// Enable **MTP (multi-token prediction)** when launching this sidecar: llama-server gets
+    /// `--mtp`, using the model's built-in NextN prediction heads for self-speculative decoding.
+    /// Only valid for models whose GGUF actually carries those heads — the start handler scans
+    /// the GGUF ([`crate::gguf`]) and refuses to launch an MTP config on a non-MTP model.
+    #[serde(default)]
+    pub mtp: bool,
     /// Coarse reasoning budget (Fast/Medium/Max) for this profile, applied to **both** the
     /// investigative primary and any pairing/partner role this profile fills. `None` leaves the
     /// model's thinking unconstrained.
@@ -130,6 +136,9 @@ impl LlmProfile {
         }
         if let Some(v) = patch.sidecar_args {
             self.sidecar_args = non_empty(v);
+        }
+        if let Some(v) = patch.mtp {
+            self.mtp = v;
         }
         if let Some(v) = patch.thinking_level {
             // Empty/unknown string clears the level (back to unconstrained thinking).
@@ -275,6 +284,7 @@ fn seeded() -> Settings {
             sidecar: true,
             model_file: Some(model.to_string()),
             sidecar_args: Some("-ngl 99 -c 32768 --jinja".to_string()),
+            mtp: false,
             thinking_level: None,
             starred: false,
         }
@@ -424,6 +434,7 @@ pub struct ProfilePatch {
     pub sidecar: Option<bool>,
     pub model_file: Option<String>,
     pub sidecar_args: Option<String>,
+    pub mtp: Option<bool>,
     /// Coarse reasoning budget label (`fast`/`medium`/`max`); empty/unknown clears it.
     pub thinking_level: Option<String>,
     pub starred: Option<bool>,
@@ -468,6 +479,7 @@ pub struct ProfileView {
     pub sidecar: bool,
     pub model_file: Option<String>,
     pub sidecar_args: Option<String>,
+    pub mtp: bool,
     pub thinking_level: Option<ThinkingLevel>,
     pub starred: bool,
 }
@@ -487,6 +499,7 @@ impl ProfileView {
             sidecar: p.sidecar,
             model_file: p.model_file.clone(),
             sidecar_args: p.sidecar_args.clone(),
+            mtp: p.mtp,
             thinking_level: p.thinking_level,
             starred: p.starred,
         }
@@ -603,6 +616,7 @@ impl SettingsStore {
             sidecar: false,
             model_file: None,
             sidecar_args: None,
+            mtp: false,
             thinking_level: None,
             starred: false,
         };
@@ -727,6 +741,7 @@ fn migrate(s: &str) -> Option<Settings> {
                 sidecar: false,
                 model_file: None,
                 sidecar_args: None,
+                mtp: false,
                 thinking_level: None,
                 starred: false,
             });
@@ -833,6 +848,7 @@ mod tests {
             sidecar: true,
             model_file: None,
             sidecar_args: None,
+            mtp: false,
             thinking_level: None,
             starred: false,
         };

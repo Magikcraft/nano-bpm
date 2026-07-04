@@ -329,6 +329,7 @@
   .pair-mode-badge.pair { color: #c084fc; background: rgba(168,85,247,.14); }
   .pair-mode-badge.monitor { color: #fbbf24; background: rgba(251,191,36,.14); }
   .pair-mode-badge.subagent { color: #67e8f9; background: rgba(103,232,249,.14); }
+  .pair-mode-badge.speculator { color: #f0abfc; background: rgba(240,171,252,.14); }
   .tool-badge { font: 700 9.5px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; vertical-align: 1px; }
   .tool-badge.python { color: #7dd3fc; background: rgba(56,189,248,.14); }
   .tool-badge.sql { color: #86efac; background: rgba(34,197,94,.14); }
@@ -873,6 +874,23 @@ function startDepsPoll(){
 // scope so it survives the view's re-renders; the warming auto-refresh is suppressed
 // while it's open so typed input isn't wiped.
 let LLM_EDITOR = { open:false, id:null, type:null };
+// GGUF capability scans (from /api/llama/scan/{id}), keyed by profile id. A scan tells us whether
+// a downloaded model carries MTP (NextN) prediction heads, so the tile can offer the MTP toggle.
+// 'pending' marks an in-flight fetch so re-renders don't refetch.
+let GGUF_SCANS = {};
+// Fetch missing scans for the given (downloaded, sidecar) profiles, then re-render once if any
+// arrived and the operator is still looking at this view with the editor closed.
+function ensureGgufScans(ids){
+  const missing = ids.filter(id => !(id in GGUF_SCANS));
+  if(!missing.length) return;
+  missing.forEach(id => { GGUF_SCANS[id] = 'pending'; });
+  Promise.all(missing.map(async id => {
+    try { GGUF_SCANS[id] = await api('/api/llama/scan/'+encodeURIComponent(id)); }
+    catch(e){ GGUF_SCANS[id] = { profileId:id, error:String(e&&e.message||e) }; }
+  })).then(() => {
+    if(STATE.view==='sidecars' && !LLM_EDITOR.open) renderSidecars();
+  });
+}
 // Context windows learned from the editor's last "Fetch models", keyed by model id, so saving a
 // remote profile persists the model's advertised window alongside it.
 let LE_CTX = {};
@@ -1067,7 +1085,9 @@ async function renderSidecars(){
     + '<p class="lede">The models ProcessOS can investigate with — <b>sidecar profiles</b> it supervises locally via '
     + '<code>llama-server</code> (llama.cpp), and <b>remote profiles</b> pointing at OpenAI-compatible endpoints. '
     + 'Up to <b>'+max+'</b> sidecars run at once (each on an auto-assigned port) — so an investigation can pair a primary '
-    + 'model with a sparring-partner or loop-monitor. The dot in the menu is green while any sidecar is up.</p>'
+    + 'model with a sparring-partner or loop-monitor. A <b>speculator</b> pairing instead loads the partner into the '
+    + 'primary’s server as a speculative-decoding draft, and models with built-in MTP heads get an <b>MTP</b> toggle below. '
+    + 'The dot in the menu is green while any sidecar is up.</p>'
     + '<div class="btnrow" style="margin:0 0 14px"><button class="btn primary" id="llAddProfileBtn">+ Add LLM profile</button></div>';
 
   // The inline add/edit editor sits at the top of the view when open.
@@ -1081,7 +1101,10 @@ async function renderSidecars(){
       + sidecars.map(r => {
           const pm = phaseMeta(r);
           return '<div class="meta" style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-          + '<b style="color:#d1fae5">'+esc(r.profileId||'?')+'</b> '+pm.pill+' · '+esc(r.model||'')+(r.port?(' · port '+r.port):'')+(r.pid?(' · pid '+r.pid):'')
+          + '<b style="color:#d1fae5">'+esc(r.profileId||'?')+'</b> '+pm.pill
+          + (r.mtp?' <span class="pill accept" title="Multi-token prediction (--mtp) is enabled">mtp</span>':'')
+          + (r.draftModel?' <span class="pill accept" title="Speculative decoding — draft model: '+esc(r.draftModel)+'">⚡ speculating</span>':'')
+          + ' · '+esc(r.model||'')+(r.port?(' · port '+r.port):'')+(r.pid?(' · pid '+r.pid):'')
           + '<button class="btn warn" data-stop="'+esc(r.profileId||'')+'" style="padding:2px 8px">Stop</button>'
           + '<button class="btn ghost" data-logs="'+esc(r.profileId||'')+'" style="padding:2px 8px">Logs</button>'
           + (pm.detail?('<div class="meta" style="flex-basis:100%;color:#93c5fd;margin-top:2px">'+esc(pm.detail)+'</div>'):'')
@@ -1123,6 +1146,26 @@ async function renderSidecars(){
       // Context window: prefer the live value the running sidecar reports, else the persisted one.
       const ctxWin = (isRunning && runById[p.id].contextWindow) || p.contextWindow || null;
       const ctxMeta = ctxWin ? ('<div class="meta" style="margin-top:4px;color:#a5b4fc">context window · '+Number(ctxWin).toLocaleString()+' tokens'+(isRunning&&runById[p.id].contextWindow?' (live)':'')+'</div>') : '';
+      // MTP (multi-token prediction): once the model is on disk its GGUF header tells us whether
+      // it carries NextN prediction heads. Capable models get a toggle (persisted on the profile);
+      // an MTP flag left on a non-capable model gets a warning (the start gate would refuse it).
+      const scan = GGUF_SCANS[p.id];
+      let mtpMeta = '';
+      if(scan && scan!=='pending' && !scan.error && scan.downloaded){
+        if(scan.mtpCapable){
+          const layers = scan.mtpLayers!=null ? (scan.mtpLayers+' MTP layer'+(scan.mtpLayers===1?'':'s')) : (scan.nextnTensors+' nextn tensors');
+          mtpMeta = '<div class="meta" style="margin-top:4px">'
+            + '<label title="Multi-token prediction: launches llama-server with --mtp so the model’s built-in NextN heads self-speculate (llama.cpp beta feature — needs a recent llama.cpp)." style="cursor:pointer">'
+            + '<input type="checkbox" data-mtp="'+esc(p.id)+'" '+(p.mtp?'checked':'')+' style="vertical-align:-2px"> '
+            + 'MTP <span style="color:#86efac">'+esc(layers)+'</span></label>'
+            + (isRunning && !runById[p.id].mtp && p.mtp ? ' <span style="color:#fbbf24" title="Enabled after this sidecar started — restart to apply">restart to apply</span>' : '')
+            + '</div>';
+        } else if(p.mtp){
+          mtpMeta = '<div class="meta" style="margin-top:4px;color:#fca5a5" title="The GGUF header carries no NextN prediction heads — llama.cpp cannot MTP-decode this model.">'
+            + 'MTP is enabled but this GGUF has no MTP heads — start will be refused. '
+            + '<a href="#" data-mtp-off="'+esc(p.id)+'" style="color:#fca5a5;text-decoration:underline">Disable</a></div>';
+        }
+      }
       // Undownloaded sidecars are dimmed with a dotted outline so cached/ready models stand out.
       const undownloaded = !isRunning && !isDownloading && !isDownloaded;
       // The action button reflects the lifecycle: download the weights, then start (serve) them.
@@ -1146,6 +1189,7 @@ async function renderSidecars(){
         + '</h3>'
         + '<div class="meta">'+esc(p.modelFile||p.model||'')+(runPort?(' · port '+esc(String(runPort))):'')+'</div>'
         + ctxMeta
+        + mtpMeta
         + (pm && pm.detail?('<div class="meta" style="margin-top:4px;color:#93c5fd">'+esc(pm.detail)+'</div>'):'')
         + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
@@ -1233,6 +1277,17 @@ async function renderSidecars(){
     } catch(e){ window.alert('Could not update star: '+(e.message||e)); }
     renderSidecars();
   });
+  // MTP toggle: persist onto the profile; the launch gate re-verifies capability at start.
+  const setMtp = async (id, want) => {
+    try { await api('/api/settings/profiles/'+encodeURIComponent(id), {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({mtp:want})}); }
+    catch(e){ window.alert('Could not update MTP: '+(e.message||e)); }
+    renderSidecars();
+  };
+  main.querySelectorAll('[data-mtp]').forEach(c => c.onchange = () => setMtp(c.dataset.mtp, c.checked));
+  main.querySelectorAll('[data-mtp-off]').forEach(a => a.onclick = (e) => { e.preventDefault(); setMtp(a.dataset.mtpOff, false); });
+  // Kick off GGUF capability scans for on-disk models we haven't scanned yet (re-renders once
+  // when they land, so the MTP toggles appear without a manual refresh).
+  ensureGgufScans(profiles.filter(p => downloadedById[p.id] || runById[p.id]).map(p => p.id));
 
   // Mount + scroll the inline editor when open.
   if(LLM_EDITOR.open){
@@ -1408,6 +1463,7 @@ const PAIR_MODES = [
   { v:'pair', label:'Pair AI — reviews the answer each turn', kind:'pair' },
   { v:'monitor', label:'Monitor — watches the live transcript & steers out of loops', kind:'monitor' },
   { v:'subagent', label:'Subagent — primary delegates research tasks to it', kind:'subagent' },
+  { v:'speculator', label:'Speculator — drafts tokens to speed up the primary (speculative decoding)', kind:'pair' },
 ];
 async function renderPairings(){
   STATE.view='pairings'; setActive(); main.innerHTML='Loading…';
@@ -1424,7 +1480,7 @@ async function renderPairings(){
   } catch(e){ return fail(e); }
   main.innerHTML =
     '<h1>LLM Pairings</h1>'
-    + '<p class="lede">A <b>pairing</b> is a saved, first-class Pair AI config: a <b>mode</b> (review, monitor, or delegate), the <b>second model</b> it runs on, an optional <b>primary model</b> (set it for a full team, or leave it blank to keep your current model), and the <b>second model\u2019s prompt</b> \u2014 stored inline so the pairing is self-contained. Pick one in the composer\u2019s <b>Pair AI</b> selector instead of wiring it up ad-hoc each turn.</p>'
+    + '<p class="lede">A <b>pairing</b> is a saved, first-class Pair AI config: a <b>mode</b> (review, monitor, delegate, or speculate), the <b>second model</b> it runs on, an optional <b>primary model</b> (set it for a full team, or leave it blank to keep your current model), and the <b>second model\u2019s prompt</b> \u2014 stored inline so the pairing is self-contained. Pick one in the composer\u2019s <b>Pair AI</b> selector instead of wiring it up ad-hoc each turn. A <b>speculator</b> pairing is different in kind: the second model writes no prose \u2014 it is loaded into the primary\u2019s <code>llama-server</code> as a speculative-decoding <b>draft model</b> to speed the primary up (the same model may even draft for itself).</p>'
     + '<div id="pairingsWrap"></div>';
   drawPairings(PAIRINGS.length ? PAIRINGS[0].id : null);
 }
@@ -1460,21 +1516,25 @@ function pairProfileOptions(selected, blankLabel){
 }
 function editPairing(id){
   const ed = $('#pairingEditor'); if(!ed) return;
-  const blank = {id:'',name:'',mode:'pair',secondaryProfileId:'',primaryProfileId:'',system:'',maxRounds:8,digestCap:4000,builtin:false};
+  const blank = {id:'',name:'',mode:'pair',secondaryProfileId:'',primaryProfileId:'',system:'',maxRounds:8,digestCap:4000,draftMax:null,draftMin:null,builtin:false};
   const p = id===null ? blank : (PAIRINGS.find(x=>x.id===id)||blank);
   const isNew = id===null;
   const ro = p.builtin;
   const mode = p.mode||'pair';
+  const spec = mode==='speculator';
   let h = '<h2 style="margin-top:0">'+(isNew?'New pairing':'Edit pairing')+'</h2>';
   h += '<label class="lbl">Id</label><input id="prId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. skeptic-team" />';
   h += '<label class="lbl">Name</label><input id="prName" value="'+esc(p.name)+'" '+(ro?'disabled':'')+' placeholder="Shown in the composer" />';
   h += '<label class="lbl">Mode</label><select id="prMode" '+(ro?'disabled':'')+' onchange="onPairingModeChange()">'
     + PAIR_MODES.map(m=>'<option value="'+m.v+'"'+(m.v===mode?' selected':'')+'>'+esc(m.label)+'</option>').join('')
     + '</select>';
-  h += '<label class="lbl">Second model (the paired LLM)</label><select id="prSecondary" '+(ro?'disabled':'')+'>'
+  h += '<label class="lbl" id="prSecondaryLbl">'+(spec?'Draft model (must be a local sidecar)':'Second model (the paired LLM)')+'</label><select id="prSecondary" '+(ro?'disabled':'')+'>'
     + pairProfileOptions(p.secondaryProfileId, PAIR_PROFILES.length?null:'No profiles configured') + '</select>';
   h += '<label class="lbl">Primary model <span class="muted" style="font-weight:400">(optional \u2014 set for a full team, or leave blank to keep your current model)</span></label><select id="prPrimary" '+(ro?'disabled':'')+'>'
     + pairProfileOptions(p.primaryProfileId||'', 'Use current / default primary') + '</select>';
+  // Chat-collaboration config (prompt/templates/tools) \u2014 hidden for speculator pairings, whose
+  // second model never chats: it only drafts tokens inside the primary's llama-server.
+  h += '<div id="prChatCfg" style="display:'+(spec?'none':'block')+'">';
   // Inline prompt + a "start from template" picker drawn from built-in/authored personas of this mode.
   h += '<label class="lbl">Second model\u2019s prompt</label>';
   h += '<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="muted" style="font-size:12px">Start from template:</span><select id="prTemplate" '+(ro?'disabled':'')+' onchange="applyPairingTemplate()"></select></div>';
@@ -1491,6 +1551,16 @@ function editPairing(id){
     + toolMultiSelect('prSecondaryTools', p.secondaryTools);
   h += '<label class="lbl">Tools for the primary model <span class="muted" style="font-weight:400">(none selected = all available)</span></label>'
     + toolMultiSelect('prPrimaryTools', p.primaryTools);
+  h += '</div>';
+  // Speculator-only config: draft-token tuning + how the pairing is validated and applied.
+  h += '<div id="prSpecAdv" style="display:'+(spec?'block':'none')+';margin-top:10px">'
+    + '<label class="lbl">Speculative-decoding tuning</label>'
+    + '<div style="display:flex;gap:14px;align-items:center">'
+    + '<label class="muted" style="font-size:12px" title="Most tokens drafted per step (--draft-max, 1\u201364). Blank = llama-server default.">draft max <input type="number" id="prDraftMax" min="1" max="64" value="'+esc(p.draftMax!=null?p.draftMax:'')+'" style="width:56px" '+(ro?'disabled':'')+'></label>'
+    + '<label class="muted" style="font-size:12px" title="Fewest tokens drafted per step (--draft-min, 0\u201316). Blank = llama-server default.">draft min <input type="number" id="prDraftMin" min="0" max="16" value="'+esc(p.draftMin!=null?p.draftMin:'')+'" style="width:56px" '+(ro?'disabled':'')+'></label>'
+    + '</div>'
+    + '<div class="muted" style="font-size:12px;margin-top:8px">The draft model is loaded into the primary\u2019s <code>llama-server</code> via <code>--model-draft</code> when the primary starts \u2014 it never runs as its own sidecar. Both models must be local sidecar GGUFs with the <b>same tokenizer family and BOS/EOS</b>, and vocab sizes within llama.cpp\u2019s tolerance; the save and every start verify this from the GGUF headers and refuse incompatible configs. Picking the <b>same model</b> for draft and primary (\u201cloaded twice\u201d) is always compatible. For models with built-in MTP heads, the per-model <b>MTP</b> toggle on the LLMs page is the zero-config alternative.</div>'
+    + '</div>';
   h += '<div class="actions">';
   if(ro){
     h += '<span class="muted" style="font-size:12px">Built-in pairings are read-only.</span>';
@@ -1500,6 +1570,19 @@ function editPairing(id){
   }
   h += '</div>';
   ed.innerHTML = h;
+  fillPairingTemplates(mode);
+}
+// Toggle the editor's mode-specific sections when the operator changes the Mode select.
+// (Referenced by the select's onchange; keep the field values \u2014 only visibility changes.)
+function onPairingModeChange(){
+  const mode = ($('#prMode')||{}).value || 'pair';
+  const spec = mode==='speculator';
+  const show = (id, on) => { const el = document.getElementById(id); if(el) el.style.display = on?'block':'none'; };
+  show('prChatCfg', !spec);
+  show('prSpecAdv', spec);
+  show('prSubAdv', mode==='subagent');
+  const lbl = document.getElementById('prSecondaryLbl');
+  if(lbl) lbl.textContent = spec ? 'Draft model (must be a local sidecar)' : 'Second model (the paired LLM)';
   fillPairingTemplates(mode);
 }
 // Refresh the template dropdown to the personas matching the selected mode.
@@ -1556,8 +1639,18 @@ async function savePairing(){
     body.maxRounds = parseInt(($('#prRounds')||{}).value,10) || undefined;
     body.digestCap = parseInt(($('#prDigest')||{}).value,10) || undefined;
   }
+  if(mode==='speculator'){
+    // A speculator carries no prompt/tools — the draft model never chats.
+    body.system = '';
+    body.primaryTools = null;
+    body.secondaryTools = null;
+    const dmax = parseInt(($('#prDraftMax')||{}).value,10);
+    const dmin = parseInt(($('#prDraftMin')||{}).value,10);
+    if(!isNaN(dmax)) body.draftMax = dmax;
+    if(!isNaN(dmin)) body.draftMin = dmin;
+  }
   if(!body.id){ alert('Id is required.'); return; }
-  if(!body.secondaryProfileId){ alert('Pick a second model for this pairing.'); return; }
+  if(!body.secondaryProfileId){ alert('Pick a '+(mode==='speculator'?'draft':'second')+' model for this pairing.'); return; }
   try { await api('/api/pairings', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
   catch(e){ alert('Save failed: '+(e.message||e)); return; }
   const ps = await api('/api/pairings'); PAIRINGS = Array.isArray(ps)?ps:[]; drawPairings(body.id);
@@ -3595,6 +3688,13 @@ function subRequest(){
   if(!p || p.mode!=='subagent') return null;
   return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined, maxRounds: p.maxRounds || undefined, digestCap: p.digestCap || undefined, tools: (p.secondaryTools&&p.secondaryTools.length)?p.secondaryTools:undefined };
 }
+// The selected speculator pairing, or null. Unlike the chat-level modes above it produces no
+// per-turn request — it changes how the PRIMARY sidecar is *launched* (draft model attached via
+// --model-draft), so only the sidecar helpers consume it.
+function speculatorRequest(){
+  const p = selectedPairing();
+  return (p && p.mode==='speculator') ? p : null;
+}
 // The PRIMARY model's tool allowlist for this turn: the per-investigation "Configure tools"
 // override (if set), else the selected pairing's primaryTools, else undefined (= all tools).
 function primaryToolsForTurn(){
@@ -3647,6 +3747,17 @@ async function refreshChatRoster(){
   const pr = pairRequest(); if(pr && pr.profileId && byId[pr.profileId]) parts.push(chip(byId[pr.profileId], 'pair'));
   const mr = monitorRequest(); if(mr && mr.profileId && byId[mr.profileId]) parts.push(chip(byId[mr.profileId], 'monitor'));
   const sr = subRequest(); if(sr && sr.profileId && byId[sr.profileId]) parts.push(chip(byId[sr.profileId], 'subagent'));
+  // Speculator: not a chat partner — it rides inside the primary's llama-server. Green ⚡ once
+  // the primary is actually running with a draft model loaded; dim until then.
+  const sp = speculatorRequest();
+  if(sp && sp.secondaryProfileId && byId[sp.secondaryProfileId]){
+    const d = byId[sp.secondaryProfileId];
+    const primaryRun = (st.sidecars||[]).find(x => primary && x.profileId===primary.id);
+    const live = !!(primaryRun && primaryRun.draftModel);
+    const col = live ? '#22c55e' : '#eab308';
+    const tip = live ? 'speculative decoding active (draft loaded in the primary)' : 'speculator configured — loads into the primary when it (re)starts';
+    parts.push('<span title="'+esc(tip)+'" style="color:'+col+';margin-right:3px">⚡</span><b style="color:#cbd5e1">'+esc(d.name||d.id)+'</b> <span style="opacity:.6">speculator</span>');
+  }
   // Warn if the primary somehow equals an enabled partner (the send would hit the partner).
   const clash = primary && partnerProfileIds().has(primary.id);
   el.innerHTML = parts.filter(Boolean).join('<span style="opacity:.4">·</span> ')
@@ -3690,14 +3801,29 @@ async function ensureSidecarsReady(onProgress){
   if(!needed.size) return true;   // nothing local to start
 
   let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return true; }
+  const hint = $('#chatHint');
+  const report = (t, info) => { if(hint) hint.textContent = t; if(typeof onProgress === 'function') onProgress(t, info); };
+  // Speculator pairing: the draft rides inside the PRIMARY's llama-server, attached at launch.
+  // If the primary is already up WITHOUT a draft loaded, offer a restart so the pairing takes
+  // effect (declining proceeds un-accelerated rather than blocking the send).
+  const spec = speculatorRequest();
+  if(spec && primary && primary.sidecar){
+    const run = (st.sidecars||[]).find(x => x.profileId===primary.id);
+    if(run && !run.draftModel){
+      if(window.confirm('Pairing “'+(spec.name||spec.id)+'” adds a speculator (draft model) to '
+          +(primary.name||primary.id)+', which is running without one. Restart it with the speculator now?')){
+        report('Restarting '+(primary.name||primary.id)+' with the speculator…', {profileId:primary.id, label:(primary.name||primary.id), phase:'starting'});
+        try { await api('/api/llama/stop', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId: primary.id})}); } catch(e){}
+        try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ st = {sidecars:[]}; }
+      }
+    }
+  }
   const ready = new Set((st.sidecars||[]).filter(x => x.phase==='ready').map(x => x.profileId));
   if([...needed.keys()].every(id => ready.has(id))) return true;   // all already serving — no wait
   // The first needed sidecar drives the warm-up bubble's "view logs" link.
   STATE.warmupLogsTarget = [...needed.keys()][0] || null;
   const running = new Set((st.sidecars||[]).map(x => x.profileId));
   const missing = [...needed.values()].filter(p => !running.has(p.id));
-  const hint = $('#chatHint');
-  const report = (t, info) => { if(hint) hint.textContent = t; if(typeof onProgress === 'function') onProgress(t, info); };
   if(missing.length){
     const names = missing.map(p => p.name||p.id).join(' + ');
     const word = missing.length>1 ? 'Sidecars' : 'Sidecar';
@@ -3707,7 +3833,11 @@ async function ensureSidecarsReady(onProgress){
     }
     for(const p of missing){
       report('Starting '+(p.name||p.id)+'…', {profileId:p.id, label:(p.name||p.id), phase:'starting'});
-      try { await api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({profileId: p.id})}); }
+      // The primary carries the speculator pairing (if selected) so the draft loads with it. The
+      // server validates GGUF compatibility and refuses invalid speculator configs here.
+      const body = { profileId: p.id };
+      if(spec && primary && p.id===primary.id) body.pairingId = spec.id;
+      try { await api('/api/llama/start', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
       catch(e){ report('Could not start '+(p.name||p.id)+': '+(e.message||e), {profileId:p.id, label:(p.name||p.id), failed:true}); return false; }
     }
     refreshLlamaDot();
