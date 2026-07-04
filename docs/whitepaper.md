@@ -828,7 +828,12 @@ are opt-in and were left off — and, counter-intuitively, turning them on would
 both relaxations: dropping to RF=1 (no replication at all) and moving the journal
 to a RAM disk (no fsync) each left aggregate throughput unchanged, at ~0% I/O
 wait. Neither replication nor durable I/O is on the binding path; the lighter
-tiers buy *latency* (§12.2's floor), not throughput. The ceiling is
+tiers buy *latency* (§12.2's floor), not throughput. At this plateau, end-to-end
+completion latency measured **p99 ≈ 2.1 s** (fresh state), with the client's
+in-flight window set deliberately deep (~16k/node) to hold the cluster at
+saturation — so that figure reflects the queue depth chosen to *find* the ceiling,
+not a latency floor; `MAX_INFLIGHT` is a latency/throughput dial, and backing it
+off trades a little throughput for lower latency. The ceiling is
 *coordination-bound*, not resource-bound: at that rate the nodes still run with
 roughly a third of their CPU idle and negligible I/O wait, the limit being
 cross-thread contention around the single-writer engine actor and the replication
@@ -850,7 +855,11 @@ quorum across many in-flight jobs (ADR 0003). The floor is thus the physics of
 synchronous quorum, not a property of Raft or the engine, and the operator who is
 constrained by it rather than by aggregate can choose a lower tier
 (leader-durable, async). We report both numbers because quoting only the second
-would hide the trade.
+would hide the trade. Concretely, "group commit amortizes the quorum" means one
+quorum round-trip durably commits a whole *batch* of pending completions at once,
+so its fixed ~10 ms cost is split across the hundreds of jobs riding in that batch
+rather than paid once per job — which is why 64 concurrent workers reach ~33k/s,
+not 64 × 100/s.
 
 ### 12.3 Footprint under load and at rest
 
