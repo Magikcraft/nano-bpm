@@ -374,6 +374,44 @@ workload.
   `NANOBPMN_REPLICATE_ACTIVATION=0`, `NANOBPMN_ACTIVATION_FAIRNESS=2`. Always
   benchmark the release binary.
 
+### What an acknowledgement means — and what a node crash costs
+
+In a cluster (`RF=3` recommended), the durability tier changes what a `2xx`
+promises when hardware fails. Both tiers preserve ordering and lose nothing they
+have already replicated; they differ only in *when* the ack is returned.
+
+- **Strict (default: `quorum` + `sync`).** A create/complete is acked only after
+  a **majority** of nodes have replicated and applied it *and* the leader has
+  fsync'd it to disk. If any single node is lost — leader or follower — everything
+  the client saw acknowledged is already durable on the surviving majority, so the
+  promoted leader has it. **Nothing you observed is lost.** The price is one
+  cross-node quorum round-trip on the critical path (a ~10 ms/job floor at low
+  concurrency; group commit amortizes it to ~33k jobs/s under many workers).
+
+- **Relaxed (`leader-durable` + `async`).** A create/complete is acked as soon as
+  the **leader alone** has applied it and written it to the OS page cache (fsync
+  deferred, bounded to a ~10 ms / 8 MiB window); followers replicate in the
+  background. If the leader process merely crashes and restarts, it recovers from
+  its own disk — no loss. Only if the leader is lost **permanently and
+  simultaneously** (disk failure, or the VM destroyed) *before* followers catch up
+  is the un-replicated tail — acks the client already saw — lost, and a follower
+  is promoted from the most complete log it holds.
+
+**Why relaxed is a latency trade, not a correctness hole.** Nano is at-least-once
+end to end. A dropped completion just means the job's lease expires and it is
+redelivered — and completion is keyed, so an idempotent worker already tolerates
+it. A dropped create means the instance was never durably admitted, and the (also
+at-least-once) producer retries. Relaxed never reorders and never loses anything
+already replicated: the leader's local log stays the single ordered source of
+truth per partition. So the trade is exact — a rare
+simultaneous-permanent-leader-loss turns from *no loss* into *a bounded tail of
+millisecond-scale redeliveries*, in exchange for taking the quorum round-trip off
+every ack.
+
+> ⚠️ **Two-node clusters are a trap.** An `RF=2` group has quorum 2, so losing
+> *either* node halts writes — durability without availability. Use **3+** nodes
+> for fault tolerance.
+
 ## Data, durability, and recovery
 
 Nano's engine runs in memory but is **event-sourced and crash-durable**. When a
