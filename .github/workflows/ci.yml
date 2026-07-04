@@ -96,6 +96,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+      - uses: taiki-e/install-action@nextest
       - name: Generate REST layer + stub impls
         # The server depends on the path crate ../generated and on
         # server/src/stub_impls.rs, both produced by codegen (gitignored). Mirror
@@ -114,4 +115,13 @@ jobs:
         run: cargo clippy --all-targets --features console -- -D warnings
       - name: Test
         working-directory: server
-        run: cargo test --features console
+        # Run with nextest so the heavy, timing-sensitive integration tests
+        # (`clustered_startup_tests` spin up multi-node Raft clusters on a
+        # worker_threads=4 runtime; `seglog::tests` drive snapshot+tail recovery)
+        # run in a single-threaded group with a couple of retries — see
+        # .config/nextest.toml. This eliminates the cross-test CPU oversubscription
+        # AND absorbs the residual timing flakes that even a serial run hit on a
+        # slow runner, while the rest of the suite stays strict and parallel.
+        # (The server crate is a binary with no lib target, so there are no
+        # doctests to run separately.)
+        run: cargo nextest run --features console

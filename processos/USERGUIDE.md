@@ -75,6 +75,32 @@ Throughout the console, a **Settings cog** in the lower-left opens the settings
 panel, where you manage AI models and a few system options. See
 [Configure AI models](#configure-ai-models).
 
+## Make it yours — theme & workbench layout
+
+**Appearance.** Every page has an appearance switcher (in the Cockpit it lives at
+the bottom of the left rail) with three modes: **light**, **dark**, and **follow
+system** — the last tracks your OS setting live. Your choice is remembered on
+this browser and applied before the page paints, so there is no flash. BPMN
+diagrams stay on a paper-white canvas in every theme; that's the ink they're
+drawn with.
+
+**Arrange the Cockpit like a workbench.** The investigation surface is yours to
+shape, and it remembers how you left it:
+
+- **Resize** the left **nav rail** and the **Chats panel** by dragging their
+  edges (the handle highlights as you hover). The **investigation panel's
+  height** resizes the same way via the handle underneath it.
+- **Collapse** the rail (the *⟨ collapse* button at its foot) or the Chats panel
+  (the *⟨* button in its header) down to a slim sliver; click the sliver to
+  bring it back.
+- **Fine-tune with the keyboard**: focus a handle and use the arrow keys to
+  nudge, or press `Home` to reset that one dimension. Double-clicking a handle
+  resets it too.
+- **Reset everything** with the **↺** button next to the rail's collapse button.
+
+The arrangement is saved per browser, so your workbench greets you the way you
+configured it.
+
 ## Load a demo dataset
 
 The fastest way to learn ProcessOS is to explore one of the bundled demo

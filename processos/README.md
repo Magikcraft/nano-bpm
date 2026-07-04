@@ -665,6 +665,21 @@ delegation boundary an operator encodes in it is durable and inspectable. The
 **cockpit** (`/cockpit`, `src/cockpit.rs` + `conversation.rs`) wraps the experiment
 stepper in a persisted droid-conversation surface.
 
+**Theming — dark / light / system.** Every ProcessOS page styles through one set of
+semantic design tokens (`/assets/theme.css`, the `--po-*` custom properties: surfaces,
+edges, text tiers, a violet+cyan accent family, and ok/warn/danger/info status
+families), deliberately mirroring the Nano console's palette so the two read as one
+product family. The **appearance switcher** (in the cockpit rail and on each page)
+offers **light / dark / follow-system**; the choice persists and `/assets/theme.js`
+applies it before first paint (no flash). System mode tracks the OS live. BPMN
+canvases stay paper-white in every theme — bpmn-js draws dark ink.
+
+**Customizable workbench.** The cockpit arranges like a workbench: the **nav rail**
+and the **chats panel** resize (drag their edge; arrow keys nudge; double-click or
+`Home` resets) and **collapse** to slivers, and the **investigation panel's height**
+resizes the same way. The arrangement persists per browser (`processos.wb`) and
+restores on reload; the rail's **↺** button resets the whole layout.
+
 ## Run
 
 ### Prerequisites (machine setup)

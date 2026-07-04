@@ -630,6 +630,8 @@ async fn main() {
         )
         .route("/assets/bpmn/{file}", get(bpmn_asset))
         .route("/assets/settings.js", get(settings_js))
+        .route("/assets/theme.css", get(theme_css))
+        .route("/assets/theme.js", get(theme_js))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/settings/profiles", post(post_profile))
         .route(
@@ -859,8 +861,8 @@ fn guide_nav(active: &str) -> String {
         .join("\n")
 }
 
-/// Wrap a rendered guide page in the branded, dark ProcessOS shell with a sticky
-/// sidebar. Self-contained (inline CSS) so `/guide` works fully offline.
+/// Wrap a rendered guide page in the branded ProcessOS shell (light/dark/system
+/// via the `--po-*` design tokens in /assets/theme.css) with a sticky sidebar.
 fn guide_shell(page: &GuidePage) -> String {
     let subtitle = if page.slug == "index" {
         "User Guide".to_string()
@@ -874,56 +876,58 @@ fn guide_shell(page: &GuidePage) -> String {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Nano ProcessOS · {title}</title>
+<link rel="stylesheet" href="/assets/theme.css">
+<script src="/assets/theme.js"></script>
 <style>
-  :root {{ --bg:#08080a; --panel:#0e0e12; --ink:#e4e4e7; --muted:#a1a1aa; --line:#26262b;
-    --violet:#a78bfa; --sky:#38bdf8; --code:#141417; }}
+  /* All colours resolve through the --po-* design tokens (/assets/theme.css); the
+     light/dark/system choice is applied by /assets/theme.js before first paint. */
   * {{ box-sizing:border-box; }}
   html {{ scroll-behavior:smooth; }}
-  body {{ margin:0; background:var(--bg); color:var(--ink);
+  body {{ margin:0; background:var(--po-app); color:var(--po-text);
     font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; line-height:1.65; }}
-  a {{ color:var(--sky); }}
+  a {{ color:var(--po-accent-2); }}
   code {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:0.86em; }}
-  .g-bar {{ display:flex; align-items:center; gap:.7rem; padding:.6rem 1.1rem; background:#0b0b0f;
-    border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }}
-  .g-bar a.brand {{ display:flex; align-items:center; gap:.5rem; text-decoration:none; color:var(--ink); font-weight:600; }}
-  .g-bar .dot {{ width:.6rem; height:.6rem; border-radius:9999px; background:linear-gradient(135deg,var(--violet),var(--sky)); }}
-  .g-bar .sub {{ color:var(--muted); font-size:.85rem; }}
+  .g-bar {{ display:flex; align-items:center; gap:.7rem; padding:.6rem 1.1rem; background:var(--po-panel);
+    border-bottom:1px solid var(--po-edge); position:sticky; top:0; z-index:10; }}
+  .g-bar a.brand {{ display:flex; align-items:center; gap:.5rem; text-decoration:none; color:var(--po-text); font-weight:600; }}
+  .g-bar .dot {{ width:.6rem; height:.6rem; border-radius:9999px; background:linear-gradient(135deg,var(--po-accent),var(--po-accent-2)); }}
+  .g-bar .sub {{ color:var(--po-text-muted); font-size:.85rem; }}
   .g-bar .spacer {{ flex:1; }}
-  .g-bar a.x {{ color:var(--sky); text-decoration:none; font-size:.85rem; margin-left:1rem; }}
+  .g-bar a.x {{ color:var(--po-accent-2); text-decoration:none; font-size:.85rem; margin-left:1rem; }}
   .g-bar a.x:hover {{ text-decoration:underline; }}
   .layout {{ display:flex; align-items:flex-start; max-width:1180px; margin:0 auto; }}
   .sidebar {{ width:255px; flex:0 0 255px; position:sticky; top:50px; align-self:flex-start;
-    max-height:calc(100vh - 50px); overflow-y:auto; padding:1.25rem .75rem 3rem; border-right:1px solid var(--line); }}
-  .nav-title {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+    max-height:calc(100vh - 50px); overflow-y:auto; padding:1.25rem .75rem 3rem; border-right:1px solid var(--po-edge); }}
+  .nav-title {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--po-text-muted);
     font-weight:700; padding:0 .6rem; margin-bottom:.5rem; }}
-  .g-link {{ display:block; padding:.34rem .6rem; border-radius:6px; text-decoration:none; color:#c7c7cf; font-size:.9rem; }}
-  .g-link:hover {{ background:#17171c; color:#fff; }}
-  .g-link.active {{ background:#1d1b34; color:#c4b5fd; font-weight:600; }}
+  .g-link {{ display:block; padding:.34rem .6rem; border-radius:6px; text-decoration:none; color:var(--po-text-muted); font-size:.9rem; }}
+  .g-link:hover {{ background:var(--po-hover); color:var(--po-text); }}
+  .g-link.active {{ background:var(--po-accent-wash); color:var(--po-accent-soft); font-weight:600; }}
   .content {{ min-width:0; flex:1; padding:1.6rem 2.2rem 5rem; }}
   .content h1 {{ font-size:1.9rem; margin:.2rem 0 1rem; }}
-  .content h2 {{ font-size:1.4rem; margin:2rem 0 .6rem; padding-bottom:.3rem; border-bottom:1px solid var(--line); }}
-  .content h3 {{ font-size:1.12rem; margin:1.5rem 0 .4rem; color:#ddd6fe; }}
+  .content h2 {{ font-size:1.4rem; margin:2rem 0 .6rem; padding-bottom:.3rem; border-bottom:1px solid var(--po-edge); }}
+  .content h3 {{ font-size:1.12rem; margin:1.5rem 0 .4rem; color:var(--po-accent-soft); }}
   .content h4 {{ font-size:1rem; margin:1.1rem 0 .3rem; }}
-  .content p, .content li {{ color:#d4d4d8; }}
+  .content p, .content li {{ color:var(--po-text); }}
   .content a {{ text-decoration:none; }}
   .content a:hover {{ text-decoration:underline; }}
   .content ul, .content ol {{ padding-left:1.4rem; }}
   .content li {{ margin:.25rem 0; }}
-  .content :not(pre) > code {{ background:var(--code); border:1px solid var(--line); border-radius:4px;
-    padding:.05rem .32rem; color:#e9d5ff; }}
-  .content pre {{ background:#050507; color:#e4e4e7; padding:.9rem 1rem; border-radius:8px; overflow-x:auto;
-    font-size:.84rem; line-height:1.5; border:1px solid var(--line); }}
+  .content :not(pre) > code {{ background:var(--po-inset); border:1px solid var(--po-edge); border-radius:4px;
+    padding:.05rem .32rem; color:var(--po-accent-soft); }}
+  .content pre {{ background:var(--po-inset); color:var(--po-text); padding:.9rem 1rem; border-radius:8px; overflow-x:auto;
+    font-size:.84rem; line-height:1.5; border:1px solid var(--po-edge); }}
   .content pre code {{ background:none; border:0; padding:0; color:inherit; }}
-  .content blockquote {{ margin:1rem 0; padding:.3rem 1rem; border-left:3px solid var(--violet); background:#101019; color:#c7c7cf; }}
+  .content blockquote {{ margin:1rem 0; padding:.3rem 1rem; border-left:3px solid var(--po-accent); background:var(--po-panel); color:var(--po-text-muted); }}
   .content table {{ border-collapse:collapse; width:100%; margin:1rem 0; font-size:.9rem; display:block; overflow-x:auto; }}
-  .content th, .content td {{ border:1px solid var(--line); padding:.4rem .6rem; text-align:left; vertical-align:top; }}
-  .content th {{ background:#141417; }}
+  .content th, .content td {{ border:1px solid var(--po-edge); padding:.4rem .6rem; text-align:left; vertical-align:top; }}
+  .content th {{ background:var(--po-raised); }}
   .content img {{ max-width:100%; }}
-  .content hr {{ border:0; border-top:1px solid var(--line); margin:2rem 0; }}
-  .source-note {{ margin-top:3rem; padding-top:1rem; border-top:1px solid var(--line); color:var(--muted); font-size:.82rem; }}
+  .content hr {{ border:0; border-top:1px solid var(--po-edge); margin:2rem 0; }}
+  .source-note {{ margin-top:3rem; padding-top:1rem; border-top:1px solid var(--po-edge); color:var(--po-text-muted); font-size:.82rem; }}
   @media (max-width:800px) {{
     .layout {{ flex-direction:column; }}
-    .sidebar {{ position:static; width:100%; max-height:none; border-right:0; border-bottom:1px solid var(--line); }}
+    .sidebar {{ position:static; width:100%; max-height:none; border-right:0; border-bottom:1px solid var(--po-edge); }}
     .content {{ padding:1.25rem; }}
   }}
 </style>
@@ -936,6 +940,7 @@ fn guide_shell(page: &GuidePage) -> String {
     <a class="x" href="/features">Features</a>
     <a class="x" href="/workspace">Workspaces</a>
     <a class="x" href="/cockpit">Cockpit</a>
+    <span id="gTheme" style="margin-left:1rem"></span>
   </div>
   <div class="layout">
     <nav class="sidebar">
@@ -946,6 +951,7 @@ fn guide_shell(page: &GuidePage) -> String {
       {body}
     </main>
   </div>
+<script>if(window.poMountThemeToggle)poMountThemeToggle(document.getElementById('gTheme'))</script>
 </body>
 </html>"###,
         title = html_escape(page.title),
@@ -1239,6 +1245,8 @@ const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css")
 /// (e.g. `zeebe:taskDefinition`) and preserves them across an edit instead of dropping them.
 const BPMN_ZEEBE_MODDLE_JSON: &str = include_str!("../assets/bpmn/zeebe-moddle.json");
 const SETTINGS_JS: &str = include_str!("../assets/settings.js");
+const THEME_CSS: &str = include_str!("../assets/theme.css");
+const THEME_JS: &str = include_str!("../assets/theme.js");
 
 /// A single embedded file belonging to a demo dataset, addressed by its path
 /// relative to the pack directory (so `bpmn_library` directory references and the
@@ -1546,6 +1554,33 @@ async fn settings_js() -> impl IntoResponse {
             (axum::http::header::CACHE_CONTROL, NO_CACHE),
         ],
         SETTINGS_JS,
+    )
+}
+
+/// Serves the shared design tokens (`/assets/theme.css`) — the `--po-*` custom properties every
+/// ProcessOS page styles through, with the dark and light palettes.
+async fn theme_css() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
+        THEME_CSS,
+    )
+}
+
+/// Serves the theme runtime (`/assets/theme.js`) — applies the persisted light/dark/system
+/// choice before first paint and mounts the appearance switcher.
+async fn theme_js() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
+        THEME_JS,
     )
 }
 
@@ -5702,65 +5737,68 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Nano ProcessOS — Live instance</title>
+<link rel="stylesheet" href="/assets/theme.css">
+<script src="/assets/theme.js"></script>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  /* All colours resolve through the --po-* design tokens (/assets/theme.css); the
+     light/dark/system choice is applied by /assets/theme.js before first paint. */
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: var(--po-app); color: var(--po-text); }
   a { color: inherit; text-decoration: none; }
   .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
-  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
+  .rail { border-right: 1px solid var(--po-edge); padding: 18px 14px; background: var(--po-panel); }
   .rail .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
-  .rail .brand .dot { color: #a5b4fc; }
-  .rail .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
-  .rail nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; }
-  .rail nav a:hover { background: #18181b; color: #e4e4e7; }
-  .rail nav a.active { background: #1d1d22; color: #c7d2fe; }
+  .rail .brand .dot { color: var(--po-accent-strong); }
+  .rail .tag { color: var(--po-text-faint); font-size: 11px; margin-bottom: 20px; }
+  .rail nav a { display: block; padding: 7px 10px; border-radius: 7px; color: var(--po-text-muted); font-weight: 500; margin-bottom: 2px; }
+  .rail nav a:hover { background: var(--po-hover); color: var(--po-text); }
+  .rail nav a.active { background: var(--po-hover); color: var(--po-accent-soft); }
   .content { min-width: 0; }
-  header { padding: 16px 24px; border-bottom: 1px solid #27272a; display: flex; align-items: baseline; gap: 12px; }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--po-edge); display: flex; align-items: baseline; gap: 12px; }
   h1 { font-size: 18px; margin: 0; }
-  .sub { color: #71717a; font-size: 12px; }
+  .sub { color: var(--po-text-faint); font-size: 12px; }
   main { padding: 24px; max-width: 1100px; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
-  .card { background: #18181b; border: 1px solid #27272a; border-radius: 8px; padding: 12px 16px; min-width: 120px; }
+  .card { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 8px; padding: 12px 16px; min-width: 120px; }
   .card .n { font-size: 22px; font-weight: 600; }
-  .card .l { color: #a1a1aa; font-size: 12px; }
-  h2 { font-size: 14px; color: #a1a1aa; margin: 24px 0 8px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .l { color: var(--po-text-muted); font-size: 12px; }
+  h2 { font-size: 14px; color: var(--po-text-muted); margin: 24px 0 8px; text-transform: uppercase; letter-spacing: .04em; }
   table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #27272a; }
-  th { color: #a1a1aa; font-weight: 500; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--po-edge); }
+  th { color: var(--po-text-muted); font-weight: 500; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .pid { font-family: ui-monospace, monospace; color: #a5b4fc; }
-  .bottleneck { color: #fca5a5; }
-  .err { color: #fca5a5; background: #2a0a0a; padding: 12px 16px; border-radius: 8px; }
-  button { background: #27272a; color: #e4e4e7; border: 1px solid #3f3f46; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
-  button:hover { background: #2f2f35; }
-  button.primary { background: #4f46e5; border-color: #6366f1; color: #fff; }
-  button.primary:hover { background: #4338ca; }
-  button.danger { color: #fca5a5; }
+  .pid { font-family: ui-monospace, monospace; color: var(--po-accent-strong); }
+  .bottleneck { color: var(--po-danger-soft); }
+  .err { color: var(--po-danger-soft); background: var(--po-danger-wash); border: 1px solid var(--po-danger-edge); padding: 12px 16px; border-radius: 8px; }
+  button { background: var(--po-raised); color: var(--po-text); border: 1px solid var(--po-edge-strong); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:hover { background: var(--po-hover); }
+  button.primary { background: var(--po-accent); border-color: var(--po-accent); color: var(--po-on-accent); }
+  button.primary:hover { background: var(--po-accent-strong); }
+  button.danger { color: var(--po-danger-soft); }
   /* Nano instance manager */
   .inst-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-bottom: 12px; }
-  .inst { background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 14px; display: flex; gap: 12px; align-items: flex-start; }
-  .inst.active { border-color: #6366f1; box-shadow: 0 0 0 1px #4f46e5 inset; }
-  .inst.starred { border-color: #b08900; }
-  .inst.active.starred { border-color: #6366f1; }
+  .inst { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 14px; display: flex; gap: 12px; align-items: flex-start; }
+  .inst.active { border-color: var(--po-accent); box-shadow: 0 0 0 1px var(--po-accent) inset; }
+  .inst.starred { border-color: var(--po-warn-edge); }
+  .inst.active.starred { border-color: var(--po-accent); }
   .inst .logo { flex: 0 0 auto; }
   .inst .meta { min-width: 0; flex: 1; }
   .inst .nm { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
-  .star { background: none; border: none; padding: 0 0 0 2px; margin-left: auto; cursor: pointer; font-size: 16px; line-height: 1; color: #71717a; }
-  .star:hover { color: #fbbf24; }
-  .star.on { color: #fbbf24; }
-  .inst .url { color: #a1a1aa; font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+  .star { background: none; border: none; padding: 0 0 0 2px; margin-left: auto; cursor: pointer; font-size: 16px; line-height: 1; color: var(--po-text-faint); }
+  .star:hover { color: var(--po-warn); }
+  .star.on { color: var(--po-warn); }
+  .inst .url { color: var(--po-text-muted); font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
   .inst .acts { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
   .inst .acts button { padding: 3px 9px; font-size: 12px; }
-  .badge { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: #c7d2fe; background: #312e81; padding: 1px 6px; border-radius: 999px; }
-  .rdot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #52525b; flex: 0 0 auto; }
-  .rdot.up { background: #34d399; box-shadow: 0 0 6px #34d39988; }
-  .rdot.down { background: #f87171; }
-  .rdot.probing { background: #fbbf24; animation: pulse 1s infinite; }
+  .badge { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--po-accent-soft); background: var(--po-accent-wash); border: 1px solid var(--po-accent-edge); padding: 1px 6px; border-radius: 999px; }
+  .rdot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--po-text-faint); flex: 0 0 auto; }
+  .rdot.up { background: var(--po-ok); box-shadow: 0 0 6px color-mix(in srgb, var(--po-ok) 53%, transparent); }
+  .rdot.down { background: var(--po-danger); }
+  .rdot.probing { background: var(--po-warn); animation: pulse 1s infinite; }
   @keyframes pulse { 50% { opacity: .35; } }
-  .empty { background: #141417; border: 1px dashed #3f3f46; border-radius: 10px; padding: 22px; color: #a1a1aa; }
-  .empty .big { color: #e4e4e7; font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .empty { background: var(--po-panel); border: 1px dashed var(--po-edge-strong); border-radius: 10px; padding: 22px; color: var(--po-text-muted); }
+  .empty .big { color: var(--po-text); font-size: 15px; font-weight: 600; margin-bottom: 6px; }
   .inst-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0 4px; }
-  .inst-form input { background: #0c0c0e; border: 1px solid #3f3f46; color: #e4e4e7; border-radius: 6px; padding: 6px 9px; font-size: 13px; }
+  .inst-form input { background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 6px; padding: 6px 9px; font-size: 13px; }
   .inst-form input.nm { width: 160px; }
   .inst-form input.url { width: 240px; font-family: ui-monospace, monospace; }
 </style>
@@ -5777,6 +5815,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
       <a href="/harness">Harness</a>
       <a href="/features">Features</a>
     </nav>
+    <div id="railTheme" style="margin-top:18px"></div>
   </aside>
   <div class="content">
     <header>
@@ -5799,12 +5838,12 @@ function nanoLogo(size){
   const s = size||34;
   return '<svg class="logo" width="'+s+'" height="'+s+'" viewBox="0 0 40 40" fill="none" aria-hidden="true">'
     + '<defs><radialGradient id="ng" cx="50%" cy="40%" r="65%">'
-    + '<stop offset="0%" stop-color="#c7d2fe"/><stop offset="60%" stop-color="#818cf8"/><stop offset="100%" stop-color="#4f46e5"/>'
+    + '<stop offset="0%" stop-color="var(--po-accent-soft)"/><stop offset="60%" stop-color="var(--po-accent-strong)"/><stop offset="100%" stop-color="var(--po-accent)"/>'
     + '</radialGradient></defs>'
-    + '<ellipse cx="20" cy="20" rx="17" ry="7" stroke="#4f46e5" stroke-width="1.4" opacity=".55" transform="rotate(35 20 20)"/>'
-    + '<ellipse cx="20" cy="20" rx="17" ry="7" stroke="#818cf8" stroke-width="1.4" opacity=".55" transform="rotate(-35 20 20)"/>'
+    + '<ellipse cx="20" cy="20" rx="17" ry="7" stroke="var(--po-accent)" stroke-width="1.4" opacity=".55" transform="rotate(35 20 20)"/>'
+    + '<ellipse cx="20" cy="20" rx="17" ry="7" stroke="var(--po-accent-strong)" stroke-width="1.4" opacity=".55" transform="rotate(-35 20 20)"/>'
     + '<path d="M20 9 L29 14.5 L29 25.5 L20 31 L11 25.5 L11 14.5 Z" fill="url(#ng)"/>'
-    + '<circle cx="34" cy="13" r="2.4" fill="#a5b4fc"/>'
+    + '<circle cx="34" cy="13" r="2.4" fill="var(--po-accent-strong)"/>'
     + '</svg>';
 }
 
@@ -5963,6 +6002,7 @@ function renderEmpty(baseUrl, detail){
 async function refreshAll(){ await loadInstances(); await load(); }
 function card(n,l){ return '<div class="card"><div class="n">'+n+'</div><div class="l">'+l+'</div></div>'; }
 refreshAll();
+if(window.poMountThemeToggle) poMountThemeToggle(document.getElementById('railTheme'));
 </script>
 <script src="/assets/settings.js"></script>
 </body>
@@ -5977,33 +6017,37 @@ const HARNESS_HTML: &str = r##"<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Nano ProcessOS — Optimization Harness</title>
+<link rel="stylesheet" href="/assets/theme.css">
+<script src="/assets/theme.js"></script>
 <style>
-  :root { color-scheme: dark; }
-  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0a0a0b; color: #e4e4e7; }
-  header { padding: 20px 24px; border-bottom: 1px solid #27272a; }
+  /* All colours resolve through the --po-* design tokens (/assets/theme.css); the
+     light/dark/system choice is applied by /assets/theme.js before first paint. */
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: var(--po-app); color: var(--po-text); }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--po-edge); }
   h1 { margin: 0; font-size: 18px; }
-  .sub { color: #a1a1aa; margin-top: 4px; }
+  .sub { color: var(--po-text-muted); margin-top: 4px; }
   main { padding: 24px; max-width: 1000px; }
-  .card { background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
-  .notes { color: #a1a1aa; font-size: 13px; }
+  .card { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 16px 18px; margin-bottom: 18px; }
+  .notes { color: var(--po-text-muted); font-size: 13px; }
   .notes li { margin: 2px 0; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #27272a; }
-  th { color: #a1a1aa; font-weight: 600; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--po-edge); }
+  th { color: var(--po-text-muted); font-weight: 600; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .ok { color: #4ade80; }
-  .bad { color: #f87171; }
-  .best { background: #14532d33; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #27272a; }
-  .pill.win { color: #4ade80; border-color: #14532d; }
-  code { color: #fbbf24; }
+  .ok { color: var(--po-ok); }
+  .bad { color: var(--po-danger); }
+  .best { background: var(--po-ok-wash); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--po-edge); }
+  .pill.win { color: var(--po-ok); border-color: var(--po-ok-edge); }
+  code { color: var(--po-warn); }
 </style>
 </head>
 <body>
 <header>
+  <div id="hTheme" style="float:right;margin-left:12px"></div>
   <h1><a href="/" style="color:inherit;text-decoration:none">Nano ProcessOS</a> — Optimization Harness</h1>
   <div class="sub">SimRunner over the bundled example scenario (worker-swap transform space). The same loop runs in production against live Nano traces.</div>
-  <div class="sub" style="margin-top:8px"><a href="/" style="color:#a5b4fc;text-decoration:none">Home</a> · <a href="/workspace" style="color:#a5b4fc;text-decoration:none">Workspaces</a> · <a href="/features" style="color:#a5b4fc;text-decoration:none">Features</a> · <a href="/console" style="color:#a5b4fc;text-decoration:none">Console</a></div>
+  <div class="sub" style="margin-top:8px"><a href="/" style="color:var(--po-accent-strong);text-decoration:none">Home</a> · <a href="/workspace" style="color:var(--po-accent-strong);text-decoration:none">Workspaces</a> · <a href="/features" style="color:var(--po-accent-strong);text-decoration:none">Features</a> · <a href="/console" style="color:var(--po-accent-strong);text-decoration:none">Console</a></div>
 </header>
 <main id="root">Running the example scenario…</main>
 <script>
@@ -6059,6 +6103,7 @@ async function load() {
   }
 }
 load();
+if (window.poMountThemeToggle) poMountThemeToggle(document.getElementById("hTheme"));
 </script>
 </body>
 </html>

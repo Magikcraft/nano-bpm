@@ -4,68 +4,71 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Nano ProcessOS — Workspaces</title>
+<link rel="stylesheet" href="/assets/theme.css" />
+<script src="/assets/theme.js"></script>
 <link rel="stylesheet" href="/assets/bpmn/diagram-js.css" />
 <link rel="stylesheet" href="/assets/bpmn/bpmn-embedded.css" />
 <style>
-  :root { color-scheme: dark; }
+  /* All colours resolve through the --po-* design tokens (/assets/theme.css); the
+     light/dark/system choice is applied by /assets/theme.js before first paint. */
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: var(--po-app); color: var(--po-text); }
   a { color: inherit; text-decoration: none; }
   .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
-  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; }
+  .rail { border-right: 1px solid var(--po-edge); padding: 18px 14px; background: var(--po-panel); }
   .rail .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
-  .brand .dot { color: #a5b4fc; }
-  .rail .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; display: block; }
-  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; }
-  .nav a:hover { background: #18181b; color: #e4e4e7; }
-  .nav a.active { background: #1d1d22; color: #c7d2fe; }
+  .brand .dot { color: var(--po-accent-strong); }
+  .rail .tag { color: var(--po-text-faint); font-size: 11px; margin-bottom: 20px; display: block; }
+  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: var(--po-text-muted); font-weight: 500; margin-bottom: 2px; }
+  .nav a:hover { background: var(--po-hover); color: var(--po-text); }
+  .nav a.active { background: var(--po-hover); color: var(--po-accent-soft); }
   .nav a.with-dot { display: flex; align-items: center; }
-  .dot-status { width: 9px; height: 9px; border-radius: 50%; margin-left: auto; flex: none; background: #52525b; box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
-  .dot-status.on { background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
-  .dot-status.off { background: #eab308; box-shadow: 0 0 0 2px rgba(234,179,8,.16); }
+  .dot-status { width: 9px; height: 9px; border-radius: 50%; margin-left: auto; flex: none; background: var(--po-text-faint); box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
+  .dot-status.on { background: var(--po-ok); box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
+  .dot-status.off { background: var(--po-warn); box-shadow: 0 0 0 2px rgba(234,179,8,.16); }
   main { padding: 24px 30px; max-width: 1100px; }
-  .crumbs { color: #71717a; font-size: 12px; margin-bottom: 14px; }
-  .crumbs a { color: #a5b4fc; cursor: pointer; }
+  .crumbs { color: var(--po-text-faint); font-size: 12px; margin-bottom: 14px; }
+  .crumbs a { color: var(--po-accent-strong); cursor: pointer; }
   h1 { font-size: 20px; margin: 0 0 4px; }
-  .lede { color: #a1a1aa; font-size: 13px; margin: 0 0 18px; max-width: 760px; }
-  h2 { font-size: 12px; color: #a1a1aa; text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
+  .lede { color: var(--po-text-muted); font-size: 13px; margin: 0 0 18px; max-width: 760px; }
+  h2 { font-size: 12px; color: var(--po-text-muted); text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 12px; }
-  .tile { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
-  .tile:hover { border-color: #3f3f6a; transform: translateY(-1px); }
-  .tile h3 { margin: 0 0 4px; font-size: 15px; color: #c7d2fe; }
-  .tile .meta { color: #8b8b93; font-size: 12px; }
+  .tile { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
+  .tile:hover { border-color: var(--po-accent-edge); transform: translateY(-1px); }
+  .tile h3 { margin: 0 0 4px; font-size: 15px; color: var(--po-accent-soft); }
+  .tile .meta { color: var(--po-text-faint); font-size: 12px; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; margin-left: 6px; }
-  .pill.live { background: #0c2a4a; color: #93c5fd; }
-  .pill.dataset { background: #06301c; color: #6ee7b7; }
-  .pill.unbound { background: #3a1c1c; color: #fca5a5; }
-  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid #3f3f46; background: #1d1d22; color: #e4e4e7; padding: 7px 13px; }
-  button.primary { background: #4f46e5; border-color: #4f46e5; color: #fff; }
+  .pill.live { background: var(--po-info-wash); color: var(--po-info-soft); }
+  .pill.dataset { background: var(--po-ok-wash); color: var(--po-ok-soft); }
+  .pill.unbound { background: var(--po-danger-wash); color: var(--po-danger-soft); }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--po-edge-strong); background: var(--po-hover); color: var(--po-text); padding: 7px 13px; }
+  button.primary { background: var(--po-accent); border-color: var(--po-accent); color: var(--po-on-accent); }
   button:hover { filter: brightness(1.1); }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  input, textarea, select { font: inherit; background: #141417; border: 1px solid #2a2a30; color: #e4e4e7; border-radius: 8px; padding: 7px 10px; }
+  input, textarea, select { font: inherit; background: var(--po-inset); border: 1px solid var(--po-edge); color: var(--po-text); border-radius: 8px; padding: 7px 10px; }
   input, select { min-width: 220px; }
-  .dialog { background: #141417; border: 1px solid #2a2a30; border-radius: 10px; padding: 16px; margin: 14px 0; max-width: 560px; }
-  .dialog label { display: block; font-size: 12px; color: #a1a1aa; margin: 10px 0 3px; }
+  .dialog { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 16px; margin: 14px 0; max-width: 560px; }
+  .dialog label { display: block; font-size: 12px; color: var(--po-text-muted); margin: 10px 0 3px; }
   .dialog input, .dialog textarea, .dialog select { width: 100%; }
   .demo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 10px; margin-top: 6px; }
-  .demo-card { background: #18181c; border: 1px solid #2a2a30; border-radius: 9px; padding: 12px 14px; display: flex; flex-direction: column; }
-  .demo-card h4 { margin: 0 0 6px; font-size: 13px; color: #c7d2fe; }
+  .demo-card { background: var(--po-hover); border: 1px solid var(--po-edge); border-radius: 9px; padding: 12px 14px; display: flex; flex-direction: column; }
+  .demo-card h4 { margin: 0 0 6px; font-size: 13px; color: var(--po-accent-soft); }
   .demo-card p { margin: 0 0 10px; font-size: 12px; line-height: 1.4; flex: 1; }
   .demo-card button { align-self: flex-start; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
-  .card { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 12px 16px; min-width: 110px; }
+  .card { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 12px 16px; min-width: 110px; }
   .card .n { font-size: 22px; font-weight: 650; }
-  .card .l { color: #8b8b93; font-size: 12px; }
+  .card .l { color: var(--po-text-faint); font-size: 12px; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; margin-top: 6px; }
-  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #1f1f23; }
-  th { color: #8b8b93; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--po-edge); }
+  th { color: var(--po-text-faint); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .err { color: #fca5a5; font-size: 13px; margin: 10px 0; }
-  .muted { color: #71717a; }
-  code { font-family: ui-monospace, monospace; color: #c7d2fe; }
-  .model { height: 420px; background: #fbfbfd; border: 1px solid #26262b; border-radius: 10px; margin: 8px 0 4px; overflow: hidden; }
+  .err { color: var(--po-danger-soft); font-size: 13px; margin: 10px 0; }
+  .muted { color: var(--po-text-faint); }
+  code { font-family: ui-monospace, monospace; color: var(--po-accent-soft); }
+  .model { height: 420px; background: #fbfbfd; border: 1px solid var(--po-edge); border-radius: 10px; margin: 8px 0 4px; overflow: hidden; }
   .model .djs-container { background: #fbfbfd; }
-  .panel { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+  .panel { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
   .panel h2 { margin-top: 0; }
   .btnrow { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 4px 0 0; }
 </style>
@@ -83,6 +86,7 @@
       <a href="/cockpit?view=experiments">Experiments</a>
       <a href="/cockpit?view=sidecars" class="with-dot">LLMs <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
+    <div id="railTheme" style="margin-top:18px"></div>
   </aside>
   <main id="app">Loading…</main>
 </div>
@@ -348,6 +352,8 @@ function route() {
 }
 window.addEventListener('hashchange', route);
 route();
+
+if (window.poMountThemeToggle) poMountThemeToggle(document.getElementById('railTheme'));
 
 // Keep the rail's sidecar status dot live on this page too (green = a llama.cpp
 // sidecar is running, yellow = off). Best-effort and non-blocking.

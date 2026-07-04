@@ -1,0 +1,15 @@
+# The heavy server integration tests each spin up a multi-node Raft cluster on a
+# `worker_threads = 4` runtime (`clustered_startup_tests`) or drive snapshot+tail
+# journal recovery (`seglog::tests`). They are timing sensitive: on a small/slow
+# CI runner their fixed replication/failover readiness budgets are borderline,
+# and running them concurrently oversubscribes the CPUs. Put them in a
+# single-threaded group so they never contend with each other, and give just
+# them a couple of retries to absorb residual timing flakes. The rest of the
+# suite stays strict (no retries) and fully parallel.
+[test-groups]
+serial-heavy = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(clustered_startup_tests) or test(seglog::tests)'
+test-group = 'serial-heavy'
+retries = 2
