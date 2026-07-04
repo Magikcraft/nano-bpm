@@ -23,7 +23,9 @@ scaffolded as later sections. Author‑facing notes are marked `> DRAFTING NOTE`
 > scaling) from add‑ons to **first principles**; (3) delivered as an
 > **API‑compatible drop‑in** for Camunda 8 — a paradigm shift behind a fixed,
 > commensurable interface, so it is adoptable without abandoning existing
-> tooling; (4) small enough (Rust, no JVM/RocksDB, WASM‑capable) to open a new
+> tooling, and **usable today** as a lightweight local‑development replacement
+> for a full Camunda 8 deployment (`c8run`) for the supported‑and‑growing C8
+> subset; (4) small enough (Rust, no JVM/RocksDB, WASM‑capable) to open a new
 > frontier: coexisting with local LLMs and replaying real historical workloads
 > against counterfactual model variants. Performance and an honestly‑named
 > throughput ceiling are presented as *evidence for the architecture*, not the
@@ -33,12 +35,24 @@ scaffolded as later sections. Author‑facing notes are marked `> DRAFTING NOTE`
 
 ## 1. Introduction: a paradigm shift, not a faster horse
 
-Process automation engines have accreted, over a decade, a large surface of
-operational tuning: backpressure thresholds, replication factors, exporter
-batching, snapshot cadences, resource limits. Each knob is individually
-reasonable and collectively they demand that an operator become an expert in the
-engine's internals — tuning the machine by watching a metric and applying a rule
-they had to learn.
+Nano is a distributed BPMN engine that speaks the Camunda 8 API, and you can use
+it **today** in the most ordinary way imaginable: as a local development
+replacement for a full Camunda 8 deployment. A developer who wants Camunda 8 on
+their workstation reaches for `c8run`, Camunda's own single‑distribution way to
+run the stack locally — to get the *API* to build and test against. Nano offers
+that same drop‑in API from one small binary that idles at a few megabytes and
+hands its memory back to the OS when quiet (§8), for as long as the subset of
+Camunda 8 it implements covers what a given project exercises. The scope is
+bounded and honestly stated — not *every* C8 feature, but the contract you
+actually use in local development — and that subset is expanding continuously.
+
+That modest, available‑today use is the visible near edge of a much larger claim
+about how such an engine should be built. Process automation engines have
+accreted, over a decade, a large surface of operational tuning: backpressure
+thresholds, replication factors, exporter batching, snapshot cadences, resource
+limits. Each knob is individually reasonable and collectively they demand that an
+operator become an expert in the engine's internals — tuning the machine by
+watching a metric and applying a rule they had to learn.
 
 This paper argues that most of that surface is **derivable**. Anything the engine
 can decide correctly from a signal a human would only ever have watched can be
@@ -58,24 +72,6 @@ Crucially, the shift is engineered to be **commensurable at the interface**
 the opposite — it preserves the Camunda 8 contract exactly, so the revolution
 happens entirely behind an API the ecosystem already speaks. It is a paradigm
 shift you can deploy as a drop‑in.
-
-And it is usable **today**, not only as a thesis. The most immediate use is the
-most modest one: a local development replacement for a full Camunda 8 deployment.
-A developer who wants Camunda 8 on their workstation today reaches for `c8run`,
-Camunda's own single‑distribution way to run the stack locally; they do it to get
-the *API* to build and test against. Nano offers that same drop‑in API from one
-small binary that idles at a few megabytes and returns its memory to the OS when
-quiet (§8), for as long as the subset of Camunda 8 it currently implements covers
-what a given project exercises. The claim is deliberately bounded and honest — not
-*every* C8 feature, but the contract you actually use in local development — and
-that supported subset is expanding continuously. The paradigm argument that
-follows is the long game; running your dev cluster on it is available now.
-
-> DRAFTING NOTE — the "faster horse" line (attributed to Ford) is almost
-> certainly apocryphal; use it as illustration, not as cited history. The point
-> stands regardless: no customer running on the JVM would have *requested* a
-> ground‑up Rust reimplementation. Revolutions come from the edge of practice,
-> not its center — which is itself a Kuhnian observation.
 
 ---
 
