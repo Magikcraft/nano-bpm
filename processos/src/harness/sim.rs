@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    Command, Engine, IncidentState, JobState, ProcessDefinition, ProcessInstanceState, TimerState,
-    Value,
+    Command, Engine, Event, IncidentState, JobState, ProcessDefinition, ProcessInstanceState,
+    TimerState, Value,
 };
 use serde_json::Value as Json;
 
@@ -53,14 +53,28 @@ pub fn run_instance(
     let mut clock: u64 = 0;
     let mut cost = 0.0_f64;
 
+    // Reconstruct the instance's terminal variables by folding every
+    // `VariablesUpdated` delta the engine emits (last-writer-wins), seeded with
+    // the creation inputs. The engine drops a terminal instance's variable
+    // payload on completion (ADR 0012), so correctness must be checked against
+    // the event-projected output rather than cleared hot state.
+    let mut output: HashMap<String, Json> = input_vars.clone();
+
     // Deploy + create. Errors here would indicate a malformed model; the caller
     // validates the BPMN up front, so we surface failure as a non-completing run.
-    let _ = engine.apply_command_at(Command::DeployResources(defs.to_vec()), clock);
+    apply_and_fold(
+        &mut engine,
+        &mut output,
+        Command::DeployResources(defs.to_vec()),
+        clock,
+    );
     let vars: HashMap<String, Value> = input_vars
         .iter()
         .map(|(k, v)| (k.clone(), json_to_value(v)))
         .collect();
-    let _ = engine.apply_command_at(
+    apply_and_fold(
+        &mut engine,
+        &mut output,
         Command::CreateInstance {
             process_id: process_id.to_string(),
             variables: vars,
@@ -99,8 +113,18 @@ pub fn run_instance(
             match next_due {
                 Some(due) => {
                     clock = clock.max(due);
-                    let _ = engine.apply_command_at(Command::TriggerTimers { now: clock }, clock);
-                    let _ = engine.apply_command_at(Command::ExpireJobs { now: clock }, clock);
+                    apply_and_fold(
+                        &mut engine,
+                        &mut output,
+                        Command::TriggerTimers { now: clock },
+                        clock,
+                    );
+                    apply_and_fold(
+                        &mut engine,
+                        &mut output,
+                        Command::ExpireJobs { now: clock },
+                        clock,
+                    );
                     continue;
                 }
                 None => break, // settled: completed, terminated, or parked on an incident
@@ -114,7 +138,9 @@ pub fn run_instance(
             cost += worker.cost;
 
             if needs_activation {
-                let _ = engine.apply_command_at(
+                apply_and_fold(
+                    &mut engine,
+                    &mut output,
                     Command::ActivateJobs {
                         job_type: job_type.clone(),
                         worker: "sim".to_string(),
@@ -129,7 +155,9 @@ pub fn run_instance(
             // Seeded outcome: same worker fails on the same logical job across
             // every candidate, so comparisons are apples-to-apples.
             if draw(seed, job_key) < worker.failure_rate {
-                let _ = engine.apply_command_at(
+                apply_and_fold(
+                    &mut engine,
+                    &mut output,
                     Command::FailJob {
                         job_key,
                         retries: 0,
@@ -143,7 +171,9 @@ pub fn run_instance(
                     .iter()
                     .map(|(k, v)| (k.clone(), json_to_value(v)))
                     .collect();
-                let _ = engine.apply_command_at(
+                apply_and_fold(
+                    &mut engine,
+                    &mut output,
                     Command::CompleteJob {
                         job_key,
                         variables: out,
@@ -159,14 +189,8 @@ pub fn run_instance(
     let completed = inst
         .map(|i| i.state == ProcessInstanceState::Completed)
         .unwrap_or(false);
-    let output: HashMap<String, Json> = inst
-        .map(|i| {
-            i.variables
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect()
-        })
-        .unwrap_or_default();
+    // `output` was reconstructed from the emitted `VariablesUpdated` events; the
+    // completed instance's hot-state variables have been dropped (ADR 0012).
     let incidents = state
         .incidents
         .values()
@@ -210,6 +234,28 @@ fn resolve_worker(
 }
 
 // --- Value <-> JSON converters (mirrors engine-wasm/src/lib.rs) -----------------
+
+/// Applies a command to the sim engine and folds any `VariablesUpdated` deltas
+/// it emits into `output` (last-writer-wins), reconstructing the instance's
+/// terminal variables from the event stream since the engine drops them on
+/// completion (ADR 0012). Command errors are swallowed (no-op), matching the
+/// prior `let _ =` behaviour.
+fn apply_and_fold(
+    engine: &mut Engine,
+    output: &mut HashMap<String, Json>,
+    cmd: Command,
+    clock: u64,
+) {
+    if let Ok(events) = engine.apply_command_at(cmd, clock) {
+        for e in &events {
+            if let Event::VariablesUpdated { variables, .. } = e {
+                for (k, v) in variables {
+                    output.insert(k.clone(), value_to_json(v));
+                }
+            }
+        }
+    }
+}
 
 fn value_to_json(v: &Value) -> Json {
     match v {

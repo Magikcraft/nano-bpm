@@ -30,8 +30,8 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    Command, Engine, JobState, MessageSubscriptionState, ProcessDefinition, ProcessInstanceState,
-    TimerState, UserTaskState, Value,
+    Command, Engine, Event, JobState, MessageSubscriptionState, ProcessDefinition,
+    ProcessInstanceState, TimerState, UserTaskState, Value,
 };
 use serde_json::Value as Json;
 
@@ -538,6 +538,18 @@ pub fn replay_instance_with_mocks(
     let mut uncovered: Vec<String> = Vec::new();
     let mut mocked: Vec<String> = Vec::new();
 
+    // Reconstruct the instance's terminal variables by folding every
+    // `VariablesUpdated` delta the engine emits during replay (last-writer-wins),
+    // seeded with the creation inputs. Reading hot state at the end no longer
+    // works: the engine drops a terminal instance's variable payload on
+    // completion (ADR 0012), so the exporter/analysis path must project from
+    // events instead.
+    let mut produced: HashMap<String, Json> = rec
+        .creation_variables
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
     // Walk the recorded stimulus timeline only for its timestamps: each job we
     // complete advances the clock to the next recorded input's `at`, so the
     // replayed latency tracks the real timeline rather than a model.
@@ -587,7 +599,9 @@ pub fn replay_instance_with_mocks(
                     let input = msg_inputs.pop_front().unwrap();
                     clock = clock.max(input.at);
                     last_consumed_at = input.at;
-                    let _ = engine.apply_command_at(
+                    apply_and_fold(
+                        &mut engine,
+                        &mut produced,
                         Command::CorrelateMessage {
                             message_name,
                             correlation_key,
@@ -619,7 +633,9 @@ pub fn replay_instance_with_mocks(
                     let input = usertask_inputs.pop_front().unwrap();
                     clock = clock.max(input.at);
                     last_consumed_at = input.at;
-                    let _ = engine.apply_command_at(
+                    apply_and_fold(
+                        &mut engine,
+                        &mut produced,
                         Command::CompleteUserTask {
                             user_task_key,
                             variables: input.vars,
@@ -652,7 +668,9 @@ pub fn replay_instance_with_mocks(
                     let input = signal_inputs.pop_front().unwrap();
                     clock = clock.max(input.at);
                     last_consumed_at = input.at;
-                    let _ = engine.apply_command_at(
+                    apply_and_fold(
+                        &mut engine,
+                        &mut produced,
                         Command::BroadcastSignal {
                             signal_name,
                             variables: input.vars,
@@ -680,8 +698,18 @@ pub fn replay_instance_with_mocks(
                 if recorded.is_some() {
                     last_consumed_at = at;
                 }
-                let _ = engine.apply_command_at(Command::TriggerTimers { now: clock }, clock);
-                let _ = engine.apply_command_at(Command::ExpireJobs { now: clock }, clock);
+                apply_and_fold(
+                    &mut engine,
+                    &mut produced,
+                    Command::TriggerTimers { now: clock },
+                    clock,
+                );
+                apply_and_fold(
+                    &mut engine,
+                    &mut produced,
+                    Command::ExpireJobs { now: clock },
+                    clock,
+                );
                 continue;
             }
             // Settled: completed, terminated, or parked waiting on an input the
@@ -693,7 +721,9 @@ pub fn replay_instance_with_mocks(
             *issued.entry(job_type.clone()).or_insert(0) += 1;
 
             if needs_activation {
-                let _ = engine.apply_command_at(
+                apply_and_fold(
+                    &mut engine,
+                    &mut produced,
                     Command::ActivateJobs {
                         job_type: job_type.clone(),
                         worker: "replay".to_string(),
@@ -718,7 +748,9 @@ pub fn replay_instance_with_mocks(
                         .iter()
                         .map(|(k, v)| (k.clone(), json_to_value(v)))
                         .collect();
-                    let _ = engine.apply_command_at(
+                    apply_and_fold(
+                        &mut engine,
+                        &mut produced,
                         Command::CompleteJob {
                             job_key,
                             variables: out,
@@ -744,7 +776,9 @@ pub fn replay_instance_with_mocks(
                                 // error so the candidate's error boundary (if any)
                                 // runs. With no matching boundary the engine raises
                                 // an incident — exactly the historic failure mode.
-                                let _ = engine.apply_command_at(
+                                apply_and_fold(
+                                    &mut engine,
+                                    &mut produced,
                                     Command::ThrowJobError {
                                         job_key,
                                         error_code: code.clone(),
@@ -761,7 +795,9 @@ pub fn replay_instance_with_mocks(
                                     .iter()
                                     .map(|(k, v)| (k.clone(), json_to_value(v)))
                                     .collect();
-                                let _ = engine.apply_command_at(
+                                apply_and_fold(
+                                    &mut engine,
+                                    &mut produced,
                                     Command::CompleteJob {
                                         job_key,
                                         variables: out,
@@ -774,7 +810,9 @@ pub fn replay_instance_with_mocks(
                             if !uncovered.contains(&job_type) {
                                 uncovered.push(job_type.clone());
                             }
-                            let _ = engine.apply_command_at(
+                            apply_and_fold(
+                                &mut engine,
+                                &mut produced,
                                 Command::CompleteJob {
                                     job_key,
                                     variables: HashMap::new(),
@@ -793,14 +831,8 @@ pub fn replay_instance_with_mocks(
     let completed = inst
         .map(|i| i.state == ProcessInstanceState::Completed)
         .unwrap_or(false);
-    let produced: HashMap<String, Json> = inst
-        .map(|i| {
-            i.variables
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect()
-        })
-        .unwrap_or_default();
+    // `produced` was reconstructed from the emitted `VariablesUpdated` events
+    // above; the completed instance's hot-state variables have been dropped.
 
     // Boundary conservation: every key in the recorded terminal must reappear
     // with an equal value. Extra keys the candidate adds are not divergences.
@@ -1078,6 +1110,30 @@ fn percentile(sorted: &[u64], p: u64) -> u64 {
 }
 
 // --- Value <-> JSON converters (mirror sim.rs / engine-wasm) ---------------------
+
+/// Applies a command to the replay engine and folds any `VariablesUpdated`
+/// deltas it emits into `produced` (last-writer-wins), so the caller can
+/// reconstruct the instance's terminal variables from the event stream even
+/// after the engine drops them on completion (ADR 0012). Command errors are
+/// swallowed — the replay treats an unaccepted command as a no-op, matching the
+/// prior `let _ =` behaviour.
+fn apply_and_fold(
+    engine: &mut Engine,
+    produced: &mut HashMap<String, Json>,
+    cmd: Command,
+    clock: u64,
+) {
+    if let Ok(events) = engine.apply_command_at(cmd, clock) {
+        for e in &events {
+            if let Event::VariablesUpdated { variables, .. } = e {
+                for (k, v) in variables {
+                    produced.insert(k.clone(), value_to_json(v));
+                }
+            }
+        }
+    }
+}
+
 fn value_to_json(v: &Value) -> Json {
     match v {
         Value::Null => Json::Null,
