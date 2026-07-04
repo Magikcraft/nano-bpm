@@ -114,11 +114,25 @@ export default function Credits() {
               An Advanced Research Prototype
             </div>
             <p className="mx-auto mt-8 max-w-xl text-sm leading-relaxed text-zinc-400">
-              Nano is the distillation of the expertise and experience of
-              Camunda Engineering over nine years of building Zeebe and the
-              Camunda platform. Zeebe was the research prototype; Nano is its
-              refinement. It is craft — and artists sign their work.
+              Nano is an Advanced Research Prototype, incorporating a decade of
+              experience and expertise of Camunda Engineering.
             </p>
+
+            <div className="mx-auto mt-12 max-w-xl">
+              <p className="text-base italic leading-relaxed text-zinc-200">
+                He aha te mea nui o te ao?
+                <br />
+                He tangata, he tangata, he tangata
+              </p>
+              <p className="mx-auto mt-5 max-w-lg text-sm leading-relaxed text-zinc-400">
+                What is the most precious thing in the world?
+                <br />
+                It is people, it is people, it is people
+              </p>
+              <p className="mt-4 text-xs uppercase tracking-[0.25em] text-zinc-600">
+                Māori tikanga · New Zealand
+              </p>
+            </div>
           </div>
 
           <Gap />
