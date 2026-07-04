@@ -124,6 +124,21 @@ the model already names it. The cluster monitoring pane (Prometheus metrics +
 display) plays the role of the unit's **gain-reduction meter** — the operator's
 feedback that the processor is working.
 
+**The limiter LED, in metrics.** A rack compressor/limiter has an *LED that lights
+when the limiter engages* — the at-a-glance "we hit the ceiling" indicator. Nano
+exposes exactly that as `nanobpm_ceiling_active{ceiling="throughput"|"memory"}`
+(1 while pressed against that ceiling, 0 with headroom), plus a rising-edge peak-hold
+counter `nanobpm_ceiling_hits_total{ceiling}` (how often the limiter engaged over a
+window). The split mirrors the device: `throughput` is the create-processing /
+active-backlog limiter (the mode-selected behaviour), and `memory` is the
+always-in-circuit safety limiter (the memory-safety rails that bite in *both* modes).
+A companion set of gauges — `nanobpm_job_type_activatable{job_type}`,
+`nanobpm_job_type_workers{job_type}`, and the hint
+`nanobpm_job_type_starved{job_type}` (jobs waiting but no worker subscribed) — makes
+worker under-provisioning legible the same way: not the processor clipping its input,
+but the *downstream* being unable to keep up. Both are published ~1 Hz by an always-on
+monitor tick off the hot path.
+
 This is design borrowing of the good kind: not a skin, but a *correct model*
 transplanted from a domain (bounded dynamics under overload) that solved the same
 problem decades earlier, which also makes an abstract distributed-systems policy

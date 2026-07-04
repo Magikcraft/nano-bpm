@@ -714,6 +714,25 @@ resident memory) with inline sparklines, derived client-side from the gateway's
 Prometheus surface (`/metrics`). In a multi-node cluster it also shows a
 **per-node breakdown** by probing each peer's `GET /console/api/metrics`.
 
+**Ceiling LEDs and worker-provisioning hints.** Like the LED on a rack
+compressor/limiter that lights when the limiter engages (see
+[ADR 0013](docs/adr/0013-sla-modes-and-varstore-wal-bounding.md)), `/metrics`
+exposes when a node is pressed against a capacity ceiling:
+
+- `nanobpm_ceiling_active{ceiling="throughput"|"memory"}` — `1` while at that
+  ceiling, else `0`. `throughput` = create-processing concurrency / active-backlog
+  limit; `memory` = the always-in-circuit memory-safety rails (create-queue depth,
+  exporter saturation, in-flight pipeline bytes, resident-memory watermark).
+- `nanobpm_ceiling_hits_total{ceiling}` — rising-edge count of how often each
+  ceiling engaged (a peak-hold on the gain-reduction meter).
+- `nanobpm_job_type_activatable{job_type}` / `nanobpm_job_type_workers{job_type}`
+  / `nanobpm_job_type_starved{job_type}` — waiting jobs, subscribed workers, and a
+  starvation hint (`1` when jobs wait with no worker to drain them) so
+  under-provisioned job types are visible at a glance.
+
+All are published ~1 Hz off the hot path (relaxed atomic reads + cheap
+low-priority scans), so scraping them never touches the create/complete path.
+
 ### Modeler
 
 A bpmn-js editor backed by a workspace model library. Create, edit, deploy

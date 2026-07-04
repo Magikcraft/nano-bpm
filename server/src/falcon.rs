@@ -604,6 +604,19 @@ impl Registry {
         }
     }
 
+    /// Live subscribed-worker count per job type (the roster width dispatch can
+    /// fan out to). Feeds the ~1 Hz worker-provisioning monitor so a job type
+    /// with waiting jobs but zero workers can be flagged as starved. A cheap
+    /// snapshot under the `by_type` lock; called off the hot path.
+    pub fn workers_per_type(&self) -> HashMap<String, usize> {
+        self.by_type
+            .lock()
+            .expect("registry poisoned")
+            .iter()
+            .map(|(job_type, ids)| (job_type.clone(), ids.len()))
+            .collect()
+    }
+
     /// Builds a round-robin–ordered dispatch plan: for each job type, the live
     /// subscriptions to attempt this tick, with the cursor advanced so a different
     /// stream leads next time. Snapshotted under the locks; all engine work then

@@ -8710,6 +8710,47 @@ impl ServerImpl {
         self.admission_shed()
     }
 
+    /// The capacity ceilings this node is currently pressed against — the
+    /// compressor/limiter LEDs of ADR 0013, surfaced as Prometheus gauges by the
+    /// monitor tick. Returns `(throughput, memory)`:
+    /// - **throughput** — create-processing concurrency at/above the AIMD limit,
+    ///   or the active-backlog latency gate at/above its limit. Reported in
+    ///   *both* SLA modes: the ceiling is equally real whether the mode clips
+    ///   (latency) or lets latency grow (admission); the LED reflects the
+    ///   physical limit, not the policy response.
+    /// - **memory** — any always-in-circuit memory-safety rail at/above its
+    ///   limit (create-queue depth, exporter saturation, in-flight pipeline
+    ///   bytes, resident-memory watermark) — the same rails
+    ///   [`admission_shed`](Self::admission_shed) enforces.
+    ///
+    /// Cheap: relaxed atomic loads plus the same cheap partition sums the
+    /// admission gate already uses; no engine round-trip. Called from the ~1 Hz
+    /// monitor tick, never the hot path.
+    pub(crate) fn ceiling_state(&self) -> (bool, bool) {
+        let processing = self.processing.load(Ordering::Relaxed);
+        let mut throughput = self.backpressure.should_shed(processing);
+        let backlog_limit = self.admission_max_backlog;
+        if !throughput && backlog_limit > 0 {
+            throughput = self.inflight.load(Ordering::Relaxed) >= backlog_limit;
+        }
+
+        let mut memory = false;
+        let cq_limit = self.admission_max_create_queue;
+        if cq_limit > 0 {
+            memory = self.engine.pending_create_queue() >= cq_limit;
+        }
+        if !memory {
+            memory = self.engine.exporter_all_saturated();
+        }
+        if !memory && self.pipeline_bytes_watermark > 0 {
+            memory = self.pipeline_bytes.load(Ordering::Relaxed) >= self.pipeline_bytes_watermark;
+        }
+        if !memory && self.mem_watermark_bytes > 0 {
+            memory = self.mem_pressure_bytes.load(Ordering::Relaxed) >= self.mem_watermark_bytes;
+        }
+        (throughput, memory)
+    }
+
     /// This node's composite create-load index for load-aware placement (ADR
     /// 0014, `PlacementMode::Balanced`). A shedding node reports
     /// [`SHED_LOAD`](crate::placement::SHED_LOAD) (weight 0 — never placed on);
@@ -10188,6 +10229,8 @@ async fn main() {
     // jobs and the existing periodic tick reclaims expired leases.
     let cs_registry = falcon::Registry::new();
     falcon::spawn_dispatcher(server.clone(), cs_registry.clone());
+    let monitor_registry = cs_registry.clone();
+    let monitor_server = server.clone();
     let cs_router = falcon::router(server.clone(), cs_registry);
 
     // Clustered partition-0 owner: push the seeded/recovered deployment
@@ -10327,6 +10370,57 @@ async fn main() {
                 if tick_server.lease_digest && !tick_server.raft.is_empty() {
                     tick_server.run_lease_digest(now).await;
                 }
+            }
+        });
+    }
+
+    // Monitor tick: publishes the operational "LED" metrics an operator watches
+    // on a dashboard — the capacity-ceiling gauges (ADR 0013's compressor/limiter
+    // LEDs: throughput vs memory) and the per-job-type worker-provisioning /
+    // starvation hints. Always on (independent of the mem-pressure sampler's
+    // watermark gating), ~1 Hz, off the hot path: a couple of relaxed atomic
+    // reads plus cheap `Low`-priority partition walks + a roster snapshot. Never
+    // touches the create/complete critical path.
+    {
+        let monitor_server = monitor_server;
+        let monitor_registry = monitor_registry;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Rising-edge state for the ceiling-hit counters, and the set of job
+            // types published last tick so a type that drained to nothing is
+            // reset to 0 instead of leaving a stale non-zero series.
+            let mut throughput_lit = false;
+            let mut memory_lit = false;
+            let mut seen_job_types: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            loop {
+                interval.tick().await;
+
+                let (throughput, memory) = monitor_server.ceiling_state();
+                crate::metrics::set_ceiling_active("throughput", throughput, throughput_lit);
+                crate::metrics::set_ceiling_active("memory", memory, memory_lit);
+                throughput_lit = throughput;
+                memory_lit = memory;
+
+                let activatable = monitor_server.engine.activatable_job_counts().await;
+                let workers = monitor_registry.workers_per_type();
+                let mut current: std::collections::HashSet<String> =
+                    std::collections::HashSet::with_capacity(activatable.len() + workers.len());
+                for job_type in activatable.keys().chain(workers.keys()) {
+                    current.insert(job_type.clone());
+                }
+                for job_type in &current {
+                    let waiting = *activatable.get(job_type).unwrap_or(&0) as i64;
+                    let workers = *workers.get(job_type).unwrap_or(&0) as i64;
+                    crate::metrics::set_job_type_provisioning(job_type, waiting, workers);
+                }
+                // Zero out job types that disappeared this tick so their gauges
+                // don't linger at a stale value.
+                for job_type in seen_job_types.difference(&current) {
+                    crate::metrics::set_job_type_provisioning(job_type, 0, 0);
+                }
+                seen_job_types = current;
             }
         });
     }

@@ -79,6 +79,30 @@ struct Metrics {
     resident_var_bytes: IntGauge,
     /// Serialized event bytes queued to the journal writer but not yet fsynced+acked.
     journal_inflight_bytes: IntGauge,
+
+    // ---- Capacity ceilings (the compressor/limiter LEDs, ADR 0013) ----
+    /// The limiter "lit LED": 1 while this node is currently pressed against a
+    /// capacity ceiling, else 0, labelled by `ceiling` (`throughput` = the
+    /// create-processing concurrency / active-backlog limiter; `memory` = the
+    /// always-in-circuit memory-safety rails — create-queue depth, exporter
+    /// saturation, in-flight pipeline bytes, resident-memory watermark).
+    ceiling_active: prometheus::IntGaugeVec,
+    /// Cumulative count of ceiling "hits" — incremented on each rising edge
+    /// (headroom → at-limit) per `ceiling`. Lets a dashboard show how often the
+    /// limiter engaged over a window, like a peak-hold on a gain-reduction meter.
+    ceiling_hits_total: prometheus::IntCounterVec,
+
+    // ---- Worker provisioning per job type ----
+    /// Activatable (waiting) jobs per `job_type` across all owned partitions —
+    /// the depth workers still have to drain.
+    job_type_activatable: prometheus::IntGaugeVec,
+    /// Live subscribed stream workers per `job_type` (falcon roster).
+    job_type_workers: prometheus::IntGaugeVec,
+    /// Under-provisioning hint per `job_type`: 1 when jobs are waiting but no
+    /// worker is subscribed to drain them (hard starvation), else 0. Pair with
+    /// `job_type_activatable` / `job_type_workers` to spot soft under-provisioning
+    /// (workers present but backlog growing).
+    job_type_starved: prometheus::IntGaugeVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -239,6 +263,51 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let ceiling_active = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_ceiling_active",
+            "Capacity-ceiling LED: 1 while pressed against the limit, else 0 (ceiling=throughput|memory).",
+        ),
+        &["ceiling"],
+    )
+    .expect("valid gauge vec");
+
+    let ceiling_hits_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_ceiling_hits_total",
+            "Rising-edge count of capacity-ceiling hits (ceiling=throughput|memory).",
+        ),
+        &["ceiling"],
+    )
+    .expect("valid counter vec");
+
+    let job_type_activatable = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_job_type_activatable",
+            "Activatable (waiting) jobs per job type across all owned partitions.",
+        ),
+        &["job_type"],
+    )
+    .expect("valid gauge vec");
+
+    let job_type_workers = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_job_type_workers",
+            "Live subscribed stream workers per job type.",
+        ),
+        &["job_type"],
+    )
+    .expect("valid gauge vec");
+
+    let job_type_starved = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_job_type_starved",
+            "Worker under-provisioning hint: 1 when jobs are waiting but no worker is subscribed to drain them, else 0.",
+        ),
+        &["job_type"],
+    )
+    .expect("valid gauge vec");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -261,6 +330,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
         .and(registry.register(Box::new(resident_var_bytes.clone())))
         .and(registry.register(Box::new(journal_inflight_bytes.clone())))
+        .and(registry.register(Box::new(ceiling_active.clone())))
+        .and(registry.register(Box::new(ceiling_hits_total.clone())))
+        .and(registry.register(Box::new(job_type_activatable.clone())))
+        .and(registry.register(Box::new(job_type_workers.clone())))
+        .and(registry.register(Box::new(job_type_starved.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -286,6 +360,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         exporter_queue_bytes,
         resident_var_bytes,
         journal_inflight_bytes,
+        ceiling_active,
+        ceiling_hits_total,
+        job_type_activatable,
+        job_type_workers,
+        job_type_starved,
     }
 });
 
@@ -372,6 +451,38 @@ pub fn journal_inflight_add(n: usize) {
 /// the burst RSS balloon (does the journal write backlog hold the ~12 GB?).
 pub fn journal_inflight_sub(n: usize) {
     METRICS.journal_inflight_bytes.sub(n as i64);
+}
+
+/// Sets the capacity-ceiling LED for `ceiling` ("throughput"|"memory") and, on
+/// a rising edge (previously below the limit, now at it), bumps its hit counter.
+/// `previously_active` is the gauge value from the prior monitor tick; the caller
+/// threads it so the rising-edge detection needs no extra state read.
+pub fn set_ceiling_active(ceiling: &str, active: bool, previously_active: bool) {
+    METRICS
+        .ceiling_active
+        .with_label_values(&[ceiling])
+        .set(i64::from(active));
+    if active && !previously_active {
+        METRICS.ceiling_hits_total.with_label_values(&[ceiling]).inc();
+    }
+}
+
+/// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live
+/// subscribed workers, and the hard-starvation hint (waiting jobs but no worker).
+pub fn set_job_type_provisioning(job_type: &str, activatable: i64, workers: i64) {
+    METRICS
+        .job_type_activatable
+        .with_label_values(&[job_type])
+        .set(activatable);
+    METRICS
+        .job_type_workers
+        .with_label_values(&[job_type])
+        .set(workers);
+    let starved = i64::from(activatable > 0 && workers == 0);
+    METRICS
+        .job_type_starved
+        .with_label_values(&[job_type])
+        .set(starved);
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
@@ -509,5 +620,55 @@ pub fn snapshot() -> MetricsSnapshot {
 
         writer_idle_seconds: m.writer_idle_seconds.get(),
         writer_busy_seconds: m.writer_busy_seconds.get(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_type_starvation_flags_waiting_jobs_with_no_workers() {
+        // Unique label so the assertion is isolated from the shared registry.
+        set_job_type_provisioning("test-starved-type", 7, 0);
+        set_job_type_provisioning("test-served-type", 7, 3);
+        set_job_type_provisioning("test-idle-type", 0, 2);
+        let out = gather();
+        assert!(out.contains(
+            "nanobpm_job_type_starved{job_type=\"test-starved-type\"} 1"
+        ));
+        assert!(out.contains(
+            "nanobpm_job_type_activatable{job_type=\"test-starved-type\"} 7"
+        ));
+        // Workers present -> not starved even with a backlog.
+        assert!(out.contains(
+            "nanobpm_job_type_starved{job_type=\"test-served-type\"} 0"
+        ));
+        // No waiting jobs -> not starved even with idle workers.
+        assert!(out.contains(
+            "nanobpm_job_type_starved{job_type=\"test-idle-type\"} 0"
+        ));
+    }
+
+    #[test]
+    fn ceiling_hits_count_only_rising_edges() {
+        // Drive a full low -> high -> high -> low -> high cycle and confirm the
+        // hit counter advances by exactly one per rising edge, while the gauge
+        // tracks the live state each tick.
+        let before = ceiling_hits_total_for("test-ceiling");
+        set_ceiling_active("test-ceiling", false, false); // stays low
+        set_ceiling_active("test-ceiling", true, false); // rising edge (+1)
+        set_ceiling_active("test-ceiling", true, true); // held high (no count)
+        set_ceiling_active("test-ceiling", false, true); // falling edge
+        set_ceiling_active("test-ceiling", true, false); // rising edge (+1)
+        assert_eq!(ceiling_hits_total_for("test-ceiling"), before + 2);
+        assert!(gather().contains("nanobpm_ceiling_active{ceiling=\"test-ceiling\"} 1"));
+    }
+
+    fn ceiling_hits_total_for(ceiling: &str) -> u64 {
+        METRICS
+            .ceiling_hits_total
+            .with_label_values(&[ceiling])
+            .get()
     }
 }

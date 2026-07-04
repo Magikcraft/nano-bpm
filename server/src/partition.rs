@@ -546,6 +546,30 @@ impl Partitions {
             .map(DeepthiHandle::pending_low)
             .sum()
     }
+
+    /// Activatable (waiting) job counts per job type, summed across every owned
+    /// partition. Feeds the ~1 Hz worker-provisioning monitor (paired with the
+    /// falcon worker roster to flag under-provisioned / starved job types). Runs
+    /// each partition's cheap map walk at `Low` priority so it never preempts
+    /// completion work, and awaited only off the hot path.
+    pub async fn activatable_job_counts(&self) -> std::collections::HashMap<String, u64> {
+        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for h in self.all() {
+            let per_partition = h
+                .with_low(|j: &mut crate::journal::Journal| {
+                    j.state()
+                        .activatable_jobs
+                        .iter()
+                        .map(|(job_type, jobs)| (job_type.clone(), jobs.len() as u64))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            for (job_type, count) in per_partition {
+                *totals.entry(job_type).or_insert(0) += count;
+            }
+        }
+        totals
+    }
 }
 
 #[cfg(test)]
