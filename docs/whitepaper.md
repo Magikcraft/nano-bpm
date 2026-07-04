@@ -225,20 +225,82 @@ with a mode switch. (Full treatment: ADR 0013.)
 
 ## 6. Closing the loops: the create → adapt → drain control system
 
-> DRAFTING NOTE — the §2.1 anomaly, resolved. The old paradigm limits at a
-> **per‑partition valve** (Zeebe applies Netflix concurrency‑limits —
-> `StabilizingAIMDLimit`/Vegas/Gradient/Fixed — at
-> `LogStreamPartitionTransitionStep.buildLogStream` via `withRequestLimit`; the
-> gateway merely maps the broker's `RESOURCE_EXHAUSTED`). Nano makes the whole
-> cluster one loop: self‑sizing AIMD watermark + create shedding
-> (`backpressure.rs`) **+ load‑aware placement (SWRR over gossiped per‑node load)
-> + backlog‑weighted activation fairness** (ADRs 0001, 0014). Server and clients
-> are treated as one system; the client sees backpressure only under genuine
-> cluster‑wide saturation.
-> Points to make: (a) the loop is end‑to‑end, not a gateway afterthought;
-> (b) node self‑protection under heterogeneous resources (a saturated owner sheds
-> a forwarded create back to ingress for rerouting); (c) it degrades gracefully
-> when nodes hit limits at different times.
+Six years ago, in a three-hour podcast conversation, Falko — whose name this
+protocol carries — walked through a spreadsheet he kept of how L2 cache behaviour
+moved engine throughput, tuning what felt like every available knob by hand. Two
+things were true at once: the craft was extraordinary, and it was *manual*. Every
+knob was a place where a human stood in for a controller the system did not yet
+contain. Listening, one question kept surfacing: why can't the clients auto-scale
+*inside* the system? The engine knew when it was saturated; the client learned it
+only by being refused. That gap is an **open feedback loop** — and an open loop is
+an invitation to close it.
+
+Closing it was a years-long approach, not a single act. First, backpressure
+backoff became the default in the client SDKs, so a refused client waited instead
+of hammering. Then the backoff became **AIMD** — additive-increase,
+multiplicative-decrease — so a client probed for headroom and yielded on the first
+sign of loss, the way a well-behaved network flow does. Then the controller was
+tuned to the *integrated* system specifically: a modified TCP-congestion algorithm
+whose constants reflect the characteristics of a BPMN engine under load rather
+than a generic link. Each step moved the intelligence a little further from the
+human and a little deeper into the machine. Nano and Falcon are where the loop
+finally closes — and not only between one client and one server, but *between the
+nodes of the cluster and within the engine itself*: throughput, available
+resources, and backlog sensed everywhere and shared, so the whole system behaves as
+one organism that sizes itself. This is the §2.1 anomaly resolved, and the central
+thesis made concrete: a pattern that *emerged* progressively across the SDKs is
+promoted to a **first-class**, always-on property of the system.
+
+### 6.1 What the old paradigm could close, and what it could not
+
+The old paradigm did close a loop — a good one — but a *local* one. Zeebe limits
+admission at a **per-partition valve**: Netflix concurrency-limits
+(`StabilizingAIMDLimit`, plus Vegas/Gradient/Fixed variants) installed at
+`LogStreamPartitionTransitionStep.buildLogStream` via `withRequestLimit`. When a
+partition is saturated it rejects, and the gateway's role is essentially to *map*
+the broker's `RESOURCE_EXHAUSTED` back to the caller. It is a real controller, and
+per-partition AIMD is a genuine feedback loop — but the loop's horizon is one
+partition, and the client sits *outside* it, learning the system's state only
+through a refusal. Cluster-level questions — which node should take this create,
+is that node's problem local or shared, how should work be shared fairly across a
+heterogeneous fleet — are outside the valve's field of view.
+
+### 6.2 Nano: one cluster-wide loop, three coupled controllers
+
+Nano treats server and clients as **one system** and closes the loop across the
+whole of it. Three controllers act together:
+
+1. **Admission** — a self-sizing AIMD watermark with create-shedding
+   (`backpressure.rs`), latency-driven rather than count-driven: the watermark
+   grows while end-to-end latency stays healthy and multiplicatively backs off the
+   moment it does not. This is the direct descendant of the SDK-side story above,
+   now resident in the server and shared by every client.
+2. **Placement** — load-aware smooth weighted round-robin over **gossiped
+   per-node load** (ADR 0014). A create is steered toward the node most able to
+   absorb it, and a saturated owner that receives a forwarded create **sheds it
+   back to ingress for rerouting** rather than queueing it — node self-protection
+   as a first-class move, not an emergent accident.
+3. **Fairness** — backlog-weighted job-activation across the cluster (ADR 0001), so
+   that under contention work is *shared* in proportion to demand rather than
+   captured by whoever polls most aggressively.
+
+The distinction from the old paradigm is not "we added AIMD" — Zeebe has AIMD too.
+It is *where the loop lives and how far it sees*. Zeebe's is a per-partition valve;
+Nano's is a cluster-wide control system with the client inside it. A client sees
+backpressure only under genuine cluster-wide saturation, and when it does, it
+adapts — because it is a participant in the loop, not a supplicant outside it.
+
+### 6.3 Why this degrades gracefully
+
+Because sensing is distributed and the controllers are coupled, a heterogeneous
+fleet degrades *gracefully* rather than as a monolith. Nodes hit their throughput
+and memory ceilings at different times; when one does, placement steers new work
+elsewhere, self-protection sheds what would have piled up, fairness keeps the
+drain equitable, and admission sheds at ingress only when the *cluster* — not one
+unlucky node — is genuinely full. The human who once read a spreadsheet and turned
+a knob is replaced not by a bigger knob but by a loop that turns itself. That the
+one decision left for a human to make is a *business* decision, not a tuning
+decision, is the subject of §5 — and the whole point.
 
 ---
 
