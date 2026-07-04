@@ -35,9 +35,9 @@ use tokio::sync::broadcast;
 use crate::ServerImpl;
 use crate::backpressure::SlaMode;
 
+pub mod config;
 pub mod extensions;
 pub mod projects;
-pub mod config;
 pub mod trace;
 pub mod worker_export;
 pub mod workers;

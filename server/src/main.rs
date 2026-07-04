@@ -12,10 +12,10 @@
 mod backpressure;
 mod cluster;
 mod coldspill;
-mod falcon;
 #[cfg(feature = "console")]
 mod console;
 mod deepthi;
+mod falcon;
 mod journal;
 mod memory;
 mod metrics;
@@ -4727,9 +4727,9 @@ impl ServerImpl {
             ForwardCreateOutcome::Created(result) => {
                 Resp::Status200_TheProcessInstanceWasCreated(result)
             }
-            ForwardCreateOutcome::Reject400(detail) => Resp::Status400_TheProvidedDataIsNotValid(
-                problem("Invalid create", 400, detail),
-            ),
+            ForwardCreateOutcome::Reject400(detail) => {
+                Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid create", 400, detail))
+            }
             // Without placement protection a peer never placement-sheds, so this
             // is only reached defensively; surface it as a retryable error.
             ForwardCreateOutcome::Shed(detail) => {
@@ -4854,7 +4854,10 @@ impl ServerImpl {
                 }
             })
             .collect();
-        let mut cur = self.placement_swrr.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cur = self
+            .placement_swrr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if cur.len() != n {
             cur.resize(n, 0);
         }
@@ -5706,11 +5709,7 @@ impl ServerImpl {
             None => {
                 if let Some(node) = self.read_route(user_task_key) {
                     let (status, body) = self
-                        .forward_get(
-                            node,
-                            crate::falcon::ReadKind::UserTask,
-                            user_task_key,
-                        )
+                        .forward_get(node, crate::falcon::ReadKind::UserTask, user_task_key)
                         .await;
                     return Ok(match (status, body) {
                         (200, Some(b)) => match serde_json::from_value(b) {
@@ -8777,7 +8776,10 @@ impl ServerImpl {
     /// The latest create-load index gossiped by peer `node`, or `None` if that
     /// peer has not reported yet (treated by placement as full headroom).
     pub(crate) fn peer_load(&self, node: u32) -> Option<i64> {
-        self.peer_pressure.lock().ok().and_then(|m| m.get(&node).copied())
+        self.peer_pressure
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&node).copied())
     }
 
     /// `InstanceCompleted` frame. Reuses the REST await path verbatim.
@@ -9256,7 +9258,6 @@ enum ForwardCreateOutcome {
     /// Any other peer error; surfaced to the client as a 5xx.
     Error(u16, String),
 }
-
 
 /// Cheap O(n) byte-size proxy for a create's engine-`Value` variable map, used to
 /// meter in-flight create payloads for byte-aware admission control. Sums each
@@ -9755,14 +9756,18 @@ async fn main() {
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
                     let owned: Vec<u64> = (0..partitions as u64).collect();
-                    let (shared, recovery) =
-                        SharedWriter::open_segmented(&dir, &owned, partitions as u64, varstore.as_deref())
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "failed to open segmented multi-partition journal at {}: {e}",
-                                    dir.display()
-                                )
-                            });
+                    let (shared, recovery) = SharedWriter::open_segmented(
+                        &dir,
+                        &owned,
+                        partitions as u64,
+                        varstore.as_deref(),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to open segmented multi-partition journal at {}: {e}",
+                            dir.display()
+                        )
+                    });
                     multi_seg = Some((Arc::clone(&recovery.shared), partitions as u64));
                     let (read_model, shards) =
                         open_sharded_read_model(db_path.as_deref(), &owned, false);
@@ -9850,14 +9855,18 @@ async fn main() {
                         .parent()
                         .map(std::path::Path::to_path_buf)
                         .unwrap_or_else(|| std::path::PathBuf::from("."));
-                    let (shared, recovery) =
-                        SharedWriter::open_segmented(&dir, &owned, partitions as u64, varstore.as_deref())
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "failed to open segmented clustered journal at {}: {e}",
-                                    dir.display()
-                                )
-                            });
+                    let (shared, recovery) = SharedWriter::open_segmented(
+                        &dir,
+                        &owned,
+                        partitions as u64,
+                        varstore.as_deref(),
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "failed to open segmented clustered journal at {}: {e}",
+                            dir.display()
+                        )
+                    });
                     multi_seg = Some((Arc::clone(&recovery.shared), partitions as u64));
                     let (read_model, shards) =
                         open_sharded_read_model(db_path.as_deref(), &owned, false);
@@ -10066,10 +10075,8 @@ async fn main() {
                                     .await
                                 {
                                     Some((snap, covered_p, upserts, forgets)) => {
-                                        let ups: Vec<(nanobpmn_engine_core::Key, &_)> = upserts
-                                            .iter()
-                                            .map(|(k, v)| (*k, v.as_ref()))
-                                            .collect();
+                                        let ups: Vec<(nanobpmn_engine_core::Key, &_)> =
+                                            upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
                                         if let Err(e) =
                                             vs.checkpoint(pid, covered_p, &ups, &forgets)
                                         {
@@ -10203,9 +10210,7 @@ async fn main() {
             loop {
                 interval.tick().await;
                 tick = tick.wrapping_add(1);
-                if sample_resident
-                    && let Some(bytes) = memory::resident_bytes()
-                {
+                if sample_resident && let Some(bytes) = memory::resident_bytes() {
                     pressure.store(bytes as u64, Ordering::Relaxed);
                 }
                 // Publish the in-flight create-payload gauge for observability
@@ -10750,7 +10755,10 @@ mod clustered_startup_tests {
 
         // Huge host: 8% would exceed the 8 GiB ceiling -> clamped down.
         let huge = 256 * 1024 * 1024 * 1024; // 256 GiB
-        assert_eq!(pipeline_bytes_watermark_default_from_limit(huge), MAX_PIPELINE_BYTES);
+        assert_eq!(
+            pipeline_bytes_watermark_default_from_limit(huge),
+            MAX_PIPELINE_BYTES
+        );
 
         // Small host: 8% below the 512 MiB floor -> floored up, but never above
         // the limit itself.
@@ -11050,9 +11058,10 @@ mod clustered_startup_tests {
         let mut node0 = build_server_in_memory(journals, topology);
         node0.placement_mode = crate::placement::PlacementMode::Protect;
 
-        let body = models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
-            models::ProcessInstanceCreationInstructionById::new("demo".to_string()),
-        );
+        let body =
+            models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
+                models::ProcessInstanceCreationInstructionById::new("demo".to_string()),
+            );
 
         // Drive enough creates that placement lands on node 1 several times; every
         // one must succeed (200) — rerouted to node 0 when node 1 sheds — rather

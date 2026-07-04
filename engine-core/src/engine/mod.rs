@@ -522,8 +522,12 @@ impl Engine {
                     // context at deploy; a static literal falls back to the
                     // parsed interval. For a cycle the resolved interval is
                     // persisted so re-arming recurs on the same delay.
-                    let (due_at, interval_millis) =
-                        self.resolve_timer(None, start_timer_def.as_ref(), self.now, interval_millis);
+                    let (due_at, interval_millis) = self.resolve_timer(
+                        None,
+                        start_timer_def.as_ref(),
+                        self.now,
+                        interval_millis,
+                    );
                     self.emit(
                         log,
                         Event::ProcessStartTimerArmed {

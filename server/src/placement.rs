@@ -158,15 +158,27 @@ mod tests {
         // Unset ⇒ the self-optimizing default.
         assert_eq!(parse_placement_mode(None), PlacementMode::Balanced);
         // Unrecognised fails toward the default rather than disabling.
-        assert_eq!(parse_placement_mode(Some("nonsense")), PlacementMode::Balanced);
+        assert_eq!(
+            parse_placement_mode(Some("nonsense")),
+            PlacementMode::Balanced
+        );
         // Explicit opt-out restores blind round-robin.
         assert_eq!(parse_placement_mode(Some("off")), PlacementMode::Off);
         assert_eq!(parse_placement_mode(Some("0")), PlacementMode::Off);
         assert_eq!(parse_placement_mode(Some("false")), PlacementMode::Off);
-        assert_eq!(parse_placement_mode(Some("protect")), PlacementMode::Protect);
-        assert_eq!(parse_placement_mode(Some(" PROTECT ")), PlacementMode::Protect);
+        assert_eq!(
+            parse_placement_mode(Some("protect")),
+            PlacementMode::Protect
+        );
+        assert_eq!(
+            parse_placement_mode(Some(" PROTECT ")),
+            PlacementMode::Protect
+        );
         assert_eq!(parse_placement_mode(Some("1")), PlacementMode::Protect);
-        assert_eq!(parse_placement_mode(Some("balanced")), PlacementMode::Balanced);
+        assert_eq!(
+            parse_placement_mode(Some("balanced")),
+            PlacementMode::Balanced
+        );
         assert_eq!(parse_placement_mode(Some("2")), PlacementMode::Balanced);
     }
 

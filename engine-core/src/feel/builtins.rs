@@ -1277,7 +1277,9 @@ fn rounding_mode(name: &str) -> Result<RoundMode, FeelError> {
         "HALF_UP" => Ok(RoundMode::HalfUp),
         "HALF_DOWN" => Ok(RoundMode::HalfDown),
         "HALF_EVEN" | "UNNECESSARY" => Ok(RoundMode::HalfEven),
-        other => Err(FeelError(format!("decimal: unknown rounding mode '{other}'"))),
+        other => Err(FeelError(format!(
+            "decimal: unknown rounding mode '{other}'"
+        ))),
     }
 }
 
@@ -1364,7 +1366,10 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
         }
     };
     let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let stripped: &[u8] = cleaned.strip_suffix(b"==").or_else(|| cleaned.strip_suffix(b"=")).unwrap_or(&cleaned);
+    let stripped: &[u8] = cleaned
+        .strip_suffix(b"==")
+        .or_else(|| cleaned.strip_suffix(b"="))
+        .unwrap_or(&cleaned);
     let mut out = Vec::with_capacity(stripped.len() / 4 * 3);
     let mut acc = 0u32;
     let mut bits = 0u32;
@@ -1465,8 +1470,16 @@ fn interval(name: &str, a: &FeelVal, b: &FeelVal) -> FeelVal {
 fn interval_bool(name: &str, a: &FeelVal, b: &FeelVal) -> Option<bool> {
     use FeelVal::Range as R;
     // Destructure ranges once where present.
-    let ra = if let R(r) = a { Some(range_parts(r)?) } else { None };
-    let rb = if let R(r) = b { Some(range_parts(r)?) } else { None };
+    let ra = if let R(r) = a {
+        Some(range_parts(r)?)
+    } else {
+        None
+    };
+    let rb = if let R(r) = b {
+        Some(range_parts(r)?)
+    } else {
+        None
+    };
     match name {
         "before" => match (ra, rb) {
             (Some((_, _, e1, e1c)), Some((s2, s2c, _, _))) => {
@@ -1516,20 +1529,16 @@ fn interval_bool(name: &str, a: &FeelVal, b: &FeelVal) -> Option<bool> {
             )
         }
         "finishes" => match (ra, rb) {
-            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
-                e1c == e2c
-                    && eqp(e1, e2)
-                    && (gt(s1, s2) || (eqp(s1, s2) && (!s1c || s2c))),
-            ),
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => {
+                Some(e1c == e2c && eqp(e1, e2) && (gt(s1, s2) || (eqp(s1, s2) && (!s1c || s2c))))
+            }
             (None, Some((_, _, e2, e2c))) => Some(e2c && eqp(e2, a)),
             _ => None,
         },
         "finished by" => match (ra, rb) {
-            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
-                e1c == e2c
-                    && eqp(e1, e2)
-                    && (lt(s1, s2) || (eqp(s1, s2) && (s1c || !s2c))),
-            ),
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => {
+                Some(e1c == e2c && eqp(e1, e2) && (lt(s1, s2) || (eqp(s1, s2) && (s1c || !s2c))))
+            }
             (Some((_, _, e1, e1c)), None) => Some(e1c && eqp(e1, b)),
             _ => None,
         },
@@ -1538,11 +1547,9 @@ fn interval_bool(name: &str, a: &FeelVal, b: &FeelVal) -> Option<bool> {
                 (lt(s1, s2) || (eqp(s1, s2) && (s1c || !s2c)))
                     && (gt(e1, e2) || (eqp(e1, e2) && (e1c || !e2c))),
             ),
-            (Some((s1, s1c, e1, e1c)), None) => Some(
-                (lt(s1, b) && gt(e1, b))
-                    || (eqp(s1, b) && s1c)
-                    || (eqp(e1, b) && e1c),
-            ),
+            (Some((s1, s1c, e1, e1c)), None) => {
+                Some((lt(s1, b) && gt(e1, b)) || (eqp(s1, b) && s1c) || (eqp(e1, b) && e1c))
+            }
             _ => None,
         },
         "during" => match (ra, rb) {
@@ -1550,28 +1557,22 @@ fn interval_bool(name: &str, a: &FeelVal, b: &FeelVal) -> Option<bool> {
                 (lt(s2, s1) || (eqp(s2, s1) && (s2c || !s1c)))
                     && (gt(e2, e1) || (eqp(e2, e1) && (e2c || !e1c))),
             ),
-            (None, Some((s2, s2c, e2, e2c))) => Some(
-                (lt(s2, a) && gt(e2, a))
-                    || (eqp(s2, a) && s2c)
-                    || (eqp(e2, a) && e2c),
-            ),
+            (None, Some((s2, s2c, e2, e2c))) => {
+                Some((lt(s2, a) && gt(e2, a)) || (eqp(s2, a) && s2c) || (eqp(e2, a) && e2c))
+            }
             _ => None,
         },
         "starts" => match (ra, rb) {
-            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
-                eqp(s1, s2)
-                    && s1c == s2c
-                    && (lt(e1, e2) || (eqp(e1, e2) && (!e1c || e2c))),
-            ),
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => {
+                Some(eqp(s1, s2) && s1c == s2c && (lt(e1, e2) || (eqp(e1, e2) && (!e1c || e2c))))
+            }
             (None, Some((s2, s2c, _, _))) => Some(eqp(s2, a) && s2c),
             _ => None,
         },
         "started by" => match (ra, rb) {
-            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
-                eqp(s1, s2)
-                    && s1c == s2c
-                    && (lt(e2, e1) || (eqp(e2, e1) && (!e2c || e1c))),
-            ),
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => {
+                Some(eqp(s1, s2) && s1c == s2c && (lt(e2, e1) || (eqp(e2, e1) && (!e2c || e1c))))
+            }
             (Some((s1, s1c, _, _)), None) => Some(eqp(s1, b) && s1c),
             _ => None,
         },

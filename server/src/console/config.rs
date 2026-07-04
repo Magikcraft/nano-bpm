@@ -508,7 +508,11 @@ mod tests {
         assert_eq!(v["slaMode"]["options"].as_array().unwrap().len(), 2);
         let params = v["params"].as_array().unwrap();
         assert!(params.iter().any(|p| p["key"] == "NANOBPMN_SLA_MODE"));
-        assert!(params.iter().any(|p| p["key"] == "NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS"));
+        assert!(
+            params
+                .iter()
+                .any(|p| p["key"] == "NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS")
+        );
         assert_eq!(v["readOnly"], true);
     }
 
@@ -519,7 +523,10 @@ mod tests {
         let deno = deps.iter().find(|d| d["id"] == "deno").expect("deno dep");
         assert!(deno["installUrl"].as_str().unwrap().starts_with("https://"));
         // A missing tool always carries an actionable hint; a present one does not.
-        assert_eq!(deno["present"].as_bool().unwrap(), deno["hint"].as_str().unwrap().is_empty());
+        assert_eq!(
+            deno["present"].as_bool().unwrap(),
+            deno["hint"].as_str().unwrap().is_empty()
+        );
     }
 
     #[test]

@@ -1361,8 +1361,9 @@ impl std::error::Error for BuildError {}
 
 #[cfg(test)]
 mod approx_bytes_tests {
-    use super::Value;
     use std::collections::BTreeMap;
+
+    use super::Value;
 
     #[test]
     fn approx_bytes_scales_with_string_payload() {
@@ -1382,7 +1383,10 @@ mod approx_bytes_tests {
         m.insert("n".to_string(), Value::Int(1));
         let map = Value::Map(m);
         let got = map.approx_bytes();
-        assert!(got >= blob.len() as u64, "map estimate {got} covers the blob");
+        assert!(
+            got >= blob.len() as u64,
+            "map estimate {got} covers the blob"
+        );
         assert!(got < blob.len() as u64 + 200, "no runaway overhead: {got}");
     }
 }

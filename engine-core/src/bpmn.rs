@@ -633,7 +633,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         // A `=`-prefixed timeDuration is a FEEL expression
                         // evaluated at timer creation; a bare value is a static
                         // ISO-8601 literal parsed now.
-                        if let Some(feel) = feel_timer_expr(trimmed, crate::model::TimerDefKind::Duration)
+                        if let Some(feel) =
+                            feel_timer_expr(trimmed, crate::model::TimerDefKind::Duration)
                         {
                             if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
                                 acc.nodes[idx].timer_expr = Some(feel);
@@ -662,7 +663,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 "timeCycle" => {
                     if let Some(text) = cycle_text.take() {
                         let trimmed = text.trim();
-                        if let Some(feel) = feel_timer_expr(trimmed, crate::model::TimerDefKind::Cycle)
+                        if let Some(feel) =
+                            feel_timer_expr(trimmed, crate::model::TimerDefKind::Cycle)
                         {
                             if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
                                 acc.nodes[idx].timer_expr = Some(feel);
