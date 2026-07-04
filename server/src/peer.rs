@@ -573,11 +573,13 @@ impl PeerLink {
         &self,
         scope_key: String,
         variables: Option<serde_json::Map<String, Value>>,
+        local: bool,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::SetVariables {
             corr,
             scope_key,
             variables,
+            local,
         })
         .await
     }

@@ -213,6 +213,44 @@ impl Engine {
         Arc::new(merged)
     }
 
+    /// Builds the variable-write **events** for merging `variables` into `scope`
+    /// with Zeebe propagation semantics (see [`Self::propagate_variables`]).
+    ///
+    /// A write that resolves to the root (process-instance) scope is emitted as
+    /// the legacy flat [`crate::Event::VariablesUpdated`] so the log, read model
+    /// and conditional-event re-evaluation stay byte-identical to the pre-scoping
+    /// engine; a write that lands in any other scope is emitted as
+    /// [`crate::Event::ScopedVariablesUpdated`]. The result is sorted by scope key
+    /// for deterministic replay.
+    pub(crate) fn propagated_updates(
+        &self,
+        instance_key: Key,
+        scope: Key,
+        variables: HashMap<String, Value>,
+        local: bool,
+    ) -> Vec<crate::Event> {
+        let mut writes = self.propagate_variables(instance_key, scope, variables, local);
+        writes.sort_by_key(|(dest, _)| *dest);
+        writes
+            .into_iter()
+            .filter(|(_, vars)| !vars.is_empty())
+            .map(|(dest, vars)| {
+                if dest == 0 || dest == instance_key {
+                    crate::Event::VariablesUpdated {
+                        instance_key,
+                        variables: vars,
+                    }
+                } else {
+                    crate::Event::ScopedVariablesUpdated {
+                        instance_key,
+                        scope_key: dest,
+                        variables: vars,
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Resolves Zeebe variable **propagation** for a merge of `variables` into
     /// `target_scope`, returning the per-scope writes to emit (as
     /// [`crate::Event::ScopedVariablesUpdated`]). With `local` true every value
@@ -220,9 +258,6 @@ impl Engine {
     /// ancestor scope (from the target upward) that already defines it; a name
     /// defined nowhere is created in the root scope. Root-only instances collapse
     /// to a single root write, matching the flat engine.
-    // Wired into the variable-write sites (I/O mappings, job/message merges,
-    // SetVariables) in Part C phase 2; defined here with the scope machinery.
-    #[allow(dead_code)]
     pub(crate) fn propagate_variables(
         &self,
         instance_key: Key,
@@ -255,7 +290,6 @@ impl Engine {
 
     /// The nearest scope (from `scope` upward to the root) that already defines
     /// `name`, or `None` if no scope in the chain holds it.
-    #[allow(dead_code)]
     fn scope_defining(
         &self,
         instance: &crate::state::ProcessInstance,

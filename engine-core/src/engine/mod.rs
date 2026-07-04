@@ -665,13 +665,16 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
-                    self.emit(
-                        &mut log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables,
-                        },
-                    );
+                    // Job result variables propagate from the task's enclosing
+                    // (flow) scope upward — each name updates the nearest ancestor
+                    // scope that defines it, defaulting to root. For a root-only
+                    // instance this collapses to the flat `VariablesUpdated`,
+                    // byte-identical to the pre-scoping engine.
+                    let flow_scope = self.scope_of(instance_key, element_instance_key);
+                    for event in self.propagated_updates(instance_key, flow_scope, variables, false)
+                    {
+                        self.emit(&mut log, event);
+                    }
                 }
                 // The parked service-task token resumes from ACTIVATED.
                 queue.push_back(Step::Complete {
@@ -785,13 +788,14 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
-                    self.emit(
-                        &mut log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables,
-                        },
-                    );
+                    // User-task completion variables propagate from the task's
+                    // enclosing (flow) scope upward, defaulting to root (flat
+                    // `VariablesUpdated` for a root-only instance).
+                    let flow_scope = self.scope_of(instance_key, element_instance_key);
+                    for event in self.propagated_updates(instance_key, flow_scope, variables, false)
+                    {
+                        self.emit(&mut log, event);
+                    }
                 }
                 // The parked user-task token resumes from ACTIVATED.
                 queue.push_back(Step::Complete {
@@ -1313,18 +1317,21 @@ impl Engine {
             Command::SetVariables {
                 scope_key,
                 variables,
+                local,
             } => {
                 let instance_key = self
                     .resolve_scope(scope_key)
                     .ok_or(EngineError::ScopeNotFound { scope_key })?;
                 if !variables.is_empty() {
-                    self.emit(
-                        &mut log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables,
-                        },
-                    );
+                    // Resolve the requested scope within the instance and write:
+                    // `local` keeps the values in that scope; otherwise they
+                    // propagate to the nearest ancestor defining each name, else
+                    // root. A root-scoped (or root-only-instance) write collapses
+                    // to the flat `VariablesUpdated`.
+                    for event in self.propagated_updates(instance_key, scope_key, variables, local)
+                    {
+                        self.emit(&mut log, event);
+                    }
                 }
             }
 
@@ -1981,15 +1988,15 @@ impl Engine {
             },
         );
         // The message's variables (if any) are merged into the correlated
-        // instance before its token advances.
+        // instance before its token advances, propagating from the catching
+        // element's enclosing (flow) scope upward (nearest defining ancestor,
+        // else root). Root-only instances collapse to the flat `VariablesUpdated`.
         if !variables.is_empty() {
-            self.emit(
-                log,
-                Event::VariablesUpdated {
-                    instance_key,
-                    variables: variables.clone(),
-                },
-            );
+            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
+            {
+                self.emit(log, event);
+            }
         }
 
         match kind {
@@ -2066,13 +2073,13 @@ impl Engine {
             },
         );
         if !variables.is_empty() {
-            self.emit(
-                log,
-                Event::VariablesUpdated {
-                    instance_key,
-                    variables: variables.clone(),
-                },
-            );
+            // Signal payload propagates from the catching element's enclosing
+            // (flow) scope upward, defaulting to root.
+            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
+            {
+                self.emit(log, event);
+            }
         }
 
         match kind {
@@ -2156,6 +2163,18 @@ impl Engine {
             // The sub-process completes in its own (parent) scope, captured before
             // its scope entry is cleared by `ElementCompleted`.
             let scope = self.scope_of(instance_key, eik);
+            // Output mappings on a sub-process evaluate against the sub-process's
+            // own scope view (its input-mapped locals + anything set inside it)
+            // BEFORE its scope is torn down, then propagate the mapped result to
+            // the enclosing (parent) scope. Capture the values now; emit them as
+            // scoped writes after `ElementCompleted` has dropped the local scope.
+            let outputs = self.io_outputs(instance_key, &element_id);
+            let output_updates = if outputs.is_empty() {
+                HashMap::new()
+            } else {
+                let visible = self.variables_for_element(instance_key, eik);
+                self.eval_io_mappings_in(&visible, &outputs)
+            };
             self.emit(
                 log,
                 Event::ElementCompleting {
@@ -2185,18 +2204,9 @@ impl Engine {
             for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
                 self.emit(log, event);
             }
-            // Output mappings on a sub-process apply as its scope drains.
-            let outputs = self.io_outputs(instance_key, &element_id);
-            if !outputs.is_empty() {
-                let updates = self.eval_io_mappings(instance_key, &outputs);
-                if !updates.is_empty() {
-                    self.emit(
-                        log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables: updates,
-                        },
-                    );
+            if !output_updates.is_empty() {
+                for event in self.propagated_updates(instance_key, scope, output_updates, false) {
+                    self.emit(log, event);
                 }
             }
             for flow in self.outgoing(instance_key, &element_id) {
@@ -2305,29 +2315,35 @@ impl Engine {
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
         // inner flow, not propagated to the parent, and dropped when the element
-        // completes. A sub-process keeps its inputs at the root scope for now;
-        // hierarchical sub-process scoping lands in Part C phase 3.
+        // completes. A sub-process is itself a variable scope: it always registers
+        // its scope (so writes inside it can resolve/propagate correctly) and its
+        // inputs are local to that scope, exactly like a leaf activity.
+        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
         let inputs = self.io_inputs(instance_key, &element_id);
+        let mut scope_registered = false;
+        if is_sub_process {
+            events.push(Event::VariableScopeCreated {
+                instance_key,
+                scope_key: element_instance_key,
+                parent_scope_key: scope,
+            });
+            scope_registered = true;
+        }
         if !inputs.is_empty() {
             let updates = self.eval_io_mappings(instance_key, &inputs);
             if !updates.is_empty() {
-                if matches!(kind, Some(ElementKind::SubProcess { .. })) {
-                    events.push(Event::VariablesUpdated {
-                        instance_key,
-                        variables: updates,
-                    });
-                } else {
+                if !scope_registered {
                     events.push(Event::VariableScopeCreated {
                         instance_key,
                         scope_key: element_instance_key,
                         parent_scope_key: scope,
                     });
-                    events.push(Event::ScopedVariablesUpdated {
-                        instance_key,
-                        scope_key: element_instance_key,
-                        variables: updates,
-                    });
                 }
+                events.push(Event::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key: element_instance_key,
+                    variables: updates,
+                });
             }
         }
 
@@ -3077,10 +3093,15 @@ impl Engine {
                 None => self.eval_io_mappings_in(&visible, &outputs),
             };
             if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
+                // Output mappings propagate their result to the element's
+                // enclosing (flow) scope and upward — each name updates the
+                // nearest ancestor scope that defines it, defaulting to root.
+                // The element's own scope is being torn down by `ElementCompleted`
+                // (built earlier in this vec), so propagating from the parent
+                // avoids writing into the dying scope. Root-only instances collapse
+                // to a single flat `VariablesUpdated`, unchanged from the flat engine.
+                let flow_scope = self.scope_of(instance_key, element_instance_key);
+                events.extend(self.propagated_updates(instance_key, flow_scope, updates, false));
             }
         }
         let mut followups = Vec::new();

@@ -3080,10 +3080,16 @@ impl ServerImpl {
         };
 
         let variables = from_object_map(&body.variables);
+        let local = body.local.unwrap_or(false);
 
         if let Some(node) = self.route_by_leader(scope_key) {
             return Ok(self
-                .forward_set_variables(node, scope_key, wire_variables(Some(&body.variables)))
+                .forward_set_variables(
+                    node,
+                    scope_key,
+                    wire_variables(Some(&body.variables)),
+                    local,
+                )
                 .await);
         }
 
@@ -3091,7 +3097,10 @@ impl ServerImpl {
             .engine
             .by_key(scope_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+                engine.apply_command_at(
+                    Command::set_variables_scoped(scope_key, variables, local),
+                    now_millis(),
+                )
             })
             .await;
         match result {
@@ -3818,12 +3827,16 @@ impl ServerImpl {
         &self,
         scope_key: u64,
         variables: std::collections::HashMap<String, Value>,
+        local: bool,
     ) -> Result<(), (u16, String)> {
         let result = self
             .engine
             .by_key(scope_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+                engine.apply_command_at(
+                    Command::set_variables_scoped(scope_key, variables, local),
+                    now_millis(),
+                )
             })
             .await;
         match result {
@@ -4484,11 +4497,15 @@ impl ServerImpl {
         node: u32,
         scope_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
+        local: bool,
     ) -> apis::element_instance::CreateElementInstanceVariablesResponse {
         use apis::element_instance::CreateElementInstanceVariablesResponse as Resp;
         let res =
             match self.peer_link(node).await {
-                Ok(link) => link.set_variables(scope_key.to_string(), variables).await,
+                Ok(link) => {
+                    link.set_variables(scope_key.to_string(), variables, local)
+                        .await
+                }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
                         problem("Peer error", s, m),

@@ -108,13 +108,17 @@ pub enum Command {
         incident_key: Key,
         operation_reference: Option<i64>,
     },
-    /// Merge variables into a scope before, typically, resolving an incident so
-    /// the retried work sees the corrected data. `scope_key` may be a process
-    /// instance key or an element instance key; both resolve to the owning
-    /// instance, since nano keeps a single instance-level variable scope.
+    /// Merge variables into a scope, typically to correct data before resolving
+    /// an incident. `scope_key` may be a process instance key or an element
+    /// instance key; it resolves to the owning instance's variable scope. When
+    /// `local` is true the values are written strictly into the target scope;
+    /// otherwise they propagate upward (each name updates the nearest ancestor
+    /// scope that defines it, defaulting to the root scope) — Zeebe's
+    /// `SetVariables` semantics.
     SetVariables {
         scope_key: Key,
         variables: HashMap<String, Value>,
+        local: bool,
     },
     /// Publish a message and correlate it to every open subscription whose
     /// message name and correlation key match. A message intermediate catch
@@ -366,11 +370,25 @@ impl Command {
         }
     }
 
-    /// Convenience constructor for a `SetVariables`.
+    /// Convenience constructor for a propagating (`local = false`) `SetVariables`.
     pub fn set_variables(scope_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::SetVariables {
             scope_key,
             variables,
+            local: false,
+        }
+    }
+
+    /// Convenience constructor for a `SetVariables` with an explicit `local` flag.
+    pub fn set_variables_scoped(
+        scope_key: Key,
+        variables: HashMap<String, Value>,
+        local: bool,
+    ) -> Self {
+        Command::SetVariables {
+            scope_key,
+            variables,
+            local,
         }
     }
 
