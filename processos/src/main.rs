@@ -629,6 +629,8 @@ async fn main() {
         )
         .route("/assets/bpmn/{file}", get(bpmn_asset))
         .route("/assets/settings.js", get(settings_js))
+        .route("/assets/theme.css", get(theme_css))
+        .route("/assets/theme.js", get(theme_js))
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/settings/profiles", post(post_profile))
         .route(
@@ -1237,6 +1239,8 @@ const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css")
 /// (e.g. `zeebe:taskDefinition`) and preserves them across an edit instead of dropping them.
 const BPMN_ZEEBE_MODDLE_JSON: &str = include_str!("../assets/bpmn/zeebe-moddle.json");
 const SETTINGS_JS: &str = include_str!("../assets/settings.js");
+const THEME_CSS: &str = include_str!("../assets/theme.css");
+const THEME_JS: &str = include_str!("../assets/theme.js");
 
 /// A single embedded file belonging to a demo dataset, addressed by its path
 /// relative to the pack directory (so `bpmn_library` directory references and the
@@ -1544,6 +1548,33 @@ async fn settings_js() -> impl IntoResponse {
             (axum::http::header::CACHE_CONTROL, NO_CACHE),
         ],
         SETTINGS_JS,
+    )
+}
+
+/// Serves the shared design tokens (`/assets/theme.css`) — the `--po-*` custom properties every
+/// ProcessOS page styles through, with the dark and light palettes.
+async fn theme_css() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
+        THEME_CSS,
+    )
+}
+
+/// Serves the theme runtime (`/assets/theme.js`) — applies the persisted light/dark/system
+/// choice before first paint and mounts the appearance switcher.
+async fn theme_js() -> impl IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, NO_CACHE),
+        ],
+        THEME_JS,
     )
 }
 

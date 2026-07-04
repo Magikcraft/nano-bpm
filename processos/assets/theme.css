@@ -1,0 +1,152 @@
+/*
+ * ProcessOS design tokens — the theming contract for every ProcessOS page
+ * (cockpit, landing, features, workspace, /console, /harness, /guide).
+ *
+ * Every surface, border, text, accent, and status colour resolves through a
+ * `--po-*` custom property. Two built-in palettes — dark and light — are
+ * switched by `data-appearance` on <html>, set before first paint by
+ * /assets/theme.js from the persisted choice (light / dark / follow-system).
+ *
+ * The palette deliberately mirrors the Nano console's design tokens (violet
+ * accent + cyan secondary over near-black / paper surfaces) so ProcessOS and
+ * Nano read as one product family.
+ */
+
+:root,
+:root[data-appearance="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces: page → panel (rails) → raised (cards/tiles) → inset (wells,
+     inputs, code) → hover (hover/active fills). */
+  --po-app: #0b0b10;
+  --po-panel: #10101a;
+  --po-raised: #16161f;
+  --po-inset: #0a0a0f;
+  --po-hover: #1e1e2a;
+
+  /* Borders. */
+  --po-edge: #24242f;
+  --po-edge-strong: #383848;
+
+  /* Text tiers. */
+  --po-text: #f2f2f7;
+  --po-text-muted: #a3a3b2;
+  --po-text-faint: #6e6e80;
+
+  /* Brand accent (violet) + secondary (cyan) — matches the Nano console. */
+  --po-accent: #8b5cf6;
+  --po-accent-strong: #a78bfa;
+  --po-accent-soft: #c4b5fd;
+  --po-accent-2: #22d3ee;
+  --po-on-accent: #ffffff;
+  --po-accent-wash: #191534;
+  --po-accent-edge: #3b3266;
+
+  /* Status families: solid, soft (readable text tint), wash (tinted bg),
+     edge (tinted border). */
+  --po-ok: #34d399;
+  --po-ok-soft: #6ee7b7;
+  --po-ok-wash: #0c231a;
+  --po-ok-edge: #1d5c38;
+
+  --po-warn: #fbbf24;
+  --po-warn-soft: #fcd34d;
+  --po-warn-wash: #251c07;
+  --po-warn-edge: #5a4312;
+
+  --po-danger: #fb7185;
+  --po-danger-soft: #fca5a5;
+  --po-danger-wash: #250f12;
+  --po-danger-edge: #5b2330;
+
+  --po-info: #38bdf8;
+  --po-info-soft: #93c5fd;
+  --po-info-wash: #10203a;
+  --po-info-edge: #2c3c66;
+
+  --po-shadow: rgba(0, 0, 0, 0.5);
+}
+
+:root[data-appearance="light"] {
+  color-scheme: light;
+
+  --po-app: #f5f5f9;
+  --po-panel: #fdfdfe;
+  --po-raised: #ffffff;
+  --po-inset: #ededf3;
+  --po-hover: #e8e8f0;
+
+  --po-edge: #e2e2ea;
+  --po-edge-strong: #c5c5d4;
+
+  --po-text: #1a1a22;
+  --po-text-muted: #565664;
+  --po-text-faint: #8c8c9c;
+
+  --po-accent: #7c3aed;
+  --po-accent-strong: #6d28d9;
+  --po-accent-soft: #5b21b6;
+  --po-accent-2: #0891b2;
+  --po-on-accent: #ffffff;
+  --po-accent-wash: #f1ecfd;
+  --po-accent-edge: #cbb8f2;
+
+  --po-ok: #059669;
+  --po-ok-soft: #047857;
+  --po-ok-wash: #e6f6ef;
+  --po-ok-edge: #a9dcc4;
+
+  --po-warn: #b45309;
+  --po-warn-soft: #92400e;
+  --po-warn-wash: #fdf3e0;
+  --po-warn-edge: #ecd9ae;
+
+  --po-danger: #e11d48;
+  --po-danger-soft: #b91c1c;
+  --po-danger-wash: #fdeaee;
+  --po-danger-edge: #f2bcc8;
+
+  --po-info: #0369a1;
+  --po-info-soft: #075985;
+  --po-info-wash: #e8f3fb;
+  --po-info-edge: #b5d6ea;
+
+  --po-shadow: rgba(30, 30, 60, 0.18);
+}
+
+/* ── Theme toggle widget (mounted by poMountThemeToggle in theme.js) ───────── */
+.po-theme-toggle {
+  display: flex;
+  border: 1px solid var(--po-edge);
+  background: var(--po-inset);
+  border-radius: 9px;
+  padding: 2px;
+  gap: 2px;
+}
+.po-theme-toggle button {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  padding: 5px 0;
+  cursor: pointer;
+  color: var(--po-text-faint);
+  font: inherit;
+  line-height: 1;
+}
+.po-theme-toggle button:hover {
+  color: var(--po-text);
+}
+.po-theme-toggle button.on {
+  background: var(--po-raised);
+  color: var(--po-accent-strong);
+  box-shadow: 0 1px 3px var(--po-shadow);
+}
+.po-theme-toggle svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}

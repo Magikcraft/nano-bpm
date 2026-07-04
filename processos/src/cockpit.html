@@ -4,352 +4,367 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Nano ProcessOS — Cockpit</title>
+<link rel="stylesheet" href="/assets/theme.css" />
+<script src="/assets/theme.js"></script>
 <link rel="stylesheet" href="/assets/bpmn/diagram-js.css" />
 <link rel="stylesheet" href="/assets/bpmn/bpmn-embedded.css" />
 <style>
-  :root { color-scheme: dark; }
+  /* All colours resolve through the --po-* design tokens (/assets/theme.css); the
+     light/dark/system choice is applied by /assets/theme.js before first paint. */
   * { box-sizing: border-box; }
   html, body { height: 100%; }
-  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: #0a0a0b; color: #e4e4e7; overflow: hidden; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: var(--po-app); color: var(--po-text); overflow: hidden; }
   a { color: inherit; text-decoration: none; }
   /* The shell fills the viewport exactly and never scrolls itself; only #main scrolls. The grid
      items get min-height/min-width:0 so a tall/wide #main can't stretch the row past 100vh and
-     drag the page (and the rail) into the document scroll. */
-  .app { display: grid; grid-template-columns: 220px 1fr; height: 100vh; overflow: hidden; }
+     drag the page (and the rail) into the document scroll. The rail column width is a custom
+     property so the workbench can resize/collapse it (persisted). */
+  .app { display: grid; grid-template-columns: var(--wb-rail, 220px) 1fr; height: 100vh; overflow: hidden; }
   /* left rail — pinned so it never scrolls out of view; #main is the scroll container */
-  .rail { border-right: 1px solid #1f1f23; padding: 18px 14px; background: #0c0c0e; height: 100vh; overflow-y: auto; min-height: 0; }
+  .rail { position: relative; border-right: 1px solid var(--po-edge); padding: 18px 14px; background: var(--po-panel); height: 100vh; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; }
+  .rail .nav { flex: 0 0 auto; }
+  .rail .rail-foot { margin-top: auto; padding-top: 14px; }
   #main { height: 100vh; overflow-y: auto; min-height: 0; min-width: 0; }
   .brand { display: block; font-weight: 700; font-size: 16px; letter-spacing: .02em; margin-bottom: 2px; }
-  .brand .dot { color: #a5b4fc; }
-  .tag { color: #71717a; font-size: 11px; margin-bottom: 20px; }
-  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: #a1a1aa; font-weight: 500; margin-bottom: 2px; cursor: pointer; }
-  .nav a:hover { background: #18181b; color: #e4e4e7; }
-  .nav a.active { background: #1d1d22; color: #c7d2fe; }
+  .brand .grad { background: linear-gradient(90deg, var(--po-accent), var(--po-accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .brand .dot { color: var(--po-accent-strong); }
+  /* Collapsed rail: the whole column narrows to a sliver holding only the expander. */
+  .app.rail-collapsed { grid-template-columns: 16px 1fr; }
+  .app.rail-collapsed .rail { padding: 6px 2px; overflow: hidden; }
+  .app.rail-collapsed .rail > :not(.rail-expand) { display: none; }
+  .rail-expand { display: none; position: absolute; inset: 0; width: 100%; background: none; border: none; cursor: pointer; color: var(--po-text-faint); font-size: 11px; }
+  .rail-expand:hover { background: var(--po-hover); color: var(--po-text); }
+  .app.rail-collapsed .rail-expand { display: block; }
+  .tag { color: var(--po-text-faint); font-size: 11px; margin-bottom: 20px; }
+  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: var(--po-text-muted); font-weight: 500; margin-bottom: 2px; cursor: pointer; }
+  .nav a:hover { background: var(--po-hover); color: var(--po-text); }
+  .nav a.active { background: var(--po-hover); color: var(--po-accent-soft); }
   .nav a.with-dot { display: flex; align-items: center; }
-  .dot-status { width: 9px; height: 9px; border-radius: 50%; margin-left: auto; flex: none; background: #52525b; box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
-  .dot-status.on { background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
-  .dot-status.off { background: #eab308; box-shadow: 0 0 0 2px rgba(234,179,8,.16); }
-  .dot-status.loading { background: #38bdf8; box-shadow: 0 0 0 2px rgba(56,189,248,.18); animation: dotpulse 1.1s ease-in-out infinite; }
+  .dot-status { width: 9px; height: 9px; border-radius: 50%; margin-left: auto; flex: none; background: var(--po-text-faint); box-shadow: 0 0 0 2px rgba(0,0,0,.35); }
+  .dot-status.on { background: var(--po-ok); box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
+  .dot-status.off { background: var(--po-warn); box-shadow: 0 0 0 2px rgba(234,179,8,.16); }
+  .dot-status.loading { background: var(--po-info); box-shadow: 0 0 0 2px rgba(56,189,248,.18); animation: dotpulse 1.1s ease-in-out infinite; }
   @keyframes dotpulse { 0%,100%{ opacity:1 } 50%{ opacity:.35 } }
   /* main */
   main { padding: 26px 30px; max-width: 1180px; }
-  .crumbs { color: #71717a; font-size: 12px; margin-bottom: 14px; }
-  .crumbs a { color: #a5b4fc; cursor: pointer; }
+  .crumbs { color: var(--po-text-faint); font-size: 12px; margin-bottom: 14px; }
+  .crumbs a { color: var(--po-accent-strong); cursor: pointer; }
   h1 { font-size: 20px; margin: 0 0 2px; }
-  h2 { font-size: 12px; color: #a1a1aa; text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
-  .lede { color: #a1a1aa; font-size: 13px; margin: 0 0 18px; max-width: 720px; }
+  h2 { font-size: 12px; color: var(--po-text-muted); text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
+  .lede { color: var(--po-text-muted); font-size: 13px; margin: 0 0 18px; max-width: 720px; }
   .cards { display: flex; gap: 12px; flex-wrap: wrap; }
-  .card { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 13px 16px; min-width: 120px; }
+  .card { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 13px 16px; min-width: 120px; }
   .card .n { font-size: 22px; font-weight: 650; }
-  .card .l { color: #8b8b93; font-size: 12px; }
+  .card .l { color: var(--po-text-faint); font-size: 12px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 12px; }
-  .tile { background: #141417; border: 1px solid #26262b; border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
-  .tile:hover { border-color: #3f3f6a; transform: translateY(-1px); }
-  .tile.tile-undownloaded { border-style: dotted; border-color: #34343c; opacity: .68; background: #101013; }
-  .tile.tile-undownloaded:hover { opacity: 1; border-color: #3f3f6a; }
-  .tile.tile-undownloaded h3 { font-weight: 400; color: #8b8b93; }
-  .tile h3 { margin: 0 0 4px; font-size: 15px; font-family: ui-monospace, monospace; color: #c7d2fe; }
-  .sc-star { background: none; border: none; padding: 0 2px; cursor: pointer; font-size: 15px; line-height: 1; color: #6b7280; vertical-align: middle; }
-  .sc-star:hover { color: #fbbf24; }
-  .sc-star.on { color: #fbbf24; }
-  .tile .meta { color: #8b8b93; font-size: 12px; }
+  .tile { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 14px 16px; cursor: pointer; transition: border-color .12s, transform .12s; }
+  .tile:hover { border-color: var(--po-accent-edge); transform: translateY(-1px); }
+  .tile.tile-undownloaded { border-style: dotted; border-color: var(--po-edge-strong); opacity: .68; background: var(--po-inset); }
+  .tile.tile-undownloaded:hover { opacity: 1; border-color: var(--po-accent-edge); }
+  .tile.tile-undownloaded h3 { font-weight: 400; color: var(--po-text-faint); }
+  .tile h3 { margin: 0 0 4px; font-size: 15px; font-family: ui-monospace, monospace; color: var(--po-accent-soft); }
+  .sc-star { background: none; border: none; padding: 0 2px; cursor: pointer; font-size: 15px; line-height: 1; color: var(--po-text-faint); vertical-align: middle; }
+  .sc-star:hover { color: var(--po-warn); }
+  .sc-star.on { color: var(--po-warn); }
+  .tile .meta { color: var(--po-text-faint); font-size: 12px; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-  .pill.run { background: #0c2a4a; color: #93c5fd; }
-  .pill.wait { background: #3a2e07; color: #fcd34d; }
-  .pill.accept { background: #06301c; color: #6ee7b7; }
-  .pill.stop { background: #2a0a0a; color: #fca5a5; }
+  .pill.run { background: var(--po-info-wash); color: var(--po-info-soft); }
+  .pill.wait { background: var(--po-warn-wash); color: var(--po-warn-soft); }
+  .pill.accept { background: var(--po-ok-wash); color: var(--po-ok-soft); }
+  .pill.stop { background: var(--po-danger-wash); color: var(--po-danger-soft); }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #1f1f23; }
-  th { color: #8b8b93; font-weight: 500; font-size: 12px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--po-edge); }
+  th { color: var(--po-text-faint); font-weight: 500; font-size: 12px; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .btn { background: #1d1d22; color: #e4e4e7; border: 1px solid #34343c; border-radius: 8px; padding: 7px 14px; cursor: pointer; font-weight: 600; font-size: 13px; }
-  .btn:hover { border-color: #555; }
-  .btn.primary { background: #4338ca; border-color: #4338ca; color: #eef2ff; }
-  .btn.primary:hover { background: #4f46e5; }
+  .btn { background: var(--po-hover); color: var(--po-text); border: 1px solid var(--po-edge-strong); border-radius: 8px; padding: 7px 14px; cursor: pointer; font-weight: 600; font-size: 13px; }
+  .btn:hover { border-color: var(--po-edge-strong); }
+  .btn.primary { background: var(--po-accent); border-color: var(--po-accent); color: var(--po-on-accent); }
+  .btn.primary:hover { background: var(--po-accent-strong); }
   .btn.ghost { background: transparent; }
   .btn:disabled { opacity: .5; cursor: not-allowed; }
   /* Inline LLM profile editor (LLMs view) */
-  #llmEditor label { display: block; font-size: 12px; color: #a1a1aa; margin: 10px 0 4px; }
-  #llmEditor input, #llmEditor select { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; box-sizing: border-box; }
+  #llmEditor label { display: block; font-size: 12px; color: var(--po-text-muted); margin: 10px 0 4px; }
+  #llmEditor input, #llmEditor select { width: 100%; background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 8px 10px; font: inherit; box-sizing: border-box; }
   .le-types { display: flex; gap: 10px; margin: 10px 0 2px; }
-  .le-rd { flex: 1; display: flex; align-items: center; gap: 7px; background: #0c0c0e; border: 1px solid #34343c; border-radius: 8px; padding: 8px 10px; font-size: 13px; color: #e4e4e7; cursor: pointer; margin: 0; }
-  .le-rd.sel { border-color: #6366f1; background: #1e1b3a; }
+  .le-rd { flex: 1; display: flex; align-items: center; gap: 7px; background: var(--po-inset); border: 1px solid var(--po-edge-strong); border-radius: 8px; padding: 8px 10px; font-size: 13px; color: var(--po-text); cursor: pointer; margin: 0; }
+  .le-rd.sel { border-color: var(--po-accent-strong); background: var(--po-accent-wash); }
   .le-rd input { width: auto; }
   .le-fields[hidden] { display: none; }
-  .le-hint { font-size: 11px; color: #71717a; }
-  .err { color: #fca5a5; background: #1f0a0a; border: 1px solid #3a1414; padding: 12px 16px; border-radius: 8px; }
-  .muted { color: #71717a; }
+  .le-hint { font-size: 11px; color: var(--po-text-faint); }
+  .err { color: var(--po-danger-soft); background: var(--po-danger-wash); border: 1px solid var(--po-danger-edge); padding: 12px 16px; border-radius: 8px; }
+  .muted { color: var(--po-text-faint); }
   /* stepper */
   .stepper { display: flex; gap: 0; margin: 8px 0 24px; }
-  .step { flex: 1; position: relative; padding: 14px 16px; border: 1px solid #26262b; background: #131316; }
+  .step { flex: 1; position: relative; padding: 14px 16px; border: 1px solid var(--po-edge); background: var(--po-raised); }
   .step:first-child { border-radius: 10px 0 0 10px; }
   .step:last-child { border-radius: 0 10px 10px 0; }
   .step + .step { border-left: none; }
-  .step .k { font-size: 11px; color: #6b6b73; text-transform: uppercase; letter-spacing: .05em; }
+  .step .k { font-size: 11px; color: var(--po-text-faint); text-transform: uppercase; letter-spacing: .05em; }
   .step .t { font-weight: 650; margin: 3px 0; }
-  .step .d { font-size: 12px; color: #9b9ba3; min-height: 16px; }
-  .step.done { border-color: #1f3a2a; background: #0e1a12; }
-  .step.done .t { color: #6ee7b7; }
-  .step.active { border-color: #4338ca; background: #14132a; box-shadow: inset 0 2px 0 #6366f1; }
-  .step.active .t { color: #c7d2fe; }
+  .step .d { font-size: 12px; color: var(--po-text-muted); min-height: 16px; }
+  .step.done { border-color: var(--po-ok-edge); background: var(--po-ok-wash); }
+  .step.done .t { color: var(--po-ok-soft); }
+  .step.active { border-color: var(--po-accent); background: var(--po-accent-wash); box-shadow: inset 0 2px 0 var(--po-accent-strong); }
+  .step.active .t { color: var(--po-accent-soft); }
   .step .badge { position: absolute; top: 12px; right: 14px; font-size: 13px; }
   /* cockpit layout: detail + droid pane */
   .cockpit { display: grid; grid-template-columns: 1fr 360px; gap: 20px; align-items: start; }
-  .pane { background: #0e0e11; border: 1px solid #26262b; border-radius: 12px; padding: 14px 16px; }
+  .pane { background: var(--po-inset); border: 1px solid var(--po-edge); border-radius: 12px; padding: 14px 16px; }
   .pane h2 { margin-top: 0; }
   .convo { display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow-y: auto; }
   .turn { padding: 9px 12px; border-radius: 10px; font-size: 13px; }
   .turn .who { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
-  .turn.engine { background: #121216; border: 1px solid #26262b; }
-  .turn.engine .who { color: #8b8b93; }
-  .turn.droid { background: #11142a; border: 1px solid #28306a; }
-  .turn.droid .who { color: #a5b4fc; }
-  .turn.pilot { background: #1b1407; border: 1px solid #4a3a12; }
-  .turn.pilot .who { color: #fcd34d; }
+  .turn.engine { background: var(--po-raised); border: 1px solid var(--po-edge); }
+  .turn.engine .who { color: var(--po-text-faint); }
+  .turn.droid { background: var(--po-accent-wash); border: 1px solid var(--po-accent-edge); }
+  .turn.droid .who { color: var(--po-accent-strong); }
+  .turn.pilot { background: var(--po-warn-wash); border: 1px solid var(--po-warn-edge); }
+  .turn.pilot .who { color: var(--po-warn-soft); }
   .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
   /* ranked-candidates table + fidelity-tier badges */
   table.rank { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.rank th, table.rank td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #1f1f24; vertical-align: top; }
-  table.rank th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #8b8b93; }
+  table.rank th, table.rank td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--po-edge); vertical-align: top; }
+  table.rank th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--po-text-faint); }
   table.rank td.num, table.rank th.num { text-align: right; font-variant-numeric: tabular-nums; }
   .tier { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
-  .tier.l2 { background: #052e1b; border: 1px solid #14532d; color: #6ee7b7; }
-  .tier.l3 { background: #2a1c05; border: 1px solid #5a3d12; color: #fcd34d; }
-  .tier.bad { background: #2a0d0d; border: 1px solid #5a1a1a; color: #fca5a5; }
-  .tier.unknown { background: #16161a; border: 1px solid #2a2a30; color: #8b8b93; }
-  .hero { font-size: 30px; font-weight: 700; color: #6ee7b7; }
-  .hero.sub { font-size: 12px; color: #8b8b93; font-weight: 400; }
-  dialog { background: #141417; color: #e4e4e7; border: 1px solid #34343c; border-radius: 12px; padding: 0; max-width: 520px; }
+  .tier.l2 { background: var(--po-ok-wash); border: 1px solid var(--po-ok-edge); color: var(--po-ok-soft); }
+  .tier.l3 { background: var(--po-warn-wash); border: 1px solid var(--po-warn-edge); color: var(--po-warn-soft); }
+  .tier.bad { background: var(--po-danger-wash); border: 1px solid var(--po-danger-edge); color: var(--po-danger-soft); }
+  .tier.unknown { background: var(--po-raised); border: 1px solid var(--po-edge); color: var(--po-text-faint); }
+  .hero { font-size: 30px; font-weight: 700; color: var(--po-ok-soft); }
+  .hero.sub { font-size: 12px; color: var(--po-text-faint); font-weight: 400; }
+  dialog { background: var(--po-raised); color: var(--po-text); border: 1px solid var(--po-edge-strong); border-radius: 12px; padding: 0; max-width: 520px; }
   dialog::backdrop { background: rgba(0,0,0,.6); }
   .dlg-body { padding: 20px 22px; }
-  .dlg-body label { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
-  .dlg-body input, .dlg-body select { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; }
-  .lbl { display: block; font-size: 12px; color: #a1a1aa; margin: 12px 0 4px; }
-  #promptEditor input, #promptEditor textarea, #cpromptEditor input, #cpromptEditor textarea, #personaEditor input, #personaEditor textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; box-sizing: border-box; }
+  .dlg-body label { display: block; font-size: 12px; color: var(--po-text-muted); margin: 12px 0 4px; }
+  .dlg-body input, .dlg-body select { width: 100%; background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 8px 10px; font: inherit; }
+  .lbl { display: block; font-size: 12px; color: var(--po-text-muted); margin: 12px 0 4px; }
+  #promptEditor input, #promptEditor textarea, #cpromptEditor input, #cpromptEditor textarea, #personaEditor input, #personaEditor textarea { width: 100%; background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 8px 10px; font: inherit; box-sizing: border-box; }
   #promptEditor textarea, #cpromptEditor textarea, #personaEditor textarea { font: 12px/1.5 ui-monospace, monospace; resize: vertical; }
   #promptEditor input:disabled, #promptEditor textarea:disabled, #cpromptEditor input:disabled, #cpromptEditor textarea:disabled, #personaEditor input:disabled, #personaEditor textarea:disabled { opacity: .6; }
-  #pilotNote { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; }
-  .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid #26262b; }
-  /* workspace investigation surface */
-  .ws-model { background: #fafafa; border: 1px solid #26262b; border-radius: 12px; height: 460px; margin: 14px 0; }
+  #pilotNote { width: 100%; background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 8px 10px; font: inherit; resize: vertical; }
+  .dlg-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 22px; border-top: 1px solid var(--po-edge); }
+  /* workspace investigation surface — the BPMN canvas stays physical paper white
+     in every theme (bpmn-js draws dark ink on it) */
+  .ws-model { background: #fafafa; border: 1px solid var(--po-edge); border-radius: 12px; height: 460px; margin: 14px 0; }
   .ws-grid { display: grid; grid-template-columns: 110px 1fr; gap: 6px 14px; font-size: 13px; margin: 10px 0; }
-  .ws-grid b { color: #a1a1aa; font-weight: 500; }
+  .ws-grid b { color: var(--po-text-muted); font-weight: 500; }
   .obj-row { display: flex; gap: 8px; align-items: center; }
-  .obj-row input { flex: 1; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 13px; }
+  .obj-row input { flex: 1; background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 13px; }
   .notebook { margin-top: 14px; }
-  .step { border: 1px solid #26262b; border-radius: 9px; margin-bottom: 8px; background: #0c0c0e; }
-  .step summary { cursor: pointer; padding: 9px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: #c7d2fe; }
-  .step pre { margin: 0; padding: 0 12px 12px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 320px; overflow: auto; }
-  .step .args { color: #71717a; padding: 0 12px 6px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
-  .conclusion { border: 1px solid #3730a3; background: #14142b; border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
+  .step { border: 1px solid var(--po-edge); border-radius: 9px; margin-bottom: 8px; background: var(--po-inset); }
+  .step summary { cursor: pointer; padding: 9px 12px; font-family: ui-monospace, monospace; font-size: 12px; color: var(--po-accent-soft); }
+  .step pre { margin: 0; padding: 0 12px 12px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: var(--po-text-muted); max-height: 320px; overflow: auto; }
+  .step .args { color: var(--po-text-faint); padding: 0 12px 6px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .conclusion { border: 1px solid var(--po-accent-edge); background: var(--po-accent-wash); border-radius: 12px; padding: 16px 18px; margin-top: 14px; white-space: pre-wrap; }
   /* interactive cockpit chat */
   .chat-wrap { display: flex; gap: 12px; margin-top: 14px; align-items: stretch; }
   .chat-wrap .chat { margin-top: 0; flex: 1; min-width: 0; }
-  .chat-sessions { width: 214px; flex: none; border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; display: flex; flex-direction: column; max-height: 64vh; }
-  .cs-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid #1f1f25; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #8b8b93; font-weight: 700; }
+  .chat-sessions { width: var(--wb-sessions, 214px); flex: none; border: 1px solid var(--po-edge); border-radius: 12px; background: var(--po-panel); display: flex; flex-direction: column; max-height: 64vh; }
+  .cs-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--po-edge); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--po-text-faint); font-weight: 700; }
   .cs-head .btn { font-size: 12px; padding: 3px 8px; }
   .cs-head-actions { display: inline-flex; gap: 6px; align-items: center; }
   .cs-imported { display: inline-block; margin-right: 5px; vertical-align: -1px; font-size: 13px; line-height: 1; filter: saturate(1.1); }
   .cs-list { overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
-  .cs-empty { color: #71717a; font-size: 12px; padding: 10px; text-align: center; }
+  .cs-empty { color: var(--po-text-faint); font-size: 12px; padding: 10px; text-align: center; }
   .cs-tab { display: flex; align-items: center; gap: 4px; border: 1px solid transparent; border-radius: 8px; padding: 7px 8px; cursor: pointer; flex-wrap: wrap; }
-  .cs-tab:hover { background: #131318; }
-  .cs-tab.on { background: #11142a; border-color: #28306a; }
+  .cs-tab:hover { background: var(--po-raised); }
+  .cs-tab.on { background: var(--po-accent-wash); border-color: var(--po-accent-edge); }
   .cs-main { flex: 1; min-width: 0; }
-  .cs-name { font-size: 15px; font-weight: 600; color: #e4e4e7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .cs-tab.on .cs-name { color: #c7d2fe; }
-  .cs-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid #3b3b52; border-top-color: #818cf8; border-radius: 50%; animation: cs-spin 0.7s linear infinite; }
+  .cs-name { font-size: 15px; font-weight: 600; color: var(--po-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cs-tab.on .cs-name { color: var(--po-accent-soft); }
+  .cs-spin { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; border: 2px solid var(--po-edge-strong); border-top-color: var(--po-accent-strong); border-radius: 50%; animation: cs-spin 0.7s linear infinite; }
   @keyframes cs-spin { to { transform: rotate(360deg); } }
-  .cs-meta { font-size: 10.5px; color: #6b7280; margin-top: 1px; }
+  .cs-meta { font-size: 10.5px; color: var(--po-text-faint); margin-top: 1px; }
   .cs-actions { display: flex; gap: 2px; opacity: 0; transition: opacity .1s; }
   .cs-tab:hover .cs-actions, .cs-tab.on .cs-actions { opacity: 1; }
-  .cs-btn { background: none; border: 0; color: #71717a; cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 11px; line-height: 1; }
-  .cs-btn:hover { background: #1f1f27; color: #e5e7eb; }
-  .cs-caret { background: none; border: 0; color: #71717a; cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 10px; line-height: 1; transition: transform .12s; }
-  .cs-caret:hover { color: #c7d2fe; }
-  .cs-caret.open { transform: rotate(180deg); color: #c7d2fe; }
-  .cs-models { flex-basis: 100%; margin: 4px 2px 2px; padding: 6px 8px; border-top: 1px dashed #26262b; font-size: 11px; color: #9ca3af; display: flex; flex-direction: column; gap: 3px; }
-  .cs-models .csm-lbl { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; font-weight: 700; }
-  .cs-models .csm-item { font-family: ui-monospace, monospace; color: #c7d2fe; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .cs-models .csm-none { color: #6b7280; font-style: italic; }
-  .chat { border: 1px solid #26262b; border-radius: 12px; background: #0c0c0e; margin-top: 14px; display: flex; flex-direction: column; height: 64vh; --chat-font: 15px; }
-  .chat-tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid #1c1c22; }
-  .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: #8b8b93; cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
-  .chat-tabs .ctab:hover { color: #c7d2fe; }
-  .chat-tabs .ctab.active { color: #e4e4e7; background: #11142a; border-color: #28306a; }
+  .cs-btn { background: none; border: 0; color: var(--po-text-faint); cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 11px; line-height: 1; }
+  .cs-btn:hover { background: var(--po-hover); color: var(--po-text); }
+  .cs-caret { background: none; border: 0; color: var(--po-text-faint); cursor: pointer; padding: 2px 4px; border-radius: 5px; font-size: 10px; line-height: 1; transition: transform .12s; }
+  .cs-caret:hover { color: var(--po-accent-soft); }
+  .cs-caret.open { transform: rotate(180deg); color: var(--po-accent-soft); }
+  .cs-models { flex-basis: 100%; margin: 4px 2px 2px; padding: 6px 8px; border-top: 1px dashed var(--po-edge); font-size: 11px; color: var(--po-text-muted); display: flex; flex-direction: column; gap: 3px; }
+  .cs-models .csm-lbl { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--po-text-faint); font-weight: 700; }
+  .cs-models .csm-item { font-family: ui-monospace, monospace; color: var(--po-accent-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cs-models .csm-none { color: var(--po-text-faint); font-style: italic; }
+  .chat { border: 1px solid var(--po-edge); border-radius: 12px; background: var(--po-panel); margin-top: 14px; display: flex; flex-direction: column; height: var(--wb-chat-h, 64vh); min-height: 280px; --chat-font: 15px; }
+  .chat-tabs { display: flex; gap: 4px; padding: 8px 10px 0; border-bottom: 1px solid var(--po-edge); }
+  .chat-tabs .ctab { background: none; border: 1px solid transparent; border-bottom: none; color: var(--po-text-faint); cursor: pointer; padding: 6px 14px; border-radius: 8px 8px 0 0; font: 600 12px/1 inherit; letter-spacing: .02em; }
+  .chat-tabs .ctab:hover { color: var(--po-accent-soft); }
+  .chat-tabs .ctab.active { color: var(--po-text); background: var(--po-accent-wash); border-color: var(--po-accent-edge); }
   /* ── Editable model Workbench (ADR 0011) ── */
   .chatwb { display: flex; flex-direction: column; min-height: 480px; padding: 8px 10px; gap: 8px; }
   .wb-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
   .wb-actions, .wb-run { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
-  .wb-prov { font-size: 11px; color: #8b8b93; }
-  .wb-prov b { color: #c7d2fe; font-weight: 700; }
-  .wb-stage { font-size: 11px; color: #8b8b93; display: flex; align-items: center; gap: 4px; }
-  .wb-stage select { background: #14141a; color: #e4e4e7; border: 1px solid #2a2a33; border-radius: 6px; padding: 3px 5px; font: inherit; font-size: 11px; }
-  .wb-lint { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 9px; border-radius: 8px; background: #0c0c0e; border: 1px solid #1f1f25; }
+  .wb-prov { font-size: 11px; color: var(--po-text-faint); }
+  .wb-prov b { color: var(--po-accent-soft); font-weight: 700; }
+  .wb-stage { font-size: 11px; color: var(--po-text-faint); display: flex; align-items: center; gap: 4px; }
+  .wb-stage select { background: var(--po-raised); color: var(--po-text); border: 1px solid var(--po-edge); border-radius: 6px; padding: 3px 5px; font: inherit; font-size: 11px; }
+  .wb-lint { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 9px; border-radius: 8px; background: var(--po-inset); border: 1px solid var(--po-edge); }
   .wb-lint-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
-  .wb-lint-dot.ok { background: #34d399; box-shadow: 0 0 8px rgba(52,211,153,.6); }
-  .wb-lint-dot.bad { background: #f87171; box-shadow: 0 0 8px rgba(248,113,113,.6); }
-  .wb-lint-dot.warn { background: #fbbf24; }
-  .wb-lint-dot.pending { background: #6b7280; }
-  .wb-lint.bad { border-color: #5b2330; background: #1a0f12; }
-  .wb-lint-hints { color: #f0a3a3; font-size: 11px; margin-left: 4px; }
-  .wb-canvas { position: relative; height: 460px; background: #fafafa; border: 1px solid #26262b; border-radius: 12px; overflow: hidden; }
+  .wb-lint-dot.ok { background: var(--po-ok); box-shadow: 0 0 8px rgba(52,211,153,.6); }
+  .wb-lint-dot.bad { background: var(--po-danger); box-shadow: 0 0 8px rgba(248,113,113,.6); }
+  .wb-lint-dot.warn { background: var(--po-warn); }
+  .wb-lint-dot.pending { background: var(--po-text-faint); }
+  .wb-lint.bad { border-color: var(--po-danger-edge); background: var(--po-danger-wash); }
+  .wb-lint-hints { color: var(--po-danger-soft); font-size: 11px; margin-left: 4px; }
+  .wb-canvas { position: relative; height: 460px; background: #fafafa; border: 1px solid var(--po-edge); border-radius: 12px; overflow: hidden; }
   .wb-canvas .djs-palette { background: #fff; }
-  .wb-err-marker .djs-visual > :nth-child(1) { stroke: #e11d48 !important; stroke-width: 2.5px !important; }
-  .wb-warn-marker .djs-visual > :nth-child(1) { stroke: #d97706 !important; stroke-width: 2px !important; }
-  .wb-overlay { background: #1a0f12; color: #f0a3a3; border: 1px solid #5b2330; border-radius: 6px; padding: 4px 7px; font: 11px/1.35 ui-monospace, monospace; max-width: 260px; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
-  .wb-overlay.warn { background: #1c1505; color: #fbcf8a; border-color: #5b4310; }
-  .wb-side { border: 1px solid #1f1f25; border-radius: 10px; background: #0c0c0e; padding: 10px 12px; font-size: 12px; }
-  .wb-side h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: #8b8b93; }
+  .wb-err-marker .djs-visual > :nth-child(1) { stroke: var(--po-danger) !important; stroke-width: 2.5px !important; }
+  .wb-warn-marker .djs-visual > :nth-child(1) { stroke: var(--po-warn) !important; stroke-width: 2px !important; }
+  .wb-overlay { background: var(--po-danger-wash); color: var(--po-danger-soft); border: 1px solid var(--po-danger-edge); border-radius: 6px; padding: 4px 7px; font: 11px/1.35 ui-monospace, monospace; max-width: 260px; box-shadow: 0 6px 18px var(--po-shadow); }
+  .wb-overlay.warn { background: var(--po-warn-wash); color: var(--po-warn-soft); border-color: var(--po-warn-edge); }
+  .wb-side { border: 1px solid var(--po-edge); border-radius: 10px; background: var(--po-inset); padding: 10px 12px; font-size: 12px; }
+  .wb-side h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--po-text-faint); }
   .wb-mock-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; flex-wrap: wrap; }
-  .wb-mock-row code { color: #c7d2fe; }
-  .wb-mock-row select, .wb-mock-row input { background: #14141a; color: #e4e4e7; border: 1px solid #2a2a33; border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 11px; }
+  .wb-mock-row code { color: var(--po-accent-soft); }
+  .wb-mock-row select, .wb-mock-row input { background: var(--po-raised); color: var(--po-text); border: 1px solid var(--po-edge); border-radius: 6px; padding: 3px 6px; font: inherit; font-size: 11px; }
   .wb-apply { margin-top: 8px; }
   .prov-badge { font: 700 9px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 6px; border-radius: 999px; vertical-align: 1px; margin-left: 6px; }
-  .prov-badge.user { color: #6ee7b7; background: rgba(16,185,129,.14); }
-  .prov-badge.agent { color: #93c5fd; background: rgba(59,130,246,.14); }
-  .prov-badge.co { color: #c084fc; background: rgba(168,85,247,.14); }
+  .prov-badge.user { color: var(--po-ok-soft); background: rgba(16,185,129,.14); }
+  .prov-badge.agent { color: var(--po-info-soft); background: rgba(59,130,246,.14); }
+  .prov-badge.co { color: var(--po-accent); background: rgba(168,85,247,.14); }
   .chat-export { position: relative; margin-left: auto; }
-  .export-menu { position: absolute; right: 0; top: calc(100% + 2px); z-index: 30; background: #14141a; border: 1px solid #2a2a33; border-radius: 8px; padding: 4px; min-width: 180px; box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  .export-menu { position: absolute; right: 0; top: calc(100% + 2px); z-index: 30; background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 8px; padding: 4px; min-width: 180px; box-shadow: 0 8px 24px var(--po-shadow); }
   .export-menu[hidden] { display: none; }
-  .export-menu .em-group { color: #8b8b93; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px 2px; }
-  .export-menu button { display: block; width: 100%; text-align: left; background: none; border: none; color: #d4d4d8; cursor: pointer; padding: 6px 8px; border-radius: 6px; font: 500 12px/1.2 inherit; }
-  .export-menu button:hover { background: #1d1d28; color: #c7d2fe; }
+  .export-menu .em-group { color: var(--po-text-faint); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px 2px; }
+  .export-menu button { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--po-text); cursor: pointer; padding: 6px 8px; border-radius: 6px; font: 500 12px/1.2 inherit; }
+  .export-menu button:hover { background: var(--po-hover); color: var(--po-accent-soft); }
   .chatdebug { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 160px; }
-  .chatdebug .empty { color: #71717a; font-size: 13px; margin: 30px auto; text-align: center; max-width: 460px; }
-  .dbg-round { border: 1px solid #26262b; border-radius: 10px; background: #0b0b14; margin-bottom: 10px; }
-  .dbg-round > summary { cursor: pointer; padding: 8px 12px; font: 600 12px/1.4 inherit; color: #c7d2fe; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .dbg-round > summary .dim { color: #6b7280; font-weight: 400; font-family: ui-monospace, monospace; font-size: 11px; }
-  .dbg-round > summary .dbg-ts { margin-left: auto; color: #6b7280; font-weight: 500; font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }
+  .chatdebug .empty { color: var(--po-text-faint); font-size: 13px; margin: 30px auto; text-align: center; max-width: 460px; }
+  .dbg-round { border: 1px solid var(--po-edge); border-radius: 10px; background: var(--po-inset); margin-bottom: 10px; }
+  .dbg-round > summary { cursor: pointer; padding: 8px 12px; font: 600 12px/1.4 inherit; color: var(--po-accent-soft); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .dbg-round > summary .dim { color: var(--po-text-faint); font-weight: 400; font-family: ui-monospace, monospace; font-size: 11px; }
+  .dbg-round > summary .dbg-ts { margin-left: auto; color: var(--po-text-faint); font-weight: 500; font-family: ui-monospace, monospace; font-size: 11px; white-space: nowrap; }
   .dbg-round .dbg-actions { padding: 0 12px 8px; display: flex; gap: 8px; flex-wrap: wrap; }
-  .dbg-round .dbg-actions .copybtn { float: none; margin: 0; border: 1px solid #34343c; border-radius: 6px; padding: 3px 9px; font-size: 11px; color: #a1a1aa; }
-  .dbg-round .dbg-actions .copybtn:hover { color: #c7d2fe; border-color: #4b5563; }
-  .dbg-msg { border-top: 1px solid #1c1c22; }
+  .dbg-round .dbg-actions .copybtn { float: none; margin: 0; border: 1px solid var(--po-edge-strong); border-radius: 6px; padding: 3px 9px; font-size: 11px; color: var(--po-text-muted); }
+  .dbg-round .dbg-actions .copybtn:hover { color: var(--po-accent-soft); border-color: var(--po-edge-strong); }
+  .dbg-msg { border-top: 1px solid var(--po-edge); }
   .dbg-msg > summary { cursor: pointer; padding: 8px 12px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; list-style: none; }
   .dbg-msg > summary::-webkit-details-marker { display: none; }
-  .dbg-msg > summary::before { content: '\25B8'; color: #52525b; font-size: 10px; }
+  .dbg-msg > summary::before { content: '\25B8'; color: var(--po-text-faint); font-size: 10px; }
   .dbg-msg[open] > summary::before { content: '\25BE'; }
   .dbg-msg .role { font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 999px; display: inline-block; }
-  .dbg-msg .role.system { color: #fcd34d; background: rgba(252,211,77,.1); }
-  .dbg-msg .role.user { color: #93c5fd; background: rgba(147,197,253,.1); }
-  .dbg-msg .role.assistant { color: #a5b4fc; background: rgba(165,180,252,.1); }
-  .dbg-msg .role.tool { color: #86efac; background: rgba(134,239,172,.1); }
-  .dbg-msg .dbg-tool { color: #c4b5fd; font: 600 11px/1.4 ui-monospace, monospace; }
-  .dbg-msg pre { margin: 0 12px 8px; white-space: pre-wrap; word-break: break-word; font: 11.5px/1.5 ui-monospace, monospace; color: #cbd5e1; max-height: 320px; overflow: auto; }
-  .dbg-msg .meta { color: #6b7280; font: 11px/1.4 ui-monospace, monospace; margin: 0 12px 4px; white-space: pre-wrap; word-break: break-word; }
-  .dbg-tools { border-top: 1px solid #1c1c22; padding: 8px 12px; }
-  .dbg-tools summary { cursor: pointer; color: #8b8b93; font: 600 11px/1.4 inherit; }
-  .dbg-tools .meta { color: #71717a; font: 11px/1.5 ui-monospace, monospace; padding-top: 5px; white-space: pre-wrap; }
+  .dbg-msg .role.system { color: var(--po-warn-soft); background: rgba(252,211,77,.1); }
+  .dbg-msg .role.user { color: var(--po-info-soft); background: rgba(147,197,253,.1); }
+  .dbg-msg .role.assistant { color: var(--po-accent-strong); background: rgba(165,180,252,.1); }
+  .dbg-msg .role.tool { color: var(--po-ok-soft); background: rgba(134,239,172,.1); }
+  .dbg-msg .dbg-tool { color: var(--po-accent-soft); font: 600 11px/1.4 ui-monospace, monospace; }
+  .dbg-msg pre { margin: 0 12px 8px; white-space: pre-wrap; word-break: break-word; font: 11.5px/1.5 ui-monospace, monospace; color: var(--po-text); max-height: 320px; overflow: auto; }
+  .dbg-msg .meta { color: var(--po-text-faint); font: 11px/1.4 ui-monospace, monospace; margin: 0 12px 4px; white-space: pre-wrap; word-break: break-word; }
+  .dbg-tools { border-top: 1px solid var(--po-edge); padding: 8px 12px; }
+  .dbg-tools summary { cursor: pointer; color: var(--po-text-faint); font: 600 11px/1.4 inherit; }
+  .dbg-tools .meta { color: var(--po-text-faint); font: 11px/1.5 ui-monospace, monospace; padding-top: 5px; white-space: pre-wrap; }
   /* Loop monitor (second LLM) debug entries — amber/dashed to read distinctly from the primary. */
-  .dbg-round.dbg-mon { border: 1px dashed #5a4326; background: #14100a; }
-  .dbg-round.dbg-mon > summary { color: #fcd34d; }
-  .dbg-mon-act { color: #fbbf24; background: rgba(251,191,36,.12); font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 999px; }
-  .dbg-mon-circ { color: #fca5a5; background: rgba(252,165,165,.12); font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; }
-  .dbg-mon-ok { color: #86efac; background: rgba(134,239,172,.1); font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; }
-  .dbg-mon-row { display: flex; gap: 10px; padding: 4px 12px; font: 12px/1.5 inherit; color: #d4d4d8; }
-  .dbg-mon-row .dbg-mon-k { color: #a8895a; font: 600 11px/1.5 ui-monospace, monospace; min-width: 64px; flex: 0 0 auto; }
-  .dbg-mon-row.dbg-mon-inj { color: #fde68a; }
-  .dbg-mon-sent { border-top: 1px dashed #3a2f1c; margin-top: 6px; }
-  .dbg-mon-sent > summary { cursor: pointer; padding: 8px 12px; color: #a8895a; font: 600 11px/1.4 inherit; }
+  .dbg-round.dbg-mon { border: 1px dashed var(--po-warn-edge); background: var(--po-warn-wash); }
+  .dbg-round.dbg-mon > summary { color: var(--po-warn-soft); }
+  .dbg-mon-act { color: var(--po-warn); background: rgba(251,191,36,.12); font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; padding: 2px 7px; border-radius: 999px; }
+  .dbg-mon-circ { color: var(--po-danger-soft); background: rgba(252,165,165,.12); font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; }
+  .dbg-mon-ok { color: var(--po-ok-soft); background: rgba(134,239,172,.1); font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; }
+  .dbg-mon-row { display: flex; gap: 10px; padding: 4px 12px; font: 12px/1.5 inherit; color: var(--po-text); }
+  .dbg-mon-row .dbg-mon-k { color: var(--po-warn-soft); font: 600 11px/1.5 ui-monospace, monospace; min-width: 64px; flex: 0 0 auto; }
+  .dbg-mon-row.dbg-mon-inj { color: var(--po-warn-soft); }
+  .dbg-mon-sent { border-top: 1px dashed var(--po-warn-edge); margin-top: 6px; }
+  .dbg-mon-sent > summary { cursor: pointer; padding: 8px 12px; color: var(--po-warn-soft); font: 600 11px/1.4 inherit; }
   /* Simulations tab — Alternate Reality Engine runs */
   .chatsims { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 160px; }
-  .chatsims .empty { color: #71717a; font-size: 13px; margin: 30px auto; text-align: center; max-width: 460px; }
-  .simrun { border: 1px solid #26262b; border-radius: 10px; background: #0b0b14; margin-bottom: 10px; }
+  .chatsims .empty { color: var(--po-text-faint); font-size: 13px; margin: 30px auto; text-align: center; max-width: 460px; }
+  .simrun { border: 1px solid var(--po-edge); border-radius: 10px; background: var(--po-inset); margin-bottom: 10px; }
   .simrun > summary { cursor: pointer; padding: 8px 12px; list-style: none; }
   .simrun > summary::-webkit-details-marker { display: none; }
   .sim-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .sim-tool { font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; color: #c4b5fd; background: rgba(196,181,253,.12); padding: 3px 8px; border-radius: 999px; }
-  .sim-meta { color: #6b7280; font: 11px/1.4 ui-monospace, monospace; }
-  .sim-head .dbg-ts { margin-left: auto; color: #6b7280; font: 500 11px/1 ui-monospace, monospace; white-space: nowrap; }
-  .sim-note { margin: 0 12px 8px; color: #fcd34d; font-size: 12px; }
-  .simcand { border-top: 1px solid #1c1c22; padding: 10px 12px; position: relative; }
+  .sim-tool { font: 700 10px/1 inherit; text-transform: uppercase; letter-spacing: .06em; color: var(--po-accent-soft); background: rgba(196,181,253,.12); padding: 3px 8px; border-radius: 999px; }
+  .sim-meta { color: var(--po-text-faint); font: 11px/1.4 ui-monospace, monospace; }
+  .sim-head .dbg-ts { margin-left: auto; color: var(--po-text-faint); font: 500 11px/1 ui-monospace, monospace; white-space: nowrap; }
+  .sim-note { margin: 0 12px 8px; color: var(--po-warn-soft); font-size: 12px; }
+  .simcand { border-top: 1px solid var(--po-edge); padding: 10px 12px; position: relative; }
   .simcand.best { background: rgba(134,239,172,.04); }
-  .sim-badge { position: absolute; top: 10px; right: 12px; z-index: 1; font: 700 9px/1 inherit; text-transform: uppercase; letter-spacing: .06em; color: #86efac; background: rgba(134,239,172,.12); padding: 3px 7px; border-radius: 999px; }
-  .sim-baseline { color: #a1a1aa; font-size: 12px; padding: 6px 0; }
-  .sim-baseline .dim { color: #6b7280; }
+  .sim-badge { position: absolute; top: 10px; right: 12px; z-index: 1; font: 700 9px/1 inherit; text-transform: uppercase; letter-spacing: .06em; color: var(--po-ok-soft); background: rgba(134,239,172,.12); padding: 3px 7px; border-radius: 999px; }
+  .sim-baseline { color: var(--po-text-muted); font-size: 12px; padding: 6px 0; }
+  .sim-baseline .dim { color: var(--po-text-faint); }
   .sc { margin-top: 8px; }
   .sc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 6px; }
-  .sc-cell { background: #11111a; border: 1px solid #1f1f27; border-radius: 8px; padding: 6px 9px; }
-  .sc-k { display: block; color: #6b7280; font: 600 10px/1.4 inherit; text-transform: uppercase; letter-spacing: .04em; }
-  .sc-v { display: block; color: #d4d4d8; font: 600 13px/1.3 ui-monospace, monospace; margin-top: 2px; word-break: break-word; }
-  .sc-conf { color: #71717a; font-size: 11px; margin-top: 6px; }
-  .sc-pending { color: #6b7280; font-size: 12px; font-style: italic; }
+  .sc-cell { background: var(--po-inset); border: 1px solid var(--po-hover); border-radius: 8px; padding: 6px 9px; }
+  .sc-k { display: block; color: var(--po-text-faint); font: 600 10px/1.4 inherit; text-transform: uppercase; letter-spacing: .04em; }
+  .sc-v { display: block; color: var(--po-text); font: 600 13px/1.3 ui-monospace, monospace; margin-top: 2px; word-break: break-word; }
+  .sc-conf { color: var(--po-text-faint); font-size: 11px; margin-top: 6px; }
+  .sc-pending { color: var(--po-text-faint); font-size: 12px; font-style: italic; }
   .sc-bad { border: 1px solid rgba(252,165,165,.35); border-radius: 8px; padding: 8px 10px; background: rgba(252,165,165,.05); }
-  .sc-bad .sc-verdict { color: #fca5a5; font: 700 11px/1 inherit; text-transform: uppercase; letter-spacing: .05em; }
-  .sc-bad .sc-err { color: #fca5a5; font: 11.5px/1.5 ui-monospace, monospace; margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
-  .sc-bad .sc-hint { color: #fcd34d; font-size: 11.5px; margin-top: 5px; }
+  .sc-bad .sc-verdict { color: var(--po-danger-soft); font: 700 11px/1 inherit; text-transform: uppercase; letter-spacing: .05em; }
+  .sc-bad .sc-err { color: var(--po-danger-soft); font: 11.5px/1.5 ui-monospace, monospace; margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
+  .sc-bad .sc-hint { color: var(--po-warn-soft); font-size: 11.5px; margin-top: 5px; }
   .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; }
-  .chatlog .empty { color: #71717a; font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
+  .chatlog .empty { color: var(--po-text-faint); font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
   .bub { padding: 10px 13px; border-radius: 12px; font-size: var(--chat-font, 15px); line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
   .bub .who { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
-  .bub.user { align-self: flex-end; background: #1b2540; border: 1px solid #2c3c66; }
-  .bub.user .who { color: #93c5fd; }
-  .bub.droid { align-self: flex-start; background: #11142a; border: 1px solid #28306a; }
-  .bub.droid .who { color: #a5b4fc; }
-  .bub.droid .who .who-model { font-size: 10px; font-weight: 500; text-transform: none; letter-spacing: 0; color: #6b7280; }
-  .bub.pending { align-self: flex-start; background: #131316; border: 1px solid #26262b; color: #a1a1aa; }
-  .bub .think { margin-bottom: 8px; border: 1px solid #26262b; border-radius: 8px; background: #0b0b14; }
-  .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: #8b8b93; text-transform: uppercase; letter-spacing: .04em; }
-  .bub .think .think-body { padding: 0 10px 9px; font-size: calc(var(--chat-font, 15px) - 2px); line-height: 1.5; color: #9ca3af; white-space: pre-wrap; }
+  .bub.user { align-self: flex-end; background: var(--po-info-wash); border: 1px solid var(--po-info-edge); }
+  .bub.user .who { color: var(--po-info-soft); }
+  .bub.droid { align-self: flex-start; background: var(--po-accent-wash); border: 1px solid var(--po-accent-edge); }
+  .bub.droid .who { color: var(--po-accent-strong); }
+  .bub.droid .who .who-model { font-size: 10px; font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--po-text-faint); }
+  .bub.pending { align-self: flex-start; background: var(--po-raised); border: 1px solid var(--po-edge); color: var(--po-text-muted); }
+  .bub .think { margin-bottom: 8px; border: 1px solid var(--po-edge); border-radius: 8px; background: var(--po-inset); }
+  .bub .think summary { cursor: pointer; padding: 5px 10px; font-size: 11px; color: var(--po-text-faint); text-transform: uppercase; letter-spacing: .04em; }
+  .bub .think .think-body { padding: 0 10px 9px; font-size: calc(var(--chat-font, 15px) - 2px); line-height: 1.5; color: var(--po-text-muted); white-space: pre-wrap; }
   .bub .think .think-body.md { white-space: normal; }
   .bub .think .think-body.md p { margin: 0 0 6px; white-space: pre-wrap; }
   .bub .think .think-body.md p:last-child { margin-bottom: 0; }
   .bub .think .think-body.md ul, .bub .think .think-body.md ol { margin: 4px 0 6px; padding-left: 20px; }
   .bub .think .think-body.md li { margin: 2px 0; }
   .bub .think .think-body.md h1, .bub .think .think-body.md h2, .bub .think .think-body.md h3,
-  .bub .think .think-body.md h4, .bub .think .think-body.md h5, .bub .think .think-body.md h6 { margin: 8px 0 4px; font-size: 1em; font-weight: 700; color: #b6bdc9; }
-  .bub .think .think-body.md code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 4px; padding: 1px 4px; font: 0.86em ui-monospace, monospace; color: #d4a0a0; }
-  .bub .think .think-body.md pre.md-code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 6px; padding: 8px 10px; margin: 5px 0; overflow: auto; max-height: 240px; white-space: pre; font: 11px/1.5 ui-monospace, monospace; color: #9ca3af; }
-  .bub .think .think-body.md strong { color: #cbd5e1; }
-  .bub .who .ts { float: right; font-weight: 500; text-transform: none; letter-spacing: 0; color: #6b7280; font-size: 10px; }
+  .bub .think .think-body.md h4, .bub .think .think-body.md h5, .bub .think .think-body.md h6 { margin: 8px 0 4px; font-size: 1em; font-weight: 700; color: var(--po-text-muted); }
+  .bub .think .think-body.md code { background: var(--po-inset); border: 1px solid var(--po-edge); border-radius: 4px; padding: 1px 4px; font: 0.86em ui-monospace, monospace; color: var(--po-danger-soft); }
+  .bub .think .think-body.md pre.md-code { background: var(--po-inset); border: 1px solid var(--po-edge); border-radius: 6px; padding: 8px 10px; margin: 5px 0; overflow: auto; max-height: 240px; white-space: pre; font: 11px/1.5 ui-monospace, monospace; color: var(--po-text-muted); }
+  .bub .think .think-body.md strong { color: var(--po-text); }
+  .bub .who .ts { float: right; font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--po-text-faint); font-size: 10px; }
   .bub .steps { margin-top: 8px; }
   /* interleaved chain-of-thought timeline inside the Thinking disclosure */
   .bub .think .think-tl { padding: 4px 10px 9px; }
   .bub .think .think-tl .think-body { padding: 0; }
-  .bub .think .think-tl .toolcall { border: 1px solid #26262b; border-radius: 8px; margin: 6px 0; background: #0c0c0e; }
-  .bub .think .think-tl .toolcall summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
-  .bub .think .think-tl .toolcall .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
-  .bub .think .think-tl .toolcall pre, .bub .think .think-tl .toolcall .result { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 280px; overflow: auto; }
+  .bub .think .think-tl .toolcall { border: 1px solid var(--po-edge); border-radius: 8px; margin: 6px 0; background: var(--po-inset); }
+  .bub .think .think-tl .toolcall summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: var(--po-accent-soft); }
+  .bub .think .think-tl .toolcall .args { color: var(--po-text-faint); padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
+  .bub .think .think-tl .toolcall pre, .bub .think .think-tl .toolcall .result { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: var(--po-text-muted); max-height: 280px; overflow: auto; }
   /* copy-to-clipboard button on a droid bubble */
-  .bub .who .copybtn { float: right; margin-left: 8px; background: none; border: none; cursor: pointer; color: #6b7280; font-size: 13px; padding: 0 2px; line-height: 1; }
-  .bub .who .copybtn:hover { color: #c7d2fe; }
-  .bub .who .copybtn.done { color: #86efac; }
-  .bub .who .carrybtn { float: right; margin-left: 6px; background: none; border: none; cursor: pointer; color: #6b7280; font-size: 14px; padding: 0 2px; line-height: 1; }
-  .bub .who .carrybtn:hover { color: #fbbf24; }
-  .bub .who .carrybtn.done { color: #86efac; }
+  .bub .who .copybtn { float: right; margin-left: 8px; background: none; border: none; cursor: pointer; color: var(--po-text-faint); font-size: 13px; padding: 0 2px; line-height: 1; }
+  .bub .who .copybtn:hover { color: var(--po-accent-soft); }
+  .bub .who .copybtn.done { color: var(--po-ok-soft); }
+  .bub .who .carrybtn { float: right; margin-left: 6px; background: none; border: none; cursor: pointer; color: var(--po-text-faint); font-size: 14px; padding: 0 2px; line-height: 1; }
+  .bub .who .carrybtn:hover { color: var(--po-warn); }
+  .bub .who .carrybtn.done { color: var(--po-ok-soft); }
   /* Pair AI reviewer bubble + badge */
-  .bub.droid.pair { border-left: 2px solid #a855f7; background: rgba(168,85,247,0.05); }
-  .pair-badge { color: #c084fc; font-weight: 700; }
-  .bub.monitor { align-self: center; max-width: 92%; background: rgba(245,158,11,0.07); border: 1px dashed #b45309; color: #fcd34d; font-size: 12.5px; padding: 7px 11px; }
-  .bub.monitor .who { color: #f59e0b; text-transform: none; letter-spacing: 0; margin-bottom: 2px; }
-  .bub.monitor .mon-reason { color: #fcd34d; }
-  .bub.monitor .mon-steer { color: #fde68a; font: 600 12px/1.5 ui-monospace, monospace; margin-top: 4px; }
+  .bub.droid.pair { border-left: 2px solid var(--po-accent); background: color-mix(in srgb, var(--po-accent) 5%, transparent); }
+  .pair-badge { color: var(--po-accent); font-weight: 700; }
+  .bub.monitor { align-self: center; max-width: 92%; background: rgba(245,158,11,0.07); border: 1px dashed var(--po-warn-edge); color: var(--po-warn-soft); font-size: 12.5px; padding: 7px 11px; }
+  .bub.monitor .who { color: var(--po-warn); text-transform: none; letter-spacing: 0; margin-bottom: 2px; }
+  .bub.monitor .mon-reason { color: var(--po-warn-soft); }
+  .bub.monitor .mon-steer { color: var(--po-warn-soft); font: 600 12px/1.5 ui-monospace, monospace; margin-top: 4px; }
   /* LLM Pairings panel — mode badges */
   .pair-mode-badge { font: 700 9.5px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; vertical-align: 1px; }
-  .pair-mode-badge.pair { color: #c084fc; background: rgba(168,85,247,.14); }
-  .pair-mode-badge.monitor { color: #fbbf24; background: rgba(251,191,36,.14); }
-  .pair-mode-badge.subagent { color: #67e8f9; background: rgba(103,232,249,.14); }
+  .pair-mode-badge.pair { color: var(--po-accent); background: rgba(168,85,247,.14); }
+  .pair-mode-badge.monitor { color: var(--po-warn); background: rgba(251,191,36,.14); }
+  .pair-mode-badge.subagent { color: var(--po-info-soft); background: rgba(103,232,249,.14); }
   .tool-badge { font: 700 9.5px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; vertical-align: 1px; }
-  .tool-badge.python { color: #7dd3fc; background: rgba(56,189,248,.14); }
-  .tool-badge.sql { color: #86efac; background: rgba(34,197,94,.14); }
-  .tool-badge.subprocess { color: #fca5a5; background: rgba(248,113,113,.14); }
-  .tool-badge.builtin { color: #9aa3b2; background: rgba(148,163,184,.14); }
+  .tool-badge.python { color: var(--po-info-soft); background: rgba(56,189,248,.14); }
+  .tool-badge.sql { color: var(--po-ok-soft); background: rgba(34,197,94,.14); }
+  .tool-badge.subprocess { color: var(--po-danger-soft); background: rgba(248,113,113,.14); }
+  .tool-badge.builtin { color: var(--po-text-muted); background: rgba(148,163,184,.14); }
   .tool-tile.builtin { border-style: dashed; opacity: .82; }
-  .tool-tile.disabled h3 { color: #8b93a4; font-weight: 500; }
-  .tool-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 4px 14px; margin: 4px 0 12px; padding: 8px 10px; border: 1px solid #2a2a33; border-radius: 8px; background: rgba(255,255,255,.02); }
+  .tool-tile.disabled h3 { color: var(--po-text-muted); font-weight: 500; }
+  .tool-checks { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 4px 14px; margin: 4px 0 12px; padding: 8px 10px; border: 1px solid var(--po-edge); border-radius: 8px; background: color-mix(in srgb, var(--po-text) 3%, transparent); }
   .tool-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; cursor: pointer; padding: 2px 0; }
   .tool-check input { margin: 0; cursor: pointer; }
   /* GitHub-style markdown tables (answers + thinking) */
   .bub table.md-table { border-collapse: collapse; margin: 6px 0 8px; font-size: 0.92em; display: block; max-width: 100%; overflow-x: auto; }
-  .bub table.md-table th, .bub table.md-table td { border: 1px solid #2b3158; padding: 4px 9px; text-align: left; white-space: nowrap; }
-  .bub table.md-table th { background: #161a35; color: #c7d2fe; font-weight: 700; }
-  .bub table.md-table tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+  .bub table.md-table th, .bub table.md-table td { border: 1px solid var(--po-accent-edge); padding: 4px 9px; text-align: left; white-space: nowrap; }
+  .bub table.md-table th { background: var(--po-accent-wash); color: var(--po-accent-soft); font-weight: 700; }
+  .bub table.md-table tr:nth-child(even) td { background: color-mix(in srgb, var(--po-text) 3%, transparent); }
   /* live streaming bubble: tool steps + a transient status line */
-  .bub .live-status { margin-top: 6px; font-size: 12px; color: #8b8b93; font-style: italic; }
-  .bub .steps .livestep { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
-  .bub .steps .livestep summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
-  .bub .steps .livestep .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
-  .bub .steps .livestep .result { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 280px; overflow: auto; }
+  .bub .live-status { margin-top: 6px; font-size: 12px; color: var(--po-text-faint); font-style: italic; }
+  .bub .steps .livestep { border: 1px solid var(--po-edge); border-radius: 8px; margin-bottom: 6px; background: var(--po-inset); }
+  .bub .steps .livestep summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: var(--po-accent-soft); }
+  .bub .steps .livestep .args { color: var(--po-text-faint); padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .bub .steps .livestep .result { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: var(--po-text-muted); max-height: 280px; overflow: auto; }
   /* rendered markdown in a droid answer: reset the bubble's pre-wrap and space block elements */
   .bub .answer.md { white-space: normal; }
   .bub .answer.md p { margin: 0 0 8px; white-space: pre-wrap; }
@@ -357,110 +372,132 @@
   .bub .answer.md h1, .bub .answer.md h2, .bub .answer.md h3,
   .bub .answer.md h4, .bub .answer.md h5, .bub .answer.md h6 { margin: 12px 0 6px; line-height: 1.3; font-weight: 700; }
   .bub .answer.md h1 { font-size: 1.3em; } .bub .answer.md h2 { font-size: 1.2em; } .bub .answer.md h3 { font-size: 1.1em; }
-  .bub .answer.md h4, .bub .answer.md h5, .bub .answer.md h6 { font-size: 1em; color: #c7d2fe; }
+  .bub .answer.md h4, .bub .answer.md h5, .bub .answer.md h6 { font-size: 1em; color: var(--po-accent-soft); }
   .bub .answer.md ul, .bub .answer.md ol { margin: 4px 0 8px; padding-left: 22px; }
   .bub .answer.md li { margin: 2px 0; }
-  .bub .answer.md code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 4px; padding: 1px 4px; font: 0.88em ui-monospace, monospace; color: #fca5a5; }
-  .bub .answer.md pre.md-code { background: #0c0c0e; border: 1px solid #26262b; border-radius: 8px; padding: 10px 12px; margin: 6px 0 8px; overflow: auto; max-height: 320px; }
-  .bub .answer.md pre.md-code { white-space: pre; font: 12px/1.5 ui-monospace, monospace; color: #a1a1aa; }
+  .bub .answer.md code { background: var(--po-inset); border: 1px solid var(--po-edge); border-radius: 4px; padding: 1px 4px; font: 0.88em ui-monospace, monospace; color: var(--po-danger-soft); }
+  .bub .answer.md pre.md-code { background: var(--po-inset); border: 1px solid var(--po-edge); border-radius: 8px; padding: 10px 12px; margin: 6px 0 8px; overflow: auto; max-height: 320px; }
+  .bub .answer.md pre.md-code { white-space: pre; font: 12px/1.5 ui-monospace, monospace; color: var(--po-text-muted); }
   /* Folded large code/XML blobs (e.g. BPMN the droid dumps inline while thinking) so they
      don't dominate the panel or look like a stalled render — click to expand. */
-  .md-codefold { border: 1px solid #26262b; border-radius: 6px; margin: 5px 0; background: #0c0c0e; }
-  .md-codefold > summary { cursor: pointer; padding: 5px 10px; font: 11px ui-monospace, monospace; color: #93a3c4; list-style: none; }
-  .md-codefold > summary::before { content: '\25B8  '; color: #6b7280; }
+  .md-codefold { border: 1px solid var(--po-edge); border-radius: 6px; margin: 5px 0; background: var(--po-inset); }
+  .md-codefold > summary { cursor: pointer; padding: 5px 10px; font: 11px ui-monospace, monospace; color: var(--po-info-soft); list-style: none; }
+  .md-codefold > summary::before { content: '\25B8  '; color: var(--po-text-faint); }
   .md-codefold[open] > summary::before { content: '\25BE  '; }
-  .md-codefold > pre.md-code { margin: 0; border: none; border-top: 1px solid #26262b; border-radius: 0 0 6px 6px; }
-  .bub .answer.md a { color: #93c5fd; }
-  .bub .answer.md strong { color: #f1f5f9; }
-  .bub .steps details { border: 1px solid #26262b; border-radius: 8px; margin-bottom: 6px; background: #0c0c0e; }
-  .bub .steps summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: #c7d2fe; }
-  .bub .steps .args { color: #71717a; padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
-  .bub .steps pre { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: #a1a1aa; max-height: 280px; overflow: auto; }
-  .compose { border-top: 1px solid #26262b; padding: 12px 14px; }
+  .md-codefold > pre.md-code { margin: 0; border: none; border-top: 1px solid var(--po-edge); border-radius: 0 0 6px 6px; }
+  .bub .answer.md a { color: var(--po-info-soft); }
+  .bub .answer.md strong { color: var(--po-text); }
+  .bub .steps details { border: 1px solid var(--po-edge); border-radius: 8px; margin-bottom: 6px; background: var(--po-inset); }
+  .bub .steps summary { cursor: pointer; padding: 6px 10px; font-family: ui-monospace, monospace; font-size: 11px; color: var(--po-accent-soft); }
+  .bub .steps .args { color: var(--po-text-faint); padding: 0 10px 5px; font: 11px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+  .bub .steps pre { margin: 0; padding: 0 10px 10px; white-space: pre-wrap; word-break: break-word; font: 11px/1.5 ui-monospace, monospace; color: var(--po-text-muted); max-height: 280px; overflow: auto; }
+  .compose { border-top: 1px solid var(--po-edge); padding: 12px 14px; }
   .compose-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
-  .compose select { background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 6px 10px; font: inherit; }
-  .persona-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #a1a1aa; }
+  .compose select { background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 6px 10px; font: inherit; }
+  .persona-pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--po-text-muted); }
   .persona-pick > span { white-space: nowrap; }
   .persona-pick select:disabled { opacity: .7; cursor: not-allowed; }
   .sub-adv { display:inline-block; }
-  .sub-adv > summary { cursor:pointer; list-style:none; color:#a1a1aa; font-size:12px; user-select:none; }
+  .sub-adv > summary { cursor:pointer; list-style:none; color:var(--po-text-muted); font-size:12px; user-select:none; }
   .sub-adv[open] { display:inline-flex; gap:6px; align-items:center; }
-  .sub-adv label { font-size:11px; color:#a1a1aa; }
-  .compose textarea { width: 100%; background: #0c0c0e; border: 1px solid #34343c; color: #e4e4e7; border-radius: 8px; padding: 10px 12px; font-family: inherit; font-size: var(--chat-font, 15px); line-height: 1.55; resize: vertical; min-height: 72px; }
+  .sub-adv label { font-size:11px; color:var(--po-text-muted); }
+  .compose textarea { width: 100%; background: var(--po-inset); border: 1px solid var(--po-edge-strong); color: var(--po-text); border-radius: 8px; padding: 10px 12px; font-family: inherit; font-size: var(--chat-font, 15px); line-height: 1.55; resize: vertical; min-height: 72px; }
   .compose-actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
   .compose-actions .muted { font-size: 12px; display: flex; align-items: center; gap: 6px; }
   .fontctl { display: inline-flex; align-items: center; gap: 4px; margin-left: 4px; }
-  .fontctl button { background: #16161a; border: 1px solid #34343c; color: #c7d2fe; border-radius: 6px; width: 24px; height: 24px; line-height: 1; cursor: pointer; font-size: 13px; }
-  .fontctl button:hover { background: #1f1f27; }
-  .pylink { color: #a5b4fc; cursor: pointer; text-decoration: underline; }
-  .btn.warn { background: #3a1d1d; border: 1px solid #7f1d1d; color: #fca5a5; }
-  .btn.warn:hover { background: #4a2424; }
+  .fontctl button { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; width: 24px; height: 24px; line-height: 1; cursor: pointer; font-size: 13px; }
+  .fontctl button:hover { background: var(--po-hover); }
+  .pylink { color: var(--po-accent-strong); cursor: pointer; text-decoration: underline; }
+  .btn.warn { background: var(--po-danger-wash); border: 1px solid var(--po-danger-edge); color: var(--po-danger-soft); }
+  .btn.warn:hover { background: var(--po-danger-edge); }
   /* Missing-dependency banner (Deno / llama-server preflight). */
   #depBanner { display: flex; flex-direction: column; gap: 8px; }
   #depBanner:not(:empty) { margin: 12px 18px 0; }
-  .dep-warn { display: flex; align-items: flex-start; gap: 10px; background: #3a2e07; border: 1px solid #7f5f1d; border-radius: 10px; padding: 10px 12px; color: #fde68a; font-size: 13px; line-height: 1.5; }
+  .dep-warn { display: flex; align-items: flex-start; gap: 10px; background: var(--po-warn-wash); border: 1px solid var(--po-warn-edge); border-radius: 10px; padding: 10px 12px; color: var(--po-warn-soft); font-size: 13px; line-height: 1.5; }
   .dep-warn-body { flex: 1; }
-  .dep-warn .dep-purpose { color: #fcd34d; }
-  .dep-warn a { color: #fbbf24; font-weight: 600; white-space: nowrap; }
-  .dep-x { background: transparent; border: none; color: #fcd34d; font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
-  .dep-x:hover { color: #fff; }
+  .dep-warn .dep-purpose { color: var(--po-warn-soft); }
+  .dep-warn a { color: var(--po-warn); font-weight: 600; white-space: nowrap; }
+  .dep-x { background: transparent; border: none; color: var(--po-warn-soft); font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
+  .dep-x:hover { color: var(--po-text); }
   /* split Send button: primary action + a caret that opens the profile picker */
   .split { position: relative; display: inline-flex; }
   .split #chatSend { border-top-right-radius: 0; border-bottom-right-radius: 0; }
   .split .split-caret { border-top-left-radius: 0; border-bottom-left-radius: 0; border-left-color: rgba(255,255,255,.25); padding: 0 9px; font-size: 11px; }
-  .split .menu { position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 240px; max-width: 360px; background: #16161a; border: 1px solid #34343c; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,.5); padding: 4px; z-index: 40; }
-  .split .menu button { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left; background: none; border: 0; color: #e5e7eb; padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-  .split .menu button:hover { background: #1f1f27; }
-  .split .menu button.on { color: #c7d2fe; }
-  .split .menu .mi-model { font-size: 11px; color: #6b7280; word-break: break-all; }
-  .split .menu .mi-on { margin-left: auto; color: #818cf8; }
+  .split .menu { position: absolute; bottom: calc(100% + 6px); left: 0; min-width: 240px; max-width: 360px; background: var(--po-raised); border: 1px solid var(--po-edge-strong); border-radius: 8px; box-shadow: 0 10px 30px var(--po-shadow); padding: 4px; z-index: 40; }
+  .split .menu button { display: flex; align-items: baseline; gap: 7px; width: 100%; text-align: left; background: none; border: 0; color: var(--po-text); padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .split .menu button:hover { background: var(--po-hover); }
+  .split .menu button.on { color: var(--po-accent-soft); }
+  .split .menu .mi-model { font-size: 11px; color: var(--po-text-faint); word-break: break-all; }
+  .split .menu .mi-on { margin-left: auto; color: var(--po-accent-strong); }
   .split .menu .mi-dot { margin: 0; align-self: center; flex: none; }
-  .split .menu .mi-empty { padding: 8px 9px; color: #8b8b93; font-size: 12px; }
+  .split .menu .mi-empty { padding: 8px 9px; color: var(--po-text-faint); font-size: 12px; }
   .modal-back { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
-  .modal { background: #111118; border: 1px solid #34343c; border-radius: 12px; padding: 20px 22px; max-width: 560px; width: 90%; max-height: 80vh; overflow: auto; }
+  .modal { background: var(--po-raised); border: 1px solid var(--po-edge-strong); border-radius: 12px; padding: 20px 22px; max-width: 560px; width: 90%; max-height: 80vh; overflow: auto; }
   .modal h3 { margin: 0 0 10px; }
-  .modal pre { background: #0c0c0e; border: 1px solid #26262b; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, monospace; color: #c7d2fe; }
+  .modal pre { background: var(--po-inset); border: 1px solid var(--po-edge); border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; word-break: break-word; font: 12px/1.6 ui-monospace, monospace; color: var(--po-accent-soft); }
   .modal .close { margin-top: 14px; }
 
   /* Suggested-model cards: tabbed BPMN diagram / XML, with expand + download. */
   .models { margin: 10px 0 2px; display: flex; flex-direction: column; gap: 10px; }
-  .models .models-lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: #8b8b93; }
-  .modelcard { border: 1px solid #2a2a32; border-radius: 10px; background: #0c0c0e; overflow: hidden; }
-  .modelcard .mc-head { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-bottom: 1px solid #1f1f25; flex-wrap: wrap; }
-  .modelcard .mc-name { font: 600 12px/1.3 ui-monospace, monospace; color: #c7d2fe; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
-  .modelcard .mc-tabs { display: inline-flex; gap: 2px; background: #15151b; border-radius: 7px; padding: 2px; }
-  .modelcard .mc-tab { background: none; border: 0; color: #8b8b93; cursor: pointer; padding: 3px 11px; border-radius: 5px; font: 600 11px/1.2 inherit; }
-  .modelcard .mc-tab.active { background: #26263a; color: #e4e4e7; }
+  .models .models-lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--po-text-faint); }
+  .modelcard { border: 1px solid var(--po-edge); border-radius: 10px; background: var(--po-panel); overflow: hidden; }
+  .modelcard .mc-head { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-bottom: 1px solid var(--po-edge); flex-wrap: wrap; }
+  .modelcard .mc-name { font: 600 12px/1.3 ui-monospace, monospace; color: var(--po-accent-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+  .modelcard .mc-tabs { display: inline-flex; gap: 2px; background: var(--po-raised); border-radius: 7px; padding: 2px; }
+  .modelcard .mc-tab { background: none; border: 0; color: var(--po-text-faint); cursor: pointer; padding: 3px 11px; border-radius: 5px; font: 600 11px/1.2 inherit; }
+  .modelcard .mc-tab.active { background: var(--po-hover); color: var(--po-text); }
   .modelcard .mc-actions { margin-left: auto; display: inline-flex; gap: 4px; }
-  .modelcard .mc-btn { background: #16161a; border: 1px solid #34343c; color: #c7d2fe; border-radius: 6px; height: 24px; min-width: 24px; padding: 0 6px; line-height: 1; cursor: pointer; font-size: 13px; }
-  .modelcard .mc-btn:hover { background: #1f1f27; }
+  .modelcard .mc-btn { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; height: 24px; min-width: 24px; padding: 0 6px; line-height: 1; cursor: pointer; font-size: 13px; }
+  .modelcard .mc-btn:hover { background: var(--po-hover); }
   .modelcard .mc-body { position: relative; }
   .modelcard .mc-diagram { background: #fafafa; height: 300px; }
   .modelcard .mc-diagram .djs-container { height: 100%; }
-  .modelcard pre.mc-xml { margin: 0; padding: 10px 12px; height: 300px; overflow: auto; white-space: pre; word-break: normal; font: 11.5px/1.5 ui-monospace, monospace; color: #c7d2fe; }
-  .modelcard .mc-err { padding: 12px; color: #fca5a5; font-size: 12px; }
+  .modelcard pre.mc-xml { margin: 0; padding: 10px 12px; height: 300px; overflow: auto; white-space: pre; word-break: normal; font: 11.5px/1.5 ui-monospace, monospace; color: var(--po-accent-soft); }
+  .modelcard .mc-err { padding: 12px; color: var(--po-danger-soft); font-size: 12px; }
   /* Big popover view of one model. */
   .model-modal { position: fixed; inset: 0; background: rgba(0,0,0,.66); display: flex; align-items: center; justify-content: center; z-index: 60; }
-  .model-modal .mm-box { background: #111118; border: 1px solid #34343c; border-radius: 12px; width: 92vw; height: 88vh; max-width: 1200px; display: flex; flex-direction: column; overflow: hidden; }
-  .model-modal .mm-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #26262b; }
-  .model-modal .mm-title { font: 600 14px/1.3 ui-monospace, monospace; color: #c7d2fe; }
+  .model-modal .mm-box { background: var(--po-raised); border: 1px solid var(--po-edge-strong); border-radius: 12px; width: 92vw; height: 88vh; max-width: 1200px; display: flex; flex-direction: column; overflow: hidden; }
+  .model-modal .mm-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--po-edge); }
+  .model-modal .mm-title { font: 600 14px/1.3 ui-monospace, monospace; color: var(--po-accent-soft); }
   .model-modal .mm-actions { margin-left: auto; display: inline-flex; gap: 6px; }
   .model-modal .mm-body { flex: 1; position: relative; min-height: 0; }
   .model-modal .mm-diagram { position: absolute; inset: 0; background: #fafafa; }
-  .model-modal pre.mm-xml { position: absolute; inset: 0; margin: 0; padding: 14px 16px; overflow: auto; white-space: pre; background: #0c0c0e; color: #c7d2fe; font: 12.5px/1.6 ui-monospace, monospace; }
+  .model-modal pre.mm-xml { position: absolute; inset: 0; margin: 0; padding: 14px 16px; overflow: auto; white-space: pre; background: var(--po-inset); color: var(--po-accent-soft); font: 12.5px/1.6 ui-monospace, monospace; }
   /* Streaming sidecar log viewer — body-level so a #main re-render can't destroy it. */
   .log-modal { position: fixed; inset: 0; background: rgba(0,0,0,.66); display: flex; align-items: center; justify-content: center; z-index: 70; }
-  .log-modal .lm-box { background: #0c0c0e; border: 1px solid #34343c; border-radius: 12px; width: 88vw; height: 82vh; max-width: 1100px; display: flex; flex-direction: column; overflow: hidden; }
-  .log-modal .lm-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #26262b; }
-  .log-modal .lm-title { font: 600 13px/1.3 ui-monospace, monospace; color: #c7d2fe; display: flex; align-items: center; gap: 8px; }
+  .log-modal .lm-box { background: var(--po-inset); border: 1px solid var(--po-edge-strong); border-radius: 12px; width: 88vw; height: 82vh; max-width: 1100px; display: flex; flex-direction: column; overflow: hidden; }
+  .log-modal .lm-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--po-edge); }
+  .log-modal .lm-title { font: 600 13px/1.3 ui-monospace, monospace; color: var(--po-accent-soft); display: flex; align-items: center; gap: 8px; }
   .log-modal .lm-actions { margin-left: auto; display: inline-flex; gap: 6px; align-items: center; }
-  .log-modal pre.lm-body { flex: 1; margin: 0; padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: #0c0c0e; color: #c7d2fe; font: 11.5px/1.55 ui-monospace, monospace; }
+  .log-modal pre.lm-body { flex: 1; margin: 0; padding: 12px 14px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: var(--po-inset); color: var(--po-accent-soft); font: 11.5px/1.55 ui-monospace, monospace; }
+
+  /* ── Customizable workbench: drag handles + collapsible panels (persisted) ──
+     Sizes live in CSS custom properties (--wb-rail / --wb-sessions / --wb-chat-h)
+     set from localStorage (processos.wb) by applyWorkbench(); handles drag them. */
+  .wb-handle { flex: none; background: transparent; border: 0; padding: 0; transition: background .1s; touch-action: none; }
+  .wb-handle:hover, .wb-handle.drag { background: color-mix(in srgb, var(--po-accent) 55%, transparent); }
+  .wb-handle:focus-visible { outline: 2px solid var(--po-accent); }
+  .wb-handle.v { width: 6px; cursor: col-resize; border-radius: 3px; align-self: stretch; margin: 0 -3px; z-index: 5; }
+  .wb-handle.h { display: block; width: 100%; height: 6px; cursor: row-resize; border-radius: 3px; margin-top: 2px; }
+  .rail-resizer { position: absolute; top: 0; right: -3px; width: 6px; height: 100%; cursor: col-resize; z-index: 5; background: transparent; border: 0; padding: 0; touch-action: none; }
+  .rail-resizer:hover, .rail-resizer.drag { background: color-mix(in srgb, var(--po-accent) 55%, transparent); }
+  .rail-collapse { background: none; border: 1px solid var(--po-edge); border-radius: 7px; color: var(--po-text-faint); cursor: pointer; font-size: 11px; padding: 4px 8px; }
+  .rail-collapse:hover { background: var(--po-hover); color: var(--po-text); }
+  /* Chats panel collapses to a slim vertical tab. */
+  .chat-sessions.collapsed { width: 30px; min-width: 30px; }
+  .chat-sessions.collapsed > :not(.cs-expand) { display: none !important; }
+  .cs-expand { display: none; flex: 1; background: none; border: 0; cursor: pointer; color: var(--po-text-faint); writing-mode: vertical-rl; font: 700 10.5px/1 inherit; text-transform: uppercase; letter-spacing: .08em; padding: 10px 0; }
+  .cs-expand:hover { color: var(--po-accent-strong); background: var(--po-hover); border-radius: 12px; }
+  .chat-sessions.collapsed .cs-expand { display: flex; align-items: center; justify-content: center; }
+  .cs-collapse { background: none; border: 0; color: var(--po-text-faint); cursor: pointer; font-size: 12px; padding: 1px 4px; border-radius: 5px; line-height: 1; }
+  .cs-collapse:hover { background: var(--po-hover); color: var(--po-text); }
+  .chat-sessions { max-height: var(--wb-chat-h, 64vh); }
 </style>
 </head>
 <body>
-<div class="app">
-  <aside class="rail">
-    <a class="brand" href="/">Nano Process<span class="dot">OS</span></a>
+<div class="app" id="appShell">
+  <aside class="rail" id="rail">
+    <a class="brand" href="/"><span class="grad">Nano Process</span><span class="dot">OS</span></a>
     <div class="tag">the cockpit</div>
     <nav class="nav">
       <a href="/workspace">Workspaces</a>
@@ -473,6 +510,15 @@
       <a data-view="experiments">Experiments</a>
       <a data-view="sidecars" class="with-dot">LLMs <span class="dot-status off" id="navLlamaDot" title="local sidecar: off"></span></a>
     </nav>
+    <div class="rail-foot">
+      <div style="display:flex;gap:6px;margin-bottom:8px">
+        <button class="rail-collapse" id="railCollapse" title="Collapse the navigation rail" style="flex:1">⟨ collapse</button>
+        <button class="rail-collapse" id="wbReset2" title="Reset the workbench layout (rail, panels, sizes) to defaults">↺</button>
+      </div>
+      <div id="railTheme"></div>
+    </div>
+    <button class="rail-resizer" id="railResizer" title="Drag to resize the rail · double-click to reset" aria-label="Resize navigation rail"></button>
+    <button class="rail-expand" id="railExpand" title="Expand the navigation rail">⟩</button>
   </aside>
   <main id="main"><div id="depBanner"></div><div id="viewHost">Loading…</div><div id="cockpitHost" style="display:none"></div></main>
 </div>
@@ -480,7 +526,7 @@
 <dialog id="newDlg">
   <div class="dlg-body">
     <h2 style="margin-top:0">New experiment</h2>
-    <p class="muted" style="font-size:12px">Fork an experiment on <b id="dlgProc" style="font-family:ui-monospace,monospace;color:#c7d2fe"></b>. The droid proposes redesigns; the engine proves them on the recorded dataset; you decide.</p>
+    <p class="muted" style="font-size:12px">Fork an experiment on <b id="dlgProc" style="font-family:ui-monospace,monospace;color:var(--po-accent-soft)"></b>. The droid proposes redesigns; the engine proves them on the recorded dataset; you decide.</p>
     <label>Droid prompt (the experimental variable)</label>
     <select id="dlgPrompt"></select>
     <label>Iteration budget (max rounds)</label>
@@ -512,6 +558,99 @@ const cockpitHost = () => $('#cockpitHost');
 let STATE = { view: 'console', proc: null, exp: null };
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+// ── Customizable workbench: persisted panel sizes + collapse state ───────────
+// The operator arranges the cockpit like a workbench: the nav rail and the chats
+// panel resize (drag) and collapse, and the investigation panel's height resizes.
+// Everything persists in one localStorage blob (processos.wb) and is applied as
+// CSS custom properties / classes, so a reload restores the arrangement exactly.
+const WBL = {
+  read(){ try { return JSON.parse(localStorage.getItem('processos.wb')||'{}') || {}; } catch(e){ return {}; } },
+  get(k, d){ const v = WBL.read()[k]; return v==null ? d : v; },
+  set(k, v){ const o = WBL.read(); if(v==null) delete o[k]; else o[k]=v; localStorage.setItem('processos.wb', JSON.stringify(o)); applyWorkbench(); },
+  reset(){ localStorage.removeItem('processos.wb'); applyWorkbench(); },
+};
+function applyWorkbench(){
+  const root = document.documentElement;
+  const railW = WBL.get('railW', null);
+  root.style.setProperty('--wb-rail', railW ? railW+'px' : '220px');
+  const app = document.getElementById('appShell');
+  if(app) app.classList.toggle('rail-collapsed', !!WBL.get('railCollapsed', false));
+  const sw = WBL.get('sessionsW', null);
+  root.style.setProperty('--wb-sessions', sw ? sw+'px' : '214px');
+  const ch = WBL.get('chatH', null);
+  root.style.setProperty('--wb-chat-h', ch ? ch+'px' : '64vh');
+  const cs = document.getElementById('chatSessionsPane');
+  if(cs) cs.classList.toggle('collapsed', !!WBL.get('sessionsCollapsed', false));
+}
+// Generic drag-to-resize: pointer-drag `handle` to change a persisted dimension.
+// opts: { axis:'x'|'y', key, base(), min, max, invert } — base() reads the current
+// px value the drag starts from; double-click resets the dimension to its default.
+function dragResize(handle, opts){
+  if(!handle) return;
+  handle.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add('drag');
+    const start = opts.axis==='x' ? e.clientX : e.clientY;
+    const base = opts.base();
+    const move = ev => {
+      const d = (opts.axis==='x' ? ev.clientX : ev.clientY) - start;
+      WBL.set(opts.key, Math.round(Math.min(opts.max, Math.max(opts.min, base + (opts.invert ? -d : d)))));
+    };
+    const up = () => {
+      handle.classList.remove('drag');
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', up);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', up);
+  });
+  handle.addEventListener('dblclick', () => WBL.set(opts.key, null));
+  // Keyboard: arrows nudge by 16px, Home resets.
+  handle.addEventListener('keydown', e => {
+    const cur = opts.base();
+    const step = 16;
+    if(e.key==='ArrowLeft'||e.key==='ArrowUp') WBL.set(opts.key, Math.max(opts.min, cur-step));
+    else if(e.key==='ArrowRight'||e.key==='ArrowDown') WBL.set(opts.key, Math.min(opts.max, cur+step));
+    else if(e.key==='Home') WBL.set(opts.key, null);
+    else return;
+    e.preventDefault();
+  });
+}
+const cssPx = (name, fallback) => {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v.endsWith('px') ? parseFloat(v) : fallback;
+};
+// Rail chrome: collapse/expand + resize + theme toggle + layout reset. Static DOM — wired once.
+function wireRailWorkbench(){
+  applyWorkbench();
+  const on = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
+  on('railCollapse', () => WBL.set('railCollapsed', true));
+  on('railExpand', () => WBL.set('railCollapsed', false));
+  on('wbReset2', () => WBL.reset());
+  dragResize(document.getElementById('railResizer'), {
+    axis:'x', key:'railW', min:150, max:360,
+    base: () => WBL.get('railW', null) || 220,
+  });
+  if(window.poMountThemeToggle) poMountThemeToggle(document.getElementById('railTheme'));
+}
+// Chat workbench: chats-panel width/collapse + investigation-panel height. The chat surface is
+// re-rendered per investigation, so this is re-wired after each renderWorkspace().
+function wireChatWorkbench(){
+  applyWorkbench();
+  const on = (id, fn) => { const el = document.getElementById(id); if(el) el.onclick = fn; };
+  on('csCollapse', () => WBL.set('sessionsCollapsed', true));
+  on('csExpand', () => WBL.set('sessionsCollapsed', false));
+  dragResize(document.getElementById('csResize'), {
+    axis:'x', key:'sessionsW', min:140, max:420,
+    base: () => WBL.get('sessionsW', null) || 214,
+  });
+  dragResize(document.getElementById('chatHResize'), {
+    axis:'y', key:'chatH', min:280, max:Math.max(320, window.innerHeight-120),
+    base: () => WBL.get('chatH', null) || Math.round(window.innerHeight*0.64),
+  });
+}
 
 // Minimal, XSS-safe Markdown → HTML for droid answers (headings, bold/italic, inline + fenced
 // code, ordered/unordered lists, http(s) links, paragraphs). Escapes all input first; only
@@ -667,8 +806,8 @@ function procTile(p){
   return '<div class="tile" onclick="goProcess(\''+esc(p.processId)+'\')">'
     + '<h3>'+esc(p.processId)+'</h3>'
     + '<div class="meta">'+p.instances+' instances · '+p.completed+' completed · avg '+ms(p.avgDurationMs)+' · p95 '+ms(p.p95DurationMs)+'</div>'
-    + '<div class="meta" style="margin-top:6px">'+(p.bottleneck?('bottleneck <b style="color:#fca5a5">'+esc(p.bottleneck)+'</b> · '):'')
-    + '<b style="color:#c7d2fe">'+p.experiments+'</b> experiment'+(p.experiments===1?'':'s')+'</div></div>';
+    + '<div class="meta" style="margin-top:6px">'+(p.bottleneck?('bottleneck <b style="color:var(--po-danger-soft)">'+esc(p.bottleneck)+'</b> · '):'')
+    + '<b style="color:var(--po-accent-soft)">'+p.experiments+'</b> experiment'+(p.experiments===1?'':'s')+'</div></div>';
 }
 
 // ---- Processes ----
@@ -687,7 +826,7 @@ async function renderProcess(pid){
   const p = d.processes.find(x=>x.processId===pid);
   const xs = d.experiments.filter(e=>e.targetProcessId===pid);
   let h = '<div class="crumbs"><a onclick="renderProcesses()">Processes</a> / '+esc(pid)+'</div>';
-  h += '<h1 style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(pid)+'</h1>';
+  h += '<h1 style="font-family:ui-monospace,monospace;color:var(--po-accent-soft)">'+esc(pid)+'</h1>';
   if(p){
     h += '<div class="cards" style="margin-top:10px">'
        + card(p.instances,'instances') + card(p.completed,'completed')
@@ -714,7 +853,7 @@ function expTable(xs){
   for(const e of xs){
     h += '<tr style="cursor:pointer" onclick="goExp(\''+esc(e.instanceKey)+'\')">'
       + '<td><b>#'+esc(e.instanceKey)+'</b> <span class="muted">'+ago(e.startedAt)+'</span></td>'
-      + '<td style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(e.targetProcessId||'—')+'</td>'
+      + '<td style="font-family:ui-monospace,monospace;color:var(--po-accent-soft)">'+esc(e.targetProcessId||'—')+'</td>'
       + '<td>'+esc(e.bestName||'—')+'</td>'
       + '<td class="num">'+pct(e.bestConservedRate)+'</td>'
       + '<td class="num">'+(e.iteration==null?'—':e.iteration+(e.maxIterations?(' / '+e.maxIterations):''))+'</td>'
@@ -731,8 +870,8 @@ async function renderExp(key){
   const s = d.summary;
   let h = '<div class="crumbs"><a onclick="renderExperiments()">Experiments</a> / #'+esc(key)+'</div>';
   h += '<div style="display:flex;align-items:baseline;gap:12px"><h1>Experiment #'+esc(key)+'</h1>'+expPill(s)+'</div>';
-  h += '<p class="lede">Optimizing <b style="font-family:ui-monospace,monospace;color:#c7d2fe">'+esc(s.targetProcessId||'—')+'</b>'
-     + (s.promptId ? ' · droid prompt <b style="color:#a5b4fc">'+esc(s.promptId)+'</b>' : ' · built-in prompt')
+  h += '<p class="lede">Optimizing <b style="font-family:ui-monospace,monospace;color:var(--po-accent-soft)">'+esc(s.targetProcessId||'—')+'</b>'
+     + (s.promptId ? ' · droid prompt <b style="color:var(--po-accent-strong)">'+esc(s.promptId)+'</b>' : ' · built-in prompt')
      + '. The shared instrument is the verifier’s gradient — the conserved-rate of the production boundary on real recorded traces.</p>';
 
   // stepper
@@ -887,7 +1026,7 @@ function llmEditorBlock(profiles, active){
   const isSidecar = type === 'sidecar';
   const keyPh = (p && p.apiKeySet) ? '\u2022\u2022\u2022\u2022 set \u2014 leave blank to keep' : '(unset)';
   const val = (x) => esc(x==null ? '' : String(x));
-  return '<div class="tile" id="llmEditor" style="cursor:default;border-color:#4f46e5;margin:0 0 16px">'
+  return '<div class="tile" id="llmEditor" style="cursor:default;border-color:var(--po-accent-strong);margin:0 0 16px">'
     + '<h3>'+(editing ? 'Edit profile' : 'Add LLM profile')+'</h3>'
     + '<label>Name</label><input id="le-name" placeholder="e.g. Local (llama.cpp)" value="'+val(p&&p.name)+'">'
     + '<div class="le-types">'
@@ -1055,11 +1194,11 @@ async function renderSidecars(){
   // is NOT immediately usable: it downloads the model, then loads it into memory, then serves.
   const phaseMeta = (r) => {
     switch(r && r.phase){
-      case 'ready':       return {pill:'<span class="pill accept">ready</span>',        border:'#14532d', detail:''};
-      case 'loading':     return {pill:'<span class="pill wait">loading model…</span>',  border:'#3f3f12', detail:(r.detail||'loading model into memory…')};
-      case 'downloading': return {pill:'<span class="pill wait">downloading…</span>',     border:'#1e3a5f', detail:(r.detail||'downloading model…')};
-      case 'starting':    return {pill:'<span class="pill wait">starting…</span>',        border:'#1e3a5f', detail:(r.detail||'starting llama-server…')};
-      default:            return {pill:'<span class="pill accept">running</span>',        border:'#14532d', detail:''};
+      case 'ready':       return {pill:'<span class="pill accept">ready</span>',        border:'var(--po-ok-edge)', detail:''};
+      case 'loading':     return {pill:'<span class="pill wait">loading model…</span>',  border:'var(--po-warn-edge)', detail:(r.detail||'loading model into memory…')};
+      case 'downloading': return {pill:'<span class="pill wait">downloading…</span>',     border:'var(--po-info-wash)', detail:(r.detail||'downloading model…')};
+      case 'starting':    return {pill:'<span class="pill wait">starting…</span>',        border:'var(--po-info-wash)', detail:(r.detail||'starting llama-server…')};
+      default:            return {pill:'<span class="pill accept">running</span>',        border:'var(--po-ok-edge)', detail:''};
     }
   };
 
@@ -1076,18 +1215,18 @@ async function renderSidecars(){
   // Live status banner: one row per running sidecar.
   if(sidecars.length){
     const anyReady = sidecars.some(r => r.phase==='ready');
-    h += '<div class="tile" style="cursor:default;border-color:'+(anyReady?'#14532d':'#1e3a5f')+'">'
-      + '<h3 style="color:'+(anyReady?'#6ee7b7':'#7dd3fc')+'">'+(anyReady?'Running':'Starting up')+' <span class="pill '+(anyReady?'accept':'wait')+'">'+sidecars.length+'/'+max+'</span></h3>'
+    h += '<div class="tile" style="cursor:default;border-color:'+(anyReady?'var(--po-ok-edge)':'var(--po-info-wash)')+'">'
+      + '<h3 style="color:'+(anyReady?'var(--po-ok-soft)':'var(--po-info-soft)')+'">'+(anyReady?'Running':'Starting up')+' <span class="pill '+(anyReady?'accept':'wait')+'">'+sidecars.length+'/'+max+'</span></h3>'
       + sidecars.map(r => {
           const pm = phaseMeta(r);
           return '<div class="meta" style="margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
-          + '<b style="color:#d1fae5">'+esc(r.profileId||'?')+'</b> '+pm.pill+' · '+esc(r.model||'')+(r.port?(' · port '+r.port):'')+(r.pid?(' · pid '+r.pid):'')
+          + '<b style="color:var(--po-ok-soft)">'+esc(r.profileId||'?')+'</b> '+pm.pill+' · '+esc(r.model||'')+(r.port?(' · port '+r.port):'')+(r.pid?(' · pid '+r.pid):'')
           + '<button class="btn warn" data-stop="'+esc(r.profileId||'')+'" style="padding:2px 8px">Stop</button>'
           + '<button class="btn ghost" data-logs="'+esc(r.profileId||'')+'" style="padding:2px 8px">Logs</button>'
-          + (pm.detail?('<div class="meta" style="flex-basis:100%;color:#93c5fd;margin-top:2px">'+esc(pm.detail)+'</div>'):'')
+          + (pm.detail?('<div class="meta" style="flex-basis:100%;color:var(--po-info-soft);margin-top:2px">'+esc(pm.detail)+'</div>'):'')
           + '</div>';
         }).join('')
-      + (anyReady?'':'<div class="meta" style="margin-top:8px;color:#93c5fd">A model is not ready to chat until it finishes downloading and loading — this can take several minutes for large models. Use <b>Logs</b> to watch progress.</div>')
+      + (anyReady?'':'<div class="meta" style="margin-top:8px;color:var(--po-info-soft)">A model is not ready to chat until it finishes downloading and loading — this can take several minutes for large models. Use <b>Logs</b> to watch progress.</div>')
       + '<div class="btnrow" style="margin-top:10px"><button class="btn ghost" id="llStopAll">Stop all</button></div></div>';
   } else {
     h += '<div class="tile" style="cursor:default"><h3>Off <span class="pill wait">idle</span></h3>'
@@ -1122,7 +1261,7 @@ async function renderSidecars(){
       const runPort = isRunning ? runById[p.id].port : null;
       // Context window: prefer the live value the running sidecar reports, else the persisted one.
       const ctxWin = (isRunning && runById[p.id].contextWindow) || p.contextWindow || null;
-      const ctxMeta = ctxWin ? ('<div class="meta" style="margin-top:4px;color:#a5b4fc">context window · '+Number(ctxWin).toLocaleString()+' tokens'+(isRunning&&runById[p.id].contextWindow?' (live)':'')+'</div>') : '';
+      const ctxMeta = ctxWin ? ('<div class="meta" style="margin-top:4px;color:var(--po-accent-strong)">context window · '+Number(ctxWin).toLocaleString()+' tokens'+(isRunning&&runById[p.id].contextWindow?' (live)':'')+'</div>') : '';
       // Undownloaded sidecars are dimmed with a dotted outline so cached/ready models stand out.
       const undownloaded = !isRunning && !isDownloading && !isDownloaded;
       // The action button reflects the lifecycle: download the weights, then start (serve) them.
@@ -1133,7 +1272,7 @@ async function renderSidecars(){
         const gb = fmtGB(dl.bytes);
         actions = '<button class="btn ghost" data-logs="'+esc(p.id)+'">Logs</button>'
                 + '<button class="btn warn" data-cancel-dl="'+esc(p.id)+'">Cancel download</button>'
-                + '<span class="meta" style="color:#7dd3fc;align-self:center">downloading'+(gb?(' · '+esc(gb)):'')+'…</span>';
+                + '<span class="meta" style="color:var(--po-info-soft);align-self:center">downloading'+(gb?(' · '+esc(gb)):'')+'…</span>';
       } else if(isDownloaded){
         actions = '<button class="btn primary" data-start="'+esc(p.id)+'" '+startDisabled+' title="'+esc(startTitle)+'">Start</button>';
       } else {
@@ -1146,8 +1285,8 @@ async function renderSidecars(){
         + '</h3>'
         + '<div class="meta">'+esc(p.modelFile||p.model||'')+(runPort?(' · port '+esc(String(runPort))):'')+'</div>'
         + ctxMeta
-        + (pm && pm.detail?('<div class="meta" style="margin-top:4px;color:#93c5fd">'+esc(pm.detail)+'</div>'):'')
-        + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:#8b8b93">'+esc(p.sidecarArgs)+'</div>'):'')
+        + (pm && pm.detail?('<div class="meta" style="margin-top:4px;color:var(--po-info-soft)">'+esc(pm.detail)+'</div>'):'')
+        + (p.sidecarArgs?('<div class="meta" style="margin-top:4px;color:var(--po-text-faint)">'+esc(p.sidecarArgs)+'</div>'):'')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
         + actions
         + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
@@ -1174,8 +1313,8 @@ async function renderSidecars(){
         + ' <button class="sc-star'+(p.starred?' on':'')+'" data-star="'+esc(p.id)+'" data-starred="'+(p.starred?'1':'0')+'" title="'+(p.starred?'Unstar':'Star (pin to top)')+'">'+(p.starred?'\u2605':'\u2606')+'</button>'
         + '</h3>'
         + '<div class="meta">'+esc(p.model||'(model unset)')+(p.baseUrl?(' · '+esc(p.baseUrl)):'')+'</div>'
-        + (p.contextWindow?('<div class="meta" style="margin-top:4px;color:#a5b4fc">context window · '+Number(p.contextWindow).toLocaleString()+' tokens</div>'):'')
-        + (p.apiKeySet?'':'<div class="meta" style="margin-top:4px;color:#fca5a5">No API key set</div>')
+        + (p.contextWindow?('<div class="meta" style="margin-top:4px;color:var(--po-accent-strong)">context window · '+Number(p.contextWindow).toLocaleString()+' tokens</div>'):'')
+        + (p.apiKeySet?'':'<div class="meta" style="margin-top:4px;color:var(--po-danger-soft)">No API key set</div>')
         + '<div class="btnrow" style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
         + (isActive ? '' : '<button class="btn ghost" data-active="'+esc(p.id)+'">Make active</button>')
         + '<button class="btn ghost" data-config="'+esc(p.id)+'">Edit profile</button>'
@@ -1355,7 +1494,7 @@ function drawPersonas(selId){
   let h = '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
   h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editPersona(null)">+ New persona</button>';
   for(const p of PERSONAS){
-    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    const active = p.id===selId ? ' style="border-color:var(--po-accent);background:var(--po-accent-wash)"' : '';
     const tags = (p.default?' <span class="muted" style="font-size:11px">default</span>':'') + (p.builtin?' <span class="muted" style="font-size:11px">built-in</span>':'');
     h += '<div class="tile"'+active+' onclick="editPersona(\''+esc(p.id)+'\')">'
       + '<h3 style="font-size:14px">'+esc(p.name||p.id)+tags+'</h3>'
@@ -1440,7 +1579,7 @@ function drawPairings(selId){
     h += '<div class="muted" style="font-size:12px;padding:6px 2px">No pairings yet. Create one to pair a second model with your investigations.</div>';
   }
   for(const p of PAIRINGS){
-    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    const active = p.id===selId ? ' style="border-color:var(--po-accent);background:var(--po-accent-wash)"' : '';
     const prof = PAIR_PROFILES.find(x=>x.id===p.secondaryProfileId);
     const sub = (prof?(prof.name||prof.id):(p.secondaryProfileId||'no model'));
     h += '<div class="tile"'+active+' onclick="editPairing(\''+esc(p.id)+'\')">'
@@ -1588,7 +1727,7 @@ async function renderTools(){
   } catch(e){ return fail(e); }
   main.innerHTML =
     '<h1>Tools</h1>'
-    + '<p class="lede">The investigator LLM\u2019s tool surface. The <b>built-in</b> tools are read-only \u2014 shown so you can see (and clone) what the model can do. Add your own <b>custom tools</b> backed by <b>Python</b>, read-only <b>SQL</b>, or an <b>external command</b>; enable the ones you want offered, and pick per-model subsets in a <a onclick="showView(\'pairings\')" style="color:#a5b4fc;cursor:pointer">Pairing</a> or per-investigation in the composer. <b>Import / export</b> bundles to share toolsets.</p>'
+    + '<p class="lede">The investigator LLM\u2019s tool surface. The <b>built-in</b> tools are read-only \u2014 shown so you can see (and clone) what the model can do. Add your own <b>custom tools</b> backed by <b>Python</b>, read-only <b>SQL</b>, or an <b>external command</b>; enable the ones you want offered, and pick per-model subsets in a <a onclick="showView(\'pairings\')" style="color:var(--po-accent-strong);cursor:pointer">Pairing</a> or per-investigation in the composer. <b>Import / export</b> bundles to share toolsets.</p>'
     + '<div style="display:flex;gap:8px;margin-bottom:10px"><button class="btn ghost" onclick="exportTools()">Export custom tools</button><button class="btn ghost" onclick="document.getElementById(\'toolImportFile\').click()">Import tools…</button><input type="file" id="toolImportFile" accept="application/json" style="display:none" onchange="importTools(this)"></div>'
     + '<div id="toolsWrap"></div>';
   const firstCustom = TOOLS.find(t=>!t.builtin);
@@ -1602,7 +1741,7 @@ function drawTools(selId){
   h += '<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin:4px 2px 6px">Custom</div>';
   if(!custom.length) h += '<div class="muted" style="font-size:12px;padding:2px 2px 8px">None yet. Create one, or clone a built-in below.</div>';
   for(const t of custom){
-    const active = t.id===selId ? ' border-color:#4338ca;background:#14132a;' : '';
+    const active = t.id===selId ? ' border-color:var(--po-accent);background:var(--po-accent-wash);' : '';
     const cls = 'tile tool-tile'+(t.enabled?'':' disabled');
     h += '<div class="'+cls+'" style="'+active+'" onclick="editTool(\''+esc(t.id)+'\')">'
       + '<h3 style="font-size:14px">'+esc(t.name||t.id)+' '+toolBadge(t)+(t.enabled?'':' <span class="muted" style="font-size:10px">disabled</span>')+'</h3>'
@@ -1610,7 +1749,7 @@ function drawTools(selId){
   }
   h += '<div class="muted" style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin:12px 2px 6px">Built-in (read-only)</div>';
   for(const t of builtin){
-    const active = t.id===selId ? ' border-color:#4338ca;background:#14132a;' : '';
+    const active = t.id===selId ? ' border-color:var(--po-accent);background:var(--po-accent-wash);' : '';
     h += '<div class="tile tool-tile builtin" style="'+active+'" onclick="editTool(\''+esc(t.id)+'\')">'
       + '<h3 style="font-size:14px">'+esc(t.name)+' '+toolBadge(t)+'</h3>'
       + '<div class="meta">'+esc((t.description||'').slice(0,90))+'</div></div>';
@@ -1641,7 +1780,7 @@ function editTool(id){
   h += '<label class="lbl">Description <span class="muted" style="font-weight:400">(steers the model on when/how to use it)</span></label><textarea id="tlDesc" rows="3" placeholder="A sharp description steers a small model far better than a vague one.">'+esc(t.description||'')+'</textarea>';
   h += '<label class="lbl">Backend</label><select id="tlBackend" onchange="onToolBackendChange()">'
     + TOOL_BACKENDS.map(b=>'<option value="'+b.v+'"'+(b.v===backend?' selected':'')+'>'+esc(b.label)+'</option>').join('') + '</select>';
-  h += '<label class="lbl">Parameters <span class="muted" style="font-weight:400">(JSON Schema object the model fills in; use <code>{{name}}</code> in the body)</span> <a style="color:#a5b4fc;cursor:pointer;font-size:11px" onclick="insertToolParam()">+ add a param</a></label>';
+  h += '<label class="lbl">Parameters <span class="muted" style="font-weight:400">(JSON Schema object the model fills in; use <code>{{name}}</code> in the body)</span> <a style="color:var(--po-accent-strong);cursor:pointer;font-size:11px" onclick="insertToolParam()">+ add a param</a></label>';
   h += '<textarea id="tlParams" rows="6" spellcheck="false" style="font-family:ui-monospace,monospace;font-size:12px">'+esc(JSON.stringify(t.parameters||{type:'object',properties:{}},null,2))+'</textarea>';
   // Template (python/sql) vs command (subprocess).
   h += '<div id="tlTemplateWrap" style="display:'+(backend==='subprocess'?'none':'block')+'">'
@@ -1743,7 +1882,7 @@ function drawChatPrompts(selId){
   let h = '<div style="display:grid;grid-template-columns:280px 1fr;gap:18px;align-items:start">';
   h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editCPrompt(null)">+ New chat prompt</button>';
   for(const p of CHAT_PROMPTS){
-    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    const active = p.id===selId ? ' style="border-color:var(--po-accent);background:var(--po-accent-wash)"' : '';
     h += '<div class="tile"'+active+' onclick="editCPrompt(\''+esc(p.id)+'\')">'
       + '<h3 style="font-size:14px">'+esc(p.name||p.id)+(p.builtin?' <span class="muted" style="font-size:11px">built-in</span>':'')+'</h3>'
       + '<div class="meta">'+esc((p.text||'').slice(0,90))+'</div></div>';
@@ -1789,7 +1928,7 @@ function drawPrompts(selId){
   // list
   h += '<div><button class="btn primary" style="width:100%;margin-bottom:10px" onclick="editPrompt(null)">+ New prompt</button>';
   for(const p of PROMPTS){
-    const active = p.id===selId ? ' style="border-color:#4338ca;background:#14132a"' : '';
+    const active = p.id===selId ? ' style="border-color:var(--po-accent);background:var(--po-accent-wash)"' : '';
     h += '<div class="tile"'+active+' onclick="editPrompt(\''+esc(p.id)+'\')">'
       + '<h3 style="font-size:14px">'+esc(p.name||p.id)+(p.builtin?' <span class="muted" style="font-size:11px">built-in</span>':'')+'</h3>'
       + '<div class="meta">'+esc((p.description||'').slice(0,80))+'</div></div>';
@@ -1881,7 +2020,7 @@ async function renderWorkspace(ws, proc){
   const binding = p.binding==='dataset' ? '<span class="pill accept">dataset</span>' : '<span class="pill run">'+esc(p.binding||'unbound')+'</span>';
   host.innerHTML = `
     <div class="muted" style="font-size:12px">
-      <a href="/workspace#/c/${encodeURIComponent(ws)}/p/${encodeURIComponent(proc)}" style="color:#a5b4fc">← back to workspace</a>
+      <a href="/workspace#/c/${encodeURIComponent(ws)}/p/${encodeURIComponent(proc)}" style="color:var(--po-accent-strong)">← back to workspace</a>
       · ${esc(ws)} / ${esc(proc)}
     </div>
     <h1 style="margin:6px 0">${esc(p.displayName||proc)} ${binding}</h1>
@@ -1896,11 +2035,13 @@ async function renderWorkspace(ws, proc){
     ${p.hasModel ? '<div id="wsModel" class="ws-model"></div>' : ''}
     <p class="muted" style="font-size:12px;max-width:720px;margin:12px 0 0">Chat with the droid about this dataset. It queries the bound traces directly (read-only SQL over a DuckDB view, plus an optional trusted Python tier) to form and test its own hypotheses. The conversation is multi-turn — it remembers earlier answers in this session.</p>
     <div class="chat-wrap">
-      <div class="chat-sessions">
-        <div class="cs-head"><span>Chats</span><span class="cs-head-actions"><button class="btn ghost" id="chatImport" title="Import a shared psychological trace (.zip) as an investigation">Import</button><button class="btn ghost" id="chatNew" title="Start a new chat session">+ New</button></span></div>
+      <div class="chat-sessions" id="chatSessionsPane">
+        <div class="cs-head"><span>Chats</span><span class="cs-head-actions"><button class="btn ghost" id="chatImport" title="Import a shared psychological trace (.zip) as an investigation">Import</button><button class="btn ghost" id="chatNew" title="Start a new chat session">+ New</button><button class="cs-collapse" id="csCollapse" title="Collapse the chats panel">⟨</button></span></div>
         <input type="file" id="chatImportFile" accept=".zip,application/zip" hidden>
         <div id="chatTabs" class="cs-list"><div class="cs-empty">Loading…</div></div>
+        <button class="cs-expand" id="csExpand" title="Expand the chats panel">Chats ⟩</button>
       </div>
+      <button class="wb-handle v" id="csResize" title="Drag to resize the chats panel · double-click to reset" aria-label="Resize chats panel"></button>
       <div class="chat">
         <div class="chat-tabs">
           <button class="ctab active" id="tabChat" data-tab="chat">Chat</button>
@@ -1983,8 +2124,10 @@ async function renderWorkspace(ws, proc){
           </div>
         </div>
       </div>
-    </div>`;
+    </div>
+    <button class="wb-handle h" id="chatHResize" title="Drag to resize the investigation panel · double-click to reset" aria-label="Resize investigation panel height"></button>`;
   if(p.hasModel) renderWsModel('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/model');
+  wireChatWorkbench();
   // Mark the cockpit pane ready & remember this process so the rail's Cockpit item can reopen it
   // (after a reload) and so re-selecting Cockpit just reveals the preserved DOM.
   cockpitHost().dataset.ready = '1';
@@ -2353,7 +2496,7 @@ async function openInvestigationTools(){
   }).join('');
   showModal('Tools for this investigation',
     '<p class="muted" style="font-size:13px">Choose which tools the <b>primary</b> model may use this investigation. Unchecking trims its surface (helpful for small models). This overrides the pairing\u2019s primary-tool list; capability gates (model / Python / recorded inputs) still apply.</p>'
-    + '<div style="max-height:46vh;overflow:auto;border:1px solid #2a2a40;border-radius:8px;padding:8px 10px;margin-bottom:8px">'+(rows||'<span class="muted">No tools available.</span>')+'</div>'
+    + '<div style="max-height:46vh;overflow:auto;border:1px solid var(--po-edge);border-radius:8px;padding:8px 10px;margin-bottom:8px">'+(rows||'<span class="muted">No tools available.</span>')+'</div>'
     + '<div style="display:flex;gap:8px"><button class="btn primary" id="invToolsApply">Apply</button><button class="btn ghost" id="invToolsAll">Select all</button><button class="btn ghost" id="invToolsDefault">Reset to default</button></div>');
   const apply = ()=>{
     const sel = Array.from(document.querySelectorAll('.invtool')).filter(c=>c.checked).map(c=>c.value);
@@ -2631,11 +2774,11 @@ function chatErrorHtml(msg){
   const raw = (msg==null ? '' : String(msg));
   const low = raw.toLowerCase();
   const ctx = low.includes('context') && (low.includes('length') || low.includes('exceed') || low.includes('window') || low.includes('too long') || low.includes('maximum'));
-  let body = '<span style="color:#fca5a5">'+esc(raw)+'</span>';
+  let body = '<span style="color:var(--po-danger-soft)">'+esc(raw)+'</span>';
   if(ctx){
-    body = '<span style="color:#fca5a5">⚠ The model ran out of context (its input window filled up).</span>'+
-      '<div style="color:#a1a1aa;font-size:12px;margin-top:4px">This investigation got too long for the model. Start a new chat, or switch to a model with a larger context window, then continue.</div>'+
-      '<details style="margin-top:4px"><summary style="cursor:pointer;color:#71717a;font-size:11px">details</summary><span style="color:#a1a1aa;font-size:11px">'+esc(raw)+'</span></details>';
+    body = '<span style="color:var(--po-danger-soft)">⚠ The model ran out of context (its input window filled up).</span>'+
+      '<div style="color:var(--po-text-muted);font-size:12px;margin-top:4px">This investigation got too long for the model. Start a new chat, or switch to a model with a larger context window, then continue.</div>'+
+      '<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--po-text-faint);font-size:11px">details</summary><span style="color:var(--po-text-muted);font-size:11px">'+esc(raw)+'</span></details>';
   }
   return '<div class="bub droid"><div class="who">'+droidWhoHtml()+'</div>'+body+'</div>';
 }
@@ -3637,11 +3780,11 @@ async function refreshChatRoster(){
     const ph = p ? phaseById[p.id] : null;
     const ready = ph==='ready';
     const warming = ph && ph!=='ready';   // running but downloading/loading — not usable yet
-    const color = !p ? '#64748b' : (!p.sidecar ? '#3b82f6' : (ready ? '#22c55e' : (warming ? '#38bdf8' : '#eab308')));
+    const color = !p ? 'var(--po-text-faint)' : (!p.sidecar ? 'var(--po-info)' : (ready ? 'var(--po-ok)' : (warming ? 'var(--po-info)' : 'var(--po-warn)')));
     const tip = !p ? '' : (!p.sidecar ? 'remote model' : (ready ? 'sidecar ready' : (warming ? ('sidecar '+ph+'… not ready yet') : 'sidecar off')));
     return '<span title="'+esc(tip)+'" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+color+';margin-right:5px;vertical-align:0"></span>';
   };
-  const chip = (p, role) => p ? (dot(p)+'<b style="color:#cbd5e1">'+esc(p.name||p.id)+'</b> <span style="opacity:.6">'+role+'</span>') : '';
+  const chip = (p, role) => p ? (dot(p)+'<b style="color:var(--po-text)">'+esc(p.name||p.id)+'</b> <span style="opacity:.6">'+role+'</span>') : '';
   const primary = byId[s.activeProfile];
   const parts = [chip(primary, 'primary')];
   const pr = pairRequest(); if(pr && pr.profileId && byId[pr.profileId]) parts.push(chip(byId[pr.profileId], 'pair'));
@@ -3650,7 +3793,7 @@ async function refreshChatRoster(){
   // Warn if the primary somehow equals an enabled partner (the send would hit the partner).
   const clash = primary && partnerProfileIds().has(primary.id);
   el.innerHTML = parts.filter(Boolean).join('<span style="opacity:.4">·</span> ')
-    + (clash ? ' <span style="color:#f87171" title="Pick a different partner — you can\'t send to the model already acting as the partner">⚠ partner = primary</span>' : '');
+    + (clash ? ' <span style="color:var(--po-danger)" title="Pick a different partner — you can\'t send to the model already acting as the partner">⚠ partner = primary</span>' : '');
 }
 // When a partner mode is turned off (switching back toward a single LLM), free the now-unused
 // sidecar's memory: stop any running sidecar that is no longer the primary or an enabled partner.
@@ -4101,7 +4244,7 @@ function showCockpit(){
   if(last && last.ws && last.proc) return renderWorkspace(last.ws, last.proc);
   host.innerHTML = '<h1>Cockpit</h1>'+
     '<p class="lede">The investigation surface for a process — chat with the droid about its traces, fork what-if variants, and prove them on the recorded dataset.</p>'+
-    '<p class="muted">Open a process to begin: pick one from <a onclick="showView(\'processes\')" style="color:#a5b4fc;cursor:pointer">Processes</a>.</p>';
+    '<p class="muted">Open a process to begin: pick one from <a onclick="showView(\'processes\')" style="color:var(--po-accent-strong);cursor:pointer">Processes</a>.</p>';
 }
 
 // Show a non-cockpit view: hide the cockpit pane, reveal the view pane, then run its renderer.
@@ -4133,6 +4276,7 @@ function renderView(v){
 // investigation surface; a ?view= param selects a named rail view; otherwise the
 // default console. The rail's sidecar status dot polls regardless of the view.
 (function(){
+  wireRailWorkbench();
   startLlamaDotPoll();
   startDepsPoll();
   const q = new URLSearchParams(location.search);
