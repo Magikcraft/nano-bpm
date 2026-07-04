@@ -75,6 +75,60 @@ working set that must fit in RAM is minimised — so in admission mode the hard
 memory rails bite far later than the latency gate would have, letting many more
 instances start before anything is shed.
 
+## Design rationale: the compressor/limiter model (why the control is a switch)
+
+The `SlaMode` control is deliberately modelled — in both mechanism and UI — on an
+audio-dynamics **compressor/limiter**, because the system at its capacity ceiling
+*is* a dynamics processor. Treat offered load as an input signal and the capacity
+ceiling as the threshold; the question "what do we do with signal above the
+threshold?" is precisely the question a comp/limiter answers, and it has exactly two
+canonical answers:
+
+- **`admission` mode = a compressor.** Nothing above the threshold is rejected;
+  instead the "gain" (per-request speed) is reduced so the whole signal still passes,
+  with its dynamic range squashed. Latency rises smoothly, no one is turned away.
+  **No information is lost — only dynamic range.**
+- **`latency` mode = a limiter (brick-wall).** The output (end-to-end latency) is
+  held flat by clamping the *input*: creates above the ceiling are clipped off
+  (`503`). What passes stays fast and clean; the peaks above the ceiling are simply
+  removed.
+
+The terminology matters and sharpens the design: shedding signal *above* a ceiling
+is **limiting/clipping**, not **gating** (a noise gate cuts signal *below* a
+threshold — the opposite operation). Naming it correctly exposes the real invariant:
+**clipping loses data but keeps what remains pristine; compression keeps everything
+but degrades it uniformly.** That is exactly the drop-vs-delay SLA tradeoff — the
+metaphor is isomorphic to the mechanism, not decorative.
+
+Two consequences of the model that are already true of the implementation:
+
+- **`admission` mode is a compressor followed by a brick-wall limiter** — the most
+  standard chain in audio mastering. You can drive the compressor hard (admit
+  everyone, let latency stretch), but the **memory-safety rails** are a safety
+  limiter you cannot bypass, so the signal can never clip into *destruction* (a
+  crash). The honest description of the device is: *a soft-knee compressor with a
+  safety limiter that is always in circuit.*
+- **Attack/release already exist.** The AIMD admission limiter's additive-increase /
+  multiplicative-decrease behaviour *is* the attack (how fast the system leans into
+  load) and release (how fast it recovers) time-constant of the compressor.
+
+**Why a switch, not a continuous knob.** The control exposes two discrete modes, so
+its correct affordance is a **mode switch**, not a rotary knob (which would imply a
+continuum the control does not offer). This is not a stylistic accident: the design
+was inspired by a rack-unit **compressor/limiter whose two behaviours were selected
+by a mode switch** — the same two behaviours, the same discrete selector. The
+remaining continuous quantity — *ratio*, the grey scale between "compress everything"
+and "clip the excess" — is intentionally **not** exposed today; if a middle SLA is
+ever wanted (shed *some* and slow *some*, a soft knee), that is the knob to add, and
+the model already names it. The cluster monitoring pane (Prometheus metrics +
+display) plays the role of the unit's **gain-reduction meter** — the operator's
+feedback that the processor is working.
+
+This is design borrowing of the good kind: not a skin, but a *correct model*
+transplanted from a domain (bounded dynamics under overload) that solved the same
+problem decades earlier, which also makes an abstract distributed-systems policy
+legible through hardware operators already understand.
+
 ## Validation (GCP 3-node RF=3 P=12, sha e97e95c14b11d5d5, fresh data)
 
 Binary built on-node from `git archive HEAD`, installed on all three nodes; each
@@ -166,5 +220,10 @@ modes cost nothing relative to each other.
 - Optionally have admission mode lower the adaptive spill high-watermark so it
   converts RAM pressure into disk earlier (bias spill), widening the admission
   runway before the hard rail.
+- **A `ratio`/soft-knee middle SLA** — the continuum between "compress everything"
+  (admission) and "clip the excess" (latency), per the compressor/limiter model:
+  shed *some* creates while letting latency grow *some*. Would move the control from
+  a two-position switch toward a knob; only worth adding if a workload actually wants
+  a blended envelope rather than one of the two canonical behaviours.
 - ~~Soak-validate admission mode on the cluster~~ (done — see Validation; modes
   converge under closed-loop clients, WAL stays bounded).
