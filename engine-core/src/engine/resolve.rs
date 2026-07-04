@@ -120,6 +120,32 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// The variables visible to a specific element instance: the instance
+    /// variables with any per-element local overlay (a multi-instance child's
+    /// `inputElement`/`loopCounter` bindings) merged on top. For the common case
+    /// of an element with no locals this returns the shared instance-variables
+    /// `Arc` directly (a cheap refcount bump); only a multi-instance child pays
+    /// the clone-and-overlay cost.
+    pub(crate) fn variables_for_element(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Arc<HashMap<String, Value>> {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Arc::default();
+        };
+        match instance.element_locals.get(&element_instance_key) {
+            Some(locals) if !locals.is_empty() => {
+                let mut merged = (*instance.variables).clone();
+                for (k, v) in locals {
+                    merged.insert(k.clone(), v.clone());
+                }
+                Arc::new(merged)
+            }
+            _ => Arc::clone(&instance.variables),
+        }
+    }
+
     /// Resolves a service task's job type against the instance's variables.
     ///
     /// A static type (`"payment"`) is returned verbatim. A FEEL expression

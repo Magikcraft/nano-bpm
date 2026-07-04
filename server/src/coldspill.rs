@@ -235,6 +235,8 @@ mod tests {
             join_instances: HashMap::new(),
             incidents: Vec::new(),
             variables_spilled: false,
+            multi_instances: HashMap::new(),
+            element_locals: HashMap::new(),
         }
     }
 

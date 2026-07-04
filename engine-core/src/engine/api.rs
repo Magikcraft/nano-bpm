@@ -130,7 +130,8 @@ impl Engine {
                     worker: worker.clone(),
                     deadline: *deadline,
                     retries: job.retries,
-                    variables: self.variables(job.instance_key),
+                    variables: self
+                        .variables_for_element(job.instance_key, job.element_instance_key),
                 }),
                 _ => None,
             })
@@ -153,7 +154,7 @@ impl Engine {
             worker: job.worker.clone().unwrap_or_default(),
             deadline: job.deadline.unwrap_or(0),
             retries: job.retries,
-            variables: self.variables(job.instance_key),
+            variables: self.variables_for_element(job.instance_key, job.element_instance_key),
         })
     }
     /// making it activatable again. Like [`Engine::trigger_timers`], the host

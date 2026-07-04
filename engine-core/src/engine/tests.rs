@@ -5371,3 +5371,278 @@ fn should_fire_a_non_interrupting_conditional_boundary_repeatedly() {
         .unwrap();
     assert!(engine.is_completed(key));
 }
+
+// ---------------------------------------------------------------------------
+// Multi-instance activities (FEEL parity 7/7)
+// ---------------------------------------------------------------------------
+
+/// A single-service-task process whose task carries multi-instance
+/// characteristics driven by the `items` variable. `output_element` doubles the
+/// bound `item`, collected into `results`. A trailing `sink` service task parks
+/// the token after the loop so the aggregated variables remain observable in hot
+/// state (ADR 0012 clears variables only on instance completion).
+fn multi_instance_service_process(sequential: bool) -> ProcessDefinition {
+    ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item * 2".to_string()),
+                completion_condition: None,
+                sequential,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn parallel_multi_instance_fans_out_a_child_per_item() {
+    // A parallel multi-instance activity spawns one child (and, for a service
+    // task, one job) per item in the input collection, all at once.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            )]),
+        ))
+        .unwrap();
+
+    // Three parallel children -> three jobs, each carrying its own loopCounter
+    // and bound item in its local variable overlay.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "one job per collection item");
+    let mut seen: Vec<(i64, i64)> = jobs
+        .iter()
+        .map(|j| {
+            let counter = j
+                .variables
+                .get("loopCounter")
+                .and_then(Value::as_f64)
+                .unwrap() as i64;
+            let item = j.variables.get("item").and_then(Value::as_f64).unwrap() as i64;
+            (counter, item)
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, vec![(1, 10), (2, 20), (3, 30)]);
+}
+
+#[test]
+fn parallel_multi_instance_collects_output_collection_in_order() {
+    // Each child's output_element is stored at its index; the body completes
+    // only after every child finishes and writes the aggregate collection —
+    // ordered by index regardless of completion order.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    // Complete out of collection order to prove index-based aggregation.
+    let mut ordered = jobs.clone();
+    ordered.sort_by_key(|j| {
+        std::cmp::Reverse(
+            j.variables
+                .get("loopCounter")
+                .and_then(Value::as_f64)
+                .unwrap() as i64,
+        )
+    });
+    for job in &ordered {
+        assert!(!engine.is_completed(key));
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    // Body drained -> the token advanced to the sink task (instance not yet
+    // completed, so the aggregate is still observable); results doubled each
+    // item in order.
+    assert!(!engine.is_completed(key));
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "sink-work" && matches!(j.state, state::JobState::Created)),
+        "token parked at the sink task"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![
+            Value::Int(2),
+            Value::Int(4),
+            Value::Int(6)
+        ]))
+    );
+}
+
+#[test]
+fn sequential_multi_instance_runs_children_one_at_a_time() {
+    // A sequential multi-instance activity spawns the next child only after the
+    // previous one completes.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(true)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(5), Value::Int(6)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Only the first child is active.
+    let first = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0]
+            .variables
+            .get("loopCounter")
+            .and_then(Value::as_f64)
+            .unwrap() as i64,
+        1
+    );
+    engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+
+    // Completing it spawns the second, still not the whole loop at once.
+    let second = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(second.len(), 1);
+    assert_eq!(
+        second[0]
+            .variables
+            .get("loopCounter")
+            .and_then(Value::as_f64)
+            .unwrap() as i64,
+        2
+    );
+    engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+
+    // Loop drained -> parked at the sink; the ordered aggregate is observable.
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(10), Value::Int(12)]))
+    );
+}
+
+#[test]
+fn multi_instance_completion_condition_completes_the_body_early() {
+    // A satisfied completion condition cancels the still-running children and
+    // completes the body without waiting for them.
+    let def = ProcessBuilder::new("mi-cc")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                // Fire as soon as the first child finishes.
+                completion_condition: Some("=true".to_string()),
+                sequential: false,
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-cc",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3);
+    // Completing ONE child satisfies the condition and ends the body; the other
+    // two jobs are canceled with the body.
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert!(engine.is_completed(key));
+    assert!(
+        engine.state().jobs.values().all(|j| matches!(
+            j.state,
+            state::JobState::Canceled | state::JobState::Completed
+        )),
+        "remaining children canceled on early completion"
+    );
+}
+
+#[test]
+fn empty_input_collection_completes_the_multi_instance_body_immediately() {
+    // An empty collection (or a non-list / erroring expression) yields zero
+    // children; the body completes at once and the token flows on.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // No `handle` jobs created; the body completed at once and the token flowed
+    // through to the sink task (parked there, aggregate still observable).
+    assert_eq!(engine.activate_jobs("handle", "w", 10, 60_000, 0).len(), 0);
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.state().jobs.len(),
+        1,
+        "token parked at the sink task"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![]))
+    );
+}

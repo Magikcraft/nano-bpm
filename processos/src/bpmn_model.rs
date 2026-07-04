@@ -1537,6 +1537,47 @@ fn collect_signals(def: &ProcessDefinition) -> BTreeMap<String, String> {
     names
 }
 
+/// Emit an activity's `multiInstanceLoopCharacteristics` block (with its
+/// `zeebe:loopCharacteristics` extension and optional `completionCondition`) as a
+/// child of the activity element. No-op when the element carries no MI. The
+/// output round-trips through the engine parser (`parse_bpmn`).
+fn emit_multi_instance(el: &Element, out: &mut String) {
+    let Some(mi) = &el.multi_instance else {
+        return;
+    };
+    let seq = if mi.sequential {
+        " isSequential=\"true\""
+    } else {
+        ""
+    };
+    out.push_str(&format!(
+        "      <bpmn:multiInstanceLoopCharacteristics{seq}>\n"
+    ));
+    out.push_str("        <bpmn:extensionElements>\n");
+    out.push_str(&format!(
+        "          <zeebe:loopCharacteristics inputCollection=\"{}\"",
+        xml_escape(&mi.input_collection)
+    ));
+    if let Some(v) = &mi.input_element {
+        out.push_str(&format!(" inputElement=\"{}\"", xml_escape(v)));
+    }
+    if let Some(v) = &mi.output_collection {
+        out.push_str(&format!(" outputCollection=\"{}\"", xml_escape(v)));
+    }
+    if let Some(v) = &mi.output_element {
+        out.push_str(&format!(" outputElement=\"{}\"", xml_escape(v)));
+    }
+    out.push_str("/>\n");
+    out.push_str("        </bpmn:extensionElements>\n");
+    if let Some(cc) = &mi.completion_condition {
+        out.push_str(&format!(
+            "        <bpmn:completionCondition>{}</bpmn:completionCondition>\n",
+            xml_escape(cc)
+        ));
+    }
+    out.push_str("      </bpmn:multiInstanceLoopCharacteristics>\n");
+}
+
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
 /// flows are emitted separately and flat, so this only renders the node and its event/extension
 /// definitions. `errors`/`messages`/`signals` provide the synthesized declaration ids to reference.
@@ -1612,6 +1653,7 @@ fn emit_element(
                 ));
             }
             out.push_str("      </bpmn:extensionElements>\n");
+            emit_multi_instance(el, out);
             out.push_str("    </bpmn:serviceTask>\n");
         }
         ElementKind::UserTask(props) => {
@@ -2553,6 +2595,7 @@ fn apply_edit_op(
                     io: Default::default(),
                     timer: None,
                     retries: None,
+                    multi_instance: None,
                 },
             );
             if let Some(label) = &op_name_label {
@@ -2606,6 +2649,7 @@ fn apply_edit_op(
                     io: Default::default(),
                     timer: None,
                     retries: None,
+                    multi_instance: None,
                 },
             );
             if let Some(label) = &op_name_label {
@@ -2766,6 +2810,7 @@ fn apply_edit_op(
                     io: Default::default(),
                     timer: None,
                     retries: None,
+                    multi_instance: None,
                 },
             );
             Ok(format!(
@@ -3336,6 +3381,64 @@ mod tests {
         );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_a_multi_instance_activity() {
+        // A multi-instance service task must round-trip: the serializer emits a
+        // <bpmn:multiInstanceLoopCharacteristics> with a nested
+        // <zeebe:loopCharacteristics> and <bpmn:completionCondition>, and the
+        // re-parse reproduces the exact MultiInstance structure.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Batched")
+            .start_event("Start")
+            .service_task("Each", "handle")
+            .with_multi_instance(
+                "Each",
+                nanobpmn_engine_core::MultiInstance {
+                    input_collection: "=items".to_string(),
+                    input_element: Some("item".to_string()),
+                    output_collection: Some("results".to_string()),
+                    output_element: Some("=item * 2".to_string()),
+                    completion_condition: Some("=count(results) >= 2".to_string()),
+                    sequential: true,
+                },
+            )
+            .end_event("Done")
+            .connect("Start", "Each")
+            .connect("Each", "Done")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:multiInstanceLoopCharacteristics"),
+            "emits the multi-instance characteristics"
+        );
+        assert!(
+            xml.contains("<zeebe:loopCharacteristics "),
+            "emits the zeebe:loopCharacteristics extension"
+        );
+        assert!(
+            xml.contains("<bpmn:completionCondition>"),
+            "emits the completion condition"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        // assert_same_structure ignores the MI field; verify it explicitly.
+        let mi = reparsed[0]
+            .element("Each")
+            .unwrap()
+            .multi_instance
+            .as_ref()
+            .expect("multi-instance survives the round-trip");
+        assert_eq!(mi.input_collection, "=items");
+        assert_eq!(mi.input_element.as_deref(), Some("item"));
+        assert_eq!(mi.output_collection.as_deref(), Some("results"));
+        assert_eq!(mi.output_element.as_deref(), Some("=item * 2"));
+        assert_eq!(
+            mi.completion_condition.as_deref(),
+            Some("=count(results) >= 2")
+        );
+        assert!(mi.sequential);
     }
 
     #[test]

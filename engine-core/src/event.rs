@@ -453,6 +453,51 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// A multi-instance body activated: its `input_collection` was evaluated to
+    /// `items` and one child of `element_id` will run per item (all at once when
+    /// `sequential` is `false`, one after another when `true`). Carries the
+    /// resolved loop configuration so the body's runtime state is fully
+    /// reconstructable from the log. `body_key` is the body element instance (the
+    /// scope the children run in).
+    MultiInstanceActivated {
+        instance_key: Key,
+        body_key: Key,
+        element_id: ElementId,
+        sequential: bool,
+        items: Vec<Value>,
+        input_element: Option<String>,
+        output_collection: Option<String>,
+        output_element: Option<String>,
+        completion_condition: Option<String>,
+    },
+    /// A multi-instance child instance was activated at `index` (0-based) into the
+    /// input collection. `local_variables` are the child's scope bindings (the
+    /// `input_element` item, when named, and `loopCounter`), overlaid on the
+    /// instance variables when the child's job is activated or its FEEL evaluated.
+    MultiInstanceChildActivated {
+        instance_key: Key,
+        body_key: Key,
+        child_key: Key,
+        index: usize,
+        local_variables: HashMap<String, Value>,
+    },
+    /// A multi-instance child completed: its `output` (the evaluated
+    /// `output_element`, if any) is recorded at `index` in the body's collected
+    /// results, the child leaves the body's active set, and its local variable
+    /// overlay is dropped.
+    MultiInstanceChildCompleted {
+        instance_key: Key,
+        body_key: Key,
+        child_key: Key,
+        index: usize,
+        output: Option<Value>,
+    },
+    /// A multi-instance body completed (all children finished, or a completion
+    /// condition fired). Its runtime state is dropped; the aggregated
+    /// `output_collection` (when named) is written by a surrounding
+    /// [`Event::VariablesUpdated`] and its outgoing flow taken by the surrounding
+    /// element-completion events.
+    MultiInstanceCompleted { instance_key: Key, body_key: Key },
     /// The **instance** partition tore down a cross-partition parked
     /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],
     /// recorded by [`Event::MessageSubscriptionOpening`]) because the element it
@@ -568,6 +613,10 @@ impl Event {
             | Event::ConditionalSubscriptionCreated { instance_key, .. }
             | Event::ConditionalTriggered { instance_key, .. }
             | Event::ConditionalSubscriptionCanceled { instance_key, .. }
+            | Event::MultiInstanceActivated { instance_key, .. }
+            | Event::MultiInstanceChildActivated { instance_key, .. }
+            | Event::MultiInstanceChildCompleted { instance_key, .. }
+            | Event::MultiInstanceCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
@@ -692,6 +741,18 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*subscription_key).max(*element_instance_key),
+            Event::MultiInstanceActivated { body_key, .. }
+            | Event::MultiInstanceCompleted { body_key, .. } => m = m.max(*body_key),
+            Event::MultiInstanceChildActivated {
+                body_key,
+                child_key,
+                ..
+            }
+            | Event::MultiInstanceChildCompleted {
+                body_key,
+                child_key,
+                ..
+            } => m = m.max(*body_key).max(*child_key),
             Event::SignalCorrelated {
                 subscription_key,
                 signal_key,

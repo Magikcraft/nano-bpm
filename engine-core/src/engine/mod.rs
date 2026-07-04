@@ -135,6 +135,19 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Activate one child of a multi-instance body: instantiate `element_id`
+    /// again in the body's scope with the `index`-th item's local bindings. The
+    /// item and bindings are read from the body's runtime state.
+    ActivateMiChild {
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        index: usize,
+    },
+    /// Complete a multi-instance body: aggregate the collected output, cancel any
+    /// children still running (an early completion-condition fire), write the
+    /// output collection, and take the activity's outgoing flow.
+    CompleteMiBody { instance_key: Key, body_key: Key },
 }
 
 impl Engine {
@@ -2224,6 +2237,16 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.create_job_for(instance_key, element_instance_key, element_id),
+            Step::ActivateMiChild {
+                instance_key,
+                element_id,
+                body_key,
+                index,
+            } => self.activate_mi_child(instance_key, element_id, body_key, index),
+            Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            } => self.complete_multi_instance_body(instance_key, body_key),
         }
     }
 
@@ -2241,6 +2264,25 @@ impl Engine {
             && self.incoming_count(instance_key, &element_id) > 1
         {
             return self.arrive_at_parallel_join(instance_key, element_id, scope);
+        }
+
+        // A multi-instance activity: unless we are already inside its body (i.e.
+        // this is one of its children, running in the body scope), this
+        // activation opens the multi-instance body — it evaluates the input
+        // collection and fans out one child per item instead of instantiating a
+        // single activity.
+        let is_mi_child = scope != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false);
+        if !is_mi_child {
+            if let Some(mi) = self.multi_instance_of(instance_key, &element_id) {
+                return self.activate_multi_instance_body(instance_key, element_id, scope, mi);
+            }
         }
 
         let element_instance_key = self.mint_key();
@@ -2485,12 +2527,440 @@ impl Engine {
         (events, followups)
     }
 
+    /// Opens a multi-instance body: evaluates the input collection and fans out
+    /// one child of the activity per item. A non-list result or an evaluation
+    /// error yields an empty loop (the body completes immediately) — a flat-scope
+    /// choice mirroring the conditional-event error semantics. Children run in the
+    /// body's scope; parallel bodies spawn every child at once, sequential bodies
+    /// spawn the first and chain the rest at each child's completion.
+    fn activate_multi_instance_body(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        mi: crate::model::MultiInstance,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let body_key = self.mint_key();
+        let mut events = vec![
+            Event::ElementActivating {
+                instance_key,
+                element_instance_key: body_key,
+                element_id: element_id.clone(),
+            },
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key: body_key,
+                element_id: element_id.clone(),
+                scope,
+            },
+        ];
+        // Input mappings on the activity apply once, on body activation.
+        let inputs = self.io_inputs(instance_key, &element_id);
+        if !inputs.is_empty() {
+            let updates = self.eval_io_mappings(instance_key, &inputs);
+            if !updates.is_empty() {
+                events.push(Event::VariablesUpdated {
+                    instance_key,
+                    variables: updates,
+                });
+            }
+        }
+        let vars = self.variables(instance_key);
+        let items: Vec<Value> = match crate::feel::eval(&mi.input_collection, &vars) {
+            Ok(Value::List(list)) => list,
+            _ => Vec::new(),
+        };
+        let total = items.len();
+        events.push(Event::MultiInstanceActivated {
+            instance_key,
+            body_key,
+            element_id: element_id.clone(),
+            sequential: mi.sequential,
+            items,
+            input_element: mi.input_element.clone(),
+            output_collection: mi.output_collection.clone(),
+            output_element: mi.output_element.clone(),
+            completion_condition: mi.completion_condition.clone(),
+        });
+
+        let mut followups = Vec::new();
+        if total == 0 {
+            followups.push(Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            });
+        } else if mi.sequential {
+            followups.push(Step::ActivateMiChild {
+                instance_key,
+                element_id,
+                body_key,
+                index: 0,
+            });
+        } else {
+            for index in 0..total {
+                followups.push(Step::ActivateMiChild {
+                    instance_key,
+                    element_id: element_id.clone(),
+                    body_key,
+                    index,
+                });
+            }
+        }
+        (events, followups)
+    }
+
+    /// Activates one child of a multi-instance body: instantiates the activity
+    /// again in the body scope, binding the `index`-th item (as `inputElement`,
+    /// when named) and the 1-based `loopCounter` into the child's local variable
+    /// overlay. A service-task child creates a job; any other activity kind passes
+    /// straight through to completion (which routes back into the loop).
+    fn activate_mi_child(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        index: usize,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let (item, input_element) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&body_key))
+        {
+            Some(mi) => (
+                mi.items.get(index).cloned().unwrap_or(Value::Null),
+                mi.input_element.clone(),
+            ),
+            None => return (Vec::new(), Vec::new()),
+        };
+
+        let child_key = self.mint_key();
+        let mut locals: HashMap<String, Value> = HashMap::new();
+        if let Some(name) = &input_element {
+            locals.insert(name.clone(), item);
+        }
+        locals.insert("loopCounter".to_string(), Value::Int((index as i64) + 1));
+
+        let mut events = vec![
+            Event::ElementActivating {
+                instance_key,
+                element_instance_key: child_key,
+                element_id: element_id.clone(),
+            },
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key: child_key,
+                element_id: element_id.clone(),
+                scope: body_key,
+            },
+            Event::MultiInstanceChildActivated {
+                instance_key,
+                body_key,
+                child_key,
+                index,
+                local_variables: locals,
+            },
+        ];
+        let mut followups = Vec::new();
+        match self.element_kind(instance_key, &element_id) {
+            Some(ElementKind::ServiceTask { job_type, priority }) => {
+                let job_key = self.mint_key();
+                let job_type = self.resolve_job_type(instance_key, &job_type);
+                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let retries = self.resolve_retries(
+                    instance_key,
+                    self.retries_of(instance_key, &element_id).as_deref(),
+                );
+                events.push(Event::JobCreated {
+                    job_key,
+                    instance_key,
+                    element_instance_key: child_key,
+                    element_id,
+                    job_type,
+                    created_at: self.now,
+                    priority,
+                    retries,
+                });
+            }
+            _ => {
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key: child_key,
+                    element_id,
+                });
+            }
+        }
+        (events, followups)
+    }
+
+    /// Completes one multi-instance child: collects its `output_element` (in the
+    /// child's local scope) into the body's results at the child's index, then
+    /// decides what comes next — fire the completion condition (complete the body
+    /// early), spawn the next child (sequential), or complete the body once every
+    /// child has finished (parallel).
+    fn complete_mi_child(
+        &mut self,
+        instance_key: Key,
+        child_eik: Key,
+        element_id: String,
+        body_key: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = vec![
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: element_id.clone(),
+            },
+        ];
+
+        // Snapshot the loop configuration and this child's index before evaluating.
+        let (
+            output_element,
+            completion_condition,
+            sequential,
+            total,
+            spawned,
+            active_now,
+            mi_element,
+        ) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&body_key))
+        {
+            Some(mi) => (
+                mi.output_element.clone(),
+                mi.completion_condition.clone(),
+                mi.sequential,
+                mi.items.len(),
+                mi.spawned,
+                mi.active.len(),
+                mi.element_id.clone(),
+            ),
+            None => return (events, Vec::new()),
+        };
+        let index = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.element_locals.get(&child_eik))
+            .and_then(|l| l.get("loopCounter"))
+            .and_then(|v| v.as_f64())
+            .map(|c| (c as i64 - 1).max(0) as usize)
+            .unwrap_or(0);
+
+        // Collect this child's output (evaluated in its local scope) at its index.
+        let output = output_element.as_deref().and_then(|expr| {
+            let vars = self.variables_for_element(instance_key, child_eik);
+            crate::feel::eval(expr, &vars).ok()
+        });
+        events.push(Event::MultiInstanceChildCompleted {
+            instance_key,
+            body_key,
+            child_key: child_eik,
+            index,
+            output,
+        });
+
+        // After each child, a satisfied completion condition ends the body early.
+        let completion_now = completion_condition
+            .as_deref()
+            .map(|c| {
+                matches!(
+                    crate::feel::eval_bool(c, &self.variables(instance_key)),
+                    Ok(true)
+                )
+            })
+            .unwrap_or(false);
+
+        let mut followups = Vec::new();
+        // `active_now` still counts this child (its removal event above is not yet
+        // applied), so the parallel body is drained when only this child remains.
+        let others_active = active_now.saturating_sub(1);
+        if completion_now {
+            followups.push(Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            });
+        } else if sequential {
+            if spawned < total {
+                followups.push(Step::ActivateMiChild {
+                    instance_key,
+                    element_id: mi_element,
+                    body_key,
+                    index: spawned,
+                });
+            } else {
+                followups.push(Step::CompleteMiBody {
+                    instance_key,
+                    body_key,
+                });
+            }
+        } else if others_active == 0 && spawned >= total {
+            followups.push(Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Completes a multi-instance body: cancels any children still running (an
+    /// early completion-condition fire), writes the aggregated output collection
+    /// (padding uncollected slots with `null`) into the instance scope, applies
+    /// the activity's output mappings, and takes its outgoing flow.
+    fn complete_multi_instance_body(
+        &mut self,
+        instance_key: Key,
+        body_key: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let (element_id, output_collection, output_values, active): (
+            ElementId,
+            Option<String>,
+            Vec<Value>,
+            Vec<Key>,
+        ) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&body_key))
+        {
+            Some(mi) => (
+                mi.element_id.clone(),
+                mi.output_collection.clone(),
+                mi.output_values
+                    .iter()
+                    .map(|o| o.clone().unwrap_or(Value::Null))
+                    .collect(),
+                mi.active.iter().copied().collect(),
+            ),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let scope = self.scope_of(instance_key, body_key);
+
+        let mut events = Vec::new();
+        // Cancel any children still running (reached here via completion condition).
+        for child in &active {
+            events.extend(self.cancel_mi_child_events(instance_key, *child));
+        }
+        // Write the aggregated output collection to the instance scope, and apply
+        // the activity's output mappings against it.
+        let mut collection_update: Option<HashMap<String, Value>> = None;
+        if let Some(name) = output_collection {
+            let mut map = HashMap::new();
+            map.insert(name, Value::List(output_values));
+            events.push(Event::VariablesUpdated {
+                instance_key,
+                variables: map.clone(),
+            });
+            collection_update = Some(map);
+        }
+        events.push(Event::ElementCompleting {
+            instance_key,
+            element_instance_key: body_key,
+            element_id: element_id.clone(),
+        });
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key: body_key,
+            element_id: element_id.clone(),
+        });
+        events.push(Event::MultiInstanceCompleted {
+            instance_key,
+            body_key,
+        });
+        // Output mappings (zeebe:output) on the activity apply as the body drains,
+        // able to reference the just-written output collection.
+        let outputs = self.io_outputs(instance_key, &element_id);
+        if !outputs.is_empty() {
+            let updates = match &collection_update {
+                Some(update) => {
+                    let mut vars = (*self.variables(instance_key)).clone();
+                    vars.extend(update.clone());
+                    self.eval_io_mappings_in(&vars, &outputs)
+                }
+                None => self.eval_io_mappings(instance_key, &outputs),
+            };
+            if !updates.is_empty() {
+                events.push(Event::VariablesUpdated {
+                    instance_key,
+                    variables: updates,
+                });
+            }
+        }
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Builds the events that cancel a still-running multi-instance child (its job
+    /// and element instance), for an early body completion. Returns events (it
+    /// does not emit) so it composes inside a `process_step` result.
+    fn cancel_mi_child_events(&self, instance_key: Key, child_eik: Key) -> Vec<Event> {
+        let mut events = Vec::new();
+        let element_id = self
+            .element_id_of_instance(instance_key, child_eik)
+            .unwrap_or_default();
+        if let Some(job_key) = self.active_job_on(child_eik) {
+            events.push(Event::JobCanceled {
+                job_key,
+                instance_key,
+            });
+        }
+        events.extend(self.cancel_all_timers_on(child_eik));
+        events.extend(self.cancel_all_subscriptions_on(child_eik));
+        events.push(Event::ElementCompleting {
+            instance_key,
+            element_instance_key: child_eik,
+            element_id: element_id.clone(),
+        });
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key: child_eik,
+            element_id,
+        });
+        events
+    }
+
     fn complete(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
+        // A completing element instance whose scope is a multi-instance body is
+        // one of that body's children: its completion feeds the loop's output
+        // collection and completion condition rather than taking the activity's
+        // outgoing flow directly.
+        let scope = self.scope_of(instance_key, element_instance_key);
+        if scope != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false)
+        {
+            return self.complete_mi_child(instance_key, element_instance_key, element_id, scope);
+        }
+
         if matches!(
             self.element_kind(instance_key, &element_id),
             Some(ElementKind::ExclusiveGateway)
@@ -2895,6 +3365,17 @@ impl Engine {
         self.process_of_instance(instance_key)?
             .element(element_id)
             .map(|e| e.kind.clone())
+    }
+
+    /// The multi-instance loop characteristics declared on `element_id`, if any.
+    fn multi_instance_of(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Option<crate::model::MultiInstance> {
+        self.process_of_instance(instance_key)?
+            .element(element_id)
+            .and_then(|e| e.multi_instance.clone())
     }
 }
 

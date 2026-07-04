@@ -224,6 +224,51 @@ pub struct TimerDef {
     pub expr: String,
 }
 
+/// Multi-instance loop characteristics declared on an activity (a service task
+/// in nano's supported subset). Mirrors BPMN `multiInstanceLoopCharacteristics`
+/// plus Zeebe's `zeebe:loopCharacteristics` extension: on activation the FEEL
+/// `input_collection` is evaluated to a list, and one child instance of the
+/// activity is created per item (all at once when `sequential == false`, one
+/// after another when `sequential == true`).
+///
+/// Each child runs in a local variable scope layered over the instance
+/// variables: `input_element` (when set) binds that item, and `loopCounter`
+/// binds the 1-based index. On each child's completion the FEEL `output_element`
+/// (when set) is evaluated in the child scope and collected, by index, into the
+/// list variable named by `output_collection`, which is written to the instance
+/// scope when the multi-instance body completes. After each child completes the
+/// FEEL `completion_condition` (when set) is evaluated; a `true` result cancels
+/// any remaining children and completes the body early.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MultiInstance {
+    /// FEEL expression (leading `=` optional) evaluated on activation to the
+    /// collection of items driving the loop.
+    pub input_collection: String,
+    /// Local variable name each item is bound to for the child instance. `None`
+    /// binds no item variable (only `loopCounter` is available).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub input_element: Option<String>,
+    /// Name of the instance-level list variable the per-child `output_element`
+    /// results are collected into. `None` collects nothing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_collection: Option<String>,
+    /// FEEL expression (leading `=` optional) evaluated in each child scope at
+    /// child completion; its result is stored at the child's index in
+    /// `output_collection`. `None` collects nothing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_element: Option<String>,
+    /// FEEL boolean expression evaluated after each child completes; `true`
+    /// cancels remaining children and completes the body early. `None` waits for
+    /// every child.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub completion_condition: Option<String>,
+    /// `true` runs children one at a time (each starts only after the previous
+    /// completes); `false` (the default) runs them all in parallel.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sequential: bool,
+}
+
 /// The (raw, un-evaluated) assignment, scheduling and priority expressions
 /// declared on a `userTask` BPMN element via its Zeebe extension elements
 /// (`zeebe:assignmentDefinition`, `zeebe:taskSchedule`, `zeebe:priorityDefinition`).
@@ -539,6 +584,11 @@ pub struct Element {
     /// and the job starts with [`crate::state::DEFAULT_JOB_RETRIES`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub retries: Option<String>,
+    /// Multi-instance loop characteristics on this activity, or `None` (the
+    /// default) for an ordinary single-instance element and for definitions
+    /// serialized before multi-instance support existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub multi_instance: Option<MultiInstance>,
 }
 
 /// An executable process definition: a set of [`Element`]s plus the id of the
@@ -667,6 +717,7 @@ fn splice_call_activities(
                     io: el.io.clone(),
                     timer: el.timer.clone(),
                     retries: el.retries.clone(),
+                    multi_instance: el.multi_instance.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -690,6 +741,7 @@ fn splice_call_activities(
                     io: el.io.clone(),
                     timer: el.timer.clone(),
                     retries: el.retries.clone(),
+                    multi_instance: el.multi_instance.clone(),
                 },
             );
         }
@@ -787,6 +839,11 @@ pub struct ProcessBuilder {
     /// [`build`]: ProcessBuilder::build
     timers: Vec<(ElementId, TimerDef)>,
     retries: Vec<(ElementId, String)>,
+    /// Recorded `(element id, multi-instance characteristics)` declarations,
+    /// applied in [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    multi_instances: Vec<(ElementId, MultiInstance)>,
 }
 
 impl ProcessBuilder {
@@ -800,6 +857,7 @@ impl ProcessBuilder {
             ios: Vec::new(),
             timers: Vec::new(),
             retries: Vec::new(),
+            multi_instances: Vec::new(),
         }
     }
 
@@ -812,6 +870,7 @@ impl ProcessBuilder {
             io: IoMapping::default(),
             timer: None,
             retries: None,
+            multi_instance: None,
         });
         self
     }
@@ -1001,6 +1060,13 @@ impl ProcessBuilder {
     /// [`build`](ProcessBuilder::build).
     pub fn with_retries(mut self, id: impl Into<String>, retries: impl Into<String>) -> Self {
         self.retries.push((id.into(), retries.into()));
+        self
+    }
+
+    /// Declares multi-instance loop characteristics (see [`MultiInstance`]) on an
+    /// activity. Applied in [`build`](ProcessBuilder::build).
+    pub fn with_multi_instance(mut self, id: impl Into<String>, mi: MultiInstance) -> Self {
+        self.multi_instances.push((id.into(), mi));
         self
     }
 
@@ -1414,6 +1480,14 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach multi-instance loop characteristics to their activity elements.
+        for (id, mi) in &self.multi_instances {
+            match elements.get_mut(id) {
+                Some(element) => element.multi_instance = Some(mi.clone()),
+                None => return Err(BuildError::UnknownMultiInstanceElement(id.clone())),
+            }
+        }
+
         // The process-level start event is the unique start event that is not
         // contained in any sub-process (sub-process inner start events have a
         // parent and start their own scope, not the instance).
@@ -1468,6 +1542,8 @@ pub enum BuildError {
     UnknownTimerElement(ElementId),
     /// A `with_retries` referenced an element that does not exist.
     UnknownRetriesElement(ElementId),
+    /// A `with_multi_instance` referenced an element that does not exist.
+    UnknownMultiInstanceElement(ElementId),
 }
 
 impl std::fmt::Display for BuildError {
@@ -1508,6 +1584,12 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::UnknownRetriesElement(id) => {
                 write!(f, "retries expression declared on unknown element {id}")
+            }
+            BuildError::UnknownMultiInstanceElement(id) => {
+                write!(
+                    f,
+                    "multi-instance characteristics declared on unknown element {id}"
+                )
             }
         }
     }

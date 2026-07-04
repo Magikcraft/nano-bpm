@@ -138,6 +138,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // A separate buffer for a conditional-event's nested `<condition>` FEEL text
     // (distinct from a sequence flow's `conditionExpression`).
     let mut event_condition_text: Option<String> = None;
+    // A buffer for a multi-instance `<completionCondition>` FEEL text, and the
+    // index of the activity whose `multiInstanceLoopCharacteristics` is open.
+    let mut completion_condition_text: Option<String> = None;
+    let mut cur_multi_instance: Option<usize> = None;
     // The boundary event currently being read (to attach its errorEventDefinition).
     let mut cur_boundary: Option<PendingBoundary> = None;
     // Index of the intermediate catch event currently being read (timer or
@@ -537,6 +541,49 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "condition" if cur_intermediate.is_some() || cur_boundary.is_some() => {
                                 event_condition_text = Some(String::new());
                             }
+                            // A `multiInstanceLoopCharacteristics` child of an
+                            // activity: mark that activity multi-instance. The
+                            // FEEL-bearing details (inputCollection/inputElement/
+                            // outputCollection/outputElement) live in a nested
+                            // `zeebe:loopCharacteristics`; the standard BPMN
+                            // `<completionCondition>` FEEL text is captured below.
+                            "multiInstanceLoopCharacteristics" => {
+                                if let Some(&idx) = io_stack.last() {
+                                    let sequential = attr(attrs, "isSequential")
+                                        .map(|v| v == "true")
+                                        .unwrap_or(false);
+                                    acc.nodes[idx].multi_instance =
+                                        Some(crate::model::MultiInstance {
+                                            sequential,
+                                            ..Default::default()
+                                        });
+                                    if !self_closing {
+                                        cur_multi_instance = Some(idx);
+                                    }
+                                }
+                            }
+                            // zeebe:loopCharacteristics inside a multi-instance
+                            // activity: the input/output collection FEEL details.
+                            "loopCharacteristics" => {
+                                if let Some(idx) = cur_multi_instance {
+                                    if let Some(mi) = acc.nodes[idx].multi_instance.as_mut() {
+                                        if let Some(v) = attr(attrs, "inputCollection") {
+                                            mi.input_collection = v.to_string();
+                                        }
+                                        mi.input_element =
+                                            attr(attrs, "inputElement").map(str::to_string);
+                                        mi.output_collection =
+                                            attr(attrs, "outputCollection").map(str::to_string);
+                                        mi.output_element =
+                                            attr(attrs, "outputElement").map(str::to_string);
+                                    }
+                                }
+                            }
+                            // The standard BPMN `<completionCondition>` FEEL text
+                            // nested in `multiInstanceLoopCharacteristics`.
+                            "completionCondition" if cur_multi_instance.is_some() => {
+                                completion_condition_text = Some(String::new());
+                            }
                             // zeebe:ioMapping and its nested zeebe:input/output.
                             // input/output are only read inside an ioMapping that
                             // belongs to an open activity (the innermost on the
@@ -583,6 +630,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 if let Some(buf) = date_text.as_mut() {
                     buf.push_str(text);
                 }
+                if let Some(buf) = completion_condition_text.as_mut() {
+                    buf.push_str(text);
+                }
             }
             Token::End { name } => match local_name(name) {
                 "process" => {
@@ -600,6 +650,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     event_condition_text = None;
                     cur_user_task = None;
                     cur_call = None;
+                    completion_condition_text = None;
+                    cur_multi_instance = None;
                     io_stack.clear();
                     in_io_mapping = false;
                 }
@@ -676,6 +728,21 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     }
                 }
                 "intermediateCatchEvent" => cur_intermediate = None,
+                "multiInstanceLoopCharacteristics" => cur_multi_instance = None,
+                "completionCondition" => {
+                    if let (Some(idx), Some(text)) =
+                        (cur_multi_instance, completion_condition_text.take())
+                    {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            if let Some(acc) = current.as_mut() {
+                                if let Some(mi) = acc.nodes[idx].multi_instance.as_mut() {
+                                    mi.completion_condition = Some(trimmed.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
                 "timeDuration" => {
                     if let Some(text) = duration_text.take() {
                         let trimmed = text.trim();
@@ -842,6 +909,10 @@ struct NodeAcc {
     /// for the event to fire. Makes the node a
     /// [`ConditionalIntermediateCatchEvent`](crate::model::ElementKind::ConditionalIntermediateCatchEvent).
     event_condition: Option<String>,
+    /// Multi-instance loop characteristics collected from a
+    /// `multiInstanceLoopCharacteristics` child plus its
+    /// `zeebe:loopCharacteristics` extension; `None` for a single-instance node.
+    multi_instance: Option<crate::model::MultiInstance>,
 }
 
 #[derive(Clone, Copy)]
@@ -943,6 +1014,7 @@ impl ProcessAcc {
             script_expression: None,
             script_result_variable: None,
             event_condition: None,
+            multi_instance: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -1080,6 +1152,15 @@ impl ProcessAcc {
             let node_timer = node.timer_expr.clone();
             let retries_id = node.id.clone();
             let node_retries = node.retries.clone();
+            let mi_id = node.id.clone();
+            // Only treat as multi-instance when an input collection was actually
+            // declared; a bare `multiInstanceLoopCharacteristics` with no
+            // `zeebe:loopCharacteristics inputCollection` degenerates to an
+            // ordinary single-instance activity.
+            let node_mi = node
+                .multi_instance
+                .clone()
+                .filter(|mi| !mi.input_collection.trim().is_empty());
             let parent = node.parent.clone();
             if let Some(d) = node.default_flow.clone() {
                 default_flow_ids.insert(d);
@@ -1209,6 +1290,9 @@ impl ProcessAcc {
             }
             if let Some(retries) = node_retries {
                 builder = builder.with_retries(retries_id, retries);
+            }
+            if let Some(mi) = node_mi {
+                builder = builder.with_multi_instance(mi_id, mi);
             }
         }
         for boundary in self.boundaries {
@@ -2287,6 +2371,64 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "aborted"));
+    }
+
+    #[test]
+    fn should_parse_multi_instance_loop_characteristics() {
+        // given: a service task carrying parallel multi-instance characteristics
+        // with a zeebe:loopCharacteristics extension (input/output collection and
+        // element) plus a completionCondition in the standard BPMN element text.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="each">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="handle" />
+                </bpmn:extensionElements>
+                <bpmn:multiInstanceLoopCharacteristics isSequential="true">
+                  <bpmn:extensionElements>
+                    <zeebe:loopCharacteristics
+                        inputCollection="=items"
+                        inputElement="item"
+                        outputCollection="results"
+                        outputElement="=item * 2" />
+                  </bpmn:extensionElements>
+                  <bpmn:completionCondition>=count(results) &gt;= 2</bpmn:completionCondition>
+                </bpmn:multiInstanceLoopCharacteristics>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="each" />
+              <bpmn:sequenceFlow id="f1" sourceRef="each" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        let mi = def
+            .element("each")
+            .unwrap()
+            .multi_instance
+            .as_ref()
+            .expect("multi-instance characteristics parsed");
+        assert_eq!(mi.input_collection, "=items");
+        assert_eq!(mi.input_element.as_deref(), Some("item"));
+        assert_eq!(mi.output_collection.as_deref(), Some("results"));
+        assert_eq!(mi.output_element.as_deref(), Some("=item * 2"));
+        assert_eq!(
+            mi.completion_condition.as_deref(),
+            Some("=count(results) >= 2")
+        );
+        assert!(mi.sequential, "isSequential=true parsed");
+        // The task itself still routes to a job (taskDefinition preserved).
+        assert!(matches!(
+            def.element("each").unwrap().kind,
+            ElementKind::ServiceTask { .. }
+        ));
     }
 
     #[test]

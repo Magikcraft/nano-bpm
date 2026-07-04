@@ -283,6 +283,50 @@ pub struct ProcessInstance {
     /// journaled, and is irrelevant to replay (a replayed instance starts
     /// resident with its variables from the log).
     pub variables_spilled: bool,
+    /// Active multi-instance bodies in this instance, keyed by the body element
+    /// instance. Empty (the default) for instances with no multi-instance
+    /// activity and when deserializing snapshots written before multi-instance
+    /// support existed. Rides along in [`InstanceSnapshot::instance`] on spill,
+    /// so it needs no separate drain/rehydrate wiring.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub multi_instances: HashMap<Key, MultiInstanceState>,
+    /// Per-element-instance local variable overlays (the multi-instance child
+    /// bindings: `inputElement` and `loopCounter`). Merged over the instance
+    /// variables when a child's job is activated or its FEEL is evaluated.
+    /// Empty for non-multi-instance work; entries are cleared as each child
+    /// completes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub element_locals: HashMap<Key, HashMap<String, Value>>,
+}
+
+/// Runtime state of an active multi-instance body (the element instance carrying
+/// [`crate::model::MultiInstance`] characteristics). Reconstructed from the
+/// multi-instance events, so it needs no bespoke snapshot handling beyond riding
+/// along in the owning [`ProcessInstance`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MultiInstanceState {
+    /// The activity element id this body loops over.
+    pub element_id: ElementId,
+    /// `true` runs children one at a time; `false` runs all in parallel.
+    pub sequential: bool,
+    /// The evaluated input collection driving the loop (one child per item).
+    pub items: Vec<Value>,
+    /// Instance-level list variable the per-child output is collected into.
+    pub output_collection: Option<String>,
+    /// FEEL expression collected per child into `output_collection`.
+    pub output_element: Option<String>,
+    /// FEEL boolean evaluated after each child; `true` completes the body early.
+    pub completion_condition: Option<String>,
+    /// Local variable name each item binds to in its child scope.
+    pub input_element: Option<String>,
+    /// How many children have been spawned so far (drives sequential's next
+    /// index and detects when all items have been started).
+    pub spawned: usize,
+    /// Element instances of the children that are still active.
+    pub active: std::collections::BTreeSet<Key>,
+    /// Collected per-child output, positioned by the child's 0-based index.
+    pub output_values: Vec<Option<Value>>,
 }
 
 /// Why an incident was raised. Maps to a recovery story and to the REST
@@ -810,6 +854,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     join_instances: HashMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
+                    multi_instances: HashMap::new(),
+                    element_locals: HashMap::new(),
                 },
             );
         }
@@ -854,6 +900,9 @@ pub fn apply(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
                 instance.scopes.remove(element_instance_key);
+                // Drop any multi-instance child local overlay (a no-op for
+                // ordinary elements); a completed/cancelled child never needs it.
+                instance.element_locals.remove(element_instance_key);
             }
         }
 
@@ -1404,6 +1453,90 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(subscription) = state.conditional_subscriptions.get_mut(subscription_key) {
                 subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
+        // A multi-instance body activated: record its runtime state so subsequent
+        // child spawns/completions and the body's completion are reconstructable.
+        Event::MultiInstanceActivated {
+            instance_key,
+            body_key,
+            element_id,
+            sequential,
+            items,
+            input_element,
+            output_collection,
+            output_element,
+            completion_condition,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                let total = items.len();
+                instance.multi_instances.insert(
+                    *body_key,
+                    MultiInstanceState {
+                        element_id: element_id.clone(),
+                        sequential: *sequential,
+                        items: items.clone(),
+                        output_collection: output_collection.clone(),
+                        output_element: output_element.clone(),
+                        completion_condition: completion_condition.clone(),
+                        input_element: input_element.clone(),
+                        spawned: 0,
+                        active: std::collections::BTreeSet::new(),
+                        output_values: vec![None; total],
+                    },
+                );
+            }
+        }
+
+        // A multi-instance child activated: register its local variable overlay
+        // and mark it active in the body it belongs to.
+        Event::MultiInstanceChildActivated {
+            instance_key,
+            body_key,
+            child_key,
+            index,
+            local_variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .element_locals
+                    .insert(*child_key, local_variables.clone());
+                if let Some(mi) = instance.multi_instances.get_mut(body_key) {
+                    mi.active.insert(*child_key);
+                    mi.spawned = mi.spawned.max(*index + 1);
+                }
+            }
+        }
+
+        // A multi-instance child completed: collect its output at its index, drop
+        // it from the active set, and clear its local variable overlay.
+        Event::MultiInstanceChildCompleted {
+            instance_key,
+            body_key,
+            child_key,
+            index,
+            output,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.element_locals.remove(child_key);
+                if let Some(mi) = instance.multi_instances.get_mut(body_key) {
+                    mi.active.remove(child_key);
+                    if let Some(slot) = mi.output_values.get_mut(*index) {
+                        *slot = output.clone();
+                    }
+                }
+            }
+        }
+
+        // A multi-instance body completed: drop its runtime state. The aggregated
+        // output and the outgoing flow are carried by surrounding events.
+        Event::MultiInstanceCompleted {
+            instance_key,
+            body_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.multi_instances.remove(body_key);
             }
         }
 
