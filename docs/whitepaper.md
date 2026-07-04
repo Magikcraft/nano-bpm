@@ -819,7 +819,11 @@ build), reproducible from the load generator and switches in the repository; no
 
 On a cluster of 3× `c2‑standard‑16`, RF=3, 12 partitions, the engine sustains
 **~95 000 process instances/s aggregate — ~30 000 per node** (one job per
-instance, so this is also jobs/s). The ceiling is *coordination-bound*, not
+instance, so this is also jobs/s), and it does so on the *strongest* durability
+setting, not a relaxed one: the default quorum-durable replication path (a
+majority replicates **and** applies before the client is acked) over local
+fsync-before-ack journalling. The lighter tiers of §9.3 (leader-durable, async)
+are opt-in and were left off. The ceiling is *coordination-bound*, not
 resource-bound: at that rate the nodes still run with roughly a third of their
 CPU idle and negligible I/O wait, the limit being cross-thread contention around
 the single-writer engine actor and the replication round-trips. That matters for
