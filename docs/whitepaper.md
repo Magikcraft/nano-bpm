@@ -827,37 +827,64 @@ producers and workers (`loadgen`, the Rust generator from `ts-performance-matrix
 that create instances under server-granted submission credits and stream-activate
 the jobs back — the create → adapt → drain loop of §6 driven at saturation.
 
-On a cluster of 3× `c2‑standard‑16` (16 vCPU each), RF=3, 3 partitions, pd‑ssd,
-with a dedicated fourth box generating load, the engine sustains **~39 000 PI/s
-aggregate — ~13 000 PI/s per node** in steady state (`PERFORMANCE.md`, 2026‑07‑01).
-That number is honest in a specific way: it is flat across replication factor
-(RF=3 vs RF=1), partition count (3 vs 9), disk (SSD vs tmpfs), and client load. In
-other words, none of the usual levers move it — which is exactly the signature of a
-ceiling that is *not* where one would first look.
+On a cluster of 3× `c2‑standard‑16` (16 vCPU each), RF=3, 12 partitions (4 owned
+per node), pd‑ssd, with a dedicated fourth box generating load, the engine sustains
+**~95 000 PI/s aggregate — ~30 000–32 000 PI/s per node** in steady state
+(`PERFORMANCE.md`, 2026‑07‑01, build `0.0.3-shard`). Getting there is itself the
+paper's most instructive result, because it is a story of a ceiling found,
+explained, and moved — not merely quoted.
 
-We chased it to ground. At the ceiling every node sat at **~50% CPU idle and 0%
-iowait**: the wall is neither the network, nor the disk, nor durability, nor the
-client. It is **one thread**. Each node runs a *single* read-model exporter
-(`spawn_exporter` in `main.rs`) that funnels every partition's events into one
-`Mutex<Connection>` SQLite read store (`readstore.rs`) — and because completion
-recognition, the backpressure in-flight gauge, hot-state eviction, and
-`awaitCompletion` wakeups all read from that projection, its insert rate *is* the
-observed throughput. Instrumented (`NANOBPMN_EXPORTER_PROFILE`), that thread pins
-**one core at ~100%, 99.6% of it inside `store.export`, at ~250 000 events/s**
-(~13k PI/s × ~19 events/PI) while the other 15 vCPU idle. Throughput is flat within
-noise across all three SQLite `synchronous` modes (FULL / NORMAL / OFF) because
-under flood the drain-everything batcher forms enormous batches (thousands to
-~80 000 events), amortizing fsync down to ~16 commits per 5 s — which is also why
-the tmpfs run did not help. The ceiling is single-thread projection CPU, full stop.
+**The first wall, and why it fell.** An earlier build on the same hardware
+plateaued at only **~39k aggregate / ~13k per node**, and the number was suspicious
+in a specific way: it was flat across replication factor (RF=3 vs RF=1), partition
+count (3 vs 9), disk (SSD vs tmpfs), and client load. None of the usual levers moved
+it — the signature of a wall that is not where one would first look. Chased to
+ground, every node sat at **~50% CPU idle and 0% iowait**: neither network, nor
+disk, nor durability, nor client. It was **one thread**. Each node ran a *single*
+read-model exporter that funnelled every partition's events through one
+`Mutex<Connection>` SQLite read store — and because completion recognition, the
+in-flight backpressure gauge, hot-state eviction, and `awaitCompletion` wakeups all
+read from that projection, its insert rate *was* the throughput. Instrumented, that
+thread pinned **one core at ~100%, 99.6% of it inside `store.export`, at ~250 000
+events/s** while 15 of 16 vCPU idled; throughput was flat across all three SQLite
+`synchronous` modes because under flood the drain-everything batcher amortized fsync
+to ~16 commits per 5 s. The wall was single-thread projection CPU, full stop.
 
-This is the paper's most useful negative result, and we present it as **named
-future work rather than a caveat**: the read model is derived, per-partition data
-is already independent, and the fix is structural — shard the exporter and read
-store per partition (N threads, N SQLite shards) so projection CPU scales with
-cores instead of pinning one. Nothing in the architecture forbids it; it simply is
-not built yet. That the engine's *coordination* substrate has headroom to spare at
-the point where its *projection* substrate saturates is precisely the kind of
-asymmetry the rest of this paper argues Nano is organized to exploit.
+Because the read model is *derived* and per-partition data is already independent,
+the fix was structural rather than heroic: shard the exporter and read store per
+partition (`4b7e24e`) — a node owning *N* partitions gets *N* `ReadStore` shards and
+*N* exporter threads, and the single mutex that pinned one core is gone. Re-run at
+12 partitions (4 shards/node), throughput rose to **~95k aggregate — a 2.4× per-node
+lift on identical hardware** — and the exporter dropped out of the profile entirely
+(its threads now sit at modest CPU beside the journal writer and engine actors, RSS
+flat at ~300–330 MB/node despite four shard databases instead of one). The
+architecture *predicted its own next move*: relieve the projection core and the
+ceiling relocates, exactly as the diagnosis said it would.
+
+**Where the wall is now — and an honest correction.** At ~100k aggregate the nodes
+run at **~65% CPU (≈35% idle), ~3% iowait**: still not hardware-bound. Our first
+reading blamed a single 100%-pinned engine/Falcon thread — but that was an
+instrumentation artifact. `top -H` was showing the parked `#[tokio::main]`
+`block_on` driver at "99.9%"; ground-truth `strace`, `/proc/<tid>/stat`, and `gdb`
+all found that thread doing **zero syscalls and 0% CPU**, futex-parked. There is no
+single-thread CPU wall. The real signature under load is **~70% futex** (heavy
+contended lock handoff) plus heavy `sendto`: the ceiling is **coordination-bound** —
+cross-thread contention around the single-writer engine actor plus the RF=3
+replication round-trips — with cores to spare. A follow-up that sharded the Falcon
+*dispatcher* confirmed this by being a **measured wash** (96.4k → 96.0k, within
+noise): the dispatcher was never the limiter, so parallelizing it moved nothing. We
+kept it only for the cleaner architecture, and report the null result because an
+evaluation that hides its washes cannot be trusted with its wins. (That episode also
+caught a subtler trap: an apparent "p99 39 s → 2 s" improvement was pure
+data-accumulation — each 45 s sweep adds ~1.3M rows to the read shards — which is
+why every A/B here is measured on freshly wiped state.)
+
+So the current honest ceiling is **~30–32k PI/s per node, coordination-bound with
+CPU in reserve**, and — consistent with the whole argument of this paper — the named
+next levers are about *reducing coordination*, not adding hardware: cut engine-actor
+cross-thread contention and batch the replication path, or spread the single-writer
+actor across more partitions per node. Memory and disk are non-constraints at this
+ceiling.
 
 ### 12.2 The latency floor is a property of quorum, not of Raft
 
