@@ -823,13 +823,19 @@ instance, so this is also jobs/s), and it does so on the *strongest* durability
 setting, not a relaxed one: the default quorum-durable replication path (a
 majority replicates **and** applies before the client is acked) over local
 fsync-before-ack journalling. The lighter tiers of §9.3 (leader-durable, async)
-are opt-in and were left off. The ceiling is *coordination-bound*, not
-resource-bound: at that rate the nodes still run with roughly a third of their
-CPU idle and negligible I/O wait, the limit being cross-thread contention around
-the single-writer engine actor and the replication round-trips. That matters for
-the paper's thesis: the next gains come from *reducing coordination* — batching the
-replication path, spreading the writer across more partitions — not from adding
-hardware. (Two false ceilings were cleared to get here: a single read-model
+are opt-in and were left off — and, counter-intuitively, turning them on would
+*not* raise this number. The sweep behind it already tested the stronger form of
+both relaxations: dropping to RF=1 (no replication at all) and moving the journal
+to a RAM disk (no fsync) each left aggregate throughput unchanged, at ~0% I/O
+wait. Neither replication nor durable I/O is on the binding path; the lighter
+tiers buy *latency* (§12.2's floor), not throughput. The ceiling is
+*coordination-bound*, not resource-bound: at that rate the nodes still run with
+roughly a third of their CPU idle and negligible I/O wait, the limit being
+cross-thread contention around the single-writer engine actor and the replication
+round-trips. That matters for the paper's thesis: the next gains come from
+*reducing coordination* — batching the replication path, spreading the writer
+across more partitions — not from adding hardware. (Two false ceilings were
+cleared to get here: a single read-model
 exporter thread, fixed by sharding it per partition for a 2.4× lift, and a
 mis-read profiler artifact — the honest arc is in `PERFORMANCE.md`.)
 
