@@ -464,6 +464,33 @@ pub enum ElementKind {
         #[cfg_attr(feature = "serde", serde(default = "default_true"))]
         interrupting: bool,
     },
+    /// A conditional intermediate catch event (`conditionalEventDefinition`). On
+    /// activation it evaluates its FEEL `condition`; if already `true` the token
+    /// continues immediately, otherwise a conditional subscription is opened and
+    /// the token rests until a change to a referenced variable makes the
+    /// condition `true`. It is always interrupting (a pure wait-until point).
+    ConditionalIntermediateCatchEvent {
+        /// The FEEL boolean condition (as authored, typically `=`-prefixed).
+        condition: String,
+    },
+    /// A conditional boundary event attached to an activity. It has no incoming
+    /// sequence flow; a conditional subscription is opened when the activity
+    /// activates and its `condition` is evaluated immediately (and again whenever
+    /// a referenced variable changes while the activity is active). An
+    /// `interrupting` boundary interrupts the activity and runs the token along
+    /// its outgoing flow when the condition becomes `true`; a non-interrupting
+    /// one leaves the activity running and spawns a new parallel token each time
+    /// the condition becomes `true`.
+    ConditionalBoundaryEvent {
+        /// Id of the activity this boundary event is attached to.
+        attached_to: ElementId,
+        /// The FEEL boolean condition (as authored, typically `=`-prefixed).
+        condition: String,
+        /// Whether firing interrupts the activity (`true`, the default) or spawns
+        /// a parallel token and leaves it running.
+        #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+        interrupting: bool,
+    },
 }
 
 impl ElementKind {
@@ -714,6 +741,15 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
         } => ElementKind::SignalBoundaryEvent {
             attached_to: pfx(attached_to),
             signal_name: signal_name.clone(),
+            interrupting: *interrupting,
+        },
+        ElementKind::ConditionalBoundaryEvent {
+            attached_to,
+            condition,
+            interrupting,
+        } => ElementKind::ConditionalBoundaryEvent {
+            attached_to: pfx(attached_to),
+            condition: condition.clone(),
             interrupting: *interrupting,
         },
         other => other.clone(),
@@ -1199,6 +1235,60 @@ impl ProcessBuilder {
             ElementKind::SignalBoundaryEvent {
                 attached_to: attached_to.into(),
                 signal_name: signal_name.into(),
+                interrupting: false,
+            },
+        )
+    }
+
+    /// Adds a conditional intermediate catch event (`conditionalEventDefinition`)
+    /// that waits until its FEEL `condition` becomes `true`.
+    pub fn conditional_intermediate_catch_event(
+        self,
+        id: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ConditionalIntermediateCatchEvent {
+                condition: condition.into(),
+            },
+        )
+    }
+
+    /// Adds an interrupting conditional boundary event attached to `attached_to`,
+    /// firing when its FEEL `condition` becomes `true` while the activity is
+    /// active (interrupting the activity and taking this event's outgoing flow).
+    pub fn conditional_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ConditionalBoundaryEvent {
+                attached_to: attached_to.into(),
+                condition: condition.into(),
+                interrupting: true,
+            },
+        )
+    }
+
+    /// Adds a non-interrupting conditional boundary event attached to
+    /// `attached_to`: each time its FEEL `condition` becomes `true` while the
+    /// activity is active, the activity keeps running and a new parallel token is
+    /// spawned along this event's outgoing flow.
+    pub fn non_interrupting_conditional_boundary_event(
+        self,
+        id: impl Into<String>,
+        attached_to: impl Into<String>,
+        condition: impl Into<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::ConditionalBoundaryEvent {
+                attached_to: attached_to.into(),
+                condition: condition.into(),
                 interrupting: false,
             },
         )

@@ -361,6 +361,34 @@ impl Engine {
                 kind,
             });
         }
+        for (boundary_id, condition, interrupting) in
+            self.attached_conditional_boundaries(instance_key, element_id)
+        {
+            let subscription_key = self.mint_key();
+            let referenced_vars = super::sorted_referenced_vars(&condition);
+            let kind = if interrupting {
+                state::MessageSubscriptionKind::InterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            } else {
+                state::MessageSubscriptionKind::NonInterruptingBoundary {
+                    boundary_element_id: boundary_id,
+                }
+            };
+            // The condition is evaluated on activation and on each change to a
+            // referenced variable by the re-evaluation pass in `run`; opening the
+            // subscription here is enough (an already-true condition fires on the
+            // first pass, right after this activation command drains).
+            events.push(Event::ConditionalSubscriptionCreated {
+                subscription_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                condition,
+                referenced_vars,
+                kind,
+            });
+        }
         events
     }
 
@@ -422,6 +450,9 @@ impl Engine {
             self.emit(log, event);
         }
         for event in self.cancel_boundary_signal_subscriptions_on(element_instance_key) {
+            self.emit(log, event);
+        }
+        for event in self.cancel_boundary_conditional_subscriptions_on(element_instance_key) {
             self.emit(log, event);
         }
     }
@@ -604,6 +635,66 @@ impl Engine {
         subs.sort_by_key(|s| s.key);
         subs.into_iter()
             .map(|s| Event::SignalSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            })
+            .collect()
+    }
+
+    /// All conditional boundary events attached to `activity_id`, as
+    /// `(boundary_id, condition, interrupting)` sorted by boundary id.
+    pub(crate) fn attached_conditional_boundaries(
+        &self,
+        instance_key: Key,
+        activity_id: &str,
+    ) -> Vec<(ElementId, String, bool)> {
+        let Some(process) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(ElementId, String, bool)> = process
+            .elements
+            .values()
+            .filter_map(|e| match &e.kind {
+                ElementKind::ConditionalBoundaryEvent {
+                    attached_to,
+                    condition,
+                    interrupting,
+                } if attached_to == activity_id => {
+                    Some((e.id.clone(), condition.clone(), *interrupting))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Cancels every open boundary conditional subscription resting on
+    /// `element_instance_key`, returning the `ConditionalSubscriptionCanceled`
+    /// events. Mirrors [`Self::cancel_boundary_signal_subscriptions_on`].
+    pub(crate) fn cancel_boundary_conditional_subscriptions_on(
+        &self,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
+        let mut subs: Vec<&state::ConditionalSubscription> = self
+            .state
+            .conditional_subscriptions
+            .values()
+            .filter(|s| {
+                s.element_instance_key == element_instance_key
+                    && s.state == state::MessageSubscriptionState::Open
+                    && matches!(
+                        s.kind,
+                        state::MessageSubscriptionKind::InterruptingBoundary { .. }
+                            | state::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                    )
+            })
+            .collect();
+        subs.sort_by_key(|s| s.key);
+        subs.into_iter()
+            .map(|s| Event::ConditionalSubscriptionCanceled {
                 subscription_key: s.key,
                 instance_key: s.instance_key,
                 element_instance_key: s.element_instance_key,

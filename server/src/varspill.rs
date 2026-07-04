@@ -197,6 +197,7 @@ mod tests {
             timers: Vec::new(),
             message_subscriptions: Vec::new(),
             signal_subscriptions: Vec::new(),
+            conditional_subscriptions: Vec::new(),
             user_tasks: Vec::new(),
             incidents: Vec::new(),
         };

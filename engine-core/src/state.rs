@@ -521,6 +521,39 @@ pub struct SignalSubscription {
     pub kind: MessageSubscriptionKind,
 }
 
+/// An open **conditional** subscription holding a token on a conditional
+/// intermediate catch event (or guarding an activity via a conditional boundary)
+/// until its FEEL `condition` becomes `true`. Unlike message/signal
+/// subscriptions there is no external trigger: the engine evaluates `condition`
+/// against the instance variables when the subscription opens and again whenever
+/// one of `referenced_vars` changes, firing when it yields `true`. An
+/// interrupting subscription (intermediate catch or interrupting boundary) fires
+/// once; a non-interrupting boundary stays open and can fire repeatedly. The
+/// `kind` reuses [`MessageSubscriptionKind`] (the token-advance semantics are
+/// identical to messages/signals).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ConditionalSubscription {
+    pub key: Key,
+    pub instance_key: Key,
+    /// The element instance the token rests on while waiting: the catch event
+    /// itself for an intermediate subscription, or the attached activity for a
+    /// boundary subscription.
+    pub element_instance_key: Key,
+    pub element_id: ElementId,
+    /// The FEEL condition (as authored, `=`-marker included) evaluated to decide
+    /// whether the event fires.
+    pub condition: String,
+    /// The root variable names `condition` references, sorted. The engine
+    /// re-evaluates the condition only when a variable in this set changes; an
+    /// empty set means the condition depends on no variable (evaluated on open
+    /// only).
+    pub referenced_vars: Vec<String>,
+    pub state: MessageSubscriptionState,
+    /// What the subscription guards, and so what firing it does.
+    pub kind: MessageSubscriptionKind,
+}
+
 /// A process-level subscription on a **message start event**: a correlating
 /// message whose name matches creates a new instance of `process_id` (starting
 /// at `start_element_id`). Unlike a [`MessageSubscription`] it is not bound to an
@@ -603,6 +636,11 @@ pub struct State {
     /// correlated subscription is retained (transitioned to
     /// [`MessageSubscriptionState::Correlated`]) as an audit trail.
     pub signal_subscriptions: HashMap<Key, SignalSubscription>,
+    /// Open and settled **conditional** subscriptions, keyed by subscription key.
+    /// A fired interrupting subscription is retained (transitioned to
+    /// [`MessageSubscriptionState::Correlated`]) so it never fires twice; a
+    /// non-interrupting boundary stays [`MessageSubscriptionState::Open`].
+    pub conditional_subscriptions: HashMap<Key, ConditionalSubscription>,
     /// Process-level message start subscriptions, keyed by message name. A
     /// correlating message whose name matches creates a new instance.
     pub message_start_subscriptions: HashMap<String, MessageStartSubscription>,
@@ -660,6 +698,8 @@ pub struct InstanceSnapshot {
     pub message_subscriptions: Vec<MessageSubscription>,
     #[cfg_attr(feature = "serde", serde(default))]
     pub signal_subscriptions: Vec<SignalSubscription>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub conditional_subscriptions: Vec<ConditionalSubscription>,
     pub user_tasks: Vec<UserTask>,
     pub incidents: Vec<Incident>,
 }
@@ -1313,6 +1353,56 @@ pub fn apply(state: &mut State, event: &Event) {
             subscription_key, ..
         } => {
             if let Some(subscription) = state.signal_subscriptions.get_mut(subscription_key) {
+                subscription.state = MessageSubscriptionState::Canceled;
+            }
+        }
+
+        Event::ConditionalSubscriptionCreated {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            condition,
+            referenced_vars,
+            kind,
+        } => {
+            state.conditional_subscriptions.insert(
+                *subscription_key,
+                ConditionalSubscription {
+                    key: *subscription_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    condition: condition.clone(),
+                    referenced_vars: referenced_vars.clone(),
+                    state: MessageSubscriptionState::Open,
+                    kind: kind.clone(),
+                },
+            );
+        }
+
+        // A conditional subscription's condition became true. Settles it (unless
+        // it is a non-interrupting boundary, which stays open so every satisfying
+        // variable change spawns another token), exactly like `SignalCorrelated`.
+        Event::ConditionalTriggered {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.conditional_subscriptions.get_mut(subscription_key) {
+                if !matches!(
+                    subscription.kind,
+                    MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                ) {
+                    subscription.state = MessageSubscriptionState::Correlated;
+                }
+            }
+        }
+
+        // An open conditional subscription was cancelled because the element it
+        // guarded left the flow first (mirrors `SignalSubscriptionCanceled`).
+        Event::ConditionalSubscriptionCanceled {
+            subscription_key, ..
+        } => {
+            if let Some(subscription) = state.conditional_subscriptions.get_mut(subscription_key) {
                 subscription.state = MessageSubscriptionState::Canceled;
             }
         }

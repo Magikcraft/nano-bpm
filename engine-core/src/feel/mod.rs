@@ -85,6 +85,87 @@ pub fn eval_bool(expr: &str, ctx: &HashMap<String, Value>) -> Result<bool, FeelE
     }
 }
 
+/// The set of top-level variable names a FEEL expression references.
+///
+/// Used to decide which variable changes should re-evaluate a conditional
+/// event's condition, matching Zeebe's expression-based dependency derivation: a
+/// member or index access (`x.y`, `x[i]`) depends on the *root* variable `x`, so
+/// `x.value > 1` yields `{x}`. Returns an empty set if the expression cannot be
+/// parsed — the caller then treats the condition as having no known dependency
+/// (and may re-evaluate conservatively).
+pub fn referenced_variables(expr: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let src = strip_marker(expr);
+    if let Ok(tokens) = lexer::tokenize(src) {
+        if let Ok(node) = parser::parse(tokens) {
+            collect_vars(&node, &mut out);
+        }
+    }
+    out
+}
+
+/// Walks a FEEL AST, collecting the name of every [`ast::Node::Var`] it contains.
+/// A dotted path `a.b` parses to `Member(Var("a"), "b")`, so recursing into the
+/// base of a member/index access naturally yields the root variable. Names bound
+/// by `for`/`some`/`every`/`function(...)` are stored as plain strings (not
+/// `Var` nodes), so they are not collected as external dependencies.
+fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
+    use ast::Node;
+    match node {
+        Node::Var(name) => {
+            out.insert(name.clone());
+        }
+        Node::Null | Node::BoolLit(_) | Node::NumLit(..) | Node::StrLit(_) | Node::AtLit(_) => {}
+        Node::Member(base, _) => collect_vars(base, out),
+        Node::Index(base, idx) => {
+            collect_vars(base, out);
+            collect_vars(idx, out);
+        }
+        Node::Neg(inner) | Node::Not(inner) => collect_vars(inner, out),
+        Node::Bin(_, l, r) => {
+            collect_vars(l, out);
+            collect_vars(r, out);
+        }
+        Node::List(items) => items.iter().for_each(|n| collect_vars(n, out)),
+        Node::Context(entries) => entries.iter().for_each(|(_, n)| collect_vars(n, out)),
+        Node::If(c, t, e) => {
+            collect_vars(c, out);
+            collect_vars(t, out);
+            collect_vars(e, out);
+        }
+        Node::For(clauses, body) | Node::Quant(_, clauses, body) => {
+            clauses.iter().for_each(|(_, n)| collect_vars(n, out));
+            collect_vars(body, out);
+        }
+        Node::Between(a, b, c) => {
+            collect_vars(a, out);
+            collect_vars(b, out);
+            collect_vars(c, out);
+        }
+        Node::In(a, b) => {
+            collect_vars(a, out);
+            collect_vars(b, out);
+        }
+        Node::InstanceOf(inner, _) => collect_vars(inner, out),
+        Node::FuncDef(_, body) => collect_vars(body, out),
+        Node::Call(callee, args) => {
+            collect_vars(callee, out);
+            match args {
+                ast::CallArgs::Positional(ns) => ns.iter().for_each(|n| collect_vars(n, out)),
+                ast::CallArgs::Named(ns) => ns.iter().for_each(|(_, n)| collect_vars(n, out)),
+            }
+        }
+        Node::Range(r) => {
+            if let Some(s) = &r.start {
+                collect_vars(s, out);
+            }
+            if let Some(e) = &r.end {
+                collect_vars(e, out);
+            }
+        }
+    }
+}
+
 fn evaluate(expr: &str, ctx: &HashMap<String, Value>) -> Result<value::FeelVal, FeelError> {
     let src = strip_marker(expr);
     let tokens = lexer::tokenize(src)?;
@@ -117,6 +198,22 @@ mod tests {
     }
 
     // --- ported baseline coverage ------------------------------------------
+
+    #[test]
+    fn referenced_variables_derives_dependencies() {
+        let vars = |e: &str| {
+            let mut v: Vec<String> = referenced_variables(e).into_iter().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(vars("=x > 1"), vec!["x"]);
+        assert_eq!(vars("=x > 1 and y < 5"), vec!["x", "y"]);
+        // A member/index access depends on the root variable only.
+        assert_eq!(vars("=x.y.z = true"), vec!["x"]);
+        assert_eq!(vars("=orders[1] > amount"), vec!["amount", "orders"]);
+        // Literals reference nothing.
+        assert!(vars("=1 > 0").is_empty());
+    }
 
     #[test]
     fn evaluates_literals_and_arithmetic() {

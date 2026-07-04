@@ -5121,3 +5121,253 @@ fn feel_boundary_timer_evaluates_variable() {
     assert_eq!(timers.len(), 1);
     assert_eq!(timers[0].due_at, 6_000);
 }
+
+// --- Conditional events (conditionalEventDefinition, re-evaluated on variable
+// change), FEEL parity feature 6. ---
+
+/// start -> gate (conditional catch: `= approved = true`) -> end
+fn process_with_conditional_catch() -> ProcessDefinition {
+    ProcessBuilder::new("await-approval")
+        .start_event("start")
+        .conditional_intermediate_catch_event("gate", "=approved = true")
+        .end_event("end")
+        .connect("start", "gate")
+        .connect("gate", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn should_park_on_a_conditional_catch_until_a_variable_change_satisfies_it() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_conditional_catch()))
+        .unwrap();
+
+    // The condition is false at arrival (approved unset), so the token parks on
+    // an open conditional subscription.
+    let created = engine
+        .apply_command(Command::create_instance("await-approval"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(!engine.is_completed(key));
+    assert_eq!(engine.conditional_subscriptions().len(), 1);
+    assert_eq!(
+        engine.conditional_subscriptions()[0].state,
+        state::MessageSubscriptionState::Open
+    );
+    // The subscription records the variable its condition depends on.
+    assert_eq!(
+        engine.conditional_subscriptions()[0].referenced_vars,
+        vec!["approved".to_string()]
+    );
+
+    // Setting an UNRELATED variable does not trigger it.
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            vars(&[("other", Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert!(!engine.is_completed(key));
+
+    // Setting `approved = true` flips the condition and fires the catch, which
+    // completes the instance.
+    let fired = engine
+        .apply_command(Command::set_variables(
+            key,
+            vars(&[("approved", Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::ConditionalTriggered { .. })));
+    assert!(engine.is_completed(key));
+    assert_eq!(
+        engine.conditional_subscriptions()[0].state,
+        state::MessageSubscriptionState::Correlated
+    );
+}
+
+#[test]
+fn should_pass_a_conditional_catch_immediately_when_already_true_on_arrival() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_conditional_catch()))
+        .unwrap();
+
+    // The condition already holds at creation, so the token passes straight
+    // through without ever opening a subscription.
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "await-approval",
+            vars(&[("approved", Value::Bool(true))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(engine.is_completed(key));
+    assert!(engine.conditional_subscriptions().is_empty());
+}
+
+/// start -> work (service task) with an interrupting conditional boundary
+///          `= cancel = true` -> done ; boundary -> aborted
+fn process_with_conditional_boundary(interrupting: bool) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("guarded-cond")
+        .start_event("start")
+        .service_task("work", "do-work");
+    let builder = if interrupting {
+        builder.conditional_boundary_event("bnd", "work", "=cancel = true")
+    } else {
+        builder.non_interrupting_conditional_boundary_event("bnd", "work", "=ping = true")
+    };
+    builder
+        .end_event("done")
+        .end_event("aborted")
+        .connect("start", "work")
+        .connect("work", "done")
+        .connect("bnd", "aborted")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn should_fire_an_interrupting_conditional_boundary_on_a_variable_change() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_conditional_boundary(
+            true,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("guarded-cond"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The task parks on a job with an open conditional boundary subscription.
+    assert_eq!(engine.pending_jobs().len(), 1);
+    let job_key = engine.pending_jobs()[0].key;
+    assert_eq!(engine.conditional_subscriptions().len(), 1);
+
+    // Flipping `cancel` interrupts the task (cancels its job) and routes along
+    // the boundary's outgoing flow, completing the instance.
+    let fired = engine
+        .apply_command(Command::set_variables(
+            key,
+            vars(&[("cancel", Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::JobCanceled { job_key: k, .. } if *k == job_key
+    )));
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "bnd" && to == "aborted"
+    )));
+    assert!(engine.is_completed(key));
+}
+
+#[test]
+fn should_fire_an_interrupting_conditional_boundary_immediately_when_true_on_activation() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_conditional_boundary(
+            true,
+        )))
+        .unwrap();
+    // `cancel` is already true when the activity activates: the boundary fires on
+    // the first evaluation pass, so no job survives and the instance completes.
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "guarded-cond",
+            vars(&[("cancel", Value::Bool(true))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(engine.is_completed(key));
+    assert_eq!(engine.pending_jobs().len(), 0);
+}
+
+#[test]
+fn should_cancel_a_conditional_boundary_subscription_when_the_job_completes_first() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_conditional_boundary(
+            true,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("guarded-cond"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let job_key = engine.pending_jobs()[0].key;
+
+    // Completing the job before the condition holds takes the normal flow and
+    // cancels the boundary subscription.
+    engine.activate_jobs("do-work", "w", 1, 60_000, 0);
+    engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+    assert!(engine.is_completed(key));
+    assert_eq!(
+        engine.conditional_subscriptions()[0].state,
+        state::MessageSubscriptionState::Canceled
+    );
+}
+
+#[test]
+fn should_fire_a_non_interrupting_conditional_boundary_repeatedly() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_conditional_boundary(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("guarded-cond"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let job_key = engine.pending_jobs()[0].key;
+
+    // First satisfying change spawns a parallel token without cancelling the job;
+    // the subscription stays open.
+    let fired = engine
+        .apply_command(Command::set_variables(
+            key,
+            vars(&[("ping", Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::ConditionalTriggered { .. })));
+    assert!(!fired.iter().any(|e| matches!(e, Event::JobCanceled { .. })));
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.conditional_subscriptions()[0].state,
+        state::MessageSubscriptionState::Open
+    );
+
+    // A second satisfying update (ping toggled off then on) fires it again.
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            vars(&[("ping", Value::Bool(false))]),
+        ))
+        .unwrap();
+    let fired = engine
+        .apply_command(Command::set_variables(
+            key,
+            vars(&[("ping", Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert!(fired
+        .iter()
+        .any(|e| matches!(e, Event::ConditionalTriggered { .. })));
+
+    // The job is still active the whole time; completing it finishes the instance.
+    engine.activate_jobs("do-work", "w", 1, 60_000, 0);
+    engine
+        .apply_command(Command::complete_job(job_key))
+        .unwrap();
+    assert!(engine.is_completed(key));
+}

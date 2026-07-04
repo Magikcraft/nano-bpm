@@ -242,6 +242,13 @@ impl Engine {
         self.state.signal_subscriptions.values().collect()
     }
 
+    /// All open and settled conditional-event subscriptions (fired/cancelled ones
+    /// are retained). Filter by [`state::ConditionalSubscription::state`] for
+    /// only-open subscriptions.
+    pub fn conditional_subscriptions(&self) -> Vec<&state::ConditionalSubscription> {
+        self.state.conditional_subscriptions.values().collect()
+    }
+
     /// Activates jobs of `job_type` and dispatches each to `handler` — the
     /// **callback** worker API for embedded use. Whatever variables the handler
     /// returns complete the job (by key); returning `None` leaves the job locked.

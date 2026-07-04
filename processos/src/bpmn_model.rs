@@ -55,6 +55,10 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::CallActivity { .. } => "callActivity",
         ElementKind::SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
         ElementKind::SignalBoundaryEvent { .. } => "signalBoundaryEvent",
+        ElementKind::ConditionalIntermediateCatchEvent { .. } => {
+            "conditionalIntermediateCatchEvent"
+        }
+        ElementKind::ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
     }
 }
 
@@ -64,6 +68,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         ElementKind::ErrorBoundaryEvent { attached_to, .. }
         | ElementKind::TimerBoundaryEvent { attached_to, .. }
         | ElementKind::SignalBoundaryEvent { attached_to, .. }
+        | ElementKind::ConditionalBoundaryEvent { attached_to, .. }
         | ElementKind::MessageBoundaryEvent { attached_to, .. } => Some(attached_to.as_str()),
         _ => None,
     }
@@ -1813,6 +1818,40 @@ fn emit_element(
             ));
             out.push_str("    </bpmn:boundaryEvent>\n");
         }
+        ElementKind::ConditionalIntermediateCatchEvent { condition } => {
+            out.push_str(&format!(
+                "    <bpmn:intermediateCatchEvent id=\"{eid}\"{na}>\n"
+            ));
+            out.push_str("      <bpmn:conditionalEventDefinition>\n");
+            out.push_str(&format!(
+                "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
+                xml_escape(condition)
+            ));
+            out.push_str("      </bpmn:conditionalEventDefinition>\n");
+            out.push_str("    </bpmn:intermediateCatchEvent>\n");
+        }
+        ElementKind::ConditionalBoundaryEvent {
+            attached_to,
+            condition,
+            interrupting,
+        } => {
+            let cancel = if *interrupting {
+                ""
+            } else {
+                " cancelActivity=\"false\""
+            };
+            out.push_str(&format!(
+                "    <bpmn:boundaryEvent id=\"{eid}\"{na} attachedToRef=\"{}\"{cancel}>\n",
+                xml_escape(attached_to)
+            ));
+            out.push_str("      <bpmn:conditionalEventDefinition>\n");
+            out.push_str(&format!(
+                "        <bpmn:condition xsi:type=\"bpmn:tFormalExpression\">{}</bpmn:condition>\n",
+                xml_escape(condition)
+            ));
+            out.push_str("      </bpmn:conditionalEventDefinition>\n");
+            out.push_str("    </bpmn:boundaryEvent>\n");
+        }
         ElementKind::SubProcess { .. } => {
             out.push_str(&format!("    <bpmn:subProcess id=\"{eid}\"{na}>\n"));
             if let Some(kids) = children_by_parent.get(id) {
@@ -3263,6 +3302,38 @@ mod tests {
         let xml = definition_to_xml(&def);
         assert!(xml.contains("<bpmn:scriptTask "), "emits a script task");
         assert!(xml.contains("<zeebe:script "), "emits the zeebe:script");
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_conditional_events() {
+        // A conditional intermediate catch and a (non-interrupting) conditional
+        // boundary must round-trip: the serializer emits
+        // <bpmn:conditionalEventDefinition><bpmn:condition>=..</> and the re-parse
+        // reproduces the exact conditional structure (condition text + attach + kind).
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Conditioned")
+            .start_event("Start")
+            .conditional_intermediate_catch_event("Gate", "=approved = true")
+            .service_task("Work", "do-work")
+            .non_interrupting_conditional_boundary_event("Ping", "Work", "=ping = true")
+            .end_event("Done")
+            .end_event("Pinged")
+            .connect("Start", "Gate")
+            .connect("Gate", "Work")
+            .connect("Work", "Done")
+            .connect("Ping", "Pinged")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:conditionalEventDefinition"),
+            "emits a conditional event definition"
+        );
+        assert!(
+            xml.contains("<bpmn:condition"),
+            "emits the nested condition element"
+        );
         let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
         assert_same_structure(&def, &reparsed[0]);
     }

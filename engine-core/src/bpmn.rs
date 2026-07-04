@@ -135,6 +135,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // Index of the sequence flow currently being read (to attach a condition).
     let mut cur_flow: Option<usize> = None;
     let mut condition_text: Option<String> = None;
+    // A separate buffer for a conditional-event's nested `<condition>` FEEL text
+    // (distinct from a sequence flow's `conditionExpression`).
+    let mut event_condition_text: Option<String> = None;
     // The boundary event currently being read (to attach its errorEventDefinition).
     let mut cur_boundary: Option<PendingBoundary> = None;
     // Index of the intermediate catch event currently being read (timer or
@@ -385,6 +388,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         interrupting: attr(attrs, "cancelActivity")
                                             != Some("false"),
                                         signal_ref: None,
+                                        condition: None,
                                     });
                                 }
                             }
@@ -526,6 +530,13 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "conditionExpression" if cur_flow.is_some() => {
                                 condition_text = Some(String::new());
                             }
+                            // A conditional event's FEEL `<condition>` (nested in
+                            // a `conditionalEventDefinition` on a catch or boundary
+                            // event). Distinct from a sequence flow's
+                            // `conditionExpression` above.
+                            "condition" if cur_intermediate.is_some() || cur_boundary.is_some() => {
+                                event_condition_text = Some(String::new());
+                            }
                             // zeebe:ioMapping and its nested zeebe:input/output.
                             // input/output are only read inside an ioMapping that
                             // belongs to an open activity (the innermost on the
@@ -560,6 +571,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 if let Some(buf) = condition_text.as_mut() {
                     buf.push_str(text);
                 }
+                if let Some(buf) = event_condition_text.as_mut() {
+                    buf.push_str(text);
+                }
                 if let Some(buf) = duration_text.as_mut() {
                     buf.push_str(text);
                 }
@@ -583,6 +597,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_start = None;
                     cycle_text = None;
                     date_text = None;
+                    event_condition_text = None;
                     cur_user_task = None;
                     cur_call = None;
                     io_stack.clear();
@@ -630,6 +645,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             || boundary.timer_expr.is_some()
                             || boundary.message_ref.is_some()
                             || boundary.signal_ref.is_some()
+                            || boundary.condition.is_some()
                         {
                             acc.boundaries.push(boundary);
                         }
@@ -645,6 +661,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                         } else {
                             Some(trimmed.to_string())
                         };
+                    }
+                }
+                "condition" => {
+                    if let Some(text) = event_condition_text.take() {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
+                                acc.nodes[idx].event_condition = Some(trimmed.to_string());
+                            } else if let Some(boundary) = cur_boundary.as_mut() {
+                                boundary.condition = Some(trimmed.to_string());
+                            }
+                        }
                     }
                 }
                 "intermediateCatchEvent" => cur_intermediate = None,
@@ -809,6 +837,11 @@ struct NodeAcc {
     /// For a script task with an inline `zeebe:script`: the `resultVariable`
     /// the expression's result is stored under.
     script_result_variable: Option<String>,
+    /// For a conditional intermediate catch event: the FEEL `condition` (from a
+    /// nested `conditionalEventDefinition`/`condition`) that must become `true`
+    /// for the event to fire. Makes the node a
+    /// [`ConditionalIntermediateCatchEvent`](crate::model::ElementKind::ConditionalIntermediateCatchEvent).
+    event_condition: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -851,6 +884,10 @@ struct PendingBoundary {
     timer_expr: Option<crate::model::TimerDef>,
     message_ref: Option<String>,
     signal_ref: Option<String>,
+    /// A FEEL `condition` (from a nested `conditionalEventDefinition`/`condition`)
+    /// that must become `true` for this boundary to fire. Makes it a
+    /// [`ConditionalBoundaryEvent`](crate::model::ElementKind::ConditionalBoundaryEvent).
+    condition: Option<String>,
     interrupting: bool,
 }
 
@@ -905,6 +942,7 @@ impl ProcessAcc {
             retries: None,
             script_expression: None,
             script_result_variable: None,
+            event_condition: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -1094,9 +1132,13 @@ impl ProcessAcc {
                 }
                 NodeKind::User => builder.user_task_with(node.id, node.user_task),
                 NodeKind::IntermediateCatch => {
-                    // A messageRef makes it a message catch; otherwise it is a
-                    // timer catch carrying a (possibly zero) duration.
-                    if let Some(message_ref) = node.message_ref {
+                    // Ordering: a conditional catch (event_condition) has no
+                    // message/signal/timer ref; a messageRef makes it a message
+                    // catch; a signalRef a signal catch; otherwise a timer catch
+                    // carrying a (possibly zero) duration.
+                    if let Some(condition) = node.event_condition {
+                        builder.conditional_intermediate_catch_event(node.id, condition)
+                    } else if let Some(message_ref) = node.message_ref {
                         let decl = messages.get(&message_ref).ok_or_else(|| {
                             ParseError::InvalidMessageEvent {
                                 process_id: self.id.clone(),
@@ -1177,9 +1219,20 @@ impl ProcessAcc {
                         process_id: self.id.clone(),
                         reason: format!("boundary event {} has no attachedToRef", boundary.id),
                     })?;
-            // Resolve the boundary's flavour: timer (duration), message
-            // (messageRef), or error (errorRef -> declared error).
-            if boundary.timer_duration_millis.is_some() || boundary.timer_expr.is_some() {
+            // Resolve the boundary's flavour: conditional (condition), timer
+            // (duration), message (messageRef), signal (signalRef), or error
+            // (errorRef -> declared error).
+            if let Some(condition) = boundary.condition {
+                builder = if boundary.interrupting {
+                    builder.conditional_boundary_event(boundary.id, attached_to, condition)
+                } else {
+                    builder.non_interrupting_conditional_boundary_event(
+                        boundary.id,
+                        attached_to,
+                        condition,
+                    )
+                };
+            } else if boundary.timer_duration_millis.is_some() || boundary.timer_expr.is_some() {
                 // A FEEL timer boundary carries no static duration; build the
                 // element with a zero fallback and attach the expression below.
                 let duration_millis = boundary.timer_duration_millis.unwrap_or(0);
@@ -2234,6 +2287,62 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "aborted"));
+    }
+
+    #[test]
+    fn should_parse_conditional_intermediate_catch_and_boundary_events() {
+        // given: a conditional intermediate catch and a conditional boundary
+        // (one interrupting, one not) whose FEEL condition lives in the nested
+        // <condition> element text of a <conditionalEventDefinition>.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:intermediateCatchEvent id="gate">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition xsi:type="bpmn:tFormalExpression">=approved = true</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:intermediateCatchEvent>
+              <bpmn:serviceTask id="work" />
+              <bpmn:endEvent id="e" />
+              <bpmn:boundaryEvent id="bnd" attachedToRef="work" cancelActivity="false">
+                <bpmn:conditionalEventDefinition>
+                  <bpmn:condition>=ping = true</bpmn:condition>
+                </bpmn:conditionalEventDefinition>
+              </bpmn:boundaryEvent>
+              <bpmn:endEvent id="pinged" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="gate" />
+              <bpmn:sequenceFlow id="f1" sourceRef="gate" targetRef="work" />
+              <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+              <bpmn:sequenceFlow id="f3" sourceRef="bnd" targetRef="pinged" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        assert_eq!(
+            def.element("gate").unwrap().kind,
+            ElementKind::ConditionalIntermediateCatchEvent {
+                condition: "=approved = true".to_string(),
+            }
+        );
+        assert_eq!(
+            def.element("bnd").unwrap().kind,
+            ElementKind::ConditionalBoundaryEvent {
+                attached_to: "work".to_string(),
+                condition: "=ping = true".to_string(),
+                interrupting: false,
+            }
+        );
+        assert!(def
+            .element("bnd")
+            .unwrap()
+            .outgoing
+            .iter()
+            .any(|f| f.to == "pinged"));
     }
 
     #[test]

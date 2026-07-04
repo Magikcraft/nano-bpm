@@ -1159,6 +1159,9 @@ impl Engine {
                         for event in self.cancel_boundary_signal_subscriptions_on(caught_eik) {
                             self.emit(&mut log, event);
                         }
+                        for event in self.cancel_boundary_conditional_subscriptions_on(caught_eik) {
+                            self.emit(&mut log, event);
+                        }
                         queue.push_back(Step::Activate {
                             instance_key,
                             element_id: boundary_id,
@@ -1673,6 +1676,26 @@ impl Engine {
                     })
                     .collect();
 
+                let mut cond_subs: Vec<&state::ConditionalSubscription> = self
+                    .state
+                    .conditional_subscriptions
+                    .values()
+                    .filter(|s| {
+                        s.instance_key == instance_key
+                            && s.state == state::MessageSubscriptionState::Open
+                    })
+                    .collect();
+                cond_subs.sort_unstable_by_key(|s| s.key);
+                let cond_sub_cancels: Vec<Event> = cond_subs
+                    .iter()
+                    .map(|s| Event::ConditionalSubscriptionCanceled {
+                        subscription_key: s.key,
+                        instance_key,
+                        element_instance_key: s.element_instance_key,
+                        element_id: s.element_id.clone(),
+                    })
+                    .collect();
+
                 let mut user_tasks: Vec<&state::UserTask> = self
                     .state
                     .user_tasks
@@ -1700,6 +1723,9 @@ impl Engine {
                     self.emit(&mut log, event);
                 }
                 for event in sig_sub_cancels {
+                    self.emit(&mut log, event);
+                }
+                for event in cond_sub_cancels {
                     self.emit(&mut log, event);
                 }
                 for event in user_task_cancels {
@@ -1738,6 +1764,7 @@ impl Engine {
     /// Drains the work queue, applying events and enqueuing follow-up steps until
     /// the instance is quiescent.
     fn run(&mut self, log: &mut Vec<Event>, mut queue: VecDeque<Step>) {
+        let mut cursor = 0usize;
         loop {
             while let Some(step) = queue.pop_front() {
                 let (events, followups) = self.process_step(step);
@@ -1753,11 +1780,161 @@ impl Engine {
             // enqueue more work (and, in turn, drain an enclosing sub-process), so
             // loop until nothing more completes.
             let followups = self.complete_drained_subprocesses(log);
-            if followups.is_empty() {
+            queue.extend(followups);
+            // Re-evaluate any conditional-event subscriptions whose condition may
+            // now hold: those opened, or whose referenced variables changed, since
+            // the last pass. A satisfied condition fires (advancing a catch token,
+            // interrupting an activity, or spawning a non-interrupting token),
+            // which enqueues more work — so this runs inside the same fixpoint loop.
+            cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
+            if queue.is_empty() {
                 break;
             }
-            queue.extend(followups);
         }
+    }
+
+    /// Re-evaluates open conditional-event subscriptions against the variable
+    /// changes and subscription openings recorded in `log[cursor..]`, firing every
+    /// one whose FEEL condition now evaluates `true`. Returns the new cursor (the
+    /// log length at entry) so the next pass only considers subsequently appended
+    /// events. A no-op (cheap early return) when no conditional subscriptions
+    /// exist, which is the common case.
+    fn reevaluate_conditionals(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        cursor: usize,
+    ) -> usize {
+        let scan_end = log.len();
+        if self.state.conditional_subscriptions.is_empty() {
+            return scan_end;
+        }
+        // Which variables changed, per instance, and which conditional
+        // subscriptions were opened, since the last pass.
+        let mut changed: HashMap<Key, std::collections::HashSet<String>> = HashMap::new();
+        let mut opened: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        for event in &log[cursor..scan_end] {
+            match event {
+                Event::VariablesUpdated {
+                    instance_key,
+                    variables,
+                } => {
+                    let entry = changed.entry(*instance_key).or_default();
+                    for name in variables.keys() {
+                        entry.insert(name.clone());
+                    }
+                }
+                Event::ProcessInstanceCreated {
+                    instance_key,
+                    variables,
+                    ..
+                } => {
+                    // Initial variables count as a change (a conditional event may
+                    // already hold at activation).
+                    let entry = changed.entry(*instance_key).or_default();
+                    for name in variables.keys() {
+                        entry.insert(name.clone());
+                    }
+                }
+                Event::ConditionalSubscriptionCreated {
+                    subscription_key, ..
+                } => {
+                    opened.insert(*subscription_key);
+                }
+                _ => {}
+            }
+        }
+        if changed.is_empty() && opened.is_empty() {
+            return scan_end;
+        }
+        // Collect the subscriptions to (re-)evaluate, deterministically by key: a
+        // newly opened one, or one whose referenced variables changed.
+        let mut candidates: Vec<Key> = self
+            .state
+            .conditional_subscriptions
+            .values()
+            .filter(|s| {
+                s.state == state::MessageSubscriptionState::Open
+                    && (opened.contains(&s.key)
+                        || changed
+                            .get(&s.instance_key)
+                            .is_some_and(|vars| s.referenced_vars.iter().any(|v| vars.contains(v))))
+            })
+            .map(|s| s.key)
+            .collect();
+        candidates.sort_unstable();
+
+        for key in candidates {
+            // A prior fire in this batch may have interrupted the activity and
+            // cancelled this subscription, so re-check it is still open.
+            let Some(sub) = self.state.conditional_subscriptions.get(&key) else {
+                continue;
+            };
+            if sub.state != state::MessageSubscriptionState::Open {
+                continue;
+            }
+            let instance_key = sub.instance_key;
+            let element_instance_key = sub.element_instance_key;
+            let element_id = sub.element_id.clone();
+            let condition = sub.condition.clone();
+            let kind = sub.kind.clone();
+            let vars = self.variables(instance_key);
+            if !matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
+                continue;
+            }
+            self.emit(
+                log,
+                Event::ConditionalTriggered {
+                    subscription_key: key,
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                },
+            );
+            match kind {
+                // Intermediate catch: releasing it resumes the token along its own
+                // outgoing flow.
+                state::MessageSubscriptionKind::IntermediateCatch => {
+                    queue.push_back(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
+                }
+                // Interrupting boundary: interrupt the attached activity, then run
+                // the boundary event's outgoing flow.
+                state::MessageSubscriptionKind::InterruptingBoundary {
+                    boundary_element_id,
+                } => {
+                    let scope = self.scope_of(instance_key, element_instance_key);
+                    self.interrupt_activity_via_boundary(
+                        log,
+                        instance_key,
+                        element_instance_key,
+                        &element_id,
+                    );
+                    queue.push_back(Step::Activate {
+                        instance_key,
+                        element_id: boundary_element_id,
+                        scope,
+                    });
+                }
+                // Non-interrupting boundary: leave the activity running and spawn a
+                // parallel token along the boundary's outgoing flow. The
+                // subscription stays open (its applier does not settle it), so a
+                // later change to a referenced variable can fire it again.
+                state::MessageSubscriptionKind::NonInterruptingBoundary {
+                    boundary_element_id,
+                } => {
+                    queue.push_back(Step::Activate {
+                        instance_key,
+                        element_id: boundary_element_id,
+                        scope: self.scope_of(instance_key, element_instance_key),
+                    });
+                }
+            }
+        }
+        scan_end
     }
 
     /// Records a correlation against a subscription whose **instance lives on this
@@ -1990,6 +2167,9 @@ impl Engine {
                 self.emit(log, event);
             }
             for event in self.cancel_boundary_signal_subscriptions_on(eik) {
+                self.emit(log, event);
+            }
+            for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
                 self.emit(log, event);
             }
             // Output mappings on a sub-process apply as its scope drains.
@@ -2236,6 +2416,36 @@ impl Engine {
                     kind: state::MessageSubscriptionKind::IntermediateCatch,
                 });
             }
+            // A conditional intermediate catch event evaluates its FEEL condition
+            // on arrival: if already `true` the token passes straight through;
+            // otherwise it parks on a conditional subscription, re-evaluated on
+            // each change to a variable the condition references. A condition that
+            // errors (e.g. a non-boolean result while a referenced variable is not
+            // yet set) is treated as not-yet-satisfied and simply waits — a
+            // conditional event is a wait-until, not an incident (a deliberate
+            // flat-scope choice).
+            Some(ElementKind::ConditionalIntermediateCatchEvent { condition }) => {
+                let vars = self.variables(instance_key);
+                if matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
+                    followups.push(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
+                } else {
+                    let subscription_key = self.mint_key();
+                    let referenced_vars = sorted_referenced_vars(&condition);
+                    events.push(Event::ConditionalSubscriptionCreated {
+                        subscription_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        condition,
+                        referenced_vars,
+                        kind: state::MessageSubscriptionKind::IntermediateCatch,
+                    });
+                }
+            }
             // An embedded sub-process opens a token scope: it activates its inner
             // start event inside its own scope (this element instance) and rests
             // while the inner flow runs. It completes once the scope drains (see
@@ -2352,6 +2562,7 @@ impl Engine {
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
+        events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
         // A script task's result is merged before output mappings so a
         // `zeebe:output` can reference/remap it (Zeebe merges `resultVariable`
         // first, then applies output mappings).
@@ -2709,6 +2920,11 @@ impl OwnedByInstance for state::SignalSubscription {
         self.instance_key
     }
 }
+impl OwnedByInstance for state::ConditionalSubscription {
+    fn instance_key(&self) -> Key {
+        self.instance_key
+    }
+}
 impl OwnedByInstance for state::UserTask {
     fn instance_key(&self) -> Key {
         self.instance_key
@@ -2718,6 +2934,17 @@ impl OwnedByInstance for state::Incident {
     fn instance_key(&self) -> Key {
         self.instance_key
     }
+}
+
+/// The sorted set of root variable names a conditional event's FEEL `condition`
+/// references, used both to record the subscription's dependencies and to decide
+/// which variable changes re-evaluate it. Sorted for a deterministic event body.
+fn sorted_referenced_vars(condition: &str) -> Vec<String> {
+    let mut vars: Vec<String> = crate::feel::referenced_variables(condition)
+        .into_iter()
+        .collect();
+    vars.sort();
+    vars
 }
 
 /// Removes from `map` every entity owned by `instance_key`, returning them. Used

@@ -415,6 +415,44 @@ pub enum Event {
         element_instance_key: Key,
         element_id: ElementId,
     },
+    /// A conditional subscription was opened: on a conditional intermediate catch
+    /// event (the token rests on it) or as a conditional boundary on an activity.
+    /// It carries the FEEL `condition` and the set of root variable names the
+    /// condition references (`referenced_vars`), so the engine re-evaluates it
+    /// only when one of those variables changes. Unlike message/signal
+    /// subscriptions it has no external trigger command: the engine evaluates it
+    /// on open and on each change to a referenced variable, firing when the
+    /// condition becomes `true` (see [`Event::ConditionalTriggered`]).
+    ConditionalSubscriptionCreated {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        condition: String,
+        referenced_vars: Vec<String>,
+        kind: MessageSubscriptionKind,
+    },
+    /// A conditional subscription's condition evaluated `true`. For an
+    /// intermediate catch or an interrupting boundary this settles the
+    /// subscription (it fires once); for a non-interrupting boundary it stays
+    /// open (each satisfying variable change spawns another token). The token
+    /// advance (catch completion / boundary interrupt / parallel spawn) is
+    /// carried by the surrounding events the same command produced.
+    ConditionalTriggered {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
+    /// An open conditional subscription was cancelled before firing because the
+    /// element it guarded left the flow first (mirrors
+    /// [`Event::SignalSubscriptionCanceled`]).
+    ConditionalSubscriptionCanceled {
+        subscription_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    },
     /// The **instance** partition tore down a cross-partition parked
     /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],
     /// recorded by [`Event::MessageSubscriptionOpening`]) because the element it
@@ -527,6 +565,9 @@ impl Event {
             | Event::SignalSubscriptionCreated { instance_key, .. }
             | Event::SignalCorrelated { instance_key, .. }
             | Event::SignalSubscriptionCanceled { instance_key, .. }
+            | Event::ConditionalSubscriptionCreated { instance_key, .. }
+            | Event::ConditionalTriggered { instance_key, .. }
+            | Event::ConditionalSubscriptionCanceled { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
@@ -632,6 +673,21 @@ impl Event {
                 ..
             }
             | Event::SignalSubscriptionCanceled {
+                subscription_key,
+                element_instance_key,
+                ..
+            } => m = m.max(*subscription_key).max(*element_instance_key),
+            Event::ConditionalSubscriptionCreated {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Event::ConditionalTriggered {
+                subscription_key,
+                element_instance_key,
+                ..
+            }
+            | Event::ConditionalSubscriptionCanceled {
                 subscription_key,
                 element_instance_key,
                 ..

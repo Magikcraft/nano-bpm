@@ -292,6 +292,7 @@ impl Engine {
         self.state.timers.shrink_to_fit();
         self.state.message_subscriptions.shrink_to_fit();
         self.state.signal_subscriptions.shrink_to_fit();
+        self.state.conditional_subscriptions.shrink_to_fit();
         self.state.incidents.shrink_to_fit();
         self.state.activatable_jobs.shrink_to_fit();
         self.state.activated_jobs.shrink_to_fit();
@@ -446,7 +447,10 @@ impl Engine {
     /// or subscriptions exist — the common case under a create-heavy backlog.
     pub(crate) fn instances_with_async_token(&self) -> std::collections::HashSet<Key> {
         let mut guarded = std::collections::HashSet::new();
-        if self.state.timers.is_empty() && self.state.message_subscriptions.is_empty() {
+        if self.state.timers.is_empty()
+            && self.state.message_subscriptions.is_empty()
+            && self.state.conditional_subscriptions.is_empty()
+        {
             return guarded;
         }
         for timer in self.state.timers.values() {
@@ -459,6 +463,13 @@ impl Engine {
                 sub.state,
                 state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
             ) {
+                guarded.insert(sub.instance_key);
+            }
+        }
+        // A conditional catch/boundary can resume without job activation (a later
+        // variable update flips its condition), so keep those instances resident.
+        for sub in self.state.conditional_subscriptions.values() {
+            if sub.state == state::MessageSubscriptionState::Open {
                 guarded.insert(sub.instance_key);
             }
         }
@@ -566,6 +577,7 @@ impl Engine {
         let timers = drain_owned(&mut self.state.timers, key);
         let message_subscriptions = drain_owned(&mut self.state.message_subscriptions, key);
         let signal_subscriptions = drain_owned(&mut self.state.signal_subscriptions, key);
+        let conditional_subscriptions = drain_owned(&mut self.state.conditional_subscriptions, key);
         let user_tasks = drain_owned(&mut self.state.user_tasks, key);
         let incidents = drain_owned(&mut self.state.incidents, key);
 
@@ -576,6 +588,7 @@ impl Engine {
             timers,
             message_subscriptions,
             signal_subscriptions,
+            conditional_subscriptions,
             user_tasks,
             incidents,
         })
@@ -592,6 +605,7 @@ impl Engine {
             timers,
             message_subscriptions,
             signal_subscriptions,
+            conditional_subscriptions,
             user_tasks,
             incidents,
         } = snapshot;
@@ -615,6 +629,9 @@ impl Engine {
         }
         for sub in signal_subscriptions {
             self.state.signal_subscriptions.insert(sub.key, sub);
+        }
+        for sub in conditional_subscriptions {
+            self.state.conditional_subscriptions.insert(sub.key, sub);
         }
         for task in user_tasks {
             self.state.user_tasks.insert(task.key, task);
