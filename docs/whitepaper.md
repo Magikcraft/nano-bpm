@@ -15,28 +15,29 @@ scaffolded as later sections. Author‑facing notes are marked `> DRAFTING NOTE`
 
 ## Abstract
 
-> DRAFTING NOTE — write last, once the sections settle. Target ~200 words.
-> Must land four claims: (1) a distributed process engine that self‑optimizes
-> with **zero technical configuration**, exposing exactly **one** irreducible
-> business decision; (2) achieved by promoting patterns that *emerged* over a
-> decade of distributed BPMN (backpressure, client adaptation, feedback‑driven
-> scaling) from add‑ons to **first principles**; (3) delivered as an
-> **API‑compatible drop‑in** for Camunda 8 — a paradigm shift behind a fixed,
-> commensurable interface, so it is adoptable without abandoning existing
-> tooling, and **usable today** as a lightweight local‑development replacement
-> for a full Camunda 8 deployment (`c8run`) for the supported‑and‑growing C8
-> subset; (4) small enough (Rust, no JVM/RocksDB, WASM‑capable) to open a new
-> frontier: coexisting with local LLMs and replaying real historical workloads
-> against counterfactual model variants. Performance and an honestly‑named
-> throughput ceiling are presented as *evidence for the architecture*, not the
-> headline.
-> Register (disciplined): frame Nano as **a refinement that creates a
-> revolutionary realm of possibility** — narrow, surgical changes (a system‑wide
-> feedback loop, the engine's relationship to its own RAM, the footprint, a few
-> perf internals) over a deliberately preserved, battle‑tested core (actor model,
-> state machinery, C8 interface). Not wholesale replacement; the revolution is in
-> what it *opens* (recursive embedding, local‑LLM composition, empirical
-> optimization), not in what it tears down.
+Nano is a distributed BPMN engine that speaks the Camunda 8 API and self‑optimizes
+with essentially zero technical configuration, leaving exactly one decision to a
+human: how the service should behave at the edge of its capacity envelope —
+compress (delay) or limit (drop). It gets there by promoting the control loops a
+decade of distributed‑BPMN practice tuned by hand — backpressure, client
+adaptation, feedback‑driven scaling — from operational add‑ons to first
+principles: feedback loops and decision nodes made first‑class inside the engine
+(cybernetics, not machine learning). Those loops were the missing concern that a
+decade of anomalies kept pointing to, and that the incumbent's own success had
+made economically unaddressable in place.
+
+The reimagining is disciplined. It preserves Zeebe's logical state model and,
+exactly, the Camunda 8 contract — so it is a drop‑in, adoptable without abandoning
+existing tooling, and usable today as a lightweight local‑development replacement
+for a full Camunda 8 deployment (`c8run`) across a supported and growing subset.
+What changes is narrow and surgical; what it opens is not. Small enough to run
+beside a local LLM and to be instantiated by the dozen — even created, recursively,
+by an LLM as a tool call — it makes a new frontier reachable: replaying real
+history against counterfactual model variants to optimize processes empirically.
+Throughput past 100 000 instances/s and a sub‑gigabyte footprint, behind an
+honestly named coordination‑bound ceiling, are offered as evidence for the
+architecture, not as the headline. Nano is a refinement that creates a
+revolutionary realm of possibility.
 
 ---
 
