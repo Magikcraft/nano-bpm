@@ -16,3 +16,7 @@ public/asyncapi/index.html
 # Documentation website, generated at build time from ../README.md
 # (see scripts/build-docs.mjs).
 public/docs/
+
+# Whitepaper page, generated at build time from ../docs/whitepaper.md
+# (see scripts/build-whitepaper.mjs).
+public/whitepaper/

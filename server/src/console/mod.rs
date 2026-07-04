@@ -76,6 +76,8 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/docs", get(docs_index))
         .route("/docs/", get(docs_index))
         .route("/docs/{*path}", get(docs_asset))
+        .route("/whitepaper", get(whitepaper_index))
+        .route("/whitepaper/", get(whitepaper_index))
         .route("/console/api/topology", get(topology))
         .route("/console/api/cluster/health", get(cluster_health))
         .route("/console/api/metrics", get(metrics_snapshot))
@@ -390,6 +392,14 @@ async fn docs_asset(
         format!("docs/{path}.html")
     };
     serve_embedded(&key, gz)
+}
+
+/// Serves the bundled whitepaper at `/whitepaper`. The page is generated at
+/// build time from `docs/whitepaper.md` (see
+/// `console/scripts/build-whitepaper.mjs`) into `dist/whitepaper/index.html`, so
+/// it refreshes on every console build and is embedded in the release binary.
+async fn whitepaper_index(headers: HeaderMap) -> Response {
+    serve_embedded("whitepaper/index.html", accepts_gzip(&headers))
 }
 
 #[derive(Serialize)]

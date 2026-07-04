@@ -54,8 +54,34 @@ Camunda 8 it implements covers what a given project exercises. The scope is
 bounded and honestly stated — not *every* C8 feature, but the contract you
 actually use in local development — and that subset is expanding continuously.
 
-That modest, available‑today use is the visible near edge of a much larger claim
-about how such an engine should be built. Process automation engines have
+**Nano at a glance.**
+
+- **Small memory footprint** — a sub‑50 MB binary that idles at ~10 MB and holds
+  ~400 MB per node at 100k process‑instances/s across three nodes (§8, §12).
+- **Sub‑second cold start** — a native binary that boots in under a second, with
+  no JVM warm‑up, in contrast to a ~1.5–2 GB local Camunda 8 stack (§8, §13.1).
+- **Self‑optimizing operation** — the operational surface is *derived*, not tuned:
+  one irreducible business decision, everything else decided by the engine from
+  live signals (§3).
+- **Closed‑loop adaptive scaling** — distributed clients and the cluster form one
+  self‑sizing control loop, so client fleets scale themselves instead of being
+  hand‑tuned (§6, §9).
+- **Fault‑tolerant clustering** — Raft‑replicated partitions for high‑availability
+  operation (§9).
+- **Tunable durability** — a declared deployment mode trades data‑safety guarantees
+  for throughput (strict quorum+sync vs. relaxed leader‑durable+async), measured
+  end‑to‑end (§8, §12).
+- **In‑browser engine** — the same engine core compiles to WebAssembly and runs in
+  the browser (the console's in‑page test‑run; `engine-wasm`) (§7).
+- **Embeddable engine** — the same engine runs embedded in a worker, microservice,
+  or application, or is invoked directly as an LLM tool call (§8, §14).
+- **Camunda 8 API‑compatible** — a drop‑in replacement behind the standard C8 REST
+  contract (§4).
+- **Zeebe engine lineage** — the proven Zeebe execution model, refined for higher
+  throughput and a smaller footprint (§7, §13).
+
+That modest, available‑today use - local development - is the visible near edge of a much larger claim
+about how such an engine can be built. Process automation engines have
 accreted, over a decade, a large surface of operational tuning: backpressure
 thresholds, replication factors, exporter batching, snapshot cadences, resource
 limits. Each knob is individually reasonable and collectively they demand that an
@@ -105,10 +131,6 @@ progressively* rather than being designed as one loop, and several loops that a
 cohesive design would close were left **open**. Scaling the system as a whole,
 rather than tuning its parts independently, was correspondingly hard.
 
-> DRAFTING NOTE — this is the deepest anomaly; it unifies §§7–9 (the create →
-> adapt → drain control system) under one principle: *close the loops the old
-> system left open.*
-
 ### 2.2 Roadmap capture (why incremental evolution could not arrive here)
 
 Adoption is a gravity well: engineering effort flows to what existing customers
@@ -118,7 +140,7 @@ an in‑browser engine) are precisely the ones no current customer would think t
 ask for. This is not a criticism of the prior roadmap; it is a structural reason
 the new paradigm had to come from outside the well.
 
-### 2.3 The exogenous shock: local LLMs make footprint a first‑class constraint
+### 2.3 The exogenous shock — and the enabler: local LLMs
 
 The rise of capable **local** LLMs changes the resource contract on a developer
 workstation: the model wants the RAM. An engine that expects to coexist with a
@@ -126,6 +148,19 @@ local model must have the smallest possible memory footprint — not as an
 efficiency nicety, but as a hard precondition for the new class of workflow
 (LLM‑assisted development and analysis) to exist at all. Footprint moves from a
 metric to a *constraint*, and then (§8) to a *capability*.
+
+The same shift is also an **enabler**, and this is the sharper point. The gravity
+well of §2.2 — the reason a ground‑up reconsideration could not be economically
+justified inside the old paradigm — is not a law of nature but a *cost*.
+LLM‑accelerated development collapses that cost: a small effort can now attempt
+what once demanded a large team over years, so climbing out of the well became
+cheap (§13.3). Far‑reaching exploration at high velocity — many designs tried,
+measured, and discarded — became accessible. Nano is an idea that
+lived for a long time before it was economically buildable; what changed is not the
+idea but the cost of realising it. And the effect compounds: once the initial
+anomalies were resolved, the frontier did not close but kept receding — *how small
+can this get? how fast can it go?* — each answer cheap enough to pursue that it
+invited the next question.
 
 ### 2.4 Emergence without cohesion
 
@@ -162,10 +197,26 @@ and under balanced load, so the defaults are byte‑identical to prior behaviour
 exactly where that behaviour was already correct. (See README, "Self‑optimizing
 by design".)
 
-> DRAFTING NOTE — precision guard: the claim is **one business decision you ever
-> *need* to set**, and "everything else is *derived*." Override switches do
-> exist (all default‑on); we state that plainly rather than claim "literally one
-> setting exists," which a reader would falsify by finding the env vars.
+This is a claim about what you *need* to set, not about what you *can*. A vast
+array of parameters remains exposed — spill and watermark fractions, checkpoint
+cadences, credit windows, replication factor, partition count — and every
+self‑optimizing subsystem carries an override, all default‑on. You *can* tune
+them; you don't *need* to, because each is *derived* from a measured signal at
+runtime rather than guessed at deploy time. Overrides exist for the operator who
+wants to pin a value; the point is that leaving them alone is the correct default,
+not a resignation.
+
+Two kinds of choice survive, and it is worth separating them. **Deployment‑mode
+options** select an operating point for the whole system — a durability tier
+(§8), a replication factor, single‑node versus cluster — and these are genuine,
+declared choices, not knobs the engine can derive, because they encode intent and
+risk appetite rather than a tunable the runtime could read off a metric. But
+*within* whatever mode you select, the **operational envelope** — how hard to
+push, when to shed, when to spill, how to balance load — is self‑optimizing. The
+mode says what you value; the engine works out how to honour it under live
+conditions. The sharpest of these value choices, and the only one that is
+*irreducibly* a business judgement rather than an infrastructure one, is the
+subject of §3.3.
 
 ### 3.3 The one irreducible decision
 
@@ -202,12 +253,15 @@ Three consequences make this invariant load‑bearing for the whole paper:
    Nano `traces.json`), real historical production workloads can be replayed on
    it — the bridge to empirical, counterfactual optimization (§8.3, Part II).
 
-**The honest tension.** A fixed contract costs design freedom: Nano must
-reproduce C8 client‑facing semantics (job activation, message correlation, FEEL,
-key/domain types) even where a cleaner model exists. The resolution is additive,
-not substitutive — the standard API remains the compatible default, and **Falcon**
-(§9) is an *optional* native protocol for higher performance. Compatible by
-default; faster if you opt in.
+**The discipline of a fixed contract.** A fixed contract removes a degree of
+design freedom, and that is the point: Nano reproduces C8 client‑facing semantics
+(job activation, message correlation, FEEL, key/domain types) faithfully, not
+grudgingly. These are sound, battle‑tested semantics; there is nothing to
+improve, and Nano makes no attempt to. Where Nano goes beyond C8 it does so
+**additively — as a superset, never a substitution**: the standard API remains
+the compatible default, untouched, and extensions are offered *alongside* it. To
+date there is exactly one such extension — **Falcon** (§9), an *optional* native
+transport for higher performance. Compatible by default; faster if you opt in.
 
 ---
 
@@ -251,10 +305,16 @@ protocol carries — walked through a spreadsheet he kept of how L2 cache behavi
 moved engine throughput, tuning what felt like every available knob by hand. Two
 things were true at once: the craft was extraordinary, and it was *manual*. Every
 knob was a place where a human stood in for a controller the system did not yet
-contain. Listening, one question kept surfacing: why can't the clients auto-scale
-*inside* the system? The engine knew when it was saturated; the client learned it
-only by being refused. That gap is an **open feedback loop** — and an open loop is
-an invitation to close it.
+contain. Some of those knobs are about the box itself — which hardware serves peak
+throughput, how L2 behaviour moves the number — and that reasoning is legitimate
+and remains: there is still a best machine to run a server on. But the opportunity
+that surfaced in that conversation was different in kind. The individual pieces
+could each be tuned locally; what the architecture of the day made impossible was
+addressing the system *as a whole* — optimising the entire distributed system, end
+to end, as one unit. Listening, one question kept surfacing: why can't the clients
+auto-scale *inside* the system? The engine knew when it was saturated; the client
+learned it only by being refused. That gap is an **open feedback loop** — and an
+open loop is an invitation to close it.
 
 Closing it was a years-long approach, not a single act. First, backpressure
 backoff became the default in the client SDKs, so a refused client waited instead

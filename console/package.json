@@ -6,7 +6,7 @@
   "description": "Web console for the self-contained single-node nanobpmn distribution: cluster/topology view, BPMN modeler, process-instance explorer, and embedded workers.",
   "scripts": {
     "dev": "vite",
-    "build": "node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && tsc && vite build",
+    "build": "node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && tsc && vite build",
     "preview": "vite preview"
   },
   "dependencies": {

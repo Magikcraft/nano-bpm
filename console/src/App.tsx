@@ -84,9 +84,30 @@ export default function App() {
           })}
         </nav>
 
+        <a
+          href="/whitepaper"
+          className="mt-auto mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm text-zinc-400 no-underline transition-colors hover:bg-zinc-800/50 hover:text-zinc-200"
+          title="Whitepaper"
+        >
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" />
+          </svg>
+          Whitepaper
+        </a>
+
         <NavLink
           to="/credits"
-          className={`mt-auto mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
+          className={`mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors ${
             location.pathname.startsWith("/credits")
               ? "bg-zinc-800 text-white"
               : "text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200"
