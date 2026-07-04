@@ -183,7 +183,14 @@ public final class EmbeddedEngine implements AutoCloseable {
     }
   }
 
-  /** Correlate a message. Returns the correlation record id (>=0), -1 for no match. */
+  /**
+   * Correlate a message and dispatch it into the running engine.
+   *
+   * <p>Returns the number of engine events produced by the correlation (which
+   * therefore also indicates whether a subscription matched: {@code 0} means
+   * no subscription matched, positive means at least one instance advanced).
+   * Returns {@code -1} only on invalid input (null engine / non-UTF-8 bytes).
+   */
   public long correlateMessage(String name, String correlationKey) {
     return correlateMessage(name, correlationKey, System.currentTimeMillis());
   }

@@ -148,4 +148,48 @@ class EmbeddedEngineTest {
       assertEquals(2, second.get(0).retries());
     }
   }
+
+  @Test
+  void correlate_message_returns_event_count_and_advances_a_waiting_instance() {
+    // Process: start -> intermediate message catch (name="ping", correlationKey=orderId) -> end.
+    // Correlating with a matching key must return > 0 (events produced) and complete the instance.
+    // Correlating with a non-matching key must return 0 (no subscription matched).
+    String msgBpmn =
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+          <bpmn:message id="pingMsg" name="ping">
+            <bpmn:extensionElements><zeebe:subscription correlationKey="=orderId" /></bpmn:extensionElements>
+          </bpmn:message>
+          <bpmn:process id="p" isExecutable="true">
+            <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+            <bpmn:intermediateCatchEvent id="c">
+              <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+              <bpmn:messageEventDefinition messageRef="pingMsg" />
+            </bpmn:intermediateCatchEvent>
+            <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="c" />
+            <bpmn:sequenceFlow id="f2" sourceRef="c" targetRef="e" />
+          </bpmn:process>
+        </bpmn:definitions>
+        """;
+    try (var engine = EmbeddedEngine.create()) {
+      engine.deploy(msgBpmn);
+      // Note: this instance has no `orderId` variable, so the subscription's
+      // correlation key resolves to empty — matched below by an empty key.
+      String pi = engine.createInstance("p", 1_000L);
+      assertFalse(engine.isCompleted(pi));
+
+      // Non-matching message name: instance stays parked (no advancement).
+      engine.correlateMessage("does-not-exist", "", 1_100L);
+      assertFalse(engine.isCompleted(pi));
+
+      // Matching name: return is the number of engine events produced (>=1),
+      // NOT a correlation-record id, and the waiting instance advances to end.
+      long produced = engine.correlateMessage("ping", "", 1_200L);
+      assertTrue(produced > 0, "expected correlate to produce events, got " + produced);
+      assertTrue(engine.isCompleted(pi));
+    }
+  }
 }
