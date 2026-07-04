@@ -251,6 +251,27 @@ one organism that sizes itself. This is the §2.1 anomaly resolved, and the cent
 thesis made concrete: a pattern that *emerged* progressively across the SDKs is
 promoted to a **first-class**, always-on property of the system.
 
+Concretely, Falcon is that loop made into a wire protocol: a single, persistent,
+bidirectional, **credit-metered** WebSocket per client (`server/src/falcon.rs`;
+`docs/falcon-design.md`). Over one socket it multiplexes the two interaction
+patterns a process client needs — **demand/push** job delivery (a worker
+`Subscribe`s to a job type with a credit count; a server-side dispatcher leases
+matching jobs and pushes `Job` frames while credits remain) and
+**request/response** writes (`CreateInstance`/`CompleteJob`/`FailJob`/`ThrowError`,
+each answered by a correlated result). The decisive detail is what meters the
+writes: process-instance creation draws on a **submission-credit** lane fed
+directly from the engine's own processing headroom through the backpressure
+controller. Under saturation the server simply *withholds credits* and the client
+stalls its intake — no `503`, no retry, no thundering herd. That credit window is
+the closed loop reified on the wire: rather than refuse a client and leave it to
+infer the system's state, Falcon hands each client exactly as much demand as the
+cluster can currently absorb, and no more. Job completion, by contrast, flows
+**unmetered** — draining backlog must never be throttled. §9 covers the transport
+in full; here the point is only that the control loop of §6 has a physical
+embodiment, one persistent socket wide, and that it is named for the craftsman
+whose L2-cache spreadsheet first made the loop visible: Falko Menge. Artists sign
+their work.
+
 ### 6.1 What the old paradigm could close, and what it could not
 
 The old paradigm did close a loop — a good one — but a *local* one. Zeebe limits
