@@ -223,7 +223,14 @@ export class EmbeddedEngine {
     }
   }
 
-  /** Correlate a message. Returns the correlation record id (>=0), or -1 for no match. */
+  /**
+   * Correlate a message and dispatch it into the running engine.
+   *
+   * Returns the number of engine events produced (>=0). Positive means at
+   * least one subscription matched and one or more instances advanced; 0
+   * means no subscription matched. Returns -1 only on invalid input (null
+   * engine / non-UTF-8 bytes).
+   */
   correlateMessage(name: string, correlationKey: string, nowEpochMs?: number): bigint {
     this.assertOpen();
     const [namePtr, nameLen] = this.writeStr(name);
