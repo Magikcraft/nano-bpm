@@ -258,32 +258,117 @@ with a mode switch. (Full treatment: ADR 0013.)
 
 ### 8.1 Memory as a designed invariant, not a background chore
 
-> DRAFTING NOTE — the showcase divergence (ADR 0012). In Zeebe, the snapshot/
-> compaction bound is `Math.min(exportedPosition, backupPosition,
-> lastProcessedPosition)` (`StateControllerImpl.java:213`); a stale/slow exporter
-> "pins the snapshot/compaction position and prevents log compaction"
-> (`ExporterDirector.java:496‑497`, `ExportersState.getLowestPosition`). State
-> reclamation is thus coupled to an unrelated subsystem's lag. Nano **decouples
-> terminal‑state reclamation from exporter position** (ADR 0012): peak resident
-> variable memory fell from **~4.35 GB to 131 MB**, reaching **0 immediately**
-> post‑load regardless of exporter position. Same class of problem, opposite
-> outcome — the anomaly, resolved.
+In the old paradigm, memory is a background chore: you provision generously, watch
+a gauge, and reach for backpressure when it climbs. Nano treats the resident
+footprint as a *designed invariant* — a quantity the engine is built to hold near
+its true working set and to return to the OS when the work is gone. The clearest
+illustration is a coupling we inherited by default, examined it, and severed.
+
+Consider what pins memory in a log-structured engine. State and log can only be
+reclaimed once every consumer that must see a record has seen it. In Zeebe the
+snapshot/compaction bound is exactly this lower envelope —
+`Math.min(exportedPosition, backupPosition, lastProcessedPosition)`
+(`StateControllerImpl.java:213`) — and a stale or slow exporter therefore "pins
+the snapshot/compaction position and prevents log compaction"
+(`ExporterDirector.java:496‑497`; `ExportersState.getLowestPosition`). This is not
+an oversight. It is *forced* by a uniform, disk-backed RocksDB design: state and
+event log share one compaction gate, and correctness demands the gate wait for the
+slowest acknowledged reader. Under that architecture the coupling is the right
+call, and RocksDB's mmap'd pages soften the cost — memory pressure pages state out
+to disk rather than pinning the heap.
+
+Nano hits the *same class* of problem and, freed from that architecture, resolves
+it the opposite way. Our hot state is a Rust `HashMap` on the heap: it cannot page
+out, so a downstream reader's lag translating into resident RAM is strictly
+*worse* for us — but it is also removable, because two properties Zeebe's uniform
+design does not isolate hold for us (ADR 0012). First, **the exporter reads the
+event log, not hot state**: the read-model projection (`readstore.rs
+upsert_variables`) is fed by event payloads, never by a read of a live instance.
+Second, **a terminal instance's variables are write-only to the engine**: once an
+instance is `Completed`/`Terminated`, nobody — not workers, not the exporter, not
+journal recovery — ever reads its variables from hot state again. They are pure
+liability in the heap the moment the instance ends.
+
+So Nano **reclaims terminal-instance variable memory on completion, independent of
+exporter position** (ADR 0012). On `ProcessInstanceCompleted`/`Terminated` the
+~50 KB payload is dropped immediately; a lightweight control-only shell (key +
+terminal state, no variables) lingers only until the exporter has projected the
+instance, so point-in-time status still resolves during the projection gap.
+Exporter lag now costs disk retention and read-model staleness — never hot-state
+RAM, and never admission. On the 3-node GCP soak (sha `15f5239f4d6cff96`), peak
+single-node resident variable memory fell from **~4.35 GB** (residue that lingered
+for *minutes* after load, gated on exporter progress) to **131 MB**, reaching
+**0 immediately** post-load regardless of exporter position (`PERFORMANCE.md`,
+ADR 0012 soak section). Same anomaly, inverted outcome — and the honest reason it
+inverts is that we had the freedom to choose a non-uniform state model, not that
+the earlier choice was wrong for its world.
 
 ### 8.2 The mechanisms
 
-> DRAFTING NOTE — tiered variable spill + cold spill (working set to disk under
-> pressure); idle‑purge (compact hot maps, return arenas to OS); var‑store WAL
-> bounding (ADR 0013); Rust + jemalloc vs JVM + RocksDB off‑heap. Note the macOS
-> measurement caveat: use `footprint`/phys_footprint, not `ps -o rss`.
+Decoupling terminal state is the load-bearing idea; a handful of supporting
+mechanisms keep the footprint honest across the whole lifecycle. They fall into
+three layers.
+
+**The live working set is bounded, not just watched.** When creates outrun
+completions, the Active backlog is capped by *byte-aware adaptive variable spill*:
+the working set of live instances is written to disk under memory pressure, driven
+by measured jemalloc `resident` rather than instance counts, with a byte-based
+guard that avoids futile spill sweeps when no candidate can actually shed bytes
+(ADR 0012, Fix 2; `journal.rs maybe_var_spill_pressure`). Snapshots stay lean:
+the periodic snapshot carries **control state only** while variables live in an
+authoritative durable `var-store.sqlite` that recovery reads directly, so a
+snapshot never has to clone the payload heap (ADR 0012, Fix 1a/1b;
+`journal.rs snapshot_and_rotate_lean`, `varstore.rs`). The var-store's WAL is in
+turn bounded by periodic `wal_checkpoint(TRUNCATE)` so the durability tier cannot
+itself become an unbounded balloon (ADR 0013).
+
+**Freed memory is actually returned to the OS.** A general-purpose allocator keeps
+freed pages on its own free lists, so an *idle* server pins its burst peak long
+after the work is gone. Nano vendors and statically links **jemalloc**, configured
+to return dirty/muzzy pages on a ~5 s decay (`dirty_decay_ms:5000,
+muzzy_decay_ms:5000`), with the background purge thread enabled where the platform
+supports it (Linux). Where it does not (macOS has no jemalloc background thread),
+an **idle-purge tick** compacts the hot-state maps after a configurable quiescence
+window and forces `arena.<all>.purge` via `mallctl`, returning the pages
+immediately (`server/src/memory.rs`; `NANOBPMN_IDLE_PURGE_MS`, default 5000, 0 to
+disable). This is why the post-load curve reaches 0 rather than merely ceasing to
+grow.
+
+**The footprint is measured truthfully.** The engine exports its own allocator
+decomposition — `nanobpm_jemalloc_bytes{kind="allocated"|"active"|"resident"|
+"mapped"|"retained"}` (`main.rs`) — so operators reason about `resident` (the
+figure that matters), not a proxy. This also encodes a hard-won measurement
+caveat: on macOS `ps -o rss` under-reports dramatically; the meaningful number is
+jemalloc `resident` / `phys_footprint` (what `footprint` and Activity Monitor
+report). Reporting the right quantity is part of treating footprint as a
+first-class invariant rather than a background chore.
 
 ### 8.3 From constraint to capability
 
-> DRAFTING NOTE — small footprint unlocks two capabilities the old paradigm could
-> not host: (1) **coexistence with a local LLM** on one workstation; (2)
-> **counterfactual replay** — spin up many lightweight engine instances to replay
-> historical production workloads against model‑variant hypotheses (bridge to
-> Part II). "Small" stops being a virtue and becomes an enabling constraint for a
-> new kind of question.
+Held small on purpose, the footprint stops being a virtue to defend and becomes an
+*enabling constraint* — it lets the engine live in places the old paradigm could
+not host, and answer questions it could not pose.
+
+The first is **coexistence with a local LLM**. A developer running a quantized
+model on a workstation needs every gigabyte of RAM for weights and KV-cache; the
+process engine is now a lodger that must leave the room mostly empty. A JVM +
+RocksDB engine provisioned for a comfortable heap is simply the wrong houseguest.
+A Rust engine that idles near **13 MB** resident (jemalloc `resident`; ≈10 MB
+`phys_footprint` for a freshly started, empty console-enabled release build on
+macOS) and returns memory to the OS the moment it goes quiet is one you can leave
+running next to the model.
+This is not a micro-optimization; it is what makes an *agentic*, engine-in-the-loop
+workflow feasible on a single machine at all.
+
+The second is **counterfactual replay**. If a single engine instance is cheap
+enough in memory to run many at once, you can take a historical production workload
+and re-run it — not once, but across a fan of model-variant hypotheses — to ask
+"what would have happened if the process had been shaped differently?" Small
+footprint is the precondition: it is what turns the engine from a thing you deploy
+into a thing you *instantiate by the dozen* for empirical exploration. This is the
+bridge to Part II, and the sharpest expression of the constraint-to-capability
+move: the discipline the LLM shock forced on us is exactly the property that opens
+a new class of question.
 
 ---
 
@@ -344,7 +429,8 @@ convergences.
 >   exporter is CPU‑bound on SQLite inserts (~250k events/s, one core ~100%, 15/16
 >   vCPU idle); throughput is flat across fsync modes. Understanding our own wall
 >   *strengthens* the paper and sets up the next chapter.
-> - Memory: ADR 0012 soak (4.35 GB→131 MB→0). Idle footprint `[MEASURE]`.
+> - Memory: ADR 0012 soak (4.35 GB→131 MB→0). Cold-idle ≈13 MB resident
+>   (measured, empty console release build, macOS).
 > - Latency floor: un‑pipelined quorum ≈ ~100 jobs/s single‑worker vs 33k @64
 >   workers (ADR 0003) — a property of synchronous quorum, not of Raft.
 > - Compatibility: the surface is *generated* from the C8 spec; validate against
