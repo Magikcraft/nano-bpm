@@ -1138,6 +1138,36 @@ Read together, these place Nano exactly: the same problem Zeebe solved, solved
 again with the same rigour, by people who could finally throw the old constraints
 away — and who chose, deliberately, to keep the one constraint that matters most.
 
+### 13.6 A refinement as much as a revolution
+
+For all the paradigm language, it is worth being precise — and humble — about the
+surface actually changed. The interventions are narrow and specific:
+
+- **One feedback loop across the whole system.** Envelope optimization at runtime
+  under dynamic load, closed through a *single* control loop that spans the
+  distributed clients and the cluster and treats them as one coherent singleton
+  (Falcon, §6, §9) — instead of separate server‑ and client‑side backpressure that
+  cannot see each other (§10, row 3).
+- **That loop extended to the server's own RAM.** The same control reaches down to
+  the engine's relationship with memory — sensing ambient available RAM and sizing
+  itself to it (§8) — a dimension the prior design never treated as a control
+  input.
+- **The memory footprint itself.** Terminal‑state reclamation decoupled from
+  exporter lag (ADR 0012) and an allocator that returns idle memory to the OS:
+  4.35 GB → 131 MB → 0 (§8).
+- **A few internal choices optimized for extreme performance.** Per‑partition
+  sharding of the read‑model exporter, the journal + read‑model substrate (§7),
+  and the like — surgical, not wholesale.
+
+Everything else, we kept — deliberately, because it is battle‑tested: the
+per‑partition **actor model**, the **state machinery** (event‑sourced
+command→event→applier, §13.4), the **Camunda 8 interface** (§4), and the broad
+architecture a decade of production hardened. Nano is not a repudiation of that
+work; it is a small number of pointed refinements to it, behind an unchanged
+contract. It is, honestly, **a refinement as much as a revolution** — and that is
+not a hedge but the thesis itself: a paradigm shift is far more adoptable when it
+is disciplined enough to change only what must change.
+
 ---
 
 ## 14. Conclusion: the frontier
