@@ -35,8 +35,12 @@ jobs:
           server-id: central
           server-username: CENTRAL_USERNAME
           server-password: CENTRAL_PASSWORD
+          # Import the GPG key, but DON'T inject the passphrase into
+          # ~/.m2/settings.xml — maven-gpg-plugin 3.2+ auto-detects
+          # MAVEN_GPG_PASSPHRASE from the environment (set on the deploy
+          # step below). Injecting it here triggers a "Sensitive content
+          # loaded from settings.xml" warning on every mvn invocation.
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
-          gpg-passphrase: GPG_PASSPHRASE
 
       - uses: actions/setup-node@v5
         with:
@@ -74,5 +78,7 @@ jobs:
         env:
           CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
           CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          # maven-gpg-plugin 3.2+ picks this up automatically — no need
+          # to plumb it through settings.xml.
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: mvn --batch-mode --no-transfer-progress -Prelease deploy
