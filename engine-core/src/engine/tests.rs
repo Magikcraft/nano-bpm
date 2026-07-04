@@ -6768,3 +6768,74 @@ fn local_write_shadows_an_inherited_root_variable_until_the_scope_is_destroyed()
     );
     assert!(!inst.scope_variables.contains_key(&child));
 }
+
+// ---------------------------------------------------------------------------
+// Perf guard (Part C phase: perf)
+//
+// The scoping model must keep the common case — a flat, root-only instance —
+// free. `element_variables` (the activation-path variable resolver) must return
+// the instance's *shared* root `Arc` by pointer for a root-only instance: no
+// clone, no merge, no allocation, byte-identical to the pre-scoping engine. A
+// nested-scope instance instead allocates a freshly merged view. Pinning the
+// pointer identity is a non-flaky structural guard against a future change
+// accidentally putting an allocation on the hot flat-activation path.
+// ---------------------------------------------------------------------------
+#[test]
+fn flat_instance_activation_returns_the_shared_root_arc_without_copying() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1)), ("b", Value::Int(2))]),
+        },
+    );
+
+    let root_arc = Arc::clone(&engine.state.instances.get(&key).unwrap().variables);
+
+    // Flat instance: the element view is the very same allocation (zero-copy).
+    let flat_view = engine.element_variables(key, key);
+    assert!(
+        Arc::ptr_eq(&flat_view, &root_arc),
+        "flat activation must reuse the shared root Arc, not allocate a merged copy",
+    );
+
+    // Add a nested scope with a local shadow: the merged view is now a fresh
+    // allocation (correctly no longer pointer-equal to root).
+    let child: Key = 940_001;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("b", Value::Int(20))]),
+        },
+    );
+    let scoped_view = engine.element_variables(key, child);
+    assert!(
+        !Arc::ptr_eq(&scoped_view, &root_arc),
+        "a nested scope must produce a distinct merged view",
+    );
+    assert_eq!(scoped_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(scoped_view.get("b"), Some(&Value::Int(20)));
+
+    // The flat resolution for the root scope still returns the shared Arc even
+    // after a sibling scope exists — only elements *in* a scope pay the merge.
+    let still_flat = engine.element_variables(key, key);
+    assert!(
+        Arc::ptr_eq(&still_flat, &root_arc),
+        "root-scope activation stays zero-copy even when other scopes exist",
+    );
+}

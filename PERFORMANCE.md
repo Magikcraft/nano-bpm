@@ -802,3 +802,40 @@ afterward. Read contract remains eventually consistent (matches Camunda 8).
 **Verdict.** The resident-variable balloon is eliminated. Spill/backpressure can
 now bound the live working set; terminal state is no longer a memory liability
 gated on a downstream reader.
+
+---
+
+## Hierarchical variable scoping — flat fast-path (Part C, PR #5)
+
+Part C replaces Nano's single flat `variables: Arc<HashMap>` per instance with
+Zeebe's hierarchical variable-scope tree (each scope-owning element instance —
+process root, embedded sub-process, multi-instance body/child, mapped activity —
+owns a variable map; reads resolve local → parent → … → root). The design keeps
+the **common case free**: an instance that never creates a child scope (the vast
+majority) stays a single root map and pays exactly what the pre-scoping engine
+paid.
+
+**Fast path (root-only instance).** `variables_for_element` /
+`element_variables` — the variable resolver on the job-activation hot path —
+returns the instance's shared root `Arc<HashMap>` **by pointer** when the target
+scope is the root or when the instance has no scope-local maps
+(`resolve.rs:176–179`). No walk, no merge, no allocation: activation is a cheap
+`Arc` clone, byte-identical to the flat engine. Root-only variable writes also
+collapse to the legacy flat `VariablesUpdated` event
+(`resolve.rs:224–228`,`266`), so the journal, read model and conditional-event
+re-evaluation replay byte-identically.
+
+**Scoped path (nested instance).** Only elements that actually run inside a
+sub-process / multi-instance scope allocate a freshly merged view (root cloned,
+then each scope in the chain overlaid root-first so nearer scopes shadow
+farther). The cost is proportional to the scope-chain depth × map size and is
+borne solely by the instances that use scoping.
+
+**Regression guard.** `flat_instance_activation_returns_the_shared_root_arc_without_copying`
+(engine-core) pins the fast path structurally with `Arc::ptr_eq`: the flat
+element view must be pointer-equal to the instance's root `Arc` (proving
+zero-copy), while a nested-scope view must be a distinct allocation. This is a
+deterministic, non-flaky guard that a future change cannot silently put an
+allocation on the flat-activation hot path. Steady-state throughput A/B (flat
+workloads) is therefore expected to be unchanged; the released cluster soaks
+above ran on the flat path and show no regression.
