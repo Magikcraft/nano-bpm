@@ -15,14 +15,20 @@ The embedded engine feature is named **Bernd**, after Bernd Ruecker (co-founder 
 
 Nano's embedded engine sits directly on that inheritance. It could have offered C7-style shared-transaction semantics — many developers would have asked for it — but chose not to, because the pattern Bernd taught turns out to work at every scale, and building the illusion again would have been an act of forgetting. So we sign the work.
 
-Naming conventions that follow:
+Naming conventions that follow. **The class is `EmbeddedEngine`** — technical, self-describing, discoverable by IDE completion. Bernd is the *codename* for the feature and lives in the identity surfaces around the class, not on it:
 
-- Java runtime library: `io.github.jwulf:nano-bernd` (Maven Central)
-- Java runtime class: `Bernd` (`Bernd.builder().clock(...).build()`)
-- npm cross-runtime package: `@nanobpm/nano-bernd` (a thin ergonomic wrapper) and `@nanobpm/nano-engine-ffi` (the raw wasm + host, unopinionated)
-- Docs / marketing surface: "Bernd — Nano's embedded engine"
-- ADR references: `Bernd` (capitalized proper noun) for the feature, `μ-nano` for the wasm blob when the engine-vs-wrapper distinction matters
-- Not: `bernd()` (lowercase in the transport API) — the transport is `NanoTransport.embedded(Bernd)` because *the feature is Bernd, the transport is embedded*. Bernd is a runtime that the SDK's embedded transport binds to.
+- **Runtime class**: `EmbeddedEngine` (Java: `io.github.jwulf.bernd.EmbeddedEngine`; TS: `import { EmbeddedEngine } from '@nanobpm/nano-bernd'`).
+- **Artifact / package name**: `io.github.jwulf:nano-bernd` (Maven Central), `@nanobpm/nano-bernd` (npm). The codename is what you type into your build file.
+- **Codename constant**: `EmbeddedEngine.CODENAME` (public, `"Bernd"`). Programmatic access without name-coupling the class.
+- **Class-level Javadoc / JSDoc**: opens with a signature block naming Bernd Ruecker and citing this ADR. Same template as this ADR §"Signature — why 'Bernd'".
+- **Boot banner / log line**: `nano embedded engine [bernd] v<version>` on startup. Every operator sees the codename in logs.
+- **Topology advertisement**: `nano.embedded.codename: "bernd"` in `/v2/topology`. Clients that care can key off it.
+- **Env-var prefix**: `NANO_BERND_*` (`NANO_BERND_JOURNAL_PATH`, `NANO_BERND_LOG_LEVEL`, …). Config namespace carries the codename.
+- **Docs / marketing surface**: "Bernd — Nano's embedded engine". The class is `EmbeddedEngine`; the *feature* is Bernd.
+- **Transport binding**: `NanoTransport.embedded(EmbeddedEngine)` — the transport is `embedded`, the runtime it binds to is a Bernd instance.
+- **ADR references**: `Bernd` (capitalized proper noun) for the feature/codename, `EmbeddedEngine` for the class, `μ-nano` for the wasm blob when the engine-vs-wrapper distinction matters.
+
+The rule: someone reading unfamiliar code sees `EmbeddedEngine engine = ...` and understands what it does immediately. Someone reading the pom, the logs, or the env eventually asks *"who's Bernd?"* — which is the moment the signature does its work.
 
 ## Context
 
@@ -41,7 +47,7 @@ The end-state we want to enable is a **single application source** that can be:
 
 Since Rev 1 the *host* set has broadened: Bernd is not Deno-only. The **same** wasm cdylib (`engine-core --features ffi`, packaged as `dist/engine-wasm-ffi/nano_engine.wasm` by `make engine-wasm-ffi-dist`) is loaded by:
 
-- **Deno / Node / browser** — via `@nanobpm/nano-engine-ffi` (plain `WebAssembly.instantiate`, no wasm-bindgen).
+- **Deno / Node / browser** — via `@nanobpm/nano-bernd` (plain `WebAssembly.instantiate`, no wasm-bindgen).
 - **JVM / GraalVM Native Image** — via `io.github.jwulf:nano-bernd` (Chicory, pure Java, AOT-compiles into a static native binary with the wasm baked in).
 - **Future**: Python (wasmtime-py), Go (wazero), .NET (Wasmtime.NET) — same wasm, same C-ABI.
 
@@ -66,7 +72,7 @@ The driving question this ADR answers:
   already `wasm32`-clean and Deno can load it directly via `WebAssembly.instantiate`.
 - **The FFI wasm is now a first-class distributable.** `make engine-wasm-ffi-dist` emits
   `dist/engine-wasm-ffi/nano_engine.wasm` (wasm-opt -Oz, ~780 KiB) + a `manifest.json` (ABI version,
-  engine version, sha256, exports). This is the artifact `nano-bernd` (Java) and `@nanobpm/nano-engine-ffi`
+  engine version, sha256, exports). This is the artifact `nano-bernd` (Java) and `@nanobpm/nano-bernd`
   (JS) both consume. **The single wasm binary is the single source of engine truth across every host.**
 - **The SDK story is already a single surface.** `docs/sdk-nano-decorator-design.md` establishes
   that users write against the generated `@camunda8/orchestration-cluster-api` SDKs, and
@@ -197,7 +203,7 @@ The SDK, docs, IDE and template README all lead with this. Not in an FAQ. Not in
 
 | Host | Package | Wasm loader | Cross-compile story |
 | --- | --- | --- | --- |
-| Deno / Node / browser | `@nanobpm/nano-engine-ffi` (raw), `@nanobpm/nano-bernd` (ergonomic) | `WebAssembly.instantiate` | `deno compile --target …` |
+| Deno / Node / browser | `@nanobpm/nano-bernd` (exports `EmbeddedEngine`) | `WebAssembly.instantiate` | `deno compile --target …` |
 | JVM | `io.github.jwulf:nano-bernd` | Chicory (pure Java) | plain `java -jar` fat-jar |
 | GraalVM Native Image | `io.github.jwulf:nano-bernd` | Chicory (AOT-compiled by GraalVM) | `native-image` → single static binary, wasm embedded as a resource |
 | Future (Python) | `nano_bernd` | wasmtime-py | PyInstaller / native binary |
