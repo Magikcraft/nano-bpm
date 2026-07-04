@@ -17,7 +17,7 @@ In <https://github.com/jwulf/nano-bpm/settings/secrets/actions>:
 |-------------|---------------------------|
 | `NPM_TOKEN` | Automation token from #1  |
 
-Provenance is signed via GitHub OIDC — no other secret needed. The workflow already grants `id-token: write`.
+The only required secret is `NPM_TOKEN`. Provenance is intentionally not used — it requires a public source repository, and nano-bpm is private.
 
 ## Cutting a release
 
@@ -34,8 +34,8 @@ Provenance is signed via GitHub OIDC — no other secret needed. The workflow al
    - Sync it into `clients/nano-bernd/wasm/`.
    - Verify the tag matches `package.json`.
    - `npm run build` + `npm test`.
-   - `npm publish --provenance --access public` — the tarball is published with an OIDC-attested provenance link back to this workflow run.
-6. Verify on <https://www.npmjs.com/package/@nanobpm/nano-bernd>. The provenance badge should point at the tagged commit.
+   - `npm publish --access public` — publishes the tarball to npm.
+6. Verify on <https://www.npmjs.com/package/@nanobpm/nano-bernd>.
 
 ## Manual dry-run (local, no publish)
 

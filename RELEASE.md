@@ -82,7 +82,7 @@ Typical durations:
 
 - **Gateway binaries**: <https://github.com/jwulf/c8ctl-plugin-nano/releases> — assets attached to the new release. S3 mirror at `s3://sitapati-storage/nanobpm-gateway/<tag>/`.
 - **ProcessOS binaries**: <https://github.com/jwulf/nano-bpm/releases> — assets on the tag. S3 at `s3://sitapati-storage/processos/<tag>/`.
-- **npm**: `npm view @nanobpm/nano-bernd version` → should be the new version. The listing at <https://www.npmjs.com/package/@nanobpm/nano-bernd> should show a green **Provenance** badge linking back to the tag.
+- **npm**: `npm view @nanobpm/nano-bernd version` → should be the new version. (Provenance is not published — it requires a public source repo, and nano-bpm is private.)
 - **Maven Central**: <https://central.sonatype.com> shows the new version immediately; <https://search.maven.org/artifact/io.github.jwulf/nano-bernd> propagates within ~30 min. Test with `mvn dependency:get -Dartifact=io.github.jwulf:nano-bernd:0.2.0`.
 
 ## Releasing only one train

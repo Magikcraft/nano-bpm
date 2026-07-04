@@ -1,11 +1,13 @@
 name: release-nano-bernd-npm
 
 # Triggered by tags of the form `nano-bernd-npm-v0.2.0`. Builds & publishes
-# @nanobpm/nano-bernd to the npm registry with sigstore/OIDC provenance.
+# @nanobpm/nano-bernd to the npm registry.
 #
 # Prerequisites (documented in clients/nano-bernd/RELEASING.md):
 #   - Repository secret NPM_TOKEN — Automation token scoped to @nanobpm.
-#   - Provenance is signed via GitHub OIDC — no extra secret needed.
+#
+# Note: npm provenance is intentionally NOT used — it requires a public source
+# repository, and nano-bpm is private by design.
 
 on:
   push:
@@ -17,10 +19,8 @@ jobs:
   publish:
     name: Publish @nanobpm/nano-bernd
     runs-on: ubuntu-24.04
-    # Required for `npm publish --provenance` to mint an OIDC token.
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v5
 
@@ -72,4 +72,4 @@ jobs:
         working-directory: clients/nano-bernd
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: npm publish --access public
