@@ -1216,19 +1216,27 @@ that makes it a good local‑dev replacement (§1) also makes it **recursive**: 
 engine small enough to be a tool call inside a task inside an engine.
 Orchestration stops being a tier you deploy and becomes a component you compose.
 
-**Local LLMs on both sides of the engine.** The same small footprint that lets a
-capable model share the developer's workstation (§13.3) invites composition in
-both directions. A local LLM can sit *above* the engine as an orchestrator —
-investigating, proposing and deploying model variants (Part II) — and *below* it
-as a tool call: the body of a service task, a job worker whose implementation is a
-model invocation. With recursive embedding, the unit of composition turns fluid —
-engines inside workers, models inside tasks, engines and models orchestrating one
-another.
+**Local LLMs on both sides of the engine — but one side is new.** An engine
+calling a local LLM is *not* novel: a service task or job worker whose
+implementation is a model invocation already works on Camunda 8 and Zeebe, and it
+works on Nano too. The genuinely new direction is the other one — a local LLM
+calling a whole **engine** as a tool. Because a Nano engine is small and embeddable
+enough to instantiate inside a single tool call (§7–§8, the µ‑nano core), an LLM
+can spin one up on demand, something no one would attempt with a JVM‑and‑RocksDB
+broker. The model does not merely *use* an engine; it *creates* them.
 
-**Empirical process optimization.** Draw these together and the frontier the whole
-paper points at appears: replaying real historical workloads against
-counterfactual, LLM‑generated model variants — cheaply, by the dozen — to optimize
-processes from evidence rather than intuition. That is the subject of Part II.
+That inversion is the mechanism behind the empirical frontier. An LLM can **propose
+a process model and then test it by running it** — deploying the candidate into a
+freshly instantiated Nano engine as a tool call and replaying real history through
+it — and, because each engine is tiny and disposable, it can test **many candidates
+in parallel**, keeping the ones the evidence favours. Propose, instantiate, replay,
+compare: a hypothesis‑testing loop for process *design*, affordable only because
+the engine is small enough to be summoned by the dozen.
+
+**Empirical process optimization.** That loop, pointed at real historical
+production workloads rather than synthetic ones, is the frontier this whole paper
+builds toward: optimizing processes from evidence rather than intuition. It is the
+subject of Part II.
 
 None of this required tearing down what worked. The interventions were narrow and
 disciplined (§13.6) — a system‑wide feedback loop, the engine's relationship to
