@@ -85,8 +85,29 @@ export default function App() {
         </nav>
 
         <a
-          href="/whitepaper"
+          href="/docs"
           className="mt-auto mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm text-zinc-400 no-underline transition-colors hover:bg-zinc-800/50 hover:text-zinc-200"
+          title="Documentation"
+        >
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+            <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+          </svg>
+          Documentation
+        </a>
+
+        <a
+          href="/whitepaper"
+          className="mx-3 flex items-center gap-2 rounded-md px-3 py-2 text-sm text-zinc-400 no-underline transition-colors hover:bg-zinc-800/50 hover:text-zinc-200"
           title="Whitepaper"
         >
           <svg
