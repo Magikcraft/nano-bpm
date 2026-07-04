@@ -21,7 +21,7 @@
 
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -59,8 +59,8 @@ try {
   execFileSync('wasm-opt', ['--version'], { stdio: 'ignore' });
 } catch {
   die(
-    'wasm-opt not found on PATH. Install binaryen (macOS: `brew install binaryen`; ' +
-      'Ubuntu: `sudo apt install binaryen`; or via `cargo install wasm-opt`).',
+    'wasm-opt not found on PATH. Install Binaryen (macOS: `brew install binaryen`; ' +
+      'Ubuntu: `sudo apt install binaryen`; other: https://github.com/WebAssembly/binaryen/releases).',
   );
 }
 console.log('wasm-opt -Oz ...');
