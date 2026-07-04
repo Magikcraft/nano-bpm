@@ -1,8 +1,5 @@
 @import "tailwindcss";
-
-:root {
-  color-scheme: dark;
-}
+@import "./theme/tokens.css";
 
 html,
 body,
@@ -15,27 +12,31 @@ body {
   font-family:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
     Arial, sans-serif;
+  background: var(--nano-app);
+  color: var(--nano-text);
 }
 
-/* BPMN diagram overlay markers (diagram-js adds these classes to shapes). */
+/* BPMN diagram overlay markers (diagram-js adds these classes to shapes).
+ * The diagram canvas is always a light surface (bpmn-js is a light-themed
+ * widget), so these stay fixed rather than token-driven. */
 .nano-active .djs-visual > :nth-child(1) {
-  stroke: #38bdf8 !important;
+  stroke: #0284c7 !important;
   stroke-width: 3px !important;
-  fill: #0c4a6e !important;
+  fill: #e0f2fe !important;
 }
 
 .nano-incident .djs-visual > :nth-child(1) {
-  stroke: #f87171 !important;
+  stroke: #dc2626 !important;
   stroke-width: 3px !important;
-  fill: #7f1d1d !important;
+  fill: #fee2e2 !important;
 }
 
 /*
- * The console runs `color-scheme: dark`, which makes the browser paint bpmn-js's
- * popup menus (the "replace element" menu, context-pad popups) and form controls
- * with light default text on their white surfaces — nearly invisible. bpmn-js
- * and the properties panel are light-themed widgets, so force dark text and
- * light controls within them.
+ * bpmn-js's popup menus (the "replace element" menu, context-pad popups),
+ * search inputs, and the properties panel are light-themed widgets. When the
+ * console runs a dark theme (`color-scheme: dark`) the browser would paint
+ * their form controls with light text on white surfaces — nearly invisible.
+ * Pin them to a light scheme with dark text regardless of the console theme.
  */
 .djs-popup,
 .djs-popup-body,
@@ -59,7 +60,7 @@ body {
   background: #ffffff !important;
 }
 
-/* Properties panel: keep it a light widget regardless of the dark page. */
+/* Properties panel: keep it a light widget regardless of the console theme. */
 .bpmn-properties {
   color-scheme: light;
 }
@@ -69,10 +70,10 @@ body {
 }
 
 /*
- * Context pad: the floating icon toolbar next to a selected element (add element /
- * change type). Its icon glyphs are a webfont whose color is inherited, so on the
- * dark page they paint nearly white-on-white. Give the pad a light surface and
- * dark icons so the actions are legible.
+ * Context pad: the floating icon toolbar next to a selected element (add
+ * element / change type). Its icon glyphs are a webfont whose color is
+ * inherited, so on a dark page they'd paint nearly white-on-white. Give the
+ * pad a light surface and dark icons so the actions are legible.
  */
 .djs-context-pad {
   color-scheme: light;
@@ -90,7 +91,8 @@ body {
 /*
  * Markdown preview tab (.md files). Tailwind's preflight strips default
  * heading/list/quote styling, so restore a readable document look for the
- * HTML markdown-it produces.
+ * HTML markdown-it produces — using theme tokens so it follows light/dark
+ * and theme packs.
  */
 .markdown-preview h1,
 .markdown-preview h2,
@@ -100,17 +102,17 @@ body {
 .markdown-preview h6 {
   font-weight: 600;
   line-height: 1.25;
-  color: #fafafa;
+  color: var(--nano-text);
   margin: 1.5em 0 0.5em;
 }
 .markdown-preview h1 {
   font-size: 1.6em;
-  border-bottom: 1px solid #27272a;
+  border-bottom: 1px solid var(--nano-edge);
   padding-bottom: 0.3em;
 }
 .markdown-preview h2 {
   font-size: 1.35em;
-  border-bottom: 1px solid #27272a;
+  border-bottom: 1px solid var(--nano-edge);
   padding-bottom: 0.3em;
 }
 .markdown-preview h3 {
@@ -148,19 +150,19 @@ body {
   margin: 0.25em 0;
 }
 .markdown-preview a {
-  color: #7dd3fc;
+  color: var(--nano-accent-strong);
   text-decoration: underline;
 }
 .markdown-preview code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.875em;
-  background: #27272a;
+  background: var(--nano-hover);
   border-radius: 4px;
   padding: 0.15em 0.4em;
 }
 .markdown-preview pre {
-  background: #18181b;
-  border: 1px solid #27272a;
+  background: var(--nano-inset);
+  border: 1px solid var(--nano-edge);
   border-radius: 6px;
   padding: 0.9em 1em;
   overflow: auto;
@@ -171,13 +173,13 @@ body {
   font-size: 0.85em;
 }
 .markdown-preview blockquote {
-  border-left: 3px solid #3f3f46;
+  border-left: 3px solid var(--nano-edge-strong);
   padding-left: 1em;
-  color: #a1a1aa;
+  color: var(--nano-text-muted);
 }
 .markdown-preview hr {
   border: 0;
-  border-top: 1px solid #27272a;
+  border-top: 1px solid var(--nano-edge);
   margin: 1.5em 0;
 }
 .markdown-preview table {
@@ -186,15 +188,14 @@ body {
 }
 .markdown-preview th,
 .markdown-preview td {
-  border: 1px solid #27272a;
+  border: 1px solid var(--nano-edge);
   padding: 0.4em 0.7em;
   text-align: left;
 }
 .markdown-preview th {
-  background: #18181b;
+  background: var(--nano-inset);
   font-weight: 600;
 }
 .markdown-preview img {
   max-width: 100%;
 }
-

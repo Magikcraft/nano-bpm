@@ -636,13 +636,23 @@ export interface ExtensionFileType {
   ext: string;
   monacoLang: string;
 }
+/// A colour theme contributed by a `kind: "theme"` pack. Mirrors
+/// src/theme/themes.ts ThemeSpec (token keys are validated client-side).
+export interface ExtensionTheme {
+  id: string;
+  label: string;
+  appearance: "light" | "dark";
+  tokens: Record<string, string>;
+}
 export interface Extension {
   id: string;
-  kind: "lang" | "app" | "example";
+  kind: "lang" | "app" | "example" | "theme";
   displayName: string;
   builtin: boolean;
   fileTypes: ExtensionFileType[];
   templates: { id: string; label: string }[];
+  /** Themes this pack contributes (theme packs only). */
+  themes?: ExtensionTheme[];
   toolchainAvailable: boolean;
   trusted: boolean;
 }
@@ -656,7 +666,7 @@ export interface MarketEntry {
   name: string;
   version: string;
   description: string;
-  category: "lang" | "app" | "example" | "other";
+  category: "lang" | "app" | "example" | "theme" | "other";
   installed: boolean;
   /** The locally-installed version, when installed. */
   installedVersion?: string;
