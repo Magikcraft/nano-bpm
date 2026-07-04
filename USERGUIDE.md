@@ -221,6 +221,92 @@ imports and writes a dependency manifest into the app's `deno.json`, so a worker
 that imports `lodash` or `@camunda8/orchestration-cluster-api` works out of the
 box — no manual dependency wrangling.
 
+## Extend the IDE with extension packs
+
+The console has a fixed built-in surface (Deno for workers), but everything else
+— Rust, Java, Deno GUI apps, ready-to-run examples — arrives as an **extension
+pack**: a plain npm package the user installs from the **Extensions** page. A
+pack is discovered by the `nano-ide-ext` keyword, its `nano-ide.ext.json`
+manifest is parsed by the console, and its templates appear in the New Project
+picker; any toolchain commands the pack contributes are gated by a per-pack
+trust prompt (ADR 0007).
+
+### Kinds
+
+| Kind | Purpose | Layout |
+| --- | --- | --- |
+| `lang` | Register a file type + Monaco grammar + a toolchain (`detect`/`run`/`compile`/`targets`). May also ship starter templates. | `templates/<id>/` (optional) |
+| `app` | Ship one or more project templates that scaffold a runnable app (e.g. Deno GUI, Java Maven module). | `templates/<id>/` |
+| `example` | The **whole pack is the template**. Ships a ready-to-run reference app under `appDir`. Requires no registration in a sibling lang pack. | `<appDir>/…` |
+
+### Minimal manifest
+
+```jsonc
+{
+  "id": "my-pack",                  // stable, unique
+  "kind": "lang" | "app" | "example",
+  "displayName": "Human name",
+
+  // lang packs
+  "fileTypes": [{ "ext": ".rs", "monacoLang": "rust" }],
+  "toolchain": {
+    "detect":  ["cargo", "--version"],
+    "run":     ["cargo", "run", "--release"],
+    "compile": ["cargo", "build", "--release"],
+    "installUrl":  "https://…",
+    "installHint": "brew install rust"
+  },
+
+  // lang / app packs — templates surfaced in the New Project picker
+  "templates": [
+    { "id": "my-starter", "label": "Human label shown in the picker" }
+  ],
+
+  // example packs
+  "appDir":   "app",                // dir copied verbatim into the new project
+  "requires": ["rust"],             // lang pack ids the example needs
+  "summary":  "One-line description shown under the display name"
+}
+```
+
+Package your pack as a standard npm package with `keywords` including
+`"nano-ide-ext"`, `files` shipping `nano-ide.ext.json` plus your `templates/`
+or `<appDir>/` directory, and `publishConfig.access: "public"`. No install
+scripts run — the console reads the manifest and copies files.
+
+### Publishing an example app (the simplest case)
+
+To share a runnable reference (like a throughput benchmark, a domain-specific
+demo, or a training exercise) *without* touching any other pack:
+
+1. `npm init` a package named `@you/nano-ide-example-<slug>` with the
+   `nano-ide-ext` keyword.
+2. Drop the runnable project under `app/`.
+3. Write `nano-ide.ext.json`:
+   ```json
+   {
+     "id": "<slug>",
+     "kind": "example",
+     "displayName": "My demo",
+     "summary":     "What this demo shows in one line",
+     "requires":    ["rust"],
+     "appDir":      "app"
+   }
+   ```
+4. `npm publish --access public`.
+
+Users install your pack from **Extensions**, and it appears immediately in
+**New Project → Template** as `"My demo — What this demo shows in one line"`.
+
+### Where the truth lives
+
+The manifest schema is authoritative in
+[`server/src/console/extensions.rs`](server/src/console/extensions.rs)
+(`ExtManifest`). A mirrored TypeScript type is published as
+`@nanobpm/nano-ide-ext-types`. Reference implementations across all three
+kinds live in the [`nano-ide` monorepo](https://github.com/jwulf/nano-ide):
+`lang-rust`, `app-deno-gui`, `example-rust-throughput`.
+
 ## Connect your application
 
 Nano serves the Camunda 8 Orchestration Cluster **v2 REST API**, so existing
