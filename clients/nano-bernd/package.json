@@ -36,10 +36,18 @@
     "vitest": "^2.1.0"
   },
   "keywords": ["nano", "nanobpm", "bernd", "bpmn", "wasm", "embedded", "ffi", "engine"],
-  "license": "SEE LICENSE IN ../../LICENSE",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/jwulf/nano-bpm/tree/main/clients/nano-bernd#readme",
+  "bugs": {
+    "url": "https://github.com/jwulf/nano-bpm/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/jwulf/nano-bpm.git",
     "directory": "clients/nano-bernd"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }
