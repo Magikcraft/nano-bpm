@@ -2265,24 +2265,25 @@ async fn llama_start(
         let snap = snap.clone();
         let profile = profile.clone();
         let models_dir = models_dir.clone();
-        let gates = tokio::task::spawn_blocking(move || -> Result<Option<llama::DraftSpec>, String> {
-            if profile.mtp {
-                let scan = scan_profile_gguf(&models_dir, &profile)?;
-                if !scan.mtp_capable() {
-                    return Err(format!(
-                        "profile '{}' has MTP enabled, but its GGUF carries no NextN \
+        let gates =
+            tokio::task::spawn_blocking(move || -> Result<Option<llama::DraftSpec>, String> {
+                if profile.mtp {
+                    let scan = scan_profile_gguf(&models_dir, &profile)?;
+                    if !scan.mtp_capable() {
+                        return Err(format!(
+                            "profile '{}' has MTP enabled, but its GGUF carries no NextN \
                          prediction heads (arch {}) — disable MTP or pick an MTP-capable model",
-                        profile.id,
-                        scan.arch.as_deref().unwrap_or("unknown")
-                    ));
+                            profile.id,
+                            scan.arch.as_deref().unwrap_or("unknown")
+                        ));
+                    }
                 }
-            }
-            pairing
-                .as_ref()
-                .map(|p| resolve_speculator_draft(&snap, p, &profile, &models_dir))
-                .transpose()
-        })
-        .await;
+                pairing
+                    .as_ref()
+                    .map(|p| resolve_speculator_draft(&snap, p, &profile, &models_dir))
+                    .transpose()
+            })
+            .await;
         match gates {
             Ok(Ok(d)) => d,
             Ok(Err(e)) => return unprocessable(e),
@@ -2338,8 +2339,7 @@ async fn llama_scan(
     let models_dir = snap.effective_models_dir();
     // Blocking file I/O (cache walk + header read) off the async worker.
     let scanned = tokio::task::spawn_blocking(move || {
-        resolve_model_gguf(&models_dir, &model)
-            .map(|path| (gguf::GgufScan::read(&path), path))
+        resolve_model_gguf(&models_dir, &model).map(|path| (gguf::GgufScan::read(&path), path))
     })
     .await;
     let body = match scanned {
@@ -4633,11 +4633,10 @@ fn validate_speculator_pairing(
     // When the pairing pins a primary, it must be a local sidecar too; and when both GGUFs are
     // already on disk, prove compatibility now instead of surprising the operator at launch.
     if let Some(pid) = pairing.primary_profile_id.as_deref() {
-        let primary = snap
-            .profiles
-            .iter()
-            .find(|p| p.id == pid)
-            .ok_or_else(|| format!("speculator pairing pins unknown primary profile '{pid}'"))?;
+        let primary =
+            snap.profiles.iter().find(|p| p.id == pid).ok_or_else(|| {
+                format!("speculator pairing pins unknown primary profile '{pid}'")
+            })?;
         if !primary.sidecar {
             return Err(format!(
                 "primary profile '{pid}' is not a local sidecar — speculative decoding only \
@@ -6290,11 +6289,9 @@ mod speculator_gate_tests {
             profile("draft", true, Some("d.gguf")),
             profile("cloud", false, None),
         ]);
-        let err =
-            validate_speculator_pairing(&snap, &pairing("draft", Some("cloud"))).unwrap_err();
+        let err = validate_speculator_pairing(&snap, &pairing("draft", Some("cloud"))).unwrap_err();
         assert!(err.contains("not a local sidecar"), "{err}");
-        let err =
-            validate_speculator_pairing(&snap, &pairing("draft", Some("ghost"))).unwrap_err();
+        let err = validate_speculator_pairing(&snap, &pairing("draft", Some("ghost"))).unwrap_err();
         assert!(err.contains("unknown primary"), "{err}");
     }
 

@@ -99,16 +99,16 @@ impl GgufScan {
 
     /// Scan the GGUF file at `path` (header + KV metadata + tensor names; weights untouched).
     pub fn read(path: &Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("open {}: {e}", path.display()))?;
-        Self::parse(&mut BufReader::new(file))
-            .map_err(|e| format!("{}: {e}", path.display()))
+        let file =
+            std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Self::parse(&mut BufReader::new(file)).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// Parse a GGUF stream. Split from [`Self::read`] so tests can feed synthetic bytes.
     fn parse<R: Read>(r: &mut R) -> Result<Self, String> {
         let mut magic = [0u8; 4];
-        r.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
+        r.read_exact(&mut magic)
+            .map_err(|e| format!("read magic: {e}"))?;
         if &magic != b"GGUF" {
             return Err("not a GGUF file (bad magic)".to_string());
         }
@@ -156,10 +156,14 @@ impl GgufScan {
             .and_then(Value::as_str)
             .map(str::to_string);
         let arch_key = |suffix: &str| -> Option<&Value> {
-            arch.as_deref().and_then(|a| kvs.get(&format!("{a}.{suffix}")))
+            arch.as_deref()
+                .and_then(|a| kvs.get(&format!("{a}.{suffix}")))
         };
         Ok(Self {
-            name: kvs.get("general.name").and_then(Value::as_str).map(str::to_string),
+            name: kvs
+                .get("general.name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             context_length: arch_key("context_length").and_then(Value::as_u64),
             vocab_size: array_lens
                 .get("tokenizer.ggml.tokens")
@@ -173,17 +177,21 @@ impl GgufScan {
                 .get("tokenizer.ggml.pre")
                 .and_then(Value::as_str)
                 .map(str::to_string),
-            bos_token_id: kvs.get("tokenizer.ggml.bos_token_id").and_then(Value::as_u64),
-            eos_token_id: kvs.get("tokenizer.ggml.eos_token_id").and_then(Value::as_u64),
-            nextn_predict_layers: arch_key("nextn_predict_layers").and_then(Value::as_u64).or_else(
-                || {
+            bos_token_id: kvs
+                .get("tokenizer.ggml.bos_token_id")
+                .and_then(Value::as_u64),
+            eos_token_id: kvs
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(Value::as_u64),
+            nextn_predict_layers: arch_key("nextn_predict_layers")
+                .and_then(Value::as_u64)
+                .or_else(|| {
                     // Fallback: any `*.nextn_predict_layers` key, in case `general.architecture`
                     // is absent or the key is namespaced unexpectedly.
                     kvs.iter()
                         .find(|(k, _)| k.ends_with(".nextn_predict_layers"))
                         .and_then(|(_, v)| v.as_u64())
-                },
-            ),
+                }),
             nextn_tensor_count,
             tensor_count,
             arch,
@@ -209,12 +217,20 @@ pub fn speculator_compatible(target: &GgufScan, draft: &GgufScan) -> Result<(), 
             )),
             _ => Err(format!(
                 "cannot verify {what}: missing from the GGUF metadata of {}",
-                if t.is_none() { "the target" } else { "the draft" }
+                if t.is_none() {
+                    "the target"
+                } else {
+                    "the draft"
+                }
             )),
         }
     }
 
-    require("tokenizer family (tokenizer.ggml.model)", &target.tokenizer_model, &draft.tokenizer_model)?;
+    require(
+        "tokenizer family (tokenizer.ggml.model)",
+        &target.tokenizer_model,
+        &draft.tokenizer_model,
+    )?;
     // `tokenizer.ggml.pre` is optional in older conversions; only compare when both declare it.
     if let (Some(a), Some(b)) = (&target.tokenizer_pre, &draft.tokenizer_pre) {
         if a != b {
@@ -274,7 +290,8 @@ fn read_string<R: Read>(r: &mut R) -> Result<String, String> {
         return Err(format!("string length {len} exceeds cap — corrupt file?"));
     }
     let mut buf = vec![0u8; len as usize];
-    r.read_exact(&mut buf).map_err(|e| format!("read string: {e}"))?;
+    r.read_exact(&mut buf)
+        .map_err(|e| format!("read string: {e}"))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -348,7 +365,9 @@ fn skip<R: Read>(r: &mut R, n: u64) -> Result<(), String> {
             if copied == n {
                 Ok(())
             } else {
-                Err(format!("truncated file (wanted {n} more bytes, got {copied})"))
+                Err(format!(
+                    "truncated file (wanted {n} more bytes, got {copied})"
+                ))
             }
         })
 }
@@ -387,7 +406,8 @@ mod tests {
             self.s(k);
             self.0.extend_from_slice(&TY_ARRAY.to_le_bytes());
             self.0.extend_from_slice(&TY_STRING.to_le_bytes());
-            self.0.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            self.0
+                .extend_from_slice(&(items.len() as u64).to_le_bytes());
             for i in items {
                 self.s(i);
             }
@@ -396,7 +416,8 @@ mod tests {
             self.s(k);
             self.0.extend_from_slice(&TY_ARRAY.to_le_bytes());
             self.0.extend_from_slice(&TY_FLOAT32.to_le_bytes());
-            self.0.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            self.0
+                .extend_from_slice(&(items.len() as u64).to_le_bytes());
             for i in items {
                 self.0.extend_from_slice(&i.to_le_bytes());
             }

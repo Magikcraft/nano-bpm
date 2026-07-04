@@ -903,9 +903,14 @@ mod tests {
     #[test]
     fn builds_local_gguf_launch_resolving_against_models_dir() {
         let p = profile("loan.gguf", "http://127.0.0.1:9001/v1", None);
-        let plan =
-            LaunchPlan::build(&p, Path::new("/models"), Some("/opt/llama-server"), 9001, None)
-                .unwrap();
+        let plan = LaunchPlan::build(
+            &p,
+            Path::new("/models"),
+            Some("/opt/llama-server"),
+            9001,
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.bin, "/opt/llama-server");
         assert_eq!(plan.args[0], "-m");
         assert_eq!(plan.args[1], "/models/loan.gguf");
@@ -924,9 +929,16 @@ mod tests {
         let mut p = profile("m.gguf", "http://127.0.0.1:8080/v1", Some("-ngl 99"));
         p.mtp = true;
         let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
-        let mtp_at = plan.args.iter().position(|a| a == "--mtp").expect("--mtp present");
+        let mtp_at = plan
+            .args
+            .iter()
+            .position(|a| a == "--mtp")
+            .expect("--mtp present");
         let ngl_at = plan.args.iter().position(|a| a == "-ngl").unwrap();
-        assert!(mtp_at < ngl_at, "operator args must come last so they can override");
+        assert!(
+            mtp_at < ngl_at,
+            "operator args must come last so they can override"
+        );
         assert!(plan.mtp);
         assert!(plan.command_line().contains("--mtp"));
     }
@@ -942,7 +954,10 @@ mod tests {
         };
         let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, Some(&draft)).unwrap();
         let a = &plan.args;
-        let md = a.iter().position(|x| x == "--model-draft").expect("--model-draft present");
+        let md = a
+            .iter()
+            .position(|x| x == "--model-draft")
+            .expect("--model-draft present");
         assert_eq!(a[md + 1], "/models/draft.gguf");
         assert!(a.windows(2).any(|w| w[0] == "--draft-max" && w[1] == "16"));
         assert!(a.windows(2).any(|w| w[0] == "--draft-min" && w[1] == "2"));
@@ -955,7 +970,10 @@ mod tests {
             draft_min: None,
         };
         let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, Some(&bare)).unwrap();
-        assert!(!plan.args.iter().any(|x| x == "--draft-max" || x == "--draft-min"));
+        assert!(!plan
+            .args
+            .iter()
+            .any(|x| x == "--draft-max" || x == "--draft-min"));
     }
 
     #[test]
