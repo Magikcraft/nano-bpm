@@ -252,25 +252,23 @@ thesis made concrete: a pattern that *emerged* progressively across the SDKs is
 promoted to a **first-class**, always-on property of the system.
 
 Concretely, Falcon is that loop made into a wire protocol: a single, persistent,
-bidirectional, **credit-metered** WebSocket per client (`server/src/falcon.rs`;
-`docs/falcon-design.md`). Over one socket it multiplexes the two interaction
-patterns a process client needs — **demand/push** job delivery (a worker
-`Subscribe`s to a job type with a credit count; a server-side dispatcher leases
-matching jobs and pushes `Job` frames while credits remain) and
-**request/response** writes (`CreateInstance`/`CompleteJob`/`FailJob`/`ThrowError`,
-each answered by a correlated result). The decisive detail is what meters the
-writes: process-instance creation draws on a **submission-credit** lane fed
-directly from the engine's own processing headroom through the backpressure
-controller. Under saturation the server simply *withholds credits* and the client
-stalls its intake — no `503`, no retry, no thundering herd. That credit window is
-the closed loop reified on the wire: rather than refuse a client and leave it to
-infer the system's state, Falcon hands each client exactly as much demand as the
-cluster can currently absorb, and no more. Job completion, by contrast, flows
-**unmetered** — draining backlog must never be throttled. §9 covers the transport
-in full; here the point is only that the control loop of §6 has a physical
-embodiment, one persistent socket wide, and that it is named for the craftsman
-whose L2-cache spreadsheet first made the loop visible: Falko Menge. Artists sign
-their work.
+bidirectional, **credit-metered** WebSocket per client (`server/src/falcon.rs`; see
+§9.1 for the wire in full). Its shape mirrors the loop directly — over one socket
+run **two credit lanes**, the loop's two directions. A **demand-pull** lane
+delivers work: a worker advertises how many jobs it can take as a credit count, and
+the server pushes jobs only up to that number, so a worker is never flooded beyond
+what it asked for. A **submission** lane admits work: process-instance creation
+draws on credits fed directly from the engine's own processing headroom through the
+backpressure controller, so under saturation the server simply *withholds credits*
+and the client stalls its intake — no `503`, no retry, no thundering herd. That
+credit window is the closed loop reified on the wire: rather than refuse a client
+and leave it to infer the system's state, Falcon hands each client exactly as much
+demand, and accepts exactly as much new work, as the cluster can currently absorb —
+and no more. Job completion, by contrast, flows **unmetered**: draining backlog must
+never be throttled. The transport mechanics are §9's subject; here the point is only
+that the control loop of §6 has a physical embodiment, one persistent socket wide,
+and that it is named for the craftsman whose L2-cache spreadsheet first made the
+loop visible: Falko Menge. Artists sign their work.
 
 ### 6.1 What the old paradigm could close, and what it could not
 
@@ -479,14 +477,57 @@ initiative toward the system, let the server hand out work as it becomes
 available.
 
 Falcon (defined in §6) takes that trajectory to its conclusion and adds the piece
-neither generation carries: a **single credit-metered window** that unifies push
-delivery *and* the write path (create/complete/fail) over one socket, so the same
-backpressure signal that governs job push also governs instance admission. It is
-an **additive native protocol**, not a replacement: a Nano cluster still speaks
-the full Camunda 8 gRPC/REST surface (§4), so an unmodified C8 client — long-poll
-or job-stream — works unchanged. Falcon is the "faster if you opt in" path, and
-its advantage is not merely a different framing but that admission and delivery
-share one credit account. Compatible by default; unified if you choose it.
+neither Zeebe generation carries: it unifies delivery *and* the write path on the
+one credit-coordinated socket of §6, so a single backpressure account governs both
+job push and instance admission rather than each fending for itself. It is an
+**additive native protocol**, not a replacement: a Nano cluster still speaks the
+full Camunda 8 gRPC/REST surface (§4), so an unmodified C8 client — long-poll or
+job-stream — works unchanged. Falcon is the "faster if you opt in" path, and its
+advantage is not merely a different framing but that admission and delivery share
+one credit account. Compatible by default; unified if you choose it.
+
+**The transport, in full.** One socket carries a small set of JSON frames, each a
+tagged union keyed by a camelCase `type`. On connect the server sends a `welcome`
+(the initial submission window and heartbeat cadence) and an opening
+`submissionCredits` grant; idle sockets exchange `heartbeat`s. Client→server frames
+are `subscribe`, `jobCredits`, `createInstance`, `completeJob`, `failJob`,
+`throwError`, `awaitInstance`, and `heartbeat`; server→client frames are `welcome`,
+`job`, `commandResult`, `instanceCompleted`, `submissionCredits`, `pressure`, and
+`heartbeat` (`server/src/falcon.rs`; the full AsyncAPI 3.1 schema of every frame is
+`docs/falcon.asyncapi.yaml`). Two credit lanes share the one engine thread. On the
+**job-push lane**, a worker `subscribe`s to a job type with a credit count; a single
+server-side dispatcher leases jobs *round-robin across all subscribers* and pushes
+`job` frames while credits remain, topped back up by `jobCredits` — and the lease
+itself is the at-least-once guarantee (a job pushed to a worker that never completes
+it is reclaimed by the lock-expiry tick, so a dropped socket needs no special
+handling). On the **submission lane**, `createInstance` draws on the credit window
+of §6 while completions (`completeJob`/`failJob`/`throwError`) flow unmetered.
+
+**Await-completion without a held request.** A `createInstance` may ask to await its
+outcome, but rather than pin a request open for the unbounded life of an instance,
+the server answers the create immediately with a `commandResult` carrying the
+`processInstanceKey`, then emits an asynchronous `instanceCompleted` frame later,
+correlated by the create's `corr`. If the socket drops in between, the client
+reconnects and sends `awaitInstance` with the persisted key; because the read model
+is durable history, an already-terminal instance resolves *immediately*, so
+`awaitInstance` doubles as a completion poll. A long-lived await costs a map entry,
+not a held connection.
+
+**Ordering and throughput are deliberately orthogonal.** Frames on one socket are
+processed in arrival order with each engine command awaited inline, so successive
+`createInstance`s on a *single* socket serialize at journal-fsync latency;
+throughput instead comes from *concurrency across sockets*, where the group-commit
+journal writer batches many connections' appends into one fsync. The job-lifecycle
+commands go further with **ack-before-fsync pipelining**: the server applies the
+command (fixing its order in the log), replies immediately, and lets fsync complete
+asynchronously (~5 ms later), batching many connections' completions into one group
+commit — measured at 4× the throughput of awaiting fsync inline (2280 vs 572
+writes/s). The trade-off is explicit and, again, at-least-once: a crash in that
+~5 ms window re-activates the job on restart when its lock expires (the equivalent
+REST completion endpoint still awaits fsync; only Falcon pipelines). The practical
+consequence is a worker topology — one stream per job-type worker, plus a small pool
+of submission sockets sized to the create rate — which the companion SDK adopts by
+default.
 
 The choice of **WebSocket** rather than gRPC for that native path is deliberate
 and field-driven. gRPC is technically capable, but a decade of customer
