@@ -17,6 +17,92 @@ existing Camunda 8 clients and tooling.
 > See [DEVELOPMENT.md](DEVELOPMENT.md). This README is for running and operating
 > the distributed binary.
 
+## Self-optimizing by design: one decision, not a hundred knobs
+
+Nano is built on a single design principle:
+
+> **If we can tell you *how* to do it, and *when* to do it — why don't we just do
+> it?**
+
+Anything the engine can decide correctly on its own, it decides on its own. Tuning
+that a human would only ever set by watching a metric and applying a rule is instead
+done by the engine, continuously, from that same metric. What's left for you is the
+one thing the engine genuinely *cannot* know: a business value judgement about how
+the service should behave at its limit.
+
+### What the engine tunes for you (no configuration)
+
+These subsystems are automatic and on by default. Each has an environment variable
+**only to override or disable** the self-tuning behaviour — you never need to set one
+to get the right behaviour:
+
+- **Backpressure & the throughput ceiling.** An adaptive AIMD limiter measures live
+  latency, sizes the in-flight watermark itself, and sheds excess creates
+  (`503 RESOURCE_EXHAUSTED`) so a producer converges to the real drain rate. It finds
+  the ceiling; you don't measure it.
+- **Memory.** Tiered hot-state **variable spill** and **cold spill** move the live
+  working set to disk under pressure; an **idle-purge** tick compacts hot maps and
+  returns freed arenas to the OS; completed-instance history is bounded automatically.
+- **Durable var-store footprint.** The var-store WAL is periodically truncated so it
+  can't ratchet up on disk under a sustained large-payload load.
+- **Cluster job drain** *(multi-node)*. Backlog-weighted activation fairness steers
+  each worker's lease budget toward the nodes that actually have jobs — the deepest
+  node drains fastest — instead of strict local-first. On by default (`stage2`).
+- **Cluster create placement** *(multi-node)*. Load-aware placement (smooth weighted
+  round-robin over gossiped per-node load) steers new instances toward nodes with
+  real spare capacity, and every node self-protects: a saturated owner sheds a
+  forwarded create back to the ingress node, which reroutes it to a node with
+  headroom. The client only sees backpressure under **genuine cluster-wide**
+  saturation. On by default (`balanced`). See
+  [ADR 0014](docs/adr/0014-create-placement-protection-and-load-awareness.md).
+
+All of the above are **no-ops on a single node** and where load is evenly balanced,
+so the defaults are byte-identical to the historical behaviour exactly where they
+can't help — and strictly better where they can.
+
+### The one decision you make: behaviour at the edge of the envelope
+
+There is exactly **one** knob that encodes a business decision, because it is the one
+thing the engine cannot infer — it depends on what *your* service promises. When the
+system reaches its capacity ceiling, which SLA do you want?
+
+> *Do we admit all-comers to the restaurant and let them know the meal-serving time
+> is getting longer — or ask newcomers to come back later so we can guarantee the
+> patrons already seated get their meals as fast as possible?*
+
+That is `NANOBPMN_SLA_MODE`:
+
+- **`latency`** (default) — *"seat fewer, serve fast."* Preserve end-to-end speed by
+  shedding admission at the ceiling. A **time-to-complete** SLA.
+- **`admission`** — *"seat everyone, warn of the wait."* Keep admitting instances and
+  let latency grow. A **start-every-process** SLA.
+
+In both modes the memory-safety rails still guard against OOM — `admission` accepts
+latency, never a crash. This is the only behavioural policy you choose, and it is
+[**switchable at runtime, cluster-wide**](docs/adr/0013-sla-modes-and-varstore-wal-bounding.md)
+(flip it on one node and it propagates to the rest).
+
+### Everything else is a deployment fact, not a tuning knob
+
+The remaining environment variables don't tune *behaviour under load* — they declare
+the **shape and durability** of your deployment, which are inherent choices for any
+distributed, durable system:
+
+- **Topology** — how many `NANOBPMN_NODES`, `NANOBPMN_PARTITIONS`, and the
+  replication factor `NANOBPMN_RF`. This is *how big and how fault-tolerant*, not
+  *how to behave*.
+- **Durability tier** — `NANOBPMN_DURABILITY` / `NANOBPMN_REPLICATION`: how much of a
+  just-acked tail you're willing to lose on an ungraceful leader loss (zero, by
+  default). Every durable distributed engine makes you state this; it's a data-safety
+  guarantee, not an envelope-edge tuning. See
+  [ADR 0003](docs/adr/0003-write-path-durability-tiers.md).
+
+So: the engine self-optimizes with **zero technical configuration**, the deployment
+knobs describe *what you're running*, and the single business decision —
+`NANOBPMN_SLA_MODE` — describes *what you promise*. Full reference in
+[Cluster configuration](#cluster-configuration) and [Cluster tuning](#cluster-tuning).
+
+
 ## Quick start with c8ctl
 
 The easiest way to run and manage Nano BPM — single node or a whole cluster — is
@@ -503,8 +589,8 @@ a transient outage, so no operator action is needed.
 | `NANOBPMN_REPLICATION=<tier>` | Replication durability tier under Raft (RF>1). Default ⇒ **quorum** (acks after a majority commits + applies; zero data loss on node loss). `leader-durable` (`acks=1`) ⇒ the leader acks after its own local durable append+apply and ships to learners asynchronously (lowest latency; a just-acked tail can be lost on ungraceful leader loss, bounded — never divergent). See [`docs/adr/0003-write-path-durability-tiers.md`](docs/adr/0003-write-path-durability-tiers.md). |
 | `NANOBPMN_RAFT_HEARTBEAT_MS` / `_ELECTION_MIN_MS` / `_ELECTION_MAX_MS` | Leader heartbeat (default `250`) and randomized election window (defaults `500`/`1000`). |
 | `NANOBPMN_RAFT_SNAPSHOT_LOGS=<n>` | Snapshot every `n` applied entries (log compaction). Default `5000`. |
-| `NANOBPMN_ACTIVATION_FAIRNESS=1\|2` | Fairness-aware job-activation routing across nodes. **Off by default** (strict local-first). `1` rotates+quota-splits a worker's lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog. See [`docs/adr/0001-cluster-job-activation-fairness.md`](docs/adr/0001-cluster-job-activation-fairness.md). |
-| `NANOBPMN_CREATE_PLACEMENT=off\|protect\|balanced` | Cluster create-placement protection & load-awareness (RF>1). **Off by default** (blind round-robin; forwarded creates ungated — byte-identical). `protect` ⇒ a saturated owner sheds a forwarded create back to the ingress node, which reroutes to an owner with headroom (only 503s the client under **global** saturation). `balanced` ⇒ `protect` **plus** load-aware weighted placement driven by peer load gossip, steering creates toward nodes with real spare capacity (helps heterogeneous resources / skewed ingress). Never risks a duplicate instance (reroute fires only on a proven-not-applied shed). See [`docs/adr/0014-create-placement-protection-and-load-awareness.md`](docs/adr/0014-create-placement-protection-and-load-awareness.md). |
+| `NANOBPMN_ACTIVATION_FAIRNESS=off\|1\|2` | Fairness-aware job-activation routing across nodes. **Default `2`** (self-optimizing: caps each source by its live backlog, steering a worker's lease budget toward where the jobs are). `1` ⇒ rotation+quota only; `off` ⇒ strict local-first (historical). No-op on a single node. See [`docs/adr/0001-cluster-job-activation-fairness.md`](docs/adr/0001-cluster-job-activation-fairness.md). |
+| `NANOBPMN_CREATE_PLACEMENT=off\|protect\|balanced` | Cluster create-placement protection & load-awareness (RF>1). **Default `balanced`** (self-optimizing): load-aware weighted placement (smooth weighted round-robin over peer-gossiped load) steers creates toward nodes with real spare capacity, **plus** `protect` — a saturated owner sheds a forwarded create back to the ingress node, which reroutes to an owner with headroom (only 503s the client under **global** saturation). `protect` ⇒ self-protection without load-weighting; `off` ⇒ blind round-robin (historical). Never risks a duplicate instance (reroute fires only on a proven-not-applied shed). **No-op on a single node** (byte-identical). See [`docs/adr/0014-create-placement-protection-and-load-awareness.md`](docs/adr/0014-create-placement-protection-and-load-awareness.md). |
 | `NANOBPMN_CREATE_PLACEMENT_GOSSIP_MS=<ms>` | Peer create-load gossip interval for `NANOBPMN_CREATE_PLACEMENT=balanced`. Default `500`. No effect in `off`/`protect` or single-node. |
 
 See [`docs/distributed-scaling-design.md`](docs/distributed-scaling-design.md) for
@@ -818,7 +904,7 @@ deliberately orthogonal — pick each axis independently for your workload.
 | **Lowest write latency** (small/medium concurrency) | `NANOBPMN_DURABILITY=async` + `NANOBPMN_REPLICATION=leader-durable` | Ack on the leader's local durable append+apply — no fsync-before-ack wait and no follower round-trip. Cost: a just-acked tail can be lost on an ungraceful leader loss (bounded, never divergent). |
 | **Zero-data-loss durability** (the default) | leave `NANOBPMN_DURABILITY=sync`, `NANOBPMN_REPLICATION=quorum` | `200`/`204` means fsync'd locally **and** majority-committed. Strongest guarantee; highest per-write latency. |
 | **High throughput under worker over-provisioning** | `NANOBPMN_REPLICATE_ACTIVATION=0` (leader-local) or `=digest` | Keep the activation lease off the Raft log (~3× activation throughput). `digest` adds a best-effort lease broadcast so failover redelivery is narrowed. All modes stay at-least-once. |
-| **Even job drain across nodes** | `NANOBPMN_ACTIVATION_FAIRNESS=1` or `=2` | `1` rotates+quota-splits the lease budget across `{local, peers}`; `2` additionally caps each source by its live backlog so the deepest node drains fastest. |
+| **Even job drain across nodes** | on by default (`NANOBPMN_ACTIVATION_FAIRNESS=2`); set `=off` to disable | Default `2` caps each source by its live backlog so the deepest node drains fastest; `1` is rotation+quota only; `off` restores strict local-first. |
 | **A producer that outpaces the workers** | leave backpressure on (default **Adaptive**), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | Adaptive (AIMD) sizes the in-flight watermark from measured latency and sheds excess creates with `503 RESOURCE_EXHAUSTED`, so the producer converges to the drain rate. |
 | **Behaviour at the saturation ceiling** | `NANOBPMN_SLA_MODE=latency` (default) or `=admission` | `latency` preserves end-to-end speed by shedding admission (**time-to-complete SLA**). `admission` keeps admitting instances and lets latency grow (**start-every-process SLA**); the memory-safety rails still guard against OOM in both modes. |
 | **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS`, `NANOBPMN_HISTORY_MAX_INSTANCES`, `NANOBPMN_VAR_SPILL*` | Idle-purge compacts hot state and returns freed arenas to the OS. Cap retained completed instances to bound read-model growth. |
@@ -833,8 +919,10 @@ deliberately orthogonal — pick each axis independently for your workload.
   `NANOBPMN_DURABILITY=async`, `NANOBPMN_REPLICATION=leader-durable`,
   `NANOBPMN_REPLICATE_ACTIVATION=digest`. Bounded-loss, self-healing failover.
 - **Max throughput / benchmarking:** one partition led per node,
-  `NANOBPMN_REPLICATE_ACTIVATION=0`, `NANOBPMN_ACTIVATION_FAIRNESS=2`. Always
-  benchmark the **release** binary.
+  `NANOBPMN_REPLICATE_ACTIVATION=0`. Job-drain fairness (`=2`) and create placement
+  (`balanced`) are already on by default; set `NANOBPMN_CREATE_PLACEMENT=off` only
+  for a strict apples-to-apples blind-round-robin baseline. Always benchmark the
+  **release** binary.
 
 > Durability/replication tiers are chosen at startup from the on-disk log; switching
 > tiers on an existing data directory is unsupported. Start each reconfigured cluster

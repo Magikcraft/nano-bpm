@@ -301,6 +301,12 @@ pub struct ServerImpl {
     /// treated as full headroom (an unprobed peer still receives traffic). Empty
     /// otherwise — zero overhead.
     peer_pressure: Arc<std::sync::Mutex<std::collections::HashMap<u32, i64>>>,
+    /// Persistent smoothing state for the smooth weighted round-robin (SWRR) that
+    /// drives load-aware create placement ([`PlacementMode::Balanced`]). One slot
+    /// per partition; carried across placement decisions so equal weights yield an
+    /// exact round-robin and skewed loads spread smoothly (see
+    /// [`crate::placement::swrr_pick`]). Only touched in `Balanced` mode.
+    placement_swrr: Arc<std::sync::Mutex<Vec<i128>>>,
     /// Tier-A execution-trace projection, folded off the engine event stream by
     /// the exporter thread (process-optimization design doc §3). In-memory and
     /// bounded; served under `/console/api/traces`. Console builds only.
@@ -623,6 +629,7 @@ impl ServerImpl {
             promotion_epoch: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(feature = "console")]
             trace_store: Arc::new(console::trace::TraceStore::from_env()),
         }
@@ -4820,9 +4827,12 @@ impl ServerImpl {
     /// every partition's owner, weights each inversely to its gossiped composite
     /// load (a shedding, or already-`tried`, owner gets weight 0 and is never
     /// picked; an unprobed peer is treated as full headroom), and selects one via
-    /// the shared placement counter. Returns `Some(node)` to forward to a peer, or
-    /// `None` to create locally (a local slot won the weighting, or no eligible
-    /// remote owner remained).
+    /// smooth weighted round-robin ([`crate::placement::swrr_pick`]) over the
+    /// persistent per-partition smoothing state. Equal loads therefore yield an
+    /// exact round-robin (creates spread evenly); skewed loads steer smoothly
+    /// toward headroom. Returns `Some(node)` to forward to a peer, or `None` to
+    /// create locally (a local slot won the weighting, or no eligible remote owner
+    /// remained).
     fn next_create_placement_weighted(&self, tried: &[u32]) -> Option<u32> {
         let n = self.engine.partition_count();
         if n <= 1 {
@@ -4844,8 +4854,11 @@ impl ServerImpl {
                 }
             })
             .collect();
-        let counter = self.engine.placement_counter();
-        crate::placement::weighted_pick(&weights, counter).and_then(|i| owners[i])
+        let mut cur = self.placement_swrr.lock().unwrap_or_else(|e| e.into_inner());
+        if cur.len() != n {
+            cur.resize(n, 0);
+        }
+        crate::placement::swrr_pick(&weights, &mut cur).and_then(|i| owners[i])
     }
 
     /// Ingress reroute loop for create-placement protection (ADR 0014). Forwards

@@ -2192,22 +2192,24 @@ fn fair_plan(want: usize, num_sources: usize, start: usize) -> Vec<(usize, usize
 /// Whether (and how) to use fairness-aware activation routing across cluster
 /// nodes.
 ///
-/// `NANOBPMN_ACTIVATION_FAIRNESS` selects the mode:
-///   * unset / `0` / `off` → `Off`: strict local-first, then peers in fixed id
-///     order — the historical behaviour, byte-identical on a single node and
-///     unchanged for existing benchmarks.
+/// `NANOBPMN_ACTIVATION_FAIRNESS` selects the mode (**defaults to `Stage2`** when
+/// unset — the self-optimizing posture; the engine steers each worker's lease
+/// budget toward where the jobs actually are, on its own):
+///   * `0` / `off` / `false` / `no` / `none` → `Off`: strict local-first, then
+///     peers in fixed id order — the historical behaviour. An explicit opt-out.
 ///   * `1` / `true` / `on` / `yes` → `Stage1`: stateless rotation + per-source
 ///     quota. Spreads a worker's lease budget evenly across `{local, peers}` so a
 ///     fat local backlog cannot monopolise a worker while peers' partitions
 ///     starve. No protocol change.
-///   * `2` / `weighted` / `stage2` → `Stage2`: backlog-weighted routing. Caps each
-///     source proportional to its current backlog — local read live, peers from a
-///     value each piggybacks on its activation response (no extra round-trip, no
-///     new RPC) — steering budget toward where the jobs are. Collapses to Stage 1
-///     when backlogs are balanced.
+///   * unset / `2` / `weighted` / `stage2` → `Stage2` (default): backlog-weighted
+///     routing. Caps each source proportional to its current backlog — local read
+///     live, peers from a value each piggybacks on its activation response (no
+///     extra round-trip, no new RPC) — steering budget toward where the jobs are.
+///     Collapses to Stage 1 when backlogs are balanced.
 ///
 /// Only affects multi-node clusters — with no peers there is a single source and
-/// every mode collapses to the historical local-only dispatch.
+/// every mode collapses to the historical local-only dispatch, so the `Stage2`
+/// default is byte-identical on a single node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FairnessMode {
     Off,
@@ -2223,9 +2225,13 @@ fn activation_mode() -> FairnessMode {
             .as_deref()
             .map(str::trim)
         {
-            Some("2") | Some("weighted") | Some("stage2") => FairnessMode::Stage2,
+            Some("0") | Some("off") | Some("false") | Some("no") | Some("none") => {
+                FairnessMode::Off
+            }
             Some("1") | Some("true") | Some("on") | Some("yes") => FairnessMode::Stage1,
-            _ => FairnessMode::Off,
+            // unset / "2" / "weighted" / "stage2" / anything unrecognised resolve
+            // to the self-optimizing default.
+            _ => FairnessMode::Stage2,
         }
     })
 }

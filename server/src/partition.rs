@@ -451,13 +451,6 @@ impl Partitions {
         }
     }
 
-    /// Advance and return the shared create-placement round-robin counter. Lets
-    /// the protection layer (ADR 0014) drive weighted / reroute placement off the
-    /// same cursor `next_create_placement` uses, so the two stay interleaved.
-    pub fn placement_counter(&self) -> usize {
-        self.next_place.fetch_add(1, Ordering::Relaxed)
-    }
-
     /// Blind-round-robin create placement that **skips** owners in `tried`
     /// (ADR 0014 `protect` reroute). Probes forward from the shared placement
     /// cursor over every partition; returns the first owner that is remote and not

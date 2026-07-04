@@ -1,9 +1,10 @@
 # ADR 0014 — Create-placement protection and cluster load-awareness
 
-Status: **Accepted — implemented; single-node/default byte-identical; unit-tested;
-release build green. Cluster soak deferred** (needs the open-loop Rust producer
-noted in ADR 0013 to generate true heterogeneous overload).
-Date: 2026-07-03.
+Status: **Accepted — implemented; default-on (`balanced`) with single-node
+byte-identical; unit-tested; release build green. Cluster soak deferred** (needs
+the open-loop Rust producer noted in ADR 0013 to generate true heterogeneous
+overload).
+Date: 2026-07-03 (default flipped to `balanced` 2026-07-04 — see "Defaulting").
 Relates to: ADR 0001 (cluster job-activation fairness), ADR 0002 (leader-local
 activation), ADR 0013 (SLA modes at the saturation ceiling),
 `server/src/placement.rs`, `server/src/partition.rs`, `server/src/main.rs`,
@@ -43,15 +44,14 @@ benchmark, and **without** ever risking a duplicate instance.
 
 ## Decision
 
-Introduce `NANOBPMN_CREATE_PLACEMENT` with three staged modes (default `off`):
+Introduce `NANOBPMN_CREATE_PLACEMENT` with three staged modes (**default
+`balanced`** — see "Defaulting" below):
 
-- **`off`** (default): historical blind round-robin, forwarded creates ungated.
-  Byte-identical to prior behaviour — single node and every existing benchmark are
-  unaffected (placement returns "local" immediately when there is ≤ 1 partition, so
-  there is zero added work off-cluster).
+- **`off`**: historical blind round-robin, forwarded creates ungated.
+  Byte-identical to the pre-cluster behaviour. An explicit opt-out.
 - **`protect`**: every node self-protects (stage 1).
-- **`balanced`**: `protect` *plus* load-aware weighted placement with peer load
-  gossip (stage 2). `balanced` implies `protect`.
+- **`balanced`** (default): `protect` *plus* load-aware weighted placement with
+  peer load gossip (stage 2). `balanced` implies `protect`.
 
 ### Stage 1 — `protect`: self-protection + ingress reroute
 
@@ -98,23 +98,57 @@ rather than "any 503."
   other configuration.
 - **Weighted placement.** Placement weights each partition's owner **inversely to
   its gossiped load** (`WEIGHT_SCALE / (load + 1)`; a shedding owner gets weight 0
-  and is never chosen), then selects via an interleaved weighted round-robin over a
-  shared counter. Creates flow to nodes with the shallowest backlog — work-conserving
-  balance — instead of being spread evenly onto a saturated owner.
+  and is never chosen), then selects via **smooth weighted round-robin** (SWRR).
+  Creates flow to nodes with the shallowest backlog — work-conserving balance —
+  instead of being spread evenly onto a saturated owner.
 - **Optimistic on missing data.** A peer that has not gossiped yet is treated as
   **full headroom** (load 0), so an unprobed peer still receives traffic; the
   reactive stage-1 shed/reroute is the backstop that corrects an over-optimistic
   guess. Placement is therefore never *worse* than round-robin even with stale hints.
 
-#### Weighted-round-robin normalisation (an implementation subtlety worth recording)
+#### Smooth weighted round-robin (an implementation subtlety worth recording)
 
-The raw inverse-load weights span many orders of magnitude
-(`WEIGHT_SCALE / (load+1)` ranges up to ~1e6). A naive unit-stepped counter over
-raw weights stays stuck in the first (enormous) band forever — a healthy peer would
-receive *zero* creates. `weighted_pick` therefore **normalises** the weights onto a
-bounded resolution (`WRR_RESOLUTION = 1024`) before sweeping, giving every
-non-shedding owner at least a `1/1024` share and letting the counter actually
-traverse the distribution in proportion to weight.
+The selection primitive (`swrr_pick`) is the nginx-style **smooth weighted
+round-robin**, keeping a persistent per-partition smoothing accumulator. It was
+chosen because it satisfies both ends of the spectrum with one mechanism:
+
+- **Equal weights ⇒ exact round-robin.** On an idle/homogeneous cluster every
+  owner's weight is equal, and SWRR then rotates strictly (owner 0, 1, 2, 0, 1, …)
+  so creates spread perfectly evenly — the same distribution as blind round-robin.
+- **Skewed weights ⇒ smooth proportional spread.** As loads diverge, picks are
+  interleaved in proportion to weight *without clumping* (a 3:1 weight yields
+  0,0,1,0,0,1,… not 0,0,0,1). Every call advances — there is no warm-up window.
+
+An earlier draft used a *banded counter sweep* normalised onto a fixed resolution;
+it was replaced because, with few creates between weight updates, a unit-stepped
+counter stayed inside a single (wide) band and failed to rotate at all when weights
+were equal — a healthy peer could receive **zero** creates over a short burst. SWRR
+has no such warm-up pathology and needs no resolution constant.
+
+## Defaulting (why `balanced` is the default, not opt-in)
+
+Nano's design philosophy: **"If we can tell the user how to do it, and when to do
+it — why don't we do it?"** Load-aware placement and self-protection are not a
+*business* decision (nothing about them depends on what the operator values); they
+are a self-optimization the engine can make correctly on its own. So the default is
+`balanced` — the engine load-balances and self-protects out of the box, and the
+operator only ever touches this knob to *opt out* (`off`, to restore blind
+round-robin, e.g. for a strict apples-to-apples benchmark).
+
+This is safe to default on because **it is a no-op wherever it cannot help**:
+
+- **Single node / a node owning every partition:** placement returns "local"
+  immediately (≤ 1 remote owner), the shed gate only fires on *forwarded* creates
+  (there are none), and the gossip tick is idle without peers. So single-node
+  behaviour is **byte-identical** to blind round-robin with zero added overhead.
+- **Idle / homogeneous cluster:** SWRR with equal weights *is* exact round-robin,
+  so the distribution matches the historical scheme until loads actually diverge.
+
+The earlier draft defaulted to `off` to keep multi-node benchmarks byte-identical;
+that discipline was superseded by the philosophy above once the single-node no-op
+and the equal-weight round-robin equivalence made the default provably harmless
+where it does not help — and strictly better where it does. (The same reasoning
+flipped `NANOBPMN_ACTIVATION_FAIRNESS` to default `stage2`.)
 
 ## Composition with prior ADRs
 
@@ -151,29 +185,32 @@ traverse the distribution in proportion to weight.
 
 ## Verification
 
-- `server/src/placement.rs` unit tests: mode parsing/aliases, capability flags,
-  inverse-load weight monotonicity + shed → weight 0, `weighted_pick` proportionality
-  over a full normalised window, and all-shedding → `None`.
+- `server/src/placement.rs` unit tests: mode parsing (default `balanced`, explicit
+  `off` opt-out, aliases), capability flags, inverse-load weight monotonicity +
+  shed → weight 0, and SWRR behaviour — equal weights ⇒ exact round-robin,
+  proportional-and-smooth spread under skew, a shedding owner is never picked, and
+  all-shedding → `None`.
 - `server/src/main.rs` `clustered_startup_tests`: `next_create_placement_avoiding`
   skips tried owners then falls back local; weighted placement steers away from a
-  loaded/shedding peer toward a healthy one; and an end-to-end
+  loaded/shedding peer toward a healthy one; REST creates spread across every
+  partition of the cluster under the default; and an end-to-end
   `protected_create_reroutes_around_a_shedding_owner` over the real peer link.
-- Full server suite green (203 tests); `cargo clippy` zero warnings on both the
+- Full server suite green (205 tests); `cargo clippy` zero warnings on both the
   default and `--features console` builds; release build green.
 
 ## Consequences
 
-- **Positive.** No node can be overrun by forwarded placement; a cluster with
-  heterogeneous resources or skewed ingress uses its aggregate capacity instead of
-  being gated by its most-loaded node; the client only sees backpressure under
-  genuine *global* saturation. All of it is opt-in and defaults to the exact prior
-  behaviour.
+- **Positive.** Out of the box, no node can be overrun by forwarded placement and a
+  cluster with heterogeneous resources or skewed ingress uses its aggregate capacity
+  instead of being gated by its most-loaded node; the client only sees backpressure
+  under genuine *global* saturation. Single node stays byte-identical; an operator
+  can still opt out with `off`.
 - **Neutral / honest limits.** See above — single-partition ceiling unchanged;
   hints are eventually-consistent; ambiguous post-send errors are retryable rather
   than auto-rerouted.
 - **Negative.** `balanced` adds a small periodic gossip fan-out (one tiny frame per
-  peer per interval, default 500 ms) and a lock-guarded peer-load map read on the
-  placement path — negligible, and entirely absent in `off`/`protect`/single-node.
+  peer per interval, default 500 ms) and a lock-guarded SWRR/peer-load read on the
+  placement path — negligible, and entirely absent in `off`/single-node.
 
 ## Alternatives considered
 
@@ -188,6 +225,7 @@ traverse the distribution in proportion to weight.
   first step: it needs a capacity model and rebalances poorly under transient load.
   The dynamic inverse-load weight is simpler and reacts to *current* pressure, which
   is what the heterogeneous-ceiling scenario actually needs.
-- **Auto-enable by default.** Rejected: the byte-identical-default discipline
-  (single node + existing benchmarks unchanged) is a hard constraint; operators opt
-  in per cluster.
+- **Keep it opt-in (default `off`).** Rejected — see "Defaulting". The behaviour is
+  a no-op on a single node and where loads are equal, and strictly better where they
+  are not, so per the design philosophy the engine does it by default; the operator
+  opts *out* rather than in.

@@ -1,7 +1,11 @@
 # ADR 0001 — Cluster job-activation fairness
 
-Status: Accepted (Stages 1 & 2 shipped, opt-in). Supersedes nothing.
-Date: 2026-06-21.
+Status: Accepted (Stages 1 & 2 shipped). **Default flipped to `stage2` on
+2026-07-04** — see ADR 0014's "Defaulting" (self-optimizations default on; the
+routing is a no-op on a single node and where backlogs are balanced, so the default
+is safe). Set `NANOBPMN_ACTIVATION_FAIRNESS=off` to restore strict local-first.
+Supersedes nothing.
+Date: 2026-06-21 (default change 2026-07-04).
 
 ## Context
 
