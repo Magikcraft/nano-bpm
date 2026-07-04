@@ -517,14 +517,28 @@ replicating the lease buys no correctness, only a narrower window of duplicate w
 on the rare event of leader failover. So Nano makes it optional
 (`NANOBPMN_REPLICATE_ACTIVATION`): in **leader-local** mode the lease lives in the
 leader's single-writer actor only, each job costs **two quorum commits instead of
-three**, and activation stops competing for the commit budget. Possession of the
-job key *is* the capability (keys are only ever minted by activation), so relaxing
-the replicated latch does not let a client complete a job it never held. The cost
-is stated honestly: a leader-local lease does not survive failover, so a new leader
-re-dispatches in-flight jobs immediately — a bounded, at-least-once-tolerable
-duplication, not a correctness loss. This is a choice Zeebe's uniform replicated
-lifecycle does not separate out, available to Nano only because it distinguishes
-*lease* from *progress*.
+three**, and activation stops competing for the commit budget.
+
+Crucially, this changes nothing about the **authority model**, which is identical
+to Zeebe's: completion is **by key alone** — a valid job key *is* the capability,
+keys are only ever minted by activation, and neither engine binds completion to the
+activating worker's identity (`engine/mod.rs:616`, "Completion is by key alone").
+This is not an incidental property but a *deliberate capability*: because
+possession of the key — not the identity of the holder — authorizes completion, a
+worker can **forward** a job. It activates the job and fire-and-forgets the key to
+a decoupled downstream system, which completes the job later using that key
+directly, without ever holding the original stream. Binding completion to holder
+identity would break this pattern, so Nano preserves it exactly. The replicated
+`activated` latch was never a holder check; it only asserts that a job was
+activated at least once. Leader-local mode merely lets a follower apply a
+replicated `CompleteJob` to a job it only ever observed as `Created` — the drop-in
+contract (any client holding a valid key may complete the job) is untouched.
+
+The cost is stated honestly instead: a leader-local lease does not survive
+failover, so a new leader re-dispatches in-flight jobs immediately — a bounded,
+at-least-once-tolerable duplication, not a correctness loss. This is a choice
+Zeebe's uniform replicated lifecycle does not separate out, available to Nano only
+because it distinguishes *lease* from *progress*.
 
 ### 9.3 Durability as a spectrum, not a constant
 
