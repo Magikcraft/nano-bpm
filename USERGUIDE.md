@@ -240,17 +240,61 @@ You have two ways to drive the engine:
 
 ### Node / TypeScript SDK
 
-The **`@nanobpmn/sdk`** package is a companion to
-`@camunda8/orchestration-cluster-api` that adds a typed Falcon client and
-a streaming job worker. The worker **auto-detects the backend**: it uses the
-Falcon against Nano and **falls back to Camunda REST polling** against a
-Camunda gateway, so the same handler code runs on both.
+The **`@nanobpm/sdk`** package is a drop-in replacement for
+`@camunda8/orchestration-cluster-api`: **change the import and nothing
+else**. The same client API, the same method signatures, the same
+request/response types. What changes is the transport underneath:
+
+- Against a **Nano** server, the SDK detects the Falcon advertisement
+  in `/v2/topology` and transparently routes `createProcessInstance`
+  through the credit-metered Falcon stream and switches job workers
+  from long-polling to Falcon's pushed subscription.
+- Against a stock **Camunda 8** server, the same code stays on the
+  byte-identical REST path — no `nano` field, no upgrade, no branching
+  in your code.
+
+```diff
+- import { createCamundaClient } from "@camunda8/orchestration-cluster-api";
++ import { createCamundaClient } from "@nanobpm/sdk";
+
+  const camunda = createCamundaClient({ /* same config */ });
+  await camunda.createProcessInstance({ processDefinitionId: "demo" });
+```
+
+The Falcon upgrade is on by default and can be disabled with
+`CAMUNDA_FALCON=off` if you want to force REST against a Nano server.
 
 > **Throughput tip.** A single connection's commands are processed in arrival
 > order at journal-commit latency. Throughput comes from **concurrency across
 > connections**. The practical worker topology is **one stream per job-type
 > worker**, plus a small **pool of separate sockets for `createInstance`** so a
 > burst of process creates can't block job completions.
+
+### Rust SDK
+
+The **`camunda-orchestration-sdk`** crate on crates.io is the same story
+with **one import for both backends** — no Nano-specific crate, no
+feature flag, no code change to switch between Camunda 8 and Nano:
+
+```toml
+[dependencies]
+camunda-orchestration-sdk = "0.2"
+```
+
+```rust
+use camunda_orchestration_sdk::CamundaClient;
+
+let client = CamundaClient::from_env()?;                  // reads CAMUNDA_REST_ADDRESS, ...
+let _ = client.create_process_instance(instruction).await?;
+```
+
+`CamundaClient` probes `GET /v2/topology` once per client. When the
+response advertises Nano (Falcon), `create_process_instance` routes
+through the shared, credit-metered Falcon producer and `JobWorker`
+subscribes to the pushed Falcon stream. Against stock Camunda the same
+client stays on plain REST. Toggle with `CAMUNDA_FALCON=off` to force
+REST against a Nano server.
+
 
 ## Deploy processes and run instances
 
