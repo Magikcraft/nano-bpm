@@ -5979,8 +5979,10 @@ impl ServerImpl {
         }
     }
 
-    /// Searches variables in the read model. nano keeps a single instance-level
-    /// scope, so every variable's `scopeKey` equals its `processInstanceKey`.
+    /// Searches variables in the read model. Each variable is reported under the
+    /// `scopeKey` of the scope that holds it — the process instance for root-scope
+    /// variables, or a sub-process / multi-instance body / child element instance
+    /// for a nested scope (Part C hierarchical scoping).
     async fn search_variables_impl(
         &self,
         query_params: &models::SearchVariablesQueryParams,

@@ -1157,11 +1157,13 @@ fn json_value(value: &Value) -> String {
     crate::value_to_json(value).to_string()
 }
 
-/// Upserts a batch of variables into the single instance-level scope (nano keeps
-/// one scope per instance, so `scopeKey == processInstanceKey`). Names are sorted
+/// Upserts a batch of variables into a single variable scope. For a root-scope
+/// write (`VariablesUpdated`) the caller passes `scope_key == instance_key`; for
+/// a nested scope (`ScopedVariablesUpdated` — a sub-process, multi-instance body
+/// or child) it passes the scope-owning element instance key. Names are sorted
 /// so the autoincrement variable keys are assigned deterministically on a rebuild
 /// (a `VariablesUpdated`/`ProcessInstanceCreated` event carries an unordered map).
-/// An already-known name keeps its key and has its value overwritten.
+/// An already-known (scope, name) keeps its key and has its value overwritten.
 /// Prepared-statement caching for the projection hot path. Plain
 /// `Connection::execute` / `query_row` recompile the SQL text on every call; the
 /// exporter runs one statement per projected event, so under load that
@@ -1195,6 +1197,7 @@ impl CachedSql for rusqlite::Connection {
 fn upsert_variables(
     tx: &rusqlite::Transaction,
     instance_key: Key,
+    scope_key: Key,
     variables: &std::collections::HashMap<String, Value>,
 ) -> rusqlite::Result<()> {
     if variables.is_empty() {
@@ -1206,10 +1209,11 @@ fn upsert_variables(
     for (name, value) in entries {
         tx.cexecute(
             "INSERT INTO variables (instance_key, scope_key, name, value, \
-             process_definition_id, process_definition_key) VALUES (?1, ?1, ?2, ?3, ?4, ?5) \
+             process_definition_id, process_definition_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(scope_key, name) DO UPDATE SET value = excluded.value",
             params![
                 instance_key as i64,
+                scope_key as i64,
                 name,
                 json_value(value),
                 def_id,
@@ -1318,7 +1322,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             )?;
             // Variables the instance was created with (the process-instance row
             // exists now, so the scope's denormalized definition resolves).
-            upsert_variables(tx, *instance_key, variables)?;
+            upsert_variables(tx, *instance_key, *instance_key, variables)?;
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
@@ -1649,7 +1653,20 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             instance_key,
             variables,
         } => {
-            upsert_variables(tx, *instance_key, variables)?;
+            upsert_variables(tx, *instance_key, *instance_key, variables)?;
+        }
+
+        // A write to a nested variable scope (sub-process, multi-instance body or
+        // child): materialize it under its own `scope_key` so `searchVariables`
+        // reports the Zeebe-correct `scopeKey`. The scope's local variables are
+        // retained after the scope tears down (the read model keeps history, like
+        // an instance's variables after it completes).
+        Event::ScopedVariablesUpdated {
+            instance_key,
+            scope_key,
+            variables,
+        } => {
+            upsert_variables(tx, *instance_key, *scope_key, variables)?;
         }
 
         // Events with no queryable read-model projection.
@@ -1935,5 +1952,81 @@ mod definition_xml_tests {
 
         // Offset past the end yields nothing.
         assert!(store.process_instances_page(2, 6).is_empty());
+    }
+
+    #[test]
+    fn scoped_variables_are_projected_under_their_own_scope_key() {
+        use nanobpmn_engine_core::Value;
+
+        let store = ReadStore::open(None).unwrap();
+        let instance_key: super::Key = 1;
+        let scope_key: super::Key = 50; // a sub-process / MI-child element instance
+        store.export(&[&created_event(instance_key)]).unwrap();
+
+        // A root-scope write and a nested-scope write of the SAME name.
+        store
+            .export(&[
+                &Event::VariablesUpdated {
+                    instance_key,
+                    variables: std::collections::HashMap::from([(
+                        "amount".to_string(),
+                        Value::Int(10),
+                    )]),
+                },
+                &Event::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key,
+                    variables: std::collections::HashMap::from([
+                        ("amount".to_string(), Value::Int(20)),
+                        ("item".to_string(), Value::Int(7)),
+                    ]),
+                },
+            ])
+            .unwrap();
+
+        let mut rows = store.instance_variables(instance_key);
+        rows.sort_by_key(|a| (a.scope_key, a.name.clone()));
+        // Three distinct rows: root `amount`, scoped `amount`, scoped `item` —
+        // the same name coexists across scopes because UNIQUE is (scope_key, name).
+        assert_eq!(rows.len(), 3);
+
+        let root_amount = rows
+            .iter()
+            .find(|r| r.scope_key == instance_key && r.name == "amount")
+            .expect("root amount");
+        assert_eq!(root_amount.value, "10");
+
+        let scoped_amount = rows
+            .iter()
+            .find(|r| r.scope_key == scope_key && r.name == "amount")
+            .expect("scoped amount");
+        assert_eq!(scoped_amount.value, "20");
+        assert_eq!(scoped_amount.instance_key, instance_key);
+
+        let scoped_item = rows
+            .iter()
+            .find(|r| r.scope_key == scope_key && r.name == "item")
+            .expect("scoped item");
+        assert_eq!(scoped_item.value, "7");
+
+        // Re-writing the nested scope updates in place (keeps its key/scope).
+        let before = scoped_amount.key;
+        store
+            .export(&[&Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key,
+                variables: std::collections::HashMap::from([(
+                    "amount".to_string(),
+                    Value::Int(99),
+                )]),
+            }])
+            .unwrap();
+        let after = store
+            .instance_variables(instance_key)
+            .into_iter()
+            .find(|r| r.scope_key == scope_key && r.name == "amount")
+            .unwrap();
+        assert_eq!(after.key, before, "upsert keeps the variable key");
+        assert_eq!(after.value, "99");
     }
 }
