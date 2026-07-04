@@ -948,15 +948,140 @@ claim is drop-in-compatible *by construction*.
 
 ---
 
-## 13. Related work and the commensurable‑interface refinement of Kuhn
+## 13. Related work: Zeebe reimagined for the post‑LLM world, free of the tyranny of success
 
-> DRAFTING NOTE — Zeebe/Camunda lineage (respectful: this stands on a decade of
-> their engineering — the "signed subsystems" ethos). Audio‑dynamics borrowing
-> (compressor/limiter) as a *correct model transplanted*, not a skin. The Kuhn
-> refinement: a paradigm shift engineered to preserve interface commensurability,
-> so adoption does not require abandoning tooling — arguably a contribution in its
-> own right. Prior art on backpressure (Netflix concurrency‑limits), event
-> sourcing, LSM vs. journal+read‑model.
+The most honest description of this work is not "a new engine." It is *Zeebe
+reimagined* — the same problem, the same hard‑won subsystem knowledge, the same
+correctness instincts — given two things the original never had: a post‑LLM
+design context, and freedom from the tyranny of its own success. Everything in
+this section is related work read through that single lens, because the lineage
+is not a competitor to be surveyed; it is the shoulders this stands on.
+
+### 13.1 Anomalies at the edge of the paradigm
+
+Kuhn's revolutions do not begin at the center of a paradigm; they begin at its
+edges, where anomalies are felt first and most sharply. For a process engine the
+outermost edge is the **client boundary** — the SDKs, and the developers who build
+against them daily — and that is the vantage point from which this work was seen.
+Years spent building Camunda's client SDKs are years spent watching where the
+core's choices resurface as friction at the rim: the semantics a client must
+reproduce exactly (§4's honest tension — activation, correlation, FEEL, key
+types); the operational surface every integration has to accommodate (§2); and,
+most concretely, the ordinary daily need to run the engine locally to build and
+test against — where a heavyweight, JVM‑bound core is felt as *weight* in a way no
+SDK can paper over (§1, §8).
+
+Nano's response is to take those edge‑observed anomalies and resolve them **at the
+core**, rather than absorbing them — once again — into the client layer. The
+local‑development footprint (§1, §8), the single ceiling decision (§5), and the
+self‑closing control loops (§6) are all core answers to friction that was
+diagnosed from the outside in. The anomaly is observed at the edge; the fix is
+made in the center — which is also why no customer running on the JVM would have
+*requested* a ground‑up Rust engine: the people best positioned to feel an anomaly
+are seldom the ones who own the core. That gap — between where a paradigm's strains
+are felt and where they can be repaired — is itself a Kuhnian observation about
+where revolutions come from.
+
+### 13.2 The tyranny of success
+
+Zeebe earned a large installed base, and success is a constraint before it is a
+reward. Once real customers run their businesses on an engine, every design
+choice becomes load‑bearing: backward compatibility is owed, operational
+familiarity is an asset that cannot be casually spent, and the surrounding
+ecosystem — the JVM, RocksDB, an Elasticsearch‑first export model, the accreted
+tuning surface (§2) — is not incidental but the very ground the installed base
+stands on. The roadmap is *rightly* driven by those users. You therefore cannot
+reimagine the engine from first principles **in place**; you can only extend it,
+and each extension must preserve everything that came before.
+
+This is the incumbent's dilemma in its classic form (in the tradition of
+Christensen's *Innovator's Dilemma*): the same success that validates an
+architecture forbids its disruption from within. Nothing here is a failing of
+Zeebe's engineers — it is what success *costs*, and it is a cost that only
+success can impose. Nano's freedom is not virtue; it is **position**. A research
+prototype with no installed base can throw away RocksDB, the JVM, and the
+exporter‑coupled compaction loop (§8, ADR 0012) precisely because no one yet
+depends on them. The interesting move is what it does with that freedom.
+
+### 13.3 The post‑LLM world
+
+Zeebe was architected before large language models were a design assumption; Nano
+is architected after. Two things change.
+
+First, **operability**. When an engine cannot reason about itself, the only place
+to put the reasoning is in a human operator armed with knobs, runbooks, and
+learned rules (§2). That was the correct — the *only* — design under the prior
+constraints. In a world where self‑optimization can absorb most of that surface
+(the compressor/limiter decision, §5; the closed create→adapt→drain loops, §6;
+the meter that replaces the runbook, §11), the operator's tuning burden can be
+*internalized* rather than externalized. And **legibility becomes a first‑class
+design goal**: an engine small and transparent enough for an LLM to reason about
+its state is a different artifact from one that assumes only human operators will
+ever read its metrics.
+
+Second, **empirical optimization**. The post‑LLM frontier this paper points at
+(Part II) — replaying real historical workloads against counterfactual model
+variants to optimize processes *from evidence rather than intuition* — is only
+feasible because the engine is tiny enough to run many alternative realities at
+once (§8) and legible enough for an automated investigator to form and test
+hypotheses over them. Zeebe could not have been the substrate for that, not for
+want of skill but because a 4.35 GB‑resident, JVM‑bound engine (§8) is the wrong
+size for a swarm of what‑ifs. Footprint, here, is what makes the new science
+possible.
+
+### 13.4 The commensurable‑interface refinement of Kuhn
+
+Freedom from the tyranny of success is normally *destructive*. The usual exercise
+of it is the green‑field rewrite, and a green‑field rewrite abandons the
+ecosystem — in Kuhn's terms (*The Structure of Scientific Revolutions*, 1962), it
+is **incommensurable** with what came before, and the field must scrap its tools
+to adopt it. That is exactly the migration tax that keeps most revolutions on the
+whiteboard.
+
+Nano's central architectural claim is that this need not be so. It takes the
+green‑field freedom **internally** — a ground‑up Rust engine with a different
+state model, a different durability story, a different control system — while
+preserving the Camunda 8 contract **exactly and by construction** (§4, the REST
+surface generated from Camunda's own OpenAPI spec). The revolution happens
+entirely behind an interface the ecosystem already speaks. Clients, SDKs, and
+tooling do not know a paradigm shifted underneath them.
+
+We offer this as a modest refinement of Kuhn worth naming: a paradigm shift can
+be *engineered to remain commensurable at its interface*, decoupling the depth of
+the change from the cost of adopting it. Kuhn described revolutions that force a
+field to abandon its instruments; this is a revolution that hands the field the
+same instruments and swaps the world behind them. Whether or not it deserves the
+weight of the word "contribution," it is the design decision that makes
+everything else in this paper deployable rather than merely admirable.
+
+### 13.5 Threads we build on
+
+The specific mechanisms are transplants, not inventions, and are strongest when
+named as such:
+
+- **Adaptive backpressure.** The self‑sizing AIMD limiter (§5–§6) sits squarely
+  in the tradition of Netflix's concurrency‑limits work and, beneath it,
+  Little's law and classical control theory. The novelty is not the loop but its
+  *placement* — server and client backpressure treated as one system (§10, row 3)
+  — and its *framing* as audio dynamics processing (below).
+- **The audio‑dynamics transplant.** The compressor/limiter model (§5, §11) is a
+  *correct model moved wholesale*, not a decorative skin: attack/release maps to
+  AIMD's additive‑increase/multiplicative‑decrease, the always‑in‑circuit safety
+  limiter maps to the memory‑safety rails, and "switch, not knob" is the literal
+  affordance of a rack compressor. It earns its place by *predicting* the design,
+  not annotating it (ADR 0013).
+- **Event sourcing and CQRS.** The append‑only journal plus a projected SQLite
+  read model (§7) is the event‑sourcing/CQRS lineage, chosen over the LSM‑tree
+  (RocksDB) path Zeebe took — a different answer to the same authoritative‑state
+  question (§10, row 2), not a rejection of it.
+- **Consensus.** The replication layer is Raft, as Zeebe's is; the divergence is
+  the added leader‑durable tier and application‑driven recovery (§9, ADR 0003),
+  measured in §12 — an extension of the shared quorum path, not a departure from
+  it.
+
+Read together, these place Nano exactly: the same problem Zeebe solved, solved
+again with the same rigour, by people who could finally throw the old constraints
+away — and who chose, deliberately, to keep the one constraint that matters most.
 
 ---
 
