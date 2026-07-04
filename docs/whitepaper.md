@@ -861,7 +861,61 @@ so its fixed ~10 ms cost is split across the hundreds of jobs riding in that bat
 rather than paid once per job — which is why 64 concurrent workers reach ~33k/s,
 not 64 × 100/s.
 
-### 12.3 Footprint under load and at rest
+### 12.3 The two durability tiers, and what a node crash actually costs
+
+The choice of §9.3 is not abstract; it changes what the word "completed" promises
+when hardware fails. The two tiers we benchmark are the default **strict**
+(replication = `quorum`, journal = `sync`) and **relaxed** (replication =
+`leader-durable`, journal = `async`).
+
+**Strict — what an ack means.** The client is told a job completed only after a
+*majority* of nodes have both replicated and applied the entry and the leader has
+fsynced it to disk. Concretely, if any single node dies — leader or follower — every
+completion the client ever saw acknowledged is already durable on a majority, so
+the promoted leader has it. Nothing the client observed is lost; the price is the
+quorum round-trip on the critical path (the §12.2 floor).
+
+**Relaxed — what an ack means.** The client is told a job completed as soon as the
+*leader alone* has applied it and written it to the OS page cache (async: the fsync
+is deferred, bounded to a ~10 ms / 8 MiB window); followers receive it in the
+background. Concretely: if the leader process merely crashes and restarts, it
+recovers from its own disk. But if the leader is lost **permanently and
+simultaneously** — disk failure, or the VM destroyed — *before* its followers have
+caught up, the un-replicated tail (completions the client was already told
+succeeded) is gone, and a follower is promoted from the most complete log it holds,
+which may be slightly behind.
+
+**Why relaxed is a latency trade, not a correctness hole.** The lost tail does not
+corrupt anything, because the whole system is at-least-once. A dropped completion
+simply means that job's lease expires and it is redelivered — and because
+completion is by key alone (§9.2), an idempotent worker already tolerates
+redelivery. A dropped *create* means the instance was never durably admitted, and
+the producer (also at-least-once) retries. What relaxed durability must never do —
+and does not — is reorder, or lose anything it has already replicated: the leader's
+local log stays the single ordered source of truth per partition. So the trade is
+exact: relaxed durability converts a rare simultaneous-permanent-leader-loss from
+*no data loss* into *a bounded tail of millisecond-scale redeliveries*, in return
+for taking the quorum round-trip off every completion.
+
+Empirically, at the ~95k-PI/s operating point of §12.1, the two tiers measure:
+
+> DRAFTING NOTE — table below is being filled from a live fresh-state A/B on the
+> 3× `c2‑standard‑16` / 12‑partition / RF=3 cluster (strict vs relaxed, ceiling
+> config). Replace the `[MEASURE]` cells with the measured numbers on return.
+
+| Tier | replication | journal | aggregate throughput | p50 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| **strict** (default) | quorum | sync | `[MEASURE]` | `[MEASURE]` | `[MEASURE]` |
+| **relaxed** | leader-durable | async | `[MEASURE]` | `[MEASURE]` | `[MEASURE]` |
+
+The expectation set by §12.1 is that relaxed will *not* materially raise aggregate
+throughput — the ceiling is coordination-bound, and the earlier sweep showed
+removing replication entirely (RF=1) and fsync entirely (tmpfs) each left aggregate
+flat — but that it should visibly lower latency, because it removes the quorum
+round-trip from the critical path. The measured table is the honest test of that
+prediction.
+
+### 12.4 Footprint under load and at rest
 
 §8 argued footprint is a designed invariant; the soak evidence bears it out. Under
 a deliberately hostile flood — worker-starved, 50 KB variable payloads — a node's
@@ -873,7 +927,7 @@ fresh empty binary idles at **~13 MB**. The engine is small when empty and *stay
 bounded* when hammered — the property that makes the co-located local-LLM future of
 §2.3 and Part II physically possible.
 
-### 12.4 Compatibility by construction
+### 12.5 Compatibility by construction
 
 Nano's central invariant (§4) is that it is a drop-in Camunda 8 replacement, and
 the evidence is architectural, not anecdotal: the API surface is **generated from
