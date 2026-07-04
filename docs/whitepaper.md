@@ -325,13 +325,59 @@ decision, is the subject of §5 — and the whole point.
 
 ## 7. The engine core
 
-> DRAFTING NOTE. Points: deterministic, event‑sourced `engine-core`; single‑writer
-> per‑partition actor (`DeepthiHandle`) — a *convergence* with Zeebe's
-> `StreamProcessor` actor, stated honestly (not everything is a divergence, which
-> makes the divergences credible). The distinctive move: the same Rust
-> `engine-core` compiles to WASM as **µ‑nano** (~0.5 MB, ~0.2 MB gzipped) and runs
-> in the browser (ADR 0005) — a correctness argument (the browser engine *is* the
-> production engine) and impossible under a RocksDB‑backed design.
+Underneath the control loop and the wire sits a small, stubborn thing: a
+deterministic, event-sourced state machine that turns commands into events and
+nothing else. `engine-core` is `std`-only and zero-dependency; it never reads a
+wall clock (every command is applied at an injected instant, `apply_command_at(cmd,
+now)`), so the same commands always produce the same events — the definition of
+determinism — and events carry enough information to rebuild state by replay. Most
+tellingly, **persistence is a caller's concern, not the engine's**: the core
+appends its event log wherever the embedder wants (in-memory, a WAL, `redb`,
+SQLite) and replays to recover. The engine does not contain a storage engine. That
+single decision is what the rest of this section — and much of the paper — rests
+on.
+
+**A convergence, stated plainly.** Around that core, each partition is driven by a
+**single-writer command actor** — Nano calls it *Deepthi* (`server/src/deepthi.rs`,
+`DeepthiHandle`) — that owns the durable journal and serializes every mutation
+through one thread. This is a genuine **convergence** with Zeebe, whose
+`StreamProcessor` is likewise a single-writer, event-sourced actor per partition.
+It is worth saying so directly: not every choice here is a divergence, and a paper
+that pretended otherwise would not be trustworthy. The single-writer,
+event-sourced, replayable design is one of Zeebe's best ideas, and Nano keeps it.
+The divergence is narrow and already stated — engine-core carries no embedded
+key-value store; storage is injected from outside.
+
+**Why the empty core matters: one engine, many hosts.** Because the core is
+`std`-only, zero-dependency, and storage-agnostic, the *same* Rust `engine-core`
+compiles to three very different targets without change: natively for the server,
+via a C-ABI/FFI surface (`engine-core/src/ffi.rs`) for embedding in iOS/Android
+apps, and to `wasm32` as **µ-nano**, which runs in a browser tab. The shipped
+browser artifact is **577 KB** (229 KB gzipped, 175 KB brotli) — an entire BPMN
+engine small enough to download as part of a web page. This yields two arguments
+the old paradigm cannot make.
+
+The first is a **correctness** argument. The engine that simulates a model live in
+the browser modeler is not a reimplementation that can drift from the server — it
+is *literally the same code*, fed the same commands, producing the same events by
+the same deterministic rules. A discrepancy between "how it ran when I designed it"
+and "how it runs in production" cannot arise from two engines, because there is one
+engine. The second is an argument from **impossibility**: none of this is available
+to a RocksDB-backed design. RocksDB is a native C++ library that does not compile
+to `wasm32` and will not live in a browser tab or a 229 KB download; an engine that
+embeds its storage engine cannot be lifted whole into those hosts. By making
+persistence a caller concern, Nano can put the entire engine wherever it is needed
+— the same property that lets a single-node build embed itself inside an
+application ("Embed Nano", ADR 0005) and lets many lightweight instances spin up for
+the counterfactual replay of Part II.
+
+A candid scope note, in keeping with the prototype's status: today the browser
+build drives the modeler's *simulator* (virtual clock, no dispatch loop), and the
+fully embedded single-node engine is a proposed direction (ADR 0005), not a shipped
+product. But the load-bearing fact is already true and already in production use in
+the console: one deterministic `engine-core`, compiled to `wasm32`, is the engine
+running in the page. The portability is not aspirational; only some of its
+destinations are.
 
 ---
 
