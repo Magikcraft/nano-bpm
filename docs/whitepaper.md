@@ -758,8 +758,12 @@ to exploit.
 ## 10. Hindsight on Zeebe: choices revisited (code‑cited, both sides)
 
 Framing for every row: *Zeebe made the right call under its constraints; freed
-from those constraints, we chose differently.* Convergences are stated as
-convergences.
+from those constraints, we chose differently.* This is hindsight, not critique —
+the refinement‑not‑repudiation register of §13.6. Most of what Zeebe built, Nano
+keeps; the single‑writer actor in the final row is one of several convergences,
+and convergences are stated as such. The table records only the narrow places the
+new constraints let us choose again, and every Nano cell is code‑ or ADR‑cited so
+the comparison can be checked rather than merely asserted.
 
 | # | Concern | Zeebe (cited) | Nano (cited) | Anomaly resolved |
 |---|---|---|---|---|
@@ -771,9 +775,6 @@ convergences.
 | 6 | Replication | Atomix Raft, fixed majority quorum (`SimpleVoteQuorum` = n/2+1); no durability tiers | Same quorum path **+ leader‑durable tier** + app‑driven recovery (ADR 0003) | Hindsight |
 | 7 | Cohesion | Broker + gateway + external exporters + Operate/Tasklist + separate modeler | One self‑contained binary: engine + read model + console + in‑browser µ‑nano | Emergence without cohesion |
 | — | Single writer (convergence) | `StreamProcessor` actor per partition on `ActorSchedulingService` | Per‑partition single‑writer actor (`DeepthiHandle`) | (agreement) |
-
-> DRAFTING NOTE — decide how pointed to be per row; §10 could be the most
-> compelling or the most delicate. Current tone: hindsight, not critique.
 
 ---
 
