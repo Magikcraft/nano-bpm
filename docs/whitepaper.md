@@ -30,6 +30,13 @@ scaffolded as later sections. Author‑facing notes are marked `> DRAFTING NOTE`
 > against counterfactual model variants. Performance and an honestly‑named
 > throughput ceiling are presented as *evidence for the architecture*, not the
 > headline.
+> Register (disciplined): frame Nano as **a refinement that creates a
+> revolutionary realm of possibility** — narrow, surgical changes (a system‑wide
+> feedback loop, the engine's relationship to its own RAM, the footprint, a few
+> perf internals) over a deliberately preserved, battle‑tested core (actor model,
+> state machinery, C8 interface). Not wholesale replacement; the revolution is in
+> what it *opens* (recursive embedding, local‑LLM composition, empirical
+> optimization), not in what it tears down.
 
 ---
 
@@ -70,8 +77,13 @@ emerged at the edges and make them the **first principles** of the design.
 Crucially, the shift is engineered to be **commensurable at the interface**
 (§4). Kuhn's paradigms typically force a field to abandon its tools; Nano's does
 the opposite — it preserves the Camunda 8 contract exactly, so the revolution
-happens entirely behind an API the ecosystem already speaks. It is a paradigm
-shift you can deploy as a drop‑in.
+happens entirely behind an API the ecosystem already speaks. And it is achieved by
+discipline, not demolition: the interventions are narrow and surgical, made over a
+deliberately preserved, battle‑tested core — the actor model, the state machinery,
+the contract itself (§13.6). Nano is, in the end, **a refinement that creates a
+revolutionary realm of possibility**: change only what must change, and a tiny,
+drop‑in, self‑optimizing engine opens a space the thing it refines could never
+reach (§14). A paradigm shift you can deploy as a drop‑in.
 
 ---
 
@@ -1172,10 +1184,62 @@ is disciplined enough to change only what must change.
 
 ## 14. Conclusion: the frontier
 
-> DRAFTING NOTE — restate: emergence → first‑class, one decision, drop‑in, tiny.
-> Then the trajectory this opens (Part II): replaying real history against
-> counterfactual model variants to optimize processes *empirically*. It is an
-> Advanced Research Prototype — but the direction is legible.
+## 14. Conclusion: the frontier
+
+In one breath: the operational tuning a decade of operators did by hand is,
+mostly, a set of feedback loops that can be made first‑class inside the engine
+(§5–§6, §13.3); what cannot be automated is a *single* business decision at the
+edge of the capacity envelope — compress or limit, delay or drop (§5); the whole
+thing sits behind an unchanged Camunda 8 contract (§4); and it is small (§8).
+Emergence made first‑class, one decision left for a human, deployable as a
+drop‑in, tiny.
+
+What fell out of building it is a frontier wider than the engine. Four directions
+are already legible.
+
+**How deep self‑optimization goes — and where it stops.** The striking result of
+treating operations as control loops is how *little* is left over: nearly every
+knob a decade accumulated turns out to be a loop the system can close itself
+(§13.3). What remains is irreducible — the one decision at the edge of the
+envelope, where offered load exceeds capacity and someone must say whether the
+service compresses (delays) or limits (drops). That is a statement of business
+value, not a tuning parameter, and no depth of self‑optimization can make it for
+you (§5, ADR 0013). The asymptote of a self‑optimizing engine is not zero
+decisions but *one* — and the work is to drive the automated depth as far as it
+goes while keeping that single human decision clean and legible.
+
+**An engine that ships inside itself.** Because Nano is small and WASM‑capable
+(the µ‑nano core, §7–§8), it can be *embedded*, not merely deployed. A job worker
+can carry a whole Nano engine inside it to run a sub‑process locally, while being
+orchestrated by an outer engine that is Camunda 8 *or another Nano*. The footprint
+that makes it a good local‑dev replacement (§1) also makes it **recursive**: an
+engine small enough to be a tool call inside a task inside an engine.
+Orchestration stops being a tier you deploy and becomes a component you compose.
+
+**Local LLMs on both sides of the engine.** The same small footprint that lets a
+capable model share the developer's workstation (§13.3) invites composition in
+both directions. A local LLM can sit *above* the engine as an orchestrator —
+investigating, proposing and deploying model variants (Part II) — and *below* it
+as a tool call: the body of a service task, a job worker whose implementation is a
+model invocation. With recursive embedding, the unit of composition turns fluid —
+engines inside workers, models inside tasks, engines and models orchestrating one
+another.
+
+**Empirical process optimization.** Draw these together and the frontier the whole
+paper points at appears: replaying real historical workloads against
+counterfactual, LLM‑generated model variants — cheaply, by the dozen — to optimize
+processes from evidence rather than intuition. That is the subject of Part II.
+
+None of this required tearing down what worked. The interventions were narrow and
+disciplined (§13.6) — a system‑wide feedback loop, the engine's relationship to
+its own memory, the footprint, a few internal choices — over a deliberately
+preserved, battle‑tested core. That discipline is the thesis: Nano is **a
+refinement that creates a revolutionary realm of possibility**. Change only what
+must change, and a tiny, drop‑in, self‑optimizing Camunda 8 opens a space —
+recursive orchestration, local‑LLM composition, empirical optimization — that the
+thing it refines could never have reached. It is an Advanced Research Prototype,
+and we say so plainly; but the direction is legible, and its near edge — an engine
+you can run today (§1) — is already in your hands.
 
 ---
 
