@@ -290,13 +290,24 @@ pub struct ProcessInstance {
     /// so it needs no separate drain/rehydrate wiring.
     #[cfg_attr(feature = "serde", serde(default))]
     pub multi_instances: HashMap<Key, MultiInstanceState>,
-    /// Per-element-instance local variable overlays (the multi-instance child
-    /// bindings: `inputElement` and `loopCounter`). Merged over the instance
-    /// variables when a child's job is activated or its FEEL is evaluated.
-    /// Empty for non-multi-instance work; entries are cleared as each child
-    /// completes.
+    /// Non-root variable scopes: each scope-owning element instance (embedded
+    /// sub-process, multi-instance body, multi-instance child) mapped to its
+    /// parent scope-owner. The root (process-instance) scope is implicit — its
+    /// key is the instance key and it is never present here. Empty for instances
+    /// with only the root scope. Together with `scope_variables` this is the
+    /// Zeebe-style hierarchical variable tree (Part C). `serde(default)` so
+    /// snapshots written before scoping deserialize as root-only.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub element_locals: HashMap<Key, HashMap<String, Value>>,
+    pub scope_parents: HashMap<Key, Key>,
+    /// Local variables held directly by each non-root scope (keyed by the
+    /// scope-owning element instance). This includes a multi-instance child's
+    /// `inputElement`/`loopCounter` bindings and a multi-instance body's
+    /// `outputCollection`. The root scope's variables live in `variables`. A read
+    /// resolves a name from the local scope upward to the root (first hit wins); a
+    /// write follows Zeebe variable propagation. Empty for root-only instances,
+    /// keeping the flat fast path unchanged.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scope_variables: HashMap<Key, HashMap<String, Value>>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying
@@ -855,7 +866,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     incidents: Vec::new(),
                     variables_spilled: false,
                     multi_instances: HashMap::new(),
-                    element_locals: HashMap::new(),
+                    scope_parents: HashMap::new(),
+                    scope_variables: HashMap::new(),
                 },
             );
         }
@@ -869,6 +881,49 @@ pub fn apply(state: &mut State, event: &Event) {
                 for (k, v) in variables {
                     map.insert(k.clone(), v.clone());
                 }
+            }
+        }
+
+        Event::ScopedVariablesUpdated {
+            instance_key,
+            scope_key,
+            variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                // A write targeting the root scope lands in the shared `variables`
+                // Arc (the flat fast path); any other scope holds its own local map.
+                if *scope_key == 0 || *scope_key == *instance_key {
+                    let map = Arc::make_mut(&mut instance.variables);
+                    for (k, v) in variables {
+                        map.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    let map = instance.scope_variables.entry(*scope_key).or_default();
+                    for (k, v) in variables {
+                        map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        Event::VariableScopeCreated {
+            instance_key,
+            scope_key,
+            parent_scope_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.scope_parents.insert(*scope_key, *parent_scope_key);
+                instance.scope_variables.entry(*scope_key).or_default();
+            }
+        }
+
+        Event::VariableScopeDestroyed {
+            instance_key,
+            scope_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.scope_parents.remove(scope_key);
+                instance.scope_variables.remove(scope_key);
             }
         }
 
@@ -900,9 +955,12 @@ pub fn apply(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
                 instance.scopes.remove(element_instance_key);
-                // Drop any multi-instance child local overlay (a no-op for
-                // ordinary elements); a completed/cancelled child never needs it.
-                instance.element_locals.remove(element_instance_key);
+                // Zeebe drops a scope's local variables (an activity's input
+                // mappings, a sub-process's or multi-instance child's locals) when
+                // the element completes. A no-op for elements that never opened a
+                // scope.
+                instance.scope_parents.remove(element_instance_key);
+                instance.scope_variables.remove(element_instance_key);
             }
         }
 
@@ -1198,6 +1256,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     instance.variables = Arc::new(HashMap::new());
                 }
                 instance.variables_spilled = false;
+                instance.scope_variables.clear();
+                instance.scope_parents.clear();
             }
         }
 
@@ -1224,6 +1284,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     instance.variables = Arc::new(HashMap::new());
                 }
                 instance.variables_spilled = false;
+                instance.scope_variables.clear();
+                instance.scope_parents.clear();
             }
         }
 
@@ -1489,8 +1551,9 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
-        // A multi-instance child activated: register its local variable overlay
-        // and mark it active in the body it belongs to.
+        // A multi-instance child activated: register its own variable scope
+        // (holding its `inputElement`/`loopCounter` bindings, parented to the
+        // body scope) and mark it active in the body it belongs to.
         Event::MultiInstanceChildActivated {
             instance_key,
             body_key,
@@ -1499,8 +1562,9 @@ pub fn apply(state: &mut State, event: &Event) {
             local_variables,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.scope_parents.insert(*child_key, *body_key);
                 instance
-                    .element_locals
+                    .scope_variables
                     .insert(*child_key, local_variables.clone());
                 if let Some(mi) = instance.multi_instances.get_mut(body_key) {
                     mi.active.insert(*child_key);
@@ -1509,8 +1573,9 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
-        // A multi-instance child completed: collect its output at its index, drop
-        // it from the active set, and clear its local variable overlay.
+        // A multi-instance child completed: collect its output at its index and
+        // drop it from the active set. Its local scope is torn down by the
+        // child's `ElementCompleted` event.
         Event::MultiInstanceChildCompleted {
             instance_key,
             body_key,
@@ -1519,7 +1584,6 @@ pub fn apply(state: &mut State, event: &Event) {
             output,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance.element_locals.remove(child_key);
                 if let Some(mi) = instance.multi_instances.get_mut(body_key) {
                     mi.active.remove(child_key);
                     if let Some(slot) = mi.output_values.get_mut(*index) {

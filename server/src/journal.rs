@@ -1854,7 +1854,14 @@ impl Journal {
                     let vars = Arc::new(vars);
                     self.engine
                         .rehydrate_variables(job.instance_key, Arc::clone(&vars));
-                    job.variables = vars;
+                    // Root is resident again; recompute the merged scoped view so a
+                    // job on a nested scope (sub-process / MI-child) regains its
+                    // scope-local bindings — those stayed resident through the spill,
+                    // but the worker's snapshot must fold the freshly restored root
+                    // back in. A flat instance yields the same root `Arc` back.
+                    job.variables = self
+                        .engine
+                        .element_variables(job.instance_key, job.element_instance_key);
                 }
             }
         }
@@ -2269,6 +2276,83 @@ mod tests {
         for k in &keys {
             assert!(!journal.engine.is_variables_spilled(*k));
         }
+    }
+
+    #[test]
+    fn spilled_nested_scope_instance_activates_with_the_merged_view() {
+        use nanobpmn_engine_core::{ProcessBuilder, Value};
+
+        // A sub-process with an input mapping is its own variable scope: the
+        // mapping creates a scope-local `scoped` (= seed + 1) that a job inside
+        // the sub-process sees merged over the root `seed`.
+        fn nested() -> nanobpmn_engine_core::ProcessDefinition {
+            ProcessBuilder::new("nested")
+                .start_event("start")
+                .sub_process("sub", "sub_start")
+                .with_io(
+                    "sub",
+                    nanobpmn_engine_core::IoMapping {
+                        inputs: vec![nanobpmn_engine_core::Mapping {
+                            source: "=seed + 1".to_string(),
+                            target: "scoped".to_string(),
+                        }],
+                        outputs: Vec::new(),
+                    },
+                )
+                .start_event("sub_start")
+                .contained_in("sub_start", "sub")
+                .service_task("inner", "inner-work")
+                .contained_in("inner", "sub")
+                .end_event("sub_end")
+                .contained_in("sub_end", "sub")
+                .end_event("done")
+                .connect("start", "sub")
+                .connect("sub_start", "inner")
+                .connect("inner", "sub_end")
+                .connect("sub", "done")
+                .build()
+                .expect("valid nested process")
+        }
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        // Budget 0: the job-parked instance spills its root payload immediately.
+        journal.set_spill(Arc::clone(&store), 0);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(nested()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("seed".to_string(), Value::Int(4));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("nested", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Shed the root payload; the sub-process scope-local map stays resident.
+        journal.force_spill_scan();
+        assert!(
+            journal.engine.is_variables_spilled(key),
+            "the job-parked nested-scope instance spilled its root payload"
+        );
+
+        // Activating the inner job rehydrates the root AND recomputes the merged
+        // scoped view: the worker must receive BOTH the restored root `seed` and
+        // the resident sub-process-local `scoped` — not the root-only payload.
+        let activated = journal.activate_jobs("inner-work", "w", 1, 60_000, 0);
+        assert_eq!(activated.len(), 1, "the inner job activates");
+        let job = &activated[0];
+        assert_eq!(
+            job.variables.get("seed"),
+            Some(&Value::Int(4)),
+            "root variable restored from the spill store"
+        );
+        assert_eq!(
+            job.variables.get("scoped"),
+            Some(&Value::Int(5)),
+            "sub-process scope-local variable folded back into the worker's view"
+        );
+        assert!(!journal.engine.is_variables_spilled(key), "rehydrated");
     }
 
     #[test]

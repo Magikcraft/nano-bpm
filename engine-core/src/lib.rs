@@ -88,8 +88,8 @@ pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
-    BuildError, Condition, Element, ElementId, ElementKind, MultiInstance, ProcessBuilder,
-    ProcessDefinition, SequenceFlow, UserTaskProps, Value,
+    BuildError, Condition, Element, ElementId, ElementKind, IoMapping, Mapping, MultiInstance,
+    ProcessBuilder, ProcessDefinition, SequenceFlow, UserTaskProps, Value,
 };
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,

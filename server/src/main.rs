@@ -3080,10 +3080,16 @@ impl ServerImpl {
         };
 
         let variables = from_object_map(&body.variables);
+        let local = body.local.unwrap_or(false);
 
         if let Some(node) = self.route_by_leader(scope_key) {
             return Ok(self
-                .forward_set_variables(node, scope_key, wire_variables(Some(&body.variables)))
+                .forward_set_variables(
+                    node,
+                    scope_key,
+                    wire_variables(Some(&body.variables)),
+                    local,
+                )
                 .await);
         }
 
@@ -3091,7 +3097,10 @@ impl ServerImpl {
             .engine
             .by_key(scope_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+                engine.apply_command_at(
+                    Command::set_variables_scoped(scope_key, variables, local),
+                    now_millis(),
+                )
             })
             .await;
         match result {
@@ -3818,12 +3827,16 @@ impl ServerImpl {
         &self,
         scope_key: u64,
         variables: std::collections::HashMap<String, Value>,
+        local: bool,
     ) -> Result<(), (u16, String)> {
         let result = self
             .engine
             .by_key(scope_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::set_variables(scope_key, variables), now_millis())
+                engine.apply_command_at(
+                    Command::set_variables_scoped(scope_key, variables, local),
+                    now_millis(),
+                )
             })
             .await;
         match result {
@@ -4484,11 +4497,15 @@ impl ServerImpl {
         node: u32,
         scope_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
+        local: bool,
     ) -> apis::element_instance::CreateElementInstanceVariablesResponse {
         use apis::element_instance::CreateElementInstanceVariablesResponse as Resp;
         let res =
             match self.peer_link(node).await {
-                Ok(link) => link.set_variables(scope_key.to_string(), variables).await,
+                Ok(link) => {
+                    link.set_variables(scope_key.to_string(), variables, local)
+                        .await
+                }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
                         problem("Peer error", s, m),
@@ -5962,8 +5979,10 @@ impl ServerImpl {
         }
     }
 
-    /// Searches variables in the read model. nano keeps a single instance-level
-    /// scope, so every variable's `scopeKey` equals its `processInstanceKey`.
+    /// Searches variables in the read model. Each variable is reported under the
+    /// `scopeKey` of the scope that holds it — the process instance for root-scope
+    /// variables, or a sub-process / multi-instance body / child element instance
+    /// for a nested scope (Part C hierarchical scoping).
     async fn search_variables_impl(
         &self,
         query_params: &models::SearchVariablesQueryParams,
@@ -14584,5 +14603,59 @@ mod data_dir_tests {
         let err = ensure_data_dir(&file).expect_err("a file is not a usable data dir");
         assert!(err.contains("not a directory"), "got: {err}");
         std::fs::remove_file(&file).ok();
+    }
+}
+
+#[cfg(test)]
+mod variable_record_projection_tests {
+    use super::*;
+
+    fn row(instance_key: u64, scope_key: u64, name: &str, value: &str) -> readstore::VariableRow {
+        readstore::VariableRow {
+            key: 9000,
+            instance_key,
+            scope_key,
+            name: name.to_string(),
+            value: value.to_string(),
+            process_definition_id: "loan".to_string(),
+            process_definition_key: "42".to_string(),
+        }
+    }
+
+    /// A Zeebe VARIABLE record carries `scopeKey` distinct from
+    /// `processInstanceKey` for a nested scope (sub-process / MI body / child
+    /// element instance). Both REST projections must surface that split rather
+    /// than collapsing the scope onto the instance.
+    #[test]
+    fn variable_search_result_reports_the_nested_scope_key() {
+        let v = row(1001, 2001, "approved", "true");
+        let r = variable_search_result(&v, false);
+        assert_eq!(r.scope_key, models::ScopeKey("2001".to_string()));
+        assert_eq!(
+            r.process_instance_key,
+            models::ProcessInstanceKey("1001".to_string())
+        );
+        assert_ne!(r.scope_key.0, r.process_instance_key.0);
+    }
+
+    #[test]
+    fn variable_result_reports_the_nested_scope_key() {
+        let v = row(1001, 2001, "approved", "true");
+        let r = variable_result(&v);
+        assert_eq!(r.scope_key, models::ScopeKey("2001".to_string()));
+        assert_eq!(
+            r.process_instance_key,
+            models::ProcessInstanceKey("1001".to_string())
+        );
+    }
+
+    /// Root-scope variables report `scopeKey == processInstanceKey`, matching
+    /// Zeebe's shape for process-level variables.
+    #[test]
+    fn root_scope_variable_reports_scope_equal_to_instance() {
+        let v = row(1001, 1001, "amount", "500");
+        let r = variable_search_result(&v, false);
+        assert_eq!(r.scope_key.0, r.process_instance_key.0);
+        assert_eq!(r.scope_key, models::ScopeKey("1001".to_string()));
     }
 }

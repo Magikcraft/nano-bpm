@@ -519,7 +519,7 @@ impl Engine {
                     // Per Zeebe, a start-event name expression is evaluated at
                     // deploy time against an empty context; a static name passes
                     // through unchanged.
-                    let message_name = self.resolve_event_name(None, &message_name);
+                    let message_name = self.resolve_event_name(&HashMap::new(), &message_name);
                     self.emit(
                         log,
                         Event::MessageStartSubscriptionCreated {
@@ -540,7 +540,7 @@ impl Engine {
                     // parsed interval. For a cycle the resolved interval is
                     // persisted so re-arming recurs on the same delay.
                     let (due_at, interval_millis) = self.resolve_timer(
-                        None,
+                        &HashMap::new(),
                         start_timer_def.as_ref(),
                         self.now,
                         interval_millis,
@@ -665,13 +665,16 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
-                    self.emit(
-                        &mut log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables,
-                        },
-                    );
+                    // Job result variables propagate from the task's enclosing
+                    // (flow) scope upward — each name updates the nearest ancestor
+                    // scope that defines it, defaulting to root. For a root-only
+                    // instance this collapses to the flat `VariablesUpdated`,
+                    // byte-identical to the pre-scoping engine.
+                    let flow_scope = self.scope_of(instance_key, element_instance_key);
+                    for event in self.propagated_updates(instance_key, flow_scope, variables, false)
+                    {
+                        self.emit(&mut log, event);
+                    }
                 }
                 // The parked service-task token resumes from ACTIVATED.
                 queue.push_back(Step::Complete {
@@ -785,13 +788,14 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
-                    self.emit(
-                        &mut log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables,
-                        },
-                    );
+                    // User-task completion variables propagate from the task's
+                    // enclosing (flow) scope upward, defaulting to root (flat
+                    // `VariablesUpdated` for a root-only instance).
+                    let flow_scope = self.scope_of(instance_key, element_instance_key);
+                    for event in self.propagated_updates(instance_key, flow_scope, variables, false)
+                    {
+                        self.emit(&mut log, event);
+                    }
                 }
                 // The parked user-task token resumes from ACTIVATED.
                 queue.push_back(Step::Complete {
@@ -962,8 +966,10 @@ impl Engine {
                                 // a static cycle keeps its parsed interval.
                                 let timer_def =
                                     self.timer_def_of(instance_key, &boundary_element_id);
+                                let rearm_vars =
+                                    self.variables_for_element(instance_key, element_instance_key);
                                 let (next_due_at, _) = self.resolve_timer(
-                                    Some(instance_key),
+                                    &rearm_vars,
                                     timer_def.as_ref(),
                                     due_at,
                                     duration_millis,
@@ -1313,18 +1319,21 @@ impl Engine {
             Command::SetVariables {
                 scope_key,
                 variables,
+                local,
             } => {
                 let instance_key = self
                     .resolve_scope(scope_key)
                     .ok_or(EngineError::ScopeNotFound { scope_key })?;
                 if !variables.is_empty() {
-                    self.emit(
-                        &mut log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables,
-                        },
-                    );
+                    // Resolve the requested scope within the instance and write:
+                    // `local` keeps the values in that scope; otherwise they
+                    // propagate to the nearest ancestor defining each name, else
+                    // root. A root-scoped (or root-only-instance) write collapses
+                    // to the flat `VariablesUpdated`.
+                    for event in self.propagated_updates(instance_key, scope_key, variables, local)
+                    {
+                        self.emit(&mut log, event);
+                    }
                 }
             }
 
@@ -1981,15 +1990,15 @@ impl Engine {
             },
         );
         // The message's variables (if any) are merged into the correlated
-        // instance before its token advances.
+        // instance before its token advances, propagating from the catching
+        // element's enclosing (flow) scope upward (nearest defining ancestor,
+        // else root). Root-only instances collapse to the flat `VariablesUpdated`.
         if !variables.is_empty() {
-            self.emit(
-                log,
-                Event::VariablesUpdated {
-                    instance_key,
-                    variables: variables.clone(),
-                },
-            );
+            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
+            {
+                self.emit(log, event);
+            }
         }
 
         match kind {
@@ -2066,13 +2075,13 @@ impl Engine {
             },
         );
         if !variables.is_empty() {
-            self.emit(
-                log,
-                Event::VariablesUpdated {
-                    instance_key,
-                    variables: variables.clone(),
-                },
-            );
+            // Signal payload propagates from the catching element's enclosing
+            // (flow) scope upward, defaulting to root.
+            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            for event in self.propagated_updates(instance_key, flow_scope, variables.clone(), false)
+            {
+                self.emit(log, event);
+            }
         }
 
         match kind {
@@ -2156,6 +2165,18 @@ impl Engine {
             // The sub-process completes in its own (parent) scope, captured before
             // its scope entry is cleared by `ElementCompleted`.
             let scope = self.scope_of(instance_key, eik);
+            // Output mappings on a sub-process evaluate against the sub-process's
+            // own scope view (its input-mapped locals + anything set inside it)
+            // BEFORE its scope is torn down, then propagate the mapped result to
+            // the enclosing (parent) scope. Capture the values now; emit them as
+            // scoped writes after `ElementCompleted` has dropped the local scope.
+            let outputs = self.io_outputs(instance_key, &element_id);
+            let output_updates = if outputs.is_empty() {
+                HashMap::new()
+            } else {
+                let visible = self.variables_for_element(instance_key, eik);
+                self.eval_io_mappings_in(&visible, &outputs)
+            };
             self.emit(
                 log,
                 Event::ElementCompleting {
@@ -2185,18 +2206,9 @@ impl Engine {
             for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
                 self.emit(log, event);
             }
-            // Output mappings on a sub-process apply as its scope drains.
-            let outputs = self.io_outputs(instance_key, &element_id);
-            if !outputs.is_empty() {
-                let updates = self.eval_io_mappings(instance_key, &outputs);
-                if !updates.is_empty() {
-                    self.emit(
-                        log,
-                        Event::VariablesUpdated {
-                            instance_key,
-                            variables: updates,
-                        },
-                    );
+            if !output_updates.is_empty() {
+                for event in self.propagated_updates(instance_key, scope, output_updates, false) {
+                    self.emit(log, event);
                 }
             }
             for flow in self.outgoing(instance_key, &element_id) {
@@ -2301,15 +2313,51 @@ impl Engine {
         ];
         let mut followups = Vec::new();
 
-        // Input mappings (zeebe:input): evaluate against the instance variables
-        // and merge the result before the element's job/subscription is created,
-        // so a later job activation snapshots the mapped values.
+        // Input mappings (zeebe:input): evaluate against the variables visible to
+        // the activating element and create the mapped values LOCAL to the
+        // element's own scope (Zeebe semantics) — visible to the element's job or
+        // inner flow, not propagated to the parent, and dropped when the element
+        // completes. A sub-process is itself a variable scope: it always registers
+        // its scope (so writes inside it can resolve/propagate correctly) and its
+        // inputs are local to that scope, exactly like a leaf activity.
+        let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
         let inputs = self.io_inputs(instance_key, &element_id);
+
+        // The scoped variable view the activating element evaluates against: both
+        // its input-mapping *source* expressions and its own FEEL attributes (job
+        // type, retries, priority, timer/message/signal name, correlation key,
+        // user-task fields). It is the element's enclosing flow scope — a
+        // root-scope element gets the shared root Arc (a cheap refcount bump), so
+        // evaluation is byte-identical to the flat engine; an element inside a
+        // sub-process or multi-instance body additionally sees its enclosing
+        // scope's locals, so an input mapping that reads an enclosing-scope-local
+        // variable resolves correctly (Zeebe parity). A sub-process's own inputs
+        // are evaluated here against its *parent* scope and then applied local to
+        // the new sub-process scope below.
+        let element_vars = self.variables_for_element(instance_key, scope);
+
+        let mut scope_registered = false;
+        if is_sub_process {
+            events.push(Event::VariableScopeCreated {
+                instance_key,
+                scope_key: element_instance_key,
+                parent_scope_key: scope,
+            });
+            scope_registered = true;
+        }
         if !inputs.is_empty() {
-            let updates = self.eval_io_mappings(instance_key, &inputs);
+            let updates = self.eval_io_mappings_in(&element_vars, &inputs);
             if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
+                if !scope_registered {
+                    events.push(Event::VariableScopeCreated {
+                        instance_key,
+                        scope_key: element_instance_key,
+                        parent_scope_key: scope,
+                    });
+                }
+                events.push(Event::ScopedVariablesUpdated {
                     instance_key,
+                    scope_key: element_instance_key,
                     variables: updates,
                 });
             }
@@ -2319,10 +2367,10 @@ impl Engine {
             // A service task creates a job and parks the token.
             Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(instance_key, &job_type);
-                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let job_type = self.resolve_job_type(&element_vars, &job_type);
+                let priority = self.resolve_priority(&element_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    instance_key,
+                    &element_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 events.push(Event::JobCreated {
@@ -2339,29 +2387,30 @@ impl Engine {
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
+                    scope,
                     &element_id,
                 ));
             }
             // A user task creates a user task record and parks the token; a
             // CompleteUserTask releases it. The assignment/scheduling/priority
             // expressions declared on the element are resolved against the
-            // instance variables at creation time.
+            // element's scoped view at creation time.
             Some(ElementKind::UserTask(props)) => {
                 let user_task_key = self.mint_key();
                 let assignee = self
-                    .resolve_user_task_string(instance_key, props.assignee.as_deref())
+                    .resolve_user_task_string(&element_vars, props.assignee.as_deref())
                     .filter(|s| !s.is_empty());
                 let candidate_groups =
-                    self.resolve_user_task_list(instance_key, props.candidate_groups.as_deref());
+                    self.resolve_user_task_list(&element_vars, props.candidate_groups.as_deref());
                 let candidate_users =
-                    self.resolve_user_task_list(instance_key, props.candidate_users.as_deref());
+                    self.resolve_user_task_list(&element_vars, props.candidate_users.as_deref());
                 let due_date = self
-                    .resolve_user_task_string(instance_key, props.due_date.as_deref())
+                    .resolve_user_task_string(&element_vars, props.due_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let follow_up_date = self
-                    .resolve_user_task_string(instance_key, props.follow_up_date.as_deref())
+                    .resolve_user_task_string(&element_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
-                let priority = self.resolve_priority(instance_key, props.priority.as_deref());
+                let priority = self.resolve_priority(&element_vars, props.priority.as_deref());
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
@@ -2378,6 +2427,7 @@ impl Engine {
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
+                    scope,
                     &element_id,
                 ));
             }
@@ -2387,7 +2437,7 @@ impl Engine {
                 let timer_key = self.mint_key();
                 let timer_def = self.timer_def_of(instance_key, &element_id);
                 let (due_at, _) = self.resolve_timer(
-                    Some(instance_key),
+                    &element_vars,
                     timer_def.as_ref(),
                     self.now,
                     duration_millis,
@@ -2410,9 +2460,9 @@ impl Engine {
                 let subscription_key = self.mint_key();
                 // The message name may be a FEEL expression evaluated on
                 // activation against the instance variables (Zeebe parity).
-                let message_name = self.resolve_event_name(Some(instance_key), &message_name);
+                let message_name = self.resolve_event_name(&element_vars, &message_name);
                 let correlation_value =
-                    self.resolve_correlation_value(instance_key, &correlation_key);
+                    self.resolve_correlation_value(&element_vars, &correlation_key);
                 let kind = state::MessageSubscriptionKind::IntermediateCatch;
                 // Zeebe-style placement: the canonical subscription lives on the
                 // partition owning `hash(correlation_key)`. When that is this
@@ -2448,7 +2498,7 @@ impl Engine {
                 let subscription_key = self.mint_key();
                 // The signal name may be a FEEL expression evaluated on
                 // activation against the instance variables (Zeebe parity).
-                let signal_name = self.resolve_event_name(Some(instance_key), &signal_name);
+                let signal_name = self.resolve_event_name(&element_vars, &signal_name);
                 events.push(Event::SignalSubscriptionCreated {
                     subscription_key,
                     instance_key,
@@ -2499,6 +2549,7 @@ impl Engine {
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
+                    scope,
                     &element_id,
                 ));
                 followups.push(Step::Activate {
@@ -2553,19 +2604,45 @@ impl Engine {
                 element_id: element_id.clone(),
                 scope,
             },
+            // The multi-instance body is a variable scope: its children run inside
+            // it and its `outputCollection` accumulates here.
+            Event::VariableScopeCreated {
+                instance_key,
+                scope_key: body_key,
+                parent_scope_key: scope,
+            },
         ];
-        // Input mappings on the activity apply once, on body activation.
+        // Input mappings on the activity apply once, on body activation, LOCAL to
+        // the body scope (Zeebe semantics), so they feed the input collection and
+        // the children without leaking to the parent scope. Their source
+        // expressions are evaluated against the body's *enclosing* scope view, so
+        // a multi-instance activity nested in a sub-process can read that
+        // sub-process's locals.
+        let enclosing_vars = self.variables_for_element(instance_key, scope);
         let inputs = self.io_inputs(instance_key, &element_id);
-        if !inputs.is_empty() {
-            let updates = self.eval_io_mappings(instance_key, &inputs);
-            if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
-            }
+        let input_updates = if inputs.is_empty() {
+            HashMap::new()
+        } else {
+            self.eval_io_mappings_in(&enclosing_vars, &inputs)
+        };
+        if !input_updates.is_empty() {
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: body_key,
+                variables: input_updates.clone(),
+            });
         }
-        let vars = self.variables(instance_key);
+        // The input collection is evaluated in the body scope view (the enclosing
+        // scope with any body input mappings overlaid).
+        let vars: Arc<HashMap<String, Value>> = {
+            if input_updates.is_empty() {
+                enclosing_vars
+            } else {
+                let mut merged = (*enclosing_vars).clone();
+                merged.extend(input_updates);
+                Arc::new(merged)
+            }
+        };
         let items: Vec<Value> = match crate::feel::eval(&mi.input_collection, &vars) {
             Ok(Value::List(list)) => list,
             _ => Vec::new(),
@@ -2641,6 +2718,14 @@ impl Engine {
         }
         locals.insert("loopCounter".to_string(), Value::Int((index as i64) + 1));
 
+        // The scoped view this child evaluates its own FEEL attributes (job type,
+        // retries, priority) against: the multi-instance body's scope (already
+        // applied) overlaid with the child's own `inputElement`/`loopCounter`
+        // bindings (not yet applied — carried in `locals`). So a child job type
+        // like `="worker-" + loopCounter` resolves correctly.
+        let mut child_vars = (*self.variables_for_element(instance_key, body_key)).clone();
+        child_vars.extend(locals.clone());
+
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -2665,10 +2750,10 @@ impl Engine {
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(instance_key, &job_type);
-                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let job_type = self.resolve_job_type(&child_vars, &job_type);
+                let priority = self.resolve_priority(&child_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    instance_key,
+                    &child_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 events.push(Event::JobCreated {
@@ -2748,7 +2833,7 @@ impl Engine {
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.element_locals.get(&child_eik))
+            .and_then(|i| i.scope_variables.get(&child_eik))
             .and_then(|l| l.get("loopCounter"))
             .and_then(|v| v.as_f64())
             .map(|c| (c as i64 - 1).max(0) as usize)
@@ -2843,22 +2928,33 @@ impl Engine {
         };
         let scope = self.scope_of(instance_key, body_key);
 
+        // Build the aggregated output collection (padding uncollected slots with
+        // null) and evaluate the activity's output mappings against the body-scope
+        // view overlaid with that collection — all while the body scope is still
+        // resident (its `ElementCompleted` below tears it down).
+        let collection_map: Option<HashMap<String, Value>> =
+            output_collection.map(|name| HashMap::from([(name, Value::List(output_values))]));
+        let outputs = self.io_outputs(instance_key, &element_id);
+        let output_updates = if outputs.is_empty() {
+            HashMap::new()
+        } else {
+            let mut ctx = (*self.variables_for_element(instance_key, body_key)).clone();
+            if let Some(map) = &collection_map {
+                ctx.extend(map.clone());
+            }
+            self.eval_io_mappings_in(&ctx, &outputs)
+        };
+
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
         for child in &active {
             events.extend(self.cancel_mi_child_events(instance_key, *child));
         }
-        // Write the aggregated output collection to the instance scope, and apply
-        // the activity's output mappings against it.
-        let mut collection_update: Option<HashMap<String, Value>> = None;
-        if let Some(name) = output_collection {
-            let mut map = HashMap::new();
-            map.insert(name, Value::List(output_values));
-            events.push(Event::VariablesUpdated {
-                instance_key,
-                variables: map.clone(),
-            });
-            collection_update = Some(map);
+        // The output collection propagates OUT of the body to its enclosing (flow)
+        // scope — for a top-level loop that is the root, collapsing to the flat
+        // `VariablesUpdated`, byte-identical to the pre-scoping engine.
+        if let Some(map) = collection_map {
+            events.extend(self.propagated_updates(instance_key, scope, map, false));
         }
         events.push(Event::ElementCompleting {
             instance_key,
@@ -2874,24 +2970,10 @@ impl Engine {
             instance_key,
             body_key,
         });
-        // Output mappings (zeebe:output) on the activity apply as the body drains,
-        // able to reference the just-written output collection.
-        let outputs = self.io_outputs(instance_key, &element_id);
-        if !outputs.is_empty() {
-            let updates = match &collection_update {
-                Some(update) => {
-                    let mut vars = (*self.variables(instance_key)).clone();
-                    vars.extend(update.clone());
-                    self.eval_io_mappings_in(&vars, &outputs)
-                }
-                None => self.eval_io_mappings(instance_key, &outputs),
-            };
-            if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
-            }
+        // Output mappings likewise propagate their projected result to the parent
+        // (flow) scope.
+        if !output_updates.is_empty() {
+            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
         }
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
@@ -3042,27 +3124,34 @@ impl Engine {
                 variables: update.clone(),
             });
         }
-        // Output mappings (zeebe:output): evaluate against the instance variables
-        // (which already include any job/message result merged on completion, or
-        // a script task's result staged above) and merge the projected result
-        // before the outgoing flows are taken.
+        // Output mappings (zeebe:output): evaluate against the variables visible
+        // to this element instance — its own scope (including any input-mapped
+        // locals) layered over the enclosing scopes, plus any job/message result
+        // merged on completion, or a script task's result staged above — and merge
+        // the projected result (at the root scope) before the outgoing flows.
         let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
+            let visible = self.variables_for_element(instance_key, element_instance_key);
             let updates = match &script_update {
                 // The script result event is not applied to state until this
                 // step returns, so overlay it onto the eval context by hand.
                 Some(update) => {
-                    let mut vars = (*self.variables(instance_key)).clone();
+                    let mut vars = (*visible).clone();
                     vars.extend(update.clone());
                     self.eval_io_mappings_in(&vars, &outputs)
                 }
-                None => self.eval_io_mappings(instance_key, &outputs),
+                None => self.eval_io_mappings_in(&visible, &outputs),
             };
             if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
+                // Output mappings propagate their result to the element's
+                // enclosing (flow) scope and upward — each name updates the
+                // nearest ancestor scope that defines it, defaulting to root.
+                // The element's own scope is being torn down by `ElementCompleted`
+                // (built earlier in this vec), so propagating from the parent
+                // avoids writing into the dying scope. Root-only instances collapse
+                // to a single flat `VariablesUpdated`, unchanged from the flat engine.
+                let flow_scope = self.scope_of(instance_key, element_instance_key);
+                events.extend(self.propagated_updates(instance_key, flow_scope, updates, false));
             }
         }
         let mut followups = Vec::new();
@@ -3096,10 +3185,14 @@ impl Engine {
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(instance_key, &job_type);
-                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                // The element instance is already active (this is an incident
+                // retry), so resolve its FEEL attributes against its own applied
+                // scope view (input mappings + ancestors).
+                let job_vars = self.variables_for_element(instance_key, element_instance_key);
+                let job_type = self.resolve_job_type(&job_vars, &job_type);
+                let priority = self.resolve_priority(&job_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    instance_key,
+                    &job_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 (

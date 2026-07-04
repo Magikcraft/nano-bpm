@@ -259,20 +259,22 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
+        scope: Key,
         element_id: &str,
     ) -> Vec<Event> {
+        // The scoped view the host activity's boundary expressions (timer/message
+        // /signal names, correlation keys) evaluate against — its flow scope, so a
+        // boundary on an activity nested in a sub-process sees the enclosing
+        // scope's locals. Root-scope hosts get the shared root Arc (unchanged).
+        let host_vars = self.variables_for_element(instance_key, scope);
         let mut events = Vec::new();
         for (boundary_id, duration_millis, interrupting) in
             self.attached_timer_boundaries(instance_key, element_id)
         {
             let timer_key = self.mint_key();
             let timer_def = self.timer_def_of(instance_key, &boundary_id);
-            let (due_at, _) = self.resolve_timer(
-                Some(instance_key),
-                timer_def.as_ref(),
-                self.now,
-                duration_millis,
-            );
+            let (due_at, _) =
+                self.resolve_timer(&host_vars, timer_def.as_ref(), self.now, duration_millis);
             let kind = if interrupting {
                 state::TimerKind::InterruptingBoundary {
                     boundary_element_id: boundary_id,
@@ -298,8 +300,8 @@ impl Engine {
             // The message name may be a FEEL expression evaluated on activation
             // (when the boundary subscription opens) against the instance
             // variables (Zeebe parity).
-            let message_name = self.resolve_event_name(Some(instance_key), &message_name);
-            let correlation_value = self.resolve_correlation_value(instance_key, &correlation_key);
+            let message_name = self.resolve_event_name(&host_vars, &message_name);
+            let correlation_value = self.resolve_correlation_value(&host_vars, &correlation_key);
             let kind = if interrupting {
                 state::MessageSubscriptionKind::InterruptingBoundary {
                     boundary_element_id: boundary_id,
@@ -342,7 +344,7 @@ impl Engine {
             // The signal name may be a FEEL expression evaluated on activation
             // (when the boundary subscription opens) against the instance
             // variables (Zeebe parity).
-            let signal_name = self.resolve_event_name(Some(instance_key), &signal_name);
+            let signal_name = self.resolve_event_name(&host_vars, &signal_name);
             let kind = if interrupting {
                 state::MessageSubscriptionKind::InterruptingBoundary {
                     boundary_element_id: boundary_id,

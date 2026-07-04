@@ -22,6 +22,15 @@
 //! | `INCIDENT` CREATED                          | `incidents[]`                     |
 //! | `PROCESS_INSTANCE_CREATION` CREATED         | `creationVariables` (Tier-1)      |
 //! | `JOB` COMPLETED (+variables)                | `stimuli[] jobCompleted` (Tier-2) |
+//! | `VARIABLE` CREATED/UPDATED (`scopeKey`)     | ignored (see below)               |
+//!
+//! Standalone `VARIABLE` records — Camunda's authoritative per-scope variable
+//! state, carrying a `scopeKey` distinct from `processInstanceKey` under the
+//! hierarchical scope model — are **intentionally ignored**. A recorded-input
+//! replay re-derives every scope from the model topology and re-applies the
+//! creation (Tier-1) and job-completion (Tier-2) payloads, so folding scoped
+//! `VARIABLE` snapshots in as well would double-count them and leak the source
+//! engine's scope keys into a scope-agnostic trace.
 //!
 //! ## Input formats accepted
 //! `load_records` is tolerant of the common Camunda dump layouts:
@@ -970,6 +979,60 @@ mod tests {
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].kind, "jobCompleted");
         assert_eq!(st[0].reference.as_deref(), Some("review-job"));
+        assert_eq!(
+            st[0].variables.as_ref().unwrap().values,
+            json!({"approved": true})
+        );
+    }
+
+    #[test]
+    fn variable_records_are_ignored_scope_agnostic() {
+        // A real Camunda export interleaves standalone VARIABLE records — the
+        // authoritative per-scope state, carrying a `scopeKey` distinct from the
+        // `processInstanceKey`. The importer must ignore them: trace variables
+        // come only from creation (Tier-1) and job completions (Tier-2), so a
+        // recorded-input replay stays scope-agnostic and byte-identical to a
+        // dump that never carried VARIABLE records.
+        let mut records = happy_instance();
+        let pik = 1001;
+        let eik = 2001; // the service-task element instance = a nested scope
+        records.push(rec(
+            "VARIABLE",
+            "CREATED",
+            5001,
+            105,
+            9,
+            // root-scope snapshot (scopeKey == processInstanceKey)
+            json!({"processInstanceKey": pik, "scopeKey": pik,
+                   "name": "amount", "value": "500"}),
+        ));
+        records.push(rec(
+            "VARIABLE",
+            "CREATED",
+            5002,
+            232,
+            10,
+            // nested-scope snapshot (scopeKey == elementInstanceKey != pik)
+            json!({"processInstanceKey": pik, "scopeKey": eik,
+                   "name": "approved", "value": "true"}),
+        ));
+
+        let with_vars = transform(&records, true);
+        let baseline = transform(&happy_instance(), true);
+        assert_eq!(
+            serde_json::to_value(&with_vars).unwrap(),
+            serde_json::to_value(&baseline).unwrap(),
+            "standalone VARIABLE records must not alter the derived trace"
+        );
+
+        // And the trace still carries exactly the creation + job-completion vars.
+        let t = &with_vars[0];
+        assert_eq!(
+            t.creation_variables.as_ref().unwrap().values,
+            json!({"amount": 500})
+        );
+        let st = t.stimuli.as_ref().unwrap();
+        assert_eq!(st.len(), 1);
         assert_eq!(
             st[0].variables.as_ref().unwrap().values,
             json!({"approved": true})

@@ -276,6 +276,8 @@ pub enum ClientFrame {
         scope_key: String,
         #[serde(default)]
         variables: Option<Map<String, Value>>,
+        #[serde(default)]
+        local: bool,
     },
     /// **Intra-cluster only.** A gateway asks a peer to activate jobs on the peer's
     /// own partitions for a worker attached to the gateway (job-stream
@@ -1455,10 +1457,11 @@ async fn handle_client_frame(
             corr,
             scope_key,
             variables,
+            local,
         } => {
             let vars = to_engine_vars(variables);
             forward_by_key_reply(conn, corr, &scope_key, |key| async move {
-                server.set_variables_local(key, vars).await
+                server.set_variables_local(key, vars, local).await
             })
             .await;
         }

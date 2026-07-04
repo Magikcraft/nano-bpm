@@ -26,6 +26,381 @@ fn task_with_priority(proc_id: &str, priority: &str) -> ProcessDefinition {
         .unwrap()
 }
 
+// --- Part C phase 3: sub-process scopes + Zeebe variable propagation --------
+
+/// A sub-process `sub` carrying an input mapping (`scoped = seed + 1`) around an
+/// inner service task `inner` (job `work`), then a normal flow out to `done`.
+fn subprocess_with_input_mapping(output: Vec<crate::model::Mapping>) -> ProcessDefinition {
+    ProcessBuilder::new("sub-scope")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=seed + 1".to_string(),
+                    target: "scoped".to_string(),
+                }],
+                outputs: output,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "work")
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn subprocess_input_mapping_is_local_to_the_subprocess_scope() {
+    // A sub-process is its own variable scope: its input mapping creates a
+    // variable LOCAL to the sub-process, visible to a job running inside it but
+    // NOT at the root scope.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The inner job sees the sub-process-local `scoped` (5 = seed + 1)...
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(job.variables.get("scoped"), Some(&Value::Int(5)));
+    // ...but it never leaked to the root scope.
+    assert_eq!(io_var(&engine, inst, "scoped"), None);
+}
+
+/// Like [`subprocess_with_input_mapping`] but the inner service task ALSO carries
+/// an input mapping (`derived = scoped * 10`) whose source reads the
+/// sub-process-local `scoped`. This only resolves if the inner element's inputs
+/// are evaluated against its enclosing (sub-process) scope, not the root.
+fn subprocess_with_nested_input_mapping() -> ProcessDefinition {
+    ProcessBuilder::new("nested-scope")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=seed + 1".to_string(),
+                    target: "scoped".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "work")
+        .with_io(
+            "inner",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=scoped * 10".to_string(),
+                    target: "derived".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn inner_element_input_mapping_resolves_against_the_enclosing_subprocess_scope() {
+    // Regression: an input mapping on an element nested inside a sub-process must
+    // evaluate its source against the sub-process's scoped view (which carries the
+    // sub-process-local `scoped`), NOT the root variables. Evaluating against root
+    // would leave `scoped` unresolved and silently drop `derived`.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            subprocess_with_nested_input_mapping(),
+        ))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    engine
+        .apply_command(Command::create_instance_with("nested-scope", vars))
+        .unwrap();
+
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    // scoped = seed + 1 = 5 (sub-process local); derived = scoped * 10 = 50,
+    // which is only correct when the inner input mapping sees the enclosing scope.
+    assert_eq!(job.variables.get("scoped"), Some(&Value::Int(5)));
+    assert_eq!(job.variables.get("derived"), Some(&Value::Int(50)));
+}
+
+#[test]
+fn subprocess_scope_local_variable_is_dropped_when_the_subprocess_completes() {
+    // Once the sub-process drains and completes, its local scope (and the
+    // input-mapped `scoped`) is destroyed — never surfacing at the root.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    complete_one(&mut engine, "work");
+    assert!(engine.is_completed(inst));
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(instance.variables.get("scoped"), None);
+    assert!(instance.scope_variables.is_empty());
+    assert!(instance.scope_parents.is_empty());
+}
+
+#[test]
+fn subprocess_output_mapping_reads_local_scope_and_propagates_to_root() {
+    // A sub-process output mapping can read the sub-process-local `scoped` and
+    // its projected result propagates OUT to the (root) parent scope, surviving
+    // the sub-process scope teardown.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(vec![
+            crate::model::Mapping {
+                source: "=scoped".to_string(),
+                target: "exported".to_string(),
+            },
+        ])))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let events = complete_one(&mut engine, "work");
+    assert!(engine.is_completed(inst));
+    // The process completes (clearing root variables), so assert the sub-process
+    // output mapping surfaced `exported = 5` propagated to the root scope as a
+    // flat `VariablesUpdated`, and that the local `scoped` never leaked there.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == inst
+                    && variables.get("exported") == Some(&Value::Int(5))
+        )),
+        "sub-process output should export scoped=5 to root; events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } if variables.contains_key("scoped")
+        )),
+        "the sub-process-local `scoped` must not surface at root; events: {events:?}"
+    );
+}
+
+#[test]
+fn job_result_updates_the_nearest_defining_ancestor_scope() {
+    // A job inside a sub-process completes with a variable whose name is already
+    // defined in the sub-process scope: Zeebe propagation updates that scope (the
+    // nearest defining ancestor), NOT the root.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    // The sub-process scope is the parent of the inner task instance.
+    let inner_eik = engine.pending_jobs()[0].element_instance_key;
+    let sub_scope = *engine
+        .instance(inst)
+        .unwrap()
+        .scopes
+        .get(&inner_eik)
+        .unwrap();
+
+    // The `work` job completes writing `scoped = 99` (a name owned by the
+    // sub-process scope). It must update the sub-process scope, not root.
+    let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
+    let mut job_vars = HashMap::new();
+    job_vars.insert("scoped".to_string(), Value::Int(99));
+    let events = engine
+        .apply_command(Command::complete_job_with(job_key, job_vars))
+        .unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { scope_key, variables, .. }
+                if *scope_key == sub_scope && variables.get("scoped") == Some(&Value::Int(99))
+        )),
+        "job result should update the sub-process scope; events: {events:?}"
+    );
+    // It never landed at the root scope.
+    assert_eq!(io_var(&engine, inst, "scoped"), None);
+}
+
+#[test]
+fn set_variables_local_writes_only_the_target_scope() {
+    // `SetVariables` with local=true writes strictly into the addressed scope.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let inner_eik = engine.pending_jobs()[0].element_instance_key;
+    let sub_scope = *engine
+        .instance(inst)
+        .unwrap()
+        .scopes
+        .get(&inner_eik)
+        .unwrap();
+
+    engine
+        .apply_command(Command::set_variables_scoped(
+            sub_scope,
+            HashMap::from([("only_here".to_string(), Value::Int(7))]),
+            true,
+        ))
+        .unwrap();
+    // The local write is in the sub-process scope, not the root.
+    assert_eq!(io_var(&engine, inst, "only_here"), None);
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .scope_variables
+            .get(&sub_scope)
+            .and_then(|m| m.get("only_here")),
+        Some(&Value::Int(7))
+    );
+}
+
+#[test]
+fn set_variables_non_local_propagates_to_the_root_scope() {
+    // `SetVariables` with local=false against a nested scope, for a name defined
+    // nowhere, creates the variable at the ROOT scope (Zeebe default).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let inner_eik = engine.pending_jobs()[0].element_instance_key;
+    let sub_scope = *engine
+        .instance(inst)
+        .unwrap()
+        .scopes
+        .get(&inner_eik)
+        .unwrap();
+
+    engine
+        .apply_command(Command::set_variables_scoped(
+            sub_scope,
+            HashMap::from([("bubbled".to_string(), Value::Int(3))]),
+            false,
+        ))
+        .unwrap();
+    // Propagated to root since no ancestor scope defines `bubbled`.
+    assert_eq!(io_var(&engine, inst, "bubbled"), Some(Value::Int(3)));
+}
+
+#[test]
+fn set_variables_non_local_updates_the_defining_scope_not_root() {
+    // `SetVariables` with local=false for a name the target scope already defines
+    // updates THAT scope, not the root.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let inner_eik = engine.pending_jobs()[0].element_instance_key;
+    let sub_scope = *engine
+        .instance(inst)
+        .unwrap()
+        .scopes
+        .get(&inner_eik)
+        .unwrap();
+
+    // `scoped` is owned by the sub-process scope (from its input mapping).
+    engine
+        .apply_command(Command::set_variables_scoped(
+            sub_scope,
+            HashMap::from([("scoped".to_string(), Value::Int(42))]),
+            false,
+        ))
+        .unwrap();
+    assert_eq!(io_var(&engine, inst, "scoped"), None);
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .scope_variables
+            .get(&sub_scope)
+            .and_then(|m| m.get("scoped")),
+        Some(&Value::Int(42))
+    );
+}
+
 fn create_instance_key(engine: &mut Engine, proc_id: &str) -> Key {
     engine
         .apply_command(Command::create_instance(proc_id))
@@ -217,6 +592,90 @@ fn variable_spill_selects_only_job_parked_instances() {
     assert_eq!(
         engine.instance(key).unwrap().variables.get("k"),
         Some(&Value::Int(7))
+    );
+}
+
+#[test]
+fn spilling_a_nested_scope_instance_preserves_the_merged_job_view() {
+    // Regression (Part C spill): a variable spill sheds only the ROOT payload;
+    // the sub-process scope-local map stays resident. After the host rehydrates
+    // the root, `element_variables` must fold both back together so a job on the
+    // nested scope regains its full view (root `seed` + the sub-process-local
+    // `scoped`) — not the root-only payload read back from the spill store.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let eik = engine.pending_jobs()[0].element_instance_key;
+
+    // The full merged view before any spill: root + sub-process local.
+    let before = engine.element_variables(inst, eik);
+    assert_eq!(before.get("seed"), Some(&Value::Int(4)));
+    assert_eq!(before.get("scoped"), Some(&Value::Int(5)));
+
+    // Spill sheds only the root payload; the scope-local map stays resident.
+    let payload = engine.spill_variables(inst).expect("spillable");
+    assert!(engine.instance(inst).unwrap().variables.is_empty());
+    assert!(
+        !engine.instance(inst).unwrap().scope_variables.is_empty(),
+        "the sub-process scope-local map stays resident through a root spill"
+    );
+    // While spilled the root is gone, so a naive read is scope-only — exactly
+    // why the host rehydrates before it reads the worker's snapshot.
+    assert_eq!(engine.element_variables(inst, eik).get("seed"), None);
+
+    // Rehydrate the root; the merged view is whole again.
+    engine.rehydrate_variables(inst, payload);
+    let after = engine.element_variables(inst, eik);
+    assert_eq!(after.get("seed"), Some(&Value::Int(4)));
+    assert_eq!(after.get("scoped"), Some(&Value::Int(5)));
+}
+
+#[test]
+fn resident_variable_bytes_counts_scope_local_maps() {
+    // The resident-footprint gauge must include non-root scope-local maps, which
+    // stay resident through a variable spill. A nested-scope instance therefore
+    // reports MORE than the same root payload alone, and spilling the root leaves
+    // the scope-local bytes still attributed as resident.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    assert!(!engine.instance(inst).unwrap().scope_variables.is_empty());
+
+    let with_scope = engine.resident_variable_bytes();
+    assert!(with_scope > 0);
+
+    // After shedding the root, the scope-local bytes are still counted resident.
+    let _ = engine.spill_variables(inst).expect("spillable");
+    let scope_only = engine.resident_variable_bytes();
+    assert!(
+        scope_only > 0,
+        "scope-local maps stay resident and keep contributing bytes after a root spill"
+    );
+    assert!(
+        scope_only < with_scope,
+        "shedding the root payload reduces the resident footprint"
     );
 }
 
@@ -424,6 +883,49 @@ fn engine_snapshot_round_trips_state_and_key_generator() {
         "next minted key {k3} must not collide with a pre-snapshot key"
     );
     assert_ne!(k3, parked);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn engine_snapshot_round_trips_scope_variables_and_parents() {
+    // Part C snapshot compatibility: a nested-scope instance's scope tree
+    // (`scope_variables` + `scope_parents`) must survive a serialized snapshot
+    // round-trip so a node rebuilt from a snapshot serves the same merged view.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    let inst = engine
+        .apply_command(Command::create_instance_with("sub-scope", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let eik = engine.pending_jobs()[0].element_instance_key;
+    // The sub-process scope is populated (input mapping created `scoped`).
+    assert!(!engine.instance(inst).unwrap().scope_variables.is_empty());
+    assert!(!engine.instance(inst).unwrap().scope_parents.is_empty());
+    let merged_before = engine.element_variables(inst, eik);
+
+    let serialized = serde_json::to_vec(&engine.snapshot()).expect("serializes");
+    let decoded: EngineSnapshot = serde_json::from_slice(&serialized).expect("deserializes");
+    let restored = Engine::from_snapshot(decoded);
+
+    assert_eq!(
+        restored.state(),
+        engine.state(),
+        "restored state (scope tree included) equals the source byte-for-byte"
+    );
+    // The merged scoped view is reproduced exactly on the restored engine.
+    assert_eq!(restored.element_variables(inst, eik), merged_before);
+    assert_eq!(
+        restored.element_variables(inst, eik).get("scoped"),
+        Some(&Value::Int(5))
+    );
 }
 
 #[test]
@@ -4805,6 +5307,7 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
         .apply_command(Command::SetVariables {
             scope_key: a,
             variables: v2,
+            local: false,
         })
         .unwrap();
     let _ = engine.spill_variables(a); // a is now spilled
@@ -4879,8 +5382,12 @@ fn input_mapping_merges_before_job_activation() {
         .iter()
         .find_map(|e| e.instance_key())
         .unwrap();
-    assert_eq!(io_var(&engine, inst, "y"), Some(Value::Int(2)));
-    // The activated job snapshots the mapped variable.
+    assert_eq!(
+        io_var(&engine, inst, "y"),
+        None,
+        "an input mapping creates a variable LOCAL to the activity scope, not at the instance root"
+    );
+    // The activated job still sees the mapped variable (its own scope shadows root).
     let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
     assert_eq!(job.variables.get("y"), Some(&Value::Int(2)));
 }
@@ -4973,11 +5480,61 @@ fn input_mapping_with_dotted_target_builds_nested_context() {
     let mut expected = std::collections::BTreeMap::new();
     expected.insert("id".to_string(), Value::Str("A1".to_string()));
     expected.insert("total".to_string(), Value::Int(12));
-    assert_eq!(io_var(&engine, inst, "order"), Some(Value::Map(expected)));
+    // The dotted input mapping builds its nested context LOCAL to the activity
+    // scope, seeded from the enclosing `order`, so the activated job sees the
+    // merged value while the root `order` keeps only its original members.
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(job.variables.get("order"), Some(&Value::Map(expected)));
+    let mut root_order = std::collections::BTreeMap::new();
+    root_order.insert("id".to_string(), Value::Str("A1".to_string()));
+    assert_eq!(io_var(&engine, inst, "order"), Some(Value::Map(root_order)));
+}
+
+#[test]
+fn input_mapped_local_variable_is_not_visible_to_a_later_activity() {
+    // `y = x + 1` is an input mapping on task `t`. Input mappings are LOCAL to the
+    // activity scope (Zeebe semantics), so `y` is dropped when `t` completes and
+    // is never visible at the root scope nor to the downstream task `u`'s job.
+    let def = ProcessBuilder::new("io-local")
+        .start_event("s")
+        .service_task("t", "work-t")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=x + 1".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .service_task("u", "work-u")
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "u")
+        .connect("u", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("x".to_string(), Value::Int(1));
+    let inst = engine
+        .apply_command(Command::create_instance_with("io-local", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    // `t`'s job sees the local `y`; complete it.
+    let job_t = engine.activate_jobs("work-t", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(job_t)).unwrap();
+    // `u` activates; its job must NOT see `y` (it was local to `t`).
+    let job_u = &engine.activate_jobs("work-u", "w", 1, 60_000, 0)[0];
+    assert_eq!(job_u.variables.get("y"), None);
+    assert_eq!(io_var(&engine, inst, "y"), None);
 }
 
 // --- FEEL timer expressions -------------------------------------------------
-
 #[test]
 fn feel_duration_timer_evaluates_variable() {
     // A timer intermediate catch whose timeDuration is a FEEL expression
@@ -5644,5 +6201,709 @@ fn empty_input_collection_completes_the_multi_instance_body_immediately() {
     assert_eq!(
         engine.instance(key).unwrap().variables.get("results"),
         Some(&Value::List(vec![]))
+    );
+}
+
+#[test]
+fn multi_instance_children_hold_their_bindings_in_real_child_scopes() {
+    // Part C: each parallel child is now a real variable scope (parented to the
+    // MI body), holding its `loopCounter`/`inputElement` locally — never leaked
+    // to the root instance variables.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Jobs still see their per-child bindings...
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3);
+    for job in &jobs {
+        assert!(job.variables.get("item").is_some());
+        assert!(job.variables.get("loopCounter").is_some());
+    }
+
+    // ...but the root scope never received them: the bindings live in dedicated
+    // child scopes parented to the multi-instance body.
+    let instance = engine.instance(key).unwrap();
+    assert!(instance.variables.get("item").is_none());
+    assert!(instance.variables.get("loopCounter").is_none());
+    let body_key = *instance
+        .multi_instances
+        .keys()
+        .next()
+        .expect("an active multi-instance body");
+    let children: Vec<Key> = instance
+        .scope_parents
+        .iter()
+        .filter(|&(_, &parent)| parent == body_key)
+        .map(|(&child, _)| child)
+        .collect();
+    assert_eq!(children.len(), 3, "one real scope per child");
+    for child in children {
+        let locals = instance
+            .scope_variables
+            .get(&child)
+            .expect("child scope carries local bindings");
+        assert!(locals.contains_key("item"));
+        assert!(locals.contains_key("loopCounter"));
+    }
+}
+
+#[test]
+fn set_variables_local_on_a_multi_instance_child_stays_in_its_scope() {
+    // A `local` SetVariables targeting a running MI child scope writes only that
+    // child's scope, invisible to the root and to sibling children.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine.activate_jobs("handle", "w", 10, 60_000, 0);
+
+    let instance = engine.instance(key).unwrap();
+    let body_key = *instance.multi_instances.keys().next().unwrap();
+    let mut children: Vec<Key> = instance
+        .scope_parents
+        .iter()
+        .filter(|&(_, &parent)| parent == body_key)
+        .map(|(&child, _)| child)
+        .collect();
+    children.sort();
+    let target = children[0];
+    let sibling = children[1];
+
+    engine
+        .apply_command(Command::set_variables_scoped(
+            target,
+            vars(&[("note", Value::Str("child-only".into()))]),
+            true,
+        ))
+        .unwrap();
+
+    let instance = engine.instance(key).unwrap();
+    assert_eq!(
+        instance.scope_variables.get(&target).unwrap().get("note"),
+        Some(&Value::Str("child-only".into())),
+        "written into the target child scope"
+    );
+    assert!(
+        instance.variables.get("note").is_none(),
+        "not propagated to the root"
+    );
+    assert!(
+        instance
+            .scope_variables
+            .get(&sibling)
+            .map(|m| !m.contains_key("note"))
+            .unwrap_or(true),
+        "not visible to the sibling child"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hierarchical variable scoping — machinery (Part C phase 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn job_type_expression_resolves_against_the_enclosing_sub_process_scope() {
+    // A service task inside a sub-process resolves its `=FEEL` job type against
+    // the sub-process's local variables (an input mapping), not just the root —
+    // if scoping leaked, `region` would be unresolved and the type would fall
+    // back to the literal expression text.
+    let model = ProcessBuilder::new("scoped-jt")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=\"north\"".to_string(),
+                    target: "region".to_string(),
+                }],
+                outputs: vec![],
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "=\"worker-\" + region")
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(model)).unwrap();
+    create_instance_key(&mut engine, "scoped-jt");
+
+    // The inner job was created with the scope-resolved type.
+    let jobs = engine.activate_jobs("worker-north", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "job type resolved against the sub-process scope"
+    );
+    // And is NOT sitting under the literal fallback type.
+    assert!(engine
+        .activate_jobs("=\"worker-\" + region", "w", 10, 60_000, 0)
+        .is_empty());
+}
+
+#[test]
+fn multi_instance_child_job_type_resolves_against_the_child_scope() {
+    // A multi-instance child resolves its `=FEEL` job type against its own scope
+    // (the bound `inputElement`), so each child lands on a per-item worker type.
+    let model = ProcessBuilder::new("mi-jt")
+        .start_event("start")
+        .service_task("each", "=\"handle-\" + item")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(model)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-jt",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            )]),
+        ))
+        .unwrap();
+
+    // Each child job carries its own item-derived type.
+    assert_eq!(
+        engine.activate_jobs("handle-a", "w", 10, 60_000, 0).len(),
+        1
+    );
+    assert_eq!(
+        engine.activate_jobs("handle-b", "w", 10, 60_000, 0).len(),
+        1
+    );
+    // No child fell back to the literal expression text.
+    assert!(engine
+        .activate_jobs("=\"handle-\" + item", "w", 10, 60_000, 0)
+        .is_empty());
+}
+
+/// Applies a raw event straight to the engine's state (test-only shortcut for
+/// exercising the scope appliers/helpers without a driving command).
+fn apply_raw(engine: &mut Engine, event: Event) {
+    crate::state::apply(&mut engine.state, &event);
+}
+
+#[test]
+fn scoped_variable_resolution_walks_child_scope_to_root() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1)), ("b", Value::Int(2))]),
+        },
+    );
+    let child: Key = 900_001;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("b", Value::Int(20)), ("c", Value::Int(3))]),
+        },
+    );
+
+    let inst = engine.state.instances.get(&key).unwrap();
+    // The root scope sees only its own variables.
+    let root_view = engine.visible_variables(inst, key);
+    assert_eq!(root_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(root_view.get("b"), Some(&Value::Int(2)));
+    assert_eq!(root_view.get("c"), None);
+    // The child scope shadows `b`, adds local `c`, and inherits `a` from root.
+    let child_view = engine.visible_variables(inst, child);
+    assert_eq!(child_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(child_view.get("b"), Some(&Value::Int(20)));
+    assert_eq!(child_view.get("c"), Some(&Value::Int(3)));
+}
+
+#[test]
+fn variable_propagation_updates_nearest_defining_scope_else_root() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1))]),
+        },
+    );
+    let child: Key = 900_002;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("b", Value::Int(2))]),
+        },
+    );
+
+    // Non-local merge into the child: `a` is defined only at root -> root; `b`
+    // is defined locally -> child; `c` is new anywhere -> created at root.
+    let writes = engine.propagate_variables(
+        key,
+        child,
+        vars(&[
+            ("a", Value::Int(9)),
+            ("b", Value::Int(9)),
+            ("c", Value::Int(9)),
+        ]),
+        false,
+    );
+    let mut by_scope: std::collections::HashMap<Key, Vec<String>> =
+        std::collections::HashMap::new();
+    for (scope, map) in writes {
+        by_scope
+            .entry(scope)
+            .or_default()
+            .extend(map.keys().cloned());
+    }
+    for names in by_scope.values_mut() {
+        names.sort();
+    }
+    assert_eq!(
+        by_scope.get(&key),
+        Some(&vec!["a".to_string(), "c".to_string()])
+    );
+    assert_eq!(by_scope.get(&child), Some(&vec!["b".to_string()]));
+}
+
+#[test]
+fn local_variable_write_stays_in_the_target_scope() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1))]),
+        },
+    );
+    let child: Key = 900_003;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+
+    // A local write pins every value to the child scope even though `a` is
+    // defined at root (Zeebe `local=true` / input-mapping semantics).
+    let writes = engine.propagate_variables(key, child, vars(&[("a", Value::Int(9))]), true);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, child);
+    assert!(writes[0].1.contains_key("a"));
+}
+
+#[test]
+fn destroying_a_scope_drops_its_local_variables() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    let child: Key = 900_004;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("c", Value::Int(3))]),
+        },
+    );
+    assert!(engine
+        .state
+        .instances
+        .get(&key)
+        .unwrap()
+        .scope_variables
+        .contains_key(&child));
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeDestroyed {
+            instance_key: key,
+            scope_key: child,
+        },
+    );
+    let inst = engine.state.instances.get(&key).unwrap();
+    assert!(!inst.scope_variables.contains_key(&child));
+    assert!(!inst.scope_parents.contains_key(&child));
+}
+
+// ---------------------------------------------------------------------------
+// Zeebe variable-scope parity matrix (Part C phase: tests)
+//
+// Rounds out the ported Zeebe scope semantics beyond the single-level cases
+// above: deep (3-level) nesting with mid-level shadowing, parallel sibling
+// isolation, and local-write shadowing over an inherited root variable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deep_nesting_resolves_each_level_through_its_nearest_shadow_to_root() {
+    // root:   a=1, b=2, c=3
+    // middle: shadows b=20, adds d=40   (parent = root)
+    // leaf:   shadows c=300, adds e=500 (parent = middle)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[
+                ("a", Value::Int(1)),
+                ("b", Value::Int(2)),
+                ("c", Value::Int(3)),
+            ]),
+        },
+    );
+    let middle: Key = 910_001;
+    let leaf: Key = 910_002;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: middle,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: leaf,
+            parent_scope_key: middle,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: middle,
+            variables: vars(&[("b", Value::Int(20)), ("d", Value::Int(40))]),
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: leaf,
+            variables: vars(&[("c", Value::Int(300)), ("e", Value::Int(500))]),
+        },
+    );
+
+    let inst = engine.state.instances.get(&key).unwrap();
+
+    // The leaf sees: a from root, b from the middle shadow, c from its own
+    // shadow, d inherited from middle, e local.
+    let leaf_view = engine.visible_variables(inst, leaf);
+    assert_eq!(leaf_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(leaf_view.get("b"), Some(&Value::Int(20)));
+    assert_eq!(leaf_view.get("c"), Some(&Value::Int(300)));
+    assert_eq!(leaf_view.get("d"), Some(&Value::Int(40)));
+    assert_eq!(leaf_view.get("e"), Some(&Value::Int(500)));
+
+    // The middle sees its own shadow of b, root's c (NOT the leaf's), and never
+    // the leaf-local e.
+    let middle_view = engine.visible_variables(inst, middle);
+    assert_eq!(middle_view.get("b"), Some(&Value::Int(20)));
+    assert_eq!(middle_view.get("c"), Some(&Value::Int(3)));
+    assert_eq!(middle_view.get("e"), None);
+
+    // The root is untouched by any descendant shadow.
+    let root_view = engine.visible_variables(inst, key);
+    assert_eq!(root_view.get("b"), Some(&Value::Int(2)));
+    assert_eq!(root_view.get("c"), Some(&Value::Int(3)));
+    assert_eq!(root_view.get("d"), None);
+}
+
+#[test]
+fn parallel_sibling_scopes_are_isolated() {
+    // Two sibling scopes under the same root each shadow root `x` with a
+    // different value and add a private local. Neither sees the other's
+    // binding; the root is unchanged.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("x", Value::Int(1))]),
+        },
+    );
+    let left: Key = 920_001;
+    let right: Key = 920_002;
+    for sib in [left, right] {
+        apply_raw(
+            &mut engine,
+            Event::VariableScopeCreated {
+                instance_key: key,
+                scope_key: sib,
+                parent_scope_key: key,
+            },
+        );
+    }
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: left,
+            variables: vars(&[("x", Value::Int(10)), ("only_left", Value::Int(7))]),
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: right,
+            variables: vars(&[("x", Value::Int(20)), ("only_right", Value::Int(9))]),
+        },
+    );
+
+    let inst = engine.state.instances.get(&key).unwrap();
+    let left_view = engine.visible_variables(inst, left);
+    let right_view = engine.visible_variables(inst, right);
+
+    assert_eq!(left_view.get("x"), Some(&Value::Int(10)));
+    assert_eq!(left_view.get("only_left"), Some(&Value::Int(7)));
+    assert_eq!(
+        left_view.get("only_right"),
+        None,
+        "left cannot see the sibling's local"
+    );
+
+    assert_eq!(right_view.get("x"), Some(&Value::Int(20)));
+    assert_eq!(right_view.get("only_right"), Some(&Value::Int(9)));
+    assert_eq!(
+        right_view.get("only_left"),
+        None,
+        "right cannot see the sibling's local"
+    );
+
+    // Root's `x` is unchanged by either sibling's shadow.
+    assert_eq!(
+        engine.visible_variables(inst, key).get("x"),
+        Some(&Value::Int(1))
+    );
+}
+
+#[test]
+fn local_write_shadows_an_inherited_root_variable_until_the_scope_is_destroyed() {
+    // Zeebe input-mapping / `local=true` semantics: a local write of a name that
+    // exists only at root creates a child-scope SHADOW, leaving the root value
+    // intact; destroying the scope resurfaces the root value.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("x", Value::Int(1))]),
+        },
+    );
+    let child: Key = 930_001;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+
+    // local=true pins the write to the child scope even though `x` is a root var.
+    let writes = engine.propagate_variables(key, child, vars(&[("x", Value::Int(99))]), true);
+    assert_eq!(writes.len(), 1);
+    assert_eq!(writes[0].0, child);
+    for event in engine.propagated_updates(key, child, vars(&[("x", Value::Int(99))]), true) {
+        apply_raw(&mut engine, event);
+    }
+
+    let inst = engine.state.instances.get(&key).unwrap();
+    // Child shadows x=99; root still reads x=1.
+    assert_eq!(
+        engine.visible_variables(inst, child).get("x"),
+        Some(&Value::Int(99))
+    );
+    assert_eq!(
+        engine.visible_variables(inst, key).get("x"),
+        Some(&Value::Int(1))
+    );
+
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeDestroyed {
+            instance_key: key,
+            scope_key: child,
+        },
+    );
+    // The shadow is gone; the child key now resolves to root and reads x=1.
+    let inst = engine.state.instances.get(&key).unwrap();
+    assert_eq!(
+        engine.visible_variables(inst, key).get("x"),
+        Some(&Value::Int(1))
+    );
+    assert!(!inst.scope_variables.contains_key(&child));
+}
+
+// ---------------------------------------------------------------------------
+// Perf guard (Part C phase: perf)
+//
+// The scoping model must keep the common case — a flat, root-only instance —
+// free. `element_variables` (the activation-path variable resolver) must return
+// the instance's *shared* root `Arc` by pointer for a root-only instance: no
+// clone, no merge, no allocation, byte-identical to the pre-scoping engine. A
+// nested-scope instance instead allocates a freshly merged view. Pinning the
+// pointer identity is a non-flaky structural guard against a future change
+// accidentally putting an allocation on the hot flat-activation path.
+// ---------------------------------------------------------------------------
+#[test]
+fn flat_instance_activation_returns_the_shared_root_arc_without_copying() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let key = create_instance_key(&mut engine, "order");
+    apply_raw(
+        &mut engine,
+        Event::VariablesUpdated {
+            instance_key: key,
+            variables: vars(&[("a", Value::Int(1)), ("b", Value::Int(2))]),
+        },
+    );
+
+    let root_arc = Arc::clone(&engine.state.instances.get(&key).unwrap().variables);
+
+    // Flat instance: the element view is the very same allocation (zero-copy).
+    let flat_view = engine.element_variables(key, key);
+    assert!(
+        Arc::ptr_eq(&flat_view, &root_arc),
+        "flat activation must reuse the shared root Arc, not allocate a merged copy",
+    );
+
+    // Add a nested scope with a local shadow: the merged view is now a fresh
+    // allocation (correctly no longer pointer-equal to root).
+    let child: Key = 940_001;
+    apply_raw(
+        &mut engine,
+        Event::VariableScopeCreated {
+            instance_key: key,
+            scope_key: child,
+            parent_scope_key: key,
+        },
+    );
+    apply_raw(
+        &mut engine,
+        Event::ScopedVariablesUpdated {
+            instance_key: key,
+            scope_key: child,
+            variables: vars(&[("b", Value::Int(20))]),
+        },
+    );
+    let scoped_view = engine.element_variables(key, child);
+    assert!(
+        !Arc::ptr_eq(&scoped_view, &root_arc),
+        "a nested scope must produce a distinct merged view",
+    );
+    assert_eq!(scoped_view.get("a"), Some(&Value::Int(1)));
+    assert_eq!(scoped_view.get("b"), Some(&Value::Int(20)));
+
+    // The flat resolution for the root scope still returns the shared Arc even
+    // after a sibling scope exists — only elements *in* a scope pay the merge.
+    let still_flat = engine.element_variables(key, key);
+    assert!(
+        Arc::ptr_eq(&still_flat, &root_arc),
+        "root-scope activation stays zero-copy even when other scopes exist",
     );
 }
