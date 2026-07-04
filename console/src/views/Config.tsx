@@ -197,13 +197,14 @@ function SlaPedal({ sla }: { sla: SlaModeConfig }) {
           >
             {/* knurled ring */}
             <div className="absolute inset-2 rounded-full border border-black/40" />
-            {/* pointer that rotates with the value */}
+            {/* pointer that rotates with the value — the wrapper fills the
+                knob (inset-0) so it pivots around the knob's exact centre */}
             <div
-              className="absolute left-1/2 top-1/2 h-12 w-12 -translate-x-1/2 -translate-y-1/2 transition-transform duration-300"
-              style={{ transform: `translate(-50%,-50%) rotate(${angle}deg)` }}
+              className="absolute inset-0 transition-transform duration-300"
+              style={{ transform: `rotate(${angle}deg)`, transformOrigin: "50% 50%" }}
             >
               <div
-                className="absolute left-1/2 top-0 h-4 w-1 -translate-x-1/2 rounded-full"
+                className="absolute left-1/2 top-2 h-4 w-1 -translate-x-1/2 rounded-full"
                 style={{
                   background: idx === 0 ? "#f59e0b" : "#22d3ee",
                   boxShadow: `0 0 6px ${idx === 0 ? "#f59e0b" : "#22d3ee"}`,

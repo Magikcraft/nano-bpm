@@ -122,7 +122,7 @@ export default function Credits() {
               <p className="text-base italic leading-relaxed text-zinc-200">
                 He aha te mea nui o te ao?
                 <br />
-                He tangata, he tangata, he tangata
+                He tāngata, he tāngata, he tāngata
               </p>
               <p className="mx-auto mt-5 max-w-lg text-sm leading-relaxed text-zinc-400">
                 What is the most precious thing in the world?
