@@ -6129,6 +6129,107 @@ fn set_variables_local_on_a_multi_instance_child_stays_in_its_scope() {
 // Hierarchical variable scoping — machinery (Part C phase 1)
 // ---------------------------------------------------------------------------
 
+#[test]
+fn job_type_expression_resolves_against_the_enclosing_sub_process_scope() {
+    // A service task inside a sub-process resolves its `=FEEL` job type against
+    // the sub-process's local variables (an input mapping), not just the root —
+    // if scoping leaked, `region` would be unresolved and the type would fall
+    // back to the literal expression text.
+    let model = ProcessBuilder::new("scoped-jt")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=\"north\"".to_string(),
+                    target: "region".to_string(),
+                }],
+                outputs: vec![],
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "=\"worker-\" + region")
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(model)).unwrap();
+    create_instance_key(&mut engine, "scoped-jt");
+
+    // The inner job was created with the scope-resolved type.
+    let jobs = engine.activate_jobs("worker-north", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "job type resolved against the sub-process scope"
+    );
+    // And is NOT sitting under the literal fallback type.
+    assert!(engine
+        .activate_jobs("=\"worker-\" + region", "w", 10, 60_000, 0)
+        .is_empty());
+}
+
+#[test]
+fn multi_instance_child_job_type_resolves_against_the_child_scope() {
+    // A multi-instance child resolves its `=FEEL` job type against its own scope
+    // (the bound `inputElement`), so each child lands on a per-item worker type.
+    let model = ProcessBuilder::new("mi-jt")
+        .start_event("start")
+        .service_task("each", "=\"handle-\" + item")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(model)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-jt",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            )]),
+        ))
+        .unwrap();
+
+    // Each child job carries its own item-derived type.
+    assert_eq!(
+        engine.activate_jobs("handle-a", "w", 10, 60_000, 0).len(),
+        1
+    );
+    assert_eq!(
+        engine.activate_jobs("handle-b", "w", 10, 60_000, 0).len(),
+        1
+    );
+    // No child fell back to the literal expression text.
+    assert!(engine
+        .activate_jobs("=\"handle-\" + item", "w", 10, 60_000, 0)
+        .is_empty());
+}
+
 /// Applies a raw event straight to the engine's state (test-only shortcut for
 /// exercising the scope appliers/helpers without a driving command).
 fn apply_raw(engine: &mut Engine, event: Event) {

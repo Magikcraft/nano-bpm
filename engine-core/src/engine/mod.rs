@@ -519,7 +519,7 @@ impl Engine {
                     // Per Zeebe, a start-event name expression is evaluated at
                     // deploy time against an empty context; a static name passes
                     // through unchanged.
-                    let message_name = self.resolve_event_name(None, &message_name);
+                    let message_name = self.resolve_event_name(&HashMap::new(), &message_name);
                     self.emit(
                         log,
                         Event::MessageStartSubscriptionCreated {
@@ -540,7 +540,7 @@ impl Engine {
                     // parsed interval. For a cycle the resolved interval is
                     // persisted so re-arming recurs on the same delay.
                     let (due_at, interval_millis) = self.resolve_timer(
-                        None,
+                        &HashMap::new(),
                         start_timer_def.as_ref(),
                         self.now,
                         interval_millis,
@@ -966,8 +966,10 @@ impl Engine {
                                 // a static cycle keeps its parsed interval.
                                 let timer_def =
                                     self.timer_def_of(instance_key, &boundary_element_id);
+                                let rearm_vars =
+                                    self.variables_for_element(instance_key, element_instance_key);
                                 let (next_due_at, _) = self.resolve_timer(
-                                    Some(instance_key),
+                                    &rearm_vars,
                                     timer_def.as_ref(),
                                     due_at,
                                     duration_millis,
@@ -2347,14 +2349,23 @@ impl Engine {
             }
         }
 
+        // The scoped variable view the activating element evaluates its own FEEL
+        // attributes against (job type, retries, priority, timer/message/signal
+        // name, correlation key, user-task fields). It is the element's flow
+        // scope — a root-scope element gets the shared root Arc (a cheap refcount
+        // bump), so evaluation is byte-identical to the flat engine; an element
+        // inside a sub-process or multi-instance body additionally sees its
+        // enclosing scope's locals (Zeebe parity).
+        let element_vars = self.variables_for_element(instance_key, scope);
+
         match kind {
             // A service task creates a job and parks the token.
             Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(instance_key, &job_type);
-                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let job_type = self.resolve_job_type(&element_vars, &job_type);
+                let priority = self.resolve_priority(&element_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    instance_key,
+                    &element_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 events.push(Event::JobCreated {
@@ -2371,29 +2382,30 @@ impl Engine {
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
+                    scope,
                     &element_id,
                 ));
             }
             // A user task creates a user task record and parks the token; a
             // CompleteUserTask releases it. The assignment/scheduling/priority
             // expressions declared on the element are resolved against the
-            // instance variables at creation time.
+            // element's scoped view at creation time.
             Some(ElementKind::UserTask(props)) => {
                 let user_task_key = self.mint_key();
                 let assignee = self
-                    .resolve_user_task_string(instance_key, props.assignee.as_deref())
+                    .resolve_user_task_string(&element_vars, props.assignee.as_deref())
                     .filter(|s| !s.is_empty());
                 let candidate_groups =
-                    self.resolve_user_task_list(instance_key, props.candidate_groups.as_deref());
+                    self.resolve_user_task_list(&element_vars, props.candidate_groups.as_deref());
                 let candidate_users =
-                    self.resolve_user_task_list(instance_key, props.candidate_users.as_deref());
+                    self.resolve_user_task_list(&element_vars, props.candidate_users.as_deref());
                 let due_date = self
-                    .resolve_user_task_string(instance_key, props.due_date.as_deref())
+                    .resolve_user_task_string(&element_vars, props.due_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let follow_up_date = self
-                    .resolve_user_task_string(instance_key, props.follow_up_date.as_deref())
+                    .resolve_user_task_string(&element_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
-                let priority = self.resolve_priority(instance_key, props.priority.as_deref());
+                let priority = self.resolve_priority(&element_vars, props.priority.as_deref());
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
@@ -2410,6 +2422,7 @@ impl Engine {
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
+                    scope,
                     &element_id,
                 ));
             }
@@ -2419,7 +2432,7 @@ impl Engine {
                 let timer_key = self.mint_key();
                 let timer_def = self.timer_def_of(instance_key, &element_id);
                 let (due_at, _) = self.resolve_timer(
-                    Some(instance_key),
+                    &element_vars,
                     timer_def.as_ref(),
                     self.now,
                     duration_millis,
@@ -2442,9 +2455,9 @@ impl Engine {
                 let subscription_key = self.mint_key();
                 // The message name may be a FEEL expression evaluated on
                 // activation against the instance variables (Zeebe parity).
-                let message_name = self.resolve_event_name(Some(instance_key), &message_name);
+                let message_name = self.resolve_event_name(&element_vars, &message_name);
                 let correlation_value =
-                    self.resolve_correlation_value(instance_key, &correlation_key);
+                    self.resolve_correlation_value(&element_vars, &correlation_key);
                 let kind = state::MessageSubscriptionKind::IntermediateCatch;
                 // Zeebe-style placement: the canonical subscription lives on the
                 // partition owning `hash(correlation_key)`. When that is this
@@ -2480,7 +2493,7 @@ impl Engine {
                 let subscription_key = self.mint_key();
                 // The signal name may be a FEEL expression evaluated on
                 // activation against the instance variables (Zeebe parity).
-                let signal_name = self.resolve_event_name(Some(instance_key), &signal_name);
+                let signal_name = self.resolve_event_name(&element_vars, &signal_name);
                 events.push(Event::SignalSubscriptionCreated {
                     subscription_key,
                     instance_key,
@@ -2531,6 +2544,7 @@ impl Engine {
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
+                    scope,
                     &element_id,
                 ));
                 followups.push(Step::Activate {
@@ -2696,6 +2710,14 @@ impl Engine {
         }
         locals.insert("loopCounter".to_string(), Value::Int((index as i64) + 1));
 
+        // The scoped view this child evaluates its own FEEL attributes (job type,
+        // retries, priority) against: the multi-instance body's scope (already
+        // applied) overlaid with the child's own `inputElement`/`loopCounter`
+        // bindings (not yet applied — carried in `locals`). So a child job type
+        // like `="worker-" + loopCounter` resolves correctly.
+        let mut child_vars = (*self.variables_for_element(instance_key, body_key)).clone();
+        child_vars.extend(locals.clone());
+
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -2720,10 +2742,10 @@ impl Engine {
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(instance_key, &job_type);
-                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let job_type = self.resolve_job_type(&child_vars, &job_type);
+                let priority = self.resolve_priority(&child_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    instance_key,
+                    &child_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 events.push(Event::JobCreated {
@@ -3155,10 +3177,14 @@ impl Engine {
         match self.element_kind(instance_key, &element_id) {
             Some(ElementKind::ServiceTask { job_type, priority }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(instance_key, &job_type);
-                let priority = self.resolve_priority(instance_key, priority.as_deref());
+                // The element instance is already active (this is an incident
+                // retry), so resolve its FEEL attributes against its own applied
+                // scope view (input mappings + ancestors).
+                let job_vars = self.variables_for_element(instance_key, element_instance_key);
+                let job_type = self.resolve_job_type(&job_vars, &job_type);
+                let priority = self.resolve_priority(&job_vars, priority.as_deref());
                 let retries = self.resolve_retries(
-                    instance_key,
+                    &job_vars,
                     self.retries_of(instance_key, &element_id).as_deref(),
                 );
                 (

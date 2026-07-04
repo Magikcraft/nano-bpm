@@ -11,54 +11,50 @@ impl Engine {
     /// REST default `correlationKey` of `""`).
     pub(crate) fn resolve_correlation_value(
         &self,
-        instance_key: Key,
+        vars: &HashMap<String, Value>,
         correlation_key: &str,
     ) -> String {
         if correlation_key.is_empty() {
             return String::new();
         }
-        let vars = self.variables(instance_key);
-        crate::feel::eval_string(correlation_key, &vars).unwrap_or_default()
+        crate::feel::eval_string(correlation_key, vars).unwrap_or_default()
     }
 
     /// Resolves a message or signal event `name` at subscription-open time.
     ///
     /// A static value (`"order canceled"`) is returned verbatim. A FEEL
     /// expression (a leading `=`, e.g. `="order " + awaitingAction`) is
-    /// evaluated to a string against the instance variables, falling back to the
-    /// literal text when it cannot be evaluated (parse error, unresolved
-    /// variable, non-string result) — matching the error-tolerant behaviour of
-    /// the other `resolve_*` helpers, which have no incident path.
+    /// evaluated to a string against `vars` (the scoped view the subscribing
+    /// element sees), falling back to the literal text when it cannot be
+    /// evaluated (parse error, unresolved variable, non-string result) — matching
+    /// the error-tolerant behaviour of the other `resolve_*` helpers, which have
+    /// no incident path.
     ///
-    /// `instance_key` is `None` for a message-start-event name, which Zeebe
-    /// evaluates at deploy time against an empty context; the catch/boundary
-    /// cases pass `Some(instance_key)` so the name is evaluated on activation.
-    pub(crate) fn resolve_event_name(&self, instance_key: Option<Key>, raw: &str) -> String {
+    /// A message-start-event name is evaluated by Zeebe at deploy time against an
+    /// empty context, so its caller passes an empty `vars`; the catch/boundary
+    /// cases pass the activating element's scoped view.
+    pub(crate) fn resolve_event_name(&self, vars: &HashMap<String, Value>, raw: &str) -> String {
         let trimmed = raw.trim();
         if !trimmed.starts_with('=') {
             return raw.to_string();
         }
-        let empty = HashMap::new();
-        let vars = instance_key.map(|k| self.variables(k));
-        let ctx: &HashMap<String, Value> = vars.as_deref().unwrap_or(&empty);
-        crate::feel::eval_string(trimmed, ctx).unwrap_or_else(|_| raw.to_string())
+        crate::feel::eval_string(trimmed, vars).unwrap_or_else(|_| raw.to_string())
     }
 
     /// Resolves a job's initial retry count from the `zeebe:taskDefinition`
     /// `retries` expression declared on the element. A literal integer (`"5"`)
     /// is used directly; a FEEL expression (leading `=`, e.g. `=maxRetries`) is
-    /// evaluated to a number against the instance variables. `None` (no
-    /// declaration) or an unresolvable expression defaults to
+    /// evaluated to a number against `vars` (the element's scoped view). `None`
+    /// (no declaration) or an unresolvable expression defaults to
     /// [`crate::state::DEFAULT_JOB_RETRIES`]. The result is floored at 0.
-    pub(crate) fn resolve_retries(&self, instance_key: Key, raw: Option<&str>) -> i32 {
+    pub(crate) fn resolve_retries(&self, vars: &HashMap<String, Value>, raw: Option<&str>) -> i32 {
         let default = crate::state::DEFAULT_JOB_RETRIES;
         let Some(raw) = raw else {
             return default;
         };
         let trimmed = raw.trim();
         let value = if let Some(expr) = trimmed.strip_prefix('=') {
-            let vars = self.variables(instance_key);
-            match crate::feel::eval(expr, &vars) {
+            match crate::feel::eval(expr, vars) {
                 Ok(Value::Int(i)) => i as i32,
                 Ok(Value::Double(d)) => d as i32,
                 _ => return default,
@@ -325,23 +321,22 @@ impl Engine {
     /// [`crate::feel`], expecting a string-like result. An expression that fails
     /// to evaluate (parse error, unresolved variable, non-string result) falls
     /// back to the literal text — nano does not raise an incident here.
-    pub(crate) fn resolve_job_type(&self, instance_key: Key, job_type: &str) -> String {
+    pub(crate) fn resolve_job_type(&self, vars: &HashMap<String, Value>, job_type: &str) -> String {
         let trimmed = job_type.trim();
         if !trimmed.starts_with('=') {
             return job_type.to_string();
         }
-        let vars = self.variables(instance_key);
-        crate::feel::eval_string(trimmed, &vars).unwrap_or_else(|_| job_type.to_string())
+        crate::feel::eval_string(trimmed, vars).unwrap_or_else(|_| job_type.to_string())
     }
 
     /// Resolves a user-task string attribute (assignee, due/follow-up date)
     /// declared on the BPMN element. A literal is returned verbatim; a FEEL
-    /// expression (leading `=`) is evaluated against the instance variables,
-    /// falling back to the literal text when it cannot be evaluated. `None` (the
-    /// attribute was not declared) resolves to `None`.
+    /// expression (leading `=`) is evaluated against `vars` (the element's scoped
+    /// view), falling back to the literal text when it cannot be evaluated.
+    /// `None` (the attribute was not declared) resolves to `None`.
     pub(crate) fn resolve_user_task_string(
         &self,
-        instance_key: Key,
+        vars: &HashMap<String, Value>,
         raw: Option<&str>,
     ) -> Option<String> {
         let raw = raw?;
@@ -349,18 +344,17 @@ impl Engine {
         if !trimmed.starts_with('=') {
             return Some(raw.to_string());
         }
-        let vars = self.variables(instance_key);
-        Some(crate::feel::eval_string(trimmed, &vars).unwrap_or_else(|_| raw.to_string()))
+        Some(crate::feel::eval_string(trimmed, vars).unwrap_or_else(|_| raw.to_string()))
     }
 
     /// Resolves a user-task candidate list (groups or users). A literal is a
     /// comma-separated list. A FEEL expression (leading `=`) is evaluated against
-    /// the instance variables; a list result yields its string items, a string
-    /// result is split on commas, anything else (or a failure) yields an empty
-    /// list. `None` resolves to an empty list.
+    /// `vars` (the element's scoped view); a list result yields its string items,
+    /// a string result is split on commas, anything else (or a failure) yields an
+    /// empty list. `None` resolves to an empty list.
     pub(crate) fn resolve_user_task_list(
         &self,
-        instance_key: Key,
+        vars: &HashMap<String, Value>,
         raw: Option<&str>,
     ) -> Vec<String> {
         let Some(raw) = raw else {
@@ -377,8 +371,7 @@ impl Engine {
         if !trimmed.starts_with('=') {
             return split(raw);
         }
-        let vars = self.variables(instance_key);
-        match crate::feel::eval(trimmed, &vars) {
+        match crate::feel::eval(trimmed, vars) {
             Ok(Value::List(items)) => items
                 .into_iter()
                 .filter_map(|v| match v {
@@ -396,19 +389,18 @@ impl Engine {
     /// Resolves a user-task priority expression. A literal integer or a FEEL
     /// expression yielding a number is clamped to `0..=100`; anything
     /// unresolvable (or absent) defaults to `50`.
-    /// Resolves a raw priority expression (literal or `=FEEL`) against the
-    /// instance variables to a `0..=100` value, defaulting to 50 when absent or
-    /// unresolvable. Shared by user-task scheduling priority and service-task job
-    /// (activation) priority.
-    pub(crate) fn resolve_priority(&self, instance_key: Key, raw: Option<&str>) -> i32 {
+    /// Resolves a raw priority expression (literal or `=FEEL`) against `vars`
+    /// (the element's scoped view) to a `0..=100` value, defaulting to 50 when
+    /// absent or unresolvable. Shared by user-task scheduling priority and
+    /// service-task job (activation) priority.
+    pub(crate) fn resolve_priority(&self, vars: &HashMap<String, Value>, raw: Option<&str>) -> i32 {
         const DEFAULT_PRIORITY: i32 = 50;
         let Some(raw) = raw else {
             return DEFAULT_PRIORITY;
         };
         let trimmed = raw.trim();
         let value = if let Some(expr) = trimmed.strip_prefix('=') {
-            let vars = self.variables(instance_key);
-            match crate::feel::eval(expr, &vars) {
+            match crate::feel::eval(expr, vars) {
                 Ok(Value::Int(i)) => i as i32,
                 Ok(Value::Double(d)) => d as i32,
                 _ => return DEFAULT_PRIORITY,
@@ -429,12 +421,12 @@ impl Engine {
     ///
     /// Returns `(due_at, interval_millis)` where `due_at` is an absolute epoch
     /// time in the engine's millisecond clock and `interval_millis` is the delay
-    /// used to re-arm a repeating (cycle) timer (0 for an absolute date).
-    /// `instance_key` is `None` for a process-level start timer evaluated at
-    /// deploy against an empty context.
+    /// used to re-arm a repeating (cycle) timer (0 for an absolute date). `vars`
+    /// is the scoped view the timer's element sees (empty for a process-level
+    /// start timer evaluated at deploy against an empty context).
     pub(crate) fn resolve_timer(
         &self,
-        instance_key: Option<Key>,
+        vars: &HashMap<String, Value>,
         def: Option<&crate::model::TimerDef>,
         base_now: u64,
         fallback_millis: u64,
@@ -444,14 +436,11 @@ impl Engine {
             return default;
         };
 
-        // A `=`-prefixed expression is FEEL, evaluated against the instance
-        // variables (or an empty context at deploy); a bare value (only for a
-        // literal timeDate) is used directly.
+        // A `=`-prefixed expression is FEEL, evaluated against the scoped view (or
+        // an empty context at deploy); a bare value (only for a literal timeDate)
+        // is used directly.
         let evaluated: Option<String> = if def.expr.trim_start().starts_with('=') {
-            let empty = HashMap::new();
-            let vars = instance_key.map(|k| self.variables(k));
-            let ctx: &HashMap<String, Value> = vars.as_deref().unwrap_or(&empty);
-            crate::feel::eval_string(&def.expr, ctx).ok()
+            crate::feel::eval_string(&def.expr, vars).ok()
         } else {
             Some(def.expr.clone())
         };
