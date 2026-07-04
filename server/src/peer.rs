@@ -805,14 +805,8 @@ mod tests {
 
     #[test]
     fn ws_url_maps_scheme_and_appends_path() {
-        assert_eq!(
-            ws_url("http://10.0.0.2:8080"),
-            "ws://10.0.0.2:8080/falcon"
-        );
-        assert_eq!(
-            ws_url("http://10.0.0.2:8080/"),
-            "ws://10.0.0.2:8080/falcon"
-        );
+        assert_eq!(ws_url("http://10.0.0.2:8080"), "ws://10.0.0.2:8080/falcon");
+        assert_eq!(ws_url("http://10.0.0.2:8080/"), "ws://10.0.0.2:8080/falcon");
         assert_eq!(ws_url("https://node:443"), "wss://node:443/falcon");
         assert_eq!(ws_url("host:9000"), "ws://host:9000/falcon");
     }

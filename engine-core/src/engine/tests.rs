@@ -4610,7 +4610,10 @@ fn output_mapping_projects_job_result() {
                     && variables.get("approved") == Some(&Value::Bool(true))
         )
     });
-    assert!(mapped, "output mapping should set approved=true; events: {events:?}");
+    assert!(
+        mapped,
+        "output mapping should set approved=true; events: {events:?}"
+    );
 }
 
 #[test]

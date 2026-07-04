@@ -1278,7 +1278,8 @@ mod tests {
 
         let (key0, key1) = {
             let (writer, recovery) =
-                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None).expect("open multi");
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
             let seg = Arc::clone(&recovery.shared);
             assert!(recovery.fresh);
             let mut engines: std::collections::HashMap<u64, Engine> =
@@ -1366,7 +1367,8 @@ mod tests {
 
         let (pre0, post1) = {
             let (writer, recovery) =
-                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None).expect("open multi");
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
             let mut engines: std::collections::HashMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j0 = crate::journal::Journal::from_engine_shared(
@@ -1428,8 +1430,9 @@ mod tests {
     /// AFTER the checkpoint (which merges onto the store's base on replay).
     #[test]
     fn lean_snapshot_recovery_matches_full_replay() {
-        use nanobpmn_engine_core::Value;
         use std::collections::HashMap;
+
+        use nanobpmn_engine_core::Value;
 
         let dir = temp_dir("lean-roundtrip");
         let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
@@ -1550,8 +1553,9 @@ mod tests {
         let (inst1, inst2) = {
             // This node owns {1,2}; the shared segmented WAL spans a 3-partition
             // cluster.
-            let (writer, recovery) = crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3, None)
-                .expect("open clustered");
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[1, 2], 3, None)
+                    .expect("open clustered");
             let mut engines: std::collections::HashMap<u64, Engine> =
                 recovery.engines.into_iter().collect();
             let mut j1 = crate::journal::Journal::from_engine_shared(

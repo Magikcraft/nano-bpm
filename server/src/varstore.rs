@@ -116,13 +116,17 @@ impl VarStore {
             Some(v) if v == SCHEMA_VERSION => {}
             Some(_) => {
                 // Incompatible format: discard and recreate empty.
-                conn.execute_batch(
-                    "DELETE FROM vars; DELETE FROM position; DELETE FROM schema;",
+                conn.execute_batch("DELETE FROM vars; DELETE FROM position; DELETE FROM schema;")?;
+                conn.execute(
+                    "INSERT INTO schema (version) VALUES (?1)",
+                    params![SCHEMA_VERSION],
                 )?;
-                conn.execute("INSERT INTO schema (version) VALUES (?1)", params![SCHEMA_VERSION])?;
             }
             None => {
-                conn.execute("INSERT INTO schema (version) VALUES (?1)", params![SCHEMA_VERSION])?;
+                conn.execute(
+                    "INSERT INTO schema (version) VALUES (?1)",
+                    params![SCHEMA_VERSION],
+                )?;
             }
         }
         Ok(Self {
@@ -146,7 +150,8 @@ impl VarStore {
         let mut conn = self.conn.lock().expect("var store poisoned");
         let tx = conn.transaction()?;
         {
-            let mut put = tx.prepare_cached("INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)")?;
+            let mut put =
+                tx.prepare_cached("INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)")?;
             for (key, vars) in upserts {
                 let json = serde_json::to_string(vars).expect("variables serialize to JSON");
                 put.execute(params![*key as i64, json])?;
@@ -286,14 +291,18 @@ mod tests {
         let store = VarStore::open(None).unwrap();
         let a = vars("alpha");
         let b = vars("beta");
-        store
-            .checkpoint(0, 10, &[(1, &a), (2, &b)], &[])
-            .unwrap();
+        store.checkpoint(0, 10, &[(1, &a), (2, &b)], &[]).unwrap();
 
         let all = store.load_all();
         assert_eq!(all.len(), 2);
-        assert_eq!(all.get(&1).and_then(|m| m.get("data")), Some(&Value::Str("alpha".into())));
-        assert_eq!(all.get(&2).and_then(|m| m.get("data")), Some(&Value::Str("beta".into())));
+        assert_eq!(
+            all.get(&1).and_then(|m| m.get("data")),
+            Some(&Value::Str("alpha".into()))
+        );
+        assert_eq!(
+            all.get(&2).and_then(|m| m.get("data")),
+            Some(&Value::Str("beta".into()))
+        );
         assert_eq!(store.position(0), 10);
     }
 
@@ -305,9 +314,14 @@ mod tests {
         // Replace 7's map, add 8, forget a not-yet-present key (no-op).
         let v2 = vars("two");
         let v8 = vars("eight");
-        store.checkpoint(0, 2, &[(7, &v2), (8, &v8)], &[99]).unwrap();
+        store
+            .checkpoint(0, 2, &[(7, &v2), (8, &v8)], &[99])
+            .unwrap();
         let all = store.load_all();
-        assert_eq!(all.get(&7).and_then(|m| m.get("data")), Some(&Value::Str("two".into())));
+        assert_eq!(
+            all.get(&7).and_then(|m| m.get("data")),
+            Some(&Value::Str("two".into()))
+        );
         assert_eq!(all.len(), 2);
         // Forget 7 in a later checkpoint.
         store.checkpoint(0, 3, &[], &[7]).unwrap();
@@ -346,7 +360,10 @@ mod tests {
         // Reopen: rows and position must survive (authoritative, not wiped).
         let store = VarStore::open(Some(&path)).unwrap();
         let all = store.load_all();
-        assert_eq!(all.get(&3).and_then(|m| m.get("data")), Some(&Value::Str("durable".into())));
+        assert_eq!(
+            all.get(&3).and_then(|m| m.get("data")),
+            Some(&Value::Str("durable".into()))
+        );
         assert_eq!(store.position(0), 42);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -366,17 +383,24 @@ mod tests {
         // Write enough distinct instances to grow the WAL past its initial size.
         for i in 0..500i64 {
             let v = vars(&format!("payload-{i}"));
-            store.checkpoint(0, i as u64, &[(i as Key, &v)], &[]).unwrap();
+            store
+                .checkpoint(0, i as u64, &[(i as Key, &v)], &[])
+                .unwrap();
         }
         let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
         assert!(before > 0, "WAL should have grown from the writes");
 
-        store.checkpoint_wal().expect("truncating checkpoint succeeds");
+        store
+            .checkpoint_wal()
+            .expect("truncating checkpoint succeeds");
 
         // TRUNCATE resets the -wal file to zero length; contents survive (they were
         // flushed into the main db file).
         let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
-        assert!(after < before, "WAL should shrink after TRUNCATE: {before} -> {after}");
+        assert!(
+            after < before,
+            "WAL should shrink after TRUNCATE: {before} -> {after}"
+        );
         assert_eq!(store.len(), 500, "all rows survive the checkpoint");
         assert_eq!(
             store.get(499).and_then(|m| m.get("data").cloned()),

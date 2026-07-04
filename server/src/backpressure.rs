@@ -163,8 +163,12 @@ pub fn parse_sla_mode(raw: Option<&str>) -> SlaMode {
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "latency" | "preserve-latency" | "time-to-complete" | "complete" => SlaMode::Latency,
-        "admission" | "preserve-admission" | "accept-latency" | "start-every-process"
-        | "start" | "throughput" => SlaMode::Admission,
+        "admission"
+        | "preserve-admission"
+        | "accept-latency"
+        | "start-every-process"
+        | "start"
+        | "throughput" => SlaMode::Admission,
         _ => SlaMode::Latency,
     }
 }
@@ -437,7 +441,13 @@ mod tests {
     #[test]
     fn sla_mode_defaults_to_latency() {
         assert_eq!(parse_sla_mode(None), SlaMode::Latency);
-        for raw in ["latency", "preserve-latency", "time-to-complete", " Latency ", ""] {
+        for raw in [
+            "latency",
+            "preserve-latency",
+            "time-to-complete",
+            " Latency ",
+            "",
+        ] {
             assert_eq!(parse_sla_mode(Some(raw)), SlaMode::Latency, "{raw:?}");
         }
     }
@@ -486,7 +496,10 @@ mod tests {
     #[test]
     fn sla_mode_from_u8_fails_safe_to_latency() {
         assert_eq!(SlaMode::from_u8(SlaMode::Latency as u8), SlaMode::Latency);
-        assert_eq!(SlaMode::from_u8(SlaMode::Admission as u8), SlaMode::Admission);
+        assert_eq!(
+            SlaMode::from_u8(SlaMode::Admission as u8),
+            SlaMode::Admission
+        );
         // Any unexpected byte never silently drops latency protection.
         assert_eq!(SlaMode::from_u8(200), SlaMode::Latency);
     }

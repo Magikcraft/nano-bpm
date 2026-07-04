@@ -463,7 +463,10 @@ pub fn set_ceiling_active(ceiling: &str, active: bool, previously_active: bool) 
         .with_label_values(&[ceiling])
         .set(i64::from(active));
     if active && !previously_active {
-        METRICS.ceiling_hits_total.with_label_values(&[ceiling]).inc();
+        METRICS
+            .ceiling_hits_total
+            .with_label_values(&[ceiling])
+            .inc();
     }
 }
 
@@ -634,20 +637,12 @@ mod tests {
         set_job_type_provisioning("test-served-type", 7, 3);
         set_job_type_provisioning("test-idle-type", 0, 2);
         let out = gather();
-        assert!(out.contains(
-            "nanobpm_job_type_starved{job_type=\"test-starved-type\"} 1"
-        ));
-        assert!(out.contains(
-            "nanobpm_job_type_activatable{job_type=\"test-starved-type\"} 7"
-        ));
+        assert!(out.contains("nanobpm_job_type_starved{job_type=\"test-starved-type\"} 1"));
+        assert!(out.contains("nanobpm_job_type_activatable{job_type=\"test-starved-type\"} 7"));
         // Workers present -> not starved even with a backlog.
-        assert!(out.contains(
-            "nanobpm_job_type_starved{job_type=\"test-served-type\"} 0"
-        ));
+        assert!(out.contains("nanobpm_job_type_starved{job_type=\"test-served-type\"} 0"));
         // No waiting jobs -> not starved even with idle workers.
-        assert!(out.contains(
-            "nanobpm_job_type_starved{job_type=\"test-idle-type\"} 0"
-        ));
+        assert!(out.contains("nanobpm_job_type_starved{job_type=\"test-idle-type\"} 0"));
     }
 
     #[test]
