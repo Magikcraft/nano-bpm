@@ -759,11 +759,51 @@ convergences.
 
 ## 11. Observability as the meter
 
-> DRAFTING NOTE — the compressor/limiter's gain‑reduction meter, realized: ceiling
-> "LED" metrics (`nanobpm_ceiling_active{ceiling=throughput|memory}` +
-> `..._hits_total`) and worker‑provisioning/starvation hints
-> (`nanobpm_job_type_{activatable,workers,starved}`), published ~1 Hz off the hot
-> path. The operator's feedback that the processor is working. (ADR 0013.)
+A rack compressor/limiter has a light on its face: the gain-reduction meter, which
+glows when the unit is actually clamping the signal. It is not decoration — it is
+how the engineer *sees* the processor working, so they know the sound is being
+shaped rather than merely passing through. §5 argued that Nano's behaviour at the
+ceiling *is* a compressor/limiter; §11 completes the instrument by giving it that
+meter. Observability here is not a generic dashboard bolted on afterward; it is the
+face-plate of the specific machine the paper describes.
+
+**The ceiling LED.** When the engine reaches the edge of its envelope — the point
+where the §5 switch actually engages — it lights up, legibly, in Prometheus.
+`nanobpm_ceiling_active{ceiling="throughput"|"memory"}` reads 1 while the system is
+pinned against that ceiling (the "gain-reduction is happening now" light), and
+`nanobpm_ceiling_hits_total{ceiling=…}` counts the *rising edges* — how often the
+envelope was reached at all. Together they answer the two questions an operator of
+a self-protecting system actually has: *is it clamping right now, and how often does
+it?* Crucially, this makes the engine's self-protection **visible rather than
+silent**. Without it, an operator sees only symptoms — latency climbing
+(`admission` mode) or a trickle of `503`s (`latency` mode) — and must infer the
+cause. With it, the engine states plainly, "I am at my throughput ceiling and the
+switch you set is doing what you asked." A system that makes its own decisions owes
+the operator a light that shows it.
+
+**The worker-provisioning meter.** The other thing an operator needs to know is not
+about the engine at all, but about *them*: are there enough workers to drain the
+work the engine is admitting? Three per-job-type gauges surface this directly —
+`nanobpm_job_type_activatable` (jobs ready to be worked), `nanobpm_job_type_workers`
+(workers currently subscribed to that type), and `nanobpm_job_type_starved`, which
+lights when a backlog exists but the workers to clear it do not. This is
+deliberately a *hint*, because it is the one thing the self-optimizing engine
+**cannot** do for you: it can place, shed, compress, and reclaim on its own, but it
+cannot conjure a worker process for a job type you have under-provisioned. So,
+faithful to the design philosophy of §3 — *if we can tell you how and when, why not
+just do it?* — where the engine cannot act, it does the next best thing and *tells
+you precisely where to act*, per job type, rather than leaving you to correlate
+queue depth against a fleet of pollers by hand.
+
+Both meters, together with the allocator decomposition of §8
+(`nanobpm_jemalloc_bytes{kind=…}`, the honest footprint), are published on the
+~1 Hz monitor tick, **off the hot path** — the act of measuring must never perturb
+the thing measured, least of all on an engine whose whole argument is about what it
+does under load (ADR 0013). The meter is thus also the visible boundary of the
+system's self-optimization: everything the engine can derive and act on, it does
+silently; the small residue it cannot — the one business decision of §5, and the
+worker provisioning only you control — it renders legible on the face-plate instead
+of hiding.
 
 ---
 
