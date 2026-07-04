@@ -584,7 +584,8 @@ a new class of question.
 
 If §6 is the control system, §9 is the machinery it runs on: how work is delivered
 over the wire, where a job's lease lives, how far durability is allowed to bend,
-and how a cluster of *unequal* nodes behaves when parts of it fill up. In each case
+how a cluster of *unequal* nodes behaves when parts of it fill up, and what it
+would take to reconfigure that cluster while it runs. In each case
 the old paradigm made a sound, conservative choice; Nano, working under the
 drop-in constraint of §4, keeps the client-facing contract and revisits the choice
 underneath it.
@@ -813,6 +814,78 @@ are unequal — is the one the new environments (local LLMs, laptops,
 counterfactual-replay fleets) actually present. Heterogeneity stops being a failure
 mode to engineer away and becomes an operating assumption the control loop is built
 to exploit.
+
+### 9.5 Runtime reconfiguration and scaling
+
+One capability the old paradigm has and Nano does not yet expose is **online
+cluster scaling**. It is worth stating plainly — both to credit it and to be honest
+about where Nano stands — because it is a real, deliberately-built Zeebe feature,
+not an oversight.
+
+Zeebe scales a live cluster through its dynamic-config subsystem, driven by a
+management endpoint (`/actuator/cluster`, a Spring Boot Actuator endpoint). It can
+**add and remove brokers**, **add partitions**, move individual partition replicas
+(join/leave with a leadership priority), change the replication factor, and
+force-remove unreachable brokers for disaster recovery. Every operation runs while
+the cluster stays online, is previewable in **dry-run**, and is orchestrated as a
+tracked, cancelable sequence of change *appliers* by a
+`ConfigurationChangeCoordinator`; partitions are redistributed by an explicit
+`RoundRobinPartitionDistributor` (or a zone-aware variant) whose output is stored
+in the cluster configuration. The constraints are equally explicit: **partition
+count can only increase**, backups are disallowed during partition scaling, and
+redistribution moves real data, so there is a temporary performance cost. It is
+also, by design, *imperative and operator-driven* — you issue a scale request
+ahead of anticipated load — rather than automatic.
+
+Nano today makes the opposite trade, and it falls directly out of §9.4's placement
+design. Its topology is **static for the process lifetime**: the peer set
+(`NANOBPMN_NODES`), node id, partition count, and replication factor are read once
+at boot (`cluster.rs::Topology::from_env`), and partition ownership is a **pure
+deterministic function of cluster size** — `owner_of(p) = p % num_nodes`, replicas
+the `RF` consecutive nodes after it — computed identically on every node with *no
+stored assignment and no coordination*. That statelessness is a genuine virtue: it
+is part of why the footprint is small and why nodes agree on placement with no
+distributor to gossip or persist. But it is exactly what makes node scaling hard:
+change `num_nodes` and the modulo remaps almost every partition at once — the
+classic reshuffle that an explicit, versioned assignment map (Zeebe's approach)
+exists precisely to avoid.
+
+So the feasibility is uneven, and instructively so:
+
+- **The consensus layer is already there.** Each partition is an
+  [openraft](https://github.com/databendlabs/openraft) group, and Nano already
+  performs runtime membership changes on it — a promoting leader `add_learner`s a
+  recovering node during failover (`raft.rs`, `main.rs`). Growing or shrinking a
+  partition's replica set online is a primitive Nano *already exercises*, not one it
+  lacks.
+- **Adding partitions is the tractable direction**, and for the same reason it is
+  in Zeebe: it is additive. New partition ids can be bootstrapped (a fresh journal
+  + read model) and new instances routed to them, leaving existing partitions and
+  their in-flight keys untouched. This would inherit Zeebe's honest
+  **scale-up-only** shape, plus routing-state versioning so producers learn the new
+  partition space.
+- **Adding or removing nodes is the real work**, and it is *placement*, not
+  consensus. Nano would have to replace the implicit `p % num_nodes` mapping with
+  either an explicit, versioned partition-assignment map plus a change-coordinator
+  that sequences learner-add → catch-up → leader transfer → old-replica-leave →
+  state handoff (rebuilding, in miniature, the coordinator Zeebe already has), or a
+  membership-stable placement function (rendezvous / consistent hashing) that moves
+  only the `~1/n` share a correct rebalance requires. Either way it trades away some
+  of the zero-coordination simplicity that keeps the current design small.
+
+There is a thesis-level observation that reframes the need, though. Much of what
+elastic node-scaling is *for* — a fleet whose load has drifted uneven — Nano
+already answers **continuously and without any rebalancing event**: §9.4's control
+loop senses per-node load and steers new creates toward the node most able to
+absorb them, and a saturated node sheds rather than queues. That is a *soft*,
+always-on elasticity over fixed membership, where Zeebe's is a *hard*, occasional
+membership change. And Nano's other defining property — instances cheap enough to
+run by the dozen (§8.3) — points at a second scaling axis that suits it better than
+heavyweight partition migration: scale by *instantiating more*, not by rebalancing
+one large cluster. Hard online membership change is feasible, and the consensus
+primitive is already in hand; whether it earns its complexity — given how much of
+its purpose the control loop and cheap instantiation already serve — is a genuine
+open design question rather than a missing checkbox.
 
 ---
 
