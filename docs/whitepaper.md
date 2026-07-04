@@ -59,6 +59,18 @@ the opposite — it preserves the Camunda 8 contract exactly, so the revolution
 happens entirely behind an API the ecosystem already speaks. It is a paradigm
 shift you can deploy as a drop‑in.
 
+And it is usable **today**, not only as a thesis. The most immediate use is the
+most modest one: a local development replacement for a full Camunda 8 deployment.
+A developer who wants Camunda 8 on their workstation today reaches for `c8run`,
+Camunda's own single‑distribution way to run the stack locally; they do it to get
+the *API* to build and test against. Nano offers that same drop‑in API from one
+small binary that idles at a few megabytes and returns its memory to the OS when
+quiet (§8), for as long as the subset of Camunda 8 it currently implements covers
+what a given project exercises. The claim is deliberately bounded and honest — not
+*every* C8 feature, but the contract you actually use in local development — and
+that supported subset is expanding continuously. The paradigm argument that
+follows is the long game; running your dev cluster on it is available now.
+
 > DRAFTING NOTE — the "faster horse" line (attributed to Ford) is almost
 > certainly apocryphal; use it as illustration, not as cited history. The point
 > stands regardless: no customer running on the JVM would have *requested* a
