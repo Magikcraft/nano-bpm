@@ -1,12 +1,28 @@
-# ADR 0005 — Embedded μ-nano (self-contained application binaries)
+# ADR 0005 — Bernd (the embedded Nano engine)
 
-Status: **Proposed — design/exploration only. No code changed by this document.**
-Date: 2026-06-28.
+Status: **Revised — 2026-07-05.** Original: Proposed 2026-06-28, Deno-only.
+This revision generalizes the embedded engine to a multi-language artifact (Deno, Java/GraalVM, and any future host that can load a wasm cdylib) and establishes the transactional-semantics + developer-experience positions that were left open in Rev 1.
 Relates to: `docs/sdk-nano-decorator-design.md` (the runtime decorator), `docs/falcon-design.md`,
 `engine-core/src/ffi.rs` (C-ABI surface), `engine-wasm/src/lib.rs` (μ-nano / `TestEngine`),
 `clients/node-stream/` (`@nanobpmn/sdk` streaming layer), `server/src/console/worker_sdk.ts`
-(Deno `defineWorker`), `processos/src/supervisor.rs` (spawn-an-engine model), the unified
-browser RAD-environment direction.
+(Deno `defineWorker`), `processos/src/supervisor.rs` (spawn-an-engine model), `dist/engine-wasm-ffi/`
+(the universal wasm artifact published from `make engine-wasm-ffi-dist`),
+jwulf/nano-bpm#10 (Maven + npm packaging), jwulf/camunda-client-java-falcon#1 (`NanoTransport.embedded()`).
+
+## Signature — why "Bernd"
+
+The embedded engine feature is named **Bernd**, after Bernd Ruecker (co-founder of Camunda, long-time evangelist of the Saga / compensation pattern, and the person whose talks and books established the intellectual framing that "you don't need shared transactions; you need workflows that reason about failure honestly").
+
+Nano's embedded engine sits directly on that inheritance. It could have offered C7-style shared-transaction semantics — many developers would have asked for it — but chose not to, because the pattern Bernd taught turns out to work at every scale, and building the illusion again would have been an act of forgetting. So we sign the work.
+
+Naming conventions that follow:
+
+- Java runtime library: `io.github.jwulf:nano-bernd` (Maven Central)
+- Java runtime class: `Bernd` (`Bernd.builder().clock(...).build()`)
+- npm cross-runtime package: `@nanobpm/nano-bernd` (a thin ergonomic wrapper) and `@nanobpm/nano-engine-ffi` (the raw wasm + host, unopinionated)
+- Docs / marketing surface: "Bernd — Nano's embedded engine"
+- ADR references: `Bernd` (capitalized proper noun) for the feature, `μ-nano` for the wasm blob when the engine-vs-wrapper distinction matters
+- Not: `bernd()` (lowercase in the transport API) — the transport is `NanoTransport.embedded(Bernd)` because *the feature is Bernd, the transport is embedded*. Bernd is a runtime that the SDK's embedded transport binds to.
 
 ## Context
 
@@ -19,15 +35,21 @@ The end-state we want to enable is a **single application source** that can be:
 1. **Lift-and-shifted on disk** and run against a stock **Camunda 8** engine;
 2. The same source run against a **remote Nano** engine (auto-upgrading to the Falcon protocol);
 3. Cross-compiled into a **self-contained native binary** that runs against Camunda or remote Nano;
-4. With one button — **"Embed Nano"** — cross-compiled into a self-contained native binary with
-   **micro-nano embedded**: a single-node engine used *only by the application itself*, needing no
+4. With one button — **"Embed Bernd"** — cross-compiled into a self-contained native binary with
+   **Bernd embedded**: a single-node engine used *only by the application itself*, needing no
    external Nano server.
+
+Since Rev 1 the *host* set has broadened: Bernd is not Deno-only. The **same** wasm cdylib (`engine-core --features ffi`, packaged as `dist/engine-wasm-ffi/nano_engine.wasm` by `make engine-wasm-ffi-dist`) is loaded by:
+
+- **Deno / Node / browser** — via `@nanobpm/nano-engine-ffi` (plain `WebAssembly.instantiate`, no wasm-bindgen).
+- **JVM / GraalVM Native Image** — via `io.github.jwulf:nano-bernd` (Chicory, pure Java, AOT-compiles into a static native binary with the wasm baked in).
+- **Future**: Python (wasmtime-py), Go (wazero), .NET (Wasmtime.NET) — same wasm, same C-ABI.
+
+The wasm carries **zero imports** and a small `nbpmn_*` C-ABI (see `engine-core/src/ffi.rs`), so every host implements the same coarse surface without host-language-specific glue.
 
 The driving question this ADR answers:
 
-> **Can we deliver all four modes without maintaining a separate SDK — letting users write
-> against the entire `@camunda8/orchestration-cluster-api` surface and choose the deployment
-> mode at compile time?**
+> **Can we deliver all four modes across all these host languages without maintaining a separate SDK per host, and without silently changing semantics between remote and embedded — letting users write against the SDK surface and choose the deployment mode by configuration?**
 
 ### What already exists (the load-bearing facts)
 
@@ -42,6 +64,10 @@ The driving question this ADR answers:
 - **`engine-wasm` (μ-nano)** is a `wasm-bindgen` wrapper (~568 KB release) exposing `TestEngine`.
   Today it is a **modeler simulator** (virtual clock, no persistence, no dispatch loop), but it is
   already `wasm32`-clean and Deno can load it directly via `WebAssembly.instantiate`.
+- **The FFI wasm is now a first-class distributable.** `make engine-wasm-ffi-dist` emits
+  `dist/engine-wasm-ffi/nano_engine.wasm` (wasm-opt -Oz, ~780 KiB) + a `manifest.json` (ABI version,
+  engine version, sha256, exports). This is the artifact `nano-bernd` (Java) and `@nanobpm/nano-engine-ffi`
+  (JS) both consume. **The single wasm binary is the single source of engine truth across every host.**
 - **The SDK story is already a single surface.** `docs/sdk-nano-decorator-design.md` establishes
   that users write against the generated `@camunda8/orchestration-cluster-api` SDKs, and
   Nano-awareness lives **entirely in the hand-written runtime seam** (survives regeneration, no
@@ -59,7 +85,7 @@ The driving question this ADR answers:
 - **Today's "embed" is spawn-a-process.** `processos/src/supervisor.rs` starts the Nano gateway
   binary as a child and talks to it over REST — the exact indirection the embedded mode removes.
 
-## Decision (proposed)
+## Decision
 
 **Yes — one SDK surface, deployment mode chosen at build/embed time, no separate SDK.**
 
@@ -79,7 +105,7 @@ one transport chokepoint. Embedded mode adds a transport implementation, not an 
 | --- | --- | --- | --- |
 | Camunda | REST (stock SDK) | runtime: `/v2/topology` has no `nano` | external Camunda |
 | Nano (remote) | Falcon WS | runtime: `/v2/topology` advertises `nano` | external Nano gateway |
-| **Embedded** | **Falcon over loopback** | **compile time: "Embed Nano" build** | **in-process μ-nano.wasm** |
+| **Embedded** | **Falcon over loopback** | **compile time: "Embed Bernd" build** | **in-process μ-nano.wasm** |
 
 The single switch the decorator already keys on is the `/v2/topology` `nano` advertisement. The
 embedded host **answers `/v2/topology` with the same `nano` field** (engine `nanobpmn`, a loopback
@@ -87,7 +113,7 @@ embedded host **answers `/v2/topology` with the same `nano` field** (engine `nan
 remote Nano except by the address it was told to bind to. This is the crux: **embedded μ-nano is
 "a Nano gateway that happens to live in the same process,"** not a new client API.
 
-### Shape of the "Embed Nano" binary
+### Shape of the "Embed Bernd" binary
 
 ```
 ┌──────────────────  deno compile --target …  → single native binary  ──────────────────┐
@@ -120,12 +146,71 @@ strictly easier than embedding a native Rust binary or FFI'ing a per-platform `c
 **one artifact that runs anywhere Deno runs** — directly serving the "Deno cross-compiles native
 binaries" goal.
 
+For **JVM hosts**, `nano-bernd` (Chicory) loads the *same* wasm inside a plain JVM; for **GraalVM Native Image**, the wasm is registered as a resource, Chicory's AOT-compiled interpreter is reachable-from-main, and `native-image` produces a single static binary with no JVM required. So the "one wasm blob, every host" property extends the "Embed Bernd" story to Java microservices without duplicating engine code.
+
+## The embedded transactional model (position)
+
+Because Bernd runs in-process, the temptation is to expose C7-style ambient-transaction semantics: `implementation="java:MyBean"`, delegate methods executed inside the same JPA/JDBC transaction as the engine's state mutation, "if my business code throws, everything rolls back." This ADR **rejects that pattern**. The reasoning:
+
+1. **It only works embedded.** The same source running against remote Nano or Camunda cannot participate in the engine's transaction — the engine is over the network. Shipping shared-tx semantics silently changes what "the same application source in every mode" *means*: correctness depends on deployment topology, which is exactly the property the SDK-unification story sells against.
+2. **It re-imports the C7→C8 pain.** The migration cost of Camunda 7 → Camunda 8 was overwhelmingly the loss of ambient-tx semantics; developers who leaned on `JavaDelegate` had to redesign around Sagas and compensation. Reintroducing shared-tx in Bernd would let developers write code that *cannot be lifted-and-shifted*, undoing the C8 lesson we're building on.
+3. **`completeJob(jobKey)` is already idempotent at the engine layer.** `jobKey` IS the idempotency key: an activated job can be completed exactly once. Business-logic idempotency belongs in the business domain using natural keys (order id, payment id, …) — the engine cannot help with that regardless of where it runs.
+4. **Outbox is defeated by lock-timeout reactivation.** A worker that writes to its DB inside a "business + outbox row" transaction and then completes the job over the SDK still races the engine: if the complete is delayed and the job lock expires, the engine reactivates the same job and hands it to another worker; the outbox row is now for a job that no longer exists. Outbox is a useful pattern, but not one Bernd should elevate to a first-class primitive — it is defensive plumbing for a specific class of side-effects, not a general answer.
+
+The position, in one line: **Bernd is a transport for Nano, not a semantics change to Nano.** Same worker code, function-call transport instead of network — nothing more.
+
+Implications for the API surface:
+
+- Worker handlers run *outside* the engine's write path. Even in-process, the engine applies the completion command atomically after the handler returns; the handler is a normal function call, not an interceptor inside a shared transaction.
+- There is no `implementation="java:BeanName"` element in Nano BPMN. Service tasks are always jobs. This is a hard non-goal.
+- There is no `implementation="expression"` short-circuit that evaluates a script inside the engine. Same reason.
+- There is no ambient `EntityManager` / `Connection` / `TransactionSynchronization` propagated into worker handlers by Bernd. Users who want their worker + DB update in one tx should own that transaction inside the handler and rely on idempotency to survive re-delivery — the same discipline they'd use against remote Nano.
+
+## Developer experience: the ergonomics that matter
+
+Rejecting shared-tx does not mean rejecting ergonomics. In-process affords a **much shorter feedback loop, deterministic testing, and complete state visibility** — that is where Bernd's DX story lives. The following ergonomics are in scope for the SDK/runtime layer (they preserve the "same code remote or embedded" invariant because remote SDKs already have equivalents, or the ergonomic is a *local addition* that no-ops on remote):
+
+1. **Auto complete/fail wrapping in the worker framework.** A handler that returns normally completes the job; a handler that throws fails it with a structured error and the appropriate retry classification. Users only write business logic; the SDK owns the acknowledgement. Same on remote and embedded.
+2. **`createInstance(...).awaitCompletion(Duration)`**. First-class API that returns instance outputs when the instance finishes (embedded: direct in-process await; remote: the Falcon `awaitInstance` frame). Same signature, same code.
+3. **`runWorkflow(bpmnPath, vars)` scripting shortcut.** For scripts, tests and CLIs: deploy → start → await result → return, with resource cleanup. Sugar over (2) and `deployResourcesFromFiles`.
+4. **Structured worker exceptions.** `BpmnError(code, message)` triggers BPMN error boundary events; `Unrecoverable` fails the job with zero retries; other exceptions retry with the default policy. Handlers become declarative about failure semantics without ever calling `job.fail(...)`.
+5. **Deterministic test mode (Bernd-only, but semantically portable).** `Bernd.builder().testClock(Clock.fixed(...)).manualTick().build()` produces a Bernd whose timer/dispatch loop only runs on `.step()`. Combined with in-memory persistence, this gives synchronous, replayable, breakpoint-friendly BPMN tests. Remote-Nano equivalent: the modeler simulator (already exists in `engine-wasm`) covers the design-time case; the runtime test mode is a Bernd affordance.
+6. **Engine state query API (Bernd-only).** `bernd.state.instances[key]`, `bernd.state.jobs(pending=true)`, `bernd.state.incidents()`, `bernd.state.timers()`. Direct reads of the single-writer snapshot — no REST round-trip, no eventual consistency, no lag against the engine's actual state. This is Bernd's answer to "the read model" for local dashboards, tests, and Cockpit-in-a-box.
+7. **Job lifecycle tracer (dev-mode Bernd).** Every state transition emitted as a structured log with instance + element + timing; opt-in via `.trace(true)` or an env var. Turns "why did my process hang" into a scan-the-trace exercise instead of a code-reading exercise.
+8. **App-level completion queue (opt-in).** A bounded queue between the dispatch loop and the worker handlers, with metrics (depth, wait time, drops). This is **not** a durability boundary — a job with an outstanding lock will be reactivated if not completed in time regardless of queue state — but it is a valuable backpressure and observability primitive. Users who want it, get it; users who don't, don't pay for it.
+
+The non-ergonomics Bernd deliberately does not ship:
+
+- **No `Idempotency-Key` request header parameter.** `jobKey` already fills that role at the engine layer.
+- **No outbox helper as a first-class API.** See "position" §4. If users want the pattern they can build it, but the SDK does not sanction it — because it does not survive lock-timeout reactivation, and sanctioning it would mislead.
+- **No `JavaDelegate` / `implementation="java:..."` shortcut.** See "position" §2.
+- **No shared JDBC/JPA transaction.** See "position" §1.
+- **No XA / 2PC.** Same reason, and 2PC has its own well-known failure modes.
+
+## The distributed monolith: front-loaded mental model
+
+Bernd users need to internalize one truth on day one, not on day thirty when the first race hits: **an application with an embedded engine is a distributed system, whether the engine lives in the same process or not.** The worker handler is *decoupled* from the engine's commit — the engine may reactivate the same job on a lock timeout while the handler is still running, and the handler will race the second activation to completion. This is exactly the property that makes Bernd portable to remote Nano; it is also exactly the property that surprises developers coming from C7's ambient-transaction world.
+
+The SDK, docs, IDE and template README all lead with this. Not in an FAQ. Not in an "advanced" chapter. First page. The distributed-monolith framing is not a warning; it is the design.
+
+## Multi-language embedded (the shape today)
+
+| Host | Package | Wasm loader | Cross-compile story |
+| --- | --- | --- | --- |
+| Deno / Node / browser | `@nanobpm/nano-engine-ffi` (raw), `@nanobpm/nano-bernd` (ergonomic) | `WebAssembly.instantiate` | `deno compile --target …` |
+| JVM | `io.github.jwulf:nano-bernd` | Chicory (pure Java) | plain `java -jar` fat-jar |
+| GraalVM Native Image | `io.github.jwulf:nano-bernd` | Chicory (AOT-compiled by GraalVM) | `native-image` → single static binary, wasm embedded as a resource |
+| Future (Python) | `nano_bernd` | wasmtime-py | PyInstaller / native binary |
+| Future (Go) | `github.com/jwulf/nano-bernd-go` | wazero (pure Go) | `go build` static binary |
+
+Each host implements the same **operation-seam contract** (§B.2/B.3): give the SDK an `EmbeddedEndpoint` that answers REST + Falcon (or direct calls, for the in-process realization). Every host uses the same `nbpmn_*` C-ABI, so adding a new host is bounded work: implement the endpoint, wire the transport switch, done. The engine itself is never re-implemented.
+
 ## Consequences
 
 ### What this buys us
 
 - **One SDK to maintain**: `@camunda8/orchestration-cluster-api` + the already-designed nano runtime
-  decorator. No `EmbeddedNanoClient`, no parallel worker class. The "Embed Nano" button is a *build
+  decorator. No `EmbeddedNanoClient`, no parallel worker class. The "Embed Bernd" button is a *build
   configuration*, not a code rewrite.
 - **True lift-and-shift**: identical application source across Camunda, remote Nano and embedded;
   the mode is a binding (env var / build flag), proven by the decorator's structural idempotency
@@ -163,6 +248,12 @@ binaries" goal.
 - Not a distributed/clustered embedded engine.
 - Not a replacement for the full gateway — embedded mode is the single-tenant, single-node deployment
   target of the *same* application.
+- **No shared JVM / JPA / JDBC transaction** between the worker handler and the engine's commit (see "position" §1).
+- **No `JavaDelegate` / `implementation="java:..."` / `implementation="expression"`** BPMN elements. Service tasks are always jobs, embedded or not (see "position" §2).
+- **No `Idempotency-Key` request header parameter** on `createProcessInstance` or job APIs. `jobKey` is the idempotency key at the engine layer; business idempotency belongs in the business domain (see "position" §3).
+- **No first-class outbox helper.** The pattern does not survive lock-timeout reactivation and sanctioning it would mislead (see "position" §4).
+- **No XA / 2PC.**
+- Not a *silent* semantics change between embedded and remote: any ergonomic that only exists embedded (state query, tracer, manual tick) must be scoped so that removing it and switching to remote still leaves the application correct.
 
 ## Options considered
 
@@ -184,7 +275,7 @@ binaries" goal.
 - **E2 — Runtime API surface**: extend the wasm exports for activate/complete/fail/correlate/query +
   the timer/dispatch tick; bridge them to the Falcon + REST-subset handlers.
 - **E3 — `deno compile` packaging**: embed μ-nano.wasm as an asset; verify `--target` cross-compiles;
-  wire the RAD-environment "Embed Nano" button to this build.
+  wire the RAD-environment "Embed Bernd" button to this build.
 - **E4 — Capability matrix**: enumerate which Camunda endpoints embedded mode supports; surface
   unsupported-endpoint diagnostics to the author at embed time.
 
@@ -205,7 +296,7 @@ shipped Falcon protocol; the client side rides the decorator design unchanged.
 - **Persistence format**: reuse the server journal format or a simpler host-owned log? The server's
   journal is cluster-oriented; embedded likely wants a minimal append-only event log.
 - **Author-time capability checks**: should the RAD environment statically flag use of
-  embedded-unsupported endpoints before the "Embed Nano" build, rather than failing at runtime?
+  embedded-unsupported endpoints before the "Embed Bernd" build, rather than failing at runtime?
 
 ## Appendix A — Embedded capability matrix
 
@@ -267,7 +358,7 @@ evaluation** (no decision-table engine yet) and the **query/search read model** 
 filterable/paginated search store). Everything identity/cluster/tenant is ⬛ by design.
 
 **Author-time contract.** The RAD environment should ship this matrix as a machine-readable
-capability manifest and, at "Embed Nano" build time, statically flag any app call into a 🔴/⬛
+capability manifest and, at "Embed Bernd" build time, statically flag any app call into a 🔴/⬛
 endpoint — failing the embed with a precise diagnostic rather than letting it fail at runtime. At
 runtime, embedded-unsupported endpoints return a structured `501 EMBEDDED_UNSUPPORTED` carrying the
 endpoint id, so the same error is observable in both places.
