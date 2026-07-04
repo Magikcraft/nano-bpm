@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api, fetchProcessXml } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import BpmnViewer from "../components/BpmnViewer";
+import { Badge, SectionLabel } from "../components/ui";
 
 export default function InstanceDetail({
   instanceKey,
@@ -24,9 +25,9 @@ export default function InstanceDetail({
     staleTime: Infinity,
   });
 
-  if (isLoading) return <p className="p-8 text-zinc-400">Loading…</p>;
+  if (isLoading) return <p className="p-8 text-fg-muted">Loading…</p>;
   if (error)
-    return <p className="p-8 text-red-400">Failed to load: {String(error)}</p>;
+    return <p className="p-8 text-danger">Failed to load: {String(error)}</p>;
   if (!data) return null;
 
   const { instance, variables, jobs, incidents } = data;
@@ -40,25 +41,21 @@ export default function InstanceDetail({
 
   return (
     <div className="flex h-full flex-col">
-      <header className="border-b border-zinc-800 px-8 py-4">
+      <header className="border-b border-edge px-8 py-4">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold">{instance.process_id}</h1>
-          <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs">
-            {instance.state}
-          </span>
-          {instance.has_incident && (
-            <span className="rounded bg-red-900/60 px-2 py-0.5 text-xs text-red-300">
-              Incident
-            </span>
-          )}
+          <h1 className="text-xl font-semibold text-fg">{instance.process_id}</h1>
+          <Badge tone="neutral">{instance.state}</Badge>
+          {instance.has_incident && <Badge tone="danger">Incident</Badge>}
         </div>
-        <div className="mt-1 font-mono text-xs text-zinc-500">
+        <div className="mt-1 font-mono text-xs text-fg-faint">
           instance {instance.key} · definition {instance.process_definition_key}{" "}
           · v{instance.version}
         </div>
       </header>
 
-      <div className="h-72 shrink-0 border-b border-zinc-800 bg-white">
+      {/* bg-white is intentional: the BPMN diagram canvas is a physical white
+          "sheet" regardless of theme. */}
+      <div className="h-72 shrink-0 border-b border-edge bg-white">
         <BpmnViewer
           xml={xml ?? null}
           activeElementIds={activeEls}
@@ -71,11 +68,11 @@ export default function InstanceDetail({
           <Section title="Incidents">
             <Table head={["Element", "Kind", "State", "Reason"]}>
               {incidents.map((i) => (
-                <tr key={i.key} className="border-b border-zinc-900">
+                <tr key={i.key} className="border-b border-edge">
                   <Td>{i.element_id}</Td>
                   <Td>{i.kind}</Td>
                   <Td>{i.state}</Td>
-                  <Td className="text-red-300">{i.reason}</Td>
+                  <Td className="text-danger">{i.reason}</Td>
                 </tr>
               ))}
             </Table>
@@ -88,10 +85,10 @@ export default function InstanceDetail({
           ) : (
             <Table head={["Name", "Value", "Scope"]}>
               {variables.map((v) => (
-                <tr key={`${v.scope_key}:${v.name}`} className="border-b border-zinc-900">
+                <tr key={`${v.scope_key}:${v.name}`} className="border-b border-edge">
                   <Td className="font-medium">{v.name}</Td>
-                  <Td className="font-mono text-zinc-300">{v.value}</Td>
-                  <Td className="font-mono text-zinc-500">{v.scope_key}</Td>
+                  <Td className="font-mono text-fg-muted">{v.value}</Td>
+                  <Td className="font-mono text-fg-faint">{v.scope_key}</Td>
                 </tr>
               ))}
             </Table>
@@ -104,12 +101,12 @@ export default function InstanceDetail({
           ) : (
             <Table head={["Element", "Type", "State", "Retries", "Worker"]}>
               {jobs.map((j) => (
-                <tr key={j.key} className="border-b border-zinc-900">
+                <tr key={j.key} className="border-b border-edge">
                   <Td>{j.element_id}</Td>
                   <Td className="font-mono">{j.job_type}</Td>
                   <Td>{j.state}</Td>
                   <Td>{j.retries}</Td>
-                  <Td className="text-zinc-500">{j.worker ?? "—"}</Td>
+                  <Td className="text-fg-faint">{j.worker ?? "—"}</Td>
                 </tr>
               ))}
             </Table>
@@ -129,9 +126,7 @@ function Section({
 }) {
   return (
     <section className="mb-8">
-      <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-        {title}
-      </h2>
+      <SectionLabel>{title}</SectionLabel>
       {children}
     </section>
   );
@@ -147,7 +142,7 @@ function Table({
   return (
     <table className="w-full border-collapse text-sm">
       <thead>
-        <tr className="border-b border-zinc-800 text-left text-zinc-500">
+        <tr className="border-b border-edge text-left text-fg-faint">
           {head.map((h) => (
             <th key={h} className="py-2 pr-4 font-medium">
               {h}
@@ -171,5 +166,5 @@ function Td({
 }
 
 function Empty({ children }: { children: ReactNode }) {
-  return <p className="text-sm text-zinc-500">{children}</p>;
+  return <p className="text-sm text-fg-faint">{children}</p>;
 }

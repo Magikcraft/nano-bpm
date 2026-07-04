@@ -17,6 +17,7 @@ import {
   type ProjectLogLine,
   type ProjectFile,
 } from "../lib/api";
+import { Button, inputClass } from "../components/ui";
 
 /// One project's workspace: file browser, graphical/code editors, the run
 /// console, and the Run/Stop/Compile/Configure/Export toolbar.
@@ -162,10 +163,10 @@ export default function ProjectWorkspace() {
   if (error) {
     return (
       <div className="p-8">
-        <Link to="/projects" className="text-sm text-violet-400 hover:underline">
+        <Link to="/projects" className="text-sm text-accent-strong hover:underline">
           ← Projects
         </Link>
-        <div className="mt-4 rounded-md border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+        <div className="mt-4 rounded-md border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger">
           {error}
         </div>
       </div>
@@ -173,27 +174,27 @@ export default function ProjectWorkspace() {
   }
 
   if (!detail) {
-    return <div className="p-8 text-sm text-zinc-500">Loading…</div>;
+    return <div className="p-8 text-sm text-fg-faint">Loading…</div>;
   }
 
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 border-b border-zinc-800 bg-zinc-900 px-4 py-2">
+      <div className="flex items-center gap-2 border-b border-edge bg-panel px-4 py-2">
         <nav className="flex items-center gap-1.5 text-sm" aria-label="Breadcrumb">
-          <Link to="/projects" className="text-zinc-500 hover:text-zinc-300">
+          <Link to="/projects" className="text-fg-faint hover:text-fg-muted">
             Projects
           </Link>
-          <span className="text-zinc-600">/</span>
-          <span className="font-semibold text-zinc-100">{detail.config.name}</span>
+          <span className="text-fg-faint">/</span>
+          <span className="font-semibold text-fg">{detail.config.name}</span>
         </nav>
         {running && (
-          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-emerald-400">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> running
+          <span className="inline-flex items-center gap-1 rounded-full bg-ok/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
+            <span className="h-1.5 w-1.5 rounded-full bg-ok" /> running
           </span>
         )}
         {compiling && (
-          <span className="rounded-full bg-sky-500/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-sky-400">
+          <span className="rounded-full bg-info/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-info">
             compiling…
           </span>
         )}
@@ -215,7 +216,7 @@ export default function ProjectWorkspace() {
       </div>
 
       {!runnable && (
-        <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-1.5 text-xs text-amber-300">
+        <div className="border-b border-warn/30 bg-warn/10 px-4 py-1.5 text-xs text-warn">
           {lang === "deno"
             ? "No Deno runtime detected — Run and Compile are disabled. Authoring and Export still work."
             : `No ${lang} toolchain detected — install it (and approve the extension) to enable Run and Compile. Authoring and Export still work.`}
@@ -234,18 +235,18 @@ export default function ProjectWorkspace() {
 
         {/* Editor + console */}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="min-h-0 flex-1 overflow-hidden border-b border-zinc-800">
+          <div className="min-h-0 flex-1 overflow-hidden border-b border-edge">
             {selected ? (
               <EditorPane key={selected} name={name} path={selected} />
             ) : (
-              <div className="flex h-full items-center justify-center text-sm text-zinc-600">
+              <div className="flex h-full items-center justify-center text-sm text-fg-faint">
                 Select a file to edit
               </div>
             )}
           </div>
           <div
             onMouseDown={startDrag}
-            className="h-1.5 shrink-0 cursor-row-resize bg-zinc-800 transition-colors hover:bg-violet-500"
+            className="h-1.5 shrink-0 cursor-row-resize bg-hover transition-colors hover:bg-accent"
             title="Drag to resize console"
           />
           <RunConsole logs={logs} forwardRef={logRef} onClear={() => setLogs([])} height={consoleHeight} />
@@ -293,10 +294,10 @@ function ToolbarButton({
 }) {
   const styles =
     kind === "primary"
-      ? "bg-emerald-600 text-white hover:bg-emerald-500"
+      ? "bg-ok text-on-accent hover:bg-ok/85"
       : kind === "danger"
-        ? "bg-red-600 text-white hover:bg-red-500"
-        : "border border-zinc-700 text-zinc-200 hover:bg-zinc-800";
+        ? "bg-danger text-on-accent hover:bg-danger/85"
+        : "border border-edge-strong text-fg hover:bg-hover";
   return (
     <button
       onClick={onClick}
@@ -348,14 +349,14 @@ function FileBrowser({
   };
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900">
-      <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-zinc-500">
+    <aside className="flex w-64 shrink-0 flex-col border-r border-edge bg-panel">
+      <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-fg-faint">
         <span>Files</span>
         <div className="flex gap-1">
-          <button title="New file" onClick={() => void newFile(false)} className="rounded px-1.5 py-0.5 hover:bg-zinc-800 hover:text-zinc-200">
+          <button title="New file" onClick={() => void newFile(false)} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
             ＋
           </button>
-          <button title="New folder" onClick={() => void newFile(true)} className="rounded px-1.5 py-0.5 hover:bg-zinc-800 hover:text-zinc-200">
+          <button title="New folder" onClick={() => void newFile(true)} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
             ⊞
           </button>
         </div>
@@ -417,9 +418,9 @@ function TreeNode({
         <div
           style={pad}
           onClick={() => setOpen((v) => !v)}
-          className="group flex cursor-pointer items-center gap-1 rounded py-1 pr-2 text-sm text-zinc-300 hover:bg-zinc-800/60"
+          className="group flex cursor-pointer items-center gap-1 rounded py-1 pr-2 text-sm text-fg-muted hover:bg-hover"
         >
-          <span className="text-zinc-500">{open ? "▾" : "▸"}</span>
+          <span className="text-fg-faint">{open ? "▾" : "▸"}</span>
           <span className="truncate">{node.name}</span>
         </div>
         {open && node.children && (
@@ -434,7 +435,7 @@ function TreeNode({
       <div
         style={pad}
         className={`group flex cursor-pointer items-center gap-1 rounded py-1 pr-2 text-sm ${
-          active ? "bg-zinc-800 text-white" : "text-zinc-400 hover:bg-zinc-800/60 hover:text-zinc-200"
+          active ? "bg-accent/10 font-medium text-accent-strong" : "text-fg-muted hover:bg-hover hover:text-fg"
         }`}
         onClick={() => onSelect(node.path)}
       >
@@ -446,7 +447,7 @@ function TreeNode({
             e.stopPropagation();
             onDelete(node.path);
           }}
-          className="hidden rounded px-1 text-xs text-zinc-500 hover:text-red-400 group-hover:block"
+          className="hidden rounded px-1 text-xs text-fg-faint hover:text-danger group-hover:block"
         >
           ✕
         </button>
@@ -547,20 +548,20 @@ function EditorPane({ name, path }: { name: string; path: string }) {
   }, [kind, save]);
 
   if (loadError) {
-    return <div className="p-6 text-sm text-red-400">{loadError}</div>;
+    return <div className="p-6 text-sm text-danger">{loadError}</div>;
   }
   if (meta == null) {
-    return <div className="p-6 text-sm text-zinc-500">Loading {path}…</div>;
+    return <div className="p-6 text-sm text-fg-faint">Loading {path}…</div>;
   }
   if (meta.binary) {
     const mb = (meta.size / (1024 * 1024)).toFixed(2);
     return (
       <div className="flex h-full flex-col">
-        <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900/60 px-3 py-1.5">
-          <span className="truncate font-mono text-xs text-zinc-400">{path}</span>
+        <div className="flex items-center gap-3 border-b border-edge bg-panel px-3 py-1.5">
+          <span className="truncate font-mono text-xs text-fg-muted">{path}</span>
         </div>
         <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-          <p className="max-w-2xl break-words text-center font-mono text-sm leading-relaxed text-zinc-400">
+          <p className="max-w-2xl break-words text-center font-mono text-sm leading-relaxed text-fg-muted">
             Binary file. Path on disk: {meta.absPath}. Size: {meta.size} ({mb}MB)
           </p>
         </div>
@@ -568,25 +569,25 @@ function EditorPane({ name, path }: { name: string; path: string }) {
     );
   }
   if (content == null) {
-    return <div className="p-6 text-sm text-zinc-500">Loading {path}…</div>;
+    return <div className="p-6 text-sm text-fg-faint">Loading {path}…</div>;
   }
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900/60 px-3 py-1.5">
-        <span className="truncate font-mono text-xs text-zinc-400">{path}</span>
-        {dirty && <span className="text-[10px] text-amber-400">● unsaved</span>}
+      <div className="flex items-center gap-3 border-b border-edge bg-panel px-3 py-1.5">
+        <span className="truncate font-mono text-xs text-fg-muted">{path}</span>
+        {dirty && <span className="text-[10px] text-warn">● unsaved</span>}
         <div className="flex-1" />
         {kind === "md" && (
-          <div className="flex overflow-hidden rounded-md border border-zinc-700">
+          <div className="flex overflow-hidden rounded-md border border-edge-strong">
             {(["preview", "edit"] as const).map((mode) => (
               <button
                 key={mode}
                 onClick={() => setMdView(mode)}
                 className={`px-3 py-1 text-xs font-medium capitalize transition-colors ${
                   mdView === mode
-                    ? "bg-violet-600 text-white"
-                    : "text-zinc-300 hover:bg-zinc-800"
+                    ? "bg-accent text-on-accent"
+                    : "text-fg-muted hover:bg-hover"
                 }`}
               >
                 {mode}
@@ -600,7 +601,7 @@ function EditorPane({ name, path }: { name: string; path: string }) {
               const xml = await bpmnRef.current?.getXml();
               if (xml) setTestXml(xml);
             }}
-            className="rounded-md border border-zinc-700 px-3 py-1 text-xs font-medium text-zinc-200 transition-colors hover:border-emerald-500 hover:text-emerald-300"
+            className="rounded-md border border-edge-strong px-3 py-1 text-xs font-medium text-fg transition-colors hover:border-ok hover:text-ok"
           >
             Test
           </button>
@@ -608,7 +609,7 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         <button
           onClick={() => void save()}
           disabled={saving || ((kind === "code" || kind === "md") && !dirty)}
-          className="rounded-md bg-violet-600 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-40"
+          className="rounded-md bg-accent px-3 py-1 text-xs font-medium text-on-accent transition-colors hover:bg-accent-strong disabled:opacity-40"
         >
           {saving ? "Saving…" : "Save"}
         </button>
@@ -618,10 +619,10 @@ function EditorPane({ name, path }: { name: string; path: string }) {
           <div className="relative h-full">
             <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} />
             {testXml && (
-              <div className="absolute inset-0 z-10 bg-zinc-950">
+              <div className="absolute inset-0 z-10 bg-app">
                 <Suspense
                   fallback={
-                    <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+                    <div className="flex h-full items-center justify-center text-sm text-fg-faint">
                       Loading the in-browser engine…
                     </div>
                   }
@@ -680,26 +681,26 @@ function RunConsole({
   height: number;
 }) {
   return (
-    <div className="flex shrink-0 flex-col bg-zinc-950" style={{ height }}>
-      <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-1 text-xs uppercase tracking-wider text-zinc-500">
+    <div className="flex shrink-0 flex-col bg-inset" style={{ height }}>
+      <div className="flex items-center justify-between border-b border-edge px-3 py-1 text-xs uppercase tracking-wider text-fg-faint">
         <span>Output</span>
-        <button onClick={onClear} className="rounded px-1.5 py-0.5 hover:bg-zinc-800 hover:text-zinc-300">
+        <button onClick={onClear} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg-muted">
           Clear
         </button>
       </div>
       <div ref={forwardRef} className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed">
         {logs.length === 0 ? (
-          <div className="text-zinc-600">No output yet. Run the application to see logs.</div>
+          <div className="text-fg-faint">No output yet. Run the application to see logs.</div>
         ) : (
           logs.map((l, i) => (
             <div
               key={i}
               className={
                 l.stream === "err"
-                  ? "whitespace-pre-wrap text-red-400"
+                  ? "whitespace-pre-wrap text-danger"
                   : l.stream === "sys"
-                    ? "whitespace-pre-wrap text-sky-400"
-                    : "whitespace-pre-wrap text-zinc-300"
+                    ? "whitespace-pre-wrap text-info"
+                    : "whitespace-pre-wrap text-fg-muted"
               }
             >
               {l.text}
@@ -754,22 +755,20 @@ function ConfigModal({
 
   return (
     <Modal title="Configure project" onClose={onClose}>
-      <label className="block text-xs uppercase tracking-wider text-zinc-500">Description</label>
+      <label className="block text-xs uppercase tracking-wider text-fg-faint">Description</label>
       <input value={desc} onChange={(e) => setDesc(e.target.value)} className={inputCls} />
-      <label className="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Deploy target</label>
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">Deploy target</label>
       <input value={deployTarget} onChange={(e) => setDeployTarget(e.target.value)} className={inputCls} placeholder="http://localhost:8080" />
-      <p className="mt-1 text-[11px] text-zinc-600">REST API at &lt;target&gt;/v2; the Falcon protocol is dialled here too.</p>
-      <label className="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Entry point</label>
+      <p className="mt-1 text-[11px] text-fg-faint">REST API at &lt;target&gt;/v2; the Falcon protocol is dialled here too.</p>
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">Entry point</label>
       <input value={main} onChange={(e) => setMain(e.target.value)} className={inputCls} placeholder="main.ts" />
-      <label className="mt-3 block text-xs uppercase tracking-wider text-zinc-500">Export platforms</label>
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">Export platforms</label>
       <PlatformPicker platforms={platforms} selected={selected} onToggle={toggle} />
       <div className="mt-5 flex justify-end gap-2">
-        <button onClick={onClose} className="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
-          Cancel
-        </button>
-        <button onClick={() => void save()} disabled={busy} className="rounded-md bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-500 disabled:opacity-50">
+        <Button onClick={onClose}>Cancel</Button>
+        <Button variant="primary" onClick={() => void save()} disabled={busy}>
           {busy ? "Saving…" : "Save"}
-        </button>
+        </Button>
       </div>
     </Modal>
   );
@@ -810,8 +809,8 @@ function CompileModal({
 
   return (
     <Modal title="Compile application" onClose={onClose}>
-      <p className="text-sm text-zinc-400">
-        Produces standalone binaries under <span className="font-mono text-zinc-300">dist/</span>. Leave all
+      <p className="text-sm text-fg-muted">
+        Produces standalone binaries under <span className="font-mono text-fg">dist/</span>. Leave all
         unchecked to compile for this host only. Cross-compiling downloads the
         Deno runtime per target and may take a few minutes — progress streams to
         the Output panel.
@@ -820,12 +819,10 @@ function CompileModal({
         <PlatformPicker platforms={platforms} selected={selected} onToggle={toggle} />
       </div>
       <div className="mt-5 flex justify-end gap-2">
-        <button onClick={onClose} className="rounded-md border border-zinc-700 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800">
-          Cancel
-        </button>
-        <button onClick={() => void compile()} disabled={busy} className="rounded-md bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-500 disabled:opacity-50">
+        <Button onClick={onClose}>Cancel</Button>
+        <Button variant="primary" onClick={() => void compile()} disabled={busy}>
           {busy ? "Starting…" : "Compile"}
-        </button>
+        </Button>
       </div>
     </Modal>
   );
@@ -852,12 +849,12 @@ function PlatformPicker({
   return (
     <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
       {platforms.map((t) => (
-        <label key={t} className="flex cursor-pointer items-center gap-2 rounded-md border border-zinc-800 px-3 py-2 text-sm text-zinc-300 hover:border-zinc-600">
+        <label key={t} className="flex cursor-pointer items-center gap-2 rounded-md border border-edge px-3 py-2 text-sm text-fg-muted hover:border-edge-strong">
           <input
             type="checkbox"
             checked={selected.includes(t)}
             onChange={() => onToggle(t)}
-            className="accent-violet-500"
+            className="accent-accent"
           />
           <span>{PLATFORM_LABELS[t] ?? t}</span>
         </label>
@@ -877,13 +874,12 @@ function Modal({
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-900 p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <h2 className="mb-4 text-lg font-semibold text-zinc-100">{title}</h2>
+      <div className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <h2 className="mb-4 text-lg font-semibold text-fg">{title}</h2>
         {children}
       </div>
     </div>
   );
 }
 
-const inputCls =
-  "mt-1 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-violet-500";
+const inputCls = `mt-1 w-full ${inputClass}`;

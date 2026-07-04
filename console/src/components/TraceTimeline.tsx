@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import type { ReactNode } from "react";
 import type { InstanceTrace, TraceElement } from "../lib/api";
+import { SectionLabel } from "./ui";
 
 /** Format a duration given in milliseconds. */
 export function fmtDuration(ms: number | null): string {
@@ -42,7 +43,7 @@ export const msFmt: TraceTimeFmt = {
 };
 
 /// The shared trace timeline: one lane per element instance with its lifetime
-/// track, the job's queue (amber) / service (emerald) segments, and an incident
+/// track, the job's queue (warn) / service (ok) segments, and an incident
 /// table. Used by both the production Traces tab and the modeler's in-browser
 /// test-run trace (which passes a step formatter).
 export function TraceTimeline({
@@ -79,19 +80,17 @@ export function TraceTimeline({
           <ElementRow key={el.elementInstanceKey} el={el} pct={pct} fmt={fmt} />
         ))}
       </div>
-      <div className="mt-2 flex justify-between border-t border-zinc-800 pt-1 font-mono text-[10px] text-zinc-500">
+      <div className="mt-2 flex justify-between border-t border-edge pt-1 font-mono text-[10px] text-fg-faint">
         <span>{fmt.origin}</span>
         <span>{fmt.duration(Math.round(span))}</span>
       </div>
 
       {trace.incidents.length > 0 && (
         <section className="mt-8">
-          <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-            Incidents
-          </h2>
+          <SectionLabel>Incidents</SectionLabel>
           <table className="w-full border-collapse text-sm">
             <thead>
-              <tr className="border-b border-zinc-800 text-left text-zinc-500">
+              <tr className="border-b border-edge text-left text-fg-faint">
                 {["Element", "Kind", "Reason", "Raised", "Resolved"].map((h) => (
                   <th key={h} className="py-2 pr-4 font-medium">
                     {h}
@@ -101,14 +100,14 @@ export function TraceTimeline({
             </thead>
             <tbody>
               {trace.incidents.map((inc, i) => (
-                <tr key={i} className="border-b border-zinc-900">
+                <tr key={i} className="border-b border-edge">
                   <td className="py-2 pr-4 font-mono">{inc.elementId}</td>
                   <td className="py-2 pr-4">{inc.kind}</td>
-                  <td className="py-2 pr-4 text-red-300">{inc.reason}</td>
-                  <td className="py-2 pr-4 font-mono text-zinc-500">
+                  <td className="py-2 pr-4 text-danger">{inc.reason}</td>
+                  <td className="py-2 pr-4 font-mono text-fg-faint">
                     {fmt.clock(inc.raisedAt)}
                   </td>
-                  <td className="py-2 pr-4 font-mono text-zinc-500">
+                  <td className="py-2 pr-4 font-mono text-fg-faint">
                     {inc.resolvedAt ? fmt.clock(inc.resolvedAt) : "—"}
                   </td>
                 </tr>
@@ -139,19 +138,19 @@ function ElementRow({
 
   return (
     <div className="flex items-center gap-3">
-      <div className="w-44 shrink-0 truncate font-mono text-xs text-zinc-300" title={el.elementId}>
+      <div className="w-44 shrink-0 truncate font-mono text-xs text-fg-muted" title={el.elementId}>
         {el.elementId}
-        {el.incidents > 0 && <span className="ml-1 text-red-400">⚠</span>}
+        {el.incidents > 0 && <span className="ml-1 text-danger">⚠</span>}
       </div>
-      <div className="relative h-6 flex-1 rounded bg-zinc-900">
+      <div className="relative h-6 flex-1 rounded bg-inset">
         <div
-          className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-zinc-700"
+          className="absolute top-1/2 h-3 -translate-y-1/2 rounded-sm bg-edge-strong"
           style={{ left: `${left}%`, width: `${width}%` }}
           title={`${el.elementId} · ${fmt.duration(el.durationMs)}`}
         />
         {job && <JobBars job={job} pct={pct} fmt={fmt} />}
       </div>
-      <div className="w-28 shrink-0 text-right font-mono text-[11px] text-zinc-500">
+      <div className="w-28 shrink-0 text-right font-mono text-[11px] text-fg-faint">
         {job
           ? job.queueMs != null
             ? `${fmt.duration(job.queueMs)} q`
@@ -182,7 +181,7 @@ function JobBars({
     segments.push(
       <div
         key="q"
-        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-l-sm bg-amber-500/80"
+        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-l-sm bg-warn/80"
         style={{ left: `${qLeft}%`, width: `${qWidth}%` }}
         title={`queue ${fmt.duration(job.queueMs)} · worker ${job.worker ?? "—"}`}
       />,
@@ -193,7 +192,7 @@ function JobBars({
     segments.push(
       <div
         key="s"
-        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-r-sm bg-emerald-500/80"
+        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-r-sm bg-ok/80"
         style={{ left: `${sLeft}%`, width: `${sWidth}%` }}
         title={`service ${fmt.duration(job.serviceMs)} · worker ${job.worker ?? "—"}`}
       />,
@@ -205,7 +204,7 @@ function JobBars({
     segments.push(
       <div
         key="w"
-        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-sm bg-amber-600/70"
+        className="absolute top-1/2 h-3.5 -translate-y-1/2 rounded-sm bg-warn/50"
         style={{ left: `${left}%`, width: `${width}%` }}
         title={`wait ${fmt.duration(job.waitMs)} (activation not observed)`}
       />,
@@ -216,11 +215,11 @@ function JobBars({
 
 function Legend() {
   return (
-    <div className="flex flex-wrap items-center gap-4 text-xs text-zinc-400">
-      <Swatch className="bg-zinc-700">element</Swatch>
-      <Swatch className="bg-amber-500/80">job queue</Swatch>
-      <Swatch className="bg-emerald-500/80">job service</Swatch>
-      <Swatch className="bg-amber-600/70">job wait (activation unobserved)</Swatch>
+    <div className="flex flex-wrap items-center gap-4 text-xs text-fg-muted">
+      <Swatch className="bg-edge-strong">element</Swatch>
+      <Swatch className="bg-warn/80">job queue</Swatch>
+      <Swatch className="bg-ok/80">job service</Swatch>
+      <Swatch className="bg-warn/50">job wait (activation unobserved)</Swatch>
     </div>
   );
 }

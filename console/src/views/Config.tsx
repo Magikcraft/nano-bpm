@@ -375,7 +375,7 @@ function SlaPedal({
               boxShadow: `0 0 8px ${idx === 0 ? "#f59e0b" : "#22d3ee"}`,
             }}
           />
-          <span className="text-[9px] uppercase tracking-widest text-zinc-400">
+          <span className="text-[9px] uppercase tracking-widest text-[#a1a1aa]">
             {idx === 0 ? "latency" : "admission"}
           </span>
         </div>
@@ -429,7 +429,7 @@ function SlaPedal({
         </div>
 
         {/* detent labels */}
-        <div className="mt-2 flex justify-between text-[9px] uppercase tracking-wider text-zinc-400">
+        <div className="mt-2 flex justify-between text-[9px] uppercase tracking-wider text-[#a1a1aa]">
           <button className="hover:text-amber-300" onClick={() => select(sla.options[0].id)}>
             ◄ reject
           </button>

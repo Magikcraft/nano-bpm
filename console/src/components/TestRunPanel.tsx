@@ -5,6 +5,7 @@ import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import init, { TestEngine } from "../wasm/nanobpmn_engine";
 import { TraceTimeline } from "./TraceTimeline";
 import { foldSimTrace, stepFmt, type WasmEvent } from "../lib/simTrace";
+import { Badge, Button, ErrorText, SectionLabel } from "./ui";
 
 interface ActiveEl {
   key: string;
@@ -260,15 +261,15 @@ export default function TestRunPanel({
   return (
     <div className="flex h-full min-h-0">
       {/* Simulated diagram / trace with live token highlighting */}
-      <div className="relative flex min-w-0 flex-1 flex-col bg-zinc-950">
-        <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-1.5">
+      <div className="relative flex min-w-0 flex-1 flex-col bg-app">
+        <div className="flex items-center gap-2 border-b border-edge px-3 py-1.5">
           <div className="flex gap-1">
             <button
               onClick={() => setLeftView("diagram")}
               className={`rounded px-2.5 py-1 text-xs ${
                 leftView === "diagram"
-                  ? "bg-zinc-700 text-white"
-                  : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+                  ? "bg-accent/10 font-medium text-accent-strong"
+                  : "bg-raised text-fg-muted hover:bg-hover"
               }`}
             >
               Diagram
@@ -277,21 +278,21 @@ export default function TestRunPanel({
               onClick={() => setLeftView("trace")}
               className={`rounded px-2.5 py-1 text-xs ${
                 leftView === "trace"
-                  ? "bg-zinc-700 text-white"
-                  : "bg-zinc-900 text-zinc-400 hover:bg-zinc-800"
+                  ? "bg-accent/10 font-medium text-accent-strong"
+                  : "bg-raised text-fg-muted hover:bg-hover"
               }`}
             >
               Trace
             </button>
           </div>
-          <span className="rounded bg-violet-900/50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-violet-300">
+          <Badge tone="accent" className="uppercase tracking-wide">
             Simulation
-          </span>
+          </Badge>
           {leftView === "trace" && started && snapshot!.instances.length > 1 && (
             <select
               value={effectiveTraceKey ?? ""}
               onChange={(e) => setTraceKey(e.target.value)}
-              className="ml-auto rounded border border-zinc-700 bg-zinc-950 px-2 py-0.5 font-mono text-xs text-zinc-200"
+              className="ml-auto rounded border border-edge-strong bg-inset px-2 py-0.5 font-mono text-xs text-fg"
             >
               {snapshot!.instances.map((i) => (
                 <option key={i.key} value={i.key}>
@@ -303,7 +304,7 @@ export default function TestRunPanel({
         </div>
         <div className="relative min-h-0 flex-1">
           {!started ? (
-            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+            <div className="flex h-full items-center justify-center text-sm text-fg-faint">
               {phase === "loading"
                 ? "Loading the in-browser engine…"
                 : "Start an instance to simulate this process."}
@@ -312,7 +313,7 @@ export default function TestRunPanel({
             <SimDiagram xml={xml} activeIds={activeIds} incidentIds={incidentIds} />
           ) : simTrace ? (
             <div className="h-full overflow-auto p-6">
-              <p className="mb-4 text-xs text-zinc-500">
+              <p className="mb-4 text-xs text-fg-faint">
                 Folded from the in-browser engine's event log. The simulation's
                 virtual clock only advances on “Advance time”, so the axis is the
                 logical step (event) index, not wall-clock time. This trace is
@@ -321,12 +322,12 @@ export default function TestRunPanel({
               <TraceTimeline trace={simTrace} fmt={stepFmt} />
             </div>
           ) : (
-            <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+            <div className="flex h-full items-center justify-center text-sm text-fg-faint">
               No trace yet.
             </div>
           )}
           {leftView === "diagram" && allDone && (
-            <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-emerald-900/80 px-4 py-1 text-xs font-medium text-emerald-200">
+            <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-ok/30 bg-panel/90 px-4 py-1 text-xs font-medium text-ok">
               ✓ All instances completed
             </div>
           )}
@@ -334,55 +335,50 @@ export default function TestRunPanel({
       </div>
 
       {/* Control panel */}
-      <div className="flex w-96 shrink-0 flex-col border-l border-zinc-800 bg-zinc-900">
-        <header className="flex items-center justify-between border-b border-zinc-800 px-4 py-2">
+      <div className="flex w-96 shrink-0 flex-col border-l border-edge bg-panel">
+        <header className="flex items-center justify-between border-b border-edge px-4 py-2">
           <div>
-            <h2 className="text-sm font-semibold">Test run</h2>
-            <p className="text-xs text-zinc-500">In-browser simulation (not deployed)</p>
+            <h2 className="text-sm font-semibold text-fg">Test run</h2>
+            <p className="text-xs text-fg-faint">In-browser simulation (not deployed)</p>
           </div>
-          <button
-            onClick={onClose}
-            className="rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-700"
-          >
+          <Button size="sm" onClick={onClose}>
             Close
-          </button>
+          </Button>
         </header>
 
         {error && (
-          <div className="border-b border-red-900/50 bg-red-950/60 px-4 py-2 text-xs text-red-300">
+          <div className="border-b border-danger/30 bg-danger/10 px-4 py-2 text-xs text-danger">
             {error}
           </div>
         )}
 
         <div className="min-h-0 flex-1 space-y-4 overflow-auto p-4">
           {phase === "error" && (
-            <p className="text-sm text-red-300">
-              Could not load the simulation engine.
-            </p>
+            <ErrorText>Could not load the simulation engine.</ErrorText>
           )}
 
           {/* Start form */}
           <section className="space-y-2">
             <div className="flex items-center justify-between">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-fg-faint">
                 Start
               </h3>
               {started && (
                 <button
                   onClick={reset}
-                  className="text-xs text-zinc-400 hover:text-zinc-200"
+                  className="text-xs text-fg-muted hover:text-fg"
                 >
                   Reset
                 </button>
               )}
             </div>
-            <label className="block text-xs text-zinc-500">
+            <label className="block text-xs text-fg-faint">
               Process
               <select
                 value={process}
                 onChange={(e) => setProcess(e.target.value)}
                 disabled={phase !== "ready" || processIds.length === 0}
-                className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200"
+                className="mt-1 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-xs text-fg outline-none focus:border-accent"
               >
                 {processIds.length === 0 && <option value="">— none —</option>}
                 {processIds.map((id) => (
@@ -392,45 +388,45 @@ export default function TestRunPanel({
                 ))}
               </select>
             </label>
-            <label className="block text-xs text-zinc-500">
+            <label className="block text-xs text-fg-faint">
               Variables (JSON)
               <textarea
                 value={startVars}
                 onChange={(e) => setStartVars(e.target.value)}
                 rows={3}
                 spellCheck={false}
-                className="mt-1 w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200"
+                className="mt-1 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-xs text-fg outline-none focus:border-accent"
               />
             </label>
-            <button
+            <Button
+              variant="primary"
+              size="sm"
+              className="w-full"
               onClick={start}
               disabled={phase !== "ready" || !process}
-              className="w-full rounded-md bg-sky-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50"
             >
               {started ? "Start another instance" : "Start instance"}
-            </button>
+            </Button>
           </section>
 
           {started && (
             <>
               {/* Waiting jobs */}
               <section className="space-y-2">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
-                  Waiting jobs ({snapshot!.jobs.length})
-                </h3>
+                <SectionLabel>Waiting jobs ({snapshot!.jobs.length})</SectionLabel>
                 {snapshot!.jobs.length === 0 ? (
-                  <p className="text-xs text-zinc-600">No jobs are waiting.</p>
+                  <p className="text-xs text-fg-faint">No jobs are waiting.</p>
                 ) : (
                   snapshot!.jobs.map((job) => (
                     <div
                       key={job.key}
-                      className="rounded border border-zinc-800 bg-zinc-950 p-2"
+                      className="rounded border border-edge bg-raised p-2"
                     >
                       <div className="flex items-center justify-between">
-                        <span className="font-mono text-xs text-zinc-300">
+                        <span className="font-mono text-xs text-fg-muted">
                           {job.elementId}
                         </span>
-                        <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-400">
+                        <span className="rounded bg-hover px-1.5 py-0.5 font-mono text-[10px] text-fg-muted">
                           {job.jobType}
                         </span>
                       </div>
@@ -442,18 +438,18 @@ export default function TestRunPanel({
                         rows={2}
                         spellCheck={false}
                         placeholder="output variables (JSON)"
-                        className="mt-1.5 w-full rounded border border-zinc-700 bg-zinc-900 px-2 py-1 font-mono text-[11px] text-zinc-200"
+                        className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
                       />
                       <div className="mt-1.5 flex gap-1.5">
                         <button
                           onClick={() => completeJob(job.key)}
-                          className="flex-1 rounded bg-emerald-800 px-2 py-1 text-[11px] font-medium text-emerald-100 hover:bg-emerald-700"
+                          className="flex-1 rounded border border-ok/30 bg-ok/10 px-2 py-1 text-[11px] font-medium text-ok hover:bg-ok/20"
                         >
                           Complete
                         </button>
                         <button
                           onClick={() => failJob(job.key)}
-                          className="flex-1 rounded bg-red-900 px-2 py-1 text-[11px] font-medium text-red-200 hover:bg-red-800"
+                          className="flex-1 rounded border border-danger/30 bg-danger/10 px-2 py-1 text-[11px] font-medium text-danger hover:bg-danger/20"
                         >
                           Fail (incident)
                         </button>
@@ -466,16 +462,14 @@ export default function TestRunPanel({
               {/* Timers */}
               {snapshot!.timers.length > 0 && (
                 <section className="space-y-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
-                    Timers ({snapshot!.timers.length})
-                  </h3>
+                  <SectionLabel>Timers ({snapshot!.timers.length})</SectionLabel>
                   {snapshot!.timers.map((t) => (
                     <div
                       key={t.key}
-                      className="flex items-center justify-between rounded border border-zinc-800 bg-zinc-950 px-2 py-1 text-xs"
+                      className="flex items-center justify-between rounded border border-edge bg-raised px-2 py-1 text-xs"
                     >
-                      <span className="font-mono text-zinc-300">{t.elementId}</span>
-                      <span className="text-zinc-500">
+                      <span className="font-mono text-fg-muted">{t.elementId}</span>
+                      <span className="text-fg-faint">
                         due in {t.dueInMs} ms
                       </span>
                     </div>
@@ -486,16 +480,16 @@ export default function TestRunPanel({
               {/* Incidents */}
               {snapshot!.incidents.length > 0 && (
                 <section className="space-y-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-red-400">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-danger">
                     Incidents ({snapshot!.incidents.length})
                   </h3>
                   {snapshot!.incidents.map((i) => (
                     <div
                       key={i.key}
-                      className="rounded border border-red-900/50 bg-red-950/40 p-2 text-xs"
+                      className="rounded border border-danger/30 bg-danger/10 p-2 text-xs"
                     >
-                      <div className="font-mono text-red-300">{i.elementId}</div>
-                      <div className="text-zinc-400">
+                      <div className="font-mono text-danger">{i.elementId}</div>
+                      <div className="text-fg-muted">
                         {i.kind}: {i.reason}
                       </div>
                     </div>
@@ -505,19 +499,17 @@ export default function TestRunPanel({
 
               {/* Clock */}
               <section className="space-y-1.5">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
-                  Virtual clock
-                </h3>
-                <div className="text-xs text-zinc-500">now = {snapshot!.now} ms</div>
+                <SectionLabel>Virtual clock</SectionLabel>
+                <div className="text-xs text-fg-faint">now = {snapshot!.now} ms</div>
                 <div className="flex gap-1.5">
                   <input
                     value={advanceMs}
                     onChange={(e) => setAdvanceMs(e.target.value)}
-                    className="w-24 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-xs text-zinc-200"
+                    className="w-24 rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-xs text-fg outline-none focus:border-accent"
                   />
                   <button
                     onClick={advance}
-                    className="flex-1 rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
+                    className="flex-1 rounded border border-edge-strong bg-raised px-2 py-1 text-xs text-fg hover:bg-hover"
                   >
                     Advance time
                   </button>
@@ -526,29 +518,29 @@ export default function TestRunPanel({
 
               {/* Variables */}
               <section className="space-y-2">
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">
+                <SectionLabel>
                   Instances ({snapshot!.completedInstances}/{snapshot!.totalInstances} done)
-                </h3>
+                </SectionLabel>
                 {snapshot!.instances.map((inst) => (
                   <div
                     key={inst.key}
-                    className="rounded border border-zinc-800 bg-zinc-950 p-2 text-xs"
+                    className="rounded border border-edge bg-raised p-2 text-xs"
                   >
                     <div className="flex items-center justify-between">
-                      <span className="font-mono text-zinc-400">#{inst.key}</span>
+                      <span className="font-mono text-fg-muted">#{inst.key}</span>
                       <span
                         className={
                           inst.state === "Completed"
-                            ? "text-emerald-400"
+                            ? "text-ok"
                             : inst.state === "Terminated"
-                              ? "text-red-400"
-                              : "text-amber-400"
+                              ? "text-danger"
+                              : "text-warn"
                         }
                       >
                         {inst.state}
                       </span>
                     </div>
-                    <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-zinc-400">
+                    <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-fg-muted">
                       {JSON.stringify(inst.variables, null, 2)}
                     </pre>
                   </div>

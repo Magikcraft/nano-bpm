@@ -79,7 +79,7 @@ export default function BpmnViewer({
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
       {!xml && (
-        <div className="absolute inset-0 flex items-center justify-center text-sm text-zinc-500">
+        <div className="absolute inset-0 flex items-center justify-center text-sm text-fg-faint">
           No diagram available for this definition.
         </div>
       )}
