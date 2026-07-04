@@ -2322,6 +2322,20 @@ impl Engine {
         // inputs are local to that scope, exactly like a leaf activity.
         let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
         let inputs = self.io_inputs(instance_key, &element_id);
+
+        // The scoped variable view the activating element evaluates against: both
+        // its input-mapping *source* expressions and its own FEEL attributes (job
+        // type, retries, priority, timer/message/signal name, correlation key,
+        // user-task fields). It is the element's enclosing flow scope — a
+        // root-scope element gets the shared root Arc (a cheap refcount bump), so
+        // evaluation is byte-identical to the flat engine; an element inside a
+        // sub-process or multi-instance body additionally sees its enclosing
+        // scope's locals, so an input mapping that reads an enclosing-scope-local
+        // variable resolves correctly (Zeebe parity). A sub-process's own inputs
+        // are evaluated here against its *parent* scope and then applied local to
+        // the new sub-process scope below.
+        let element_vars = self.variables_for_element(instance_key, scope);
+
         let mut scope_registered = false;
         if is_sub_process {
             events.push(Event::VariableScopeCreated {
@@ -2332,7 +2346,7 @@ impl Engine {
             scope_registered = true;
         }
         if !inputs.is_empty() {
-            let updates = self.eval_io_mappings(instance_key, &inputs);
+            let updates = self.eval_io_mappings_in(&element_vars, &inputs);
             if !updates.is_empty() {
                 if !scope_registered {
                     events.push(Event::VariableScopeCreated {
@@ -2348,15 +2362,6 @@ impl Engine {
                 });
             }
         }
-
-        // The scoped variable view the activating element evaluates its own FEEL
-        // attributes against (job type, retries, priority, timer/message/signal
-        // name, correlation key, user-task fields). It is the element's flow
-        // scope — a root-scope element gets the shared root Arc (a cheap refcount
-        // bump), so evaluation is byte-identical to the flat engine; an element
-        // inside a sub-process or multi-instance body additionally sees its
-        // enclosing scope's locals (Zeebe parity).
-        let element_vars = self.variables_for_element(instance_key, scope);
 
         match kind {
             // A service task creates a job and parks the token.
@@ -2609,12 +2614,16 @@ impl Engine {
         ];
         // Input mappings on the activity apply once, on body activation, LOCAL to
         // the body scope (Zeebe semantics), so they feed the input collection and
-        // the children without leaking to the parent scope.
+        // the children without leaking to the parent scope. Their source
+        // expressions are evaluated against the body's *enclosing* scope view, so
+        // a multi-instance activity nested in a sub-process can read that
+        // sub-process's locals.
+        let enclosing_vars = self.variables_for_element(instance_key, scope);
         let inputs = self.io_inputs(instance_key, &element_id);
         let input_updates = if inputs.is_empty() {
             HashMap::new()
         } else {
-            self.eval_io_mappings(instance_key, &inputs)
+            self.eval_io_mappings_in(&enclosing_vars, &inputs)
         };
         if !input_updates.is_empty() {
             events.push(Event::ScopedVariablesUpdated {
@@ -2623,14 +2632,13 @@ impl Engine {
                 variables: input_updates.clone(),
             });
         }
-        // The input collection is evaluated in the body scope view (the root
-        // variables with any body input mappings overlaid).
+        // The input collection is evaluated in the body scope view (the enclosing
+        // scope with any body input mappings overlaid).
         let vars: Arc<HashMap<String, Value>> = {
-            let base = self.variables(instance_key);
             if input_updates.is_empty() {
-                base
+                enclosing_vars
             } else {
-                let mut merged = (*base).clone();
+                let mut merged = (*enclosing_vars).clone();
                 merged.extend(input_updates);
                 Arc::new(merged)
             }

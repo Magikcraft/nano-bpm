@@ -516,26 +516,6 @@ impl Engine {
             .unwrap_or(0)
     }
 
-    /// Evaluates a list of `zeebe:input`/`zeebe:output` [`Mapping`]s against the
-    /// instance variables and returns the top-level variable updates to merge.
-    ///
-    /// Each mapping's `source` FEEL expression is evaluated against the instance
-    /// variables; the result is written to its `target` path (a plain name or a
-    /// dotted path naming a nested context entry). Nano keeps a single flat
-    /// instance-level variable scope, so the merge map is applied via a normal
-    /// [`Event::VariablesUpdated`]. A mapping whose source fails to evaluate
-    /// (parse error, unresolved variable) is skipped — matching the
-    /// error-tolerant behaviour of the other `resolve_*` helpers, which have no
-    /// incident path for expression failures.
-    pub(crate) fn eval_io_mappings(
-        &self,
-        instance_key: Key,
-        mappings: &[crate::model::Mapping],
-    ) -> HashMap<String, Value> {
-        let vars = self.variables(instance_key);
-        self.eval_io_mappings_in(&vars, mappings)
-    }
-
     /// Writes `value` to `target` (a plain name or a dotted path) inside the
     /// accumulating merge map, seeding nested context from the existing instance
     /// variables so a partial-path mapping (`order.total`) preserves the other

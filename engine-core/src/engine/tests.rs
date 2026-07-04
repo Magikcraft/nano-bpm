@@ -86,6 +86,74 @@ fn subprocess_input_mapping_is_local_to_the_subprocess_scope() {
     assert_eq!(io_var(&engine, inst, "scoped"), None);
 }
 
+/// Like [`subprocess_with_input_mapping`] but the inner service task ALSO carries
+/// an input mapping (`derived = scoped * 10`) whose source reads the
+/// sub-process-local `scoped`. This only resolves if the inner element's inputs
+/// are evaluated against its enclosing (sub-process) scope, not the root.
+fn subprocess_with_nested_input_mapping() -> ProcessDefinition {
+    ProcessBuilder::new("nested-scope")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=seed + 1".to_string(),
+                    target: "scoped".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "work")
+        .with_io(
+            "inner",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=scoped * 10".to_string(),
+                    target: "derived".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn inner_element_input_mapping_resolves_against_the_enclosing_subprocess_scope() {
+    // Regression: an input mapping on an element nested inside a sub-process must
+    // evaluate its source against the sub-process's scoped view (which carries the
+    // sub-process-local `scoped`), NOT the root variables. Evaluating against root
+    // would leave `scoped` unresolved and silently drop `derived`.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            subprocess_with_nested_input_mapping(),
+        ))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("seed".to_string(), Value::Int(4));
+    engine
+        .apply_command(Command::create_instance_with("nested-scope", vars))
+        .unwrap();
+
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    // scoped = seed + 1 = 5 (sub-process local); derived = scoped * 10 = 50,
+    // which is only correct when the inner input mapping sees the enclosing scope.
+    assert_eq!(job.variables.get("scoped"), Some(&Value::Int(5)));
+    assert_eq!(job.variables.get("derived"), Some(&Value::Int(50)));
+}
+
 #[test]
 fn subprocess_scope_local_variable_is_dropped_when_the_subprocess_completes() {
     // Once the sub-process drains and completes, its local scope (and the
