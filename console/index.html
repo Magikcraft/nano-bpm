@@ -4,6 +4,45 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>nanobpmn console</title>
+    <script>
+      // Apply the persisted theme before first paint so there is no flash of
+      // the wrong appearance. Mirrors src/theme/themes.ts (applySelection).
+      (function () {
+        try {
+          var root = document.documentElement;
+          var sel = localStorage.getItem("nano.theme") || "system";
+          var appearance;
+          if (sel.indexOf("theme:") === 0) {
+            var spec = JSON.parse(localStorage.getItem("nano.theme.active") || "null");
+            if (spec && spec.id === sel.slice(6)) {
+              appearance = spec.appearance === "light" ? "light" : "dark";
+              for (var key in spec.tokens) {
+                var v = spec.tokens[key];
+                if (typeof v === "string") {
+                  root.style.setProperty(
+                    "--nano-" +
+                      key.replace(/[A-Z2]/g, function (c) {
+                        return c === "2" ? "-2" : "-" + c.toLowerCase();
+                      }),
+                    v,
+                  );
+                }
+              }
+            }
+          } else if (sel === "light" || sel === "dark") {
+            appearance = sel;
+          }
+          if (!appearance) {
+            appearance = window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+          }
+          root.dataset.appearance = appearance;
+        } catch (e) {
+          document.documentElement.dataset.appearance = "dark";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

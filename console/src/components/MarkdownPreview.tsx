@@ -13,9 +13,9 @@ const md = new MarkdownIt({
 export default function MarkdownPreview({ source }: { source: string }) {
   const html = useMemo(() => md.render(source), [source]);
   return (
-    <div className="h-full overflow-auto bg-zinc-950 px-6 py-5">
+    <div className="h-full overflow-auto bg-app px-6 py-5">
       <div
-        className="markdown-preview mx-auto max-w-3xl text-sm leading-relaxed text-zinc-200"
+        className="markdown-preview mx-auto max-w-3xl text-sm leading-relaxed text-fg"
         // Safe: markdown-it is configured with html:false, so any raw HTML in
         // the source is escaped rather than injected.
         dangerouslySetInnerHTML={{ __html: html }}

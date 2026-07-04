@@ -4,20 +4,24 @@ import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, type Instance } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import InstanceDetail from "./InstanceDetail";
+import { Badge, Button } from "../components/ui";
 
 const PAGE_SIZE = 50;
 
-function stateBadge(state: string, hasIncident: boolean): string {
-  if (hasIncident) return "bg-red-900/60 text-red-300";
+function stateTone(
+  state: string,
+  hasIncident: boolean,
+): "danger" | "info" | "ok" | "neutral" {
+  if (hasIncident) return "danger";
   switch (state) {
     case "Active":
-      return "bg-sky-900/60 text-sky-300";
+      return "info";
     case "Completed":
-      return "bg-emerald-900/60 text-emerald-300";
+      return "ok";
     case "Terminated":
-      return "bg-zinc-700 text-zinc-300";
+      return "neutral";
     default:
-      return "bg-zinc-700 text-zinc-300";
+      return "neutral";
   }
 }
 
@@ -61,10 +65,10 @@ export default function Explorer() {
 
   return (
     <div className="flex h-full">
-      <div className="flex w-[28rem] shrink-0 flex-col border-r border-zinc-800">
-        <header className="border-b border-zinc-800 px-5 py-4">
-          <h1 className="text-xl font-semibold">Process instances</h1>
-          <p className="text-xs text-zinc-500">
+      <div className="flex w-[28rem] shrink-0 flex-col border-r border-edge">
+        <header className="border-b border-edge px-5 py-4">
+          <h1 className="text-xl font-semibold text-fg">Process instances</h1>
+          <p className="text-xs text-fg-faint">
             {data
               ? total === 0
                 ? "0 instances"
@@ -73,12 +77,12 @@ export default function Explorer() {
           </p>
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
-          {isLoading && <p className="p-5 text-zinc-400">Loading…</p>}
+          {isLoading && <p className="p-5 text-fg-muted">Loading…</p>}
           {error && (
-            <p className="p-5 text-red-400">Failed to load: {String(error)}</p>
+            <p className="p-5 text-danger">Failed to load: {String(error)}</p>
           )}
           {data && data.items.length === 0 && (
-            <p className="p-5 text-zinc-500">
+            <p className="p-5 text-fg-faint">
               No instances yet. Deploy a process and create one.
             </p>
           )}
@@ -87,22 +91,17 @@ export default function Explorer() {
               <li key={inst.key}>
                 <button
                   onClick={() => setSelected(inst.key)}
-                  className={`flex w-full flex-col gap-1 border-b border-zinc-900 px-5 py-3 text-left hover:bg-zinc-900 ${
-                    selected === inst.key ? "bg-zinc-900" : ""
+                  className={`flex w-full flex-col gap-1 border-b border-edge px-5 py-3 text-left hover:bg-hover ${
+                    selected === inst.key ? "bg-accent/10" : ""
                   }`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-medium">{inst.process_id}</span>
-                    <span
-                      className={`rounded px-1.5 py-0.5 text-xs ${stateBadge(
-                        inst.state,
-                        inst.has_incident,
-                      )}`}
-                    >
+                    <span className="font-medium text-fg">{inst.process_id}</span>
+                    <Badge tone={stateTone(inst.state, inst.has_incident)}>
                       {inst.has_incident ? "Incident" : inst.state}
-                    </span>
+                    </Badge>
                   </div>
-                  <div className="font-mono text-xs text-zinc-500">
+                  <div className="font-mono text-xs text-fg-faint">
                     {inst.key} · v{inst.version}
                   </div>
                 </button>
@@ -111,24 +110,24 @@ export default function Explorer() {
           </ul>
         </div>
         {total > PAGE_SIZE && (
-          <footer className="flex items-center justify-between border-t border-zinc-800 px-5 py-3 text-xs">
-            <button
+          <footer className="flex items-center justify-between border-t border-edge px-5 py-3 text-xs">
+            <Button
+              size="sm"
               onClick={() => setPage((p) => Math.max(0, p - 1))}
               disabled={page === 0}
-              className="rounded border border-zinc-700 px-2 py-1 hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
             >
               ← Prev
-            </button>
-            <span className="text-zinc-500">
+            </Button>
+            <span className="text-fg-faint">
               Page {page + 1} of {pageCount}
             </span>
-            <button
+            <Button
+              size="sm"
               onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
               disabled={page >= pageCount - 1}
-              className="rounded border border-zinc-700 px-2 py-1 hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Next →
-            </button>
+            </Button>
           </footer>
         )}
       </div>
@@ -137,7 +136,7 @@ export default function Explorer() {
         {selected ? (
           <InstanceDetail instanceKey={selected} />
         ) : (
-          <div className="flex h-full items-center justify-center text-sm text-zinc-500">
+          <div className="flex h-full items-center justify-center text-sm text-fg-faint">
             Select an instance to inspect it.
           </div>
         )}

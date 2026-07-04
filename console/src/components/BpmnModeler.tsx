@@ -163,11 +163,14 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     }));
 
     return (
+      // The bpmn-js canvas + properties panel are light-themed third-party
+      // widgets, so both surfaces stay physically white (with a matching light
+      // divider) regardless of the console theme to keep diagrams legible.
       <div className="flex h-full w-full">
         <div ref={containerRef} className="h-full min-w-0 flex-1 bg-white" />
         <div
           ref={panelRef}
-          className="bpmn-properties h-full w-80 shrink-0 overflow-auto border-l border-zinc-300 bg-white"
+          className="bpmn-properties h-full w-80 shrink-0 overflow-auto border-l border-[#d4d4d8] bg-white"
         />
       </div>
     );

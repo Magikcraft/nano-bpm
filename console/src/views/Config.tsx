@@ -7,23 +7,27 @@ import {
   type ServerConfig,
   type SlaModeConfig,
 } from "../lib/api";
+import { useTheme } from "../theme/ThemeProvider";
+import { TOKEN_KEYS, type ThemeSpec } from "../theme/themes";
+import { Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
 
-type Tab = "server" | "ide";
+type Tab = "server" | "ide" | "appearance";
 
 export default function Config() {
   const [tab, setTab] = useState<Tab>("server");
   return (
     <div className="mx-auto max-w-4xl p-6">
-      <h1 className="mb-1 text-xl font-semibold text-zinc-100">Configuration</h1>
-      <p className="mb-4 text-sm text-zinc-500">
-        Server runtime behaviour and IDE toolchains for this node.
-      </p>
+      <PageHeader
+        title="Configuration"
+        subtitle="Server runtime behaviour, IDE toolchains, and the console's appearance."
+      />
 
-      <div className="mb-6 inline-flex rounded-lg border border-zinc-800 bg-zinc-900 p-1">
+      <div className="mb-6 inline-flex rounded-lg border border-edge bg-panel p-1">
         {(
           [
             ["server", "Server"],
             ["ide", "IDE"],
+            ["appearance", "Appearance"],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -31,8 +35,8 @@ export default function Config() {
             onClick={() => setTab(id)}
             className={`rounded-md px-4 py-1.5 text-sm transition-colors ${
               tab === id
-                ? "bg-zinc-800 text-white"
-                : "text-zinc-400 hover:text-zinc-200"
+                ? "bg-accent/10 font-medium text-accent-strong"
+                : "text-fg-muted hover:text-fg"
             }`}
           >
             {label}
@@ -40,7 +44,183 @@ export default function Config() {
         ))}
       </div>
 
-      {tab === "server" ? <ServerPane /> : <IdePane />}
+      {tab === "server" ? <ServerPane /> : tab === "ide" ? <IdePane /> : <AppearancePane />}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Appearance pane — light/dark/system modes, theme packs, custom theme import
+// ---------------------------------------------------------------------------
+
+/** Render a theme's key colours as chips so the gallery previews without applying. */
+function ThemeSwatch({ spec }: { spec: ThemeSpec }) {
+  const base =
+    spec.appearance === "dark"
+      ? { app: "#0b0b10", raised: "#16161f", text: "#f2f2f7", accent: "#8b5cf6" }
+      : { app: "#f5f5f9", raised: "#ffffff", text: "#1a1a22", accent: "#7c3aed" };
+  const t = { ...base, ...spec.tokens };
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-md border border-edge p-1"
+      style={{ background: t.app }}
+      aria-hidden="true"
+    >
+      {[t.raised, t.text, t.accent].map((c, i) => (
+        <span key={i} className="h-3.5 w-3.5 rounded-full" style={{ background: c }} />
+      ))}
+    </span>
+  );
+}
+
+const THEME_JSON_EXAMPLE = `{
+  "id": "my-theme",
+  "label": "My Theme",
+  "appearance": "dark",
+  "tokens": { "accent": "#f472b6", "app": "#0c0a12" }
+}`;
+
+function AppearancePane() {
+  const {
+    selection,
+    select,
+    packThemes,
+    importedThemes,
+    importTheme,
+    removeImportedTheme,
+  } = useTheme();
+  const [json, setJson] = useState("");
+  const [importErr, setImportErr] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  const modes = [
+    { mode: "light", label: "Light", blurb: "Bright surfaces, dark text." },
+    { mode: "dark", label: "Dark", blurb: "The classic console look." },
+    { mode: "system", label: "System", blurb: "Follow the OS appearance." },
+  ] as const;
+
+  const doImport = (text: string) => {
+    const err = importTheme(text);
+    setImportErr(err);
+    if (!err) setJson("");
+  };
+
+  const themeCard = (t: ThemeSpec, removable: boolean) => {
+    const active = selection.mode === "theme" && selection.id === t.id;
+    return (
+      <Card
+        key={t.id}
+        className={`flex items-center justify-between p-3 ${active ? "border-accent/60 ring-1 ring-accent/40" : ""}`}
+      >
+        <button
+          onClick={() => select({ mode: "theme", id: t.id })}
+          className="flex min-w-0 items-center gap-3 text-left"
+        >
+          <ThemeSwatch spec={t} />
+          <span>
+            <span className="block text-sm font-medium text-fg">{t.label}</span>
+            <span className="block text-xs text-fg-faint">
+              {t.appearance} base · {Object.keys(t.tokens).length} token
+              {Object.keys(t.tokens).length === 1 ? "" : "s"}
+            </span>
+          </span>
+        </button>
+        <div className="flex shrink-0 items-center gap-2">
+          {active && <span className="text-xs font-medium text-accent-strong">active</span>}
+          {removable && (
+            <Button variant="ghost" size="sm" onClick={() => removeImportedTheme(t.id)}>
+              remove
+            </Button>
+          )}
+        </div>
+      </Card>
+    );
+  };
+
+  return (
+    <div className="space-y-8">
+      <section>
+        <SectionLabel>Mode</SectionLabel>
+        <div className="grid gap-3 sm:grid-cols-3">
+          {modes.map((m) => {
+            const active = selection.mode === m.mode;
+            return (
+              <button
+                key={m.mode}
+                onClick={() => select({ mode: m.mode })}
+                className={`rounded-xl border p-4 text-left transition-colors ${
+                  active
+                    ? "border-accent/60 bg-accent/10"
+                    : "border-edge bg-raised hover:bg-hover"
+                }`}
+              >
+                <div className={`text-sm font-medium ${active ? "text-accent-strong" : "text-fg"}`}>
+                  {m.label}
+                </div>
+                <div className="mt-0.5 text-xs text-fg-faint">{m.blurb}</div>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      <section>
+        <SectionLabel>Theme packs</SectionLabel>
+        {packThemes.length > 0 ? (
+          <div className="grid gap-2">{packThemes.map((t) => themeCard(t, false))}</div>
+        ) : (
+          <p className="text-sm text-fg-faint">
+            No theme packs installed. Browse the{" "}
+            <a href="/console/extensions" className="text-accent-strong hover:underline">
+              extension marketplace
+            </a>{" "}
+            for <code className="font-mono text-xs">nano-ide-theme-*</code> packs, or import a
+            theme below.
+          </p>
+        )}
+      </section>
+
+      <section>
+        <SectionLabel>Imported themes</SectionLabel>
+        {importedThemes.length > 0 && (
+          <div className="mb-3 grid gap-2">{importedThemes.map((t) => themeCard(t, true))}</div>
+        )}
+        <Card className="p-3">
+          <div className="mb-2 text-xs text-fg-muted">
+            Paste a theme JSON (or load a <code className="font-mono">.json</code> file). Tokens:{" "}
+            <code className="font-mono text-[11px] text-fg-faint">{TOKEN_KEYS.join(" ")}</code>
+          </div>
+          <textarea
+            value={json}
+            onChange={(e) => setJson(e.target.value)}
+            placeholder={THEME_JSON_EXAMPLE}
+            rows={5}
+            spellCheck={false}
+            className="mb-2 w-full rounded-md border border-edge bg-inset px-3 py-2 font-mono text-xs text-fg placeholder:text-fg-faint outline-none focus:border-accent"
+          />
+          {importErr && <div className="mb-2"><ErrorText>{importErr}</ErrorText></div>}
+          <div className="flex items-center gap-2">
+            <Button variant="primary" size="sm" disabled={!json.trim()} onClick={() => doImport(json)}>
+              Import & apply
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => fileRef.current?.click()}>
+              Load file…
+            </Button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                void f.text().then(doImport);
+                e.target.value = "";
+              }}
+            />
+          </div>
+        </Card>
+      </section>
     </div>
   );
 }
@@ -58,23 +238,23 @@ function ServerPane() {
     configApi.server().then(setCfg).catch((e) => setErr(String(e)));
   }, []);
 
-  if (err) return <div className="text-sm text-rose-400">{err}</div>;
-  if (!cfg) return <div className="text-sm text-zinc-500">Loading…</div>;
+  if (err) return <ErrorText>{err}</ErrorText>;
+  if (!cfg) return <div className="text-sm text-fg-faint">Loading…</div>;
 
   return (
     <div>
       <div className="mb-4 flex items-center justify-between">
-        <div className="text-sm text-zinc-400">
+        <div className="text-sm text-fg-muted">
           The SLA mode is switchable live below; other parameters are set on
           startup via the environment.
         </div>
-        <div className="inline-flex rounded-md border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
+        <div className="inline-flex rounded-md border border-edge bg-panel p-0.5 text-xs">
           {(["basic", "advanced"] as const).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
               className={`rounded px-3 py-1 capitalize transition-colors ${
-                mode === m ? "bg-zinc-800 text-white" : "text-zinc-400 hover:text-zinc-200"
+                mode === m ? "bg-accent/10 font-medium text-accent-strong" : "text-fg-muted hover:text-fg"
               }`}
             >
               {m}
@@ -96,6 +276,8 @@ function ServerPane() {
 // server's current mode. When the server reports `switchable`, turning the knob
 // applies the mode live (and the server propagates it cluster-wide); otherwise
 // it previews the alternative and shows how to apply it on startup.
+// The pedal chassis is deliberately skeuomorphic "hardware" — its metals and
+// LED colours are fixed rather than theme-token driven.
 function SlaPedal({
   sla,
   onApplied,
@@ -193,7 +375,7 @@ function SlaPedal({
               boxShadow: `0 0 8px ${idx === 0 ? "#f59e0b" : "#22d3ee"}`,
             }}
           />
-          <span className="text-[9px] uppercase tracking-widest text-zinc-500">
+          <span className="text-[9px] uppercase tracking-widest text-[#a1a1aa]">
             {idx === 0 ? "latency" : "admission"}
           </span>
         </div>
@@ -247,7 +429,7 @@ function SlaPedal({
         </div>
 
         {/* detent labels */}
-        <div className="mt-2 flex justify-between text-[9px] uppercase tracking-wider text-zinc-500">
+        <div className="mt-2 flex justify-between text-[9px] uppercase tracking-wider text-[#a1a1aa]">
           <button className="hover:text-amber-300" onClick={() => select(sla.options[0].id)}>
             ◄ reject
           </button>
@@ -259,45 +441,45 @@ function SlaPedal({
 
       {/* Explanation + apply hint */}
       <div className="flex-1">
-        <div className="mb-1 text-sm font-semibold text-zinc-100">{selected.label}</div>
-        <div className="mb-3 text-xs uppercase tracking-wider text-violet-300/80">
+        <div className="mb-1 text-sm font-semibold text-fg">{selected.label}</div>
+        <div className="mb-3 text-xs uppercase tracking-wider text-accent-strong/80">
           {selected.tagline}
         </div>
-        <p className="mb-4 text-sm leading-relaxed text-zinc-400">{selected.description}</p>
+        <p className="mb-4 text-sm leading-relaxed text-fg-muted">{selected.description}</p>
 
-        <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-3 text-xs text-zinc-400">
+        <div className="rounded-lg border border-edge bg-raised p-3 text-xs text-fg-muted">
           <div className="mb-1">
             Current:{" "}
-            <span className="font-mono text-zinc-200">{sla.current}</span>{" "}
-            <span className="text-zinc-600">
+            <span className="font-mono text-fg">{sla.current}</span>{" "}
+            <span className="text-fg-faint">
               (source: {sla.source === "default" ? "default" : "environment"})
             </span>
           </div>
           {sla.switchable ? (
             applyErr ? (
-              <div className="text-rose-400">Switch failed: {applyErr}</div>
+              <div className="text-danger">Switch failed: {applyErr}</div>
             ) : applying ? (
-              <div className="text-cyan-400">Applying {preview} across the cluster…</div>
+              <div className="text-info">Applying {preview} across the cluster…</div>
             ) : (
-              <div className="text-emerald-400">
+              <div className="text-ok">
                 Live. Turning the knob switches the mode immediately and propagates
                 it cluster-wide. On restart it reseeds from{" "}
-                <code className="rounded bg-black/40 px-1 py-0.5 font-mono text-emerald-300">
+                <code className="rounded bg-inset px-1 py-0.5 font-mono text-ok">
                   NANOBPMN_SLA_MODE
                 </code>
                 .
               </div>
             )
           ) : changed ? (
-            <div className="text-amber-400">
+            <div className="text-warn">
               Preview only. To apply, restart with{" "}
-              <code className="rounded bg-black/40 px-1 py-0.5 font-mono text-amber-300">
+              <code className="rounded bg-inset px-1 py-0.5 font-mono text-warn">
                 NANOBPMN_SLA_MODE={preview}
               </code>
               .
             </div>
           ) : (
-            <div className="text-zinc-500">
+            <div className="text-fg-faint">
               Turn the knob to preview the other mode; the mode is set on startup.
             </div>
           )}
@@ -321,34 +503,32 @@ function AdvancedParams({ cfg }: { cfg: ServerConfig }) {
     <div className="space-y-6">
       {groups.map(([cat, params]) => (
         <section key={cat}>
-          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-            {cat}
-          </h2>
-          <div className="overflow-hidden rounded-lg border border-zinc-800">
+          <SectionLabel>{cat}</SectionLabel>
+          <div className="overflow-hidden rounded-lg border border-edge">
             <table className="w-full text-sm">
               <tbody>
                 {params.map((p, i) => (
                   <tr
                     key={p.key}
-                    className={i % 2 ? "bg-zinc-900/40" : "bg-zinc-900/10"}
+                    className={i % 2 ? "bg-raised/60" : "bg-raised/20"}
                   >
-                    <td className="w-1/3 border-b border-zinc-800/60 px-3 py-2 align-top">
-                      <div className="text-zinc-200">{p.label}</div>
-                      <div className="font-mono text-[11px] text-zinc-600">{p.key}</div>
+                    <td className="w-1/3 border-b border-edge/60 px-3 py-2 align-top">
+                      <div className="text-fg">{p.label}</div>
+                      <div className="font-mono text-[11px] text-fg-faint">{p.key}</div>
                     </td>
-                    <td className="border-b border-zinc-800/60 px-3 py-2 align-top">
+                    <td className="border-b border-edge/60 px-3 py-2 align-top">
                       <div className="mb-0.5 flex items-center gap-2">
                         {p.value !== null ? (
-                          <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-xs text-emerald-300">
+                          <span className="rounded bg-ok/10 px-1.5 py-0.5 font-mono text-xs text-ok">
                             {p.value}
                           </span>
                         ) : (
-                          <span className="font-mono text-xs text-zinc-500">
+                          <span className="font-mono text-xs text-fg-faint">
                             default: {p.default}
                           </span>
                         )}
                       </div>
-                      <div className="text-xs text-zinc-500">{p.description}</div>
+                      <div className="text-xs text-fg-faint">{p.description}</div>
                     </td>
                   </tr>
                 ))}
@@ -373,8 +553,8 @@ function IdePane() {
     configApi.ide().then(setCfg).catch((e) => setErr(String(e)));
   }, []);
 
-  if (err) return <div className="text-sm text-rose-400">{err}</div>;
-  if (!cfg) return <div className="text-sm text-zinc-500">Loading…</div>;
+  if (err) return <ErrorText>{err}</ErrorText>;
+  if (!cfg) return <div className="text-sm text-fg-faint">Loading…</div>;
 
   const missing = cfg.dependencies.filter((d) => !d.present);
 
@@ -382,9 +562,7 @@ function IdePane() {
     <div className="space-y-6">
       {missing.length > 0 && (
         <section>
-          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-            Missing dependencies
-          </h2>
+          <SectionLabel>Missing dependencies</SectionLabel>
           <div className="space-y-2">
             {missing.map((d) => (
               <DepCard key={d.id} d={d} />
@@ -394,9 +572,7 @@ function IdePane() {
       )}
 
       <section>
-        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          Toolchains
-        </h2>
+        <SectionLabel>Toolchains</SectionLabel>
         <div className="space-y-2">
           {cfg.dependencies.map((d) => (
             <ToolchainRow key={d.id} d={d} />
@@ -405,9 +581,7 @@ function IdePane() {
       </section>
 
       <section>
-        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-          Language packs
-        </h2>
+        <SectionLabel>Language packs</SectionLabel>
         <div className="space-y-3">
           {cfg.langPacks.map((p) => (
             <LangPackCard key={p.id} p={p} />
@@ -420,17 +594,17 @@ function IdePane() {
 
 function DepCard({ d }: { d: ConfigDependency }) {
   return (
-    <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+    <div className="rounded-lg border border-warn/30 bg-warn/5 p-3">
       <div className="text-sm">
-        <span className="font-semibold text-amber-300">{d.name} is not installed.</span>{" "}
-        <span className="text-zinc-400">{d.purpose}</span>
+        <span className="font-semibold text-warn">{d.name} is not installed.</span>{" "}
+        <span className="text-fg-muted">{d.purpose}</span>
       </div>
-      <div className="mt-1 text-xs text-zinc-400">{d.hint}</div>
+      <div className="mt-1 text-xs text-fg-muted">{d.hint}</div>
       <a
         href={d.installUrl}
         target="_blank"
         rel="noopener noreferrer"
-        className="mt-2 inline-block text-xs font-medium text-violet-300 hover:text-violet-200"
+        className="mt-2 inline-block text-xs font-medium text-accent-strong hover:underline"
       >
         Install instructions →
       </a>
@@ -440,22 +614,22 @@ function DepCard({ d }: { d: ConfigDependency }) {
 
 function ToolchainRow({ d }: { d: ConfigDependency }) {
   return (
-    <div className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/40 px-3 py-2">
+    <div className="flex items-center justify-between rounded-lg border border-edge bg-raised px-3 py-2">
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span
             className={`inline-block h-2 w-2 rounded-full ${
-              d.present ? "bg-emerald-400" : "bg-zinc-600"
+              d.present ? "bg-ok" : "bg-fg-faint/50"
             }`}
           />
-          <span className="text-sm text-zinc-200">{d.name}</span>
+          <span className="text-sm text-fg">{d.name}</span>
         </div>
-        <div className="truncate font-mono text-[11px] text-zinc-500">
+        <div className="truncate font-mono text-[11px] text-fg-faint">
           {d.present ? d.version ?? d.bin : d.bin}
         </div>
       </div>
       {d.present ? (
-        <span className="rounded bg-emerald-500/10 px-2 py-0.5 text-xs text-emerald-300">
+        <span className="rounded bg-ok/10 px-2 py-0.5 text-xs text-ok">
           installed
         </span>
       ) : (
@@ -463,7 +637,7 @@ function ToolchainRow({ d }: { d: ConfigDependency }) {
           href={d.installUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="text-xs font-medium text-violet-300 hover:text-violet-200"
+          className="text-xs font-medium text-accent-strong hover:underline"
         >
           Install →
         </a>
@@ -474,12 +648,12 @@ function ToolchainRow({ d }: { d: ConfigDependency }) {
 
 function LangPackCard({ p }: { p: LangPackConfig }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+    <div className="rounded-lg border border-edge bg-raised p-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium text-zinc-100">{p.displayName}</span>
+          <span className="text-sm font-medium text-fg">{p.displayName}</span>
           {p.builtin && (
-            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-zinc-400">
+            <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-fg-muted">
               built-in
             </span>
           )}
@@ -487,8 +661,8 @@ function LangPackCard({ p }: { p: LangPackConfig }) {
         <span
           className={`rounded px-2 py-0.5 text-xs ${
             p.available
-              ? "bg-emerald-500/10 text-emerald-300"
-              : "bg-amber-500/10 text-amber-300"
+              ? "bg-ok/10 text-ok"
+              : "bg-warn/10 text-warn"
           }`}
         >
           {p.available ? "ready" : "toolchain missing"}
@@ -496,32 +670,32 @@ function LangPackCard({ p }: { p: LangPackConfig }) {
       </div>
 
       {p.detect.length > 0 && (
-        <div className="mt-1 font-mono text-[11px] text-zinc-600">
+        <div className="mt-1 font-mono text-[11px] text-fg-faint">
           probe: {p.detect.join(" ")}
         </div>
       )}
 
       {p.configFields.length > 0 && (
-        <div className="mt-3 space-y-2 border-t border-zinc-800 pt-2">
+        <div className="mt-3 space-y-2 border-t border-edge pt-2">
           {p.configFields.map((f) => (
             <div key={f.key} className="text-xs">
               <div className="flex items-center gap-2">
-                <span className="text-zinc-300">{f.label}</span>
+                <span className="text-fg">{f.label}</span>
                 {f.value !== null ? (
-                  <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 font-mono text-emerald-300">
+                  <span className="rounded bg-ok/10 px-1.5 py-0.5 font-mono text-ok">
                     {f.value}
                   </span>
                 ) : (
-                  <span className="font-mono text-zinc-500">
+                  <span className="font-mono text-fg-faint">
                     default: {f.default ?? "—"}
                   </span>
                 )}
                 {f.env && (
-                  <span className="font-mono text-[10px] text-zinc-600">{f.env}</span>
+                  <span className="font-mono text-[10px] text-fg-faint">{f.env}</span>
                 )}
               </div>
               {f.description && (
-                <div className="text-zinc-500">{f.description}</div>
+                <div className="text-fg-faint">{f.description}</div>
               )}
             </div>
           ))}

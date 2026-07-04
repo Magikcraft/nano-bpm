@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import { nodeConsoleUrl } from "../lib/api";
 import { metricsStore } from "../lib/metricsStore";
+import { Badge, Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
 
 export default function Metrics() {
   const state = useSyncExternalStore(metricsStore.subscribe, metricsStore.getSnapshot);
@@ -14,37 +15,31 @@ export default function Metrics() {
 
   return (
     <div className="p-8">
-      <header className="mb-6 flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Metrics</h1>
-          <p className="text-sm text-zinc-500">
+      <PageHeader
+        title="Metrics"
+        subtitle={
+          <>
             Live throughput &amp; durability, sourced from the Prometheus surface
             {" · "}
-            <a className="underline hover:text-zinc-300" href="/metrics">
+            <a className="underline hover:text-fg" href="/metrics">
               /metrics
             </a>
-          </p>
-        </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => metricsStore.setPaused(!paused)}
-            className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800"
-          >
-            {paused ? "Resume" : "Pause"}
-          </button>
-          <button
-            onClick={reset}
-            className="rounded-md border border-zinc-700 px-3 py-1.5 text-sm hover:bg-zinc-800"
-          >
-            Clear
-          </button>
-        </div>
-      </header>
+          </>
+        }
+        actions={
+          <>
+            <Button size="sm" onClick={() => metricsStore.setPaused(!paused)}>
+              {paused ? "Resume" : "Pause"}
+            </Button>
+            <Button size="sm" onClick={reset}>
+              Clear
+            </Button>
+          </>
+        }
+      />
 
-      {isLoading && !data && <p className="text-zinc-400">Loading…</p>}
-      {error && (
-        <p className="text-red-400">Failed to load metrics: {String(error)}</p>
-      )}
+      {isLoading && !data && <p className="text-fg-muted">Loading…</p>}
+      {error && <ErrorText>Failed to load metrics: {String(error)}</ErrorText>}
 
       {data && (
         <div className="space-y-8">
@@ -68,31 +63,29 @@ export default function Metrics() {
           <section className="grid gap-4 lg:grid-cols-2">
             <Chart
               title="Process starts / s"
-              color="#34d399"
+              color="var(--nano-ok)"
               values={samples.map((s) => s.startsPerSec)}
             />
             <Chart
               title="Jobs completed / s"
-              color="#38bdf8"
+              color="var(--nano-info)"
               values={samples.map((s) => s.jobsPerSec)}
             />
             <Chart
               title="Active processes"
-              color="#a78bfa"
+              color="var(--nano-accent-strong)"
               values={samples.map((s) => s.active)}
             />
             <Chart
               title="Commit pipeline depth (in-flight)"
-              color="#fbbf24"
+              color="var(--nano-warn)"
               values={samples.map((s) => s.inflight)}
             />
           </section>
 
           {/* Totals & durability */}
           <section>
-            <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-              Totals
-            </h2>
+            <SectionLabel>Totals</SectionLabel>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
               <Stat label="Instances created" value={data.createsTotal.toLocaleString()} sub={`rest ${data.createsRest.toLocaleString()} · stream ${data.createsStream.toLocaleString()}`} />
               <Stat label="Jobs completed" value={data.completionsTotal.toLocaleString()} sub={`rest ${data.completionsRest.toLocaleString()} · stream ${data.completionsStream.toLocaleString()}`} />
@@ -107,11 +100,9 @@ export default function Metrics() {
           {/* Cluster breakdown (only when this is a multi-node cluster) */}
           {isCluster && cluster && (
             <section>
-              <div className="mb-3 flex items-baseline justify-between">
-                <h2 className="text-sm font-medium uppercase tracking-wide text-zinc-500">
-                  Cluster
-                </h2>
-                <span className="text-xs text-zinc-500">
+              <div className="mb-1 flex items-baseline justify-between">
+                <SectionLabel>Cluster</SectionLabel>
+                <span className="text-xs text-fg-faint">
                   {cluster.aggregate.reachableNodes}/{cluster.aggregate.totalNodes} nodes up
                 </span>
               </div>
@@ -122,10 +113,10 @@ export default function Metrics() {
                 <Stat label="Clients (cluster)" value={cluster.aggregate.connectionsActive.toLocaleString()} />
                 <Stat label="Memory (cluster)" value={fmtBytes(cluster.aggregate.residentBytes)} />
               </div>
-              <div className="overflow-x-auto rounded-lg border border-zinc-800">
+              <div className="overflow-x-auto rounded-lg border border-edge">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="border-b border-zinc-800 text-left text-zinc-500">
+                    <tr className="border-b border-edge text-left text-fg-faint">
                       <th className="px-3 py-2 font-medium">Node</th>
                       <th className="px-3 py-2 font-medium">Status</th>
                       <th className="px-3 py-2 text-right font-medium">Active</th>
@@ -142,7 +133,7 @@ export default function Metrics() {
                         ? null
                         : nodeConsoleUrl(n.address, "/metrics");
                       return (
-                      <tr key={n.nodeId} className="border-b border-zinc-900 last:border-0">
+                      <tr key={n.nodeId} className="border-b border-edge last:border-0">
                         <td className="px-3 py-2">
                           <div className="flex items-center gap-2">
                             {href ? (
@@ -151,30 +142,26 @@ export default function Metrics() {
                                 target="_blank"
                                 rel="noreferrer"
                                 title={`Open node ${n.nodeId} console (${n.address})`}
-                                className="font-medium text-sky-400 hover:underline"
+                                className="font-medium text-info hover:underline"
                               >
                                 node {n.nodeId} ↗
                               </a>
                             ) : (
                               <span className="font-medium">node {n.nodeId}</span>
                             )}
-                            {n.isSelf && (
-                              <span className="rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
-                                this
-                              </span>
-                            )}
+                            {n.isSelf && <Badge tone="ok">this</Badge>}
                           </div>
                           {n.address && (
-                            <div className="mt-0.5 text-xs text-zinc-500">
+                            <div className="mt-0.5 text-xs text-fg-faint">
                               {n.address}
                             </div>
                           )}
                         </td>
                         <td className="px-3 py-2">
                           {n.reachable ? (
-                            <span className="text-emerald-400">● up</span>
+                            <span className="text-ok">● up</span>
                           ) : (
-                            <span className="text-red-400" title={n.error ?? ""}>
+                            <span className="text-danger" title={n.error ?? ""}>
                               ● {n.error ?? "down"}
                             </span>
                           )}
@@ -195,9 +182,7 @@ export default function Metrics() {
           )}
 
           <section>
-            <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-              Durability &amp; latency (means)
-            </h2>
+            <SectionLabel>Durability &amp; latency (means)</SectionLabel>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
               <Stat label="fsync mean" value={`${fmt(data.fsyncMeanMs, 2)} ms`} />
               <Stat label="Commit wait mean" value={`${fmt(data.commitWaitMeanMs, 2)} ms`} />
@@ -233,8 +218,8 @@ function fmtBytes(n: number): string {
 }
 
 const ACCENTS: Record<string, string> = {
-  emerald: "text-emerald-400",
-  sky: "text-sky-400",
+  emerald: "text-ok",
+  sky: "text-info",
 };
 
 function Stat({
@@ -249,13 +234,13 @@ function Stat({
   accent?: string;
 }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-3">
-      <div className="text-xs uppercase tracking-wide text-zinc-500">{label}</div>
+    <Card className="px-4 py-3">
+      <div className="text-xs uppercase tracking-wide text-fg-faint">{label}</div>
       <div className={`mt-1 text-2xl font-semibold tabular-nums ${accent ? ACCENTS[accent] : ""}`}>
         {value}
       </div>
-      {sub && <div className="mt-0.5 text-xs text-zinc-500">{sub}</div>}
-    </div>
+      {sub && <div className="mt-0.5 text-xs text-fg-faint">{sub}</div>}
+    </Card>
   );
 }
 
@@ -277,7 +262,7 @@ function Chart({
   const last = values[values.length - 1] ?? 0;
 
   let body: React.ReactNode = (
-    <text x={W / 2} y={H / 2} fill="#52525b" fontSize="13" textAnchor="middle">
+    <text x={W / 2} y={H / 2} fill="var(--nano-text-faint)" fontSize="13" textAnchor="middle">
       collecting…
     </text>
   );
@@ -307,9 +292,9 @@ function Chart({
   }
 
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4">
+    <Card className="p-4">
       <div className="mb-2 flex items-baseline justify-between">
-        <span className="text-sm text-zinc-400">{title}</span>
+        <span className="text-sm text-fg-muted">{title}</span>
         <span className="text-sm font-semibold tabular-nums" style={{ color }}>
           {fmt(last, last < 10 ? 1 : 0)}
         </span>
@@ -321,6 +306,6 @@ function Chart({
       >
         {body}
       </svg>
-    </div>
+    </Card>
   );
 }

@@ -9,6 +9,7 @@ import {
 } from "../lib/api";
 import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
+import { Button, PageHeader } from "../components/ui";
 
 // Monaco is multi-MB; load it as a separate chunk only when an editor is shown
 // so the initial console bundle stays lean.
@@ -17,13 +18,13 @@ const CodeEditor = lazy(() => import("../components/CodeEditor"));
 function phaseBadge(phase: WorkerPhase): { label: string; cls: string; dot: string } {
   switch (phase) {
     case "running":
-      return { label: "Running", cls: "bg-emerald-900/60 text-emerald-300", dot: "bg-emerald-400" };
+      return { label: "Running", cls: "bg-ok/10 text-ok", dot: "bg-ok" };
     case "starting":
-      return { label: "Starting", cls: "bg-sky-900/60 text-sky-300", dot: "bg-sky-400 animate-pulse" };
+      return { label: "Starting", cls: "bg-info/10 text-info", dot: "bg-info animate-pulse" };
     case "crashed":
-      return { label: "Crashed", cls: "bg-red-900/60 text-red-300", dot: "bg-red-400" };
+      return { label: "Crashed", cls: "bg-danger/10 text-danger", dot: "bg-danger" };
     case "stopped":
-      return { label: "Stopped", cls: "bg-zinc-700 text-zinc-300", dot: "bg-zinc-500" };
+      return { label: "Stopped", cls: "bg-hover text-fg-muted", dot: "bg-fg-faint" };
   }
 }
 
@@ -153,31 +154,32 @@ export default function Workers() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
-        <div>
-          <h1 className="text-lg font-semibold">Embedded Workers</h1>
-          <p className="text-xs text-zinc-500">
-            Author TypeScript job workers and run them as sandboxed Deno processes over the
-            Falcon.
-          </p>
-        </div>
-        <div className="flex gap-1 rounded-lg bg-zinc-900 p-1 text-sm">
-          {(["editor", "running"] as const).map((t) => (
-            <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`rounded-md px-3 py-1 transition-colors ${
-                tab === t ? "bg-zinc-700 text-white" : "text-zinc-400 hover:text-zinc-200"
-              }`}
-            >
-              {t === "running" ? "Running" : "Editor"}
-            </button>
-          ))}
-        </div>
-      </header>
+      <div className="border-b border-edge px-6 pt-4">
+        <PageHeader
+          title="Embedded Workers"
+          subtitle="Author TypeScript job workers and run them as sandboxed Deno processes over the Falcon."
+          actions={
+            <div className="flex gap-1 rounded-lg bg-inset p-1 text-sm">
+              {(["editor", "running"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`rounded-md px-3 py-1 transition-colors ${
+                    tab === t
+                      ? "bg-accent/10 font-medium text-accent-strong"
+                      : "text-fg-muted hover:text-fg"
+                  }`}
+                >
+                  {t === "running" ? "Running" : "Editor"}
+                </button>
+              ))}
+            </div>
+          }
+        />
+      </div>
 
       {!denoAvailable && (
-        <div className="border-b border-amber-900/50 bg-amber-950/40 px-6 py-2 text-xs text-amber-300">
+        <div className="border-b border-warn/30 bg-warn/10 px-6 py-2 text-xs text-warn">
           Deno runtime not found — you can author workers, but starting them requires Deno on PATH
           (or set NANOBPMN_DENO_BIN). Install from https://deno.com.
         </div>
@@ -186,8 +188,8 @@ export default function Workers() {
         <div
           className={`border-b px-6 py-2 text-xs ${
             message.kind === "ok"
-              ? "border-emerald-900/50 bg-emerald-950/40 text-emerald-300"
-              : "border-red-900/50 bg-red-950/40 text-red-300"
+              ? "border-ok/30 bg-ok/10 text-ok"
+              : "border-danger/30 bg-danger/10 text-danger"
           }`}
         >
           {message.text}
@@ -199,9 +201,9 @@ export default function Workers() {
       ) : (
         <div className="flex min-h-0 flex-1">
           {/* Worker library */}
-          <aside className="flex w-60 shrink-0 flex-col border-r border-zinc-800">
+          <aside className="flex w-60 shrink-0 flex-col border-r border-edge">
             <div className="flex items-center justify-between px-3 py-2">
-              <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+              <span className="text-xs font-medium uppercase tracking-wide text-fg-faint">
                 Workers
               </span>
               <div className="flex gap-1">
@@ -209,14 +211,14 @@ export default function Workers() {
                   onClick={openExport}
                   disabled={busy || workers.length === 0}
                   title="Export selected workers as a standalone Deno application"
-                  className="rounded bg-zinc-700 px-2 py-0.5 text-xs hover:bg-zinc-600 disabled:opacity-50"
+                  className="rounded border border-edge-strong bg-raised px-2 py-0.5 text-xs text-fg hover:bg-hover disabled:opacity-50"
                 >
                   Export app
                 </button>
                 <button
                   onClick={newWorker}
                   disabled={busy}
-                  className="rounded bg-zinc-700 px-2 py-0.5 text-xs hover:bg-zinc-600 disabled:opacity-50"
+                  className="rounded border border-edge-strong bg-raised px-2 py-0.5 text-xs text-fg hover:bg-hover disabled:opacity-50"
                 >
                   + New
                 </button>
@@ -224,7 +226,7 @@ export default function Workers() {
             </div>
             <ul className="min-h-0 flex-1 overflow-auto">
               {workers.length === 0 && (
-                <li className="px-3 py-2 text-xs text-zinc-600">No workers yet.</li>
+                <li className="px-3 py-2 text-xs text-fg-faint">No workers yet.</li>
               )}
               {workers.map((w) => {
                 const b = phaseBadge(w.runtime.status);
@@ -236,7 +238,9 @@ export default function Workers() {
                         setShowLib(false);
                       }}
                       className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
-                        selected === w.name && !showLib ? "bg-zinc-800" : "hover:bg-zinc-800/50"
+                        selected === w.name && !showLib
+                          ? "bg-accent/10 font-medium text-accent-strong"
+                          : "hover:bg-hover"
                       }`}
                     >
                       <span className={`h-2 w-2 shrink-0 rounded-full ${b.dot}`} />
@@ -247,16 +251,16 @@ export default function Workers() {
               })}
             </ul>
             {/* Shared library — author once, import from any worker via `@lib/…`. */}
-            <div className="border-t border-zinc-800">
+            <div className="border-t border-edge">
               <button
                 onClick={() => setShowLib(true)}
                 className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
-                  showLib ? "bg-zinc-800" : "hover:bg-zinc-800/50"
+                  showLib ? "bg-accent/10 font-medium text-accent-strong" : "hover:bg-hover"
                 }`}
               >
-                <span className="text-zinc-500">📚</span>
+                <span className="text-fg-faint">📚</span>
                 <span className="min-w-0 flex-1 truncate">Shared library</span>
-                <span className="font-mono text-[10px] text-zinc-600">@lib/</span>
+                <span className="font-mono text-[10px] text-fg-faint">@lib/</span>
               </button>
             </div>
           </aside>
@@ -277,7 +281,7 @@ export default function Workers() {
                 flash={flash}
               />
             ) : (
-              <div className="flex flex-1 items-center justify-center text-sm text-zinc-600">
+              <div className="flex flex-1 items-center justify-center text-sm text-fg-faint">
                 Select a worker, or create one to start authoring.
               </div>
             )}
@@ -291,12 +295,12 @@ export default function Workers() {
           onClick={() => setExportSel(null)}
         >
           <div
-            className="w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 shadow-xl"
+            className="w-full max-w-md rounded-lg border border-edge-strong bg-panel shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="border-b border-zinc-800 px-5 py-3">
-              <h2 className="text-sm font-semibold">Export workers as an application</h2>
-              <p className="mt-1 text-xs text-zinc-500">
+            <div className="border-b border-edge px-5 py-3">
+              <h2 className="text-sm font-semibold text-fg">Export workers as an application</h2>
+              <p className="mt-1 text-xs text-fg-faint">
                 Bundle the selected workers into a self-contained Deno app. The downloaded
                 zip deploys every model in its <code>resources/</code> folder on startup,
                 then runs the workers. Requires Deno to run.
@@ -316,22 +320,20 @@ export default function Workers() {
                 </li>
               ))}
             </ul>
-            <div className="flex items-center justify-between gap-2 border-t border-zinc-800 px-5 py-3">
-              <span className="text-xs text-zinc-500">{exportSel.size} selected</span>
+            <div className="flex items-center justify-between gap-2 border-t border-edge px-5 py-3">
+              <span className="text-xs text-fg-faint">{exportSel.size} selected</span>
               <div className="flex gap-2">
-                <button
-                  onClick={() => setExportSel(null)}
-                  className="rounded bg-zinc-700 px-3 py-1 text-xs hover:bg-zinc-600"
-                >
+                <Button size="sm" onClick={() => setExportSel(null)}>
                   Cancel
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
                   onClick={doExport}
                   disabled={busy || exportSel.size === 0}
-                  className="rounded bg-emerald-700 px-3 py-1 text-xs hover:bg-emerald-600 disabled:opacity-50"
                 >
                   Download zip
-                </button>
+                </Button>
               </div>
             </div>
           </div>
@@ -355,8 +357,8 @@ function RunningTab({
   return (
     <div className="min-h-0 flex-1 overflow-auto p-6">
       <table className="w-full text-left text-sm">
-        <thead className="text-xs uppercase tracking-wide text-zinc-500">
-          <tr className="border-b border-zinc-800">
+        <thead className="text-xs uppercase tracking-wide text-fg-faint">
+          <tr className="border-b border-edge">
             <th className="py-2 pr-4">Worker</th>
             <th className="py-2 pr-4">Status</th>
             <th className="py-2 pr-4">Completed</th>
@@ -371,7 +373,7 @@ function RunningTab({
         <tbody>
           {workers.length === 0 && (
             <tr>
-              <td colSpan={9} className="py-4 text-zinc-600">
+              <td colSpan={9} className="py-4 text-fg-faint">
                 No workers.
               </td>
             </tr>
@@ -381,7 +383,7 @@ function RunningTab({
             const m = w.runtime.metrics;
             const active = w.runtime.status === "running" || w.runtime.status === "starting";
             return (
-              <tr key={w.name} className="border-b border-zinc-800/60">
+              <tr key={w.name} className="border-b border-edge/60">
                 <td className="py-2 pr-4 font-medium">{w.name}</td>
                 <td className="py-2 pr-4">
                   <span className={`rounded px-1.5 py-0.5 text-xs ${b.cls}`}>{b.label}</span>
@@ -399,7 +401,7 @@ function RunningTab({
                     <button
                       onClick={() => onStop(w.name)}
                       disabled={busy}
-                      className="rounded bg-zinc-700 px-2 py-0.5 text-xs hover:bg-zinc-600 disabled:opacity-50"
+                      className="rounded border border-edge-strong bg-raised px-2 py-0.5 text-xs text-fg hover:bg-hover disabled:opacity-50"
                     >
                       Stop
                     </button>
@@ -407,7 +409,7 @@ function RunningTab({
                     <button
                       onClick={() => onStart(w.name)}
                       disabled={busy}
-                      className="rounded bg-emerald-700 px-2 py-0.5 text-xs hover:bg-emerald-600 disabled:opacity-50"
+                      className="rounded border border-ok/30 bg-ok/10 px-2 py-0.5 text-xs font-medium text-ok hover:bg-ok/20 disabled:opacity-50"
                     >
                       Start
                     </button>
@@ -419,12 +421,12 @@ function RunningTab({
         </tbody>
       </table>
       {workers.some((w) => w.runtime.lastError) && (
-        <div className="mt-4 space-y-1 text-xs text-red-300/80">
+        <div className="mt-4 space-y-1 text-xs text-danger/80">
           {workers
             .filter((w) => w.runtime.lastError)
             .map((w) => (
               <div key={w.name}>
-                <span className="text-zinc-500">{w.name}:</span> {w.runtime.lastError}
+                <span className="text-fg-faint">{w.name}:</span> {w.runtime.lastError}
               </div>
             ))}
         </div>
@@ -560,11 +562,11 @@ function WorkerEditor({
   return (
     <>
       {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800 px-4 py-2">
-        <span className="font-medium">{worker.name}</span>
+      <div className="flex flex-wrap items-center gap-2 border-b border-edge px-4 py-2">
+        <span className="font-medium text-fg">{worker.name}</span>
         <span className={`rounded px-1.5 py-0.5 text-xs ${b.cls}`}>{b.label}</span>
         <div className="flex-1" />
-        <span className="text-xs text-zinc-500">
+        <span className="text-xs text-fg-faint">
           {m.completed} done · {m.failed} failed · {m.throughput.toFixed(1)}/s
           {active ? ` · up ${fmtUptime(m.uptimeMs)}` : ""}
         </span>
@@ -572,7 +574,7 @@ function WorkerEditor({
           <button
             onClick={onStop}
             disabled={busy}
-            className="rounded bg-zinc-700 px-3 py-1 text-xs hover:bg-zinc-600 disabled:opacity-50"
+            className="rounded border border-edge-strong bg-raised px-3 py-1 text-xs text-fg hover:bg-hover disabled:opacity-50"
           >
             Stop
           </button>
@@ -580,7 +582,7 @@ function WorkerEditor({
           <button
             onClick={onStart}
             disabled={busy}
-            className="rounded bg-emerald-700 px-3 py-1 text-xs hover:bg-emerald-600 disabled:opacity-50"
+            className="rounded border border-ok/30 bg-ok/10 px-3 py-1 text-xs font-medium text-ok hover:bg-ok/20 disabled:opacity-50"
           >
             Start
           </button>
@@ -589,39 +591,41 @@ function WorkerEditor({
           onClick={onDelete}
           disabled={busy || active}
           title={active ? "Stop the worker before deleting" : "Delete worker"}
-          className="rounded bg-red-900/70 px-3 py-1 text-xs hover:bg-red-800 disabled:opacity-40"
+          className="rounded border border-danger/30 bg-danger/10 px-3 py-1 text-xs text-danger hover:bg-danger/20 disabled:opacity-40"
         >
           Delete
         </button>
       </div>
 
       {/* File tabs */}
-      <div className="flex items-center gap-1 border-b border-zinc-800 px-3 py-1.5 text-xs">
+      <div className="flex items-center gap-1 border-b border-edge px-3 py-1.5 text-xs">
         {worker.files.map((f) => (
           <button
             key={f}
             onClick={() => setFile(f)}
             className={`rounded px-2 py-1 font-mono ${
-              file === f ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-800"
+              file === f
+                ? "bg-accent/10 font-medium text-accent-strong"
+                : "text-fg-muted hover:bg-hover"
             }`}
           >
             {f}
           </button>
         ))}
-        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-zinc-500 hover:text-zinc-200">
+        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-fg-faint hover:text-fg">
           + file
         </button>
         <div className="flex-1" />
         <button
           onClick={deleteFile}
-          className="rounded px-2 py-1 text-zinc-500 hover:text-red-300"
+          className="rounded px-2 py-1 text-fg-faint hover:text-danger"
         >
           delete file
         </button>
         <button
           onClick={save}
           disabled={!dirty}
-          className="rounded bg-sky-700 px-3 py-1 text-white hover:bg-sky-600 disabled:opacity-40"
+          className="rounded bg-accent px-3 py-1 font-medium text-on-accent hover:bg-accent-strong disabled:opacity-40"
         >
           Save{dirty ? " •" : ""}
         </button>
@@ -630,7 +634,7 @@ function WorkerEditor({
       {/* Code editor (Monaco) */}
       <div className="min-h-0 flex-1 bg-[#1e1e1e]">
         <Suspense
-          fallback={<div className="p-4 text-sm text-zinc-500">Loading editor…</div>}
+          fallback={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
         >
           <CodeEditor
             value={loadedFile === file ? content : ""}
@@ -756,35 +760,37 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800 px-4 py-2">
-        <span className="font-medium">Shared library</span>
-        <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-zinc-400">
+      <div className="flex flex-wrap items-center gap-2 border-b border-edge px-4 py-2">
+        <span className="font-medium text-fg">Shared library</span>
+        <span className="rounded bg-hover px-1.5 py-0.5 font-mono text-xs text-fg-muted">
           import … from "@lib/…"
         </span>
         <div className="flex-1" />
-        <span className="text-xs text-zinc-500">Reusable across every worker.</span>
+        <span className="text-xs text-fg-faint">Reusable across every worker.</span>
       </div>
 
-      <div className="flex items-center gap-1 border-b border-zinc-800 px-3 py-1.5 text-xs">
+      <div className="flex items-center gap-1 border-b border-edge px-3 py-1.5 text-xs">
         {files.map((f) => (
           <button
             key={f}
             onClick={() => setFile(f)}
             className={`rounded px-2 py-1 font-mono ${
-              file === f ? "bg-zinc-700 text-white" : "text-zinc-400 hover:bg-zinc-800"
+              file === f
+                ? "bg-accent/10 font-medium text-accent-strong"
+                : "text-fg-muted hover:bg-hover"
             }`}
           >
             {f}
           </button>
         ))}
-        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-zinc-500 hover:text-zinc-200">
+        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-fg-faint hover:text-fg">
           + file
         </button>
         <div className="flex-1" />
         {file && (
           <button
             onClick={deleteFile}
-            className="rounded px-2 py-1 text-zinc-500 hover:text-red-300"
+            className="rounded px-2 py-1 text-fg-faint hover:text-danger"
           >
             delete file
           </button>
@@ -792,7 +798,7 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
         <button
           onClick={save}
           disabled={!dirty || !file}
-          className="rounded bg-sky-700 px-3 py-1 text-white hover:bg-sky-600 disabled:opacity-40"
+          className="rounded bg-accent px-3 py-1 font-medium text-on-accent hover:bg-accent-strong disabled:opacity-40"
         >
           Save{dirty ? " •" : ""}
         </button>
@@ -801,7 +807,7 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
       <div className="min-h-0 flex-1 bg-[#1e1e1e]">
         {file ? (
           <Suspense
-            fallback={<div className="p-4 text-sm text-zinc-500">Loading editor…</div>}
+            fallback={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
           >
             <CodeEditor
               value={loadedFile === file ? content : ""}
@@ -819,15 +825,12 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
             />
           </Suspense>
         ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-zinc-600">
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-fg-faint">
             <p>No shared library files yet.</p>
-            <button
-              onClick={newFile}
-              className="rounded bg-zinc-700 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-600"
-            >
+            <Button size="sm" onClick={newFile}>
               + New library file
-            </button>
-            <p className="max-w-sm text-center text-xs text-zinc-700">
+            </Button>
+            <p className="max-w-sm text-center text-xs text-fg-faint">
               Drop a module here and import it from any worker with{" "}
               <span className="font-mono">import {"{ … }"} from "@lib/your-file.ts"</span>.
             </p>
@@ -864,20 +867,20 @@ function LogPanel({ worker }: { worker: string }) {
   }, [lines]);
 
   return (
-    <div className="h-44 shrink-0 overflow-auto border-t border-zinc-800 bg-black/40 p-2 font-mono text-xs">
-      {lines.length === 0 && <div className="text-zinc-600">No log output yet.</div>}
+    <div className="h-44 shrink-0 overflow-auto border-t border-edge bg-inset p-2 font-mono text-xs">
+      {lines.length === 0 && <div className="text-fg-faint">No log output yet.</div>}
       {lines.map((l, i) => (
         <div
           key={i}
           className={
             l.stream === "err"
-              ? "text-red-300"
+              ? "text-danger"
               : l.stream === "sys"
-                ? "text-sky-400/80"
-                : "text-zinc-300"
+                ? "text-info/80"
+                : "text-fg-muted"
           }
         >
-          <span className="mr-2 text-zinc-600">
+          <span className="mr-2 text-fg-faint">
             {new Date(l.tsMs).toLocaleTimeString()}
           </span>
           {l.text}

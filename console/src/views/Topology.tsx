@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { api, nodeConsoleUrl, type NodeHealth } from "../lib/api";
+import { Badge, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
 
 export default function Topology() {
   const { data, isLoading, error } = useQuery({
@@ -22,18 +23,18 @@ export default function Topology() {
 
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold">Cluster topology</h1>
-        <p className="text-sm text-zinc-500">
-          Live view of nodes and partition placement
-          {data ? ` · gateway v${data.gateway_version}` : ""}
-        </p>
-      </header>
+      <PageHeader
+        title="Cluster topology"
+        subtitle={
+          <>
+            Live view of nodes and partition placement
+            {data ? ` · gateway v${data.gateway_version}` : ""}
+          </>
+        }
+      />
 
-      {isLoading && <p className="text-zinc-400">Loading…</p>}
-      {error && (
-        <p className="text-red-400">Failed to load topology: {String(error)}</p>
-      )}
+      {isLoading && <p className="text-fg-muted">Loading…</p>}
+      {error && <ErrorText>Failed to load topology: {String(error)}</ErrorText>}
 
       {data && (
         <div className="space-y-8">
@@ -48,9 +49,7 @@ export default function Topology() {
           </section>
 
           <section>
-            <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-              Nodes
-            </h2>
+            <SectionLabel>Nodes</SectionLabel>
             <div className="flex flex-wrap gap-3">
               {data.nodes.map((n) => {
                 const h = healthOf(n.node_id);
@@ -62,13 +61,13 @@ export default function Topology() {
                   : nodeConsoleUrl(n.address, "/topology");
                 const cls = `block min-w-[12rem] rounded-lg border px-4 py-3 ${
                   down
-                    ? "border-red-800 bg-red-950/30"
+                    ? "border-danger/40 bg-danger/10"
                     : n.is_self
-                      ? "border-emerald-700 bg-emerald-950/40"
-                      : "border-zinc-800 bg-zinc-900"
+                      ? "border-ok/40 bg-ok/10"
+                      : "border-edge bg-raised"
                 }${
                   href
-                    ? " cursor-pointer transition-colors hover:border-sky-600 hover:bg-zinc-800"
+                    ? " cursor-pointer transition-colors hover:border-info hover:bg-hover"
                     : ""
                 }`;
                 const inner = (
@@ -78,9 +77,9 @@ export default function Topology() {
                         className={`inline-block h-2 w-2 shrink-0 rounded-full ${
                           h
                             ? h.reachable
-                              ? "bg-emerald-400"
-                              : "bg-red-500"
-                            : "bg-zinc-600"
+                              ? "bg-ok"
+                              : "bg-danger"
+                            : "bg-fg-faint"
                         }`}
                         title={
                           h
@@ -91,42 +90,38 @@ export default function Topology() {
                         }
                       />
                       <span className="font-medium">node {n.node_id}</span>
-                      {n.is_self && (
-                        <span className="rounded bg-emerald-800 px-1.5 py-0.5 text-xs">
-                          this
-                        </span>
-                      )}
+                      {n.is_self && <Badge tone="ok">this</Badge>}
                       {href && (
                         <span
-                          className="ml-auto text-xs text-sky-400"
+                          className="ml-auto text-xs text-info"
                           aria-hidden
                         >
                           open ↗
                         </span>
                       )}
                     </div>
-                    <div className="mt-1 text-xs text-zinc-500">
+                    <div className="mt-1 text-xs text-fg-faint">
                       {n.address || "local"}
                     </div>
                     <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
                       {h?.reachable ? (
                         <>
                           {h.version && (
-                            <span className="text-zinc-400">v{h.version}</span>
+                            <span className="text-fg-muted">v{h.version}</span>
                           )}
                           {h.latencyMs != null && !n.is_self && (
-                            <span className="text-zinc-500">{h.latencyMs} ms</span>
+                            <span className="text-fg-faint">{h.latencyMs} ms</span>
                           )}
                           {n.is_self && (
-                            <span className="text-emerald-400">healthy</span>
+                            <span className="text-ok">healthy</span>
                           )}
                         </>
                       ) : h ? (
-                        <span className="text-red-400">
+                        <span className="text-danger">
                           unreachable{h.error ? ` · ${h.error}` : ""}
                         </span>
                       ) : (
-                        <span className="text-zinc-600">probing…</span>
+                        <span className="text-fg-faint">probing…</span>
                       )}
                     </div>
                   </>
@@ -152,12 +147,10 @@ export default function Topology() {
           </section>
 
           <section>
-            <h2 className="mb-3 text-sm font-medium uppercase tracking-wide text-zinc-500">
-              Partitions
-            </h2>
+            <SectionLabel>Partitions</SectionLabel>
             <table className="w-full max-w-2xl border-collapse text-sm">
               <thead>
-                <tr className="border-b border-zinc-800 text-left text-zinc-500">
+                <tr className="border-b border-edge text-left text-fg-faint">
                   <th className="py-2 pr-4 font-medium">Partition</th>
                   <th className="py-2 pr-4 font-medium">Leader</th>
                   <th className="py-2 pr-4 font-medium">Replicas</th>
@@ -166,19 +159,19 @@ export default function Topology() {
               </thead>
               <tbody>
                 {data.partitions.map((p) => (
-                  <tr key={p.partition_id} className="border-b border-zinc-900">
+                  <tr key={p.partition_id} className="border-b border-edge">
                     <td className="py-2 pr-4">{p.partition_id}</td>
                     <td className="py-2 pr-4">
                       {p.leader === null ? (
-                        <span className="text-amber-400">no leader</span>
+                        <span className="text-warn">no leader</span>
                       ) : (
                         `node ${p.leader}`
                       )}
                     </td>
-                    <td className="py-2 pr-4 text-zinc-400">
+                    <td className="py-2 pr-4 text-fg-muted">
                       {p.replicas.map((r) => `node ${r}`).join(", ")}
                     </td>
-                    <td className="py-2 pr-4 text-zinc-400">
+                    <td className="py-2 pr-4 text-fg-muted">
                       {p.raft_term ?? "—"}
                     </td>
                   </tr>
@@ -194,11 +187,11 @@ export default function Topology() {
 
 function Stat({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900 px-4 py-3">
-      <div className="text-xs uppercase tracking-wide text-zinc-500">
+    <Card className="px-4 py-3">
+      <div className="text-xs uppercase tracking-wide text-fg-faint">
         {label}
       </div>
       <div className="mt-1 text-xl font-semibold">{value}</div>
-    </div>
+    </Card>
   );
 }

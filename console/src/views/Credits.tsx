@@ -132,10 +132,10 @@ export default function Credits() {
   };
 
   return (
-    <div className="relative h-full overflow-hidden bg-black text-zinc-100">
+    <div className="relative h-full overflow-hidden bg-app text-fg">
       {/* subtle vignette top/bottom so text fades in/out at the edges */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-20 bg-gradient-to-b from-black to-transparent" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-20 bg-gradient-to-t from-black to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-20 bg-gradient-to-b from-app to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-20 bg-gradient-to-t from-app to-transparent" />
 
       {/* controls */}
       <div className="absolute right-4 top-4 z-20 flex items-center gap-2 text-xs">
@@ -144,33 +144,33 @@ export default function Credits() {
           title={musicOn ? "Mute ambient music" : "Play ambient music"}
           className={`rounded-md border px-3 py-1.5 ${
             musicOn
-              ? "border-violet-600 bg-violet-500/30 text-violet-200"
-              : "border-zinc-700 bg-zinc-900/80 text-zinc-400 hover:bg-zinc-800"
+              ? "border-accent bg-accent/20 text-accent-strong"
+              : "border-edge-strong bg-panel/80 text-fg-muted hover:bg-hover"
           }`}
         >
           {musicOn ? "♪ Music" : "♪ Muted"}
         </button>
         <button
           onClick={() => setPlaying((p) => !p)}
-          className="rounded-md border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-300 hover:bg-zinc-800"
+          className="rounded-md border border-edge-strong bg-panel/80 px-3 py-1.5 text-fg-muted hover:bg-hover"
         >
           {playing ? "Pause" : "Play"}
         </button>
         <button
           onClick={restart}
-          className="rounded-md border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-zinc-300 hover:bg-zinc-800"
+          className="rounded-md border border-edge-strong bg-panel/80 px-3 py-1.5 text-fg-muted hover:bg-hover"
         >
           Restart
         </button>
-        <div className="flex overflow-hidden rounded-md border border-zinc-700">
+        <div className="flex overflow-hidden rounded-md border border-edge-strong">
           {SPEEDS.map((s) => (
             <button
               key={s}
               onClick={() => setSpeed(s)}
               className={`px-2 py-1.5 ${
                 speed === s
-                  ? "bg-violet-500/30 text-violet-200"
-                  : "bg-zinc-900/80 text-zinc-400 hover:bg-zinc-800"
+                  ? "bg-accent/20 text-accent-strong"
+                  : "bg-panel/80 text-fg-muted hover:bg-hover"
               }`}
             >
               {s}×
@@ -192,26 +192,26 @@ export default function Credits() {
             <div className="text-7xl font-semibold tracking-tight sm:text-8xl">
               nano BPM
             </div>
-            <div className="mt-5 text-lg uppercase tracking-[0.35em] text-violet-300">
+            <div className="mt-5 text-lg uppercase tracking-[0.35em] text-accent-strong">
               An Advanced Research Prototype
             </div>
-            <p className="mx-auto mt-10 max-w-2xl text-xl leading-relaxed text-zinc-300">
+            <p className="mx-auto mt-10 max-w-2xl text-xl leading-relaxed text-fg-muted">
               Nano is an Advanced Research Prototype, incorporating a decade of
               experience and expertise of Camunda Engineering.
             </p>
 
             <div className="mx-auto mt-16 max-w-2xl">
-              <p className="text-3xl italic leading-relaxed text-zinc-100 sm:text-4xl">
+              <p className="text-3xl italic leading-relaxed text-fg sm:text-4xl">
                 He aha te mea nui o te ao?
                 <br />
                 He tāngata, he tāngata, he tāngata
               </p>
-              <p className="mx-auto mt-7 max-w-xl text-xl leading-relaxed text-zinc-400">
+              <p className="mx-auto mt-7 max-w-xl text-xl leading-relaxed text-fg-muted">
                 What is the most precious thing in the world?
                 <br />
                 It is people, it is people, it is people
               </p>
-              <p className="mt-6 text-sm uppercase tracking-[0.25em] text-zinc-600">
+              <p className="mt-6 text-sm uppercase tracking-[0.25em] text-fg-faint">
                 Māori tikanga · New Zealand
               </p>
             </div>
@@ -263,12 +263,12 @@ export default function Credits() {
           <Gap />
 
           <Section title="The Camunda Engineering Community">
-            <p className="mb-6 max-w-lg text-sm leading-relaxed text-zinc-500">
+            <p className="mb-6 max-w-lg text-sm leading-relaxed text-fg-faint">
               {credits.counts.total} contributors across the Camunda platform,
               Zeebe, FEEL, and the bpmn-io modeling toolkit — everyone whose work
               Nano stands on.
             </p>
-            <div className="grid grid-cols-2 gap-x-10 gap-y-2 text-lg text-zinc-300 sm:grid-cols-3">
+            <div className="grid grid-cols-2 gap-x-10 gap-y-2 text-lg text-fg-muted sm:grid-cols-3">
               {credits.cast.map((n) => (
                 <div key={n} className="truncate">
                   {n}
@@ -280,17 +280,17 @@ export default function Credits() {
           <Gap />
 
           <div className="pt-8 text-center">
-            <div className="text-base uppercase tracking-[0.3em] text-zinc-500">
+            <div className="text-base uppercase tracking-[0.3em] text-fg-faint">
               With gratitude
             </div>
-            <div className="mt-5 text-4xl font-semibold tracking-tight text-zinc-100">
+            <div className="mt-5 text-4xl font-semibold tracking-tight text-fg">
               Camunda Engineering
             </div>
-            <div className="mx-auto mt-10 max-w-md text-sm text-zinc-600">
+            <div className="mx-auto mt-10 max-w-md text-sm text-fg-faint">
               Names are engraved inside the machine, the way the Macintosh and
               Amiga teams signed their cases.
             </div>
-            <div className="mx-auto mt-8 max-w-md text-xs leading-relaxed text-zinc-700">
+            <div className="mx-auto mt-8 max-w-md text-xs leading-relaxed text-fg-faint">
               Music: “Impact Prelude” by Kevin MacLeod (incompetech.com) ·
               Licensed under Creative Commons: By Attribution 4.0
             </div>
@@ -310,7 +310,7 @@ function Section({
 }) {
   return (
     <section className="flex w-full flex-col items-center">
-      <h2 className="mb-8 text-sm font-bold uppercase tracking-[0.3em] text-zinc-500">
+      <h2 className="mb-8 text-sm font-bold uppercase tracking-[0.3em] text-fg-faint">
         {title}
       </h2>
       <div className="flex w-full flex-col items-center gap-7">{children}</div>
@@ -321,10 +321,10 @@ function Section({
 function BigName({ name, sub }: { name: string; sub?: string }) {
   return (
     <div>
-      <div className="text-3xl font-medium tracking-tight text-white sm:text-4xl">
+      <div className="text-3xl font-medium tracking-tight text-fg sm:text-4xl">
         {name}
       </div>
-      {sub && <div className="mt-1.5 text-sm text-zinc-500">{sub}</div>}
+      {sub && <div className="mt-1.5 text-sm text-fg-faint">{sub}</div>}
     </div>
   );
 }
@@ -340,13 +340,13 @@ function NamedLine({
 }) {
   return (
     <div className="flex flex-col items-center">
-      <div className="text-sm font-semibold uppercase tracking-widest text-violet-300">
+      <div className="text-sm font-semibold uppercase tracking-widest text-accent-strong">
         {lead}
       </div>
-      <div className="mt-1.5 text-3xl font-medium tracking-tight text-white sm:text-4xl">
+      <div className="mt-1.5 text-3xl font-medium tracking-tight text-fg sm:text-4xl">
         {name}
       </div>
-      {sub && <div className="mt-1 text-sm text-zinc-500">{sub}</div>}
+      {sub && <div className="mt-1 text-sm text-fg-faint">{sub}</div>}
     </div>
   );
 }

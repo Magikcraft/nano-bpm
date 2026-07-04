@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as monaco from "monaco-editor";
 import { Editor, loader } from "@monaco-editor/react";
+import { useTheme } from "../theme/ThemeProvider";
 
 // Bundle Monaco's web workers through Vite (the `?worker` suffix emits each as a
 // separate chunk) instead of fetching them from a CDN. This keeps the console
@@ -199,6 +200,10 @@ export default function CodeEditor({
   onChange: (value: string) => void;
   onSave?: () => void;
 }) {
+  // Monaco is theme-managed per instance; follow the console's resolved
+  // appearance (light/dark/system/theme packs all reduce to one of the two).
+  const { appearance } = useTheme();
+
   // Keep the latest onSave in a ref so the Cmd/Ctrl+S keybinding registered on
   // mount always calls the current handler (avoids a stale closure).
   const saveRef = useRef(onSave);
@@ -234,7 +239,7 @@ export default function CodeEditor({
       value={value}
       language={language}
       path={path}
-      theme="vs-dark"
+      theme={appearance === "light" ? "light" : "vs-dark"}
       onChange={(v) => {
         const next = v ?? "";
         onChange(next);
@@ -243,7 +248,7 @@ export default function CodeEditor({
       onMount={(editor) => {
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current?.());
       }}
-      loading={<div className="p-4 text-sm text-zinc-500">Loading editor…</div>}
+      loading={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
       options={{
         readOnly,
         fontSize: 13,

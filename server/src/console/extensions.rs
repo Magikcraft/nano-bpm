@@ -37,6 +37,28 @@ pub enum ExtKind {
     /// A complete example app shipped under `appDir`, copied into a new
     /// project (`nano-ide-example-*`).
     Example,
+    /// A console colour-theme pack: one or more themes declared in the
+    /// manifest as design-token values (`nano-ide-theme-*`). Pure data — no
+    /// toolchain, no code.
+    Theme,
+}
+
+/// One console colour theme a `kind: "theme"` pack contributes. `tokens` maps
+/// the console's design-token vocabulary (see console/src/theme/themes.ts
+/// TOKEN_KEYS — "app", "panel", "accent", …) to CSS colours; unknown keys are
+/// ignored client-side, missing keys fall back to the base `appearance`.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeSpec {
+    /// Stable id, unique across packs (e.g. "nord-dark").
+    pub id: String,
+    /// Human-facing name shown in the theme picker.
+    pub label: String,
+    /// Base palette the tokens override: "light" or "dark".
+    pub appearance: String,
+    /// Design-token name -> CSS colour.
+    #[serde(default)]
+    pub tokens: std::collections::BTreeMap<String, String>,
 }
 
 /// Editor profile for one file extension.
@@ -137,6 +159,9 @@ pub struct ExtManifest {
     /// Config fields this pack contributes to the IDE config panel (read-only).
     #[serde(default)]
     pub config_fields: Vec<ConfigField>,
+    /// Console colour themes this pack contributes (theme packs).
+    #[serde(default)]
+    pub themes: Vec<ThemeSpec>,
 }
 
 /// The built-in first-party packs — always available, offline, unremovable.
@@ -172,6 +197,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 env: Some("NANOBPMN_DENO_BIN".into()),
                 default: Some("deno (on PATH)".into()),
             }],
+            themes: vec![],
         },
         ExtManifest {
             id: "rust".into(),
@@ -200,6 +226,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             summary: None,
             builtin: true,
             config_fields: vec![],
+            themes: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -216,6 +243,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             summary: None,
             builtin: true,
             config_fields: vec![],
+            themes: vec![],
         },
     ]
 }
@@ -488,6 +516,8 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 "app"
             } else if kws.iter().any(|k| k == "nano-ide-example") {
                 "example"
+            } else if kws.iter().any(|k| k == "nano-ide-theme") {
+                "theme"
             } else {
                 "other"
             };
