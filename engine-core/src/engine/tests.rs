@@ -6009,6 +6009,122 @@ fn empty_input_collection_completes_the_multi_instance_body_immediately() {
     );
 }
 
+#[test]
+fn multi_instance_children_hold_their_bindings_in_real_child_scopes() {
+    // Part C: each parallel child is now a real variable scope (parented to the
+    // MI body), holding its `loopCounter`/`inputElement` locally — never leaked
+    // to the root instance variables.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Jobs still see their per-child bindings...
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3);
+    for job in &jobs {
+        assert!(job.variables.get("item").is_some());
+        assert!(job.variables.get("loopCounter").is_some());
+    }
+
+    // ...but the root scope never received them: the bindings live in dedicated
+    // child scopes parented to the multi-instance body.
+    let instance = engine.instance(key).unwrap();
+    assert!(instance.variables.get("item").is_none());
+    assert!(instance.variables.get("loopCounter").is_none());
+    let body_key = *instance
+        .multi_instances
+        .keys()
+        .next()
+        .expect("an active multi-instance body");
+    let children: Vec<Key> = instance
+        .scope_parents
+        .iter()
+        .filter(|&(_, &parent)| parent == body_key)
+        .map(|(&child, _)| child)
+        .collect();
+    assert_eq!(children.len(), 3, "one real scope per child");
+    for child in children {
+        let locals = instance
+            .scope_variables
+            .get(&child)
+            .expect("child scope carries local bindings");
+        assert!(locals.contains_key("item"));
+        assert!(locals.contains_key("loopCounter"));
+    }
+}
+
+#[test]
+fn set_variables_local_on_a_multi_instance_child_stays_in_its_scope() {
+    // A `local` SetVariables targeting a running MI child scope writes only that
+    // child's scope, invisible to the root and to sibling children.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine.activate_jobs("handle", "w", 10, 60_000, 0);
+
+    let instance = engine.instance(key).unwrap();
+    let body_key = *instance.multi_instances.keys().next().unwrap();
+    let mut children: Vec<Key> = instance
+        .scope_parents
+        .iter()
+        .filter(|&(_, &parent)| parent == body_key)
+        .map(|(&child, _)| child)
+        .collect();
+    children.sort();
+    let target = children[0];
+    let sibling = children[1];
+
+    engine
+        .apply_command(Command::set_variables_scoped(
+            target,
+            vars(&[("note", Value::Str("child-only".into()))]),
+            true,
+        ))
+        .unwrap();
+
+    let instance = engine.instance(key).unwrap();
+    assert_eq!(
+        instance.scope_variables.get(&target).unwrap().get("note"),
+        Some(&Value::Str("child-only".into())),
+        "written into the target child scope"
+    );
+    assert!(
+        instance.variables.get("note").is_none(),
+        "not propagated to the root"
+    );
+    assert!(
+        instance
+            .scope_variables
+            .get(&sibling)
+            .map(|m| !m.contains_key("note"))
+            .unwrap_or(true),
+        "not visible to the sibling child"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Hierarchical variable scoping — machinery (Part C phase 1)
 // ---------------------------------------------------------------------------

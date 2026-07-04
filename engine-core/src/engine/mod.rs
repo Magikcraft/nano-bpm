@@ -2585,19 +2585,42 @@ impl Engine {
                 element_id: element_id.clone(),
                 scope,
             },
+            // The multi-instance body is a variable scope: its children run inside
+            // it and its `outputCollection` accumulates here.
+            Event::VariableScopeCreated {
+                instance_key,
+                scope_key: body_key,
+                parent_scope_key: scope,
+            },
         ];
-        // Input mappings on the activity apply once, on body activation.
+        // Input mappings on the activity apply once, on body activation, LOCAL to
+        // the body scope (Zeebe semantics), so they feed the input collection and
+        // the children without leaking to the parent scope.
         let inputs = self.io_inputs(instance_key, &element_id);
-        if !inputs.is_empty() {
-            let updates = self.eval_io_mappings(instance_key, &inputs);
-            if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
-            }
+        let input_updates = if inputs.is_empty() {
+            HashMap::new()
+        } else {
+            self.eval_io_mappings(instance_key, &inputs)
+        };
+        if !input_updates.is_empty() {
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: body_key,
+                variables: input_updates.clone(),
+            });
         }
-        let vars = self.variables(instance_key);
+        // The input collection is evaluated in the body scope view (the root
+        // variables with any body input mappings overlaid).
+        let vars: Arc<HashMap<String, Value>> = {
+            let base = self.variables(instance_key);
+            if input_updates.is_empty() {
+                base
+            } else {
+                let mut merged = (*base).clone();
+                merged.extend(input_updates);
+                Arc::new(merged)
+            }
+        };
         let items: Vec<Value> = match crate::feel::eval(&mi.input_collection, &vars) {
             Ok(Value::List(list)) => list,
             _ => Vec::new(),
@@ -2780,7 +2803,7 @@ impl Engine {
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.element_locals.get(&child_eik))
+            .and_then(|i| i.scope_variables.get(&child_eik))
             .and_then(|l| l.get("loopCounter"))
             .and_then(|v| v.as_f64())
             .map(|c| (c as i64 - 1).max(0) as usize)
@@ -2875,22 +2898,33 @@ impl Engine {
         };
         let scope = self.scope_of(instance_key, body_key);
 
+        // Build the aggregated output collection (padding uncollected slots with
+        // null) and evaluate the activity's output mappings against the body-scope
+        // view overlaid with that collection — all while the body scope is still
+        // resident (its `ElementCompleted` below tears it down).
+        let collection_map: Option<HashMap<String, Value>> =
+            output_collection.map(|name| HashMap::from([(name, Value::List(output_values))]));
+        let outputs = self.io_outputs(instance_key, &element_id);
+        let output_updates = if outputs.is_empty() {
+            HashMap::new()
+        } else {
+            let mut ctx = (*self.variables_for_element(instance_key, body_key)).clone();
+            if let Some(map) = &collection_map {
+                ctx.extend(map.clone());
+            }
+            self.eval_io_mappings_in(&ctx, &outputs)
+        };
+
         let mut events = Vec::new();
         // Cancel any children still running (reached here via completion condition).
         for child in &active {
             events.extend(self.cancel_mi_child_events(instance_key, *child));
         }
-        // Write the aggregated output collection to the instance scope, and apply
-        // the activity's output mappings against it.
-        let mut collection_update: Option<HashMap<String, Value>> = None;
-        if let Some(name) = output_collection {
-            let mut map = HashMap::new();
-            map.insert(name, Value::List(output_values));
-            events.push(Event::VariablesUpdated {
-                instance_key,
-                variables: map.clone(),
-            });
-            collection_update = Some(map);
+        // The output collection propagates OUT of the body to its enclosing (flow)
+        // scope — for a top-level loop that is the root, collapsing to the flat
+        // `VariablesUpdated`, byte-identical to the pre-scoping engine.
+        if let Some(map) = collection_map {
+            events.extend(self.propagated_updates(instance_key, scope, map, false));
         }
         events.push(Event::ElementCompleting {
             instance_key,
@@ -2906,24 +2940,10 @@ impl Engine {
             instance_key,
             body_key,
         });
-        // Output mappings (zeebe:output) on the activity apply as the body drains,
-        // able to reference the just-written output collection.
-        let outputs = self.io_outputs(instance_key, &element_id);
-        if !outputs.is_empty() {
-            let updates = match &collection_update {
-                Some(update) => {
-                    let mut vars = (*self.variables(instance_key)).clone();
-                    vars.extend(update.clone());
-                    self.eval_io_mappings_in(&vars, &outputs)
-                }
-                None => self.eval_io_mappings(instance_key, &outputs),
-            };
-            if !updates.is_empty() {
-                events.push(Event::VariablesUpdated {
-                    instance_key,
-                    variables: updates,
-                });
-            }
+        // Output mappings likewise propagate their projected result to the parent
+        // (flow) scope.
+        if !output_updates.is_empty() {
+            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
         }
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {

@@ -120,12 +120,12 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// The variables visible to a specific element instance: the instance
-    /// variables with any per-element local overlay (a multi-instance child's
-    /// `inputElement`/`loopCounter` bindings) merged on top. For the common case
-    /// of an element with no locals this returns the shared instance-variables
-    /// `Arc` directly (a cheap refcount bump); only a multi-instance child pays
-    /// the clone-and-overlay cost.
+    /// The variables visible to a specific element instance: its scope's local
+    /// variables layered over its ancestors up to the root. For an element in the
+    /// root scope with no sub-scopes this returns the shared instance-variables
+    /// `Arc` directly (a cheap refcount bump); only an element that lives in (or
+    /// under) a sub-scope — a sub-process, a multi-instance body or child — pays
+    /// the clone-and-merge cost.
     pub(crate) fn variables_for_element(
         &self,
         instance_key: Key,
@@ -134,22 +134,12 @@ impl Engine {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return Arc::default();
         };
-        // Base: the hierarchical scoped view visible to this element (root scope
-        // fast-path returns the shared `variables` Arc unchanged). The MI child
-        // `element_locals` overlay is layered on top for backward compatibility
-        // until multi-instance moves onto real scopes (Part C phase 3).
+        // The hierarchical scoped view visible to this element (root scope
+        // fast-path returns the shared `variables` Arc unchanged). Multi-instance
+        // child bindings (`inputElement`/`loopCounter`) and sub-process locals all
+        // live in the child/sub-process scope, resolved by this walk.
         let scope = self.variable_scope_of(instance, element_instance_key);
-        let base = self.visible_variables(instance, scope);
-        match instance.element_locals.get(&element_instance_key) {
-            Some(locals) if !locals.is_empty() => {
-                let mut merged = (*base).clone();
-                for (k, v) in locals {
-                    merged.insert(k.clone(), v.clone());
-                }
-                Arc::new(merged)
-            }
-            _ => base,
-        }
+        self.visible_variables(instance, scope)
     }
 
     /// The variable scope that directly owns `key`'s variables: `key` itself when
