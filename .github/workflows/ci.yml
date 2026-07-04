@@ -93,6 +93,32 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  nano-bernd-npm:
+    name: '@nanobpm/nano-bernd (build + test)'
+    runs-on: ubuntu-24.04
+    needs: engine-wasm-ffi-dist
+    defaults:
+      run:
+        working-directory: clients/nano-bernd
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+      - name: Download engine-wasm-ffi artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: engine-wasm-ffi
+          path: dist/engine-wasm-ffi/
+      - name: Install
+        run: npm install
+      - name: Sync wasm from dist
+        run: npm run sync-wasm
+      - name: Build
+        run: npm run build
+      - name: Test
+        run: npm test
+
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04

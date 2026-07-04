@@ -1,0 +1,6 @@
+# The wasm blob + manifest are copied here from the top-level `dist/engine-wasm-ffi/`
+# by `npm run sync-wasm` (which runs automatically before `build` and `test`). They
+# are packaged into the tarball at publish time. Do not hand-edit — regenerate via
+# `make engine-wasm-ffi-dist` from the repo root, then re-run sync-wasm here.
+*
+!.gitignore
