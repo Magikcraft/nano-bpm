@@ -79,10 +79,20 @@ pub const TEMPLATES: &[(&str, &str)] = &[
 /// merged with templates contributed by installed extension packs. Built-ins win
 /// on id collision so a pack cannot silently shadow an offline scaffold.
 ///
+/// Two flavours of pack contribution are recognised:
+///
+/// * A `lang` or `app` pack with a non-empty `templates[]` array — the classic
+///   contribution, one entry per template in `<pack>/templates/<id>/`.
+/// * A `kind: example` pack — the entire pack **is** the template. Its `id`,
+///   `displayName` and `summary` are surfaced directly, no separate
+///   registration in some other pack needed. This is the intended shape for a
+///   third party to publish a runnable example without touching any lang pack.
+///
 /// Each entry carries a `source` discriminator (`"builtin"` or `"pack"`); pack
 /// entries also include a `pack` field with the contributing extension id, so
 /// the Console can render provenance in the New Project picker.
 pub fn project_templates() -> Vec<serde_json::Value> {
+    use super::extensions::ExtKind;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<serde_json::Value> = TEMPLATES
         .iter()
@@ -104,6 +114,21 @@ pub fn project_templates() -> Vec<serde_json::Value> {
                     "pack": ext.id,
                 }));
             }
+        }
+        // Example packs advertise themselves as a template — no registration
+        // in a sibling lang pack required.
+        if ext.kind == ExtKind::Example && seen.insert(ext.id.clone()) {
+            let label = ext
+                .summary
+                .clone()
+                .map(|s| format!("{} — {}", ext.display_name, s))
+                .unwrap_or_else(|| ext.display_name.clone());
+            out.push(serde_json::json!({
+                "id": ext.id,
+                "label": label,
+                "source": "pack",
+                "pack": ext.id,
+            }));
         }
     }
     out
@@ -2030,6 +2055,17 @@ mod tests {
                  "templates":[{"id":"starter","label":"Should not appear"}]}"#,
         )
         .unwrap();
+        // An example pack advertises itself as a template — no lang-pack
+        // registration required. This is what a third-party publishing a
+        // runnable example gets for free.
+        let example = ext.join("nanobpm__example-thing");
+        std::fs::create_dir_all(example.join("app")).unwrap();
+        std::fs::write(
+            example.join("nano-ide.ext.json"),
+            r#"{"id":"thing-example","kind":"example","displayName":"Thing example",
+                 "summary":"Runs the thing","appDir":"app"}"#,
+        )
+        .unwrap();
 
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
         let templates = project_templates();
@@ -2055,6 +2091,19 @@ mod tests {
         let starter_hits: Vec<_> = templates.iter().filter(|t| t["id"] == "starter").collect();
         assert_eq!(starter_hits.len(), 1);
         assert_eq!(starter_hits[0]["source"].as_str(), Some("builtin"));
+        // The example pack should appear as a template automatically, with its
+        // display name + summary composed into the label.
+        let ex_hits: Vec<_> = templates
+            .iter()
+            .filter(|t| t["id"] == "thing-example")
+            .collect();
+        assert_eq!(ex_hits.len(), 1, "example pack should auto-register");
+        assert_eq!(ex_hits[0]["source"].as_str(), Some("pack"));
+        assert_eq!(ex_hits[0]["pack"].as_str(), Some("thing-example"));
+        assert_eq!(
+            ex_hits[0]["label"].as_str(),
+            Some("Thing example — Runs the thing")
+        );
     }
 
     #[test]
