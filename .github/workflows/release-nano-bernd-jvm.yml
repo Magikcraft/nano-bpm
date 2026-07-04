@@ -1,0 +1,78 @@
+name: release-nano-bernd-jvm
+
+# Triggered by tags of the form `nano-bernd-jvm-v0.2.0`. Builds & signs the
+# nano-bernd JVM artefact and publishes it to Maven Central via the Sonatype
+# Central Portal.
+#
+# Prerequisites (one-time, documented in clients/nano-bernd-jvm/RELEASING.md):
+#   - Namespace io.github.jwulf registered at central.sonatype.com
+#   - GPG key generated and its public key uploaded to the OpenPGP keyservers
+#   - Repository secrets:
+#       CENTRAL_USERNAME       — User Token username from the Central Portal
+#       CENTRAL_PASSWORD       — User Token password
+#       GPG_PRIVATE_KEY        — ASCII-armoured secret key export
+#       GPG_PASSPHRASE         — passphrase for the secret key
+
+on:
+  push:
+    tags:
+      - 'nano-bernd-jvm-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: Publish io.github.jwulf:nano-bernd
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Java 21 + Maven cache
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          server-id: central
+          server-username: CENTRAL_USERNAME
+          server-password: CENTRAL_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: GPG_PASSPHRASE
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      # Build the wasm from source in the release job so the release artefact
+      # is provably built from the tag, not downloaded from a CI run.
+      - name: Build engine-wasm-ffi dist
+        run: make engine-wasm-ffi-dist
+
+      - name: Sync wasm into JVM module resources
+        working-directory: clients/nano-bernd-jvm
+        run: bash scripts/sync-wasm.sh
+
+      - name: Verify tag matches pom version
+        working-directory: clients/nano-bernd-jvm
+        run: |
+          pom_version=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)
+          tag_version="${GITHUB_REF_NAME#nano-bernd-jvm-v}"
+          if [[ "$pom_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match pom version $pom_version"
+            exit 1
+          fi
+          echo "releasing nano-bernd $pom_version"
+
+      - name: Deploy to Central Portal
+        working-directory: clients/nano-bernd-jvm
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: mvn --batch-mode --no-transfer-progress -Prelease deploy
