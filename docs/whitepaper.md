@@ -15,15 +15,14 @@ for as long as the subset it implements covers what your project uses.
 
 - **Small memory footprint** — a sub-50 MB binary that idles at ~10 MB resident
   and holds ~400 MB per node at 100k process-instances/s across three nodes.
-- **Sub-second cold start** — a native binary with no JVM warm-up, versus a
-  ~1.5–2 GB local Camunda 8 stack.
+- **Sub-second cold start** — a native binary with no JVM warm-up.
 - **Self-optimizing operation** — most operational tuning is *derived* rather than
   set: the engine decides from live signals what a human would otherwise tune by
   hand, leaving one deployment-time business decision (how to behave at the
   capacity ceiling: shed admission, or absorb it and let latency rise).
 - **Closed-loop adaptive scaling** — distributed clients and the cluster form one
   self-sizing control loop (AIMD backpressure + load-aware placement), so client
-  fleets adapt themselves instead of being hand-tuned.
+  fleets adapt themselves instead of being hand-tuned (when using the additive Falcon protocol).
 - **Fault-tolerant clustering** — Raft-replicated partitions (openraft) for
   high-availability operation.
 - **Tunable durability** — a declared deployment choice trades data-safety
@@ -34,7 +33,7 @@ for as long as the subset it implements covers what your project uses.
 - **Embeddable engine** — the same engine runs embedded in a worker, microservice,
   or application, or is invoked directly as a tool call.
 - **Camunda 8 API-compatible** — a drop-in replacement behind the standard Camunda
-  8 REST/gRPC contract.
+  8 REST contract.
 - **Zeebe engine lineage** — the proven Zeebe execution model (single-writer actor
   per partition, event-sourced state), refined for a smaller footprint and higher
   throughput.
@@ -42,7 +41,7 @@ for as long as the subset it implements covers what your project uses.
 ## The Falcon transport
 
 Falcon is an **optional native transport**, offered *alongside* the standard API,
-never in place of it. A Nano cluster speaks the full Camunda 8 gRPC/REST surface,
+never in place of it. A Nano cluster speaks the full Camunda 8 REST surface,
 so an unmodified Camunda 8 client works unchanged. Falcon is the "faster if you
 opt in" path.
 
