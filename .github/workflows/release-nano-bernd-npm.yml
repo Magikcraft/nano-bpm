@@ -1,0 +1,75 @@
+name: release-nano-bernd-npm
+
+# Triggered by tags of the form `nano-bernd-npm-v0.2.0`. Builds & publishes
+# @nanobpm/nano-bernd to the npm registry with sigstore/OIDC provenance.
+#
+# Prerequisites (documented in clients/nano-bernd/RELEASING.md):
+#   - Repository secret NPM_TOKEN — Automation token scoped to @nanobpm.
+#   - Provenance is signed via GitHub OIDC — no extra secret needed.
+
+on:
+  push:
+    tags:
+      - 'nano-bernd-npm-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: Publish @nanobpm/nano-bernd
+    runs-on: ubuntu-24.04
+    # Required for `npm publish --provenance` to mint an OIDC token.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      # Build the wasm from source in the release job so the published tarball
+      # is provably built from the tag, not lifted from a CI run.
+      - name: Build engine-wasm-ffi dist
+        run: make engine-wasm-ffi-dist
+
+      - name: Install
+        working-directory: clients/nano-bernd
+        run: npm ci
+
+      - name: Sync wasm into package
+        working-directory: clients/nano-bernd
+        run: npm run sync-wasm
+
+      - name: Verify tag matches package version
+        working-directory: clients/nano-bernd
+        run: |
+          pkg_version=$(node -p "require('./package.json').version")
+          tag_version="${GITHUB_REF_NAME#nano-bernd-npm-v}"
+          if [[ "$pkg_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match package.json version $pkg_version"
+            exit 1
+          fi
+          echo "releasing @nanobpm/nano-bernd $pkg_version"
+
+      - name: Build
+        working-directory: clients/nano-bernd
+        run: npm run build
+
+      - name: Test
+        working-directory: clients/nano-bernd
+        run: npm test
+
+      - name: Publish
+        working-directory: clients/nano-bernd
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
