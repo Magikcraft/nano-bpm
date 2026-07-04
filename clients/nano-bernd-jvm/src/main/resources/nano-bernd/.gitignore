@@ -1,0 +1,5 @@
+# Wasm blobs are synced from top-level dist/engine-wasm-ffi/ at build time by
+# scripts/sync-wasm.sh (run automatically by CI after the engine-wasm-ffi-dist
+# job artefact is downloaded). They should never be checked in.
+nano_engine.wasm
+manifest.json
