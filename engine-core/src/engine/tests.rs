@@ -1094,6 +1094,103 @@ fn inline_script_task_completes_the_instance_when_terminal() {
     assert!(engine.is_completed(key));
 }
 
+#[test]
+fn inline_script_task_raises_an_incident_when_the_expression_fails_and_recovers() {
+    // A script whose FEEL expression cannot evaluate (type error: string + int)
+    // raises an ExpressionEvaluation incident and parks the token — matching
+    // Zeebe (and nano's exclusive gateway), not a silent pass-through. Fixing
+    // the variable and resolving the incident re-evaluates the script, which
+    // then writes the result and lets the instance continue.
+    let def = ProcessBuilder::new("scripted-fail")
+        .start_event("start")
+        .script_task("calc", "=n + 1", "next")
+        .service_task("work", "do-work")
+        .end_event("end")
+        .connect("start", "calc")
+        .connect("calc", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "scripted-fail",
+            vars(&[("n", Value::Str("oops".into()))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The script failed: one active ExpressionEvaluation incident, no job, and
+    // the token is parked (the downstream service task never activated).
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::ExpressionEvaluation);
+    assert_eq!(engine.state().jobs.len(), 0);
+    assert!(!engine.is_completed(key));
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix the variable to a number and resolve the incident: the script
+    // re-evaluates, writes `next`, and the token advances to the service task.
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("n".to_string(), Value::Int(41))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert_eq!(engine.state().jobs.len(), 1);
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("next"),
+        Some(&Value::Int(42))
+    );
+}
+
+#[test]
+fn inline_script_task_result_is_visible_to_output_mappings() {
+    // Zeebe merges resultVariable first, then applies output mappings; a
+    // zeebe:output on the script task can therefore reference the result.
+    let def = ProcessBuilder::new("scripted-out")
+        .start_event("start")
+        .script_task("calc", "=a + b", "sum")
+        .with_io(
+            "calc",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=sum".to_string(),
+                    target: "total".to_string(),
+                }],
+            },
+        )
+        .service_task("work", "do-work")
+        .end_event("end")
+        .connect("start", "calc")
+        .connect("calc", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "scripted-out",
+            vars(&[("a", Value::Int(4)), ("b", Value::Int(5))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("total"),
+        Some(&Value::Int(9))
+    );
+}
+
 /// The cross-partition (Zeebe-style) placement protocol for an intermediate
 /// catch: the instance partition parks on an `Opening` record, the host routes
 /// `OpenMessageSubscription` to the message partition (`hash(correlation_key)`),

@@ -2081,22 +2081,17 @@ impl Engine {
 
         // Input mappings (zeebe:input): evaluate against the instance variables
         // and merge the result before the element's job/subscription is created,
-        // so a later job activation snapshots the mapped values. The updates are
-        // also retained locally so a script task activating this step can see
-        // them (the event is not applied to state until the step returns).
+        // so a later job activation snapshots the mapped values.
         let inputs = self.io_inputs(instance_key, &element_id);
-        let input_updates = if inputs.is_empty() {
-            HashMap::new()
-        } else {
+        if !inputs.is_empty() {
             let updates = self.eval_io_mappings(instance_key, &inputs);
             if !updates.is_empty() {
                 events.push(Event::VariablesUpdated {
                     instance_key,
-                    variables: updates.clone(),
+                    variables: updates,
                 });
             }
-            updates
-        };
+        }
 
         match kind {
             // A service task creates a job and parks the token.
@@ -2260,29 +2255,10 @@ impl Engine {
                     scope: element_instance_key,
                 });
             }
-            // An inline-FEEL script task: evaluate the expression against the
-            // instance variables (plus any input mappings just applied this
-            // activation), store the result under resultVariable, then complete
-            // immediately — no job is created. Output mappings, if any, run at
-            // completion like every other activity.
-            Some(ElementKind::ScriptTask {
-                expression,
-                result_variable,
-            }) => {
-                if let Some(value) = self.eval_script(instance_key, &expression, &input_updates) {
-                    let mut variables = HashMap::new();
-                    variables.insert(result_variable, value);
-                    events.push(Event::VariablesUpdated {
-                        instance_key,
-                        variables,
-                    });
-                }
-                followups.push(Step::Complete {
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                });
-            }
+            // An inline-FEEL script task is a synchronous activity: it activates
+            // and immediately completes (no job). Its FEEL expression is
+            // evaluated at completion (see `complete`), where a failure raises
+            // an ExpressionEvaluation incident that re-evaluates on resolution.
             // Pass-through elements (events, exclusive gateway, parallel split)
             // complete immediately; routing happens at completion.
             Some(_) => {
@@ -2312,6 +2288,51 @@ impl Engine {
             return self.complete_exclusive_gateway(instance_key, element_instance_key, element_id);
         }
 
+        // Inline-FEEL script task: evaluate its `zeebe:script` expression now.
+        // The instance variables already include any input mappings applied when
+        // the task activated. On success the result is staged under
+        // `resultVariable` and written before output mappings run (so a
+        // `zeebe:output` can reference it); on failure an ExpressionEvaluation
+        // incident is raised and the element stays active — matching Zeebe, which
+        // re-evaluates the script when the incident is resolved (the resolution
+        // re-runs completion), exactly as an exclusive gateway condition does.
+        let mut script_update: Option<HashMap<String, Value>> = None;
+        if let Some(ElementKind::ScriptTask {
+            expression,
+            result_variable,
+        }) = self.element_kind(instance_key, &element_id)
+        {
+            let vars = self.variables(instance_key);
+            match crate::feel::eval(&expression, &vars) {
+                Ok(value) => {
+                    let mut update = HashMap::new();
+                    update.insert(result_variable, value);
+                    script_update = Some(update);
+                }
+                Err(err) => {
+                    let incident_key = self.mint_key();
+                    let reason = format!(
+                        "failed to evaluate script expression '{expression}' at script task \
+                         '{element_id}': {}",
+                        err.0
+                    );
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            }
+        }
+
         // Default behaviour: complete and take every outgoing flow (a single flow
         // for ordinary elements; all flows for a parallel split).
         let mut events = vec![
@@ -2331,12 +2352,31 @@ impl Engine {
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
+        // A script task's result is merged before output mappings so a
+        // `zeebe:output` can reference/remap it (Zeebe merges `resultVariable`
+        // first, then applies output mappings).
+        if let Some(update) = &script_update {
+            events.push(Event::VariablesUpdated {
+                instance_key,
+                variables: update.clone(),
+            });
+        }
         // Output mappings (zeebe:output): evaluate against the instance variables
-        // (which already include any job/message result merged on completion) and
-        // merge the projected result before the outgoing flows are taken.
+        // (which already include any job/message result merged on completion, or
+        // a script task's result staged above) and merge the projected result
+        // before the outgoing flows are taken.
         let outputs = self.io_outputs(instance_key, &element_id);
         if !outputs.is_empty() {
-            let updates = self.eval_io_mappings(instance_key, &outputs);
+            let updates = match &script_update {
+                // The script result event is not applied to state until this
+                // step returns, so overlay it onto the eval context by hand.
+                Some(update) => {
+                    let mut vars = (*self.variables(instance_key)).clone();
+                    vars.extend(update.clone());
+                    self.eval_io_mappings_in(&vars, &outputs)
+                }
+                None => self.eval_io_mappings(instance_key, &outputs),
+            };
             if !updates.is_empty() {
                 events.push(Event::VariablesUpdated {
                     instance_key,

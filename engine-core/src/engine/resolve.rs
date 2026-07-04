@@ -79,28 +79,24 @@ impl Engine {
             .and_then(|e| e.retries.clone())
     }
 
-    /// Evaluates a script task's inline `zeebe:script` FEEL `expression` against
-    /// the instance variables, overlaid with any input mappings applied earlier
-    /// in the same activation (`overlay`), returning the result value to store
-    /// under the task's `resultVariable`. Returns `None` when the expression
-    /// cannot be evaluated (parse error, unresolved variable) — nano does not
-    /// raise an incident here, consistent with the other FEEL resolve helpers.
-    pub(crate) fn eval_script(
+    /// Evaluates the given io mappings against an explicit variable context
+    /// `vars` (rather than the instance's persisted variables), returning the
+    /// merged projection. Used when an as-yet-unapplied result (e.g. a script
+    /// task's `resultVariable`) must be visible to output mappings within the
+    /// same step.
+    pub(crate) fn eval_io_mappings_in(
         &self,
-        instance_key: Key,
-        expression: &str,
-        overlay: &HashMap<String, Value>,
-    ) -> Option<Value> {
-        let base = self.variables(instance_key);
-        if overlay.is_empty() {
-            crate::feel::eval(expression, &base).ok()
-        } else {
-            let mut ctx = (*base).clone();
-            for (k, v) in overlay {
-                ctx.insert(k.clone(), v.clone());
+        vars: &HashMap<String, Value>,
+        mappings: &[crate::model::Mapping],
+    ) -> HashMap<String, Value> {
+        let mut result: HashMap<String, Value> = HashMap::new();
+        for m in mappings {
+            match crate::feel::eval(m.source.trim(), vars) {
+                Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
+                Err(_) => continue,
             }
-            crate::feel::eval(expression, &ctx).ok()
         }
+        result
     }
 
     pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
@@ -358,14 +354,7 @@ impl Engine {
         mappings: &[crate::model::Mapping],
     ) -> HashMap<String, Value> {
         let vars = self.variables(instance_key);
-        let mut result: HashMap<String, Value> = HashMap::new();
-        for m in mappings {
-            match crate::feel::eval(m.source.trim(), &vars) {
-                Ok(value) => Self::assign_io_target(&mut result, &vars, &m.target, value),
-                Err(_) => continue,
-            }
-        }
-        result
+        self.eval_io_mappings_in(&vars, mappings)
     }
 
     /// Writes `value` to `target` (a plain name or a dotted path) inside the
