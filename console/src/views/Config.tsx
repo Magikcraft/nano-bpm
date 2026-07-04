@@ -65,8 +65,8 @@ function ServerPane() {
     <div>
       <div className="mb-4 flex items-center justify-between">
         <div className="text-sm text-zinc-400">
-          Parameters are set on startup via the environment —{" "}
-          <span className="text-zinc-500">read-only for now.</span>
+          The SLA mode is switchable live below; other parameters are set on
+          startup via the environment.
         </div>
         <div className="inline-flex rounded-md border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
           {(["basic", "advanced"] as const).map((m) => (
@@ -84,7 +84,7 @@ function ServerPane() {
       </div>
 
       {mode === "basic" ? (
-        <SlaPedal sla={cfg.slaMode} />
+        <SlaPedal sla={cfg.slaMode} onApplied={setCfg} />
       ) : (
         <AdvancedParams cfg={cfg} />
       )}
@@ -93,12 +93,25 @@ function ServerPane() {
 }
 
 // The single-knob guitar-effects pedal for the SLA mode. The knob reflects the
-// server's current mode; turning it previews the alternative and shows how to
-// apply it on startup (live switching is not wired yet).
-function SlaPedal({ sla }: { sla: SlaModeConfig }) {
+// server's current mode. When the server reports `switchable`, turning the knob
+// applies the mode live (and the server propagates it cluster-wide); otherwise
+// it previews the alternative and shows how to apply it on startup.
+function SlaPedal({
+  sla,
+  onApplied,
+}: {
+  sla: SlaModeConfig;
+  onApplied: (cfg: ServerConfig) => void;
+}) {
   const [preview, setPreview] = useState(sla.current);
+  const [applying, setApplying] = useState(false);
+  const [applyErr, setApplyErr] = useState<string | null>(null);
   const dragging = useRef(false);
   const knobRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep the knob in sync with the server's live mode (e.g. after a
+  // cluster-wide switch initiated elsewhere refetches, or on apply).
+  useEffect(() => setPreview(sla.current), [sla.current]);
 
   const idx = Math.max(
     0,
@@ -109,13 +122,32 @@ function SlaPedal({ sla }: { sla: SlaModeConfig }) {
   const angle = idx === 0 ? -48 : 48;
   const changed = preview !== sla.current;
 
+  // Move the knob to `mode`. When the server allows live switching, apply it
+  // immediately (optimistic knob move, revert on failure); otherwise just
+  // preview so the restart hint shows the target env value.
+  const select = (mode: string) => {
+    if (mode === preview) return;
+    setPreview(mode);
+    if (!sla.switchable) return;
+    setApplyErr(null);
+    setApplying(true);
+    configApi
+      .setSla(mode)
+      .then(onApplied)
+      .catch((e) => {
+        setApplyErr(String(e));
+        setPreview(sla.current);
+      })
+      .finally(() => setApplying(false));
+  };
+
   const setFromPointer = (clientX: number) => {
     const el = knobRef.current;
     if (!el) return;
     const r = el.getBoundingClientRect();
     // Left half selects option 0, right half option 1.
     const left = clientX < r.left + r.width / 2;
-    setPreview(sla.options[left ? 0 : 1].id);
+    select(sla.options[left ? 0 : 1].id);
   };
 
   return (
@@ -184,8 +216,8 @@ function SlaPedal({ sla }: { sla: SlaModeConfig }) {
             }}
             onPointerUp={() => (dragging.current = false)}
             onKeyDown={(e) => {
-              if (e.key === "ArrowLeft") setPreview(sla.options[0].id);
-              if (e.key === "ArrowRight") setPreview(sla.options[1].id);
+              if (e.key === "ArrowLeft") select(sla.options[0].id);
+              if (e.key === "ArrowRight") select(sla.options[1].id);
             }}
             className="relative h-28 w-28 cursor-pointer rounded-full"
             style={{
@@ -216,10 +248,10 @@ function SlaPedal({ sla }: { sla: SlaModeConfig }) {
 
         {/* detent labels */}
         <div className="mt-2 flex justify-between text-[9px] uppercase tracking-wider text-zinc-500">
-          <button className="hover:text-amber-300" onClick={() => setPreview(sla.options[0].id)}>
+          <button className="hover:text-amber-300" onClick={() => select(sla.options[0].id)}>
             ◄ reject
           </button>
-          <button className="hover:text-cyan-300" onClick={() => setPreview(sla.options[1].id)}>
+          <button className="hover:text-cyan-300" onClick={() => select(sla.options[1].id)}>
             accept ►
           </button>
         </div>
@@ -241,7 +273,22 @@ function SlaPedal({ sla }: { sla: SlaModeConfig }) {
               (source: {sla.source === "default" ? "default" : "environment"})
             </span>
           </div>
-          {changed ? (
+          {sla.switchable ? (
+            applyErr ? (
+              <div className="text-rose-400">Switch failed: {applyErr}</div>
+            ) : applying ? (
+              <div className="text-cyan-400">Applying {preview} across the cluster…</div>
+            ) : (
+              <div className="text-emerald-400">
+                Live. Turning the knob switches the mode immediately and propagates
+                it cluster-wide. On restart it reseeds from{" "}
+                <code className="rounded bg-black/40 px-1 py-0.5 font-mono text-emerald-300">
+                  NANOBPMN_SLA_MODE
+                </code>
+                .
+              </div>
+            )
+          ) : changed ? (
             <div className="text-amber-400">
               Preview only. To apply, restart with{" "}
               <code className="rounded bg-black/40 px-1 py-0.5 font-mono text-amber-300">
@@ -251,8 +298,7 @@ function SlaPedal({ sla }: { sla: SlaModeConfig }) {
             </div>
           ) : (
             <div className="text-zinc-500">
-              Turn the knob to preview the other mode. Live switching is coming soon;
-              for now the mode is set on startup.
+              Turn the knob to preview the other mode; the mode is set on startup.
             </div>
           )}
         </div>

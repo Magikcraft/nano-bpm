@@ -310,6 +310,13 @@ impl PeerLink {
         .await
     }
 
+    /// Fire-and-forget the runtime SLA-mode switch to this peer, so the cluster
+    /// applies a single uniform admission policy. `mode` is the
+    /// [`crate::backpressure::SlaMode`] string. See [`ClientFrame::SetSlaMode`].
+    pub async fn send_sla_mode(&self, mode: String) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::SetSlaMode { mode }).await
+    }
+
     /// Forwards a `createProcessInstance` to this peer (it creates on one of its
     /// own partitions). `await_completion` is intentionally unsupported here —
     /// it resolves over an async `InstanceCompleted` frame, wired in a later

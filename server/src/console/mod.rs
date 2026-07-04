@@ -24,7 +24,7 @@ use axum::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, put},
 };
 use futures_util::stream::{Stream, unfold};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::ServerImpl;
+use crate::backpressure::SlaMode;
 
 pub mod extensions;
 pub mod projects;
@@ -97,6 +98,7 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/worker-sdk", get(worker_sdk_source))
         .route("/console/api/deno-types", get(deno_types_source))
         .route("/console/api/config/server", get(config_server))
+        .route("/console/api/config/server/sla", put(config_server_sla))
         .route("/console/api/config/ide", get(config_ide))
         .route("/console/api/lib", get(lib_list).post(lib_file_create))
         .route(
@@ -1960,8 +1962,36 @@ async fn extensions_list() -> Response {
 }
 
 /// `GET /console/api/config/server` — SLA mode + read-only env-parameter registry.
-async fn config_server() -> Response {
-    Json(config::server_config_json()).into_response()
+async fn config_server(State(server): State<ServerImpl>) -> Response {
+    Json(config::server_config_json(server.sla_mode())).into_response()
+}
+
+/// `PUT /console/api/config/server/sla` — switch the SLA mode at runtime. Body
+/// `{"mode":"latency"|"admission"}`. An unrecognised mode is rejected (400)
+/// rather than silently fail-safing, so an operator gets clear feedback; the
+/// updated config is returned on success.
+async fn config_server_sla(
+    State(server): State<ServerImpl>,
+    Json(body): Json<SlaModeBody>,
+) -> Response {
+    let mode = match body.mode.trim().to_ascii_lowercase().as_str() {
+        "latency" => SlaMode::Latency,
+        "admission" => SlaMode::Admission,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown SLA mode {other:?}; expected \"latency\" or \"admission\""),
+            )
+                .into_response();
+        }
+    };
+    server.switch_sla_mode(mode).await;
+    Json(config::server_config_json(server.sla_mode())).into_response()
+}
+
+#[derive(Deserialize)]
+struct SlaModeBody {
+    mode: String,
 }
 
 /// `GET /console/api/config/ide` — toolchain dependencies + language-pack config.

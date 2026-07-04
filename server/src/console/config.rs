@@ -23,7 +23,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use super::extensions;
-use crate::backpressure::{SlaMode, parse_sla_mode};
+use crate::backpressure::SlaMode;
 
 // ---------------------------------------------------------------------------
 // Server config
@@ -269,9 +269,11 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
 ];
 
 /// `GET /console/api/config/server` — SLA mode + the full env-parameter registry.
-pub fn server_config_json() -> serde_json::Value {
+///
+/// `current` is the live, possibly runtime-switched mode (the server passes its
+/// `SharedSlaMode` value in); the env var is reported only as the seed source.
+pub fn server_config_json(current: SlaMode) -> serde_json::Value {
     let raw = std::env::var("NANOBPMN_SLA_MODE").ok();
-    let mode = parse_sla_mode(raw.as_deref());
     let params: Vec<EnvParam> = PARAMS
         .iter()
         .map(|(key, category, label, default, description)| EnvParam {
@@ -286,9 +288,12 @@ pub fn server_config_json() -> serde_json::Value {
 
     serde_json::json!({
         "slaMode": {
-            "current": mode.as_str(),
-            "description": mode.describe(),
+            "current": current.as_str(),
+            "description": current.describe(),
             "source": if raw.is_some() { "NANOBPMN_SLA_MODE" } else { "default" },
+            // The SLA mode can be switched live from the console; only the env
+            // parameters below are startup-only.
+            "switchable": true,
             "options": [
                 {
                     "id": SlaMode::Latency.as_str(),
@@ -304,7 +309,8 @@ pub fn server_config_json() -> serde_json::Value {
                 },
             ],
         },
-        // Read-only for now: parameters are set on startup via the environment.
+        // Read-only: parameters are set on startup via the environment. (The SLA
+        // mode above is the exception — it is runtime-switchable.)
         "readOnly": true,
         "params": params,
     })
@@ -492,11 +498,13 @@ pub fn ide_config_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backpressure::parse_sla_mode;
 
     #[test]
     fn server_config_reports_sla_mode_and_params() {
-        let v = server_config_json();
-        assert!(v["slaMode"]["current"].is_string());
+        let v = server_config_json(parse_sla_mode(Some("admission")));
+        assert_eq!(v["slaMode"]["current"], "admission");
+        assert_eq!(v["slaMode"]["switchable"], true);
         assert_eq!(v["slaMode"]["options"].as_array().unwrap().len(), 2);
         let params = v["params"].as_array().unwrap();
         assert!(params.iter().any(|p| p["key"] == "NANOBPMN_SLA_MODE"));

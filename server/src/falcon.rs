@@ -395,6 +395,21 @@ pub enum ClientFrame {
         leader_node: u64,
         leader_addr: String,
     },
+    /// **Intra-cluster only.** An operator switched the runtime SLA mode on one
+    /// node (via the console SLA knob); that node fans the new mode out to every
+    /// peer so the whole cluster applies a single, uniform admission policy (a
+    /// split — some nodes shedding to preserve latency while others keep admitting
+    /// — would make client behaviour depend on which node routed the create).
+    /// `mode` is the [`crate::backpressure::SlaMode`] string (`"latency"` /
+    /// `"admission"`). Fire-and-forget (no `corr`): the recipient applies it
+    /// locally and does **not** re-broadcast (no fan-out loop); a briefly
+    /// unreachable node keeps its prior mode until the next switch or a restart
+    /// (which reseeds from `NANOBPMN_SLA_MODE`), which is safe for an operational
+    /// knob.
+    #[serde(rename_all = "camelCase")]
+    SetSlaMode {
+        mode: String,
+    },
 }
 
 /// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
@@ -886,6 +901,7 @@ async fn handle_client_frame(
         ClientFrame::Raft { .. } => "raft",
         ClientFrame::LeaseDigest { .. } => "lease_digest",
         ClientFrame::Promote { .. } => "promote",
+        ClientFrame::SetSlaMode { .. } => "set_sla_mode",
     };
     crate::metrics::record_stream_frame(frame_type);
 
@@ -1522,6 +1538,13 @@ async fn handle_client_frame(
             // leader of `partition`. Adopt the epoch and rejoin as a learner (or
             // step down if we were a stale leader). Fire-and-forget: no reply.
             server.handle_promotion(partition, epoch, leader_node).await;
+        }
+        ClientFrame::SetSlaMode { mode } => {
+            // A peer's operator switched the runtime SLA mode; apply it locally so
+            // the whole cluster runs one uniform admission policy. We do NOT
+            // re-broadcast (the originator already fanned out to every peer), so
+            // there is no propagation loop. Fire-and-forget: no reply.
+            server.apply_remote_sla_mode(&mode);
         }
     }
 

@@ -54,8 +54,8 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, Backpressure, BackpressureSetting, SlaMode, parse_backpressure_setting,
-    parse_sla_mode,
+    AdaptiveController, Backpressure, BackpressureSetting, SharedSlaMode, SlaMode,
+    parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -121,15 +121,17 @@ pub struct ServerImpl {
     /// per-command latency); a fixed watermark or fully-off are selectable via
     /// `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`. See [`crate::backpressure`].
     backpressure: Backpressure,
-    /// Behaviour selected at the saturation ceiling (`NANOBPMN_SLA_MODE`).
+    /// Behaviour selected at the saturation ceiling (seeded from
+    /// `NANOBPMN_SLA_MODE`, then **switchable at runtime** via the console).
     /// [`SlaMode::Latency`] (default) sheds admission to preserve end-to-end
     /// latency; [`SlaMode::Admission`] suppresses the latency-preservation gates
     /// (the AIMD concurrency limiter and the active-backlog gate) to keep
     /// admitting instances, accepting higher latency. It never relaxes the
     /// memory-safety rails (create-queue, in-flight-payload, resident-memory
-    /// watermarks), which guard against OOM in both modes. See
-    /// [`crate::backpressure::SlaMode`].
-    sla_mode: SlaMode,
+    /// watermarks), which guard against OOM in both modes. Held behind a
+    /// [`SharedSlaMode`] so an operator toggle reaches every request handler
+    /// without a restart. See [`crate::backpressure::SlaMode`].
+    sla_mode: SharedSlaMode,
     /// Lock-free gauge of in-flight (Active) process instances, maintained by the
     /// read-model exporter (+1 per `ProcessInstanceCreated`, −1 per terminal
     /// event). This is the *active backlog*; it is kept for observability and
@@ -421,6 +423,7 @@ impl ServerImpl {
 
         let sla_mode = parse_sla_mode(std::env::var("NANOBPMN_SLA_MODE").ok().as_deref());
         tracing::info!("SLA mode at ceiling: {}", sla_mode.describe());
+        let sla_mode = SharedSlaMode::new(sla_mode);
 
         let admission_max_backlog = admission_max_backlog_from_env();
         if admission_max_backlog > 0 {
@@ -2073,7 +2076,7 @@ impl ServerImpl {
         // instances and accepts higher latency, so it does not shed on the
         // latency-driven concurrency limit (the memory-safety rails in
         // `admission_shed` still apply and keep the node from OOMing).
-        if self.sla_mode.sheds_for_latency()
+        if self.sla_mode.get().sheds_for_latency()
             && let Some(limit) = self.backpressure.current_limit()
         {
             let processing = self.processing.load(Ordering::Relaxed);
@@ -6590,6 +6593,44 @@ impl ServerImpl {
         }
     }
 
+    /// Switch the runtime SLA mode from an operator action on THIS node (the
+    /// console SLA knob), then fan the new mode out to every peer so the whole
+    /// cluster runs one uniform admission policy. Applied locally first (so the
+    /// originating node reflects it immediately even if peers are unreachable),
+    /// then best-effort broadcast — the same fire-and-forget model as
+    /// [`Self::broadcast_promotion`]/deployment fan-out.
+    #[cfg(feature = "console")]
+    pub(crate) async fn switch_sla_mode(&self, mode: SlaMode) {
+        self.set_sla_mode(mode);
+        self.broadcast_sla_mode(mode).await;
+    }
+
+    /// Fire-and-forget the SLA mode to every reachable peer. A peer that is
+    /// briefly unreachable keeps its prior mode until the next switch or a restart
+    /// (which reseeds from `NANOBPMN_SLA_MODE`) — acceptable for an operational
+    /// knob, consistent with how deployments/promotions propagate.
+    #[cfg(feature = "console")]
+    async fn broadcast_sla_mode(&self, mode: SlaMode) {
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id;
+        for n in 0..topology.num_nodes() {
+            if n == me {
+                continue;
+            }
+            if let Ok(link) = self.peers.link(n).await {
+                link.send_sla_mode(mode.as_str().to_string()).await.ok();
+            }
+        }
+    }
+
+    /// Apply an SLA mode switched on a PEER (inbound [`ClientFrame::SetSlaMode`]).
+    /// Sets it locally only — we do not re-broadcast (the originator already fanned
+    /// out to every peer), so there is no propagation loop. Fail-safe parse: any
+    /// unrecognised string resolves to [`SlaMode::Latency`].
+    pub(crate) fn apply_remote_sla_mode(&self, mode: &str) {
+        self.set_sla_mode(parse_sla_mode(Some(mode)));
+    }
+
     /// Handles an inbound [`ClientFrame::Promote`]: a peer (`leader_node`) has
     /// app-promoted itself leader of partition `p` at `epoch` (leader-durable
     /// recovery). We adopt the announcement when it *wins the fence*: a strictly
@@ -8137,13 +8178,34 @@ impl ServerImpl {
             .await
     }
 
+    /// The SLA mode currently in effect. Read live from the shared handle, so it
+    /// reflects any runtime switch.
+    #[cfg(feature = "console")]
+    pub(crate) fn sla_mode(&self) -> SlaMode {
+        self.sla_mode.get()
+    }
+
+    /// Switch the SLA mode at runtime (e.g. from the console SLA knob). Takes
+    /// effect on the next admission decision across all handlers.
+    pub(crate) fn set_sla_mode(&self, mode: SlaMode) {
+        let previous = self.sla_mode.get();
+        self.sla_mode.set(mode);
+        if previous != mode {
+            tracing::info!(
+                "SLA mode switched at runtime: {} -> {}",
+                previous.as_str(),
+                mode.describe()
+            );
+        }
+    }
+
     /// Read access to the create-side backpressure controller for the stream's
     /// submission-credit policy. Honours the SLA mode: in
     /// [`SlaMode::Admission`](crate::backpressure::SlaMode::Admission) the
     /// latency-driven concurrency limit does not withhold submission credit
     /// (admission is preferred over latency); the memory-safety rails still apply.
     pub(crate) fn submission_pressure(&self) -> bool {
-        if !self.sla_mode.sheds_for_latency() {
+        if !self.sla_mode.get().sheds_for_latency() {
             return false;
         }
         let processing = self.processing.load(Ordering::Relaxed);
@@ -8188,7 +8250,7 @@ impl ServerImpl {
             }
         }
         let backlog_limit = self.admission_max_backlog;
-        if self.sla_mode.sheds_for_latency() && backlog_limit > 0 {
+        if self.sla_mode.get().sheds_for_latency() && backlog_limit > 0 {
             let backlog = self.inflight.load(Ordering::Relaxed);
             if backlog >= backlog_limit {
                 return Some(format!(
@@ -10298,6 +10360,49 @@ mod clustered_startup_tests {
             .await
             .expect("peer creates after the wire broadcast");
         assert!(!completed);
+    }
+
+    /// A runtime SLA switch on one node propagates over the Falcon peer link to
+    /// its peers, so the whole cluster converges on one admission policy.
+    #[cfg(feature = "console")]
+    #[tokio::test]
+    async fn sla_mode_switch_propagates_over_the_wire_to_a_peer() {
+        // node 1 serves its falcon endpoint; it starts in the default Latency mode.
+        let node1 = clustered_node(1);
+        assert_eq!(node1.sla_mode(), crate::backpressure::SlaMode::Latency);
+        let node1_url = serve_node(&node1).await;
+
+        // node 0 points at the served peer and is the node an operator switches.
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused".into(), node1_url],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node0 = build_server_in_memory(journals, topology);
+
+        // The operator flips node 0 to Admission; it applies locally and fans out.
+        node0
+            .switch_sla_mode(crate::backpressure::SlaMode::Admission)
+            .await;
+        assert_eq!(node0.sla_mode(), crate::backpressure::SlaMode::Admission);
+
+        // The switch rode the wire: the peer adopted Admission too. Poll briefly —
+        // the fan-out is fire-and-forget over an async socket.
+        let mut adopted = false;
+        for _ in 0..50 {
+            if node1.sla_mode() == crate::backpressure::SlaMode::Admission {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(adopted, "peer should adopt the cluster-wide SLA switch");
     }
 
     /// Serves a node's falcon endpoint on an ephemeral port and returns

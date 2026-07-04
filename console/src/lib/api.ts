@@ -828,6 +828,8 @@ export interface SlaModeConfig {
   description: string;
   /** "NANOBPMN_SLA_MODE" when set explicitly, else "default". */
   source: string;
+  /** True when the mode can be switched live from the console (no restart). */
+  switchable?: boolean;
   options: SlaOption[];
 }
 export interface ServerParam {
@@ -882,4 +884,12 @@ export interface IdeConfig {
 export const configApi = {
   server: () => getJson<ServerConfig>("/config/server"),
   ide: () => getJson<IdeConfig>("/config/ide"),
+  /** Switch the runtime SLA mode; propagates cluster-wide. Returns fresh config. */
+  setSla: (mode: string) =>
+    send<ServerConfig>(
+      "PUT",
+      "/config/server/sla",
+      JSON.stringify({ mode }),
+      "application/json",
+    ),
 };

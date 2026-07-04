@@ -18,7 +18,7 @@
 //! is limited (instances) — it makes the *limit itself* track latency.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Parsed configuration for the backpressure subsystem.
@@ -61,6 +61,7 @@ pub fn parse_backpressure_setting(raw: Option<&str>) -> BackpressureSetting {
 /// resident-memory watermarks) that exist to keep the node from OOMing — those
 /// are survival guards active in every mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SlaMode {
     /// **Preserve end-to-end latency** (default). At the ceiling, shed new
     /// `createProcessInstance` calls (`503 RESOURCE_EXHAUSTED`) so accepted
@@ -106,6 +107,45 @@ impl SlaMode {
                 "admission (preserve admission; accept higher latency at the ceiling)"
             }
         }
+    }
+
+    /// Reconstruct from the atomic byte used by [`SharedSlaMode`]. Fails safe to
+    /// [`SlaMode::Latency`] for any unexpected value (never silently drop latency
+    /// protection).
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => SlaMode::Admission,
+            _ => SlaMode::Latency,
+        }
+    }
+}
+
+/// A runtime-switchable SLA mode: a cheap, cloneable handle over an atomic so an
+/// operator toggle (e.g. the console SLA knob) is visible to every in-flight
+/// request handler **without a restart**. Mirrors the [`Backpressure::Adaptive`]
+/// watermark, which is likewise an `Arc<Atomic…>` written by one place and read
+/// lock-free on the hot path. The stored value is [`SlaMode`] encoded via
+/// `#[repr(u8)]`.
+#[derive(Clone)]
+pub struct SharedSlaMode(Arc<AtomicU8>);
+
+impl SharedSlaMode {
+    /// Seed with the startup mode (resolved from `NANOBPMN_SLA_MODE`).
+    pub fn new(mode: SlaMode) -> Self {
+        Self(Arc::new(AtomicU8::new(mode as u8)))
+    }
+
+    /// The current mode. A relaxed atomic load — no coordination, safe on the
+    /// admission hot path.
+    pub fn get(&self) -> SlaMode {
+        SlaMode::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Switch the mode at runtime. Takes effect on the next admission decision;
+    /// a small race against concurrent creates is irrelevant for an approximate
+    /// gate.
+    pub fn set(&self, mode: SlaMode) {
+        self.0.store(mode as u8, Ordering::Relaxed);
     }
 }
 
@@ -427,6 +467,28 @@ mod tests {
     fn sla_mode_sheds_for_latency_only_in_latency_mode() {
         assert!(SlaMode::Latency.sheds_for_latency());
         assert!(!SlaMode::Admission.sheds_for_latency());
+    }
+
+    #[test]
+    fn shared_sla_mode_is_switchable_and_shared_across_clones() {
+        let a = SharedSlaMode::new(SlaMode::Latency);
+        let b = a.clone();
+        assert_eq!(a.get(), SlaMode::Latency);
+        assert_eq!(b.get(), SlaMode::Latency);
+        // A switch on one handle is visible through the other (shared Arc<atomic>).
+        b.set(SlaMode::Admission);
+        assert_eq!(a.get(), SlaMode::Admission);
+        assert_eq!(b.get(), SlaMode::Admission);
+        a.set(SlaMode::Latency);
+        assert_eq!(b.get(), SlaMode::Latency);
+    }
+
+    #[test]
+    fn sla_mode_from_u8_fails_safe_to_latency() {
+        assert_eq!(SlaMode::from_u8(SlaMode::Latency as u8), SlaMode::Latency);
+        assert_eq!(SlaMode::from_u8(SlaMode::Admission as u8), SlaMode::Admission);
+        // Any unexpected byte never silently drops latency protection.
+        assert_eq!(SlaMode::from_u8(200), SlaMode::Latency);
     }
 
     #[test]
