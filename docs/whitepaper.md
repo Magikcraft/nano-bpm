@@ -534,11 +534,44 @@ activated at least once. Leader-local mode merely lets a follower apply a
 replicated `CompleteJob` to a job it only ever observed as `Created` — the drop-in
 contract (any client holding a valid key may complete the job) is untouched.
 
-The cost is stated honestly instead: a leader-local lease does not survive
-failover, so a new leader re-dispatches in-flight jobs immediately — a bounded,
-at-least-once-tolerable duplication, not a correctness loss. This is a choice
-Zeebe's uniform replicated lifecycle does not separate out, available to Nano only
-because it distinguishes *lease* from *progress*.
+What makes a leader-local lease *safe* — and why the other replicas need no
+knowledge of it — is that **activation is leader-exclusive per partition**. Every
+job key embeds its partition id (`main.rs:587`), so a job belongs to exactly one
+partition; a node activates jobs only for the partitions it *leads* and skips the
+rest, "their leader activates" (`main.rs:7362`); and Raft guarantees a single
+leader per partition per term, fenced against stale leaders (`main.rs:277`). There
+is thus never a second node that *could* activate the same job — not because
+followers are told about the lease, but because followers do not activate at all.
+The one node that activates a partition's jobs is precisely the one holding that
+partition's lease in its own memory; coordination is unnecessary because there is
+only one actor. What the rest of the cluster *does* know is the **job key itself**:
+it is minted on the replicated job-creation path (deterministic key allocation on
+every replica, ADR 0002), so every follower holds the job — in `Created` state,
+without the lease. Key: replicated, known everywhere. Lease: leader-local. That
+asymmetry is the whole design.
+
+Is this distinct from Zeebe? The *exclusivity* is not — it is a **convergence**,
+stated plainly: Zeebe also runs one leader per partition and activates only there
+(its `StreamProcessor`). The real distinction is narrower and more honest. Zeebe
+writes activation as a **replicated follow-up event** —
+`JobBatchActivateProcessor.java:193`,
+`stateWriter.appendFollowUpEvent(jobBatchKey, JobBatchIntent.ACTIVATED, …)` — so
+the lease is durable state that *survives failover*: a new leader knows the
+in-flight deadline and waits it out before redelivering. **Nano's default mode does
+exactly the same thing.** The divergence is the *optional* leader-local mode,
+which — having recognized that activation is a lease, not durable progress, in an
+already at-least-once system — takes the lease out of the replicated stream
+entirely. The cost is stated honestly: a leader-local lease does not survive
+failover, so a new leader re-dispatches in-flight jobs immediately rather than
+honoring a deadline it never received — a bounded, at-least-once-tolerable
+duplication, not a correctness loss. A middle setting, the best-effort **lease
+digest** (`NANOBPMN_REPLICATE_ACTIVATION=digest`), has the leader broadcast its
+held `{job_key → deadline}` leases to followers without durability; on promotion
+the new leader soft-recovers them and honors the deadlines, shrinking the duplicate
+window at no per-job quorum cost. Nano thus turns a single fixed point in Zeebe —
+activation is always replicated — into a **three-position choice** (replicated /
+digest / leader-local), available only because it separates *lease* from
+*progress*.
 
 ### 9.3 Durability as a spectrum, not a constant
 
