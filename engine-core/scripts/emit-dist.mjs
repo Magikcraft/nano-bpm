@@ -25,7 +25,7 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const ABI_VERSION = 1;
+const ABI_VERSION = 2;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const engineCoreDir = join(here, '..');
@@ -110,6 +110,11 @@ const REQUIRED_EXPORTS = [
   'nbpmn_trigger_timers',
   'nbpmn_is_completed',
   'nbpmn_instance_count',
+  // ABI v2: job worker surface
+  'nbpmn_activate_jobs',
+  'nbpmn_complete_job',
+  'nbpmn_fail_job',
+  'nbpmn_expire_jobs',
 ];
 const exportNames = new Set(exports.map((e) => e.name));
 const missing = REQUIRED_EXPORTS.filter((n) => !exportNames.has(n));
