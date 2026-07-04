@@ -149,6 +149,8 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // start event's nested `timeCycle` text while inside it.
     let mut cur_start: Option<usize> = None;
     let mut cycle_text: Option<String> = None;
+    // Buffer for a timer event's nested `timeDate` (an absolute FEEL/ISO instant).
+    let mut date_text: Option<String> = None;
     // Definitions-level `<error id=… errorCode=…>` declarations: id -> code.
     let mut errors: HashMap<String, String> = HashMap::new();
     // Definitions-level `<message id=… name=…>` declarations, with the
@@ -378,6 +380,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         error_ref: None,
                                         timer_duration_millis: None,
                                         timer_repeating: false,
+                                        timer_expr: None,
                                         message_ref: None,
                                         interrupting: attr(attrs, "cancelActivity")
                                             != Some("false"),
@@ -492,6 +495,13 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "timeCycle" if cur_start.is_some() || cur_boundary.is_some() => {
                                 cycle_text = Some(String::new());
                             }
+                            "timeDate"
+                                if cur_intermediate.is_some()
+                                    || cur_boundary.is_some()
+                                    || cur_start.is_some() =>
+                            {
+                                date_text = Some(String::new());
+                            }
                             "conditionExpression" if cur_flow.is_some() => {
                                 condition_text = Some(String::new());
                             }
@@ -535,6 +545,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 if let Some(buf) = cycle_text.as_mut() {
                     buf.push_str(text);
                 }
+                if let Some(buf) = date_text.as_mut() {
+                    buf.push_str(text);
+                }
             }
             Token::End { name } => match local_name(name) {
                 "process" => {
@@ -548,6 +561,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     duration_text = None;
                     cur_start = None;
                     cycle_text = None;
+                    date_text = None;
                     cur_user_task = None;
                     cur_call = None;
                     io_stack.clear();
@@ -592,6 +606,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     if let (Some(acc), Some(boundary)) = (current.as_mut(), cur_boundary.take()) {
                         if boundary.error_ref.is_some()
                             || boundary.timer_duration_millis.is_some()
+                            || boundary.timer_expr.is_some()
                             || boundary.message_ref.is_some()
                             || boundary.signal_ref.is_some()
                         {
@@ -614,30 +629,78 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 "intermediateCatchEvent" => cur_intermediate = None,
                 "timeDuration" => {
                     if let Some(text) = duration_text.take() {
-                        let millis = parse_iso8601_duration(&text);
-                        if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
-                            // An intermediate catch event's duration.
-                            acc.nodes[idx].duration_millis = millis;
-                        } else if let Some(boundary) = cur_boundary.as_mut() {
-                            // A timer boundary event's duration.
-                            boundary.timer_duration_millis = millis;
-                        } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
-                            // A one-shot timer start event's duration.
-                            acc.nodes[idx].duration_millis = millis;
-                            acc.nodes[idx].timer_repeating = Some(false);
+                        let trimmed = text.trim();
+                        // A `=`-prefixed timeDuration is a FEEL expression
+                        // evaluated at timer creation; a bare value is a static
+                        // ISO-8601 literal parsed now.
+                        if let Some(feel) = feel_timer_expr(trimmed, crate::model::TimerDefKind::Duration)
+                        {
+                            if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
+                                acc.nodes[idx].timer_expr = Some(feel);
+                            } else if let Some(boundary) = cur_boundary.as_mut() {
+                                boundary.timer_expr = Some(feel);
+                            } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                acc.nodes[idx].timer_expr = Some(feel);
+                                acc.nodes[idx].timer_repeating = Some(false);
+                            }
+                        } else {
+                            let millis = parse_iso8601_duration(trimmed);
+                            if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
+                                // An intermediate catch event's duration.
+                                acc.nodes[idx].duration_millis = millis;
+                            } else if let Some(boundary) = cur_boundary.as_mut() {
+                                // A timer boundary event's duration.
+                                boundary.timer_duration_millis = millis;
+                            } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                // A one-shot timer start event's duration.
+                                acc.nodes[idx].duration_millis = millis;
+                                acc.nodes[idx].timer_repeating = Some(false);
+                            }
                         }
                     }
                 }
                 "timeCycle" => {
                     if let Some(text) = cycle_text.take() {
-                        if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                        let trimmed = text.trim();
+                        if let Some(feel) = feel_timer_expr(trimmed, crate::model::TimerDefKind::Cycle)
+                        {
+                            if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                acc.nodes[idx].timer_expr = Some(feel);
+                                acc.nodes[idx].timer_repeating = Some(true);
+                            } else if let Some(boundary) = cur_boundary.as_mut() {
+                                boundary.timer_expr = Some(feel);
+                                boundary.timer_repeating = true;
+                            }
+                        } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
                             // A recurring timer start event's cycle.
-                            acc.nodes[idx].duration_millis = parse_iso8601_cycle(&text);
+                            acc.nodes[idx].duration_millis = parse_iso8601_cycle(trimmed);
                             acc.nodes[idx].timer_repeating = Some(true);
                         } else if let Some(boundary) = cur_boundary.as_mut() {
                             // A recurring (cycle) timer boundary event.
-                            boundary.timer_duration_millis = parse_iso8601_cycle(&text);
+                            boundary.timer_duration_millis = parse_iso8601_cycle(trimmed);
                             boundary.timer_repeating = true;
+                        }
+                    }
+                }
+                "timeDate" => {
+                    if let Some(text) = date_text.take() {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            // A timeDate is always an absolute instant, resolved
+                            // at timer creation (FEEL when `=`-prefixed, else a
+                            // literal ISO-8601 date-time).
+                            let def = crate::model::TimerDef {
+                                kind: crate::model::TimerDefKind::Date,
+                                expr: trimmed.to_string(),
+                            };
+                            if let (Some(acc), Some(idx)) = (current.as_mut(), cur_intermediate) {
+                                acc.nodes[idx].timer_expr = Some(def);
+                            } else if let Some(boundary) = cur_boundary.as_mut() {
+                                boundary.timer_expr = Some(def);
+                            } else if let (Some(acc), Some(idx)) = (current.as_mut(), cur_start) {
+                                acc.nodes[idx].timer_expr = Some(def);
+                                acc.nodes[idx].timer_repeating = Some(false);
+                            }
                         }
                     }
                 }
@@ -708,6 +771,10 @@ struct NodeAcc {
     /// output mappings applied on completion), populated from nested
     /// `zeebe:input`/`zeebe:output` children.
     io: crate::model::IoMapping,
+    /// A FEEL timer expression (a `=`-prefixed `timeDuration`/`timeCycle` or any
+    /// `timeDate`) evaluated at timer creation; `None` for a static ISO-8601
+    /// literal (which populates `duration_millis` at deploy instead).
+    timer_expr: Option<crate::model::TimerDef>,
 }
 
 #[derive(Clone, Copy)]
@@ -746,6 +813,8 @@ struct PendingBoundary {
     error_ref: Option<String>,
     timer_duration_millis: Option<u64>,
     timer_repeating: bool,
+    /// A FEEL timer expression on this boundary timer (see [`NodeAcc::timer_expr`]).
+    timer_expr: Option<crate::model::TimerDef>,
     message_ref: Option<String>,
     signal_ref: Option<String>,
     interrupting: bool,
@@ -798,6 +867,7 @@ impl ProcessAcc {
             is_adhoc: false,
             default_flow: None,
             io: crate::model::IoMapping::default(),
+            timer_expr: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -931,6 +1001,8 @@ impl ProcessAcc {
             let node_id = node.id.clone();
             let io_id = node.id.clone();
             let node_io = node.io.clone();
+            let timer_id = node.id.clone();
+            let node_timer = node.timer_expr.clone();
             let parent = node.parent.clone();
             if let Some(d) = node.default_flow.clone() {
                 default_flow_ids.insert(d);
@@ -1040,6 +1112,9 @@ impl ProcessAcc {
             if !node_io.is_empty() {
                 builder = builder.with_io(io_id, node_io);
             }
+            if let Some(timer) = node_timer {
+                builder = builder.with_timer(timer_id, timer);
+            }
         }
         for boundary in self.boundaries {
             let attached_to =
@@ -1051,7 +1126,12 @@ impl ProcessAcc {
                     })?;
             // Resolve the boundary's flavour: timer (duration), message
             // (messageRef), or error (errorRef -> declared error).
-            if let Some(duration_millis) = boundary.timer_duration_millis {
+            if boundary.timer_duration_millis.is_some() || boundary.timer_expr.is_some() {
+                // A FEEL timer boundary carries no static duration; build the
+                // element with a zero fallback and attach the expression below.
+                let duration_millis = boundary.timer_duration_millis.unwrap_or(0);
+                let boundary_id = boundary.id.clone();
+                let timer_expr = boundary.timer_expr.clone();
                 builder = if boundary.interrupting {
                     // An interrupting timer fires once and cancels its activity,
                     // so a cycle is treated as a one-shot at the interval.
@@ -1069,6 +1149,9 @@ impl ProcessAcc {
                         duration_millis,
                     )
                 };
+                if let Some(timer) = timer_expr {
+                    builder = builder.with_timer(boundary_id, timer);
+                }
             } else if let Some(message_ref) = boundary.message_ref {
                 let decl =
                     messages
@@ -1158,11 +1241,28 @@ impl ProcessAcc {
     }
 }
 
+/// Returns a FEEL [`crate::model::TimerDef`] of `kind` when `trimmed` is a FEEL
+/// expression (a leading `=`), otherwise `None` (the caller treats it as a
+/// static ISO-8601 literal).
+fn feel_timer_expr(
+    trimmed: &str,
+    kind: crate::model::TimerDefKind,
+) -> Option<crate::model::TimerDef> {
+    if trimmed.starts_with('=') {
+        Some(crate::model::TimerDef {
+            kind,
+            expr: trimmed.to_string(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Parses an ISO-8601 duration (e.g. `PT5S`, `PT1M30S`, `PT2H`, `P1DT6H`,
 /// `P1W`) into milliseconds. Supports weeks, days, hours, minutes and seconds
 /// (the date-portion years/months are ambiguous in length and not supported).
 /// Returns `None` if the string is not a recognisable duration.
-fn parse_iso8601_duration(raw: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_duration(raw: &str) -> Option<u64> {
     let s = raw.trim();
     let s = s.strip_prefix('P')?;
     if s.is_empty() {
@@ -1211,7 +1311,7 @@ fn parse_iso8601_duration(raw: &str) -> Option<u64> {
 /// prefix is accepted but ignored (the engine repeats unboundedly). A bare
 /// duration without the `R[n]/` prefix is also accepted. Returns `None` if the
 /// interval portion is not a recognisable duration.
-fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_cycle(raw: &str) -> Option<u64> {
     let s = raw.trim();
     let interval = match s.split_once('/') {
         Some((repeat, interval)) if repeat.starts_with('R') => interval,
@@ -2488,5 +2588,49 @@ mod io_mapping_tests {
         let io2 = &def.element("t2").unwrap().io;
         assert!(io2.inputs.is_empty());
         assert_eq!(io2.outputs.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod feel_timer_tests {
+    use super::*;
+    use crate::model::TimerDefKind;
+
+    #[test]
+    fn parses_feel_timer_expressions() {
+        // A `=`-prefixed timeDuration/timeCycle and any timeDate are captured as
+        // FEEL timer expressions; a static ISO literal is not.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:intermediateCatchEvent id="wait">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>=waitFor</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="until">
+      <bpmn:timerEventDefinition><bpmn:timeDate>=dueAt</bpmn:timeDate></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:intermediateCatchEvent id="fixed">
+      <bpmn:timerEventDefinition><bpmn:timeDuration>PT30S</bpmn:timeDuration></bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="wait" />
+    <bpmn:sequenceFlow id="f2" sourceRef="wait" targetRef="until" />
+    <bpmn:sequenceFlow id="f3" sourceRef="until" targetRef="fixed" />
+    <bpmn:sequenceFlow id="f4" sourceRef="fixed" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        let wait = def.element("wait").unwrap().timer.as_ref().unwrap();
+        assert_eq!(wait.kind, TimerDefKind::Duration);
+        assert_eq!(wait.expr, "=waitFor");
+
+        let until = def.element("until").unwrap().timer.as_ref().unwrap();
+        assert_eq!(until.kind, TimerDefKind::Date);
+        assert_eq!(until.expr, "=dueAt");
+
+        // A static ISO literal is parsed at deploy, not carried as a FEEL expr.
+        assert!(def.element("fixed").unwrap().timer.is_none());
     }
 }

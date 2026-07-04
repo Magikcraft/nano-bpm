@@ -154,6 +154,79 @@ impl Engine {
         value.clamp(0, 100)
     }
 
+    /// Resolves a timer's due time (and, for a cycle, its re-arm interval) at
+    /// timer-creation time, honouring a FEEL timer expression
+    /// ([`crate::model::TimerDef`]) when one is declared on the element, and
+    /// falling back to the statically-parsed `fallback_millis` otherwise.
+    ///
+    /// Returns `(due_at, interval_millis)` where `due_at` is an absolute epoch
+    /// time in the engine's millisecond clock and `interval_millis` is the delay
+    /// used to re-arm a repeating (cycle) timer (0 for an absolute date).
+    /// `instance_key` is `None` for a process-level start timer evaluated at
+    /// deploy against an empty context.
+    pub(crate) fn resolve_timer(
+        &self,
+        instance_key: Option<Key>,
+        def: Option<&crate::model::TimerDef>,
+        base_now: u64,
+        fallback_millis: u64,
+    ) -> (u64, u64) {
+        let default = (base_now.saturating_add(fallback_millis), fallback_millis);
+        let Some(def) = def else {
+            return default;
+        };
+
+        // A `=`-prefixed expression is FEEL, evaluated against the instance
+        // variables (or an empty context at deploy); a bare value (only for a
+        // literal timeDate) is used directly.
+        let evaluated: Option<String> = if def.expr.trim_start().starts_with('=') {
+            let empty = HashMap::new();
+            let vars = instance_key.map(|k| self.variables(k));
+            let ctx: &HashMap<String, Value> = vars.as_deref().unwrap_or(&empty);
+            crate::feel::eval_string(&def.expr, ctx).ok()
+        } else {
+            Some(def.expr.clone())
+        };
+        let Some(text) = evaluated else {
+            return default;
+        };
+        let text = text.trim();
+
+        match def.kind {
+            crate::model::TimerDefKind::Duration => {
+                match crate::bpmn::parse_iso8601_duration(text) {
+                    Some(ms) => (base_now.saturating_add(ms), ms),
+                    None => default,
+                }
+            }
+            crate::model::TimerDefKind::Cycle => match crate::bpmn::parse_iso8601_cycle(text) {
+                Some(ms) => (base_now.saturating_add(ms), ms),
+                None => default,
+            },
+            crate::model::TimerDefKind::Date => {
+                match crate::feel::temporal::DateTime::parse(text) {
+                    Some(dt) => {
+                        let millis = (dt.epoch_nanos() / 1_000_000).max(0) as u64;
+                        (millis, 0)
+                    }
+                    None => default,
+                }
+            }
+        }
+    }
+
+    /// Looks up the FEEL timer expression declared on `element_id` in the process
+    /// definition that owns `instance_key` (if any).
+    pub(crate) fn timer_def_of(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Option<crate::model::TimerDef> {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .and_then(|e| e.timer.clone())
+    }
+
     /// Resolves a variable scope key to the process instance that owns it. The
     /// key may be the process instance itself or any of its active element
     /// instances; nano keeps a single instance-level variable scope, so both map

@@ -488,6 +488,10 @@ impl Engine {
                 .elements
                 .get(&process.start_event)
                 .map(|e| e.kind.clone());
+            let start_timer_def = process
+                .elements
+                .get(&process.start_event)
+                .and_then(|e| e.timer.clone());
             self.emit(
                 log,
                 Event::ProcessDeployed {
@@ -514,7 +518,12 @@ impl Engine {
                     repeating,
                 }) => {
                     let timer_key = self.mint_key();
-                    let due_at = self.now.saturating_add(interval_millis);
+                    // Evaluate a FEEL start-timer expression against an empty
+                    // context at deploy; a static literal falls back to the
+                    // parsed interval. For a cycle the resolved interval is
+                    // persisted so re-arming recurs on the same delay.
+                    let (due_at, interval_millis) =
+                        self.resolve_timer(None, start_timer_def.as_ref(), self.now, interval_millis);
                     self.emit(
                         log,
                         Event::ProcessStartTimerArmed {
@@ -927,6 +936,17 @@ impl Engine {
                             }) = self.element_kind(instance_key, &boundary_element_id)
                             {
                                 let next_timer_key = self.mint_key();
+                                // Re-evaluate a FEEL cycle against current vars so
+                                // the next interval reflects any updated variable;
+                                // a static cycle keeps its parsed interval.
+                                let timer_def =
+                                    self.timer_def_of(instance_key, &boundary_element_id);
+                                let (next_due_at, _) = self.resolve_timer(
+                                    Some(instance_key),
+                                    timer_def.as_ref(),
+                                    due_at,
+                                    duration_millis,
+                                );
                                 self.emit(
                                     &mut log,
                                     Event::TimerCreated {
@@ -934,7 +954,7 @@ impl Engine {
                                         instance_key,
                                         element_instance_key,
                                         element_id: element_id.clone(),
-                                        due_at: due_at.saturating_add(duration_millis),
+                                        due_at: next_due_at,
                                         kind: state::TimerKind::NonInterruptingBoundary {
                                             boundary_element_id,
                                         },
@@ -2130,12 +2150,19 @@ impl Engine {
             // a clock tick (TriggerTimers) releases it once the timer is due.
             Some(ElementKind::TimerIntermediateCatchEvent { duration_millis }) => {
                 let timer_key = self.mint_key();
+                let timer_def = self.timer_def_of(instance_key, &element_id);
+                let (due_at, _) = self.resolve_timer(
+                    Some(instance_key),
+                    timer_def.as_ref(),
+                    self.now,
+                    duration_millis,
+                );
                 events.push(Event::TimerCreated {
                     timer_key,
                     instance_key,
                     element_instance_key,
                     element_id,
-                    due_at: self.now.saturating_add(duration_millis),
+                    due_at,
                     kind: state::TimerKind::IntermediateCatch,
                 });
             }

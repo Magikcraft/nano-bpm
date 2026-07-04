@@ -266,6 +266,9 @@ impl Engine {
             self.attached_timer_boundaries(instance_key, element_id)
         {
             let timer_key = self.mint_key();
+            let timer_def = self.timer_def_of(instance_key, &boundary_id);
+            let (due_at, _) =
+                self.resolve_timer(Some(instance_key), timer_def.as_ref(), self.now, duration_millis);
             let kind = if interrupting {
                 state::TimerKind::InterruptingBoundary {
                     boundary_element_id: boundary_id,
@@ -280,7 +283,7 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id: element_id.to_string(),
-                due_at: self.now.saturating_add(duration_millis),
+                due_at,
                 kind,
             });
         }

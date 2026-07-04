@@ -2496,6 +2496,8 @@ fn apply_edit_op(
                     },
                     outgoing: moved,
                     parent,
+                    io: Default::default(),
+                    timer: None,
                 },
             );
             if let Some(label) = &op_name_label {
@@ -2546,6 +2548,8 @@ fn apply_edit_op(
                         is_default: false,
                     }],
                     parent: None,
+                    io: Default::default(),
+                    timer: None,
                 },
             );
             if let Some(label) = &op_name_label {
@@ -2703,6 +2707,8 @@ fn apply_edit_op(
                     kind: ElementKind::ExclusiveGateway,
                     outgoing,
                     parent,
+                    io: Default::default(),
+                    timer: None,
                 },
             );
             Ok(format!(

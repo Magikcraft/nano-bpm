@@ -196,6 +196,34 @@ impl IoMapping {
     }
 }
 
+/// The flavour of a FEEL timer expression, mirroring the BPMN
+/// `timerEventDefinition` children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TimerDefKind {
+    /// A `timeDuration`: a relative delay (the timer is due `now + duration`).
+    Duration,
+    /// A `timeCycle`: a repeating interval (`R{n}/{duration}` or a bare
+    /// duration); the cycle count is ignored — Nano cycles are unbounded.
+    Cycle,
+    /// A `timeDate`: an absolute point in time (the timer is due at that instant).
+    Date,
+}
+
+/// A FEEL timer expression declared on a timer event, evaluated against the
+/// instance variables (or an empty context for a process-level start timer)
+/// when the timer is created, rather than parsed as a static ISO-8601 literal
+/// at deploy time. This is how a timer references variables
+/// (`= "PT" + hours + "H"`, `= dueDate`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TimerDef {
+    /// Whether the expression yields a duration, a cycle, or an absolute date.
+    pub kind: TimerDefKind,
+    /// The raw FEEL expression text (a leading `=` marker is optional).
+    pub expr: String,
+}
+
 /// The (raw, un-evaluated) assignment, scheduling and priority expressions
 /// declared on a `userTask` BPMN element via its Zeebe extension elements
 /// (`zeebe:assignmentDefinition`, `zeebe:taskSchedule`, `zeebe:priorityDefinition`).
@@ -457,6 +485,12 @@ pub struct Element {
     /// field existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub io: IoMapping,
+    /// A FEEL timer expression on a timer event, evaluated at timer creation
+    /// against the instance variables (or an empty context for a start timer).
+    /// `None` (the default) for non-timer elements and for timers whose
+    /// definition is a static ISO-8601 literal parsed at deploy time.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub timer: Option<TimerDef>,
 }
 
 /// An executable process definition: a set of [`Element`]s plus the id of the
@@ -583,6 +617,7 @@ fn splice_call_activities(
                     outgoing,
                     parent: new_parent,
                     io: el.io.clone(),
+                    timer: el.timer.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -604,6 +639,7 @@ fn splice_call_activities(
                     outgoing,
                     parent: new_parent,
                     io: el.io.clone(),
+                    timer: el.timer.clone(),
                 },
             );
         }
@@ -686,6 +722,11 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     ios: Vec<(ElementId, IoMapping)>,
+    /// Recorded `(element id, timer expression)` declarations, applied in
+    /// [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    timers: Vec<(ElementId, TimerDef)>,
 }
 
 impl ProcessBuilder {
@@ -697,6 +738,7 @@ impl ProcessBuilder {
             edges: Vec::new(),
             parents: Vec::new(),
             ios: Vec::new(),
+            timers: Vec::new(),
         }
     }
 
@@ -707,6 +749,7 @@ impl ProcessBuilder {
             outgoing: Vec::new(),
             parent: None,
             io: IoMapping::default(),
+            timer: None,
         });
         self
     }
@@ -862,6 +905,13 @@ impl ProcessBuilder {
     /// [`IoMapping`]). Applied in [`build`](ProcessBuilder::build).
     pub fn with_io(mut self, id: impl Into<String>, io: IoMapping) -> Self {
         self.ios.push((id.into(), io));
+        self
+    }
+
+    /// Declares a FEEL timer expression on a timer element (see [`TimerDef`]).
+    /// Applied in [`build`](ProcessBuilder::build).
+    pub fn with_timer(mut self, id: impl Into<String>, timer: TimerDef) -> Self {
+        self.timers.push((id.into(), timer));
         self
     }
 
@@ -1205,6 +1255,14 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach FEEL timer expressions to their timer elements.
+        for (id, timer) in &self.timers {
+            match elements.get_mut(id) {
+                Some(element) => element.timer = Some(timer.clone()),
+                None => return Err(BuildError::UnknownTimerElement(id.clone())),
+            }
+        }
+
         // The process-level start event is the unique start event that is not
         // contained in any sub-process (sub-process inner start events have a
         // parent and start their own scope, not the instance).
@@ -1255,6 +1313,8 @@ pub enum BuildError {
     },
     /// A `with_io` referenced an element that does not exist.
     UnknownIoMappingElement(ElementId),
+    /// A `with_timer` referenced an element that does not exist.
+    UnknownTimerElement(ElementId),
 }
 
 impl std::fmt::Display for BuildError {
@@ -1289,6 +1349,9 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::UnknownIoMappingElement(id) => {
                 write!(f, "ioMapping declared on unknown element {id}")
+            }
+            BuildError::UnknownTimerElement(id) => {
+                write!(f, "timer expression declared on unknown element {id}")
             }
         }
     }

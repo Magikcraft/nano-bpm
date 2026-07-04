@@ -4654,3 +4654,149 @@ fn input_mapping_with_dotted_target_builds_nested_context() {
     expected.insert("total".to_string(), Value::Int(12));
     assert_eq!(io_var(&engine, inst, "order"), Some(Value::Map(expected)));
 }
+
+// --- FEEL timer expressions -------------------------------------------------
+
+#[test]
+fn feel_duration_timer_evaluates_variable() {
+    // A timer intermediate catch whose timeDuration is a FEEL expression
+    // (`=waitFor`) resolves against the instance variables at timer creation.
+    let def = ProcessBuilder::new("feel-timer")
+        .start_event("start")
+        .service_task("charge", "payment")
+        .timer_intermediate_catch_event("wait", 0)
+        .with_timer(
+            "wait",
+            crate::model::TimerDef {
+                kind: crate::model::TimerDefKind::Duration,
+                expr: "=waitFor".to_string(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "charge")
+        .connect("charge", "wait")
+        .connect("wait", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("waitFor".to_string(), Value::Str("PT5S".to_string()));
+    let events = engine
+        .apply_command_at(Command::create_instance_with("feel-timer", vars), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let job = engine
+        .activate_jobs("payment", "w", 1, 60_000, 1_000)
+        .into_iter()
+        .next()
+        .unwrap();
+    engine
+        .apply_command_at(Command::complete_job(job.key), 1_000)
+        .unwrap();
+
+    // due_at = now(1000) + FEEL("PT5S")=5000 = 6000.
+    let timers = engine.timers();
+    assert_eq!(timers.len(), 1);
+    assert_eq!(timers[0].due_at, 6_000);
+    assert!(!engine.is_completed(instance_key));
+    assert!(engine.trigger_timers(5_999).is_empty());
+    assert!(engine
+        .trigger_timers(6_000)
+        .iter()
+        .any(|e| matches!(e, Event::TimerTriggered { .. })));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn feel_date_timer_fires_at_absolute_instant() {
+    // A timeDate timer resolves to an absolute epoch instant, independent of the
+    // engine's current clock.
+    let def = ProcessBuilder::new("feel-date")
+        .start_event("start")
+        .service_task("charge", "payment")
+        .timer_intermediate_catch_event("wait", 0)
+        .with_timer(
+            "wait",
+            crate::model::TimerDef {
+                kind: crate::model::TimerDefKind::Date,
+                expr: "=dueAt".to_string(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "charge")
+        .connect("charge", "wait")
+        .connect("wait", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert(
+        "dueAt".to_string(),
+        Value::Str("2030-01-01T00:00:00Z".to_string()),
+    );
+    engine
+        .apply_command_at(Command::create_instance_with("feel-date", vars), 1_000)
+        .unwrap();
+
+    let job = engine
+        .activate_jobs("payment", "w", 1, 60_000, 1_000)
+        .into_iter()
+        .next()
+        .unwrap();
+    engine
+        .apply_command_at(Command::complete_job(job.key), 1_000)
+        .unwrap();
+
+    // 2030-01-01T00:00:00Z = 1_893_456_000_000 ms since the Unix epoch.
+    let timers = engine.timers();
+    assert_eq!(timers.len(), 1);
+    assert_eq!(timers[0].due_at, 1_893_456_000_000);
+}
+
+#[test]
+fn feel_boundary_timer_evaluates_variable() {
+    // A boundary timer with a FEEL timeDuration resolves against the instance
+    // variables when the guarded activity is entered.
+    let def = ProcessBuilder::new("feel-boundary")
+        .start_event("start")
+        .service_task("charge", "payment")
+        .timer_boundary_event("deadline", "charge", 0)
+        .with_timer(
+            "deadline",
+            crate::model::TimerDef {
+                kind: crate::model::TimerDefKind::Duration,
+                expr: "=deadline".to_string(),
+            },
+        )
+        .end_event("end")
+        .end_event("timedout")
+        .connect("start", "charge")
+        .connect("charge", "end")
+        .connect("deadline", "timedout")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("deadline".to_string(), Value::Str("PT5S".to_string()));
+    engine
+        .apply_command_at(Command::create_instance_with("feel-boundary", vars), 1_000)
+        .unwrap();
+
+    // Activating the job parks the token on `charge` with the boundary timer armed.
+    engine.activate_jobs("payment", "w", 1, 60_000, 1_000);
+
+    // due_at = now(1000) + FEEL("PT5S")=5000 = 6000.
+    let timers = engine.timers();
+    assert_eq!(timers.len(), 1);
+    assert_eq!(timers[0].due_at, 6_000);
+}

@@ -38,7 +38,7 @@ mod eval;
 mod lexer;
 mod parser;
 mod regex;
-mod temporal;
+pub(crate) mod temporal;
 mod value;
 
 use std::collections::HashMap;
