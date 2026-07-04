@@ -1027,7 +1027,24 @@ Zeebe's engineers — it is what success *costs*, and it is a cost that only
 success can impose. Nano's freedom is not virtue; it is **position**. A research
 prototype with no installed base can throw away RocksDB, the JVM, and the
 exporter‑coupled compaction loop (§8, ADR 0012) precisely because no one yet
-depends on them. The interesting move is what it does with that freedom.
+depends on them.
+
+Read from both sides, Kuhn and Christensen describe the same event. The Kuhnian
+anomalies of §2 were not scattered; they pointed, again and again, at a single
+missing first‑class concern — the **control loop**. Backpressure, client
+adaptation, exporter‑coupled reclamation, fleet heterogeneity, footprint: each
+strain was, underneath, a feedback loop the architecture ran by hand, or not at
+all (§13.3). That diagnosis was available from inside. The *cure* was not — because
+promoting control loops to a first principle is not a feature you bolt on; it
+reorganizes the engine around a different center. Christensen supplies the reason
+it stayed unbuilt: a roadmap funded by the installed base cannot justify a
+ground‑up reimagining that ships those customers no new capability, so the fix was
+**economically unaddressable in place** even as the anomaly grew more legible. The
+anomaly was visible; the remedy was foreclosed. Crossing that gap is what a
+research prototype, unburdened by success, exists to do — and the crossing is a
+total reimagining at a fundamental level, not a patch.
+
+The interesting move is what it does with that freedom.
 
 ### 13.3 A confluence of paradigm‑shifting factors
 
@@ -1175,15 +1192,18 @@ surface actually changed. The interventions are narrow and specific:
 Everything else, we kept — deliberately, because it is battle‑tested: the
 per‑partition **actor model**, the **state machinery** (event‑sourced
 command→event→applier, §13.4), the **Camunda 8 interface** (§4), and the broad
-architecture a decade of production hardened. Nano is not a repudiation of that
-work; it is a small number of pointed refinements to it, behind an unchanged
-contract. It is, honestly, **a refinement as much as a revolution** — and that is
-not a hedge but the thesis itself: a paradigm shift is far more adoptable when it
-is disciplined enough to change only what must change.
+architecture a decade of production hardened. Hold both halves at once: the
+reimagining is *fundamental* in its organizing principle — the engine reorganized
+around control loops as a first‑class concern, the center Zeebe could not move to
+(§13.2) — and *disciplined* in its implementation, changing only what that new
+center requires. That is why Nano is, honestly, **a refinement as much as a
+revolution**: not a hedge but the exact shape of the thing. And it is precisely
+that discipline that opens the revolutionary space — the memory drop (§8) and the
+engine recursion it enables (§14) reach a realm simply unreachable to a heavyweight
+engine, however it was tuned. Change only what must change, and a space the old
+paradigm could never enter opens up.
 
 ---
-
-## 14. Conclusion: the frontier
 
 ## 14. Conclusion: the frontier
 
