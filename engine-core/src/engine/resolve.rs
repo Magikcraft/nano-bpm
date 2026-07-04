@@ -44,6 +44,41 @@ impl Engine {
         crate::feel::eval_string(trimmed, ctx).unwrap_or_else(|_| raw.to_string())
     }
 
+    /// Resolves a job's initial retry count from the `zeebe:taskDefinition`
+    /// `retries` expression declared on the element. A literal integer (`"5"`)
+    /// is used directly; a FEEL expression (leading `=`, e.g. `=maxRetries`) is
+    /// evaluated to a number against the instance variables. `None` (no
+    /// declaration) or an unresolvable expression defaults to
+    /// [`crate::state::DEFAULT_JOB_RETRIES`]. The result is floored at 0.
+    pub(crate) fn resolve_retries(&self, instance_key: Key, raw: Option<&str>) -> i32 {
+        let default = crate::state::DEFAULT_JOB_RETRIES;
+        let Some(raw) = raw else {
+            return default;
+        };
+        let trimmed = raw.trim();
+        let value = if let Some(expr) = trimmed.strip_prefix('=') {
+            let vars = self.variables(instance_key);
+            match crate::feel::eval(expr, &vars) {
+                Ok(Value::Int(i)) => i as i32,
+                Ok(Value::Double(d)) => d as i32,
+                _ => return default,
+            }
+        } else {
+            match trimmed.parse::<i32>() {
+                Ok(i) => i,
+                Err(_) => return default,
+            }
+        };
+        value.max(0)
+    }
+
+    /// The raw `retries` expression declared on `element_id` (if any).
+    pub(crate) fn retries_of(&self, instance_key: Key, element_id: &str) -> Option<String> {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .and_then(|e| e.retries.clone())
+    }
+
     pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))

@@ -2498,6 +2498,7 @@ fn apply_edit_op(
                     parent,
                     io: Default::default(),
                     timer: None,
+                    retries: None,
                 },
             );
             if let Some(label) = &op_name_label {
@@ -2550,6 +2551,7 @@ fn apply_edit_op(
                     parent: None,
                     io: Default::default(),
                     timer: None,
+                    retries: None,
                 },
             );
             if let Some(label) = &op_name_label {
@@ -2709,6 +2711,7 @@ fn apply_edit_op(
                     parent,
                     io: Default::default(),
                     timer: None,
+                    retries: None,
                 },
             );
             Ok(format!(

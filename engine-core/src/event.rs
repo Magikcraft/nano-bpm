@@ -126,6 +126,11 @@ pub enum Event {
             serde(default = "crate::state::default_job_priority")
         )]
         priority: i32,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default = "crate::state::default_job_retries")
+        )]
+        retries: i32,
     },
     /// A job was activated by a worker and locked until `deadline` (a logical
     /// instant supplied by the caller). Another worker cannot activate it until

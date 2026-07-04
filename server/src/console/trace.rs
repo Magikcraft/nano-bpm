@@ -1299,6 +1299,7 @@ mod tests {
             job_type: ty.to_string(),
             created_at: 0,
             priority: 50,
+            retries: 3,
         }
     }
 

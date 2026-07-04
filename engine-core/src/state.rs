@@ -179,6 +179,13 @@ pub(crate) fn activation_order(priority: i32, key: Key) -> (i32, Key) {
 /// Retries a job starts with when first created.
 pub const DEFAULT_JOB_RETRIES: i32 = 3;
 
+/// serde default for [`Job::retries`] / [`crate::Event::JobCreated`] on records
+/// serialized before the `retries` field existed on `JobCreated`.
+#[cfg(feature = "serde")]
+pub fn default_job_retries() -> i32 {
+    DEFAULT_JOB_RETRIES
+}
+
 /// Lifecycle state of a (native) user task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -853,6 +860,7 @@ pub fn apply(state: &mut State, event: &Event) {
             job_type,
             created_at,
             priority,
+            retries,
         } => {
             state.jobs.insert(
                 *job_key,
@@ -866,7 +874,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     worker: None,
                     deadline: None,
                     activated: false,
-                    retries: DEFAULT_JOB_RETRIES,
+                    retries: *retries,
                     priority: *priority,
                     created_at: *created_at,
                 },

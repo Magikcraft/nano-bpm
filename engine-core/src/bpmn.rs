@@ -420,11 +420,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "taskDefinition" => {
-                                // zeebe:taskDefinition type="…" inside a service task.
-                                if let (Some(idx), Some(t)) =
-                                    (cur_service_task, attr(attrs, "type"))
-                                {
-                                    acc.nodes[idx].job_type = Some(t.to_string());
+                                // zeebe:taskDefinition type="…" retries="…" inside
+                                // a service task.
+                                if let Some(idx) = cur_service_task {
+                                    if let Some(t) = attr(attrs, "type") {
+                                        acc.nodes[idx].job_type = Some(t.to_string());
+                                    }
+                                    if let Some(r) = attr(attrs, "retries") {
+                                        acc.nodes[idx].retries = Some(r.to_string());
+                                    }
                                 }
                             }
                             "assignmentDefinition" => {
@@ -777,6 +781,9 @@ struct NodeAcc {
     /// `timeDate`) evaluated at timer creation; `None` for a static ISO-8601
     /// literal (which populates `duration_millis` at deploy instead).
     timer_expr: Option<crate::model::TimerDef>,
+    /// The raw `zeebe:taskDefinition` `retries` expression (literal or FEEL),
+    /// resolved to a number at job creation; `None` for the default of 3.
+    retries: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -870,6 +877,7 @@ impl ProcessAcc {
             default_flow: None,
             io: crate::model::IoMapping::default(),
             timer_expr: None,
+            retries: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -1005,6 +1013,8 @@ impl ProcessAcc {
             let node_io = node.io.clone();
             let timer_id = node.id.clone();
             let node_timer = node.timer_expr.clone();
+            let retries_id = node.id.clone();
+            let node_retries = node.retries.clone();
             let parent = node.parent.clone();
             if let Some(d) = node.default_flow.clone() {
                 default_flow_ids.insert(d);
@@ -1116,6 +1126,9 @@ impl ProcessAcc {
             }
             if let Some(timer) = node_timer {
                 builder = builder.with_timer(timer_id, timer);
+            }
+            if let Some(retries) = node_retries {
+                builder = builder.with_retries(retries_id, retries);
             }
         }
         for boundary in self.boundaries {
@@ -1613,6 +1626,40 @@ mod tests {
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
+    }
+
+    #[test]
+    fn should_parse_zeebe_task_definition_retries() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="retryable" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="do-work" retries="=maxRetries" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work" />
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        let def = &defs[0];
+        // The retries expression is captured verbatim (with its `=` prefix) for
+        // evaluation at job creation; the type still drives the job type.
+        assert_eq!(
+            def.element("work").unwrap().retries.as_deref(),
+            Some("=maxRetries")
+        );
+        assert_eq!(
+            def.element("work").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "do-work".to_string(),
+                priority: None,
+            }
+        );
     }
 
     #[test]

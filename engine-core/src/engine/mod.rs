@@ -2099,6 +2099,10 @@ impl Engine {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(instance_key, &job_type);
                 let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let retries = self.resolve_retries(
+                    instance_key,
+                    self.retries_of(instance_key, &element_id).as_deref(),
+                );
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -2107,6 +2111,7 @@ impl Engine {
                     job_type,
                     created_at: self.now,
                     priority,
+                    retries,
                 });
                 // Arm timers/subscriptions for every attached boundary event.
                 events.extend(self.arm_boundary_events(
@@ -2344,6 +2349,10 @@ impl Engine {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(instance_key, &job_type);
                 let priority = self.resolve_priority(instance_key, priority.as_deref());
+                let retries = self.resolve_retries(
+                    instance_key,
+                    self.retries_of(instance_key, &element_id).as_deref(),
+                );
                 (
                     vec![Event::JobCreated {
                         job_key,
@@ -2353,6 +2362,7 @@ impl Engine {
                         job_type,
                         created_at: self.now,
                         priority,
+                        retries,
                     }],
                     Vec::new(),
                 )

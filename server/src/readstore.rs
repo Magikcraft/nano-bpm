@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
-    DEFAULT_JOB_RETRIES, Event, IncidentKind, IncidentState, JobState, Key, ProcessInstanceState,
-    UserTaskState, Value, partition_of,
+    Event, IncidentKind, IncidentState, JobState, Key, ProcessInstanceState, UserTaskState, Value,
+    partition_of,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -1357,6 +1357,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
             element_instance_key,
             element_id,
             job_type,
+            retries,
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
@@ -1373,7 +1374,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     element_id,
                     job_type,
                     job_state_code(JobState::Created),
-                    DEFAULT_JOB_RETRIES,
+                    *retries,
                     def_id,
                     def_key,
                 ],

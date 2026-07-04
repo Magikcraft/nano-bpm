@@ -986,6 +986,47 @@ fn feel_signal_name_resolves_on_activation() {
     assert!(engine.is_completed(key));
 }
 
+fn deploy_and_create_retryable(retries: Option<&str>, vars_in: HashMap<String, Value>) -> Engine {
+    let mut builder = ProcessBuilder::new("retryable")
+        .start_event("start")
+        .service_task("work", "do-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end");
+    if let Some(r) = retries {
+        builder = builder.with_retries("work", r);
+    }
+    let def = builder.build().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("retryable", vars_in))
+        .unwrap();
+    engine
+}
+
+#[test]
+fn static_retries_declaration_sets_initial_job_retries() {
+    let engine = deploy_and_create_retryable(Some("5"), HashMap::new());
+    let job = engine.state().jobs.values().next().unwrap();
+    assert_eq!(job.retries, 5);
+}
+
+#[test]
+fn feel_retries_expression_resolves_against_variables() {
+    let engine =
+        deploy_and_create_retryable(Some("=maxRetries"), vars(&[("maxRetries", Value::Int(7))]));
+    let job = engine.state().jobs.values().next().unwrap();
+    assert_eq!(job.retries, 7);
+}
+
+#[test]
+fn missing_retries_declaration_defaults_to_three() {
+    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let job = engine.state().jobs.values().next().unwrap();
+    assert_eq!(job.retries, state::DEFAULT_JOB_RETRIES);
+}
+
 /// The cross-partition (Zeebe-style) placement protocol for an intermediate
 /// catch: the instance partition parks on an `Opening` record, the host routes
 /// `OpenMessageSubscription` to the message partition (`hash(correlation_key)`),

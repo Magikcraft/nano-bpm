@@ -491,6 +491,13 @@ pub struct Element {
     /// definition is a static ISO-8601 literal parsed at deploy time.
     #[cfg_attr(feature = "serde", serde(default))]
     pub timer: Option<TimerDef>,
+    /// The raw `zeebe:taskDefinition` `retries` expression on a job-based task
+    /// (e.g. a service task), evaluated to a number at job creation against the
+    /// instance variables. A literal (`"5"`) is used directly; a FEEL expression
+    /// (`"=maxRetries"`) is evaluated. `None` (the default) means no declaration
+    /// and the job starts with [`crate::state::DEFAULT_JOB_RETRIES`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub retries: Option<String>,
 }
 
 /// An executable process definition: a set of [`Element`]s plus the id of the
@@ -618,6 +625,7 @@ fn splice_call_activities(
                     parent: new_parent,
                     io: el.io.clone(),
                     timer: el.timer.clone(),
+                    retries: el.retries.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -640,6 +648,7 @@ fn splice_call_activities(
                     parent: new_parent,
                     io: el.io.clone(),
                     timer: el.timer.clone(),
+                    retries: el.retries.clone(),
                 },
             );
         }
@@ -727,6 +736,7 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     timers: Vec<(ElementId, TimerDef)>,
+    retries: Vec<(ElementId, String)>,
 }
 
 impl ProcessBuilder {
@@ -739,6 +749,7 @@ impl ProcessBuilder {
             parents: Vec::new(),
             ios: Vec::new(),
             timers: Vec::new(),
+            retries: Vec::new(),
         }
     }
 
@@ -750,6 +761,7 @@ impl ProcessBuilder {
             parent: None,
             io: IoMapping::default(),
             timer: None,
+            retries: None,
         });
         self
     }
@@ -912,6 +924,14 @@ impl ProcessBuilder {
     /// Applied in [`build`](ProcessBuilder::build).
     pub fn with_timer(mut self, id: impl Into<String>, timer: TimerDef) -> Self {
         self.timers.push((id.into(), timer));
+        self
+    }
+
+    /// Declares a `zeebe:taskDefinition` `retries` expression (literal or FEEL)
+    /// on a job-based task, evaluated to a number at job creation. Applied in
+    /// [`build`](ProcessBuilder::build).
+    pub fn with_retries(mut self, id: impl Into<String>, retries: impl Into<String>) -> Self {
+        self.retries.push((id.into(), retries.into()));
         self
     }
 
@@ -1263,6 +1283,14 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach retries expressions to their job-based task elements.
+        for (id, retries) in &self.retries {
+            match elements.get_mut(id) {
+                Some(element) => element.retries = Some(retries.clone()),
+                None => return Err(BuildError::UnknownRetriesElement(id.clone())),
+            }
+        }
+
         // The process-level start event is the unique start event that is not
         // contained in any sub-process (sub-process inner start events have a
         // parent and start their own scope, not the instance).
@@ -1315,6 +1343,8 @@ pub enum BuildError {
     UnknownIoMappingElement(ElementId),
     /// A `with_timer` referenced an element that does not exist.
     UnknownTimerElement(ElementId),
+    /// A `with_retries` referenced an element that does not exist.
+    UnknownRetriesElement(ElementId),
 }
 
 impl std::fmt::Display for BuildError {
@@ -1352,6 +1382,9 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::UnknownTimerElement(id) => {
                 write!(f, "timer expression declared on unknown element {id}")
+            }
+            BuildError::UnknownRetriesElement(id) => {
+                write!(f, "retries expression declared on unknown element {id}")
             }
         }
     }
