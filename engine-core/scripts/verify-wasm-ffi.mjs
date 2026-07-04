@@ -39,6 +39,11 @@ const required = [
   'nbpmn_trigger_timers',
   'nbpmn_is_completed',
   'nbpmn_instance_count',
+  // ABI v2: job worker surface
+  'nbpmn_activate_jobs',
+  'nbpmn_complete_job',
+  'nbpmn_fail_job',
+  'nbpmn_expire_jobs',
 ];
 const missing = required.filter((name) => !exported.has(name));
 if (missing.length > 0) {
