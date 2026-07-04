@@ -160,6 +160,7 @@ mod tests {
             sidecar: true,
             model_file: None,
             sidecar_args: None,
+            mtp: false,
             thinking_level: None,
             starred: false,
         }

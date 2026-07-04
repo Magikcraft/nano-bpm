@@ -1,10 +1,10 @@
 //! The cockpit **LLM-pairing library** — named, first-class "Pair AI" configurations.
 //!
 //! A *pairing* bundles everything needed to run a second model alongside the primary in one of
-//! three collaboration [`PairMode`]s, so the operator picks a saved pairing instead of assembling
+//! four collaboration [`PairMode`]s, so the operator picks a saved pairing instead of assembling
 //! a mode + model + prompt ad-hoc every turn:
 //!
-//! - the **mode** (review / monitor / delegate),
+//! - the **mode** (review / monitor / delegate / speculate),
 //! - the **secondary** LLM profile (the second model),
 //! - an optional **primary** LLM profile (set it for a full "team"; leave it blank to keep using
 //!   whatever primary is currently active),
@@ -22,8 +22,9 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-/// How a pairing's secondary model collaborates with the primary. Mirrors the three partner roles
-/// the chat turn already supports (Pair AI reviewer, loop monitor, delegation subagent).
+/// How a pairing's secondary model collaborates with the primary. Pair/Monitor/Subagent mirror
+/// the three partner roles the chat turn supports (Pair AI reviewer, loop monitor, delegation
+/// subagent); Speculator pairs the models at the **inference engine** level instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PairMode {
@@ -34,6 +35,14 @@ pub enum PairMode {
     Monitor,
     /// A worker the primary can DELEGATE self-contained research tasks to (the `delegate` tool).
     Subagent,
+    /// The sparring-partner slot becomes a **speculative-decoding draft model**: the primary's
+    /// `llama-server` loads the secondary profile's GGUF via `--model-draft` and uses it to
+    /// propose tokens the primary verifies. Unlike the chat-level modes, the secondary never runs
+    /// as its own sidecar and contributes no prose — it only accelerates the primary. The same
+    /// model may be named on both sides ("loaded twice", self-speculation). Both sides must be
+    /// local sidecar GGUFs with compatible tokenizers/vocab; the API validates and refuses
+    /// incompatible configs (see `gguf::speculator_compatible`).
+    Speculator,
 }
 
 /// One saved Pair AI configuration.
@@ -62,6 +71,13 @@ pub struct Pairing {
     /// Subagent only: max chars of digest fed back to the primary (server clamps 500..20000).
     #[serde(default)]
     pub digest_cap: Option<usize>,
+    /// Speculator only: `--draft-max` — most tokens drafted per step (llama-server default when
+    /// unset; server clamps 1..64).
+    #[serde(default)]
+    pub draft_max: Option<u32>,
+    /// Speculator only: `--draft-min` — fewest tokens drafted per step (server clamps 0..16).
+    #[serde(default)]
+    pub draft_min: Option<u32>,
     /// Optional allowlist of tool names the PRIMARY model may use under this pairing. `None` =
     /// the full available surface. Lets a pairing scope the primary's tools as well as the team.
     #[serde(default)]
@@ -125,6 +141,10 @@ impl PairingStore {
         if p.primary_profile_id.as_deref().map(str::trim) == Some("") {
             p.primary_profile_id = None;
         }
+        // Clamp the speculator draft tuning into llama-server-sane ranges (mirrors the
+        // subagent maxRounds/digestCap clamping done server-side).
+        p.draft_max = p.draft_max.map(|v| v.clamp(1, 64));
+        p.draft_min = p.draft_min.map(|v| v.clamp(0, 16));
         if let Ok(mut m) = self.pairings.write() {
             let existing = m.get(&p.id);
             // A caller may never mint the server-owned builtin flag.
@@ -200,6 +220,8 @@ mod tests {
             system: String::new(),
             max_rounds: None,
             digest_cap: None,
+            draft_max: None,
+            draft_min: None,
             primary_tools: None,
             secondary_tools: None,
             builtin: false,
@@ -214,6 +236,8 @@ mod tests {
             system: String::new(),
             max_rounds: None,
             digest_cap: None,
+            draft_max: None,
+            draft_min: None,
             primary_tools: None,
             secondary_tools: None,
             builtin: false,
@@ -235,6 +259,8 @@ mod tests {
             system: "Pressure-test the answer.".into(),
             max_rounds: None,
             digest_cap: None,
+            draft_max: None,
+            draft_min: None,
             primary_tools: None,
             secondary_tools: None,
             builtin: false,

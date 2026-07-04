@@ -23,6 +23,7 @@ mod corpus;
 mod dataset;
 mod deps;
 mod experiment;
+mod gguf;
 mod harness;
 mod investigate;
 mod llama;
@@ -641,6 +642,7 @@ async fn main() {
         .route("/api/llama/status", get(llama_status))
         .route("/api/llama/ready", get(llama_ready))
         .route("/api/llama/start", post(llama_start))
+        .route("/api/llama/scan/{profile_id}", get(llama_scan))
         .route("/api/llama/download", post(llama_download))
         .route("/api/llama/download/cancel", post(llama_download_cancel))
         .route("/api/llama/stop", post(llama_stop))
@@ -1895,18 +1897,20 @@ fn download_in_progress(models_dir: &std::path::Path, model: &str) -> Option<u64
     best
 }
 
-/// Whether `model`'s GGUF is already fully present in the local cache under `models_dir`, so it
-/// can be started without a (re)download. Distinguishes "downloaded" from "configured" and from
-/// "available for use" (running). Two cases:
-///   * a local `*.gguf` model spec → the file exists on disk;
-///   * a Hugging Face `repo[:quant]` spec → the llama.cpp cache folder `models--org--repo` has a
-///     usable `snapshots/<rev>/<file>.gguf` (whose backing blob exists) AND no half-finished
-///     `*.downloadInProgress` blob. When a `:quant` is given, the snapshot filename must contain it
-///     (case-insensitive) so a different quant already in the cache doesn't read as downloaded.
-fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
+/// Resolve `model` to its on-disk GGUF, when fully present in the cache under `models_dir`.
+/// Two cases:
+///   * a local `*.gguf` model spec → the file itself (absolute, or relative to the models dir);
+///   * a Hugging Face `repo[:quant]` spec → a usable `snapshots/<rev>/<file>.gguf` (whose backing
+///     blob exists) in the llama.cpp cache folder `models--org--repo`, provided no half-finished
+///     `*.downloadInProgress` blob remains. When a `:quant` is given, the snapshot filename must
+///     contain it (case-insensitive) so a different quant already cached doesn't resolve.
+///
+/// Sharded models resolve to their lexicographically-first shard (`…-00001-of-…`), which carries
+/// the full GGUF metadata a header scan needs. `None` when absent or still downloading.
+fn resolve_model_gguf(models_dir: &std::path::Path, model: &str) -> Option<std::path::PathBuf> {
     let model = model.trim();
     if model.is_empty() {
-        return false;
+        return None;
     }
     if model.to_ascii_lowercase().ends_with(".gguf") {
         let p = std::path::PathBuf::from(model);
@@ -1915,7 +1919,7 @@ fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
         } else {
             models_dir.join(&p)
         };
-        return resolved.exists();
+        return resolved.exists().then_some(resolved);
     }
     // Hugging Face spec: split repo from the optional :quant tag.
     let (repo, quant) = match model.split_once(':') {
@@ -1925,14 +1929,12 @@ fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
     let base = models_dir.join(format!("models--{}", repo.replace('/', "--")));
     // A still-in-progress blob means the download is not complete.
     if download_in_progress(models_dir, model).is_some() {
-        return false;
+        return None;
     }
-    // Look for a usable .gguf under any snapshot revision whose backing blob exists.
+    // Collect the usable .gguf files under any snapshot revision whose backing blob exists.
     let snaps = base.join("snapshots");
-    let Ok(revs) = std::fs::read_dir(&snaps) else {
-        return false;
-    };
-    for rev in revs.flatten() {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for rev in std::fs::read_dir(&snaps).ok()?.flatten() {
         let Ok(files) = std::fs::read_dir(rev.path()) else {
             continue;
         };
@@ -1949,11 +1951,30 @@ fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
             // `f.path()` is usually a symlink into blobs/; `exists()` follows it, so a dangling
             // link (blob evicted) correctly reads as not-downloaded.
             if f.path().exists() {
-                return true;
+                candidates.push(f.path());
             }
         }
     }
-    false
+    // Sorting puts a sharded model's first shard (…-00001-of-…) ahead of its siblings.
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// Whether `model`'s GGUF is already fully present in the local cache under `models_dir`, so it
+/// can be started without a (re)download. Distinguishes "downloaded" from "configured" and from
+/// "available for use" (running).
+fn model_downloaded(models_dir: &std::path::Path, model: &str) -> bool {
+    resolve_model_gguf(models_dir, model).is_some()
+}
+
+/// The model a sidecar profile loads: `model_file`, else the plain `model` id.
+fn profile_model_spec(p: &settings::LlmProfile) -> Option<String> {
+    p.model_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(p.model.as_deref())
+        .map(str::to_string)
 }
 
 /// The real, operator-facing lifecycle phase of a sidecar — beyond the binary "the process is
@@ -2146,17 +2167,111 @@ async fn llama_ready(
     }))
 }
 
-/// Request body for starting the sidecar: which saved profile to serve.
+/// Request body for starting the sidecar: which saved profile to serve, and optionally which
+/// speculator-mode pairing to apply (the pairing's secondary model is loaded as the
+/// speculative-decoding draft via `--model-draft`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LlamaStartRequest {
     profile_id: String,
+    #[serde(default)]
+    pairing_id: Option<String>,
+}
+
+/// Scan a sidecar profile's GGUF header, resolving the model through the cache. Errors when the
+/// profile has no model spec or the model is not fully downloaded (a scan needs the file).
+fn scan_profile_gguf(
+    models_dir: &std::path::Path,
+    profile: &settings::LlmProfile,
+) -> Result<gguf::GgufScan, String> {
+    let model = profile_model_spec(profile)
+        .ok_or_else(|| format!("profile '{}' has no model to scan", profile.id))?;
+    let path = resolve_model_gguf(models_dir, &model).ok_or_else(|| {
+        format!(
+            "model for profile '{}' ({model}) is not downloaded yet — download it first so its \
+             GGUF metadata can be verified",
+            profile.id
+        )
+    })?;
+    gguf::GgufScan::read(&path)
+}
+
+/// Resolve + validate a speculator pairing for launching `primary`, returning the draft spec to
+/// attach to the launch plan. This is the **hard gate** that disallows invalid configs:
+/// the pairing must be speculator-mode and name this primary (when it pins one), the draft must
+/// be a local sidecar GGUF that is fully downloaded, and the two models' GGUF metadata must be
+/// speculative-decoding compatible (same tokenizer family, BOS/EOS, vocab within llama.cpp's
+/// tolerance). The same model on both sides — "loaded twice" — passes trivially.
+fn resolve_speculator_draft(
+    snap: &settings::Settings,
+    pairing: &pairings::Pairing,
+    primary: &settings::LlmProfile,
+    models_dir: &std::path::Path,
+) -> Result<llama::DraftSpec, String> {
+    if pairing.mode != pairings::PairMode::Speculator {
+        return Err(format!(
+            "pairing '{}' is {:?}-mode, not a speculator pairing",
+            pairing.id, pairing.mode
+        ));
+    }
+    if let Some(pinned) = pairing.primary_profile_id.as_deref() {
+        if pinned != primary.id {
+            return Err(format!(
+                "pairing '{}' pins primary profile '{pinned}', but '{}' is being started",
+                pairing.id, primary.id
+            ));
+        }
+    }
+    let draft_profile = snap
+        .profiles
+        .iter()
+        .find(|p| p.id == pairing.secondary_profile_id)
+        .ok_or_else(|| {
+            format!(
+                "pairing '{}' names unknown draft profile '{}'",
+                pairing.id, pairing.secondary_profile_id
+            )
+        })?;
+    if !draft_profile.sidecar {
+        return Err(format!(
+            "draft profile '{}' is not a local sidecar — a speculator must be a local GGUF the \
+             primary's llama-server can load",
+            draft_profile.id
+        ));
+    }
+    let draft_model = profile_model_spec(draft_profile)
+        .ok_or_else(|| format!("draft profile '{}' has no model file", draft_profile.id))?;
+    let draft_path = resolve_model_gguf(models_dir, &draft_model).ok_or_else(|| {
+        format!(
+            "draft model for '{}' ({draft_model}) is not downloaded yet",
+            draft_profile.id
+        )
+    })?;
+    let target_scan = scan_profile_gguf(models_dir, primary)?;
+    let draft_scan = gguf::GgufScan::read(&draft_path)?;
+    gguf::speculator_compatible(&target_scan, &draft_scan).map_err(|e| {
+        format!(
+            "'{}' cannot draft for '{}': {e}",
+            draft_profile.id, primary.id
+        )
+    })?;
+    Ok(llama::DraftSpec {
+        profile_id: draft_profile.id.clone(),
+        model_path: draft_path,
+        draft_max: pairing.draft_max,
+        draft_min: pairing.draft_min,
+    })
 }
 
 /// `POST /api/llama/start` — launch `llama-server` for the named `sidecar:true` profile. ProcessOS
 /// auto-assigns a free TCP port (the operator never configures one); the assigned port is written
 /// back into the profile's `base_url` so the model client talks to it. Up to [`llama::MAX_SIDECARS`]
 /// run at once. The models directory is exported as `LLAMA_CACHE`.
+///
+/// Two launch-time capability gates (both scan GGUF headers, see [`crate::gguf`]):
+///   * a profile with `mtp: true` must actually carry MTP (NextN) prediction heads;
+///   * a `pairingId` must name a speculator pairing whose draft model is verified compatible —
+///     the draft is then loaded into the same `llama-server` via `--model-draft`.
 async fn llama_start(
     State(state): State<AppState>,
     Json(req): Json<LlamaStartRequest>,
@@ -2173,10 +2288,49 @@ async fn llama_start(
         ));
     }
     let models_dir = snap.effective_models_dir();
-    let status = match state
-        .llama
-        .start_profile(&profile, &models_dir, snap.llama_bin.as_deref())
-    {
+    // Header scans are blocking file I/O — run the gates off the async worker.
+    let pairing = match req.pairing_id.as_deref() {
+        Some(pid) => match state.pairings.list().into_iter().find(|p| p.id == pid) {
+            Some(p) => Some(p),
+            None => return unprocessable(format!("no such pairing: {pid}")),
+        },
+        None => None,
+    };
+    let draft = {
+        let snap = snap.clone();
+        let profile = profile.clone();
+        let models_dir = models_dir.clone();
+        let gates =
+            tokio::task::spawn_blocking(move || -> Result<Option<llama::DraftSpec>, String> {
+                if profile.mtp {
+                    let scan = scan_profile_gguf(&models_dir, &profile)?;
+                    if !scan.mtp_capable() {
+                        return Err(format!(
+                            "profile '{}' has MTP enabled, but its GGUF carries no NextN \
+                         prediction heads (arch {}) — disable MTP or pick an MTP-capable model",
+                            profile.id,
+                            scan.arch.as_deref().unwrap_or("unknown")
+                        ));
+                    }
+                }
+                pairing
+                    .as_ref()
+                    .map(|p| resolve_speculator_draft(&snap, p, &profile, &models_dir))
+                    .transpose()
+            })
+            .await;
+        match gates {
+            Ok(Ok(d)) => d,
+            Ok(Err(e)) => return unprocessable(e),
+            Err(e) => return unprocessable(format!("scan task failed: {e}")),
+        }
+    };
+    let status = match state.llama.start_profile(
+        &profile,
+        &models_dir,
+        snap.llama_bin.as_deref(),
+        draft.as_ref(),
+    ) {
         Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
@@ -2193,6 +2347,62 @@ async fn llama_start(
         }
     }
     Json(status).into_response()
+}
+
+/// `GET /api/llama/scan/{profile_id}` — scan a sidecar profile's GGUF header and report its
+/// capability card: architecture, tokenizer family, vocab size, context length, and whether the
+/// model carries MTP (NextN multi-token-prediction) heads that llama.cpp's `--mtp` can drive.
+/// Only the header is read (weights untouched), but the model must be fully downloaded. Powers
+/// the Models view's MTP toggle and the speculator-pairing compatibility hints.
+async fn llama_scan(
+    State(state): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> impl IntoResponse {
+    let snap = state.settings.snapshot();
+    let Some(profile) = snap.profiles.iter().find(|p| p.id == profile_id).cloned() else {
+        return unprocessable(format!("no such profile: {profile_id}"));
+    };
+    if !profile.sidecar {
+        return unprocessable(format!(
+            "profile '{}' is not a local sidecar — only local GGUF models can be scanned",
+            profile.id
+        ));
+    }
+    let Some(model) = profile_model_spec(&profile) else {
+        return unprocessable(format!("profile '{}' has no model to scan", profile.id));
+    };
+    let models_dir = snap.effective_models_dir();
+    // Blocking file I/O (cache walk + header read) off the async worker.
+    let scanned = tokio::task::spawn_blocking(move || {
+        resolve_model_gguf(&models_dir, &model).map(|path| (gguf::GgufScan::read(&path), path))
+    })
+    .await;
+    let body = match scanned {
+        Ok(None) => serde_json::json!({
+            "profileId": profile.id, "downloaded": false,
+        }),
+        Ok(Some((Ok(scan), path))) => serde_json::json!({
+            "profileId": profile.id, "downloaded": true,
+            "path": path.display().to_string(),
+            "arch": scan.arch, "name": scan.name,
+            "contextLength": scan.context_length,
+            "vocabSize": scan.vocab_size,
+            "tokenizerModel": scan.tokenizer_model,
+            "tokenizerPre": scan.tokenizer_pre,
+            "bosTokenId": scan.bos_token_id, "eosTokenId": scan.eos_token_id,
+            "mtpCapable": scan.mtp_capable(),
+            "mtpLayers": scan.nextn_predict_layers,
+            "nextnTensors": scan.nextn_tensor_count,
+            "tensorCount": scan.tensor_count,
+        }),
+        Ok(Some((Err(e), _))) => serde_json::json!({
+            "profileId": profile.id, "downloaded": true, "error": e,
+        }),
+        Err(e) => serde_json::json!({
+            "profileId": profile.id, "error": format!("scan task failed: {e}"),
+        }),
+    };
+    Json(body).into_response()
 }
 
 /// `POST /api/llama/download` — start a BACKGROUND download of a `sidecar:true` profile's model
@@ -4401,14 +4611,85 @@ async fn pairings_list(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// `POST /api/pairings` — author or update a pairing (persisted to the config dir).
+///
+/// Speculator-mode pairings get semantic validation on top of the store's syntactic checks:
+/// the draft (secondary) profile must be a local sidecar with a model file, a pinned primary must
+/// also be a local sidecar, and — when both models are already downloaded — their GGUF headers
+/// must be speculative-decoding compatible. Verification that needs a not-yet-downloaded model is
+/// deferred to launch time ([`llama_start`]'s hard gate), so authoring before downloading works.
 async fn pairings_upsert(
     State(state): State<AppState>,
     Json(pairing): Json<pairings::Pairing>,
 ) -> impl IntoResponse {
+    if pairing.mode == pairings::PairMode::Speculator {
+        let snap = state.settings.snapshot();
+        let p = pairing.clone();
+        let verdict = tokio::task::spawn_blocking(move || validate_speculator_pairing(&snap, &p))
+            .await
+            .unwrap_or_else(|e| Err(format!("validation task failed: {e}")));
+        if let Err(e) = verdict {
+            return unprocessable(e);
+        }
+    }
     match state.pairings.upsert(pairing) {
         Ok(p) => Json(p).into_response(),
         Err(e) => unprocessable(e),
     }
+}
+
+/// Author-time validation for a speculator pairing (see [`pairings_upsert`]). Rejects what is
+/// provably invalid now; anything unverifiable because a model isn't downloaded yet is allowed
+/// through and re-checked by the launch-time gate.
+fn validate_speculator_pairing(
+    snap: &settings::Settings,
+    pairing: &pairings::Pairing,
+) -> Result<(), String> {
+    let draft = snap
+        .profiles
+        .iter()
+        .find(|p| p.id == pairing.secondary_profile_id)
+        .ok_or_else(|| {
+            format!(
+                "speculator pairing names unknown draft profile '{}'",
+                pairing.secondary_profile_id
+            )
+        })?;
+    if !draft.sidecar {
+        return Err(format!(
+            "draft profile '{}' is not a local sidecar — a speculator must be a local GGUF the \
+             primary's llama-server can load via --model-draft",
+            draft.id
+        ));
+    }
+    if profile_model_spec(draft).is_none() {
+        return Err(format!("draft profile '{}' has no model file", draft.id));
+    }
+    let models_dir = snap.effective_models_dir();
+    // When the pairing pins a primary, it must be a local sidecar too; and when both GGUFs are
+    // already on disk, prove compatibility now instead of surprising the operator at launch.
+    if let Some(pid) = pairing.primary_profile_id.as_deref() {
+        let primary =
+            snap.profiles.iter().find(|p| p.id == pid).ok_or_else(|| {
+                format!("speculator pairing pins unknown primary profile '{pid}'")
+            })?;
+        if !primary.sidecar {
+            return Err(format!(
+                "primary profile '{pid}' is not a local sidecar — speculative decoding only \
+                 applies to models ProcessOS launches itself"
+            ));
+        }
+        let scans = (
+            profile_model_spec(primary).and_then(|m| resolve_model_gguf(&models_dir, &m)),
+            profile_model_spec(draft).and_then(|m| resolve_model_gguf(&models_dir, &m)),
+        );
+        if let (Some(tp), Some(dp)) = scans {
+            let target = gguf::GgufScan::read(&tp)?;
+            let draft_scan = gguf::GgufScan::read(&dp)?;
+            gguf::speculator_compatible(&target, &draft_scan)
+                .map_err(|e| format!("'{}' cannot draft for '{pid}': {e}", draft.id))?;
+        }
+    }
+    Ok(())
 }
 
 /// `DELETE /api/pairings/{id}` — delete a non-built-in pairing.
@@ -5957,5 +6238,127 @@ mod sidecar_phase_tests {
         fs::write(dir.join("local-model.gguf"), vec![0u8; 16]).unwrap();
         assert!(model_downloaded(&dir, "local-model.gguf"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sharded_model_resolves_to_its_first_shard() {
+        let dir = std::env::temp_dir().join(format!("se-shard-{}", std::process::id()));
+        let snap = dir
+            .join("models--org--Big-GGUF")
+            .join("snapshots")
+            .join("rev0");
+        fs::create_dir_all(&snap).unwrap();
+        // Write shards out of order — resolution must still pick the first (which carries the
+        // full GGUF metadata a header scan needs).
+        fs::write(snap.join("big-q4-00002-of-00002.gguf"), vec![0u8; 8]).unwrap();
+        fs::write(snap.join("big-q4-00001-of-00002.gguf"), vec![0u8; 8]).unwrap();
+        let path = super::resolve_model_gguf(&dir, "org/Big-GGUF:q4").expect("resolves");
+        assert!(
+            path.to_string_lossy().contains("00001-of-00002"),
+            "expected first shard, got {}",
+            path.display()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod speculator_gate_tests {
+    use super::{profile_model_spec, validate_speculator_pairing};
+    use crate::pairings::{PairMode, Pairing};
+    use crate::settings::{LlmProfile, Settings};
+
+    fn profile(id: &str, sidecar: bool, model_file: Option<&str>) -> LlmProfile {
+        LlmProfile {
+            id: id.into(),
+            name: id.into(),
+            provider: Some("openai".into()),
+            base_url: None,
+            model: None,
+            api_key: None,
+            max_tokens: None,
+            context_window: None,
+            temperature: None,
+            sidecar,
+            model_file: model_file.map(String::from),
+            sidecar_args: None,
+            mtp: false,
+            thinking_level: None,
+            starred: false,
+        }
+    }
+
+    fn pairing(secondary: &str, primary: Option<&str>) -> Pairing {
+        Pairing {
+            id: "spec".into(),
+            name: "Speculator".into(),
+            mode: PairMode::Speculator,
+            secondary_profile_id: secondary.into(),
+            primary_profile_id: primary.map(String::from),
+            system: String::new(),
+            max_rounds: None,
+            digest_cap: None,
+            draft_max: None,
+            draft_min: None,
+            primary_tools: None,
+            secondary_tools: None,
+            builtin: false,
+        }
+    }
+
+    fn settings(profiles: Vec<LlmProfile>) -> Settings {
+        Settings {
+            profiles,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_or_remote_or_modelless_draft_profiles() {
+        let snap = settings(vec![
+            profile("target", true, Some("t.gguf")),
+            profile("remote", false, None),
+            profile("empty", true, None),
+        ]);
+        let err = validate_speculator_pairing(&snap, &pairing("nope", None)).unwrap_err();
+        assert!(err.contains("unknown draft profile"), "{err}");
+        let err = validate_speculator_pairing(&snap, &pairing("remote", None)).unwrap_err();
+        assert!(err.contains("not a local sidecar"), "{err}");
+        let err = validate_speculator_pairing(&snap, &pairing("empty", None)).unwrap_err();
+        assert!(err.contains("no model file"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_pinned_primary_that_is_not_a_sidecar() {
+        let snap = settings(vec![
+            profile("draft", true, Some("d.gguf")),
+            profile("cloud", false, None),
+        ]);
+        let err = validate_speculator_pairing(&snap, &pairing("draft", Some("cloud"))).unwrap_err();
+        assert!(err.contains("not a local sidecar"), "{err}");
+        let err = validate_speculator_pairing(&snap, &pairing("draft", Some("ghost"))).unwrap_err();
+        assert!(err.contains("unknown primary"), "{err}");
+    }
+
+    #[test]
+    fn allows_authoring_before_the_models_are_downloaded() {
+        // Neither GGUF exists on disk — compatibility cannot be proven yet, so the save is
+        // allowed; the launch-time gate re-checks with the real files.
+        let snap = settings(vec![
+            profile("target", true, Some("/nonexistent/t.gguf")),
+            profile("draft", true, Some("/nonexistent/d.gguf")),
+        ]);
+        assert!(validate_speculator_pairing(&snap, &pairing("draft", Some("target"))).is_ok());
+        // The same model on both sides ("loaded twice") is a legal speculator config.
+        assert!(validate_speculator_pairing(&snap, &pairing("target", Some("target"))).is_ok());
+    }
+
+    #[test]
+    fn profile_model_spec_prefers_model_file_over_model_id() {
+        let mut p = profile("x", true, Some("file.gguf"));
+        p.model = Some("ignored".into());
+        assert_eq!(profile_model_spec(&p).as_deref(), Some("file.gguf"));
+        p.model_file = None;
+        assert_eq!(profile_model_spec(&p).as_deref(), Some("ignored"));
     }
 }

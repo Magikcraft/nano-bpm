@@ -43,6 +43,23 @@ pub const MAX_DOWNLOADS: usize = 2;
 /// The plan for launching `llama-server`: the resolved binary, argv, and the `LLAMA_CACHE`
 /// (models) directory. Split out from the spawn so it can be unit-tested and shown to the operator
 /// as the equivalent terminal command.
+/// A resolved **draft model** for llama.cpp speculative decoding: the primary `llama-server`
+/// loads this second GGUF via `--model-draft` and uses it to propose tokens the main model then
+/// verifies. Built from a `speculator`-mode pairing ([`crate::pairings::PairMode::Speculator`])
+/// after the compatibility gate (`crate::gguf::speculator_compatible`) has passed — the same
+/// GGUF as the target is explicitly allowed ("the model loaded twice", self-speculation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraftSpec {
+    /// Profile the draft model came from (display only).
+    pub profile_id: String,
+    /// The resolved on-disk GGUF path of the draft model.
+    pub model_path: PathBuf,
+    /// `--draft-max` — most tokens drafted per step (llama-server default when `None`).
+    pub draft_max: Option<u32>,
+    /// `--draft-min` — fewest tokens drafted per step (llama-server default when `None`).
+    pub draft_min: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
     pub bin: String,
@@ -52,17 +69,24 @@ pub struct LaunchPlan {
     pub profile_id: String,
     pub model: String,
     pub port: u16,
+    /// True when the plan enables MTP (`--mtp`) self-speculative decoding.
+    pub mtp: bool,
+    /// The draft model GGUF loaded for speculative decoding (a speculator pairing), if any.
+    pub draft_model: Option<String>,
 }
 
 impl LaunchPlan {
     /// Build the launch plan for a sidecar profile. `llama_bin` is the operator-configured binary
     /// path (else `llama-server` on `PATH`); `models_dir` is exported as `LLAMA_CACHE` so HF
-    /// downloads and local GGUFs are shared with a separately-run llama.cpp.
+    /// downloads and local GGUFs are shared with a separately-run llama.cpp. `draft` attaches a
+    /// speculative-decoding draft model (from a speculator pairing); the caller is responsible for
+    /// the MTP/compatibility gates — this only assembles argv.
     pub fn build(
         profile: &LlmProfile,
         models_dir: &Path,
         llama_bin: Option<&str>,
         port: u16,
+        draft: Option<&DraftSpec>,
     ) -> Result<Self, String> {
         let model = profile
             .model_file
@@ -103,7 +127,26 @@ impl LaunchPlan {
         args.push("127.0.0.1".into());
         args.push("--port".into());
         args.push(port.to_string());
-        // Append the operator's extra args verbatim (e.g. "-ngl 99 -c 32768 --jinja").
+        // MTP (multi-token prediction): llama.cpp's feature-flagged self-speculative decoding
+        // using the model's built-in NextN prediction heads. Gated upstream by a GGUF scan.
+        if profile.mtp {
+            args.push("--mtp".into());
+        }
+        // Speculative decoding with a separate draft model (speculator pairing).
+        if let Some(d) = draft {
+            args.push("--model-draft".into());
+            args.push(d.model_path.display().to_string());
+            if let Some(n) = d.draft_max {
+                args.push("--draft-max".into());
+                args.push(n.to_string());
+            }
+            if let Some(n) = d.draft_min {
+                args.push("--draft-min".into());
+                args.push(n.to_string());
+            }
+        }
+        // Append the operator's extra args verbatim (e.g. "-ngl 99 -c 32768 --jinja") last, so
+        // they can override the defaults above.
         if let Some(extra) = profile.sidecar_args.as_deref() {
             args.extend(split_args(extra));
         }
@@ -115,6 +158,8 @@ impl LaunchPlan {
             profile_id: profile.id.clone(),
             model,
             port,
+            mtp: profile.mtp,
+            draft_model: draft.map(|d| d.model_path.display().to_string()),
         })
     }
 
@@ -262,6 +307,10 @@ pub struct LlamaStatus {
     pub command: Option<String>,
     pub models_dir: Option<String>,
     pub started_at: Option<String>,
+    /// True when this sidecar was launched with MTP (`--mtp`) enabled.
+    pub mtp: bool,
+    /// The draft-model GGUF loaded for speculative decoding, when a speculator pairing is active.
+    pub draft_model: Option<String>,
     /// Set when the last start/stop attempt failed.
     pub error: Option<String>,
 }
@@ -289,6 +338,8 @@ struct Running {
     command: String,
     models_dir: String,
     started_at: String,
+    mtp: bool,
+    draft_model: Option<String>,
 }
 
 /// A live background model download. The owning watcher task holds the `llama-server` child; this
@@ -360,6 +411,7 @@ impl LlamaManager {
         profile: &LlmProfile,
         models_dir: &Path,
         llama_bin: Option<&str>,
+        draft: Option<&DraftSpec>,
     ) -> Result<LlamaStatus, String> {
         self.reap();
         let excluded: Vec<u16> = {
@@ -377,7 +429,7 @@ impl LlamaManager {
         let port = pick_free_port(profile.preferred_port(), &excluded).ok_or_else(|| {
             "no free TCP port available for the sidecar; stop another server and retry".to_string()
         })?;
-        let plan = LaunchPlan::build(profile, models_dir, llama_bin, port)?;
+        let plan = LaunchPlan::build(profile, models_dir, llama_bin, port, draft)?;
         self.start(plan)
     }
 
@@ -423,6 +475,8 @@ impl LlamaManager {
             command,
             models_dir: plan.models_dir.display().to_string(),
             started_at,
+            mtp: plan.mtp,
+            draft_model: plan.draft_model.clone(),
         };
         let status = running_status(&running, None);
         let mut g = self.inner.lock().unwrap();
@@ -518,7 +572,8 @@ impl LlamaManager {
         }
         let port = pick_free_port(profile.preferred_port(), &excluded)
             .ok_or_else(|| "no free TCP port available for the download".to_string())?;
-        let plan = LaunchPlan::build(profile, models_dir, llama_bin, port)?;
+        // A download never speculates — it is stopped before the model loads into memory.
+        let plan = LaunchPlan::build(profile, models_dir, llama_bin, port, None)?;
         let (mut child, _pid) = self.spawn_child(&plan)?;
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -745,6 +800,8 @@ fn running_status(r: &Running, last_error: Option<String>) -> LlamaStatus {
         command: Some(r.command.clone()),
         models_dir: Some(r.models_dir.clone()),
         started_at: Some(r.started_at.clone()),
+        mtp: r.mtp,
+        draft_model: r.draft_model.clone(),
         error: last_error,
     }
 }
@@ -759,6 +816,8 @@ fn empty_status(last_error: Option<String>) -> LlamaStatus {
         command: None,
         models_dir: None,
         started_at: None,
+        mtp: false,
+        draft_model: None,
         error: last_error,
     }
 }
@@ -805,6 +864,7 @@ mod tests {
             sidecar: true,
             model_file: Some(model_file.into()),
             sidecar_args: args.map(String::from),
+            mtp: false,
             thinking_level: None,
             starred: false,
         }
@@ -817,7 +877,7 @@ mod tests {
             "http://127.0.0.1:8888/v1",
             Some("-ngl 99 -c 32768"),
         );
-        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8888).unwrap();
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8888, None).unwrap();
         assert_eq!(plan.bin, "llama-server");
         assert_eq!(plan.port, 8888);
         assert_eq!(
@@ -843,8 +903,14 @@ mod tests {
     #[test]
     fn builds_local_gguf_launch_resolving_against_models_dir() {
         let p = profile("loan.gguf", "http://127.0.0.1:9001/v1", None);
-        let plan =
-            LaunchPlan::build(&p, Path::new("/models"), Some("/opt/llama-server"), 9001).unwrap();
+        let plan = LaunchPlan::build(
+            &p,
+            Path::new("/models"),
+            Some("/opt/llama-server"),
+            9001,
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.bin, "/opt/llama-server");
         assert_eq!(plan.args[0], "-m");
         assert_eq!(plan.args[1], "/models/loan.gguf");
@@ -854,8 +920,60 @@ mod tests {
     #[test]
     fn absolute_gguf_path_is_left_untouched() {
         let p = profile("/data/m.gguf", "http://127.0.0.1:8080/v1", None);
-        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080).unwrap();
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
         assert_eq!(plan.args[1], "/data/m.gguf");
+    }
+
+    #[test]
+    fn mtp_profile_gets_the_mtp_flag_before_operator_args() {
+        let mut p = profile("m.gguf", "http://127.0.0.1:8080/v1", Some("-ngl 99"));
+        p.mtp = true;
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
+        let mtp_at = plan
+            .args
+            .iter()
+            .position(|a| a == "--mtp")
+            .expect("--mtp present");
+        let ngl_at = plan.args.iter().position(|a| a == "-ngl").unwrap();
+        assert!(
+            mtp_at < ngl_at,
+            "operator args must come last so they can override"
+        );
+        assert!(plan.mtp);
+        assert!(plan.command_line().contains("--mtp"));
+    }
+
+    #[test]
+    fn draft_spec_adds_model_draft_and_tuning_args() {
+        let p = profile("target.gguf", "http://127.0.0.1:8080/v1", None);
+        let draft = DraftSpec {
+            profile_id: "draft-p".into(),
+            model_path: PathBuf::from("/models/draft.gguf"),
+            draft_max: Some(16),
+            draft_min: Some(2),
+        };
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, Some(&draft)).unwrap();
+        let a = &plan.args;
+        let md = a
+            .iter()
+            .position(|x| x == "--model-draft")
+            .expect("--model-draft present");
+        assert_eq!(a[md + 1], "/models/draft.gguf");
+        assert!(a.windows(2).any(|w| w[0] == "--draft-max" && w[1] == "16"));
+        assert!(a.windows(2).any(|w| w[0] == "--draft-min" && w[1] == "2"));
+        assert_eq!(plan.draft_model.as_deref(), Some("/models/draft.gguf"));
+        // Tuning flags are optional — omitted when unset.
+        let bare = DraftSpec {
+            profile_id: "draft-p".into(),
+            model_path: PathBuf::from("/models/draft.gguf"),
+            draft_max: None,
+            draft_min: None,
+        };
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, Some(&bare)).unwrap();
+        assert!(!plan
+            .args
+            .iter()
+            .any(|x| x == "--draft-max" || x == "--draft-min"));
     }
 
     #[test]
@@ -901,6 +1019,8 @@ mod tests {
             profile_id: profile_id.into(),
             model: "stub".into(),
             port,
+            mtp: false,
+            draft_model: None,
         }
     }
 

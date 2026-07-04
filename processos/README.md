@@ -155,6 +155,31 @@ supervisor runs at most **two** `llama-server` children, each auto-assigned a di
 starting a third or re-starting one already up is rejected with a clear message. See the
 [llama endpoints](#endpoints).
 
+**MTP — multi-token prediction (`src/gguf.rs`).** Some model families (GLM-4.5+, DeepSeek-V3+,
+Qwen3.6+) bake **NextN prediction heads** into the weights, which llama.cpp's beta `--mtp` flag
+uses for *self-speculative decoding* — the model drafts several tokens per step and verifies them
+itself, often a >1.5× decode speed-up with no second model. ProcessOS **scans the GGUF header**
+(`GET /api/llama/scan/{profileId}` — the `{arch}.nextn_predict_layers` metadata key and `nextn`
+tensor names; only the header is read, never the weights) and, when the heads are really present,
+the model's tile on the **LLMs** page grows an **MTP** toggle. The toggle persists on the profile
+(`mtp: true` ⇒ launch with `--mtp`); the start endpoint **re-verifies capability at launch and
+refuses** an MTP config whose GGUF carries no MTP heads (e.g. a conversion that stripped them),
+so an invalid config cannot start. A running MTP sidecar shows an **mtp** pill.
+
+**Speculator pairings — a fourth pairing mode.** Alongside review/monitor/delegate, a pairing can
+be a **speculator**: the sparring-partner slot becomes a **speculative-decoding draft model**. The
+pairing's second profile is not started as its own sidecar and writes no prose — when the primary
+launches, its GGUF is loaded into the *primary's* `llama-server` via `--model-draft` (with optional
+`--draft-max` / `--draft-min` tuning stored on the pairing), where it proposes tokens the primary
+verifies. Picking the **same model** for both sides ("loaded twice") is explicitly supported —
+self-drafting is a cheap accept-rate win for MoE models. **Invalid configs are disallowed twice**:
+saving a speculator pairing validates that the draft is a local sidecar GGUF (and, when both models
+are already on disk, that the pair is compatible), and every start re-checks from the GGUF headers —
+same tokenizer family and BOS/EOS, vocab sizes within llama.cpp's speculative tolerance (±128) —
+refusing the launch otherwise. In the composer, selecting a speculator pairing starts (or offers to
+restart) the primary with the draft attached; the roster shows a **⚡ speculator** chip and the LLMs
+view a **⚡ speculating** pill while active.
+
 **Missing-tool preflight.** ProcessOS shells out to two optional CLI tools it does **not** bundle:
 **`llama-server`** (llama.cpp — the local LLM sidecars above) and **Deno** (which the supervised
 Nano engine uses to run its embedded job workers). On startup the Console checks both via
@@ -778,7 +803,8 @@ for it automatically.
 | `POST` | `/api/settings/models` | Query an endpoint for its model list (body: `profileId` + optional `provider`/`baseUrl`/`apiKey` overrides) so the console can pick a model id; each entry includes its `contextWindow` when the endpoint reports one |
 | `GET` | `/api/llama/status` | Local llama.cpp sidecar pool: `{running, count, max, sidecars[], error}` where each entry has `profileId`, `model`, `port`, `pid`, `command`, `startedAt`. `running` is true when ≥1 is up |
 | `GET` | `/api/llama/ready?profileId=…` | Whether a sidecar is answering its `/health` probe (model loaded). Returns `{running, ready, profileId}`; polled by the cockpit's just-in-time start before sending a queued message |
-| `POST` | `/api/llama/start` | Start a sidecar for a profile (`{profileId}`; must have `sidecar:true`). ProcessOS auto-assigns a free port and records it in the profile's Base URL. Up to **two** run at once. Returns the new status |
+| `POST` | `/api/llama/start` | Start a sidecar for a profile (`{profileId, pairingId?}`; must have `sidecar:true`). ProcessOS auto-assigns a free port and records it in the profile's Base URL. Up to **two** run at once. A `pairingId` naming a **speculator** pairing loads its draft model via `--model-draft` — after verifying GGUF tokenizer/vocab compatibility; a profile with `mtp:true` is verified to actually carry MTP heads. Invalid configs are refused. Returns the new status |
+| `GET` | `/api/llama/scan/{profileId}` | Scan a downloaded sidecar model's GGUF **header** (weights untouched): `{downloaded, arch, tokenizerModel, vocabSize, contextLength, mtpCapable, mtpLayers, nextnTensors, …}`. Powers the MTP toggle and speculator compatibility checks |
 | `POST` | `/api/llama/stop` | Stop one sidecar (`{profileId}`) or **all** of them (empty body). Returns the resulting pool state |
 | `GET` | `/api/llama/logs?profileId=…&since=N` | Tail a sidecar's combined stdout/stderr from offset `N`; returns `{lines, text, nextOffset, running}` for incremental polling |
 | `GET` | `/api/llama/reasoning-control?profileId=…` | Probe whether the active (or named) profile's endpoint exposes the optional reasoning-control surface (`/v1/chat/completions/control`). Returns `{supported, ready, baseUrl}`; wrap-up/monitor use it for a mid-thinking halt when present, else fall back to the round-boundary cancel |
