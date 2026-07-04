@@ -769,11 +769,17 @@ mod tests {
             let job_key: u64 = json[k_start..k_end].parse().unwrap();
 
             let msg = b"boom";
-            assert_eq!(nbpmn_fail_job(engine, job_key, 2, msg.as_ptr(), msg.len()), 0);
+            assert_eq!(
+                nbpmn_fail_job(engine, job_key, 2, msg.as_ptr(), msg.len()),
+                0
+            );
             // A null message is accepted.
             assert_eq!(nbpmn_fail_job(engine, job_key, 1, core::ptr::null(), 0), 0);
             // Bad key rejected.
-            assert_eq!(nbpmn_fail_job(engine, 9_999_999, 0, core::ptr::null(), 0), -2);
+            assert_eq!(
+                nbpmn_fail_job(engine, 9_999_999, 0, core::ptr::null(), 0),
+                -2
+            );
             nbpmn_engine_free(engine);
         }
     }
