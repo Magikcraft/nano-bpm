@@ -13,18 +13,21 @@
 // glue. The same `nano_engine.wasm` binary powers the JVM (via Chicory) and
 // future Python/Go/.NET embedded hosts — this file is its JS-side twin.
 //
-// v0.1.0 surface (matches the current FFI exports in engine-core/src/ffi.rs):
-//   - deploy(bpmnXml) → { count }
-//   - createInstance(processId) → { processInstanceKey }
-//   - correlateMessage(name, correlationKey) → i64
-//   - triggerTimers(nowEpochMs) → i64      // injected clock; caller decides cadence
-//   - isCompleted(key) → boolean
-//   - instanceCount() → number
+// v0.1.0 → v0.2.0 surface (matches engine-core FFI ABI v2):
+//   deploy(bpmnXml) → { count }
+//   createInstance(processId) → { processInstanceKey }
+//   correlateMessage(name, correlationKey) → i64
+//   triggerTimers(nowEpochMs) → i64        // fires due timers
+//   expireJobs(nowEpochMs) → i64           // releases expired activation locks
+//   activateJobs({ type, worker, maxJobs, timeoutMs, now }) → ActivatedJob[]
+//   completeJob(jobKey) → void
+//   failJob(jobKey, retries, message?) → void
+//   isCompleted(key) → boolean
+//   instanceCount() → number
 //
-// Coming in a follow-up (bumps manifest ABI_VERSION):
-//   - activateJobs / completeJob / failJob (job worker loop)
-// These live in the wasm-bindgen build already; adding them to the FFI cdylib
-// is a separate change tracked alongside PR B.
+// Variables-on-complete deferred to a future ABI (engine-core would need a
+// JSON parser, which breaks the dep-free promise — v3 route is a separate
+// `setVariables` command before completion).
 
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -45,7 +48,40 @@ export interface WasmManifest {
 }
 
 /** ABI version this JS host is written against. Bumped when the C-ABI changes. */
-export const EXPECTED_ABI_VERSION = 1;
+export const EXPECTED_ABI_VERSION = 2;
+
+/** An activated job as returned by {@link EmbeddedEngine.activateJobs}. */
+export interface ActivatedJob {
+  /** Job key, u64 stringified so callers round-trip without BigInt woes. */
+  key: string;
+  type: string;
+  /** Process instance key (stringified). */
+  instanceKey: string;
+  /** Element instance key of the token parked on this job (stringified). */
+  elementInstanceKey: string;
+  /** BPMN element id of the service task (or equivalent) that produced the job. */
+  elementId: string;
+  /** The worker id the activation was locked to. */
+  worker: string;
+  /** Epoch-ms instant at which the activation lock expires. */
+  deadline: number;
+  /** Remaining retries; 0 means the next failure raises an incident. */
+  retries: number;
+  /** Snapshot of the instance variables at activation time. */
+  variables: Record<string, unknown>;
+}
+
+/** Parameters to {@link EmbeddedEngine.activateJobs}. */
+export interface ActivateJobsRequest {
+  type: string;
+  worker: string;
+  /** Upper bound on activations for this call. Defaults to 1. */
+  maxJobs?: number;
+  /** Lock timeout in ms from `now`. Defaults to 30_000. */
+  timeoutMs?: number;
+  /** Logical `now` in epoch-ms. Defaults to `Date.now()`. */
+  now?: number;
+}
 
 /** Coarse exports of the FFI cdylib. */
 interface NanoExports {
@@ -55,11 +91,27 @@ interface NanoExports {
   nbpmn_engine_new(): number;
   nbpmn_engine_free(engine: number): void;
   nbpmn_deploy_bpmn(engine: number, ptr: number, len: number): bigint;
-  nbpmn_create_instance(engine: number, idPtr: number, idLen: number, varsBits: bigint): bigint;
-  nbpmn_correlate_message(engine: number, namePtr: number, nameLen: number, keyPtr: number, keyLen: number): bigint;
+  nbpmn_create_instance(engine: number, idPtr: number, idLen: number, now: bigint): bigint;
+  nbpmn_correlate_message(engine: number, namePtr: number, nameLen: number, keyPtr: number, keyLen: number, now: bigint): bigint;
   nbpmn_trigger_timers(engine: number, now: bigint): bigint;
   nbpmn_is_completed(engine: number, instanceKey: bigint): number;
   nbpmn_instance_count(engine: number): bigint;
+  // ABI v2 job worker surface.
+  nbpmn_activate_jobs(
+    engine: number,
+    typePtr: number,
+    typeLen: number,
+    workerPtr: number,
+    workerLen: number,
+    maxJobs: number,
+    timeoutMs: bigint,
+    now: bigint,
+    outPtrPtr: number,
+    outLenPtr: number,
+  ): number;
+  nbpmn_complete_job(engine: number, jobKey: bigint): number;
+  nbpmn_fail_job(engine: number, jobKey: bigint, retries: number, msgPtr: number, msgLen: number): number;
+  nbpmn_expire_jobs(engine: number, now: bigint): bigint;
 }
 
 export interface CreateOptions {
@@ -120,7 +172,7 @@ export class EmbeddedEngine {
       manifest = options.manifest;
     } else {
       const packaged = await loadPackagedWasm();
-      bytes = options.wasmBytes ?? packaged.bytes;
+      bytes = (options.wasmBytes ?? packaged.bytes) as BufferSource;
       manifest = options.manifest ?? packaged.manifest;
     }
 
@@ -155,13 +207,15 @@ export class EmbeddedEngine {
   /**
    * Start a process instance. Returns the process instance key as a string
    * (u64 in wasm; stringified so callers can round-trip without BigInt woes).
+   *
+   * `nowEpochMs` defaults to `Date.now()` — override for deterministic tests.
    */
-  createInstance(processId: string): { processInstanceKey: string } {
+  createInstance(processId: string, nowEpochMs?: number): { processInstanceKey: string } {
     this.assertOpen();
     const [ptr, len] = this.writeStr(processId);
     try {
-      // varsBits: 0 = no variables. Reserved for a future JSON-vars channel.
-      const key = this.exports.nbpmn_create_instance(this.engine, ptr, len, 0n);
+      const now = BigInt(nowEpochMs ?? Date.now());
+      const key = this.exports.nbpmn_create_instance(this.engine, ptr, len, now);
       if (key === 0n) throw new Error(`create_instance failed (no such process id: ${processId})`);
       return { processInstanceKey: String(key) };
     } finally {
@@ -170,12 +224,13 @@ export class EmbeddedEngine {
   }
 
   /** Correlate a message. Returns the correlation record id (>=0), or -1 for no match. */
-  correlateMessage(name: string, correlationKey: string): bigint {
+  correlateMessage(name: string, correlationKey: string, nowEpochMs?: number): bigint {
     this.assertOpen();
     const [namePtr, nameLen] = this.writeStr(name);
     const [keyPtr, keyLen] = this.writeStr(correlationKey);
     try {
-      return this.exports.nbpmn_correlate_message(this.engine, namePtr, nameLen, keyPtr, keyLen);
+      const now = BigInt(nowEpochMs ?? Date.now());
+      return this.exports.nbpmn_correlate_message(this.engine, namePtr, nameLen, keyPtr, keyLen, now);
     } finally {
       this.exports.nbpmn_free(namePtr, nameLen);
       this.exports.nbpmn_free(keyPtr, keyLen);
@@ -192,6 +247,87 @@ export class EmbeddedEngine {
   triggerTimers(nowEpochMs: number): bigint {
     this.assertOpen();
     return this.exports.nbpmn_trigger_timers(this.engine, BigInt(nowEpochMs));
+  }
+
+  /**
+   * Release job activations whose lock has expired as of `nowEpochMs`.
+   * Pair with {@link triggerTimers} on the same tick to drive wall-clock
+   * progress; returns the number of events written (0 = nothing to do).
+   */
+  expireJobs(nowEpochMs: number): bigint {
+    this.assertOpen();
+    return this.exports.nbpmn_expire_jobs(this.engine, BigInt(nowEpochMs));
+  }
+
+  /**
+   * Activate up to `maxJobs` jobs of the given type on behalf of `worker`.
+   * Returns the activated jobs (deserialised from the JSON blob the engine
+   * writes into a caller-owned allocation).
+   */
+  activateJobs(req: ActivateJobsRequest): ActivatedJob[] {
+    this.assertOpen();
+    const [typePtr, typeLen] = this.writeStr(req.type);
+    const [workerPtr, workerLen] = this.writeStr(req.worker);
+    // Scratch region for the two out-params (ptr: u32, len: u32) — 8 bytes.
+    const outPtrPtr = this.exports.nbpmn_alloc(8);
+    if (outPtrPtr === 0) throw new Error('nbpmn_alloc(8) failed for activate out-params');
+    const outLenPtr = outPtrPtr + 4;
+    try {
+      const rc = this.exports.nbpmn_activate_jobs(
+        this.engine,
+        typePtr,
+        typeLen,
+        workerPtr,
+        workerLen,
+        req.maxJobs ?? 1,
+        BigInt(req.timeoutMs ?? 30_000),
+        BigInt(req.now ?? Date.now()),
+        outPtrPtr,
+        outLenPtr,
+      );
+      if (rc < 0) throw new Error(`activate_jobs failed (${rc})`);
+      const view = new DataView(this.exports.memory.buffer);
+      const jsonPtr = view.getUint32(outPtrPtr, true);
+      const jsonLen = view.getUint32(outLenPtr, true);
+      if (jsonLen === 0) return [];
+      const jsonBytes = new Uint8Array(this.exports.memory.buffer, jsonPtr, jsonLen).slice();
+      try {
+        const text = new TextDecoder().decode(jsonBytes);
+        return JSON.parse(text) as ActivatedJob[];
+      } finally {
+        this.exports.nbpmn_free(jsonPtr, jsonLen);
+      }
+    } finally {
+      this.exports.nbpmn_free(outPtrPtr, 8);
+      this.exports.nbpmn_free(typePtr, typeLen);
+      this.exports.nbpmn_free(workerPtr, workerLen);
+    }
+  }
+
+  /** Complete an activated job. Throws if the job is unknown or already resolved. */
+  completeJob(jobKey: string): void {
+    this.assertOpen();
+    const rc = this.exports.nbpmn_complete_job(this.engine, BigInt(jobKey));
+    if (rc !== 0) throw new Error(`complete_job(${jobKey}) failed (${rc})`);
+  }
+
+  /**
+   * Fail an activated job with `retries` attempts remaining. 0 retries parks
+   * the job with an incident. `message` is optional operator-facing context.
+   */
+  failJob(jobKey: string, retries: number, message?: string): void {
+    this.assertOpen();
+    let msgPtr = 0;
+    let msgLen = 0;
+    if (message !== undefined && message.length > 0) {
+      [msgPtr, msgLen] = this.writeStr(message);
+    }
+    try {
+      const rc = this.exports.nbpmn_fail_job(this.engine, BigInt(jobKey), retries, msgPtr, msgLen);
+      if (rc !== 0) throw new Error(`fail_job(${jobKey}) failed (${rc})`);
+    } finally {
+      if (msgLen > 0) this.exports.nbpmn_free(msgPtr, msgLen);
+    }
   }
 
   isCompleted(processInstanceKey: string): boolean {

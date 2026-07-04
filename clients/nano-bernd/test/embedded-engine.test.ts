@@ -74,4 +74,81 @@ describe('EmbeddedEngine (nano_engine.wasm FFI)', () => {
     host.close();
     expect(() => host!.deploy(TRIVIAL_BPMN)).toThrow(/closed/);
   });
+
+  it('drives the full job worker lifecycle: activate → complete', async () => {
+    host = await EmbeddedEngine.create();
+    const SERVICE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="svc" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="t" name="Do work">
+      <bpmn:extensionElements><zeebe:taskDefinition type="do-work" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>`;
+    host.deploy(SERVICE_BPMN);
+    const { processInstanceKey } = host.createInstance('svc', 1000);
+    expect(host.isCompleted(processInstanceKey)).toBe(false);
+
+    const activated = host.activateJobs({
+      type: 'do-work',
+      worker: 'w1',
+      maxJobs: 10,
+      timeoutMs: 30_000,
+      now: 1000,
+    });
+    expect(activated).toHaveLength(1);
+    const job = activated[0]!;
+    expect(job.type).toBe('do-work');
+    expect(job.worker).toBe('w1');
+    expect(job.elementId).toBe('t');
+    expect(job.retries).toBeGreaterThan(0);
+    expect(job.deadline).toBe(31000);
+    expect(job.key).toMatch(/^\d+$/);
+
+    host.completeJob(job.key);
+    expect(host.isCompleted(processInstanceKey)).toBe(true);
+  });
+
+  it('returns an empty array when no jobs of the requested type are available', async () => {
+    host = await EmbeddedEngine.create();
+    host.deploy(TRIVIAL_BPMN);
+    const activated = host.activateJobs({ type: 'nothing', worker: 'w', maxJobs: 5, now: 1 });
+    expect(activated).toEqual([]);
+  });
+
+  it('fails a job with retries and allows re-activation on the next tick', async () => {
+    host = await EmbeddedEngine.create();
+    const SERVICE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="svc" isExecutable="true">
+    <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="t">
+      <bpmn:extensionElements><zeebe:taskDefinition type="flaky" retries="3" /></bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming><bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>`;
+    host.deploy(SERVICE_BPMN);
+    host.createInstance('svc', 1000);
+
+    const first = host.activateJobs({ type: 'flaky', worker: 'w', maxJobs: 1, now: 1000 });
+    expect(first).toHaveLength(1);
+    host.failJob(first[0]!.key, 2, 'transient upstream error');
+
+    // After expiring the failed activation lock, the job must be re-activatable.
+    host.expireJobs(2_000_000);
+    const second = host.activateJobs({ type: 'flaky', worker: 'w', maxJobs: 1, now: 2_000_000 });
+    expect(second).toHaveLength(1);
+    expect(second[0]!.retries).toBe(2);
+  });
 });
