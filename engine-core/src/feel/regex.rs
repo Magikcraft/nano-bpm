@@ -259,6 +259,26 @@ impl Regex {
         out.push(chars[last..].iter().collect());
         out
     }
+
+    /// Returns every non-overlapping whole match in `input`, in order (the
+    /// `extract` builtin's `findAllIn` semantics).
+    pub fn find_all(&self, input: &str) -> Vec<String> {
+        let chars: Vec<char> = input.chars().collect();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos <= chars.len() {
+            match self.find(&chars, pos) {
+                Some(caps) => {
+                    let (s, e) = caps[0].unwrap();
+                    out.push(chars[s..e].iter().collect());
+                    // Advance past the match; step one char on a zero-width hit.
+                    pos = if e > s { e } else { s + 1 };
+                }
+                None => break,
+            }
+        }
+        out
+    }
 }
 
 fn expand(template: &str, caps: &[Option<(usize, usize)>], input: &[char], out: &mut String) {

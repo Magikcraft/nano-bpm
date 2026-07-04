@@ -5,9 +5,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::error::FeelError;
+use super::eval::compare;
 use super::regex::Regex;
 use super::temporal::{civil_from_days, Date, DateTime, DtDuration, Time, YmDuration};
-use super::value::FeelVal;
+use super::value::{FeelVal, Range};
 use crate::model::Value;
 
 /// The canonical names of every builtin we recognise.
@@ -42,6 +43,10 @@ const BUILTINS: &[&str] = &[
     "split",
     "string join",
     "trim",
+    "extract",
+    "uuid",
+    "to base64",
+    "from base64",
     // list
     "list contains",
     "count",
@@ -69,6 +74,8 @@ const BUILTINS: &[&str] = &[
     "sort",
     "is empty",
     "partition",
+    "and",
+    "or",
     // numeric
     "decimal",
     "floor",
@@ -84,11 +91,16 @@ const BUILTINS: &[&str] = &[
     "round down",
     "round half up",
     "round half down",
+    "random number",
     // context
     "context put",
     "context merge",
+    "put",
+    "put all",
     "get or else",
     "is defined",
+    // boolean
+    "assert",
     // temporal
     "now",
     "today",
@@ -97,6 +109,21 @@ const BUILTINS: &[&str] = &[
     "week of year",
     "month of year",
     "last day of month",
+    // range / interval (Allen's algebra)
+    "before",
+    "after",
+    "meets",
+    "met by",
+    "overlaps",
+    "overlaps before",
+    "overlaps after",
+    "finishes",
+    "finished by",
+    "includes",
+    "during",
+    "starts",
+    "started by",
+    "coincides",
     // misc extensions
     "is blank",
 ];
@@ -291,6 +318,21 @@ pub fn call(
         }
         "string join" => string_join(&args),
         "trim" => Ok(Str(want_str(&arg(&args, 0), "trim")?.trim().to_string())),
+        "extract" => {
+            let input = want_str(&arg(&args, 0), "extract")?;
+            let pattern = want_str(&arg(&args, 1), "extract")?;
+            let re = Regex::new(&pattern, "")
+                .ok_or_else(|| FeelError(format!("invalid regex '{pattern}'")))?;
+            Ok(List(re.find_all(&input).into_iter().map(Str).collect()))
+        }
+        "uuid" => Ok(Str(uuid_v4())),
+        "to base64" => Ok(Str(base64_encode(
+            want_str(&arg(&args, 0), "to base64")?.as_bytes(),
+        ))),
+        "from base64" => Ok(base64_decode(&want_str(&arg(&args, 0), "from base64")?)
+            .and_then(|b| String::from_utf8(b).ok())
+            .map(Str)
+            .unwrap_or(Null)),
 
         // --- list ---
         "list contains" => {
@@ -334,8 +376,8 @@ pub fn call(
         "median" => median(&list_or_varargs(&args)),
         "stddev" => stddev(&list_or_varargs(&args)),
         "mode" => mode(&list_or_varargs(&args)),
-        "all" => bool_reduce(&list_or_varargs(&args), true),
-        "any" => bool_reduce(&list_or_varargs(&args), false),
+        "all" | "and" => bool_reduce(&list_or_varargs(&args), true),
+        "any" | "or" => bool_reduce(&list_or_varargs(&args), false),
         "sublist" => sublist(&args),
         "append" => {
             let mut list = want_list(&arg(&args, 0), "append")?;
@@ -426,10 +468,34 @@ pub fn call(
         "decimal" => {
             let n = want_num(&arg(&args, 0), "decimal")?;
             let scale = want_num(&arg(&args, 1), "decimal")? as i32;
-            Ok(FeelVal::num(round_scale(n, scale, RoundMode::HalfEven)))
+            let mode = match args.get(2) {
+                Some(v) => rounding_mode(&want_str(v, "decimal")?)?,
+                None => RoundMode::HalfEven,
+            };
+            Ok(FeelVal::num(round_scale(n, scale, mode)))
         }
-        "floor" => Ok(FeelVal::num(want_num(&arg(&args, 0), "floor")?.floor())),
-        "ceiling" => Ok(FeelVal::num(want_num(&arg(&args, 0), "ceiling")?.ceil())),
+        "floor" => {
+            let n = want_num(&arg(&args, 0), "floor")?;
+            match args.get(1) {
+                Some(v) => {
+                    let scale = want_num(v, "floor")? as i32;
+                    let f = 10f64.powi(scale);
+                    Ok(FeelVal::num((n * f).floor() / f))
+                }
+                None => Ok(FeelVal::num(n.floor())),
+            }
+        }
+        "ceiling" => {
+            let n = want_num(&arg(&args, 0), "ceiling")?;
+            match args.get(1) {
+                Some(v) => {
+                    let scale = want_num(v, "ceiling")? as i32;
+                    let f = 10f64.powi(scale);
+                    Ok(FeelVal::num((n * f).ceil() / f))
+                }
+                None => Ok(FeelVal::num(n.ceil())),
+            }
+        }
         "abs" => match arg(&args, 0) {
             YmDur(d) => Ok(YmDur(YmDuration::new(d.months.abs()))),
             DtDur(d) => Ok(DtDur(DtDuration::from_nanos(d.nanos.abs()))),
@@ -460,10 +526,11 @@ pub fn call(
         "round down" => round_builtin(&args, RoundMode::Down),
         "round half up" => round_builtin(&args, RoundMode::HalfUp),
         "round half down" => round_builtin(&args, RoundMode::HalfDown),
+        "random number" => Ok(Double(rand_unit())),
 
         // --- context ---
-        "context put" => context_put(&args),
-        "context merge" => {
+        "context put" | "put" => context_put(&args),
+        "context merge" | "put all" => {
             let mut out = BTreeMap::new();
             for a in list_or_varargs(&args) {
                 if let Context(m) = a {
@@ -477,6 +544,7 @@ pub fn call(
             v => v,
         }),
         "is defined" => Ok(Bool(!matches!(arg(&args, 0), Null))),
+        "assert" => assert_builtin(&args),
 
         // --- temporal ---
         "now" => Ok(now_datetime().map(DateTime).unwrap_or(Null)),
@@ -500,6 +568,11 @@ pub fn call(
             Null => true,
             _ => false,
         })),
+
+        // --- range / interval (Allen's algebra) ---
+        "before" | "after" | "meets" | "met by" | "overlaps" | "overlaps before"
+        | "overlaps after" | "finishes" | "finished by" | "includes" | "during" | "starts"
+        | "started by" | "coincides" => Ok(interval(name, &arg(&args, 0), &arg(&args, 1))),
 
         other => Err(FeelError(format!("unknown function '{other}'"))),
     }
@@ -779,6 +852,8 @@ enum RoundMode {
     HalfUp,
     HalfDown,
     HalfEven,
+    Ceiling,
+    Floor,
 }
 
 fn round_builtin(args: &[FeelVal], mode: RoundMode) -> Result<FeelVal, FeelError> {
@@ -819,6 +894,8 @@ fn round_scale(n: f64, scale: i32, mode: RoundMode) -> f64 {
                 r
             }
         }
+        RoundMode::Ceiling => x.ceil(),
+        RoundMode::Floor => x.floor(),
     };
     rounded / factor
 }
@@ -1184,5 +1261,327 @@ fn json_object(c: &[char], pos: &mut usize) -> Option<FeelVal> {
             }
             _ => return None,
         }
+    }
+}
+
+// --- new-parity helpers -----------------------------------------------------
+
+/// Maps a `decimal(n, scale, mode)` rounding-mode string (feel-scala's
+/// `java.math.RoundingMode` names) to a [`RoundMode`].
+fn rounding_mode(name: &str) -> Result<RoundMode, FeelError> {
+    match name {
+        "UP" => Ok(RoundMode::Up),
+        "DOWN" => Ok(RoundMode::Down),
+        "CEILING" => Ok(RoundMode::Ceiling),
+        "FLOOR" => Ok(RoundMode::Floor),
+        "HALF_UP" => Ok(RoundMode::HalfUp),
+        "HALF_DOWN" => Ok(RoundMode::HalfDown),
+        "HALF_EVEN" | "UNNECESSARY" => Ok(RoundMode::HalfEven),
+        other => Err(FeelError(format!("decimal: unknown rounding mode '{other}'"))),
+    }
+}
+
+/// A dependency-free `[0, 1)` double for `random number()`, seeded from the
+/// wall clock and a monotonic counter (nondeterministic, like `now()`).
+fn rand_unit() -> f64 {
+    (next_random() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// A single 64-bit draw from a SplitMix64 generator seeded per call from the
+/// clock and a process-wide counter, so successive calls differ.
+fn next_random() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut z = nanos
+        .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Generates a random RFC-4122 version-4 UUID string.
+fn uuid_v4() -> String {
+    let a = next_random();
+    let b = next_random();
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&a.to_be_bytes());
+    bytes[8..].copy_from_slice(&b.to_be_bytes());
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
+    let h: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard Base64 encoding (with `=` padding), matching `java.util.Base64`.
+fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64[(n >> 18) as usize & 63] as char);
+        out.push(B64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Standard Base64 decoding; returns `None` on any invalid input.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let cleaned: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let stripped: &[u8] = cleaned.strip_suffix(b"==").or_else(|| cleaned.strip_suffix(b"=")).unwrap_or(&cleaned);
+    let mut out = Vec::with_capacity(stripped.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in stripped {
+        let v = val(c)?;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// `assert(value, condition)` / `assert(value, condition, cause)`: returns
+/// `value` when `condition` is `true`, otherwise raises an error.
+fn assert_builtin(args: &[FeelVal]) -> Result<FeelVal, FeelError> {
+    let value = arg(args, 0);
+    let ok = matches!(arg(args, 1), FeelVal::Bool(true));
+    if ok {
+        Ok(value)
+    } else {
+        let cause = match args.get(2) {
+            Some(FeelVal::Str(s)) => s.clone(),
+            _ => "The condition is not fulfilled".to_string(),
+        };
+        Err(FeelError(format!("assert failed: {cause}")))
+    }
+}
+
+// --- range / interval functions (Allen's algebra) ---------------------------
+
+/// The `(start, start_closed, end, end_closed)` view of a bounded range, or
+/// `None` if either bound is open-ended (unbounded ranges are not comparable
+/// under the interval functions).
+fn range_parts(r: &Range) -> Option<(&FeelVal, bool, &FeelVal, bool)> {
+    match (&r.start, &r.end) {
+        (Some(s), Some(e)) => Some((s, r.start_inclusive, e, r.end_inclusive)),
+        _ => None,
+    }
+}
+
+/// Whether a value is a valid FEEL range *point* (number, date, time,
+/// date-time or duration — feel-scala excludes strings and booleans).
+fn is_point(v: &FeelVal) -> bool {
+    matches!(
+        v,
+        FeelVal::Int(_)
+            | FeelVal::Double(_)
+            | FeelVal::Date(_)
+            | FeelVal::Time(_)
+            | FeelVal::DateTime(_)
+            | FeelVal::YmDur(_)
+            | FeelVal::DtDur(_)
+    )
+}
+
+fn lt(a: &FeelVal, b: &FeelVal) -> bool {
+    compare(a, b) == Some(std::cmp::Ordering::Less)
+}
+fn gt(a: &FeelVal, b: &FeelVal) -> bool {
+    compare(a, b) == Some(std::cmp::Ordering::Greater)
+}
+fn eqp(a: &FeelVal, b: &FeelVal) -> bool {
+    compare(a, b) == Some(std::cmp::Ordering::Equal)
+}
+
+/// The reference point of an argument (a range's start, or the point itself),
+/// used to decide whether the two arguments are type-comparable.
+fn ref_point(v: &FeelVal) -> Option<&FeelVal> {
+    match v {
+        FeelVal::Range(r) => r.start.as_ref(),
+        other if is_point(other) => Some(other),
+        _ => None,
+    }
+}
+
+/// Evaluates one of the 14 Allen interval-relation builtins, returning `null`
+/// for incomparable or unsupported argument shapes (feel-scala semantics).
+fn interval(name: &str, a: &FeelVal, b: &FeelVal) -> FeelVal {
+    // Comparability: both reference points must exist, be points, and be of a
+    // mutually comparable type.
+    let comparable = match (ref_point(a), ref_point(b)) {
+        (Some(pa), Some(pb)) => is_point(pa) && is_point(pb) && compare(pa, pb).is_some(),
+        _ => false,
+    };
+    if !comparable {
+        return FeelVal::Null;
+    }
+    let result = interval_bool(name, a, b);
+    match result {
+        Some(v) => FeelVal::Bool(v),
+        None => FeelVal::Null,
+    }
+}
+
+fn interval_bool(name: &str, a: &FeelVal, b: &FeelVal) -> Option<bool> {
+    use FeelVal::Range as R;
+    // Destructure ranges once where present.
+    let ra = if let R(r) = a { Some(range_parts(r)?) } else { None };
+    let rb = if let R(r) = b { Some(range_parts(r)?) } else { None };
+    match name {
+        "before" => match (ra, rb) {
+            (Some((_, _, e1, e1c)), Some((s2, s2c, _, _))) => {
+                Some(lt(e1, s2) || ((!e1c || !s2c) && eqp(e1, s2)))
+            }
+            (None, Some((s2, s2c, _, _))) => Some(lt(a, s2) || (eqp(a, s2) && !s2c)),
+            (Some((_, _, e1, e1c)), None) => Some(lt(e1, b) || (eqp(e1, b) && !e1c)),
+            (None, None) => Some(lt(a, b)),
+        },
+        "after" => match (ra, rb) {
+            (Some((s1, s1c, _, _)), Some((_, _, e2, e2c))) => {
+                Some(gt(s1, e2) || ((!s1c || !e2c) && eqp(s1, e2)))
+            }
+            (None, Some((_, _, e2, e2c))) => Some(gt(a, e2) || (eqp(a, e2) && !e2c)),
+            (Some((s1, s1c, _, _)), None) => Some(gt(s1, b) || (eqp(s1, b) && !s1c)),
+            (None, None) => Some(gt(a, b)),
+        },
+        "meets" => {
+            let ((_, _, e1, e1c), (s2, s2c, _, _)) = (ra?, rb?);
+            Some(e1c && s2c && eqp(e1, s2))
+        }
+        "met by" => {
+            let ((s1, s1c, _, _), (_, _, e2, e2c)) = (ra?, rb?);
+            Some(s1c && e2c && eqp(s1, e2))
+        }
+        "overlaps" => {
+            let ((s1, s1c, e1, e1c), (s2, s2c, e2, e2c)) = (ra?, rb?);
+            Some(
+                (gt(e1, s2) || (eqp(e1, s2) && e1c && s2c))
+                    && (lt(s1, e2) || (eqp(s1, e2) && s1c && e2c)),
+            )
+        }
+        "overlaps before" => {
+            let ((s1, s1c, e1, e1c), (s2, s2c, e2, e2c)) = (ra?, rb?);
+            Some(
+                (lt(s1, s2) || (eqp(s1, s2) && s1c && !s2c))
+                    && (gt(e1, s2) || (eqp(e1, s2) && e1c && s2c))
+                    && (lt(e1, e2) || (eqp(e1, e2) && (!e1c || e2c))),
+            )
+        }
+        "overlaps after" => {
+            let ((s1, s1c, e1, e1c), (s2, s2c, e2, e2c)) = (ra?, rb?);
+            Some(
+                (lt(s2, s1) || (eqp(s2, s1) && s2c && !s1c))
+                    && (gt(e2, s1) || (eqp(e2, s1) && e2c && s1c))
+                    && (lt(e2, e1) || (eqp(e2, e1) && (!e2c || e1c))),
+            )
+        }
+        "finishes" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
+                e1c == e2c
+                    && eqp(e1, e2)
+                    && (gt(s1, s2) || (eqp(s1, s2) && (!s1c || s2c))),
+            ),
+            (None, Some((_, _, e2, e2c))) => Some(e2c && eqp(e2, a)),
+            _ => None,
+        },
+        "finished by" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
+                e1c == e2c
+                    && eqp(e1, e2)
+                    && (lt(s1, s2) || (eqp(s1, s2) && (s1c || !s2c))),
+            ),
+            (Some((_, _, e1, e1c)), None) => Some(e1c && eqp(e1, b)),
+            _ => None,
+        },
+        "includes" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
+                (lt(s1, s2) || (eqp(s1, s2) && (s1c || !s2c)))
+                    && (gt(e1, e2) || (eqp(e1, e2) && (e1c || !e2c))),
+            ),
+            (Some((s1, s1c, e1, e1c)), None) => Some(
+                (lt(s1, b) && gt(e1, b))
+                    || (eqp(s1, b) && s1c)
+                    || (eqp(e1, b) && e1c),
+            ),
+            _ => None,
+        },
+        "during" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
+                (lt(s2, s1) || (eqp(s2, s1) && (s2c || !s1c)))
+                    && (gt(e2, e1) || (eqp(e2, e1) && (e2c || !e1c))),
+            ),
+            (None, Some((s2, s2c, e2, e2c))) => Some(
+                (lt(s2, a) && gt(e2, a))
+                    || (eqp(s2, a) && s2c)
+                    || (eqp(e2, a) && e2c),
+            ),
+            _ => None,
+        },
+        "starts" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
+                eqp(s1, s2)
+                    && s1c == s2c
+                    && (lt(e1, e2) || (eqp(e1, e2) && (!e1c || e2c))),
+            ),
+            (None, Some((s2, s2c, _, _))) => Some(eqp(s2, a) && s2c),
+            _ => None,
+        },
+        "started by" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => Some(
+                eqp(s1, s2)
+                    && s1c == s2c
+                    && (lt(e2, e1) || (eqp(e2, e1) && (!e2c || e1c))),
+            ),
+            (Some((s1, s1c, _, _)), None) => Some(eqp(s1, b) && s1c),
+            _ => None,
+        },
+        "coincides" => match (ra, rb) {
+            (Some((s1, s1c, e1, e1c)), Some((s2, s2c, e2, e2c))) => {
+                Some(eqp(s1, s2) && s1c == s2c && eqp(e1, e2) && e1c == e2c)
+            }
+            (None, None) => Some(eqp(a, b)),
+            _ => None,
+        },
+        _ => None,
     }
 }

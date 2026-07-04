@@ -405,6 +405,127 @@ mod tests {
         );
     }
 
+    // --- feel-scala parity: new builtins -----------------------------------
+
+    #[test]
+    fn interval_before_after_points_and_ranges() {
+        let c = ctx(&[]);
+        // point / point
+        assert_eq!(eval_bool("before(1, 10)", &c), Ok(true));
+        assert_eq!(eval_bool("after(10, 1)", &c), Ok(true));
+        // point / range
+        assert_eq!(eval_bool("before(1, [5..10])", &c), Ok(true));
+        assert_eq!(eval_bool("before(5, [5..10])", &c), Ok(false));
+        assert_eq!(eval_bool("before(5, (5..10])", &c), Ok(true));
+        // range / point
+        assert_eq!(eval_bool("before([1..5], 10)", &c), Ok(true));
+        assert_eq!(eval_bool("after([11..20], 10)", &c), Ok(true));
+        // range / range
+        assert_eq!(eval_bool("before([1..5], [6..10])", &c), Ok(true));
+        assert_eq!(eval_bool("before([1..5], [5..10])", &c), Ok(false));
+        assert_eq!(eval_bool("before([1..5), [5..10])", &c), Ok(true));
+    }
+
+    #[test]
+    fn interval_meets_overlaps_includes_during() {
+        let c = ctx(&[]);
+        assert_eq!(eval_bool("meets([1..5], [5..10])", &c), Ok(true));
+        assert_eq!(eval_bool("meets([1..5), [5..10])", &c), Ok(false));
+        assert_eq!(eval_bool("met by([5..10], [1..5])", &c), Ok(true));
+        assert_eq!(eval_bool("overlaps([1..5], [3..8])", &c), Ok(true));
+        assert_eq!(eval_bool("overlaps([1..5], [6..8])", &c), Ok(false));
+        assert_eq!(eval_bool("overlaps before([1..5], [3..8])", &c), Ok(true));
+        assert_eq!(eval_bool("overlaps after([3..8], [1..5])", &c), Ok(true));
+        assert_eq!(eval_bool("includes([1..10], 5)", &c), Ok(true));
+        assert_eq!(eval_bool("includes([1..10], [4..6])", &c), Ok(true));
+        assert_eq!(eval_bool("during(5, [1..10])", &c), Ok(true));
+        assert_eq!(eval_bool("during([4..6], [1..10])", &c), Ok(true));
+        assert_eq!(eval_bool("finishes(10, [1..10])", &c), Ok(true));
+        assert_eq!(eval_bool("finished by([1..10], 10)", &c), Ok(true));
+        assert_eq!(eval_bool("starts(1, [1..10])", &c), Ok(true));
+        assert_eq!(eval_bool("started by([1..10], 1)", &c), Ok(true));
+        assert_eq!(eval_bool("coincides([1..5], [1..5])", &c), Ok(true));
+        assert_eq!(eval_bool("coincides([1..5], [2..5])", &c), Ok(false));
+    }
+
+    #[test]
+    fn interval_dates_are_comparable() {
+        let c = ctx(&[]);
+        assert_eq!(
+            eval_bool(
+                r#"before(date("2024-01-01"), [date("2024-02-01")..date("2024-03-01")])"#,
+                &c
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn string_extract_uuid_base64() {
+        let c = ctx(&[]);
+        assert_eq!(
+            eval(r#"extract("references are 1234 and 5678", "[0-9]+")"#, &c),
+            Ok(Value::List(vec![
+                Value::Str("1234".into()),
+                Value::Str("5678".into())
+            ]))
+        );
+        assert_eq!(
+            eval(r#"to base64("FEEL")"#, &c),
+            Ok(Value::Str("RkVFTA==".into()))
+        );
+        assert_eq!(
+            eval(r#"from base64("RkVFTA==")"#, &c),
+            Ok(Value::Str("FEEL".into()))
+        );
+        // uuid() round-trips through base64 shape: 36 chars with dashes.
+        match eval("uuid()", &c) {
+            Ok(Value::Str(s)) => {
+                assert_eq!(s.len(), 36);
+                assert_eq!(s.chars().filter(|&ch| ch == '-').count(), 4);
+                assert_eq!(&s[14..15], "4"); // version nibble
+            }
+            other => panic!("uuid() returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_overloads_and_random() {
+        let c = ctx(&[]);
+        assert_eq!(eval("floor(-1.5, 0)", &c), Ok(Value::Int(-2)));
+        assert_eq!(eval("ceiling(1.01, 1)", &c), Ok(Value::Double(1.1)));
+        assert_eq!(eval(r#"decimal(1.5, 0, "HALF_UP")"#, &c), Ok(Value::Int(2)));
+        assert_eq!(eval(r#"decimal(1.5, 0, "DOWN")"#, &c), Ok(Value::Int(1)));
+        assert_eq!(eval(r#"decimal(-1.5, 0, "FLOOR")"#, &c), Ok(Value::Int(-2)));
+        match eval("random number()", &c) {
+            Ok(Value::Double(d)) => assert!((0.0..1.0).contains(&d)),
+            other => panic!("random number() returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_and_context_aliases() {
+        let c = ctx(&[]);
+        assert_eq!(eval("and([true, true, false])", &c), Ok(Value::Bool(false)));
+        assert_eq!(eval("or([false, true])", &c), Ok(Value::Bool(true)));
+        assert_eq!(
+            eval(r#"put({x: 1}, "y", 2)"#, &c),
+            Ok(ctx_value(&[("x", Value::Int(1)), ("y", Value::Int(2))]))
+        );
+        assert_eq!(
+            eval(r#"put all({x: 1}, {y: 2})"#, &c),
+            Ok(ctx_value(&[("x", Value::Int(1)), ("y", Value::Int(2))]))
+        );
+    }
+
+    #[test]
+    fn boolean_assert() {
+        let c = ctx(&[("x", Value::Int(7))]);
+        assert_eq!(eval("assert(x, x > 0)", &c), Ok(Value::Int(7)));
+        assert!(eval("assert(x, x > 100)", &c).is_err());
+        assert!(eval(r#"assert(x, false, "must be set")"#, &c).is_err());
+    }
+
     fn ctx_value(pairs: &[(&str, Value)]) -> Value {
         Value::Map(
             pairs
