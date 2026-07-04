@@ -29,11 +29,10 @@
 // JSON parser, which breaks the dep-free promise — v3 route is a separate
 // `setVariables` command before completion).
 
-import { readFile } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
+// Note: the packaged-wasm loader uses `node:*` modules, so it is defined
+// inline and imported dynamically only when needed. That way this module can
+// be bundled for the browser as long as callers pass their own `wasmBytes +
+// manifest` to `EmbeddedEngine.create({...})`.
 
 /** JSON manifest emitted alongside the wasm by `make engine-wasm-ffi-dist`. */
 export interface WasmManifest {
@@ -121,9 +120,19 @@ export interface CreateOptions {
   manifest?: WasmManifest;
 }
 
-/** Load the wasm blob + manifest packaged alongside this module. */
-async function loadPackagedWasm(): Promise<{ bytes: Buffer; manifest: WasmManifest }> {
-  const wasmDir = join(HERE, '..', 'wasm');
+/**
+ * Load the wasm blob + manifest packaged alongside this module.
+ *
+ * Uses dynamic `node:*` imports so the module can also be bundled for the
+ * browser (browser hosts must pass their own `wasmBytes + manifest` to
+ * {@link EmbeddedEngine.create} and never reach this path).
+ */
+async function loadPackagedWasm(): Promise<{ bytes: Uint8Array; manifest: WasmManifest }> {
+  const { readFile } = await import('node:fs/promises');
+  const { fileURLToPath } = await import('node:url');
+  const { dirname, join } = await import('node:path');
+  const here = dirname(fileURLToPath(import.meta.url));
+  const wasmDir = join(here, '..', 'wasm');
   const [bytes, manifestJson] = await Promise.all([
     readFile(join(wasmDir, 'nano_engine.wasm')),
     readFile(join(wasmDir, 'manifest.json'), 'utf8'),
@@ -133,7 +142,9 @@ async function loadPackagedWasm(): Promise<{ bytes: Buffer; manifest: WasmManife
 
 /**
  * In-process Nano engine backed by wasm. Own the lifecycle: `close()` frees
- * both the wasm engine handle and its linear memory.
+ * the wasm engine handle. The WebAssembly instance and its linear memory are
+ * owned by the JS runtime and are reclaimed by the garbage collector once
+ * this object is unreachable.
  *
  * Codename: **Bernd** (see file header). `EmbeddedEngine.CODENAME` exposes it
  * programmatically; boot logs, topology advertisement and env-var prefix all
@@ -161,10 +172,22 @@ export class EmbeddedEngine {
   }
 
   /**
-   * Instantiate the wasm engine. The default loads the wasm packaged with this
-   * module; pass `wasmBytes` to load from elsewhere (browser fetch, tests, etc).
+   * Instantiate the wasm engine.
+   *
+   * With no arguments, loads the wasm packaged with this module via `node:fs`
+   * (Node-only).
+   *
+   * Pass **both** `wasmBytes` and `manifest` to load from elsewhere (browser
+   * fetch, tests, hosts embedding their own build) — the packaged-wasm loader
+   * is not invoked in that case, so browsers work without a Node polyfill.
+   * Passing only one of the two is a programmer error.
    */
   static async create(options: CreateOptions = {}): Promise<EmbeddedEngine> {
+    if ((options.wasmBytes === undefined) !== (options.manifest === undefined)) {
+      throw new Error(
+        'EmbeddedEngine.create: wasmBytes and manifest must be provided together, or both omitted.',
+      );
+    }
     let bytes: BufferSource;
     let manifest: WasmManifest;
     if (options.wasmBytes && options.manifest) {
@@ -172,8 +195,8 @@ export class EmbeddedEngine {
       manifest = options.manifest;
     } else {
       const packaged = await loadPackagedWasm();
-      bytes = (options.wasmBytes ?? packaged.bytes) as BufferSource;
-      manifest = options.manifest ?? packaged.manifest;
+      bytes = packaged.bytes as BufferSource;
+      manifest = packaged.manifest;
     }
 
     if (manifest.abi_version !== EXPECTED_ABI_VERSION) {
@@ -296,7 +319,19 @@ export class EmbeddedEngine {
       const view = new DataView(this.exports.memory.buffer);
       const jsonPtr = view.getUint32(outPtrPtr, true);
       const jsonLen = view.getUint32(outLenPtr, true);
-      if (jsonLen === 0) return [];
+      // The engine always writes a JSON blob for rc>=0 (at minimum `[]` for
+      // rc=0). If rc>0 but the blob is empty, the engine locked activations
+      // it couldn't serialise — jobs unreachable from the host. Treat as an
+      // error rather than silently returning [] (which would lose the locks).
+      if (jsonLen === 0) {
+        if (rc > 0) {
+          throw new Error(
+            `activate_jobs returned ${rc} jobs but wrote no JSON payload — ` +
+              `jobs are locked but unreachable from the host; ABI mismatch or wasm OOM likely.`,
+          );
+        }
+        return [];
+      }
       const jsonBytes = new Uint8Array(this.exports.memory.buffer, jsonPtr, jsonLen).slice();
       try {
         const text = new TextDecoder().decode(jsonBytes);
