@@ -158,6 +158,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     let mut cur_message: Option<String> = None;
     // Definitions-level `<signal id=… name=…>` declarations: id -> name.
     let mut signals: HashMap<String, String> = HashMap::new();
+    // Stack of activity node indices that can carry a `zeebe:ioMapping`, so a
+    // nested `zeebe:input`/`zeebe:output` attaches to the innermost open
+    // activity. `in_io_mapping` gates input/output reads to a real ioMapping.
+    let mut io_stack: Vec<usize> = Vec::new();
+    let mut in_io_mapping = false;
 
     for token in &tokens {
         match token {
@@ -244,6 +249,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
                                 if !self_closing {
                                     cur_service_task = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
                                 }
                             }
                             // A business-rule task (DMN) and a script task are
@@ -261,6 +269,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
                                 if !self_closing {
                                     cur_service_task = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
                                 }
                             }
                             // zeebe:calledDecision decisionId="…" on a business-rule
@@ -278,6 +289,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 let idx = acc.add_node(attrs, NodeKind::User);
                                 if !self_closing {
                                     cur_user_task = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
                                 }
                             }
                             "callActivity" => {
@@ -294,6 +308,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                                 if !self_closing {
                                     cur_call = idx;
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
                                 }
                             }
                             // zeebe:calledElement processId="…" — the Camunda 8
@@ -307,10 +324,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 // An embedded sub-process: register it, then push
                                 // its scope so nested nodes are tagged as
                                 // contained in it until its end tag.
-                                acc.add_node(attrs, NodeKind::SubProcess);
+                                let idx = acc.add_node(attrs, NodeKind::SubProcess);
                                 if let Some(id) = attr(attrs, "id") {
                                     if !self_closing {
                                         acc.scope_stack.push(id.to_string());
+                                    }
+                                }
+                                if !self_closing {
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
                                     }
                                 }
                             }
@@ -335,6 +357,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     cur_service_task = idx;
                                     if let Some(id) = attr(attrs, "id") {
                                         acc.scope_stack.push(id.to_string());
+                                    }
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
                                     }
                                 }
                             }
@@ -470,6 +495,30 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "conditionExpression" if cur_flow.is_some() => {
                                 condition_text = Some(String::new());
                             }
+                            // zeebe:ioMapping and its nested zeebe:input/output.
+                            // input/output are only read inside an ioMapping that
+                            // belongs to an open activity (the innermost on the
+                            // io_stack).
+                            "ioMapping" => {
+                                in_io_mapping = true;
+                            }
+                            "input" | "output" if in_io_mapping => {
+                                if let (Some(&idx), Some(source), Some(target)) = (
+                                    io_stack.last(),
+                                    attr(attrs, "source"),
+                                    attr(attrs, "target"),
+                                ) {
+                                    let mapping = crate::model::Mapping {
+                                        source: source.to_string(),
+                                        target: target.to_string(),
+                                    };
+                                    if local_name(name) == "input" {
+                                        acc.nodes[idx].io.inputs.push(mapping);
+                                    } else {
+                                        acc.nodes[idx].io.outputs.push(mapping);
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -501,21 +550,39 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cycle_text = None;
                     cur_user_task = None;
                     cur_call = None;
+                    io_stack.clear();
+                    in_io_mapping = false;
                 }
-                "serviceTask" => cur_service_task = None,
-                "userTask" => cur_user_task = None,
-                "callActivity" => cur_call = None,
+                "serviceTask" => {
+                    cur_service_task = None;
+                    io_stack.pop();
+                }
+                "businessRuleTask" | "scriptTask" => {
+                    cur_service_task = None;
+                    io_stack.pop();
+                }
+                "userTask" => {
+                    cur_user_task = None;
+                    io_stack.pop();
+                }
+                "callActivity" => {
+                    cur_call = None;
+                    io_stack.pop();
+                }
                 "subProcess" => {
                     if let Some(acc) = current.as_mut() {
                         acc.scope_stack.pop();
                     }
+                    io_stack.pop();
                 }
                 "adHocSubProcess" => {
                     if let Some(acc) = current.as_mut() {
                         acc.scope_stack.pop();
                     }
                     cur_service_task = None;
+                    io_stack.pop();
                 }
+                "ioMapping" => in_io_mapping = false,
                 "startEvent" => cur_start = None,
                 "message" => cur_message = None,
                 "boundaryEvent" => {
@@ -637,6 +704,10 @@ struct NodeAcc {
     /// declared. That flow becomes the gateway's fallback (taken only when no
     /// other outgoing condition matches), regardless of document order.
     default_flow: Option<String>,
+    /// The element's `zeebe:ioMapping` (input mappings applied on activation,
+    /// output mappings applied on completion), populated from nested
+    /// `zeebe:input`/`zeebe:output` children.
+    io: crate::model::IoMapping,
 }
 
 #[derive(Clone, Copy)]
@@ -726,6 +797,7 @@ impl ProcessAcc {
             user_task: crate::model::UserTaskProps::default(),
             is_adhoc: false,
             default_flow: None,
+            io: crate::model::IoMapping::default(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -857,6 +929,8 @@ impl ProcessAcc {
             std::collections::HashSet::new();
         for node in self.nodes {
             let node_id = node.id.clone();
+            let io_id = node.id.clone();
+            let node_io = node.io.clone();
             let parent = node.parent.clone();
             if let Some(d) = node.default_flow.clone() {
                 default_flow_ids.insert(d);
@@ -962,6 +1036,9 @@ impl ProcessAcc {
             };
             if let Some(parent) = parent {
                 builder = builder.contained_in(node_id, parent);
+            }
+            if !node_io.is_empty() {
+                builder = builder.with_io(io_id, node_io);
             }
         }
         for boundary in self.boundaries {
@@ -2339,5 +2416,77 @@ mod tests {
             </bpmn:process>
           </bpmn:definitions>"#;
         assert!(parse_bpmn(xml).is_err());
+    }
+}
+
+#[cfg(test)]
+mod io_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn parses_zeebe_io_mapping_inputs_and_outputs() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+        <zeebe:ioMapping>
+          <zeebe:input source="=x + 1" target="y" />
+          <zeebe:input source="=a" target="order.id" />
+          <zeebe:output source="=result" target="approved" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let io = &def.element("t").unwrap().io;
+        assert_eq!(io.inputs.len(), 2);
+        assert_eq!(io.inputs[0].source, "=x + 1");
+        assert_eq!(io.inputs[0].target, "y");
+        assert_eq!(io.inputs[1].target, "order.id");
+        assert_eq!(io.outputs.len(), 1);
+        assert_eq!(io.outputs[0].source, "=result");
+        assert_eq!(io.outputs[0].target, "approved");
+    }
+
+    #[test]
+    fn io_mapping_is_scoped_to_its_own_activity() {
+        // Two service tasks each with their own ioMapping; the mappings must not
+        // bleed across activities.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t1">
+      <bpmn:extensionElements>
+        <zeebe:ioMapping><zeebe:input source="=1" target="one" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="t2">
+      <bpmn:extensionElements>
+        <zeebe:ioMapping><zeebe:output source="=2" target="two" /></zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t1" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t1" targetRef="t2" />
+    <bpmn:sequenceFlow id="f3" sourceRef="t2" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let io1 = &def.element("t1").unwrap().io;
+        assert_eq!(io1.inputs.len(), 1);
+        assert!(io1.outputs.is_empty());
+        let io2 = &def.element("t2").unwrap().io;
+        assert!(io2.inputs.is_empty());
+        assert_eq!(io2.outputs.len(), 1);
     }
 }

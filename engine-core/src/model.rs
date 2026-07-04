@@ -152,6 +152,50 @@ pub struct SequenceFlow {
     pub is_default: bool,
 }
 
+/// A single `zeebe:input` / `zeebe:output` variable mapping: a FEEL `source`
+/// expression whose result is assigned to the `target` variable path.
+///
+/// `source` is a FEEL expression (an optional leading `=` is tolerated) and
+/// `target` is a variable name or a dotted path (`order.total`) naming a nested
+/// context entry. Nano keeps a single flat instance-level variable scope, so
+/// both input and output mappings resolve their source against — and merge
+/// their result into — the instance variables (Zeebe's local element scope is
+/// collapsed to the instance scope).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Mapping {
+    /// The FEEL source expression (a leading `=` marker is optional).
+    pub source: String,
+    /// The target variable name or dotted path the source result is written to.
+    pub target: String,
+}
+
+/// The `zeebe:ioMapping` of a BPMN activity: input mappings applied when the
+/// element **activates** and output mappings applied when it **completes**.
+///
+/// Each mapping's `source` FEEL expression is evaluated against the instance
+/// variables and merged into them under its `target` path. Input mappings run
+/// on activation (so an activity's job/subscription sees the mapped values);
+/// output mappings run on completion (so a service task's job result, already
+/// merged into the instance variables, can be projected/renamed). An empty
+/// mapping list (the default) is a no-op, so pre-existing definitions are
+/// unaffected.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct IoMapping {
+    /// Input mappings, applied on element activation.
+    pub inputs: Vec<Mapping>,
+    /// Output mappings, applied on element completion.
+    pub outputs: Vec<Mapping>,
+}
+
+impl IoMapping {
+    /// Whether there are no mappings at all (the common case).
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.outputs.is_empty()
+    }
+}
+
 /// The (raw, un-evaluated) assignment, scheduling and priority expressions
 /// declared on a `userTask` BPMN element via its Zeebe extension elements
 /// (`zeebe:assignmentDefinition`, `zeebe:taskSchedule`, `zeebe:priorityDefinition`).
@@ -407,6 +451,12 @@ pub struct Element {
     /// before sub-processes existed still load.
     #[cfg_attr(feature = "serde", serde(default))]
     pub parent: Option<ElementId>,
+    /// The element's `zeebe:ioMapping` (input mappings applied on activation,
+    /// output mappings applied on completion). Empty (the default) for elements
+    /// without mappings and when deserializing definitions written before this
+    /// field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub io: IoMapping,
 }
 
 /// An executable process definition: a set of [`Element`]s plus the id of the
@@ -532,6 +582,7 @@ fn splice_call_activities(
                     },
                     outgoing,
                     parent: new_parent,
+                    io: el.io.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -552,6 +603,7 @@ fn splice_call_activities(
                     kind: remap_kind_ids(&el.kind, &pfx),
                     outgoing,
                     parent: new_parent,
+                    io: el.io.clone(),
                 },
             );
         }
@@ -630,6 +682,10 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     parents: Vec<(ElementId, ElementId)>,
+    /// Recorded `(element id, ioMapping)` declarations, applied in [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    ios: Vec<(ElementId, IoMapping)>,
 }
 
 impl ProcessBuilder {
@@ -640,6 +696,7 @@ impl ProcessBuilder {
             elements: Vec::new(),
             edges: Vec::new(),
             parents: Vec::new(),
+            ios: Vec::new(),
         }
     }
 
@@ -649,6 +706,7 @@ impl ProcessBuilder {
             kind,
             outgoing: Vec::new(),
             parent: None,
+            io: IoMapping::default(),
         });
         self
     }
@@ -796,6 +854,14 @@ impl ProcessBuilder {
     /// sub-process and so the process-level start event can be identified.
     pub fn contained_in(mut self, child: impl Into<String>, parent: impl Into<String>) -> Self {
         self.parents.push((child.into(), parent.into()));
+        self
+    }
+
+    /// Attaches a `zeebe:ioMapping` to a previously-added element. Input mappings
+    /// are applied on activation and output mappings on completion (see
+    /// [`IoMapping`]). Applied in [`build`](ProcessBuilder::build).
+    pub fn with_io(mut self, id: impl Into<String>, io: IoMapping) -> Self {
+        self.ios.push((id.into(), io));
         self
     }
 
@@ -1131,6 +1197,14 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach ioMapping declarations to their elements.
+        for (id, io) in &self.ios {
+            match elements.get_mut(id) {
+                Some(element) => element.io = io.clone(),
+                None => return Err(BuildError::UnknownIoMappingElement(id.clone())),
+            }
+        }
+
         // The process-level start event is the unique start event that is not
         // contained in any sub-process (sub-process inner start events have a
         // parent and start their own scope, not the instance).
@@ -1179,6 +1253,8 @@ pub enum BuildError {
         child: ElementId,
         parent: ElementId,
     },
+    /// A `with_io` referenced an element that does not exist.
+    UnknownIoMappingElement(ElementId),
 }
 
 impl std::fmt::Display for BuildError {
@@ -1210,6 +1286,9 @@ impl std::fmt::Display for BuildError {
                     f,
                     "unknown element {child} declared as contained in sub-process {parent}"
                 )
+            }
+            BuildError::UnknownIoMappingElement(id) => {
+                write!(f, "ioMapping declared on unknown element {id}")
             }
         }
     }

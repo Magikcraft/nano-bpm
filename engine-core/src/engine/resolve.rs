@@ -185,4 +185,101 @@ impl Engine {
             .and_then(|i| i.join_counts.get(element_id).copied())
             .unwrap_or(0)
     }
+
+    /// Evaluates a list of `zeebe:input`/`zeebe:output` [`Mapping`]s against the
+    /// instance variables and returns the top-level variable updates to merge.
+    ///
+    /// Each mapping's `source` FEEL expression is evaluated against the instance
+    /// variables; the result is written to its `target` path (a plain name or a
+    /// dotted path naming a nested context entry). Nano keeps a single flat
+    /// instance-level variable scope, so the merge map is applied via a normal
+    /// [`Event::VariablesUpdated`]. A mapping whose source fails to evaluate
+    /// (parse error, unresolved variable) is skipped — matching the
+    /// error-tolerant behaviour of the other `resolve_*` helpers, which have no
+    /// incident path for expression failures.
+    pub(crate) fn eval_io_mappings(
+        &self,
+        instance_key: Key,
+        mappings: &[crate::model::Mapping],
+    ) -> HashMap<String, Value> {
+        let vars = self.variables(instance_key);
+        let mut result: HashMap<String, Value> = HashMap::new();
+        for m in mappings {
+            match crate::feel::eval(m.source.trim(), &vars) {
+                Ok(value) => Self::assign_io_target(&mut result, &vars, &m.target, value),
+                Err(_) => continue,
+            }
+        }
+        result
+    }
+
+    /// Writes `value` to `target` (a plain name or a dotted path) inside the
+    /// accumulating merge map, seeding nested context from the existing instance
+    /// variables so a partial-path mapping (`order.total`) preserves the other
+    /// members of `order`.
+    fn assign_io_target(
+        result: &mut HashMap<String, Value>,
+        vars: &HashMap<String, Value>,
+        target: &str,
+        value: Value,
+    ) {
+        let parts: Vec<&str> = target.split('.').filter(|p| !p.is_empty()).collect();
+        match parts.as_slice() {
+            [] => {}
+            [single] => {
+                result.insert((*single).to_string(), value);
+            }
+            [top, rest @ ..] => {
+                let mut root = result
+                    .get(*top)
+                    .or_else(|| vars.get(*top))
+                    .cloned()
+                    .unwrap_or_else(|| Value::Map(std::collections::BTreeMap::new()));
+                Self::set_io_path(&mut root, rest, value);
+                result.insert((*top).to_string(), root);
+            }
+        }
+    }
+
+    /// Sets a nested path inside a [`Value`], coercing intermediate nodes to
+    /// maps as needed.
+    fn set_io_path(node: &mut Value, parts: &[&str], value: Value) {
+        let Some((head, tail)) = parts.split_first() else {
+            *node = value;
+            return;
+        };
+        if !matches!(node, Value::Map(_)) {
+            *node = Value::Map(std::collections::BTreeMap::new());
+        }
+        if let Value::Map(map) = node {
+            let entry = map
+                .entry((*head).to_string())
+                .or_insert_with(|| Value::Map(std::collections::BTreeMap::new()));
+            Self::set_io_path(entry, tail, value);
+        }
+    }
+
+    /// Cloned input mappings declared on an element (empty if none).
+    pub(crate) fn io_inputs(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Vec<crate::model::Mapping> {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .map(|e| e.io.inputs.clone())
+            .unwrap_or_default()
+    }
+
+    /// Cloned output mappings declared on an element (empty if none).
+    pub(crate) fn io_outputs(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Vec<crate::model::Mapping> {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .map(|e| e.io.outputs.clone())
+            .unwrap_or_default()
+    }
 }

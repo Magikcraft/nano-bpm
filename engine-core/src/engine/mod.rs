@@ -1964,6 +1964,20 @@ impl Engine {
             for event in self.cancel_boundary_signal_subscriptions_on(eik) {
                 self.emit(log, event);
             }
+            // Output mappings on a sub-process apply as its scope drains.
+            let outputs = self.io_outputs(instance_key, &element_id);
+            if !outputs.is_empty() {
+                let updates = self.eval_io_mappings(instance_key, &outputs);
+                if !updates.is_empty() {
+                    self.emit(
+                        log,
+                        Event::VariablesUpdated {
+                            instance_key,
+                            variables: updates,
+                        },
+                    );
+                }
+            }
             for flow in self.outgoing(instance_key, &element_id) {
                 self.emit(
                     log,
@@ -2036,6 +2050,20 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
+
+        // Input mappings (zeebe:input): evaluate against the instance variables
+        // and merge the result before the element's job/subscription is created,
+        // so a later job activation snapshots the mapped values.
+        let inputs = self.io_inputs(instance_key, &element_id);
+        if !inputs.is_empty() {
+            let updates = self.eval_io_mappings(instance_key, &inputs);
+            if !updates.is_empty() {
+                events.push(Event::VariablesUpdated {
+                    instance_key,
+                    variables: updates,
+                });
+            }
+        }
 
         match kind {
             // A service task creates a job and parks the token.
@@ -2229,6 +2257,19 @@ impl Engine {
         events.extend(self.cancel_boundary_timers_on(element_instance_key));
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
+        // Output mappings (zeebe:output): evaluate against the instance variables
+        // (which already include any job/message result merged on completion) and
+        // merge the projected result before the outgoing flows are taken.
+        let outputs = self.io_outputs(instance_key, &element_id);
+        if !outputs.is_empty() {
+            let updates = self.eval_io_mappings(instance_key, &outputs);
+            if !updates.is_empty() {
+                events.push(Event::VariablesUpdated {
+                    instance_key,
+                    variables: updates,
+                });
+            }
+        }
         let mut followups = Vec::new();
         let scope = self.scope_of(instance_key, element_instance_key);
         for flow in self.outgoing(instance_key, &element_id) {

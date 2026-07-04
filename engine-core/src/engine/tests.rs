@@ -4522,3 +4522,135 @@ fn dirty_var_tracking_drains_upserts_and_forgets_for_lean_snapshot() {
         Some(&Value::Int(99))
     );
 }
+
+// --- zeebe:ioMapping (FEEL input/output variable mappings) ------------------
+
+fn io_var(engine: &Engine, key: Key, name: &str) -> Option<Value> {
+    engine.instance(key)?.variables.get(name).cloned()
+}
+
+#[test]
+fn input_mapping_merges_before_job_activation() {
+    // A service task with an input mapping `y = x + 1`. On activation the mapped
+    // variable is merged, so a worker that activates the job sees it.
+    let def = ProcessBuilder::new("io-in")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=x + 1".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("x".to_string(), Value::Int(1));
+    let inst = engine
+        .apply_command(Command::create_instance_with("io-in", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    assert_eq!(io_var(&engine, inst, "y"), Some(Value::Int(2)));
+    // The activated job snapshots the mapped variable.
+    let job = &engine.activate_jobs("work", "w", 1, 60_000, 0)[0];
+    assert_eq!(job.variables.get("y"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn output_mapping_projects_job_result() {
+    // A service task with an output mapping `approved = result.ok`. The job
+    // completes with `result`, and the mapping projects a renamed variable.
+    let def = ProcessBuilder::new("io-out")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=result.ok".to_string(),
+                    target: "approved".to_string(),
+                }],
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = create_instance_key(&mut engine, "io-out");
+    let job_key = engine.activate_jobs("work", "w", 1, 60_000, 0)[0].key;
+    let mut result = std::collections::BTreeMap::new();
+    result.insert("ok".to_string(), Value::Bool(true));
+    let mut job_vars = HashMap::new();
+    job_vars.insert("result".to_string(), Value::Map(result));
+    let events = engine
+        .apply_command(Command::complete_job_with(job_key, job_vars))
+        .unwrap();
+    // The process runs to completion (clearing instance variables), so assert the
+    // output mapping surfaced on a VariablesUpdated event for this instance.
+    let mapped = events.iter().any(|e| {
+        matches!(
+            e,
+            Event::VariablesUpdated { instance_key, variables }
+                if *instance_key == inst
+                    && variables.get("approved") == Some(&Value::Bool(true))
+        )
+    });
+    assert!(mapped, "output mapping should set approved=true; events: {events:?}");
+}
+
+#[test]
+fn input_mapping_with_dotted_target_builds_nested_context() {
+    // A dotted target `order.total` merges into a nested context, preserving the
+    // other members of an existing `order`.
+    let def = ProcessBuilder::new("io-nested")
+        .start_event("s")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=price * qty".to_string(),
+                    target: "order.total".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let mut existing_order = std::collections::BTreeMap::new();
+    existing_order.insert("id".to_string(), Value::Str("A1".to_string()));
+    let mut vars = HashMap::new();
+    vars.insert("price".to_string(), Value::Int(3));
+    vars.insert("qty".to_string(), Value::Int(4));
+    vars.insert("order".to_string(), Value::Map(existing_order));
+    let inst = engine
+        .apply_command(Command::create_instance_with("io-nested", vars))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    expected.insert("id".to_string(), Value::Str("A1".to_string()));
+    expected.insert("total".to_string(), Value::Int(12));
+    assert_eq!(io_var(&engine, inst, "order"), Some(Value::Map(expected)));
+}
