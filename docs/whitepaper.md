@@ -831,12 +831,18 @@ instance, so this is also jobs/s), and it does so on the *strongest* durability
 setting, not a relaxed one: the default quorum-durable replication path (a
 majority replicates **and** applies before the client is acked) over local
 fsync-before-ack journalling. The lighter tiers of §9.3 (leader-durable, async)
-are opt-in and were left off — and, counter-intuitively, turning them on would
-*not* raise this number. The sweep behind it already tested the stronger form of
-both relaxations: dropping to RF=1 (no replication at all) and moving the journal
-to a RAM disk (no fsync) each left aggregate throughput unchanged, at ~0% I/O
-wait. Neither replication nor durable I/O is on the binding path; the lighter
-tiers buy *latency* (§12.2's floor), not throughput. At this plateau, end-to-end
+are opt-in and were left off — and here, because the ceiling is
+*coordination-bound* (below), turning them on genuinely *does* raise the number.
+A clean fresh-state A/B (§12.3) puts strict at ~104k PI/s and relaxed at ~121k —
+about 15% higher throughput, at lower latency too, because taking the quorum
+round-trip off the completion path removes load from the very thing that binds.
+This reverses what an earlier sweep had suggested: when the ceiling was still
+*exporter*-bound at ~36k, dropping to RF=1 (no replication) or moving the journal
+to a RAM disk (no fsync) changed aggregate throughput not at all, because
+durability was nowhere near the binding path. Sharding the read-model exporter
+moved the ceiling *onto* coordination — and coordination is exactly what the
+lighter tiers relax (the honest arc is in `PERFORMANCE.md`). At this plateau,
+end-to-end
 completion latency measured **p99 ≈ 2.1 s** (fresh state), with the client's
 in-flight window set deliberately deep (~16k/node) to hold the cluster at
 saturation — so that figure reflects the queue depth chosen to *find* the ceiling,
@@ -905,16 +911,23 @@ exact: relaxed durability converts a rare simultaneous-permanent-leader-loss fro
 *no data loss* into *a bounded tail of millisecond-scale redeliveries*, in return
 for taking the quorum round-trip off every completion.
 
-Empirically, at the ~95k-PI/s operating point of §12.1, the two tiers measure:
+Empirically, at the operating point of §12.1, a clean fresh-state A/B on the 3×
+`c2‑standard‑16` / 12‑partition / RF=3 cluster — strict vs relaxed at the ceiling
+config, interleaved (strict→relaxed→strict→relaxed) to rule out drift — measures:
 
-> DRAFTING NOTE — table below is being filled from a live fresh-state A/B on the
-> 3× `c2‑standard‑16` / 12‑partition / RF=3 cluster (strict vs relaxed, ceiling
-> config). Replace the `[MEASURE]` cells with the measured numbers on return.
+| Tier | replication | journal | aggregate throughput | p50 | p99 | peak RSS/node |
+| --- | --- | --- | --- | --- | --- | --- |
+| **strict** (default) | quorum | sync | ~104k PI/s | ~325 ms | ~1.92 s | 322–325 MB |
+| **relaxed** | leader-durable | async | ~121k PI/s | ~275 ms | ~1.64 s | 333–343 MB |
 
-| Tier | replication | journal | aggregate throughput | p50 | p99 |
-| --- | --- | --- | --- | --- | --- |
-| **strict** (default) | quorum | sync | `[MEASURE]` | `[MEASURE]` | `[MEASURE]` |
-| **relaxed** | leader-durable | async | `[MEASURE]` | `[MEASURE]` | `[MEASURE]` |
+Relaxed is ~15% faster and about 15% lower at both p50 and p99 — relaxed beat
+strict in *both* interleaved pairs, so the gap is the tier, not run-to-run noise.
+The cost is a modest ~10–15 MB/node more peak memory, because the higher rate
+keeps more un-replicated tail in flight — precisely the tail the crash analysis
+above prices out. Note the whole engine — hot state, journal, and SQLite read
+model — stays under ~345 MB resident per node even at saturation (§8), on either
+tier. (Peak RSS is the kernel's `VmHWM` high-water mark, measured per node
+immediately after each run.)
 
 The expectation set by §12.1 is that relaxed will *not* materially raise aggregate
 throughput — the ceiling is coordination-bound, and the earlier sweep showed
