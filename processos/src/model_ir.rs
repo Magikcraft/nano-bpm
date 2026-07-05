@@ -465,8 +465,22 @@ pub fn write_model_ir(
     di_source: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let parsed = ir_to_definition(ir)?;
-    let (xml, edited_process) = match base {
+    let (xml, analysis_xml, edited_process) = match base {
         None => {
+            // Without a base the IR *is* the whole model. A `process` arg here is meaningless and
+            // usually signals the caller meant to splice into a multi-stage doc — fail fast rather
+            // than silently write a standalone model that ignores it.
+            if let Some(pid) = process {
+                if pid != parsed.definition.id {
+                    return Err(format!(
+                        "`process` was '{pid}' but no `base` model was given, so the IR is written \
+                         as a standalone model with id '{}'. To splice a phase into a multi-stage \
+                         model, pass the full document as `base`. To write a standalone model, omit \
+                         `process` (or match it to the IR's process id).",
+                        parsed.definition.id
+                    ));
+                }
+            }
             // Single-process write: re-attach the original hand layout when the edit left the node
             // and flow topology unchanged (ADR 0001 Phase 5), else auto-layout.
             let xml = crate::bpmn_model::definition_to_xml_preserving_di(
@@ -475,7 +489,8 @@ pub fn write_model_ir(
                 di_source,
             );
             let id = parsed.definition.id.clone();
-            (xml, id)
+            // The whole model is the edited process, so it is also what we analyze.
+            (xml.clone(), xml, id)
         }
         Some(base_xml) => {
             let mut defs =
@@ -501,10 +516,24 @@ pub fn write_model_ir(
                 })?,
                 None => 0,
             };
+            // The IR must keep the phase's id: the splice replaces the target definition in place,
+            // and a renamed process would orphan the callActivity `calledElement` that invokes it.
+            if parsed.definition.id != defs[target_idx].id {
+                return Err(format!(
+                    "the IR's `process \"{}\"` header does not match the phase being replaced \
+                     ('{}'). Splicing keeps the phase id stable so the orchestrator's callActivity \
+                     still resolves — read the phase with read_model_ir and keep its header id.",
+                    parsed.definition.id, defs[target_idx].id
+                ));
+            }
+            // The findings/metrics must describe the edited phase, not the first (orchestrator)
+            // definition analyze_model would otherwise pick — so analyze the phase in isolation.
+            let analysis_xml =
+                crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
+            let id = parsed.definition.id.clone();
             defs[target_idx] = parsed.definition;
-            let id = defs[target_idx].id.clone();
             let xml = crate::bpmn_model::assemble_model(&defs, &names);
-            (xml, id)
+            (xml, analysis_xml, id)
         }
     };
 
@@ -515,7 +544,8 @@ pub fn write_model_ir(
              reference — a flow to a node that isn't declared."
         ));
     }
-    let analysis = crate::bpmn_model::analyze_model(&xml).unwrap_or_else(|_| serde_json::json!({}));
+    let analysis =
+        crate::bpmn_model::analyze_model(&analysis_xml).unwrap_or_else(|_| serde_json::json!({}));
     Ok(serde_json::json!({
         "ok": true,
         "process": edited_process,
@@ -1677,6 +1707,94 @@ mod tests {
             ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, "work-v2"),
             other => panic!("Work should stay a service task, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_model_ir_analyzes_the_edited_phase_not_the_orchestrator() {
+        // In a splice, findings/metrics must describe the edited phase, not the first (orchestrator)
+        // definition analyze_model would otherwise pick. Give the phase an unguarded-service-task
+        // smell the orchestrator lacks, and confirm the finding surfaces against the phase's node.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="Orchestrator" isExecutable="true">
+    <bpmn:startEvent id="OStart"><bpmn:outgoing>o1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:callActivity id="RunPhase"><bpmn:extensionElements><zeebe:calledElement processId="Phase" /></bpmn:extensionElements><bpmn:incoming>o1</bpmn:incoming><bpmn:outgoing>o2</bpmn:outgoing></bpmn:callActivity>
+    <bpmn:endEvent id="ODone"><bpmn:incoming>o2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="o1" sourceRef="OStart" targetRef="RunPhase" />
+    <bpmn:sequenceFlow id="o2" sourceRef="RunPhase" targetRef="ODone" />
+  </bpmn:process>
+  <bpmn:process id="Phase" isExecutable="true">
+    <bpmn:startEvent id="PStart"><bpmn:outgoing>p1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="Work"><bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements><bpmn:incoming>p1</bpmn:incoming><bpmn:outgoing>p2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:endEvent id="PDone"><bpmn:incoming>p2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="p1" sourceRef="PStart" targetRef="Work" />
+    <bpmn:sequenceFlow id="p2" sourceRef="Work" targetRef="PDone" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let phase_ir = read_model_ir(base, Some("Phase")).expect("read phase")["ir"]
+            .as_str()
+            .expect("ir")
+            .to_string();
+        // Add an unguarded exclusive gateway inside the phase (a node the orchestrator lacks).
+        let edited = phase_ir
+            .replace(
+                "serviceTask Work {\n    jobType \"work\"\n  }\n",
+                "serviceTask Work {\n    jobType \"work\"\n  }\n  exclusiveGateway Fork\n",
+            )
+            .replace("Work -> PDone\n", "Work -> Fork\n  Fork -> PDone\n");
+        let v = write_model_ir(&edited, Some(base), Some("Phase"), Some(base)).expect("write");
+        let findings = v["findings"].as_array().expect("findings array");
+        // The finding references a phase node id (Fork/Work/PStart…), never an orchestrator id.
+        let mentions_orchestrator = findings.iter().any(|f| {
+            matches!(f.get("element").and_then(|e| e.as_str()), Some(id) if
+                id == "RunPhase" || id == "OStart" || id == "ODone")
+        });
+        assert!(
+            !mentions_orchestrator,
+            "findings must describe the edited phase, not the orchestrator: {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn write_model_ir_rejects_a_phase_id_rename_during_splice() {
+        // The IR header id must match the phase being replaced; a rename would orphan the
+        // orchestrator's callActivity calledElement. It must fail fast, not silently mis-splice.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="Orchestrator" isExecutable="true">
+    <bpmn:startEvent id="OStart"><bpmn:outgoing>o1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="ODone"><bpmn:incoming>o1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="o1" sourceRef="OStart" targetRef="ODone" />
+  </bpmn:process>
+  <bpmn:process id="Phase" isExecutable="true">
+    <bpmn:startEvent id="PStart"><bpmn:outgoing>p1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="PDone"><bpmn:incoming>p1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="p1" sourceRef="PStart" targetRef="PDone" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let renamed = "process \"Phase-RENAMED\" {\n  start PStart\n  startEvent PStart\n  \
+                       endEvent PDone\n  PStart -> PDone\n}";
+        let err = write_model_ir(renamed, Some(base), Some("Phase"), Some(base)).unwrap_err();
+        assert!(
+            err.contains("does not match") && err.contains("Phase"),
+            "error should explain the id-rename mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn write_model_ir_rejects_a_process_arg_without_a_base() {
+        // `process` is meaningless without a base to splice into; a mismatched value must fail fast
+        // rather than silently write a standalone model that ignores the caller's intent.
+        let ir = "process \"router\" {\n  start S\n  startEvent S\n  endEvent E\n  S -> E\n}";
+        let err = write_model_ir(ir, None, Some("some-other-phase"), None).unwrap_err();
+        assert!(
+            err.contains("no `base`") || err.contains("standalone"),
+            "error should explain base is required for splicing: {err}"
+        );
+        // Matching the IR's own id is harmless and still writes standalone.
+        write_model_ir(ir, None, Some("router"), None).expect("matching id writes standalone");
     }
 
     /// A hand-laid diagram with deliberately non-generatable coordinates and custom flow ids, so a
