@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { projectsApi, type ExtensionsOverview, type MarketEntry } from "../lib/api";
+import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { useTheme } from "../theme/ThemeProvider";
 import { isThemeSpec } from "../theme/themes";
 import { Badge, Button, Card, ErrorText, Input, PageHeader, SectionLabel } from "../components/ui";
@@ -23,7 +24,13 @@ export default function Extensions() {
   const [err, setErr] = useState<string | null>(null);
   const { selection, select } = useTheme();
 
-  const load = async () => setOv(await projectsApi.extensions());
+  const load = async () => {
+    const next = await projectsApi.extensions();
+    setOv(next);
+    // Refresh Monaco's ext→language map so a pack installed just now lights
+    // up in the editor without a page reload.
+    registerFileTypesFromOverview(next);
+  };
   const loadMarket = async () => {
     setMarketErr(null);
     try { setMarket((await projectsApi.marketplace()).entries); }

@@ -9,7 +9,7 @@ import {
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
 import { api, projectsApi } from "./lib/api";
-import { registerFileTypes } from "./lib/editorLang";
+import { registerFileTypesFromOverview } from "./lib/editorLang";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -209,22 +209,20 @@ export default function App() {
   }, []);
 
   // Register every installed lang pack's `fileTypes[]` with the Monaco
-  // ext→language map at boot. Without this, a `.java` file (contributed by
-  // the `lang-java` pack) falls through to the "typescript" default and
-  // Monaco paints Java source with TS highlighting. Done once at App mount
-  // so every code editor mounted afterwards sees the right language.
+  // ext→language map at boot, and again whenever the user navigates — so a
+  // pack installed via the Extensions view during this session takes effect
+  // as soon as they open a project, without a hard reload. Extensions.tsx
+  // also calls the same helper right after install/remove, which is the
+  // fast path; this navigation-triggered refetch is the safety net for any
+  // other codepath that might mutate the extension set.
   useEffect(() => {
     projectsApi
       .extensions()
-      .then((ov) => {
-        for (const e of ov.extensions) {
-          if (e.fileTypes?.length) registerFileTypes(e.fileTypes);
-        }
-      })
+      .then(registerFileTypesFromOverview)
       .catch(() => {
         /* ignore — the static fallback table still covers the common cases */
       });
-  }, []);
+  }, [location.pathname]);
 
   return (
     <div className="flex h-full bg-app text-fg">
