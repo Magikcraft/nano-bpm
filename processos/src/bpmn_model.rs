@@ -2898,6 +2898,28 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
     edit_model_in(base_xml, ops, None)
 }
 
+/// Serialize one or more process definitions back into a single self-contained BPMN document.
+/// A single definition round-trips exactly; a multi-stage model re-emits the orchestrator (index
+/// 0, with a fresh diagram) and splices the remaining phase definitions back in, so the file stays
+/// self-contained and the authored overview survives. Shared by `edit_model_in` and the IR
+/// `write_model_ir` path so both assemble multi-phase models identically.
+pub(crate) fn assemble_model(
+    defs: &[ProcessDefinition],
+    names: &HashMap<String, String>,
+) -> String {
+    if defs.len() == 1 {
+        definition_to_xml_labeled(&defs[0], names)
+    } else {
+        let primary = definition_to_xml_labeled(&defs[0], names);
+        let extras: Vec<String> = defs[1..]
+            .iter()
+            .map(|d| definition_to_xml_labeled(d, names))
+            .collect();
+        let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
+        merge_definitions(&primary, &extra_refs)
+    }
+}
+
 /// Like [`edit_model`], but `process` selects WHICH definition to edit in a
 /// multi-stage model: the orchestrator (default / first) or a named called phase.
 /// The other definitions and the orchestrator's authored diagram are preserved, so
@@ -2954,17 +2976,7 @@ pub fn edit_model_in(
     // Serialize. Single-definition models round-trip exactly as before. For a multi-stage model
     // we re-emit the orchestrator (with a fresh diagram) and splice the remaining phase
     // definitions back in, so the file stays self-contained and the overview survives.
-    let xml = if defs.len() == 1 {
-        definition_to_xml_labeled(&defs[0], &names)
-    } else {
-        let primary = definition_to_xml_labeled(&defs[0], &names);
-        let extras: Vec<String> = defs[1..]
-            .iter()
-            .map(|d| definition_to_xml_labeled(d, &names))
-            .collect();
-        let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
-        merge_definitions(&primary, &extra_refs)
-    };
+    let xml = assemble_model(&defs, &names);
 
     // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
     // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.

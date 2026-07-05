@@ -503,8 +503,20 @@ have a variant in mind, emit the edit_model call, then simulate the `model` it r
 your turn by \
 saying you 'will now' or 'next' author or run something. If your message names a next step, you have \
 NOT finished: perform it (call the tool) before you stop. Stop only to deliver evidence-backed \
-findings or to ask the operator a genuine decision. Keep your thinking BRIEF: never write the \
-variant's BPMN XML inside your reasoning — express the change as edit_model ops instead. Drafting the \
+findings or to ask the operator a genuine decision. \n\
+\n\
+For a change edit_model's fixed op menu can't express — most importantly adding a gateway \
+`default` (fallback) flow, but any non-templated structural rewrite — use the semantic IR instead: \
+read_model_ir returns the model as a compact, executable text notation (a node is `<kind> <id> \
+[\"name\"] [{ attrs }]`; a flow is `<from> -> <to> [when \"<feel>\"] [default]`), you EDIT that text, \
+then write_model_ir compiles it back to an engine-validated `model` you pass straight to simulate. \
+The IR is reversible against the engine's own model (so it can't drift from execution semantics) and \
+is terser than BPMN XML. To add a default branch: read_model_ir, append ` default` to the fallback \
+flow line, write_model_ir. For a multi-stage orchestrator, read_model_ir process:\"<id>\" for one \
+phase, edit it, and write_model_ir base:<full model xml> process:\"<id>\" to splice it back. \
+Keep your thinking BRIEF: never write the \
+variant's BPMN XML inside your reasoning — express the change as edit_model ops or an IR edit instead. \
+Drafting the \
 full XML in your head wastes the output budget and can truncate the turn before you reach the tool \
 call. Read the scorecard honestly: \
 fidelityTier (recorded-replay means it was actually re-run on real inputs; mocked-replay means a new \
@@ -685,7 +697,8 @@ run SQL); simulate/compare_variants with mockWorkers (mock a job OUTPUT, or mock
 with \"throwError\":\"<CODE>\" to exercise an error/timeout boundary that is otherwise never \
 reached); scale_workers (for an under-provisioning/queue bottleneck, quantify the workers a job \
 type needs — the infra what-if simulate cannot run); edit_model (add or change tasks, gateways, \
-boundary events); validate_model (fast \
+boundary events) or read_model_ir/write_model_ir (edit the model as reversible IR text — the way \
+to add a gateway default flow); validate_model (fast \
 static check of BPMN XML before deploying).\n\
 \n\
 Respond with ONLY a JSON object and nothing else:\n\
