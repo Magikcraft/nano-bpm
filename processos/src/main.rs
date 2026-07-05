@@ -141,9 +141,9 @@ struct AppState {
     /// endpoint (end its thinking mid-generation). Cleared once the turn ends.
     chat_cmpl_ids: Arc<CompletionIds>,
     /// The exact model request bodies sent during each session's most recent turn, keyed by
-    /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. In-memory
-    /// (not persisted) — it shows what was last sent and is cleared on restart.
-    chat_debug: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
+    /// session (one entry per round), powering the cockpit's per-chat "Debug" tab. Durable —
+    /// written through to disk (alongside the chat store) so it survives a server restart.
+    chat_debug: Arc<chat::DebugStore>,
     /// Live event buffers for in-flight chat turns, keyed by session. The streaming turn appends
     /// every SSE event here as it produces it; the original request *and* any later reattach
     /// (`GET .../chat/stream/live`, used after a page reload) replay the buffer then follow along.
@@ -432,7 +432,7 @@ async fn main() {
         chat_cancels: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_steers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         chat_cmpl_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        chat_debug: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        chat_debug: Arc::new(chat::DebugStore::open(cfg.data_dir.join("chat"))),
         chat_live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         llama: llama::LlamaManager::new(),
     };
@@ -3091,12 +3091,7 @@ async fn cockpit_chat_session_debug(
 ) -> impl IntoResponse {
     let key = chat::session_key(&workspace, &process);
     let cancel_key = chat_cancel_key(&key, &id);
-    let requests = state
-        .chat_debug
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&cancel_key).cloned())
-        .unwrap_or_default();
+    let requests = state.chat_debug.load(&cancel_key);
     Json(serde_json::json!({ "sessionId": id, "requests": requests }))
 }
 
@@ -3664,12 +3659,7 @@ async fn cockpit_chat_session_trace_export(
         .unwrap_or_default();
     let turns = chat::render_view_full(&s.messages, &s.stamps, &s.turn_models);
     let transcript = chat::export_transcript(&s.name, &turns, true, true);
-    let debug_requests = state
-        .chat_debug
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&chat_cancel_key(&key, &id)).cloned())
-        .unwrap_or_default();
+    let debug_requests = state.chat_debug.load(&chat_cancel_key(&key, &id));
 
     let manifest = trace::TraceManifest {
         schema: trace::SCHEMA.to_string(),
@@ -3793,9 +3783,7 @@ async fn cockpit_chat_session_delete(
 ) -> impl IntoResponse {
     let key = chat::session_key(&workspace, &process);
     if state.chat.delete(&key, &id) {
-        if let Ok(mut m) = state.chat_debug.lock() {
-            m.remove(&chat_cancel_key(&key, &id));
-        }
+        state.chat_debug.remove(&chat_cancel_key(&key, &id));
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
@@ -4099,11 +4087,9 @@ async fn cockpit_chat_send(
             ))
         })
         .await;
-        // Stash this turn's exact request payloads for the session's Debug tab.
+        // Stash this turn's exact request payloads for the session's Debug tab (durable).
         let bodies = dbg.lock().map(|d| d.clone()).unwrap_or_default();
-        if let Ok(mut m) = state.chat_debug.lock() {
-            m.insert(cancel_key.clone(), bodies);
-        }
+        state.chat_debug.save(&cancel_key, bodies);
         handle
     };
     if let Ok(mut m) = state.chat_cancels.lock() {
@@ -4369,9 +4355,7 @@ async fn cockpit_chat_stream(
         task_monitor_done.store(true, std::sync::atomic::Ordering::Relaxed);
         // Persist the captured payloads regardless of outcome (a failed turn still sent a request).
         let bodies = dbg.lock().map(|d| d.clone()).unwrap_or_default();
-        if let Ok(mut m) = task_state.chat_debug.lock() {
-            m.insert(task_cancel_key.clone(), bodies);
-        }
+        task_state.chat_debug.save(&task_cancel_key, bodies);
         match result {
             Ok(r) => {
                 let stamps = chat::extend_stamps(&r.messages, prior_stamps, user_ts, chat_now_ms());

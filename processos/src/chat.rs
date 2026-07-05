@@ -516,6 +516,114 @@ impl ChatStore {
     }
 }
 
+/// Durable store for the per-session **Debug** payloads: the exact model request bodies
+/// sent during a chat session's most recent turn (one entry per round), powering the
+/// cockpit's per-chat "Debug" tab and the psychological-trace export. Mirrors [`ChatStore`]
+/// — one JSON file per session `cancel_key`, sanitised so it can't escape `dir`, degrading
+/// to memory-only on a dir failure. Unlike the former in-memory-only buffer, these survive a
+/// server restart, so the operator can still inspect what was sent after ProcessOS bounces.
+pub struct DebugStore {
+    dir: PathBuf,
+    mem: RwLock<HashMap<String, Vec<serde_json::Value>>>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct DebugFile {
+    #[serde(default)]
+    requests: Vec<serde_json::Value>,
+}
+
+impl DebugStore {
+    /// Open (creating if needed) a store rooted at `dir`. A dir-create failure degrades to
+    /// memory-only rather than failing the server.
+    pub fn open(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        if let Err(e) = fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "debug store: dir create failed; memory-only");
+        }
+        Self {
+            dir,
+            mem: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Replace the stored request payloads for a session (`cancel_key` = `key::session_id`),
+    /// writing through to disk so they outlive a restart.
+    pub fn save(&self, cancel_key: &str, requests: Vec<serde_json::Value>) {
+        if let Ok(mut m) = self.mem.write() {
+            m.insert(cancel_key.to_string(), requests.clone());
+        }
+        self.persist(cancel_key, &requests);
+    }
+
+    /// Load a session's request payloads: the in-memory copy if present, else the persisted
+    /// file (cached back into memory). Empty when nothing has been captured for the session.
+    pub fn load(&self, cancel_key: &str) -> Vec<serde_json::Value> {
+        if let Ok(m) = self.mem.read() {
+            if let Some(v) = m.get(cancel_key) {
+                return v.clone();
+            }
+        }
+        let loaded = self.load_from_disk(cancel_key).unwrap_or_default();
+        if let Ok(mut m) = self.mem.write() {
+            m.entry(cancel_key.to_string())
+                .or_insert_with(|| loaded.clone());
+        }
+        loaded
+    }
+
+    /// Drop a session's payloads from memory and disk (called when the session is deleted).
+    pub fn remove(&self, cancel_key: &str) {
+        if let Ok(mut m) = self.mem.write() {
+            m.remove(cancel_key);
+        }
+        let path = self.path_for(cancel_key);
+        if path.exists() {
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!(key = %cancel_key, error = %e, "debug store: remove failed");
+            }
+        }
+    }
+
+    fn load_from_disk(&self, cancel_key: &str) -> Option<Vec<serde_json::Value>> {
+        let body = fs::read_to_string(self.path_for(cancel_key)).ok()?;
+        let file: DebugFile = serde_json::from_str(&body).ok()?;
+        Some(file.requests)
+    }
+
+    fn persist(&self, cancel_key: &str, requests: &[serde_json::Value]) {
+        let file = DebugFile {
+            requests: requests.to_vec(),
+        };
+        match serde_json::to_string(&file) {
+            Ok(body) => {
+                if let Err(e) = fs::write(self.path_for(cancel_key), body) {
+                    tracing::warn!(key = %cancel_key, error = %e, "debug store: persist failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(key = %cancel_key, error = %e, "debug store: serialise failed")
+            }
+        }
+    }
+
+    /// One file per session; the `key::session_id` cancel-key is sanitised so it can never
+    /// escape `dir`.
+    fn path_for(&self, cancel_key: &str) -> PathBuf {
+        let safe: String = cancel_key
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        self.dir.join(format!("debug-{safe}.json"))
+    }
+}
+
 /// A fresh, collision-resistant session id (`s{epoch_ms}-{seq}`).
 fn new_session_id() -> String {
     let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1065,6 +1173,43 @@ mod tests {
         assert_eq!(store.list(&key).len(), 1);
         assert!(store.delete(&key, &id));
         assert!(store.get(&key, &id).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_store_persists_across_reopen_and_removes() {
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        let cancel_key = format!("{key}::s123-0");
+        let requests = vec![
+            serde_json::json!({ "round": 1, "body": { "messages": ["system", "user"] } }),
+            serde_json::json!({ "round": 2, "body": { "messages": ["assistant"] } }),
+        ];
+        {
+            let store = DebugStore::open(&dir);
+            // Nothing captured yet.
+            assert!(store.load(&cancel_key).is_empty());
+            store.save(&cancel_key, requests.clone());
+            assert_eq!(store.load(&cancel_key), requests);
+        }
+        // Simulate a server restart: a fresh store with an empty memory cache must recover
+        // the payloads from disk — the whole point of the fix.
+        let store = DebugStore::open(&dir);
+        assert_eq!(
+            store.load(&cancel_key),
+            requests,
+            "debug payloads must survive a restart"
+        );
+        // A later turn replaces (not appends to) the buffer, matching the Debug tab contract.
+        let newer = vec![serde_json::json!({ "round": 1, "body": "newer" })];
+        store.save(&cancel_key, newer.clone());
+        assert_eq!(store.load(&cancel_key), newer);
+        // Deleting the session drops the payloads from memory and disk.
+        store.remove(&cancel_key);
+        assert!(store.load(&cancel_key).is_empty());
+        assert!(!dir
+            .join(format!("debug-{}.json", "acme__loan__s123-0"))
+            .exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
