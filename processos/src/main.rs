@@ -27,6 +27,7 @@ mod gguf;
 mod harness;
 mod investigate;
 mod llama;
+mod model_ir;
 mod monitor;
 mod nano_instances;
 mod pairings;

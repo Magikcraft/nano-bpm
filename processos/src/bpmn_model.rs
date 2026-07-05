@@ -1330,7 +1330,7 @@ fn tag_attr(tag: &str, key: &str) -> Option<String> {
 /// Harvest a map of `element id -> human label` from a BPMN document by scanning every start tag
 /// that carries both `id=` and a non-empty `name=`. The engine model drops names (it is purely
 /// semantic), so `edit_model` re-reads them here to preserve operator-facing labels across an edit.
-fn parse_element_names(xml: &str) -> HashMap<String, String> {
+pub(crate) fn parse_element_names(xml: &str) -> HashMap<String, String> {
     let mut names = HashMap::new();
     let mut i = 0usize;
     while let Some(rel) = xml[i..].find('<') {
