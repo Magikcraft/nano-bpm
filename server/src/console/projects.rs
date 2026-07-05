@@ -260,13 +260,13 @@ pub struct ProjectConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectToolchain {
     /// Argv the "Run" button spawns in the project dir. Empty => fall through
-    /// to the lang-pack toolchain / Deno runner. Ignored when a run config
-    /// from `run_configs` is active.
+    /// to the lang-pack toolchain / Deno runner. Also serves as a fallback
+    /// when a run config is active but its own `run` argv is empty.
     #[serde(default)]
     pub run: Vec<String>,
     /// Argv the "Compile" button spawns in the project dir. Empty => fall
-    /// through to the lang-pack toolchain / Deno compile. Ignored when a
-    /// run config from `run_configs` is active and provides its own compile.
+    /// through to the lang-pack toolchain / Deno compile. Also serves as a
+    /// fallback when a run config is active but its own `compile` is empty.
     #[serde(default)]
     pub compile: Vec<String>,
     /// Named run configurations snapshotted from the scaffolding pack.
@@ -2107,6 +2107,14 @@ impl ProjectSupervisor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Even when the toolchain argv resolves to the built-in Deno runner,
+        // an active run config's `env` must still be honored — otherwise
+        // env-only runConfigs (e.g. different NANOBPMN_BASE_URL per target)
+        // silently no-op for Deno projects. Same precedence as run_toolchain:
+        // base spawn env above, then active-config env last-wins.
+        for (k, v) in resolve_run_env(&cfg) {
+            cmd.env(k, v);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -2401,6 +2409,12 @@ impl ProjectSupervisor {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            // Layer active run-config env onto the built-in Deno compile too;
+            // otherwise env-only runConfigs no-op on Deno projects during
+            // Compile (see run() for the symmetric fix and rationale).
+            for (k, v) in resolve_run_env(&cfg) {
+                cmd.env(k, v);
+            }
 
             let child = cmd
                 .spawn()

@@ -119,11 +119,12 @@ pub struct Toolchain {
     #[serde(default)]
     pub detect: Vec<String>,
     /// Shell-style argv to run the project (cwd = project dir). Empty => use the
-    /// built-in Deno runner. Ignored when `run_configs` is non-empty and one is
-    /// active.
+    /// built-in Deno runner. Serves as a fallback when the active run config's
+    /// `run` argv is empty (per [`RunConfig`] semantics).
     #[serde(default)]
     pub run: Vec<String>,
-    /// Shell-style argv to compile the project. Empty => Deno compile.
+    /// Shell-style argv to compile the project. Empty => Deno compile. Serves
+    /// as a fallback when the active run config's `compile` argv is empty.
     #[serde(default)]
     pub compile: Vec<String>,
     /// Cross-compile target triples this toolchain offers.
