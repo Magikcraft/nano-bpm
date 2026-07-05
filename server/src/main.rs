@@ -10324,7 +10324,9 @@ async fn main() {
             .allow_headers(Any)
             .expose_headers(Any);
         app = app.layer(cors);
-        tracing::info!("CORS enabled on all routes (Access-Control-Allow-Origin: *). Set NANOBPM_CORS=off to disable.");
+        tracing::info!(
+            "CORS enabled on all routes (Access-Control-Allow-Origin: *). Set NANOBPM_CORS=off to disable."
+        );
     }
 
     // Background "tick": drives the host clock into the engine so timers fire and
