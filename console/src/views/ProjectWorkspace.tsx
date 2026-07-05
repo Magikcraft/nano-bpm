@@ -159,6 +159,28 @@ export default function ProjectWorkspace() {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
+  // The cross-compile modal is Deno-specific — its copy talks about downloading
+  // the Deno runtime per target, and its picker only knows Deno target triples.
+  // Skip it whenever this project isn't Deno: either it has a snapshotted
+  // toolchain (Java/Rust/… scaffolded from an app pack that declared its own
+  // compile argv) OR its lang pack drives compile (cfg.lang != "deno"). Either
+  // way there's one canonical compile invocation and no per-platform variant
+  // for the user to choose from.
+  const handleCompile = async () => {
+    const isDenoProject =
+      !detail?.config.toolchain?.compile?.length &&
+      (!detail?.config.lang || detail.config.lang === "deno");
+    if (!isDenoProject) {
+      try {
+        await projectsApi.compileProject(name, []);
+        void load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+    setShowCompile(true);
+  };
 
   if (error) {
     return (
@@ -208,7 +230,10 @@ export default function ProjectWorkspace() {
             ▶ Run
           </ToolbarButton>
         )}
-        <ToolbarButton onClick={() => setShowCompile(true)} disabled={!runnable || compiling}>
+        <ToolbarButton
+          onClick={() => void handleCompile()}
+          disabled={!runnable || compiling}
+        >
           Compile
         </ToolbarButton>
         <ToolbarButton onClick={() => setShowConfig(true)}>Configure</ToolbarButton>
