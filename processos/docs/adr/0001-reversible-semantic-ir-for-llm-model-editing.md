@@ -190,6 +190,90 @@ tools do. The default tool result is a compact one-page production cheat-sheet;
 `analyze_model` does the contextual narrowing. The grammar tells the model that
 default flows *exist*; the analyzer tells it *which* gateway needs one.
 
+### The desirability dimension: guided search against an externalized objective
+
+Legality and visibility (the two grammar maps above) constrain and illuminate the
+space of valid models. They do not tell the LLM which move through that space is
+an *improvement*. That is a third, orthogonal dimension. Three walls:
+
+| Dimension | Question | Mechanism |
+|-----------|----------|-----------|
+| **CAN** (legality) | Is the edit valid? | grammar / GBNF / parser |
+| **COULD** (extent) | What is expressible, and what is available here? | grammar-as-tool + `analyze_model` |
+| **SHOULD** (desirability) | Which edit makes the model *better*? | an explicit objective function |
+
+The design position: **do not encode desirability as an LLM prior; externalize it
+as a measurable objective and structure the interaction as guided search.** The
+grammar-constrained LLM is the *proposal distribution* (a smart, always-legal
+mutation operator); a separate *evaluator* scores candidates; the LLM climbs the
+gradient. The intelligence lives in the loop, not in a weak local model's priors —
+which is what makes it robust on a 4–8B local model.
+
+**"Better" is only defined relative to a stated objective.** There is no universal
+"better BPMN"; a default flow is desirable only relative to a goal. The system
+should *require or elicit* an objective rather than assume one. Given one,
+desirability stratifies into a tiered fitness function — cheap to expensive,
+mirroring the existing `limit:1 → 25 → full` replay sampling:
+
+1. **Static well-formedness (cheap, ms).** `analyze_model` smell count. The
+   `exclusive-no-default` warning is *already* a desirability signal, not merely a
+   "you could": all-conditional branches with no default is a **liveness defect** —
+   a token can get stuck. Adding the default *eliminates a defect*. Reducing
+   warnings is a coarse monotone gradient, but a proxy: a model can be
+   warning-free and still wrong.
+2. **Behavioral fit — the replay oracle (expensive, the true gradient).** The
+   signal ProcessOS uniquely owns, and the reason tier-2 capture exists. "Better"
+   becomes *measurable*: replay a candidate against recorded stimuli and score it
+   — does it reproduce observed outcomes and eliminate the divergence/incident
+   that opened the investigation? `compare_variants` / `replay_rank`
+   (`RankedCandidate`, confidence bands, divergent-vs-structural) is already this
+   evaluator. Desirability = fit-to-reality + fault-elimination, empirically, not
+   by prior.
+3. **The investigation's goal (the target).** The loss is measured against intent
+   ("loans over $X auto-approve when they should route to manual review"). Without
+   a stated goal, dimension 3 collapses back to smell reduction.
+
+**The LLM is a mutation operator, not an oracle.** This reframes model editing as
+generate-and-test / guided search: the grammar-constrained LLM proposes legal
+candidates, the harness scores them, the LLM climbs. ProcessOS already owns the
+test half; the IR + grammar make the generate half tractable and legal, closing
+the loop.
+
+**Two dangers require regularizers:**
+
+- **Objective-hacking / corpus overfitting.** If fitness is only "reproduce
+  recorded traces," the LLM will memorize a finite corpus — special-case
+  conditions that pass replay but generalize badly. Guard with: **minimal semantic
+  diff** (surgical change, not a rewrite — this recovers the imperative API's one
+  virtue, blast-radius containment, as a *regularizer*), a **held-out replay
+  split** (train/validate on the trace corpus), and **preferring structural fixes
+  over instance patches** — which replay already distinguishes
+  (`requiresNewWorkers`/mock vs `structuralDivergence`/topology). Structural =
+  general = more desirable.
+- **"Better" is not scalar.** Fit-to-reality, fault-elimination, parsimony, and
+  closeness-to-original trade off. Surface a **fitness vector / Pareto front**
+  rather than letting the LLM silently collapse it; parsimony and minimal-diff are
+  the regularizers that hold overfitting in check.
+
+**Desirability replay cannot measure** — readability, naming, convention
+alignment — needs a *normative* oracle: a best-practice lint catalog (a BPMN
+"clippy": unnamed elements, single-flow gateways, implicit splits). It is
+prior-based, so it belongs in an explicit, auditable, tunable rule set, never in
+the model's head.
+
+**The default-flow case, restated as desirability:** it is desirable when
+*demonstrated* to be, via the fitness delta — *"adding `review_gw ->
+manual_review [default]` removes 1 liveness warning, makes replay reproduce 3
+previously-divergent instances, and is a 1-line diff."* Desirability is
+**explained, not asserted**: the semantic diff plus the measured fitness change,
+surfaced for the operator to accept or reject. For a reasoning/advisory agent the
+human is the final objective, so making the *why* legible is part of the design.
+
+Open concerns (carried, not yet settled): how to weight the multi-objective
+vector; how to split a small customer corpus for held-out validation without
+starving either side; and whether the normative lint catalog is authored,
+learned, or both.
+
 ## Consequences
 
 - **The per-op treadmill ends.** The LLM's loop becomes the read-modify-write
@@ -241,3 +325,10 @@ default flows *exist*; the analyzer tells it *which* gateway needs one.
    (or keep them as sugar over the IR).
 5. DI-preservation sidecar so hand-laid-out customer diagrams survive a
    round-trip.
+6. Engine-derived grammar: `#[derive(JsonSchema)]` on the IR types + a coverage
+   parity test, exposed as a `describe_ir_grammar` tool result and a GBNF grammar
+   for llama.cpp constrained decoding.
+7. Guided search (the desirability dimension): make the fitness explicit and
+   tiered — static smells → replay score against the investigation goal — with a
+   minimal-diff regularizer and the fitness delta surfaced per candidate. Reuses
+   `analyze_model` and `compare_variants` / `replay_rank`.
