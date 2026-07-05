@@ -2227,7 +2227,11 @@ mod tests {
             r#"{"id":"multi","kind":"app","displayName":"Multi","requires":["java","maven"],"templates":[{"id":"multi-starter","label":"Multi starter"}]}"#,
         )
         .unwrap();
-        std::fs::write(pack.join("templates/multi-starter/pom.xml"), "<aggregator/>\n").unwrap();
+        std::fs::write(
+            pack.join("templates/multi-starter/pom.xml"),
+            "<aggregator/>\n",
+        )
+        .unwrap();
         std::fs::write(
             pack.join("templates/multi-starter/microservice/pom.xml"),
             "<module/>\n",
