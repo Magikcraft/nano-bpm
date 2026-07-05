@@ -293,7 +293,14 @@ pub fn template_source(template_id: &str) -> Option<(ExtManifest, PathBuf)> {
     let rd = std::fs::read_dir(extensions_root()).ok()?;
     for entry in rd.flatten() {
         let base = entry.path();
-        let txt = std::fs::read_to_string(base.join(manifest_name())).ok()?;
+        // Extensions root also holds non-pack entries (e.g. `trust.json`) and
+        // pack directories may be missing the manifest mid-install. Skip those
+        // — using `?` here would early-return None from the whole lookup and
+        // silently drop every remaining pack (see the Deno-fallback bug this
+        // caused on `java-starter` when trust.json sat alongside the packs).
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
         let m: ExtManifest = match serde_json::from_str(&txt) {
             Ok(m) => m,
             Err(_) => continue,
@@ -612,10 +619,18 @@ mod tests {
         assert_eq!(back.toolchain.run, vec!["cargo", "run", "--release"]);
     }
 
+    // NANOBPMN_EXTENSIONS_DIR is process-global; serialize any test in this
+    // module that flips it so concurrent tests can't stomp each other's root.
+    fn ext_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn installed_version_reads_package_json() {
         // Point the extensions root at a unique temp dir and drop a pack with a
         // package.json, then confirm installed_version reads its version.
+        let _g = ext_env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-test-{}", std::process::id()));
         let pkg = "@nanobpm/nano-ide-lang-rust";
         // SAFETY: test-local env set; other tests in this module don't depend on
@@ -632,5 +647,49 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    /// Regression: extensions_root also holds non-pack files (notably
+    /// `trust.json`) and pack directories may temporarily lack the manifest
+    /// during install. Using `?` on the manifest read early-returned None
+    /// from the whole lookup, so `create_project(template="java-starter")`
+    /// silently fell back to the Deno starter. See PR #25.
+    #[test]
+    fn template_source_skips_non_pack_entries_in_extensions_root() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let _g = ext_env_lock();
+        let root = std::env::temp_dir().join(format!(
+            "nano-ext-tsrc-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // trust.json is a *file* in extensions_root — the exact non-pack entry
+        // that broke pack discovery.
+        std::fs::write(root.join("trust.json"), "{}\n").unwrap();
+        // An installing-in-progress pack: directory exists but no manifest yet.
+        std::fs::create_dir_all(root.join("nanobpm__half-installed")).unwrap();
+        // A real pack that must be discoverable regardless of iteration order.
+        let pack = root.join("nanobpm__nano-ide-lang-java");
+        std::fs::create_dir_all(pack.join("templates/java-starter")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"java","kind":"lang","displayName":"Java","templates":[{"id":"java-starter","label":"Java starter"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("templates/java-starter/pom.xml"), "<project/>\n").unwrap();
+
+        // SAFETY: test-local env set; unique per-pid+counter dir isolates from
+        // parallel test binaries. Serialized against sibling tests via ext_env_lock.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let hit = template_source("java-starter");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+
+        let (m, dir) = hit.expect("java-starter should be discoverable");
+        assert_eq!(m.id, "java");
+        assert!(dir.ends_with("templates/java-starter"));
     }
 }

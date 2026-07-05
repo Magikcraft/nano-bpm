@@ -1035,10 +1035,28 @@ pub fn create_project(
     if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
         mk(dir.clone())?;
         super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
+        // Lang precedence: manifest.requires (for example packs that opt in)
+        // → fileTypes[0].monacoLang → on-disk heuristic (pom.xml→java,
+        // Cargo.toml→rust) → "deno". App packs typically leave `requires`
+        // empty, so without a fallback they'd all be classified Deno and
+        // wear the wrong toolbar/runner in the console.
         let cfg_lang = m
             .requires
             .first()
             .cloned()
+            .or_else(|| m.file_types.first().map(|ft| ft.monaco_lang.clone()))
+            .or_else(|| {
+                if dir.join("pom.xml").is_file()
+                    || dir.join("microservice/pom.xml").is_file()
+                    || dir.join("app/pom.xml").is_file()
+                {
+                    Some("java".to_string())
+                } else if dir.join("Cargo.toml").is_file() || dir.join("src/main.rs").is_file() {
+                    Some("rust".to_string())
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| "deno".to_string());
         // Best-effort detection of the "main" entrypoint the console
         // surfaces in the workspace toolbar. Ordered from most specific
