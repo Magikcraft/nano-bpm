@@ -2450,10 +2450,24 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    /// A unique temp dir that doesn't touch `NANOBPMN_PROJECTS_DIR`, so async
+    /// tests don't need to hold a std Mutex across `.await`.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "nano-discover-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     #[tokio::test]
     async fn discover_finds_configured_extensions_sorted_per_dir() {
-        let _g = lock();
-        let root = temp_root().join("p1");
+        let root = scratch_dir("sorted").join("p1");
         std::fs::create_dir_all(&root).unwrap();
         touch(&root.join("models/onboarding.bpmn"), "<x/>");
         touch(&root.join("models/adhoc.bpmn"), "<x/>");
@@ -2484,8 +2498,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_empty_list_disables_sweep() {
-        let _g = lock();
-        let root = temp_root().join("p2");
+        let root = scratch_dir("empty").join("p2");
         std::fs::create_dir_all(&root).unwrap();
         touch(&root.join("models/x.bpmn"), "<x/>");
         let files = ProjectSupervisor::discover_deployables(&root, &[]).await;
@@ -2494,8 +2507,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_rejects_dotdot_traversal() {
-        let _g = lock();
-        let sandbox = temp_root().join("sandbox");
+        let sandbox = scratch_dir("dotdot").join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
         // A "leak" dir outside the project that contains a bpmn file the
         // attacker would like to exfiltrate.
@@ -2515,8 +2527,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_rejects_absolute_paths() {
-        let _g = lock();
-        let root = temp_root().join("p3");
+        let root = scratch_dir("abs").join("p3");
         std::fs::create_dir_all(&root).unwrap();
         touch(&root.join("models/x.bpmn"), "<x/>");
 
@@ -2531,8 +2542,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_symlink_escape_rejected() {
-        let _g = lock();
-        let sandbox = temp_root().join("sandbox2");
+        let sandbox = scratch_dir("symlink").join("sandbox2");
         std::fs::create_dir_all(&sandbox).unwrap();
         touch(&sandbox.join("outside/secret.bpmn"), "<pwned/>");
         let root = sandbox.join("project");
