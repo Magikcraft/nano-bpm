@@ -293,7 +293,16 @@ pub fn template_source(template_id: &str) -> Option<(ExtManifest, PathBuf)> {
     let rd = std::fs::read_dir(extensions_root()).ok()?;
     for entry in rd.flatten() {
         let base = entry.path();
-        let txt = std::fs::read_to_string(base.join(manifest_name())).ok()?;
+        // The extensions root holds more than pack dirs — the trust store
+        // (trust.json), OS litter (.DS_Store), a mid-install tarball. Skip
+        // anything without a readable manifest instead of aborting the scan:
+        // a `?` here let the FIRST such entry hide every installed template
+        // (the picker still offered them via the tolerant all_extensions(),
+        // but creation silently fell back to the built-in Deno starter).
+        let txt = match std::fs::read_to_string(base.join(manifest_name())) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
         let m: ExtManifest = match serde_json::from_str(&txt) {
             Ok(m) => m,
             Err(_) => continue,
