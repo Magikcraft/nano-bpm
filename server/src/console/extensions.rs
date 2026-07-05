@@ -72,6 +72,43 @@ pub struct FileType {
     pub monaco_lang: String,
 }
 
+/// One named way to run/compile the same project — used by packs whose
+/// example is a matrix (e.g. `example-java-throughput` has four
+/// transport/profile combos over one Java source). The Console offers
+/// these in a Run/Target dropdown; the picked id is persisted per project.
+///
+/// **Env merging:** `env` extends (and, on key conflict, overrides) the
+/// project-level environment when the config is spawned.
+///
+/// **Trust:** each config's `run`/`compile` argv is snapshotted into the
+/// project on scaffold — trust is granted per scaffolding pack id, same
+/// model as the flat `run`/`compile`.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunConfig {
+    /// Stable id, unique within a pack (e.g. `"stock-rest"`).
+    pub id: String,
+    /// Human label shown in the picker (e.g. `"Camunda 8 · REST"`).
+    pub label: String,
+    /// If true and no `activeRunConfig` is set on the project, this one wins.
+    /// At most one per pack should be flagged; extras are ignored deterministically
+    /// (first one wins in pack order).
+    #[serde(default)]
+    pub default: bool,
+    /// Shell-style argv to run this config. Empty falls back to the toolchain's
+    /// top-level `run`.
+    #[serde(default)]
+    pub run: Vec<String>,
+    /// Shell-style argv to compile this config. Empty falls back to the
+    /// toolchain's top-level `compile`.
+    #[serde(default)]
+    pub compile: Vec<String>,
+    /// Extra environment variables set on spawn — overrides project env on key
+    /// conflict.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 /// On-machine toolchain the supervisor drives. Commands run on the user's
 /// machine and are gated by [`TrustStore`].
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -82,15 +119,22 @@ pub struct Toolchain {
     #[serde(default)]
     pub detect: Vec<String>,
     /// Shell-style argv to run the project (cwd = project dir). Empty => use the
-    /// built-in Deno runner.
+    /// built-in Deno runner. Serves as a fallback when the active run config's
+    /// `run` argv is empty (per [`RunConfig`] semantics).
     #[serde(default)]
     pub run: Vec<String>,
-    /// Shell-style argv to compile the project. Empty => Deno compile.
+    /// Shell-style argv to compile the project. Empty => Deno compile. Serves
+    /// as a fallback when the active run config's `compile` argv is empty.
     #[serde(default)]
     pub compile: Vec<String>,
     /// Cross-compile target triples this toolchain offers.
     #[serde(default)]
     pub targets: Vec<String>,
+    /// Named run configurations (see [`RunConfig`]). When present, the Console
+    /// surfaces them in a Run/Target dropdown and the supervisor prefers them
+    /// over the top-level `run`/`compile`.
+    #[serde(default)]
+    pub run_configs: Vec<RunConfig>,
     /// Official, OS-aware install instructions for this toolchain, surfaced in the
     /// IDE config panel when the `detect` probe fails. Empty for the built-in Deno
     /// pack (whose runtime is reported separately as a first-class dependency).
@@ -216,6 +260,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 run: vec!["cargo".into(), "run".into(), "--release".into()],
                 compile: vec!["cargo".into(), "build".into(), "--release".into()],
                 targets: vec![],
+                run_configs: vec![],
                 install_url: Some("https://www.rust-lang.org/tools/install".into()),
                 install_hint: Some(
                     "`cargo` was not found. Install the Rust toolchain (see the link) so `cargo` is on PATH. Until then, Rust projects cannot run or compile.".into(),
