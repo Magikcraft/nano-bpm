@@ -2172,8 +2172,16 @@ mod tests {
         )
         .unwrap();
         std::fs::write(pack.join("app/pom.xml"), "<project/>\n").unwrap();
-        std::fs::write(pack.join("app/src/main/java/com/example/Main.java"), "class Main{}\n").unwrap();
-        std::fs::write(pack.join("app/src/main/resources/throughput.bpmn"), "<bpmn/>").unwrap();
+        std::fs::write(
+            pack.join("app/src/main/java/com/example/Main.java"),
+            "class Main{}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("app/src/main/resources/throughput.bpmn"),
+            "<bpmn/>",
+        )
+        .unwrap();
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
         let cfg = create_project("jbench", "", "throughput-jvm").expect("create");
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
@@ -2188,10 +2196,18 @@ mod tests {
         assert!(!dir.join("main.ts").exists(), "Deno main.ts leaked");
         assert!(!dir.join("deno.json").exists(), "Deno deno.json leaked");
         assert!(!dir.join("lib/nano.ts").exists(), "Deno lib/nano.ts leaked");
-        assert!(!dir.join(".nanobpm/worker-sdk.ts").exists(), ".nanobpm/worker-sdk.ts leaked");
-        assert!(!dir.join("workers/do-work").exists(), "workers/do-work leaked");
-        assert!(!dir.join("resources/processes/jbench.bpmn").exists(),
-                "built-in starter BPMN shadowed the pack BPMN");
+        assert!(
+            !dir.join(".nanobpm/worker-sdk.ts").exists(),
+            ".nanobpm/worker-sdk.ts leaked"
+        );
+        assert!(
+            !dir.join("workers/do-work").exists(),
+            "workers/do-work leaked"
+        );
+        assert!(
+            !dir.join("resources/processes/jbench.bpmn").exists(),
+            "built-in starter BPMN shadowed the pack BPMN"
+        );
     }
 
     #[test]
