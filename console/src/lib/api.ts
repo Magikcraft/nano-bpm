@@ -495,14 +495,19 @@ export async function exportWorkersApp(workers: string[]): Promise<void> {
 /// endpoint (not a console API). Resolves on success; throws with the server's
 /// problem detail otherwise. Deployment is idempotent, so deploying an unchanged
 /// model is a safe no-op.
-export async function deployXml(name: string, xml: string): Promise<void> {
+export async function deployXml(
+  name: string,
+  xml: string,
+  baseUrl?: string,
+): Promise<void> {
   const form = new FormData();
   form.append(
     "resources",
     new Blob([xml], { type: "text/xml" }),
     `${name}.bpmn`,
   );
-  const res = await fetch("/v2/deployments", { method: "POST", body: form });
+  const url = joinBase(baseUrl, "/v2/deployments");
+  const res = await fetch(url, { method: "POST", body: form });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(detail || `deploy → HTTP ${res.status}`);
@@ -529,13 +534,15 @@ export async function createProcessInstance(opts: {
   processId: string;
   variables?: Record<string, unknown>;
   awaitCompletion?: boolean;
+  baseUrl?: string;
 }): Promise<CreateInstanceResult> {
   const body: Record<string, unknown> = {
     processDefinitionId: opts.processId,
     variables: opts.variables ?? {},
   };
   if (opts.awaitCompletion) body.awaitCompletion = true;
-  const res = await fetch("/v2/process-instances", {
+  const url = joinBase(opts.baseUrl, "/v2/process-instances");
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -545,6 +552,53 @@ export async function createProcessInstance(opts: {
     throw new Error(detail || `start instance → HTTP ${res.status}`);
   }
   return (await res.json()) as CreateInstanceResult;
+}
+
+/// Concats a Camunda-relative path with an optional base URL. When `base` is
+/// missing or empty the path is returned verbatim, so fetch() targets the
+/// console's own gateway. Trailing/leading slashes are normalised.
+function joinBase(base: string | undefined, path: string): string {
+  if (!base) return path;
+  return `${base.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+/// Fetches the deployed BPMN XML for a process id from a specific gateway.
+/// Used by the modeler to decide whether the on-disk file matches the deployed
+/// definition. Camunda's REST API needs the deployment *key* to serve XML; we
+/// look up the latest deployed definition by id first, then pull its XML.
+/// Returns `null` for any non-success outcome — the process has never been
+/// deployed, the gateway is unreachable, the request fails auth/validation,
+/// or the search returns no matches. Callers treat "unknown" the same as
+/// "not deployed": Start stays disabled until the user clicks Deploy.
+export async function fetchDeployedXmlByProcessId(
+  processId: string,
+  baseUrl?: string,
+): Promise<string | null> {
+  try {
+    const searchUrl = joinBase(baseUrl, "/v2/process-definitions/search");
+    const res = await fetch(searchUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filter: { processDefinitionId: processId },
+        sort: [{ field: "version", order: "DESC" }],
+        page: { from: 0, limit: 1 },
+      }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      items?: Array<{ processDefinitionKey?: string }>;
+    };
+    const key = body.items?.[0]?.processDefinitionKey;
+    if (!key) return null;
+    const xmlRes = await fetch(
+      joinBase(baseUrl, `/v2/process-definitions/${key}/xml`),
+    );
+    if (xmlRes.status !== 200) return null;
+    return await xmlRes.text();
+  } catch {
+    return null;
+  }
 }
 
 /// The verbatim BPMN XML for a process definition, served by the gateway's

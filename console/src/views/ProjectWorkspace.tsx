@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, lazy, Suspense } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
 import MarkdownPreview from "../components/MarkdownPreview";
@@ -10,6 +10,9 @@ import {
   projectsApi,
   projectLogs,
   exportProject,
+  deployXml,
+  createProcessInstance,
+  fetchDeployedXmlByProcessId,
   type FileNode,
   type ProjectDetail,
   type ProjectConfig,
@@ -262,7 +265,12 @@ export default function ProjectWorkspace() {
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-hidden border-b border-edge">
             {selected ? (
-              <EditorPane key={selected} name={name} path={selected} />
+              <EditorPane
+                key={selected}
+                name={name}
+                path={selected}
+                deployTarget={detail.config.deployTarget}
+              />
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-fg-faint">
                 Select a file to edit
@@ -483,7 +491,15 @@ function TreeNode({
 
 // --- Editor dispatch -------------------------------------------------------
 
-function EditorPane({ name, path }: { name: string; path: string }) {
+function EditorPane({
+  name,
+  path,
+  deployTarget,
+}: {
+  name: string;
+  path: string;
+  deployTarget: string;
+}) {
   const [content, setContent] = useState<string | null>(null);
   const [meta, setMeta] = useState<ProjectFile | null>(null);
   const [dirty, setDirty] = useState(false);
@@ -504,6 +520,13 @@ function EditorPane({ name, path }: { name: string; path: string }) {
   // the modeler. On switch back to Visual we import it so both surfaces stay in
   // sync; on Save from the XML tab we persist `bpmnXml` directly.
   const bpmnXmlDirtyRef = useRef(false);
+  // Track what we most recently deployed to <deployTarget> so we can enable
+  // Start Instance only when the saved XML matches deployment. Primed once
+  // on load by pulling the deployed XML for the file's primary process id;
+  // updated in-place after a successful Deploy.
+  const [lastDeployedXml, setLastDeployedXml] = useState<string | null>(null);
+  const [deploying, setDeploying] = useState(false);
+  const [startModalOpen, setStartModalOpen] = useState(false);
 
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   const kind: "bpmn" | "dmn" | "form" | "md" | "code" =
@@ -516,6 +539,18 @@ function EditorPane({ name, path }: { name: string; path: string }) {
           : ext === "md" || ext === "markdown"
             ? "md"
             : "code";
+
+  // Parse process ids client-side. Multi-process files are rare and use the
+  // first as the primary (matches the server's deploy_status_of contract).
+  const processIds = useMemo<string[]>(() => {
+    if (kind !== "bpmn" || content == null) return [];
+    return Array.from(
+      content.matchAll(/<(?:bpmn2?:)?process\b[^>]*\bid=["']([^"']+)["']/g),
+    ).map((m) => m[1]);
+  }, [kind, content]);
+  const primaryProcessId = processIds[0] ?? null;
+  const deployedInSync =
+    lastDeployedXml != null && lastDeployedXml === content && !dirty;
 
   useEffect(() => {
     let alive = true;
@@ -590,6 +625,40 @@ function EditorPane({ name, path }: { name: string; path: string }) {
       setSaving(false);
     }
   }, [content, kind, name, path, bpmnView, bpmnXml]);
+
+  // Prime lastDeployedXml on load — probes <deployTarget> for the currently
+  // deployed BPMN of primaryProcessId. Silent on failure (network down, no
+  // deployment yet) — the Start Instance button just stays disabled until
+  // the user clicks Deploy.
+  useEffect(() => {
+    if (kind !== "bpmn" || !primaryProcessId) {
+      setLastDeployedXml(null);
+      return;
+    }
+    let alive = true;
+    void fetchDeployedXmlByProcessId(primaryProcessId, deployTarget).then(
+      (xml) => alive && setLastDeployedXml(xml),
+    );
+    return () => {
+      alive = false;
+    };
+  }, [kind, primaryProcessId, deployTarget]);
+
+  const deploy = useCallback(async () => {
+    if (content == null) return;
+    setDeploying(true);
+    try {
+      // Deploy the saved on-disk XML — the user has to Save first if they
+      // want their in-flight edits deployed (dirty guard disables the button).
+      const modelName = path.split("/").pop()?.replace(/\.bpmn$/i, "") || name;
+      await deployXml(modelName, content, deployTarget);
+      setLastDeployedXml(content);
+    } catch (e) {
+      alert(`Deploy failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setDeploying(false);
+    }
+  }, [content, deployTarget, name, path]);
 
   // Switches the BPMN editor between the graphical canvas and the raw XML tab.
   // Visual → XML: pull the current serialized document from the modeler.
@@ -699,6 +768,42 @@ function EditorPane({ name, path }: { name: string; path: string }) {
           </div>
         )}
         {kind === "bpmn" && (
+          <>
+            <button
+              onClick={() => void deploy()}
+              disabled={deploying || dirty || !primaryProcessId}
+              title={
+                !primaryProcessId
+                  ? "The BPMN file has no <process id=...>"
+                  : dirty
+                    ? "Save first"
+                    : `Deploy to ${deployTarget}`
+              }
+              className="rounded-md border border-edge-strong px-3 py-1 text-xs font-medium text-fg transition-colors hover:border-accent hover:text-accent-strong disabled:opacity-40"
+            >
+              {deploying
+                ? "Deploying…"
+                : deployedInSync
+                  ? "Deploy ✓"
+                  : "Deploy"}
+            </button>
+            <button
+              onClick={() => setStartModalOpen(true)}
+              disabled={!deployedInSync || !primaryProcessId}
+              title={
+                !primaryProcessId
+                  ? "The BPMN file has no <process id=...>"
+                  : !deployedInSync
+                    ? "Deploy the current model first"
+                    : `Start an instance of ${primaryProcessId}`
+              }
+              className="rounded-md border border-edge-strong px-3 py-1 text-xs font-medium text-fg transition-colors hover:border-accent hover:text-accent-strong disabled:opacity-40"
+            >
+              Start instance
+            </button>
+          </>
+        )}
+        {kind === "bpmn" && (
           <button
             onClick={async () => {
               // Pull from whichever surface currently holds the latest doc.
@@ -757,6 +862,13 @@ function EditorPane({ name, path }: { name: string; path: string }) {
                   <TestRunPanel xml={testXml} onClose={() => setTestXml(null)} />
                 </Suspense>
               </div>
+            )}
+            {startModalOpen && primaryProcessId && (
+              <StartInstanceModal
+                processId={primaryProcessId}
+                deployTarget={deployTarget}
+                onClose={() => setStartModalOpen(false)}
+              />
             )}
           </div>
         )}
@@ -1006,6 +1118,91 @@ function Modal({
         {children}
       </div>
     </div>
+  );
+}
+
+/// Modal for starting a process instance. User pastes/edits a JSON variables
+/// payload (defaults to `{}`); the POST goes to <deployTarget>/v2/process-instances.
+/// Shows the returned processInstanceKey on success, or the server's problem
+/// detail on failure — no navigation, so the user can start another instance
+/// right away with tweaked variables.
+function StartInstanceModal({
+  processId,
+  deployTarget,
+  onClose,
+}: {
+  processId: string;
+  deployTarget: string;
+  onClose: () => void;
+}) {
+  const [json, setJson] = useState("{}");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const start = async () => {
+    setError(null);
+    setResult(null);
+    let variables: Record<string, unknown>;
+    try {
+      const parsed = json.trim() === "" ? {} : JSON.parse(json);
+      if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Variables must be a JSON object.");
+      }
+      variables = parsed as Record<string, unknown>;
+    } catch (e) {
+      setError(`Invalid JSON: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await createProcessInstance({
+        processId,
+        variables,
+        baseUrl: deployTarget,
+      });
+      setResult(r.processInstanceKey);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title={`Start instance — ${processId}`} onClose={onClose}>
+      <p className="text-sm text-fg-muted">
+        Posted to{" "}
+        <span className="font-mono text-fg">{`${deployTarget.replace(/\/+$/, "")}/v2/process-instances`}</span>.
+        Variables must be a JSON object; leave <span className="font-mono">{"{}"}</span> for no vars.
+      </p>
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
+        Variables (JSON)
+      </label>
+      <textarea
+        value={json}
+        onChange={(e) => setJson(e.target.value)}
+        spellCheck={false}
+        rows={8}
+        className={`${inputCls} font-mono text-xs`}
+      />
+      {error && (
+        <p className="mt-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+          {error}
+        </p>
+      )}
+      {result && (
+        <p className="mt-2 rounded-md border border-ok/40 bg-ok/10 px-3 py-2 text-xs text-ok">
+          Started — processInstanceKey <span className="font-mono">{result}</span>
+        </p>
+      )}
+      <div className="mt-5 flex justify-end gap-2">
+        <Button onClick={onClose}>Close</Button>
+        <Button variant="primary" onClick={() => void start()} disabled={busy}>
+          {busy ? "Starting…" : "Start"}
+        </Button>
+      </div>
+    </Modal>
   );
 }
 
