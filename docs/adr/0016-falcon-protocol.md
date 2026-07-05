@@ -1,4 +1,4 @@
-# ADR 0015 — The Falcon protocol (unified bidirectional command stream)
+# ADR 0016 — The Falcon protocol (unified bidirectional command stream)
 
 Status: **Accepted — implemented.** Shipped in `server/src/falcon.rs` (the
 `/falcon` WebSocket endpoint), the `@nanobpmn/sdk` client (`clients/node-stream/`),
