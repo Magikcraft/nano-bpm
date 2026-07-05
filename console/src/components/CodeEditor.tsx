@@ -146,14 +146,12 @@ function acquireTypes(code: string): void {
   void ensureAta().then((run) => run?.(code));
 }
 
-export function languageForFile(file: string): string {
-  if (file.endsWith(".json")) return "json";
-  if (file.endsWith(".js") || file.endsWith(".mjs") || file.endsWith(".cjs")) return "javascript";
-  if (file.endsWith(".rs")) return "rust";
-  if (file.endsWith(".toml") || file.endsWith(".lock")) return "ini";
-  if (file.endsWith(".md")) return "markdown";
-  return "typescript";
-}
+// Re-export from the framework-free module so the sibling registerModels()
+// below and consumers importing `languageForFile` from CodeEditor share a
+// single ext→language table — including any file types registered from
+// installed lang packs at runtime.
+import { languageForFile } from "../lib/editorLang";
+export { languageForFile };
 
 // --- Cross-file IntelliSense: sibling + shared-library models --------------
 // A worker is a folder of files, and shared logic lives under `@lib/…`. For the

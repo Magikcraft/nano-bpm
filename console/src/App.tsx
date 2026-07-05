@@ -8,7 +8,8 @@ import {
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
-import { api } from "./lib/api";
+import { api, projectsApi } from "./lib/api";
+import { registerFileTypes } from "./lib/editorLang";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -205,6 +206,24 @@ export default function App() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // Register every installed lang pack's `fileTypes[]` with the Monaco
+  // ext→language map at boot. Without this, a `.java` file (contributed by
+  // the `lang-java` pack) falls through to the "typescript" default and
+  // Monaco paints Java source with TS highlighting. Done once at App mount
+  // so every code editor mounted afterwards sees the right language.
+  useEffect(() => {
+    projectsApi
+      .extensions()
+      .then((ov) => {
+        for (const e of ov.extensions) {
+          if (e.fileTypes?.length) registerFileTypes(e.fileTypes);
+        }
+      })
+      .catch(() => {
+        /* ignore — the static fallback table still covers the common cases */
+      });
   }, []);
 
   return (
