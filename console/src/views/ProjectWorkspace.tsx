@@ -153,6 +153,24 @@ export default function ProjectWorkspace() {
   const lang = detail?.config.lang ?? "deno";
   const running = runState?.status === "running" || runState?.status === "starting";
   const compiling = runState?.compiling ?? false;
+  const runConfigs = detail?.config.toolchain?.runConfigs ?? [];
+  // The server resolves the same fallback (pinned → default:true → first) at
+  // resolve_run_argv time, but we mirror it here so the picker's initial
+  // value matches what Run would actually spawn.
+  const activeRunConfigId =
+    detail?.config.toolchain?.activeRunConfig ??
+    runConfigs.find((c) => c.default)?.id ??
+    runConfigs[0]?.id ??
+    null;
+
+  const changeRunConfig = async (id: string | null) => {
+    try {
+      await projectsApi.setActiveRunConfig(name, id);
+      void load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const run = async () => {
     setLogs([]);
@@ -177,8 +195,16 @@ export default function ProjectWorkspace() {
   // way there's one canonical compile invocation and no per-platform variant
   // for the user to choose from.
   const handleCompile = async () => {
+    // A project is Deno-scaffolded when neither the snapshotted toolchain
+    // (flat `compile` or any runConfig with compile argv) nor its lang pack
+    // drives compile — i.e. lang == "deno" and no argv override. Anything
+    // else has a canonical compile and skips the cross-compile modal.
+    const hasRunConfigCompile = (detail?.config.toolchain?.runConfigs ?? []).some(
+      (c) => (c.compile?.length ?? 0) > 0,
+    );
     const isDenoProject =
       !detail?.config.toolchain?.compile?.length &&
+      !hasRunConfigCompile &&
       (!detail?.config.lang || detail.config.lang === "deno");
     if (!isDenoProject) {
       try {
@@ -231,6 +257,26 @@ export default function ProjectWorkspace() {
           </span>
         )}
         <div className="flex-1" />
+        {runConfigs.length > 0 && (
+          <label
+            className="flex items-center gap-1.5 text-xs text-fg-faint"
+            title="Named run configuration from the pack — drives Run and Compile. Persists in nanobpm.project.json."
+          >
+            <span className="hidden sm:inline">Config:</span>
+            <select
+              value={activeRunConfigId ?? ""}
+              onChange={(e) => void changeRunConfig(e.target.value || null)}
+              disabled={running || compiling}
+              className="rounded-md border border-edge-strong bg-bg-subtle px-2 py-1 text-sm text-fg hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {runConfigs.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {running ? (
           <ToolbarButton onClick={() => void stop()} kind="danger">
             ■ Stop
