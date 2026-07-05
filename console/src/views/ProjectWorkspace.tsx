@@ -544,6 +544,20 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         // Persisted body is now authoritative in both surfaces.
         setBpmnXml(body);
         bpmnXmlDirtyRef.current = false;
+        // If the save came from the XML tab, the canvas still holds the
+        // pre-save document. Push the saved XML into the modeler so a
+        // subsequent switch to Visual shows the up-to-date diagram
+        // (the switch guards on bpmnXmlDirtyRef and would otherwise skip
+        // importXml, leaving the canvas stale).
+        if (bpmnView === "xml" && bpmnRef.current) {
+          try {
+            await bpmnRef.current.importXml(body);
+          } catch {
+            // Invalid XML shouldn't normally reach here (Save with bad
+            // XML is on the user), but don't turn a successful persist
+            // into a hard error.
+          }
+        }
       }
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -696,7 +710,7 @@ function EditorPane({ name, path }: { name: string; path: string }) {
                 <CodeEditor
                   value={bpmnXml}
                   language="xml"
-                  path={`file:///bpmn-xml-view/${path}`}
+                  path={`file:///${name}/${path}`}
                   onChange={(v) => {
                     setBpmnXml(v);
                     bpmnXmlDirtyRef.current = true;
