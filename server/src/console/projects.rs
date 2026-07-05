@@ -1728,6 +1728,81 @@ impl ProjectSupervisor {
         }
     }
 
+    /// Enumerates deployable resource files under a project directory.
+    ///
+    /// For each configured subdirectory: rejects any value with non-`Normal`
+    /// path components (`..`, absolute paths, root, prefix) so an
+    /// attacker-controlled `nanobpm.project.json` can't traverse out of the
+    /// project. Then canonicalises the resolved subdirectory and requires it
+    /// to sit under the canonicalised project root — symlink chases can't
+    /// escape either. Non-existent / non-directory / non-canonicalisable
+    /// entries are silently skipped (a project without a `decisions/` dir is
+    /// normal, not an error).
+    ///
+    /// Files are matched by extension (`.bpmn`, `.dmn`, `.form`) and sorted
+    /// within each directory so log lines / deployment order are stable
+    /// across filesystems.
+    ///
+    /// Pure: no HTTP, no logs. Kept out of `auto_deploy_resources` for tests.
+    async fn discover_deployables(project_dir: &Path, dirs: &[String]) -> Vec<PathBuf> {
+        let root_canonical = match tokio::fs::canonicalize(project_dir).await {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        let mut files: Vec<PathBuf> = Vec::new();
+        for sub in dirs {
+            let sub_path = Path::new(sub);
+            // Reject `..`, absolute paths, drive prefixes, etc. Only ordinary
+            // "look in this named directory" values are accepted.
+            let clean = sub_path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if !clean {
+                continue;
+            }
+            let joined = root_canonical.join(sub_path);
+            let resolved = match tokio::fs::canonicalize(&joined).await {
+                Ok(p) => p,
+                Err(_) => continue, // missing dir is expected
+            };
+            if !resolved.starts_with(&root_canonical) {
+                // Symlink chain escaped the project root — refuse to sweep.
+                continue;
+            }
+            if !resolved.is_dir() {
+                continue;
+            }
+            let mut rd = match tokio::fs::read_dir(&resolved).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            let mut names: Vec<String> = Vec::new();
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                if !entry
+                    .file_type()
+                    .await
+                    .ok()
+                    .map(|t| t.is_file())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(name) = entry.file_name().into_string().ok() else {
+                    continue;
+                };
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".bpmn") || lower.ends_with(".dmn") || lower.ends_with(".form") {
+                    names.push(name);
+                }
+            }
+            names.sort();
+            for n in names {
+                files.push(resolved.join(n));
+            }
+        }
+        files
+    }
+
     /// Sweeps the configured `auto_deploy` dirs (default `models/`, `decisions/`,
     /// `forms/`) for `.bpmn`, `.dmn`, `.form` files and POSTs each one to
     /// `<base_url>/v2/deployments` as multipart. Streams progress to the project
@@ -1748,34 +1823,7 @@ impl ProjectSupervisor {
         if dirs.is_empty() {
             return;
         }
-        // Collect candidate files up front so the log lines come out in a
-        // stable, per-directory order (a directory walk in filesystem-native
-        // order would surprise the user on macOS's case-insensitive HFS+).
-        let mut files: Vec<PathBuf> = Vec::new();
-        for sub in dirs {
-            let root = dir.join(sub);
-            if !root.is_dir() {
-                continue;
-            }
-            let mut names: Vec<String> = match std::fs::read_dir(&root) {
-                Ok(rd) => rd
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.file_type().ok().map(|t| t.is_file()).unwrap_or(false))
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| {
-                        let lower = n.to_ascii_lowercase();
-                        lower.ends_with(".bpmn")
-                            || lower.ends_with(".dmn")
-                            || lower.ends_with(".form")
-                    })
-                    .collect(),
-                Err(_) => continue,
-            };
-            names.sort();
-            for n in names {
-                files.push(root.join(n));
-            }
-        }
+        let files = Self::discover_deployables(dir, dirs).await;
         if files.is_empty() {
             return;
         }
@@ -1843,8 +1891,15 @@ impl ProjectSupervisor {
                 }
                 Ok(resp) => {
                     let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    let body = body
+                    // Cap the read so an unfriendly proxy (nginx HTML error page,
+                    // a huge JSON blob) can't balloon memory just to log one line.
+                    const MAX_ERR_BODY: u64 = 4 * 1024;
+                    let short_body = if resp.content_length().unwrap_or(0) > MAX_ERR_BODY {
+                        String::new()
+                    } else {
+                        resp.text().await.unwrap_or_default()
+                    };
+                    let body = short_body
                         .lines()
                         .next()
                         .unwrap_or("")
@@ -2386,6 +2441,110 @@ mod tests {
         assert!(safe_project_path("app", "a/../b").is_none());
         assert!(safe_project_path("app", "resources/processes/x.bpmn").is_some());
         assert!(safe_project_path("../bad", "x").is_none());
+    }
+
+    // --- discover_deployables --------------------------------------------
+
+    fn touch(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discover_finds_configured_extensions_sorted_per_dir() {
+        let _g = lock();
+        let root = temp_root().join("p1");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/onboarding.bpmn"), "<x/>");
+        touch(&root.join("models/adhoc.bpmn"), "<x/>");
+        touch(&root.join("models/README.md"), "not deployable");
+        touch(&root.join("decisions/pricing.dmn"), "<x/>");
+        touch(&root.join("forms/consent.form"), "{}");
+        // Case-insensitive extension match, still picked up.
+        touch(&root.join("models/EDGE.BPMN"), "<x/>");
+
+        let dirs = vec!["models".into(), "decisions".into(), "forms".into()];
+        let files = ProjectSupervisor::discover_deployables(&root, &dirs).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "EDGE.BPMN",
+                "adhoc.bpmn",
+                "onboarding.bpmn",
+                "pricing.dmn",
+                "consent.form",
+            ],
+            "files must group by configured dir + sort within each"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_empty_list_disables_sweep() {
+        let _g = lock();
+        let root = temp_root().join("p2");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/x.bpmn"), "<x/>");
+        let files = ProjectSupervisor::discover_deployables(&root, &[]).await;
+        assert!(files.is_empty(), "autoDeploy: [] must skip discovery");
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_dotdot_traversal() {
+        let _g = lock();
+        let sandbox = temp_root().join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        // A "leak" dir outside the project that contains a bpmn file the
+        // attacker would like to exfiltrate.
+        touch(&sandbox.join("leak/secret.bpmn"), "<pwned/>");
+        let root = sandbox.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/legit.bpmn"), "<ok/>");
+
+        let dirs = vec!["../leak".into(), "models".into()];
+        let files = ProjectSupervisor::discover_deployables(&root, &dirs).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["legit.bpmn"], "'../leak' must be rejected");
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_absolute_paths() {
+        let _g = lock();
+        let root = temp_root().join("p3");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/x.bpmn"), "<x/>");
+
+        let dirs = vec!["/etc".into(), "models".into()];
+        let files = ProjectSupervisor::discover_deployables(&root, &dirs).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["x.bpmn"], "absolute paths must be rejected");
+    }
+
+    #[tokio::test]
+    async fn discover_symlink_escape_rejected() {
+        let _g = lock();
+        let sandbox = temp_root().join("sandbox2");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        touch(&sandbox.join("outside/secret.bpmn"), "<pwned/>");
+        let root = sandbox.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        // symlink `models` in the project to a directory *outside* the project.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(sandbox.join("outside"), root.join("models"))
+                .expect("symlink");
+            let files = ProjectSupervisor::discover_deployables(&root, &["models".into()]).await;
+            assert!(files.is_empty(), "symlink escape must be rejected");
+        }
     }
 
     #[test]
