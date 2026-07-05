@@ -1959,6 +1959,113 @@ fn emit_element(
     }
 }
 
+/// A hand-authored diagram-interchange sidecar extracted from an original BPMN document, so a pure
+/// attribute/condition/default edit can preserve the customer's layout byte-for-byte (ADR 0001
+/// Phase 5). The executable core (nodes + flows) is a bijection; layout is the opaque complement —
+/// kept keyed by element id, re-attached when the topology is unchanged and regenerated otherwise.
+struct PreservedDi {
+    /// The verbatim `<bpmndi:BPMNDiagram>…</bpmndi:BPMNDiagram>` block.
+    diagram_block: String,
+    /// Node ids that carry a `<bpmndi:BPMNShape>`.
+    shape_ids: HashSet<String>,
+    /// `(sourceRef, targetRef)` pairs that carry a `<bpmndi:BPMNEdge>` (via their sequence flow).
+    edge_keys: HashSet<(String, String)>,
+    /// `(sourceRef, targetRef) -> original sequence-flow id`, so the reused body can adopt the same
+    /// ids the preserved edges already reference.
+    flow_ids: HashMap<(String, String), String>,
+}
+
+impl PreservedDi {
+    /// The original id of the flow between `src` and `to`, if the preserved diagram had one.
+    fn flow_id(&self, src: &str, to: &str) -> Option<String> {
+        self.flow_ids
+            .get(&(src.to_string(), to.to_string()))
+            .cloned()
+    }
+
+    /// True iff the preserved diagram covers *exactly* `def`'s node and flow topology, so it can be
+    /// re-attached verbatim without dangling or missing DI. Any node/flow added or removed — or a
+    /// duplicate parallel edge the `(src,to)` key can't disambiguate — fails the check and forces a
+    /// clean auto-layout instead.
+    fn covers(&self, def: &ProcessDefinition) -> bool {
+        let def_nodes: HashSet<&str> = def.elements.keys().map(String::as_str).collect();
+        if def_nodes.len() != self.shape_ids.len()
+            || !self
+                .shape_ids
+                .iter()
+                .all(|id| def_nodes.contains(id.as_str()))
+        {
+            return false;
+        }
+        let mut def_flows: Vec<(String, String)> = Vec::new();
+        for (src, el) in &def.elements {
+            for f in &el.outgoing {
+                def_flows.push((src.clone(), f.to.clone()));
+            }
+        }
+        let def_set: HashSet<(String, String)> = def_flows.iter().cloned().collect();
+        if def_set.len() != def_flows.len() {
+            return false; // duplicate parallel edge — can't key layout by (src,to)
+        }
+        def_set.len() == self.edge_keys.len() && def_set.iter().all(|k| self.edge_keys.contains(k))
+    }
+}
+
+/// Extract a [`PreservedDi`] from an original BPMN document, or `None` if it has no diagram (or no
+/// shapes). Edges are re-keyed by `(sourceRef, targetRef)` because the executable serializer
+/// regenerates flow ids; shapes stay keyed by the stable node id.
+fn extract_preserved_di(xml: &str) -> Option<PreservedDi> {
+    let (ds, de) = element_span(xml, "BPMNDiagram", 0)?;
+    let diagram_block = xml[ds..de].to_string();
+
+    // Map every sequence flow's id to its endpoints (flows live in the process body, not the DI).
+    let mut flow_endpoints: HashMap<String, (String, String)> = HashMap::new();
+    let mut from = 0;
+    while let Some((s, e)) = element_span(xml, "sequenceFlow", from) {
+        let span = &xml[s..e];
+        if let (Some(id), Some(src), Some(to)) = (
+            attr_value_in(span, "id"),
+            attr_value_in(span, "sourceRef"),
+            attr_value_in(span, "targetRef"),
+        ) {
+            flow_endpoints.insert(id, (src, to));
+        }
+        from = e;
+    }
+
+    let mut shape_ids: HashSet<String> = HashSet::new();
+    let mut from = 0;
+    while let Some((s, e)) = element_span(&diagram_block, "BPMNShape", from) {
+        if let Some(be) = attr_value_in(&diagram_block[s..e], "bpmnElement") {
+            shape_ids.insert(be);
+        }
+        from = e;
+    }
+
+    let mut edge_keys: HashSet<(String, String)> = HashSet::new();
+    let mut flow_ids: HashMap<(String, String), String> = HashMap::new();
+    let mut from = 0;
+    while let Some((s, e)) = element_span(&diagram_block, "BPMNEdge", from) {
+        if let Some(be) = attr_value_in(&diagram_block[s..e], "bpmnElement") {
+            if let Some((src, to)) = flow_endpoints.get(&be) {
+                edge_keys.insert((src.clone(), to.clone()));
+                flow_ids.insert((src.clone(), to.clone()), be);
+            }
+        }
+        from = e;
+    }
+
+    if shape_ids.is_empty() {
+        return None;
+    }
+    Some(PreservedDi {
+        diagram_block,
+        shape_ids,
+        edge_keys,
+        flow_ids,
+    })
+}
+
 /// Serialize a [`ProcessDefinition`] back to BPMN XML that the engine's own parser round-trips
 /// (start event, every node kind, sequence flows with conditions, and the definitions-level
 /// `<bpmn:error>` / `<bpmn:message>` declarations boundary and message events reference).
@@ -1971,6 +2078,29 @@ fn emit_element(
 pub fn definition_to_xml_labeled(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
+) -> String {
+    serialize_definition(def, overrides, None)
+}
+
+/// Like [`definition_to_xml_labeled`], but when `di_source` (the original XML the model was read
+/// from) carries a hand-authored `<bpmndi:BPMNDiagram>` whose shapes and edges cover *exactly* the
+/// current node + flow topology, that diagram is re-attached verbatim and the original sequence-flow
+/// ids are reused — so a pure attribute/condition/default edit preserves the customer's hand layout
+/// byte-for-byte. Any topology change (a node or flow added/removed) falls back to auto-layout,
+/// identical to `definition_to_xml_labeled`. This is the DI-preservation lens of ADR 0001 Phase 5.
+pub fn definition_to_xml_preserving_di(
+    def: &ProcessDefinition,
+    overrides: &HashMap<String, String>,
+    di_source: Option<&str>,
+) -> String {
+    let di = di_source.and_then(extract_preserved_di);
+    serialize_definition(def, overrides, di.as_ref())
+}
+
+fn serialize_definition(
+    def: &ProcessDefinition,
+    overrides: &HashMap<String, String>,
+    di: Option<&PreservedDi>,
 ) -> String {
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
@@ -2051,10 +2181,16 @@ pub fn definition_to_xml_labeled(
         "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
         xml_escape(&def.id)
     ));
-    // Precompute the synthesized id of each source's default outgoing flow, replicating the exact
-    // numbering the sequence-flow loop below uses (sorted sources, outgoing in declaration order,
-    // `Flow_{n}` starting at 1). A gateway then emits `default="Flow_N"` referencing the same id,
-    // so the parser re-flags the branch as the default fallback on the round-trip.
+    // Decide whether a preserved hand-layout can be re-attached verbatim: its shapes and edges must
+    // cover exactly the current node + flow topology (a pure attribute/condition/default edit).
+    let preserve = di.filter(|d| d.covers(def));
+
+    // Assign a stable id to every sequence flow once, in the canonical order the body and DI both
+    // use (sorted sources, outgoing in declaration order). When a preserved diagram covers the
+    // topology, reuse the original flow ids so its `<bpmndi:BPMNEdge>`s still reference live flows;
+    // otherwise synthesize `Flow_{n}` (n starting at 1). A gateway emits `default="<id>"` referencing
+    // the same id, so the parser re-flags the branch as the default fallback on the round-trip.
+    let mut flow_ids: Vec<String> = Vec::new();
     let mut default_flows: HashMap<String, String> = HashMap::new();
     {
         let mut sources: Vec<&String> = def.elements.keys().collect();
@@ -2063,9 +2199,13 @@ pub fn definition_to_xml_labeled(
         for src in sources {
             for flow in &def.elements[src].outgoing {
                 k += 1;
+                let id = preserve
+                    .and_then(|d| d.flow_id(src, &flow.to))
+                    .unwrap_or_else(|| format!("Flow_{k}"));
                 if flow.is_default {
-                    default_flows.insert(src.clone(), format!("Flow_{k}"));
+                    default_flows.insert(src.clone(), id.clone());
                 }
+                flow_ids.push(id);
             }
         }
     }
@@ -2091,22 +2231,23 @@ pub fn definition_to_xml_labeled(
         );
     }
 
-    // Synthesize a stable flow id for every sequence flow once, so the process body and the DI
-    // edges reference the same ids. The engine parser builds flows purely from sourceRef/targetRef,
+    // Emit each sequence flow using the id assigned above, so the process body and the DI edges
+    // reference the same ids. The engine parser builds flows purely from sourceRef/targetRef,
     // so flat emission (scope-independent) is faithful.
     let mut sources: Vec<&String> = def.elements.keys().collect();
     sources.sort();
     let mut flows: Vec<FlowEdge> = Vec::new();
-    let mut n = 0usize;
+    let mut idx = 0usize;
     for src in sources {
         for flow in &def.elements[src].outgoing {
-            n += 1;
+            let fid = flow_ids[idx].clone();
+            idx += 1;
             // Label a guarded branch with its condition so a person can read WHY each branch is
             // taken — bpmn.js renders a flow's `name`, not its conditionExpression, so without this
             // the diagram shows bare arrows and the guards look "lost".
             let label = flow.condition.as_ref().map(|c| flow_label(&c.expression));
             flows.push(FlowEdge {
-                id: format!("Flow_{n}"),
+                id: fid.clone(),
                 src: src.clone(),
                 to: flow.to.clone(),
                 label: label.clone(),
@@ -2118,7 +2259,8 @@ pub fn definition_to_xml_labeled(
             match &flow.condition {
                 Some(cond) => {
                     out.push_str(&format!(
-                        "    <bpmn:sequenceFlow id=\"Flow_{n}\"{name_attr} sourceRef=\"{}\" targetRef=\"{}\">\n",
+                        "    <bpmn:sequenceFlow id=\"{}\"{name_attr} sourceRef=\"{}\" targetRef=\"{}\">\n",
+                        xml_escape(&fid),
                         xml_escape(src),
                         xml_escape(&flow.to)
                     ));
@@ -2130,7 +2272,8 @@ pub fn definition_to_xml_labeled(
                 }
                 None => {
                     out.push_str(&format!(
-                        "    <bpmn:sequenceFlow id=\"Flow_{n}\"{name_attr} sourceRef=\"{}\" targetRef=\"{}\"/>\n",
+                        "    <bpmn:sequenceFlow id=\"{}\"{name_attr} sourceRef=\"{}\" targetRef=\"{}\"/>\n",
+                        xml_escape(&fid),
                         xml_escape(src),
                         xml_escape(&flow.to)
                     ));
@@ -2140,7 +2283,14 @@ pub fn definition_to_xml_labeled(
     }
 
     out.push_str("  </bpmn:process>\n");
-    append_diagram(def, &flows, &mut out);
+    match preserve {
+        // Re-attach the customer's hand layout verbatim (shapes + edges keyed by the reused ids).
+        Some(d) => {
+            out.push_str(d.diagram_block.trim_end());
+            out.push('\n');
+        }
+        None => append_diagram(def, &flows, &mut out),
+    }
     out.push_str("</bpmn:definitions>\n");
     out
 }
@@ -2898,6 +3048,28 @@ pub fn edit_model(base_xml: &str, ops: &[Value]) -> Result<Value, String> {
     edit_model_in(base_xml, ops, None)
 }
 
+/// Serialize one or more process definitions back into a single self-contained BPMN document.
+/// A single definition round-trips exactly; a multi-stage model re-emits the orchestrator (index
+/// 0, with a fresh diagram) and splices the remaining phase definitions back in, so the file stays
+/// self-contained and the authored overview survives. Shared by `edit_model_in` and the IR
+/// `write_model_ir` path so both assemble multi-phase models identically.
+pub(crate) fn assemble_model(
+    defs: &[ProcessDefinition],
+    names: &HashMap<String, String>,
+) -> String {
+    if defs.len() == 1 {
+        definition_to_xml_labeled(&defs[0], names)
+    } else {
+        let primary = definition_to_xml_labeled(&defs[0], names);
+        let extras: Vec<String> = defs[1..]
+            .iter()
+            .map(|d| definition_to_xml_labeled(d, names))
+            .collect();
+        let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
+        merge_definitions(&primary, &extra_refs)
+    }
+}
+
 /// Like [`edit_model`], but `process` selects WHICH definition to edit in a
 /// multi-stage model: the orchestrator (default / first) or a named called phase.
 /// The other definitions and the orchestrator's authored diagram are preserved, so
@@ -2954,17 +3126,7 @@ pub fn edit_model_in(
     // Serialize. Single-definition models round-trip exactly as before. For a multi-stage model
     // we re-emit the orchestrator (with a fresh diagram) and splice the remaining phase
     // definitions back in, so the file stays self-contained and the overview survives.
-    let xml = if defs.len() == 1 {
-        definition_to_xml_labeled(&defs[0], &names)
-    } else {
-        let primary = definition_to_xml_labeled(&defs[0], &names);
-        let extras: Vec<String> = defs[1..]
-            .iter()
-            .map(|d| definition_to_xml_labeled(d, &names))
-            .collect();
-        let extra_refs: Vec<&str> = extras.iter().map(String::as_str).collect();
-        merge_definitions(&primary, &extra_refs)
-    };
+    let xml = assemble_model(&defs, &names);
 
     // The serializer owns correctness, but re-parse defensively so we never hand back XML that the
     // engine would reject at deploy time — surfacing any logical inconsistency the ops introduced.

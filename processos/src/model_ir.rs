@@ -36,10 +36,10 @@
 //! a new engine element kind fails to compile until the IR learns to render it — the
 //! coverage guarantee ADR 0001 relies on.
 
-// Phase 1 is the pretty-printer and Phase 2 the inverse parser. Their public API
-// (`definition_to_ir`/`xml_to_ir`, `ir_to_definition`/`analyze_ir`) is exercised by this module's
-// tests now and wired to `read_model_ir`/`write_model_ir` LLM tools in ADR 0001 Phase 4; until then
-// it has no non-test caller in the binary.
+// The pretty-printer (Phase 1), the inverse parser (Phase 2), and the `read_model_ir` /
+// `write_model_ir` LLM tools (Phase 4) are all wired. `analyze_ir` remains an exercised-in-tests
+// convenience with no binary caller yet (write_model_ir already returns analyze_model findings), so
+// the module keeps a dead-code allowance for that residue.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
@@ -399,6 +399,163 @@ pub fn analyze_ir(ir: &str) -> Result<serde_json::Value, String> {
     let parsed = ir_to_definition(ir)?;
     let xml = crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
     crate::bpmn_model::analyze_model(&xml)
+}
+
+/// `read_model_ir` LLM tool (ADR 0001 Phase 4): emit the executable IR for a model. With no
+/// `target`, returns the IR for the first (orchestrator) definition. Pass a process id — or a
+/// callActivity node id, resolved to its `calledElement` — to isolate a called phase's IR (the
+/// same targeting `read_model_xml` uses), so an operator can read and edit one phase of a
+/// multi-stage model. The returned IR round-trips through `write_model_ir` (ADR Phase 3 proves the
+/// executable core survives), so it is the surface an LLM edits instead of hand-writing XML.
+pub fn read_model_ir(xml: &str, target: Option<&str>) -> Result<serde_json::Value, String> {
+    match target {
+        None => {
+            let ir = xml_to_ir(xml)?;
+            Ok(serde_json::json!({
+                "scope": "full",
+                "ir": ir,
+                "note": "The executable IR for this process (the orchestrator, for a multi-stage \
+                         model). Edit it and deploy the result with write_model_ir. Pass \
+                         process:\"<id>\" (a process id or a callActivity node id) to read a \
+                         called phase's IR instead.",
+            }))
+        }
+        Some(_) => {
+            let block = crate::bpmn_model::read_model_xml(xml, target)?;
+            let phase_xml = block
+                .get("xml")
+                .and_then(|v| v.as_str())
+                .ok_or("could not isolate the phase XML for that target")?;
+            let ir = xml_to_ir(phase_xml)?;
+            let process_id = block
+                .get("processId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            Ok(serde_json::json!({
+                "scope": "process",
+                "processId": process_id,
+                "ir": ir,
+                "note": "The executable IR for this phase. Edit it, then deploy with \
+                         write_model_ir passing base:<full model xml> and process:\"<id>\" so it \
+                         is spliced back into the document, preserving the other phases and the \
+                         overview diagram. Keep the IR's `process \"<id>\"` header matching the \
+                         phase you read.",
+            }))
+        }
+    }
+}
+
+/// `write_model_ir` LLM tool (ADR 0001 Phase 4): parse + validate + compile IR to a deployable,
+/// engine-validated BPMN model — the inverse of `read_model_ir` and the write side that retires
+/// hand-written XML. `ir_to_definition` validates structure (unknown kinds, missing attributes,
+/// dangling flow targets) with a human-readable error before anything is emitted.
+///
+/// With no `base`, the IR *is* the whole model and compiles standalone; when `di_source` (the XML
+/// the model was read from) carries a hand-authored diagram and the edit left the node + flow
+/// topology unchanged, that layout is preserved verbatim (ADR 0001 Phase 5), else it is auto-laid.
+/// Pass `base` (the full document) and `process` (the phase id) to splice the IR back into a
+/// multi-stage model in place, preserving the other phase definitions and the authored overview —
+/// the same capability as `edit_model process:"<id>"`, but IR-driven (the spliced phase is
+/// auto-laid). The result mirrors `edit_model`: a ready-to-simulate `model` plus the post-write
+/// `analyze_model` findings/metrics.
+pub fn write_model_ir(
+    ir: &str,
+    base: Option<&str>,
+    process: Option<&str>,
+    di_source: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let parsed = ir_to_definition(ir)?;
+    let (xml, analysis_xml, edited_process) = match base {
+        None => {
+            // Without a base the IR *is* the whole model. A `process` arg here is meaningless and
+            // usually signals the caller meant to splice into a multi-stage doc — fail fast rather
+            // than silently write a standalone model that ignores it.
+            if let Some(pid) = process {
+                if pid != parsed.definition.id {
+                    return Err(format!(
+                        "`process` was '{pid}' but no `base` model was given, so the IR is written \
+                         as a standalone model with id '{}'. To splice a phase into a multi-stage \
+                         model, pass the full document as `base`. To write a standalone model, omit \
+                         `process` (or match it to the IR's process id).",
+                        parsed.definition.id
+                    ));
+                }
+            }
+            // Single-process write: re-attach the original hand layout when the edit left the node
+            // and flow topology unchanged (ADR 0001 Phase 5), else auto-layout.
+            let xml = crate::bpmn_model::definition_to_xml_preserving_di(
+                &parsed.definition,
+                &parsed.names,
+                di_source,
+            );
+            let id = parsed.definition.id.clone();
+            // The whole model is the edited process, so it is also what we analyze.
+            (xml.clone(), xml, id)
+        }
+        Some(base_xml) => {
+            let mut defs =
+                parse_bpmn(base_xml).map_err(|e| format!("base model failed to parse: {e:?}"))?;
+            if defs.is_empty() {
+                return Err("base model contained no process definitions".to_string());
+            }
+            // Preserve the base document's labels; the IR's names override for the replaced phase.
+            let mut names = crate::bpmn_model::parse_element_names(base_xml);
+            for (k, v) in &parsed.names {
+                names.insert(k.clone(), v.clone());
+            }
+            let target_idx = match process {
+                Some(pid) => defs.iter().position(|d| d.id == pid).ok_or_else(|| {
+                    format!(
+                        "no process '{pid}' in the base model. Known process ids: {}. Omit \
+                         `process` to replace the orchestrator (first) definition.",
+                        defs.iter()
+                            .map(|d| d.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?,
+                None => 0,
+            };
+            // The IR must keep the phase's id: the splice replaces the target definition in place,
+            // and a renamed process would orphan the callActivity `calledElement` that invokes it.
+            if parsed.definition.id != defs[target_idx].id {
+                return Err(format!(
+                    "the IR's `process \"{}\"` header does not match the phase being replaced \
+                     ('{}'). Splicing keeps the phase id stable so the orchestrator's callActivity \
+                     still resolves — read the phase with read_model_ir and keep its header id.",
+                    parsed.definition.id, defs[target_idx].id
+                ));
+            }
+            // The findings/metrics must describe the edited phase, not the first (orchestrator)
+            // definition analyze_model would otherwise pick — so analyze the phase in isolation.
+            let analysis_xml =
+                crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
+            let id = parsed.definition.id.clone();
+            defs[target_idx] = parsed.definition;
+            let xml = crate::bpmn_model::assemble_model(&defs, &names);
+            (xml, analysis_xml, id)
+        }
+    };
+
+    // Defensive re-parse: never hand back XML the engine would reject at deploy time.
+    if let Err(e) = parse_bpmn(&xml) {
+        return Err(format!(
+            "the IR compiled to XML that does not parse ({e:?}). This usually means a dangling \
+             reference — a flow to a node that isn't declared."
+        ));
+    }
+    let analysis =
+        crate::bpmn_model::analyze_model(&analysis_xml).unwrap_or_else(|_| serde_json::json!({}));
+    Ok(serde_json::json!({
+        "ok": true,
+        "process": edited_process,
+        "model": xml,
+        "findings": analysis.get("findings").cloned().unwrap_or(serde_json::json!([])),
+        "metrics": analysis.get("metrics").cloned().unwrap_or(serde_json::json!({})),
+        "note": "This XML is engine-validated and ready to simulate (start with limit:1) or \
+                 compare_variants. Do NOT hand-edit it — author further changes in IR and call \
+                 write_model_ir again.",
+    }))
 }
 
 // --- tokenizer ------------------------------------------------------------------------------
@@ -1416,5 +1573,340 @@ mod tests {
             checked >= 11,
             "expected at least 11 corpus models, only checked {checked} — has corpus-packs moved?"
         );
+    }
+
+    #[test]
+    fn read_model_ir_emits_the_current_model_ir() {
+        let v = read_model_ir(LOAN_BPMN, None).expect("read ir");
+        assert_eq!(v["scope"], "full");
+        let ir = v["ir"].as_str().expect("ir string");
+        assert!(ir.contains("process \"loan-approval\" {"), "\n{ir}");
+        assert!(ir.contains("Decision -> Manual default\n"), "\n{ir}");
+    }
+
+    #[test]
+    fn write_model_ir_compiles_ir_to_a_deployable_model() {
+        // Round-trip through the tools: read -> write reproduces a deployable, engine-valid model.
+        let ir = xml_to_ir(LOAN_BPMN).expect("emit ir");
+        let v = write_model_ir(&ir, None, None, None).expect("write ir");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["process"], "loan-approval");
+        let model = v["model"].as_str().expect("model xml");
+        let reparsed = parse_bpmn(model).expect("written model parses");
+        let orig = parse_bpmn(LOAN_BPMN).expect("orig parses");
+        assert_eq!(
+            reparsed[0].elements, orig[0].elements,
+            "write_model_ir preserves the executable model"
+        );
+        // The finding surface is present (analyze_model ran on the written model).
+        assert!(v["findings"].is_array());
+    }
+
+    #[test]
+    fn write_model_ir_can_add_a_gateway_default_flow() {
+        // THE motivating case: the imperative edit_model verbs cannot add a gateway `default`
+        // fallback, but the IR can. Start from a gateway whose second branch is a plain flow, add
+        // `default` in the IR text, write it back, and confirm the compiled model flags that branch
+        // as the exclusive gateway's default.
+        let ir = "process \"router\" {\n  \
+             start Start\n  \
+             endEvent Hit\n  \
+             endEvent Miss\n  \
+             exclusiveGateway Gate\n  \
+             startEvent Start\n  \
+             Start -> Gate\n  \
+             Gate -> Hit when \"= score >= 700\"\n  \
+             Gate -> Miss\n}";
+        // Sanity: without `default`, the Miss branch is a plain flow.
+        let before = write_model_ir(ir, None, None, None).expect("write baseline");
+        let before_model = before["model"].as_str().unwrap();
+        let before_def = parse_bpmn(before_model).expect("parse baseline");
+        assert!(
+            !before_def[0].elements["Gate"]
+                .outgoing
+                .iter()
+                .any(|f| f.is_default),
+            "baseline has no default flow"
+        );
+        // Now the edit an LLM would make: append ` default` to the Miss branch.
+        let edited = ir.replace("Gate -> Miss\n", "Gate -> Miss default\n");
+        let after = write_model_ir(&edited, None, None, None).expect("write with default");
+        let after_model = after["model"].as_str().unwrap();
+        let after_def = parse_bpmn(after_model).expect("parse edited");
+        let gate = &after_def[0].elements["Gate"];
+        let default = gate
+            .outgoing
+            .iter()
+            .find(|f| f.is_default)
+            .expect("the edited model now has a default flow");
+        assert_eq!(default.to, "Miss", "Miss is the default branch");
+    }
+
+    #[test]
+    fn write_model_ir_reports_a_clear_error_on_a_dangling_flow() {
+        // A flow to an undeclared node must fail validation with a readable error, not a panic.
+        let ir = "process \"p\" {\n  start S\n  startEvent S\n  S -> Nope\n}";
+        let err = write_model_ir(ir, None, None, None).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("nope") || err.to_lowercase().contains("declared"),
+            "error should name the dangling target: {err}"
+        );
+    }
+
+    #[test]
+    fn write_model_ir_splices_a_phase_into_a_multi_stage_model() {
+        // A multi-stage model: an orchestrator whose callActivity invokes a phase process.
+        // read_model_ir(process) reads the phase's IR; editing it and writing back with base +
+        // process must splice it in place while preserving the orchestrator definition.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="Orchestrator" isExecutable="true">
+    <bpmn:startEvent id="OStart"><bpmn:outgoing>o1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:callActivity id="RunPhase" name="Run phase">
+      <bpmn:extensionElements><zeebe:calledElement processId="Phase" /></bpmn:extensionElements>
+      <bpmn:incoming>o1</bpmn:incoming><bpmn:outgoing>o2</bpmn:outgoing>
+    </bpmn:callActivity>
+    <bpmn:endEvent id="ODone"><bpmn:incoming>o2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="o1" sourceRef="OStart" targetRef="RunPhase" />
+    <bpmn:sequenceFlow id="o2" sourceRef="RunPhase" targetRef="ODone" />
+  </bpmn:process>
+  <bpmn:process id="Phase" isExecutable="true">
+    <bpmn:startEvent id="PStart"><bpmn:outgoing>p1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="Work">
+      <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+      <bpmn:incoming>p1</bpmn:incoming><bpmn:outgoing>p2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="PDone"><bpmn:incoming>p2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="p1" sourceRef="PStart" targetRef="Work" />
+    <bpmn:sequenceFlow id="p2" sourceRef="Work" targetRef="PDone" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        // Read the phase's IR (targeting by the callActivity node id resolves to its calledElement).
+        let read = read_model_ir(base, Some("RunPhase")).expect("read phase ir");
+        assert_eq!(read["processId"], "Phase");
+        let phase_ir = read["ir"].as_str().expect("phase ir");
+        assert!(phase_ir.contains("process \"Phase\" {"), "\n{phase_ir}");
+        // Edit the phase: change the job type, then splice it back.
+        let edited = phase_ir.replace("\"work\"", "\"work-v2\"");
+        let v =
+            write_model_ir(&edited, Some(base), Some("Phase"), Some(base)).expect("splice write");
+        assert_eq!(v["process"], "Phase");
+        let model = v["model"].as_str().expect("model");
+        let defs = parse_bpmn(model).expect("spliced model parses");
+        // Both definitions survive, and the phase's job type is updated.
+        assert!(
+            defs.iter().any(|d| d.id == "Orchestrator"),
+            "orchestrator preserved"
+        );
+        let phase = defs
+            .iter()
+            .find(|d| d.id == "Phase")
+            .expect("phase present");
+        match &phase.elements["Work"].kind {
+            ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, "work-v2"),
+            other => panic!("Work should stay a service task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_model_ir_analyzes_the_edited_phase_not_the_orchestrator() {
+        // In a splice, findings/metrics must describe the edited phase, not the first (orchestrator)
+        // definition analyze_model would otherwise pick. Give the phase an unguarded-service-task
+        // smell the orchestrator lacks, and confirm the finding surfaces against the phase's node.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="Orchestrator" isExecutable="true">
+    <bpmn:startEvent id="OStart"><bpmn:outgoing>o1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:callActivity id="RunPhase"><bpmn:extensionElements><zeebe:calledElement processId="Phase" /></bpmn:extensionElements><bpmn:incoming>o1</bpmn:incoming><bpmn:outgoing>o2</bpmn:outgoing></bpmn:callActivity>
+    <bpmn:endEvent id="ODone"><bpmn:incoming>o2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="o1" sourceRef="OStart" targetRef="RunPhase" />
+    <bpmn:sequenceFlow id="o2" sourceRef="RunPhase" targetRef="ODone" />
+  </bpmn:process>
+  <bpmn:process id="Phase" isExecutable="true">
+    <bpmn:startEvent id="PStart"><bpmn:outgoing>p1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="Work"><bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements><bpmn:incoming>p1</bpmn:incoming><bpmn:outgoing>p2</bpmn:outgoing></bpmn:serviceTask>
+    <bpmn:endEvent id="PDone"><bpmn:incoming>p2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="p1" sourceRef="PStart" targetRef="Work" />
+    <bpmn:sequenceFlow id="p2" sourceRef="Work" targetRef="PDone" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let phase_ir = read_model_ir(base, Some("Phase")).expect("read phase")["ir"]
+            .as_str()
+            .expect("ir")
+            .to_string();
+        // Add an unguarded exclusive gateway inside the phase (a node the orchestrator lacks).
+        let edited = phase_ir
+            .replace(
+                "serviceTask Work {\n    jobType \"work\"\n  }\n",
+                "serviceTask Work {\n    jobType \"work\"\n  }\n  exclusiveGateway Fork\n",
+            )
+            .replace("Work -> PDone\n", "Work -> Fork\n  Fork -> PDone\n");
+        let v = write_model_ir(&edited, Some(base), Some("Phase"), Some(base)).expect("write");
+        let findings = v["findings"].as_array().expect("findings array");
+        // The finding references a phase node id (Fork/Work/PStart…), never an orchestrator id.
+        let mentions_orchestrator = findings.iter().any(|f| {
+            matches!(f.get("element").and_then(|e| e.as_str()), Some(id) if
+                id == "RunPhase" || id == "OStart" || id == "ODone")
+        });
+        assert!(
+            !mentions_orchestrator,
+            "findings must describe the edited phase, not the orchestrator: {findings:#?}"
+        );
+    }
+
+    #[test]
+    fn write_model_ir_rejects_a_phase_id_rename_during_splice() {
+        // The IR header id must match the phase being replaced; a rename would orphan the
+        // orchestrator's callActivity calledElement. It must fail fast, not silently mis-splice.
+        let base = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="Orchestrator" isExecutable="true">
+    <bpmn:startEvent id="OStart"><bpmn:outgoing>o1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="ODone"><bpmn:incoming>o1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="o1" sourceRef="OStart" targetRef="ODone" />
+  </bpmn:process>
+  <bpmn:process id="Phase" isExecutable="true">
+    <bpmn:startEvent id="PStart"><bpmn:outgoing>p1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:endEvent id="PDone"><bpmn:incoming>p1</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="p1" sourceRef="PStart" targetRef="PDone" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let renamed = "process \"Phase-RENAMED\" {\n  start PStart\n  startEvent PStart\n  \
+                       endEvent PDone\n  PStart -> PDone\n}";
+        let err = write_model_ir(renamed, Some(base), Some("Phase"), Some(base)).unwrap_err();
+        assert!(
+            err.contains("does not match") && err.contains("Phase"),
+            "error should explain the id-rename mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn write_model_ir_rejects_a_process_arg_without_a_base() {
+        // `process` is meaningless without a base to splice into; a mismatched value must fail fast
+        // rather than silently write a standalone model that ignores the caller's intent.
+        let ir = "process \"router\" {\n  start S\n  startEvent S\n  endEvent E\n  S -> E\n}";
+        let err = write_model_ir(ir, None, Some("some-other-phase"), None).unwrap_err();
+        assert!(
+            err.contains("no `base`") || err.contains("standalone"),
+            "error should explain base is required for splicing: {err}"
+        );
+        // Matching the IR's own id is harmless and still writes standalone.
+        write_model_ir(ir, None, Some("router"), None).expect("matching id writes standalone");
+    }
+
+    /// A hand-laid diagram with deliberately non-generatable coordinates and custom flow ids, so a
+    /// preserved round-trip is observable (auto-layout would never reproduce these exact bounds).
+    const HAND_LAID_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
+  <bpmn:process id="router" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f_sg</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gate"><bpmn:incoming>f_sg</bpmn:incoming><bpmn:outgoing>f_hit</bpmn:outgoing><bpmn:outgoing>f_miss</bpmn:outgoing></bpmn:exclusiveGateway>
+    <bpmn:endEvent id="Hit"><bpmn:incoming>f_hit</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Miss"><bpmn:incoming>f_miss</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_sg" sourceRef="Start" targetRef="Gate" />
+    <bpmn:sequenceFlow id="f_hit" sourceRef="Gate" targetRef="Hit"><bpmn:conditionExpression>= score &gt;= 700</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_miss" sourceRef="Gate" targetRef="Miss" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diag">
+    <bpmndi:BPMNPlane id="Plane" bpmnElement="router">
+      <bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="152" y="82" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gate_di" bpmnElement="Gate" isMarkerVisible="true"><dc:Bounds x="251" y="73" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Hit_di" bpmnElement="Hit"><dc:Bounds x="403" y="41" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Miss_di" bpmnElement="Miss"><dc:Bounds x="403" y="121" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f_sg_di" bpmnElement="f_sg"><di:waypoint x="188" y="100" /><di:waypoint x="251" y="98" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_hit_di" bpmnElement="f_hit"><di:waypoint x="276" y="73" /><di:waypoint x="276" y="59" /><di:waypoint x="403" y="59" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_miss_di" bpmnElement="f_miss"><di:waypoint x="276" y="123" /><di:waypoint x="276" y="139" /><di:waypoint x="403" y="139" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn write_model_ir_preserves_hand_layout_on_an_unchanged_topology_edit() {
+        // ADR 0001 Phase 5: an attribute-only edit (add a gateway default flow) must NOT re-lay the
+        // customer's diagram. Read -> edit the IR -> write with the original as the DI source, and
+        // confirm the exact hand-laid bounds AND the original flow ids survive verbatim.
+        let ir = read_model_ir(HAND_LAID_BPMN, None).expect("read ir")["ir"]
+            .as_str()
+            .expect("ir string")
+            .to_string();
+        let edited = ir.replace("Gate -> Miss\n", "Gate -> Miss default\n");
+        assert_ne!(edited, ir, "the edit must actually change the IR");
+        let v = write_model_ir(&edited, None, None, Some(HAND_LAID_BPMN)).expect("write");
+        let model = v["model"].as_str().expect("model xml");
+
+        // The exact hand-laid coordinates and the marker flag survive byte-for-byte.
+        assert!(
+            model.contains(r#"bpmnElement="Gate" isMarkerVisible="true""#),
+            "gateway shape preserved verbatim:\n{model}"
+        );
+        assert!(
+            model.contains(r#"<dc:Bounds x="251" y="73" width="50" height="50" />"#),
+            "hand-laid gateway bounds preserved:\n{model}"
+        );
+        assert!(
+            model.contains(r#"<dc:Bounds x="403" y="121" width="36" height="36" />"#),
+            "hand-laid Miss bounds preserved:\n{model}"
+        );
+        // Original flow ids are reused (not re-synthesized as Flow_N), so the preserved DI edges
+        // still resolve and the gateway's default references the original id.
+        assert!(
+            model.contains(r#"id="f_sg""#),
+            "original flow id reused:\n{model}"
+        );
+        assert!(
+            model.contains(r#"default="f_miss""#),
+            "gateway default references the reused flow id:\n{model}"
+        );
+        assert!(
+            !model.contains("Flow_1"),
+            "no synthesized flow ids on the preserved path:\n{model}"
+        );
+        // The edit still took: the compiled model flags Miss as the gateway default.
+        let def = parse_bpmn(model).expect("written model parses");
+        let default = def[0].elements["Gate"]
+            .outgoing
+            .iter()
+            .find(|f| f.is_default)
+            .expect("Miss is now the default");
+        assert_eq!(default.to, "Miss");
+    }
+
+    #[test]
+    fn write_model_ir_auto_lays_out_when_the_topology_changes() {
+        // Adding a node changes the topology, so the hand layout can no longer be re-attached
+        // verbatim (it would dangle / miss shapes). The serializer falls back to a clean auto-layout
+        // — synthesized flow ids and a freshly generated diagram — and the model still parses.
+        let ir = read_model_ir(HAND_LAID_BPMN, None).expect("read ir")["ir"]
+            .as_str()
+            .expect("ir string")
+            .to_string();
+        // Reroute Miss through a new task, adding a node + flow.
+        let edited = ir
+            .replace("Gate -> Miss\n", "Gate -> Extra\n  Extra -> Miss\n")
+            .replace(
+                "exclusiveGateway Gate\n",
+                "exclusiveGateway Gate\n  serviceTask Extra {\n    jobType \"extra\"\n  }\n",
+            );
+        let v = write_model_ir(&edited, None, None, Some(HAND_LAID_BPMN)).expect("write");
+        let model = v["model"].as_str().expect("model xml");
+        // Fell back to auto-layout: the original hand-laid ids and bounds are gone.
+        assert!(
+            !model.contains(r#"id="f_sg""#),
+            "topology change must not reuse original flow ids:\n{model}"
+        );
+        assert!(
+            model.contains("Flow_1"),
+            "auto-layout synthesizes Flow_N ids:\n{model}"
+        );
+        // The new node is present and the model deploys.
+        let def = parse_bpmn(model).expect("auto-laid model parses");
+        assert!(def[0].elements.contains_key("Extra"), "new node present");
     }
 }

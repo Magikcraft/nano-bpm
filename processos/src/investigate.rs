@@ -544,6 +544,74 @@ impl ToolBox for AnalysisTools {
                 }),
             });
             specs.push(ToolSpec {
+                name: "read_model_ir".into(),
+                description: "Return the model as canonical IR — a compact, executable text \
+                    notation for the process (the surface syntax of the ENGINE's own model, so it \
+                    cannot drift from execution semantics). PREFER THIS over read_model_xml when you \
+                    intend to EDIT: the IR is far terser than BPMN XML (no DI/layout, no synthesized \
+                    ids), and it can express constructs the structured edit_model verbs cannot — \
+                    notably a gateway `default` flow. A node is `<kind> <id> [\"name\"] [{ attrs }]`; \
+                    a flow is `<from> -> <to> [when \"<feel>\"] [default]`. Read it, reason over it, \
+                    author your changes in IR, then deploy with write_model_ir. With no argument it \
+                    returns the first (orchestrator) definition's IR; pass process:\"<id>\" — a \
+                    process id OR a callActivity node id (resolved to its calledElement) — to read \
+                    ONE called phase's IR. Args: process (optional)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "process": {
+                            "type": "string",
+                            "description": "A process id, or a callActivity node id (resolved to \
+                                its calledElement), to read that phase's IR. Omit for the \
+                                orchestrator / whole-model IR."
+                        }
+                    }
+                }),
+            });
+            specs.push(ToolSpec {
+                name: "write_model_ir".into(),
+                description: "COMPILE canonical IR back into a deployable, engine-validated BPMN \
+                    model — the write side of read_model_ir and the GENERAL way to author changes \
+                    (edit the IR text you got from read_model_ir, then write it back). This OWNS \
+                    correctness: it parses + validates the IR with the engine's model (catching \
+                    unknown kinds, missing attributes, and dangling flow targets with a clear \
+                    error), emits engine-validated XML, and returns the full `model` (ready to pass \
+                    straight to simulate / compare_variants) plus the post-write analyze_model \
+                    `findings` and `metrics`. Unlike edit_model's fixed op menu, the IR can express \
+                    ANY structural change — including a gateway `default` flow (`... -> <to> \
+                    default`). For a SINGLE-process model, pass just `ir`. For a multi-stage \
+                    ORCHESTRATOR, edit ONE phase's IR (from read_model_ir process:\"<id>\") and pass \
+                    it back with base:<the current full model XML> and process:\"<id>\" so it is \
+                    spliced in place — the other phases and the authored overview are preserved. \
+                    Keep the IR's `process \"<id>\"` header equal to that phase id. \
+                    Args: ir (required), base (optional full BPMN XML), process (optional phase id)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "ir": {
+                            "type": "string",
+                            "description": "The canonical IR text to compile (as produced and then \
+                                edited from read_model_ir)."
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "For a multi-stage model: the current full BPMN document \
+                                to splice the IR into. Omit for a single-process model (the IR is \
+                                the whole model)."
+                        },
+                        "process": {
+                            "type": "string",
+                            "description": "For a multi-stage model: the phase (process id) the IR \
+                                replaces inside `base`. Omit to replace the orchestrator (first) \
+                                definition."
+                        }
+                    },
+                    "required": ["ir"]
+                }),
+            });
+            specs.push(ToolSpec {
                 name: "conformance_check".into(),
                 description: "Replay the mined trace behaviour against the BPMN MODEL and report \
                     where reality diverges from design: a transition-fitness score, nonconformant \
@@ -845,6 +913,28 @@ impl ToolBox for AnalysisTools {
                     None => crate::bpmn_model::edit_model(base, ops)?,
                 };
                 serde_json::to_string(&v).map_err(|e| format!("serialise edit: {e}"))
+            }
+            "read_model_ir" => {
+                let xml = self
+                    .model
+                    .as_ref()
+                    .ok_or("read_model_ir is not available: this process has no BPMN model")?;
+                let target = args.get("process").and_then(|v| v.as_str());
+                let v = crate::model_ir::read_model_ir(xml, target)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise model ir: {e}"))
+            }
+            "write_model_ir" => {
+                let ir = args
+                    .get("ir")
+                    .and_then(|v| v.as_str())
+                    .ok_or("write_model_ir requires an 'ir' string argument")?;
+                let base = args.get("base").and_then(|v| v.as_str());
+                let process = args.get("process").and_then(|v| v.as_str());
+                // Preserve the customer's hand layout on an unchanged-topology edit: the DI source is
+                // the base document (multi-phase) or, for a single-process write, the current model.
+                let di_source = base.or(self.model.as_deref());
+                let v = crate::model_ir::write_model_ir(ir, base, process, di_source)?;
+                serde_json::to_string(&v).map_err(|e| format!("serialise write ir: {e}"))
             }
             "conformance_check" => {
                 let xml = self
