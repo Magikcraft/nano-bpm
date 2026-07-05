@@ -221,6 +221,14 @@ pub struct ProjectConfig {
     /// served-UI binary. Default `console`.
     #[serde(default = "default_app")]
     pub app: String,
+    /// Project-relative directories the supervisor sweeps for deployable
+    /// resources (`.bpmn`, `.dmn`, `.form`) each time Run is clicked, POSTing
+    /// each file to `<deployTarget>/v2/deployments`. Default is
+    /// `["models", "decisions", "forms"]`; templates or pack scaffolders can
+    /// override. Set to `[]` to disable — useful when the app deploys its
+    /// own resources at boot.
+    #[serde(default = "default_auto_deploy")]
+    pub auto_deploy: Vec<String>,
     /// Toolchain snapshotted from the scaffolding pack — the *project* is the
     /// authority for how it runs and compiles, not the pack (which can change
     /// or be uninstalled). Precedence for Run/Compile:
@@ -291,6 +299,14 @@ fn default_app() -> String {
     "console".to_string()
 }
 
+fn default_auto_deploy() -> Vec<String> {
+    vec![
+        "models".to_string(),
+        "decisions".to_string(),
+        "forms".to_string(),
+    ]
+}
+
 impl ProjectConfig {
     fn new(name: &str, description: &str) -> Self {
         let ts = now_ms();
@@ -302,6 +318,7 @@ impl ProjectConfig {
             platforms: vec![host_target().to_string()],
             lang: default_lang(),
             app: default_app(),
+            auto_deploy: default_auto_deploy(),
             toolchain: None,
             scaffolded_from: None,
             created_ms: ts,
@@ -1711,6 +1728,142 @@ impl ProjectSupervisor {
         }
     }
 
+    /// Sweeps the configured `auto_deploy` dirs (default `models/`, `decisions/`,
+    /// `forms/`) for `.bpmn`, `.dmn`, `.form` files and POSTs each one to
+    /// `<base_url>/v2/deployments` as multipart. Streams progress to the project
+    /// log so users see each deployment (or failure) in the Output pane.
+    ///
+    /// Deliberately best-effort: a failing deploy logs and moves on, and the
+    /// app is still started — the alternative would be that a temporarily-down
+    /// gateway blocks running a self-hosting app entirely. Templates that need
+    /// deploy-strict semantics can turn this off (`autoDeploy: []`) and drive
+    /// deployment from their own bootstrap.
+    async fn auto_deploy_resources(
+        cfg: &ProjectConfig,
+        dir: &Path,
+        base_url: &str,
+        inner: &Arc<ProjectInner>,
+    ) {
+        let dirs = &cfg.auto_deploy;
+        if dirs.is_empty() {
+            return;
+        }
+        // Collect candidate files up front so the log lines come out in a
+        // stable, per-directory order (a directory walk in filesystem-native
+        // order would surprise the user on macOS's case-insensitive HFS+).
+        let mut files: Vec<PathBuf> = Vec::new();
+        for sub in dirs {
+            let root = dir.join(sub);
+            if !root.is_dir() {
+                continue;
+            }
+            let mut names: Vec<String> = match std::fs::read_dir(&root) {
+                Ok(rd) => rd
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().ok().map(|t| t.is_file()).unwrap_or(false))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| {
+                        let lower = n.to_ascii_lowercase();
+                        lower.ends_with(".bpmn")
+                            || lower.ends_with(".dmn")
+                            || lower.ends_with(".form")
+                    })
+                    .collect(),
+                Err(_) => continue,
+            };
+            names.sort();
+            for n in names {
+                files.push(root.join(n));
+            }
+        }
+        if files.is_empty() {
+            return;
+        }
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                inner
+                    .push_log(
+                        "err",
+                        format!("auto-deploy: could not build http client: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let url = format!("{}/v2/deployments", base_url.trim_end_matches('/'));
+        inner
+            .push_log(
+                "sys",
+                format!("auto-deploy: {} resource(s) -> {url}", files.len()),
+            )
+            .await;
+        for path in &files {
+            let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("resource")
+                .to_string();
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: read failed: {e}"))
+                        .await;
+                    continue;
+                }
+            };
+            let mime = if name.to_ascii_lowercase().ends_with(".form") {
+                "application/json"
+            } else {
+                "text/xml"
+            };
+            let part = match reqwest::multipart::Part::bytes(bytes)
+                .file_name(name.clone())
+                .mime_str(mime)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: {e}"))
+                        .await;
+                    continue;
+                }
+            };
+            let form = reqwest::multipart::Form::new().part("resources", part);
+            match client.post(&url).multipart(form).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    inner
+                        .push_log("sys", format!("auto-deploy: deployed {rel}"))
+                        .await;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    let body = body
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: HTTP {status} {body}"))
+                        .await;
+                }
+                Err(e) => {
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: {e}"))
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Spawns `deno run main.ts` for a project. Idempotent if already running.
     pub async fn run(&self, name: &str) -> Result<(), String> {
         let dir = project_dir(name).ok_or("invalid project name")?;
@@ -1750,6 +1903,8 @@ impl ProjectSupervisor {
         let cache = dir.join(".deno-cache");
         let _ = std::fs::create_dir_all(&cache);
         let base_url = Self::base_url(&cfg);
+
+        Self::auto_deploy_resources(&cfg, &dir, &base_url, &inner).await;
 
         let mut cmd = Command::new(&deno);
         cmd.current_dir(&dir)
@@ -1886,6 +2041,7 @@ impl ProjectSupervisor {
         *inner.phase.lock().await = Phase::Starting;
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let base_url = Self::base_url(cfg);
+        Self::auto_deploy_resources(cfg, &dir, &base_url, &inner).await;
         let mut cmd = Command::new(&bin);
         cmd.current_dir(&dir)
             .args(&argv[1..])
