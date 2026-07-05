@@ -4,9 +4,11 @@
 //! The IR is the surface syntax of the engine's own executable model, so it cannot drift from
 //! execution semantics. This module only *emits* the IR; the validating parser (IR → model) and
 //! the engine-derived grammar/GBNF are later phases. The output is a **normal form**: elements are
-//! rendered in a deterministic order (sorted by id) and sequence flows as a separate,
-//! globally-sorted block, so `definition_to_ir` is a pure function of the model and two runs always
-//! agree (a prerequisite for the future `emit(parse(ir)) == ir` idempotence guarantee).
+//! rendered in a deterministic order (sorted by id) and sequence flows as a separate block grouped
+//! by source id — but WITHIN each source the model's declared outgoing order is preserved verbatim,
+//! because an exclusive gateway takes the *first* matching outgoing flow, so that order is
+//! load-bearing. `definition_to_ir` is thus a pure function of the model and two runs always agree
+//! (a prerequisite for the future `emit(parse(ir)) == ir` idempotence guarantee).
 //!
 //! ## Concrete syntax
 //!
@@ -16,7 +18,7 @@
 //!
 //!   <node statements, sorted by id>
 //!
-//!   <flow statements, sorted by (from, to)>
+//!   <flow statements, grouped by source id; per-source declaration order preserved>
 //! }
 //! ```
 //!
@@ -65,14 +67,20 @@ pub fn definition_to_ir(def: &ProcessDefinition, names: &HashMap<String, String>
         render_node(id, el, names.get(*id).map(String::as_str), &mut out);
     }
 
-    // Sequence flows as one globally-sorted block, keyed by (from, to), decoupled from node order.
+    // Sequence flows as one block after the nodes. Grouped by source id for a deterministic order,
+    // but WITHIN a source the model's declared outgoing order is preserved verbatim: for an
+    // exclusive gateway the engine takes the first matching outgoing flow (see the declaration-order
+    // scan in engine/mod.rs), so that order is load-bearing and must not be re-sorted by target.
+    // `ordered` is a BTreeMap (iterates by source id) and each element's `outgoing` is kept in
+    // declaration order, so the collection is already grouped-by-id in declaration order; a *stable*
+    // sort by source id only cements the grouping without disturbing the per-source order.
     let mut flows: Vec<(&str, &SequenceFlow)> = Vec::new();
     for (id, el) in &ordered {
         for f in &el.outgoing {
             flows.push((id, f));
         }
     }
-    flows.sort_by(|a, b| (a.0, a.1.to.as_str()).cmp(&(b.0, b.1.to.as_str())));
+    flows.sort_by(|a, b| a.0.cmp(b.0));
     if !flows.is_empty() {
         out.push('\n');
     }
@@ -428,6 +436,35 @@ mod tests {
         let a = xml_to_ir(LOAN_BPMN).expect("render");
         let b = xml_to_ir(LOAN_BPMN).expect("render");
         assert_eq!(a, b, "the pretty-printer must be a normal form");
+    }
+
+    #[test]
+    fn preserves_gateway_outgoing_declaration_order() {
+        // An exclusive gateway takes the FIRST matching outgoing flow, so declaration order is
+        // load-bearing. Here the conditional flow ("Zeta") is declared before the default ("Alpha")
+        // even though sorting by target id would put "Alpha" first — the IR must keep Zeta first.
+        let def = ProcessBuilder::new("Priority")
+            .start_event("Start")
+            .exclusive_gateway("Gate")
+            .end_event("Zeta")
+            .end_event("Alpha")
+            .connect("Start", "Gate")
+            .connect_when("Gate", "Zeta", "= amount > 100")
+            .connect_default("Gate", "Alpha")
+            .build()
+            .unwrap();
+        let ir = definition_to_ir(&def, &HashMap::new());
+        let zeta = ir.find("Gate -> Zeta").expect("zeta flow present");
+        let alpha = ir.find("Gate -> Alpha").expect("alpha flow present");
+        assert!(
+            zeta < alpha,
+            "declared order (conditional before default) must survive; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("Gate -> Zeta when \"= amount > 100\"\n"),
+            "\n{ir}"
+        );
+        assert!(ir.contains("Gate -> Alpha default\n"), "\n{ir}");
     }
 
     #[test]
