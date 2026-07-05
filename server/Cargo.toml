@@ -20,11 +20,12 @@ prometheus = { version = "0.13", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs"] }
 # WebSocket *client* for the intra-cluster peer uplink: a node speaks the same
 # Falcon protocol it serves (axum's `ws` feature is server-only). Pinned
 # to the same tungstenite the server already pulls in via axum. No TLS — the
 # cluster mesh is a trusted private network; `ws://` only.
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls", "http2"] }
 tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-subscriber = "0.3"
