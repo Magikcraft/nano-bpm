@@ -155,24 +155,43 @@ conditional"*; the model writes `review_gw -> manual_review [default]`. Neither
 map alone suffices — the context-sensitive half already exists (the
 `exclusive-no-default` warning); the context-free half is what this ADR adds.
 
-**The grammar is generated from the engine surface, not hand-maintained.** The
-engine's possibility space is a closed algebraic data type — `ElementKind` (its
-variants and each variant's fields), `SequenceFlow` (`condition`, `is_default`),
-boundary-event kinds, multi-instance, IO mappings. An ADT maps directly onto an
-EBNF: variants → alternations, fields → attributes, `Option` → optional. The
-space is finite and enumerable because the enum is closed. The single-source-of-
-truth discipline (the same anti-drift guarantee the IR itself relies on):
+**The grammar is emitted from the engine surface, not hand-maintained — with one
+precise caveat about what is auto-derived.** The engine's possibility space is a
+closed algebraic data type — `ElementKind` (its variants and each variant's
+fields), `SequenceFlow` (`condition`, `is_default`), boundary-event kinds,
+multi-instance, IO mappings. Two layers must be distinguished:
 
-- Derive a machine schema from the IR types (`#[derive(schemars::JsonSchema)]`)
-  → exhaustive by construction; this is what the grammar tool returns.
-- The **concrete notation** (keywords, layout) is authored once — an ADT yields
-  *abstract* syntax, not surface syntax. What is derived-and-checked is
-  **coverage**: the pretty-printer and parser are exhaustive `match`es over
-  `ElementKind`, so the Rust compiler refuses to build if a new variant is added
-  without a production. A parity test asserts every variant and field has a
-  notation. The grammar therefore cannot silently fall behind the engine.
+- **Abstract syntax (the possibility space)** — which element kinds exist, which
+  fields each carries, required vs optional, value types — is **fully derivable**
+  from the ADT via `#[derive(schemars::JsonSchema)]`. An ADT maps onto an EBNF:
+  variants → alternations, fields → attributes, `Option` → optional. Finite and
+  enumerable because the enum is closed. Nothing here can drift or be omitted.
+- **Concrete syntax (the surface notation)** — `service`, `->`, `[default]`,
+  `when = …`, layout — is **not inventable** from the ADT: the type system knows a
+  flow *has* an `is_default: bool` but has no opinion that it renders `[default]`.
+  This is authored **once**, as a compact notation table.
 
-**The grammar does triple duty**, which is why generating it from the engine
+So the grammar *document* is emitted programmatically, from two inputs — the ADT
+(auto) + the authored notation table. The emitter walks the ADT **exhaustively**,
+so the authored half only answers "how does *this* construct render," never
+"which constructs exist." Coverage is machine-enforced: the pretty-printer and
+parser are exhaustive `match`es over `ElementKind` (the Rust compiler refuses to
+build if a new variant lacks a production), and a parity test asserts every
+variant and field has a notation. The grammar cannot silently fall behind the
+engine.
+
+**Preferred architecture — one notation table, four consumers.** Define the
+concrete syntax as a single declarative table `(ElementKind variant → production
+template)` and drive from it: (1) the pretty-printer (model → IR), (2) the parser
+(or the grammar it is checked against), (3) the human grammar cheat-sheet (the
+tool result), (4) the GBNF grammar (constrained decoding). One spec, many
+emitters — a parser generator whose spec also yields the printer and the docs, so
+the four cannot disagree. Pragmatic fallback if that metacompiler is too much up
+front: hand-write printer + parser, auto-derive the JsonSchema possibility space,
+and parity-test the three for coverage — same anti-drift guarantee, less
+machinery.
+
+**The grammar does triple duty**, which is why emitting it from the engine
 surface pays off disproportionately:
 
 1. **Tool result** — `describe_ir_grammar` returns the productions, mapping the
@@ -184,11 +203,35 @@ surface pays off disproportionately:
    not valid IR*. For a 4–8B local model this eliminates invalid-syntax failures
    at the decoding layer rather than catching them post-hoc.
 
-Caveat — **tier the grammar to protect small-model context.** A large grammar
-dumped every turn degrades tool-selection and reasoning the same way too many
-tools do. The default tool result is a compact one-page production cheat-sheet;
-`analyze_model` does the contextual narrowing. The grammar tells the model that
-default flows *exist*; the analyzer tells it *which* gateway needs one.
+#### Grammar delivery: an on-demand, scoped tool — not a per-turn dump
+
+Sending the whole grammar every turn wastes context and degrades small-model
+reasoning (the too-many-tools failure mode). Deliver it through three channels
+matched to need:
+
+- **Pull — `describe_ir_grammar(kind?)`.** On-demand. No argument returns the
+  compact one-page cheat-sheet; `kind: "exclusiveGateway"` returns *only* that
+  element's productions plus the flow annotations it can carry (`[default]`,
+  `when = …`). Scoped retrieval keeps every result small — it solves both "don't
+  send every turn" *and* "don't send too much even when asked." This tool is a
+  static, model-independent language reference; `analyze_model` remains the
+  model-*aware* half.
+- **Pair with the analyzer.** A context-sensitive finding names the context-free
+  entry to consult: the `exclusive-no-default` warning points at
+  `describe_ir_grammar(exclusiveGateway)`. The two maps compose exactly at the
+  moment of need.
+- **Push-on-error.** `write_model_ir` parse failures echo the relevant production
+  inline, so a bad write teaches the syntax on the error path — no separate call
+  needed to recover.
+
+A subtlety that reinforces the three walls: **GBNF and the tool are complementary
+even at decode time.** GBNF guarantees the model cannot emit *invalid* IR, but at
+a gateway it exposes all legal continuations without signalling that a default
+flow is an option *worth choosing*. Legality (CAN) is not knowing-the-option
+(COULD). GBNF enforces *form*; the tool and analyzer still drive *choice*.
+
+The grammar tells the model that default flows *exist*; the analyzer tells it
+*which* gateway needs one; GBNF ensures whatever it writes is syntactically valid.
 
 ### The desirability dimension: guided search against an externalized objective
 
@@ -325,9 +368,13 @@ learned, or both.
    (or keep them as sugar over the IR).
 5. DI-preservation sidecar so hand-laid-out customer diagrams survive a
    round-trip.
-6. Engine-derived grammar: `#[derive(JsonSchema)]` on the IR types + a coverage
-   parity test, exposed as a `describe_ir_grammar` tool result and a GBNF grammar
-   for llama.cpp constrained decoding.
+6. Engine-derived grammar: a single declarative notation table
+   `(ElementKind variant → production template)` driving the printer, parser,
+   grammar cheat-sheet, and GBNF; the possibility space auto-derived via
+   `#[derive(JsonSchema)]`; coverage held by exhaustive-match + a parity test.
+   Exposed as a **scoped** `describe_ir_grammar(kind?)` tool (on-demand, not a
+   per-turn dump), with `analyze_model` warnings pointing at the relevant grammar
+   entry and `write_model_ir` errors echoing productions inline.
 7. Guided search (the desirability dimension): make the fitness explicit and
    tiered — static smells → replay score against the investigation goal — with a
    minimal-diff regularizer and the fitness delta surfaced per candidate. Reuses
