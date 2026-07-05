@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   NavLink,
   Navigate,
@@ -8,6 +8,7 @@ import {
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
+import { api } from "./lib/api";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -185,6 +186,27 @@ export default function App() {
     }
   }, [location.pathname]);
 
+  // The running gateway's version, shown in the sidebar chrome so it's visible
+  // on every page — useful when bouncing between dev builds and staged releases
+  // to confirm which binary is actually serving the console. Reads
+  // `/console/api/topology`'s `gateway_version` (the same field surfaced on the
+  // Topology page); silently absent if the probe fails.
+  const [serverVersion, setServerVersion] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .topology()
+      .then((t) => {
+        if (!cancelled) setServerVersion(t.gateway_version);
+      })
+      .catch(() => {
+        /* leave hidden — sidebar is not the place to surface a probe error */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div className="flex h-full bg-app text-fg">
       <aside className="flex w-56 shrink-0 flex-col border-r border-edge bg-panel">
@@ -194,6 +216,14 @@ export default function App() {
               nano BPM
             </div>
             <div className="text-xs text-fg-faint">single-node console</div>
+            {serverVersion && (
+              <div
+                className="mt-1 font-mono text-[10px] text-fg-faint"
+                title="Version of the running gateway (from /console/api/topology)"
+              >
+                gateway v{serverVersion}
+              </div>
+            )}
             <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
               Advanced Research Prototype
             </div>
