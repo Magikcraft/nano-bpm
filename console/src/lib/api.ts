@@ -726,6 +726,27 @@ export interface ProjectSummary {
   running: boolean;
 }
 
+/// One named way to run/compile a project — mirrors the server's
+/// `ProjectRunConfig`. Populated when a pack ships a `toolchain.runConfigs`
+/// matrix (e.g. `example-java-throughput` has four transport combos).
+export interface ProjectRunConfig {
+  id: string;
+  label: string;
+  /** When no `activeRunConfig` is pinned, the `default: true` entry wins. */
+  default?: boolean;
+  run: string[];
+  compile: string[];
+  /** Env vars layered on top of the base spawn env (last wins on key clash). */
+  env?: Record<string, string>;
+}
+
+/// Response of `GET /projects/:name/run-configs` — the pack-snapshotted
+/// configs plus the currently-pinned id (or `null` when unset).
+export interface ProjectRunConfigsResponse {
+  runConfigs: ProjectRunConfig[];
+  active: string | null;
+}
+
 export interface ProjectConfig {
   name: string;
   description: string;
@@ -739,10 +760,21 @@ export interface ProjectConfig {
   lang: string;
   /** App/output pack id (`console`, or e.g. `deno-gui`). */
   app: string;
-  /** Snapshotted toolchain (run/compile argv). Set at scaffold time by any
-   * app pack that declares its own toolchain; otherwise resolved live from
-   * the lang pack. Hand-editable in `nanobpm.project.json`. */
-  toolchain?: { run: string[]; compile: string[] };
+  /** Snapshotted toolchain (run/compile argv + named run configs). Set at
+   * scaffold time by any app pack that declares its own toolchain; otherwise
+   * resolved live from the lang pack. Hand-editable in `nanobpm.project.json`. */
+  toolchain?: {
+    run: string[];
+    compile: string[];
+    /** Named run configurations (see Magikcraft/nano-bpm#42). When set, the
+     * Run/Compile buttons use the active one; the flat `run`/`compile` are
+     * a fallback for older gateways / hand-edited projects. */
+    runConfigs?: ProjectRunConfig[];
+    /** Id of the config currently pinned by the user. When `null` and
+     * `runConfigs` is non-empty, the server picks the `default: true`
+     * entry, else the first. */
+    activeRunConfig?: string | null;
+  };
   /** Origin pack + version at scaffold time. Purely informational, but the
    * server uses it to gate trust — approving `<scaffoldedFrom.pack>` covers
    * the snapshotted argv only when the installed pack still declares it. */
@@ -927,6 +959,22 @@ export const projectsApi = {
       "POST",
       `/projects/${encodeURIComponent(name)}/compile`,
       JSON.stringify({ targets }),
+      "application/json",
+    ),
+  /// List the pack-snapshotted run configurations + the currently-pinned id.
+  /// Returns `{ runConfigs: [], active: null }` for projects without a
+  /// runConfigs-shaped toolchain — the caller can hide its picker.
+  getRunConfigs: (name: string) =>
+    getJson<ProjectRunConfigsResponse>(
+      `/projects/${encodeURIComponent(name)}/run-configs`,
+    ),
+  /// Pin (or clear, with `null`) the active run configuration. Rejects unknown
+  /// ids so a stale picker can't silently persist a typo.
+  setActiveRunConfig: (name: string, id: string | null) =>
+    send<{ active: string | null }>(
+      "PUT",
+      `/projects/${encodeURIComponent(name)}/active-run-config`,
+      JSON.stringify({ id }),
       "application/json",
     ),
 };
