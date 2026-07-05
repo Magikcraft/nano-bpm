@@ -156,9 +156,13 @@ export default function ProjectWorkspace() {
   const runConfigs = detail?.config.toolchain?.runConfigs ?? [];
   // The server resolves the same fallback (pinned → default:true → first) at
   // resolve_run_argv time, but we mirror it here so the picker's initial
-  // value matches what Run would actually spawn.
+  // value matches what Run would actually spawn. Also validate the pinned
+  // id against the current runConfigs — a hand-edited nanobpm.project.json
+  // could name an unknown id, in which case the server falls back but the
+  // controlled <select> would render blank/out-of-sync without this check.
+  const pinnedId = detail?.config.toolchain?.activeRunConfig ?? null;
   const activeRunConfigId =
-    detail?.config.toolchain?.activeRunConfig ??
+    (pinnedId && runConfigs.some((c) => c.id === pinnedId) ? pinnedId : null) ??
     runConfigs.find((c) => c.default)?.id ??
     runConfigs[0]?.id ??
     null;
