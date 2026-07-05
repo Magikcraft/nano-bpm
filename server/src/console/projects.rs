@@ -1035,11 +1035,18 @@ pub fn create_project(
     if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
         mk(dir.clone())?;
         super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
-        let cfg_lang = m
-            .requires
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "deno".to_string());
+        // The project's `lang` drives the run/compile toolchain (lang_pack lookup):
+        // a LANG pack's own template implies the pack itself; app/example packs
+        // name their language via `requires` (first entry = the lang pack id).
+        // Only with neither do we fall back to the built-in Deno runtime.
+        let cfg_lang = if m.kind == super::extensions::ExtKind::Lang {
+            m.id.clone()
+        } else {
+            m.requires
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "deno".to_string())
+        };
         // Best-effort detection of the "main" entrypoint the console
         // surfaces in the workspace toolbar. Ordered from most specific
         // to least so multi-module Java packs prefer the actual module
@@ -2210,6 +2217,70 @@ mod tests {
             !dir.join("resources/processes/jbench.bpmn").exists(),
             "built-in starter BPMN shadowed the pack BPMN"
         );
+    }
+
+    /// Regression for the "Java template creates a Deno app" bug: the
+    /// extensions root ALWAYS holds non-pack entries in real installs — the
+    /// trust store (trust.json), `.DS_Store`, a mid-install tarball — and
+    /// template_source() used to abort its whole scan on the first one,
+    /// so create_project silently fell back to the built-in Deno starter.
+    /// With litter present, an installed example pack must still scaffold.
+    #[test]
+    fn pack_template_survives_stray_files_in_extensions_root() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        std::fs::create_dir_all(&ext).unwrap();
+        // The litter, named to sort BEFORE the pack dir in any readdir order
+        // that happens to be alphabetical (real-world order is arbitrary).
+        std::fs::write(ext.join(".DS_Store"), b"\x00\x01").unwrap();
+        std::fs::write(ext.join("a-leftover-0.0.1.tgz"), b"gz").unwrap();
+        std::fs::write(ext.join("trust.json"), r#"{"yolo":false,"approved":[]}"#).unwrap();
+        let pack = ext.join("nanobpm__nano-ide-example-java-throughput");
+        std::fs::create_dir_all(pack.join("app/src/main/java")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"java-throughput","kind":"example","displayName":"Java throughput",
+                 "requires":["java"],"appDir":"app"}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("app/pom.xml"), "<project/>\n").unwrap();
+        std::fs::write(pack.join("app/src/main/java/Main.java"), "class Main{}\n").unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let cfg = create_project("jt", "", "java-throughput").expect("create");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        assert_eq!(cfg.lang, "java", "lang must come from the pack, not the Deno fallback");
+        let dir = root.join("jt");
+        assert!(dir.join("pom.xml").is_file(), "pack files must be copied");
+        assert!(dir.join("src/main/java/Main.java").is_file());
+        assert!(!dir.join("main.ts").exists(), "must not fall back to the Deno starter");
+        assert!(!dir.join("deno.json").exists());
+    }
+
+    /// A LANG pack's own starter template (e.g. lang-java's `java-starter`)
+    /// implies the pack itself as the project language — lang packs don't
+    /// declare `requires`, so the old requires-only derivation left these
+    /// projects on the Deno runtime.
+    #[test]
+    fn lang_pack_template_sets_lang_to_the_pack_id() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__nano-ide-lang-java");
+        std::fs::create_dir_all(pack.join("templates/java-starter")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"java","kind":"lang","displayName":"Java",
+                 "templates":[{"id":"java-starter","label":"Starter (Java / Maven)"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("templates/java-starter/pom.xml"), "<project/>\n").unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let cfg = create_project("jstart", "", "java-starter").expect("create");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        assert_eq!(cfg.lang, "java");
+        assert_eq!(cfg.main, "pom.xml");
+        assert!(root.join("jstart/pom.xml").is_file());
     }
 
     /// Regression: when a pack ships an aggregator `pom.xml` alongside a
