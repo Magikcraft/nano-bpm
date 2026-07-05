@@ -1042,17 +1042,19 @@ pub fn create_project(
             .unwrap_or_else(|| "deno".to_string());
         // Best-effort detection of the "main" entrypoint the console
         // surfaces in the workspace toolbar. Ordered from most specific
-        // to least; falls back to main.ts to match the Deno default.
+        // to least so multi-module Java packs prefer the actual module
+        // POM over an aggregator root POM. `is_file()` (not `exists()`)
+        // so a same-named directory can't masquerade as the entrypoint.
         let candidates: &[&str] = &[
             "src/main.rs",
-            "pom.xml",
             "microservice/pom.xml",
             "app/pom.xml",
+            "pom.xml",
             "main.ts",
         ];
         let cfg_main = candidates
             .iter()
-            .find(|c| dir.join(c).exists())
+            .find(|c| dir.join(c).is_file())
             .map(|c| c.to_string())
             .unwrap_or_else(|| "main.ts".to_string());
         let mut cfg = ProjectConfig::new(name, description);
@@ -2208,6 +2210,33 @@ mod tests {
             !dir.join("resources/processes/jbench.bpmn").exists(),
             "built-in starter BPMN shadowed the pack BPMN"
         );
+    }
+
+    /// Regression: when a pack ships an aggregator `pom.xml` alongside a
+    /// module `microservice/pom.xml`, `cfg.main` must point at the module
+    /// POM (most specific) rather than the aggregator.
+    #[test]
+    fn multi_module_java_pack_prefers_module_pom_over_root_pom() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__app-embedded-multi");
+        std::fs::create_dir_all(pack.join("templates/multi-starter/microservice")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"multi","kind":"app","displayName":"Multi","requires":["java","maven"],"templates":[{"id":"multi-starter","label":"Multi starter"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("templates/multi-starter/pom.xml"), "<aggregator/>\n").unwrap();
+        std::fs::write(
+            pack.join("templates/multi-starter/microservice/pom.xml"),
+            "<module/>\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let cfg = create_project("multiproj", "", "multi-starter").expect("create");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        assert_eq!(cfg.main, "microservice/pom.xml");
     }
 
     #[test]
