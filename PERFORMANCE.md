@@ -15,6 +15,19 @@ credits; workers stream-activate and complete `test-job`. `tput` is measured
 completed jobs/s during the steady-state window; `producedRate ≈ tput` means the
 cluster keeps up with the create rate (no growing backlog).
 
+> **Correction (2026-07-05): every run below was Raft-OFF.** All cluster runs set
+> `NANOBPMN_RF=3` but did **not** set `NANOBPMN_RAFT=1` — none of the deploy/start
+> scripts do. With Raft off, `NANOBPMN_RF` selects only *static* partition
+> ownership and cross-node request forwarding: each partition is journaled solely
+> by its owner and is **not** replicated to peers. There were **no quorum-commit
+> rounds, no cross-node replication, and no failover** in any measurement here.
+> Statements below implying the "Raft quorum-commit path" was exercised or that
+> peers' partitions were "replicated" are inaccurate and have been annotated. The
+> throughput/latency numbers themselves stand — they just reflect the Raft-off
+> (single-homed, forward-on-create) topology, which is the only configuration that
+> currently sustains load: enabling Raft wedges the cluster under sustained load
+> (single-voter groups stall in a snapshot/purge loop; see the engine notes).
+
 ---
 
 ## 2026-07-01 — Ceiling diagnosed: the single per-node read-model exporter
@@ -121,8 +134,9 @@ and the load box was **80% idle** (so it is *not* the client).
 The signature — many threads each partially busy, half the cores idle, no hot
 thread, no iowait, latency that grows with in-flight while throughput stays flat —
 is a **coordination-bound service rate**: each create/complete awaits the
-per-partition commit/apply pipeline (Raft batcher → engine actor → read-model
-projection), and the cross-thread handoffs cap the node at **~12k PI/s** long
+per-partition commit/apply pipeline (engine actor → read-model
+projection; **note:** with Raft off there is no Raft batcher/replication hop in
+this path), and the cross-thread handoffs cap the node at **~12k PI/s** long
 before the cores or disk saturate.
 
 ### Implication for scaling
@@ -161,8 +175,9 @@ box.)
   gave the best latency (p50 ~330 ms) at full throughput here; higher just queued.
 - **Spread clients across all gateways** (one producer/worker set per node). A
   single gateway forwards the rest and bottlenecks.
-- **RF=3 was ~free** on same-zone SSD nodes — keep durability on; it did not cap
-  throughput.
+- **RF=3 was ~free** on same-zone SSD nodes — but note this was **Raft-off**, so
+  RF=3 meant only static ownership/forwarding, **not** actual replication; the
+  "durability" here is each owner's local journal fsync, not quorum durability.
 - **Partitions:** 3 (one leader/node) already saturated the nodes; more partitions
   didn't add throughput but do add parallelism headroom for bigger machines /
   multi-task processes. Match partition count to node count as a starting point.
@@ -177,8 +192,10 @@ Build: `0.0.3-stress` (commit `21d954a`), release profile.
 
 - **3× GCP `c2-standard-16`** (16 vCPU, 64 GB), Debian 12, 200 GB `pd-ssd`, all
   in `us-central1-a` (same zone → low inter-node latency).
-- Cluster: 3 nodes, 3 partitions, **RF=3** (every partition replicated to all
-  three nodes). Each node leads one partition and follows the other two.
+- Cluster: 3 nodes, 3 partitions, **RF=3** (**Raft-off**: RF=3 sets static
+  ownership only — each partition is journaled solely by its owner, **not**
+  replicated to the other two). Each node owns/leads one partition; the
+  leader/follower labels are a static replica-set map, not live replication.
 - Config per node: `NANOBPMN_NODES=<3 internal IPs>:8080`, `NANOBPMN_NODE_ID`,
   `NANOBPMN_RF=3`, `NANOBPMN_PARTITIONS=3`, `NANOBPMN_DATA_DIR` on the SSD,
   `PORT=8080`. Segmented multi-partition journal, snapshot/compaction every 60s.
@@ -187,7 +204,8 @@ Build: `0.0.3-stress` (commit `21d954a`), release profile.
   gateway, so clients spread across gateways and each node activates jobs on its
   own partitions locally (zero-hop hot path). Note: create *placement* still
   round-robins cluster-wide by design, so ~2/3 of creates are forwarded to peer
-  partition owners over the Raft quorum-commit path (intentionally exercised).
+  partition owners (over the plain create-forwarding seam — **not** a Raft
+  quorum-commit path, since Raft was off; the owner commits to its local journal).
 - Load config per node: `WORKERS=256`, `PROD_CONNS=64`, `MAXPAR=4`,
   `MAX_INFLIGHT=6000`, `TRANSPORT=stream`, `DURATION_S=1800`.
 
@@ -213,7 +231,7 @@ Sustained throughput was flat across the run (sampled 34,142 → 34,233 →
 | node-2 | 309 MB | 148 MB | 1.6 GB | ~43% |
 
 - **Memory:** the engine holds a flat **~300–320 MB RSS** per node while
-  leading one partition and replicating two peers' partitions at ~11.4k PI/s.
+  owning one partition (Raft off → no peer replication) at ~11.4k PI/s.
   Memory is not a constraint (jemalloc + idle-purge story holds under load).
 - **CPU:** load average ~10/16, i.e. **~43% CPU idle**. nano-gw ≈ 6.9 cores,
   loadgen ≈ 1.3 cores → only ~8.2 of 16 cores busy.
@@ -393,10 +411,12 @@ cores**. Whole-process `strace -c` under load shows the real signature:
 
 The ~100k PI/s/node ceiling is **coordination-bound**, not
 dispatch-CPU-bound: cross-thread lock/handoff contention (futex) around the
-single-writer engine actor plus the RF=3 replication round-trips — with CPU to
-spare. The dispatcher change didn't move the ceiling because the dispatcher was
-never the limiter. Real levers from here: reduce engine-actor cross-thread
-contention / batching on the replication path, or scale partitions-per-node to
+single-writer engine actor — with CPU to spare. (**Raft-off:** the earlier
+mention of "RF=3 replication round-trips" here is inaccurate — there was no
+replication; the contention is the local engine-actor/journal handoff, not a
+replication path.) The dispatcher change didn't move the ceiling because the
+dispatcher was never the limiter. Real levers from here: reduce engine-actor
+cross-thread contention / batching, or scale partitions-per-node to
 spread the single-writer actor further. It was kept for the cleaner architecture
 (dispatch CPU spread across cores, single serialization pass).
 
