@@ -159,14 +159,18 @@ export default function ProjectWorkspace() {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  // The Deno cross-compile picker only makes sense when the toolchain is Deno.
-  // Any project with a snapshotted toolchain (Java/Rust/…) has one canonical
-  // compile invocation — skip the modal and run it directly.
+  // The cross-compile modal is Deno-specific — its copy talks about downloading
+  // the Deno runtime per target, and its picker only knows Deno target triples.
+  // Skip it whenever this project isn't Deno: either it has a snapshotted
+  // toolchain (Java/Rust/… scaffolded from an app pack that declared its own
+  // compile argv) OR its lang pack drives compile (cfg.lang != "deno"). Either
+  // way there's one canonical compile invocation and no per-platform variant
+  // for the user to choose from.
   const handleCompile = async () => {
-    const hasSnapshot =
-      !!detail?.config.toolchain?.compile?.length ||
-      (detail?.config.lang && detail.config.lang !== "deno");
-    if (hasSnapshot) {
+    const isDenoProject =
+      !detail?.config.toolchain?.compile?.length &&
+      (!detail?.config.lang || detail.config.lang === "deno");
+    if (!isDenoProject) {
       try {
         await projectsApi.compileProject(name, []);
         void load();
