@@ -1142,6 +1142,7 @@ function StartInstanceModal({
 
   const start = async () => {
     setError(null);
+    setResult(null);
     let variables: Record<string, unknown>;
     try {
       const parsed = json.trim() === "" ? {} : JSON.parse(json);
@@ -1172,7 +1173,7 @@ function StartInstanceModal({
     <Modal title={`Start instance — ${processId}`} onClose={onClose}>
       <p className="text-sm text-fg-muted">
         Posted to{" "}
-        <span className="font-mono text-fg">{deployTarget}/v2/process-instances</span>.
+        <span className="font-mono text-fg">{`${deployTarget.replace(/\/+$/, "")}/v2/process-instances`}</span>.
         Variables must be a JSON object; leave <span className="font-mono">{"{}"}</span> for no vars.
       </p>
       <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">

@@ -566,8 +566,10 @@ function joinBase(base: string | undefined, path: string): string {
 /// Used by the modeler to decide whether the on-disk file matches the deployed
 /// definition. Camunda's REST API needs the deployment *key* to serve XML; we
 /// look up the latest deployed definition by id first, then pull its XML.
-/// Returns `null` when the process has never been deployed to this gateway,
-/// or when the base URL is unreachable.
+/// Returns `null` for any non-success outcome — the process has never been
+/// deployed, the gateway is unreachable, the request fails auth/validation,
+/// or the search returns no matches. Callers treat "unknown" the same as
+/// "not deployed": Start stays disabled until the user clicks Deploy.
 export async function fetchDeployedXmlByProcessId(
   processId: string,
   baseUrl?: string,
