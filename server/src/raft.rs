@@ -743,6 +743,22 @@ struct Submission {
     resp: tokio::sync::oneshot::Sender<anyhow::Result<ReplicatedItem>>,
 }
 
+/// Command intake classification for the propose batcher's two-tier priority.
+///
+/// Mirrors Zeebe's `WhiteListedCommands`: the only thing deprioritized is fresh
+/// *demand entering* the system — process creation ([`Command::CreateInstance`]).
+/// Everything else — job completion, failure, thrown errors, activation, timer
+/// and lock-expiry ticks, message/signal correlation, cancellation, deploys and
+/// all administrative commands — is *progress on already-admitted work* and rides
+/// the high-priority lane. This guarantees a flood of creates can never sit in
+/// the Raft log ahead of the drain path: the cluster always makes progress on
+/// (and frees the resources of) work it has already accepted, which in turn
+/// reopens admission. It matches the engine actor's High/Low mailbox
+/// (`deepthi::Priority`) one layer down, so the two agree end to end.
+fn is_creation_intake(command: &Command) -> bool {
+    matches!(command, Command::CreateInstance { .. })
+}
+
 /// Coalesces concurrently-proposed commands for one partition into batched Raft
 /// log entries. A single background task drains every submission that queued
 /// while the previous `client_write` was in flight into the next entry — classic
@@ -751,20 +767,53 @@ struct Submission {
 /// apply hop now carry up to [`MAX_PROPOSE_BATCH`] commands. A lone proposer
 /// (tests, deploy) simply forms batches of one — byte-identical to the prior
 /// one-command-per-entry path.
+///
+/// Two lanes give the drain path priority over creation intake (see
+/// [`is_creation_intake`]): every batch is filled from the `hi` lane first, so
+/// completes/activation always ride the next entry even while a backlog of
+/// creates waits in the `lo` lane. Creation is admitted only with the batch
+/// capacity the drain path leaves — the log-layer analogue of Zeebe's
+/// `WhiteListedCommands`, and the fix for the credit-starvation latch where a
+/// create flood at the single FIFO starved job completion.
 struct Batcher {
-    tx: tokio::sync::mpsc::UnboundedSender<Submission>,
+    hi_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
+    lo_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
 }
 
 impl Batcher {
     fn spawn(raft: openraft::Raft<RaftConfig>) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
+        let (hi_tx, mut hi_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
+        let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         tokio::spawn(async move {
-            while let Some(first) = rx.recv().await {
+            loop {
+                // Block until at least one submission is queued on either lane.
+                // `biased` polls the high-priority (drain) lane first, so when
+                // both lanes have work waiting, the batch starts with drain
+                // commands. `else` fires only once BOTH senders have dropped
+                // (partition teardown), ending the task.
+                let first = tokio::select! {
+                    biased;
+                    Some(s) = hi_rx.recv() => s,
+                    Some(s) = lo_rx.recv() => s,
+                    else => break,
+                };
                 let mut subs = vec![first];
-                // Drain everything already queued (accumulated during the prior
-                // in-flight commit) into this batch, bounded by the cap.
+                // Drain ALL pending high-priority (drain) commands into this
+                // batch first, bounded by the cap — so a completion or activation
+                // never queues behind a backlog of creates in a later entry.
                 while subs.len() < MAX_PROPOSE_BATCH {
-                    match rx.try_recv() {
+                    match hi_rx.try_recv() {
+                        Ok(s) => subs.push(s),
+                        Err(_) => break,
+                    }
+                }
+                // Fill any remaining batch capacity with low-priority creation
+                // intake. Under a sustained drain flood creation yields entirely
+                // (the intended backpressure); a completion can never outnumber
+                // the creates that produced its jobs, so this is self-limiting and
+                // does not permanently starve admission.
+                while subs.len() < MAX_PROPOSE_BATCH {
+                    match lo_rx.try_recv() {
                         Ok(s) => subs.push(s),
                         Err(_) => break,
                     }
@@ -798,17 +847,24 @@ impl Batcher {
                 }
             }
         });
-        Self { tx }
+        Self { hi_tx, lo_tx }
     }
 
     async fn submit(&self, command: Command, now: u64) -> anyhow::Result<ReplicatedItem> {
         let (resp, rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(Submission {
-                item: ReplicatedCommand { command, now },
-                resp,
-            })
-            .map_err(|_| anyhow::anyhow!("raft propose batcher stopped"))?;
+        // Route fresh creation intake to the low-priority lane; the drain path
+        // (completes, fails, activation, ticks, admin) takes the high lane so it
+        // is never queued behind a backlog of creates in the Raft log.
+        let tx = if is_creation_intake(&command) {
+            &self.lo_tx
+        } else {
+            &self.hi_tx
+        };
+        tx.send(Submission {
+            item: ReplicatedCommand { command, now },
+            resp,
+        })
+        .map_err(|_| anyhow::anyhow!("raft propose batcher stopped"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("raft propose batcher dropped the response"))?
     }
@@ -1062,6 +1118,29 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    #[test]
+    fn only_process_creation_is_low_priority_intake() {
+        use std::collections::HashMap;
+        // Fresh demand entering the system is the sole low-priority (deprioritized)
+        // command — the log-layer analogue of Zeebe's `WhiteListedCommands`.
+        assert!(is_creation_intake(&Command::CreateInstance {
+            process_id: "p".into(),
+            variables: HashMap::new(),
+            tags: vec![],
+            business_id: None,
+        }));
+
+        // The drain / progress path takes the high-priority lane so a create flood
+        // can never starve it in the Raft log.
+        assert!(!is_creation_intake(&Command::complete_job_with(1, HashMap::new())));
+        assert!(!is_creation_intake(&Command::fail_job(1, 0, "e")));
+        assert!(!is_creation_intake(&Command::activate_jobs("t", "w", 1, 1, 0)));
+        assert!(!is_creation_intake(&Command::ExpireJobs { now: 0 }));
+        assert!(!is_creation_intake(&Command::TriggerTimers { now: 0 }));
+        assert!(!is_creation_intake(&Command::CancelInstance { instance_key: 1 }));
+        assert!(!is_creation_intake(&deploy_command()));
     }
 
     #[tokio::test]
