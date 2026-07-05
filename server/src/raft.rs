@@ -53,10 +53,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
-use std::io::Cursor;
 use std::ops::RangeBounds;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use nanobpmn_engine_core::{Command, Event};
 use openraft::storage::{
@@ -81,6 +83,7 @@ openraft::declare_raft_types!(
     pub RaftConfig:
         D = ReplicatedBatch,
         R = ReplicatedResponse,
+        SnapshotData = SnapshotFile,
 );
 
 /// The unit replicated through the Raft log: an engine [`Command`] plus the
@@ -257,14 +260,73 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
     }
 }
 
-/// A persisted snapshot: the metadata plus the serialized [`EngineSnapshot`] that
-/// reconstructs the engine directly (state-based, not event-replay — its size
-/// tracks the live working set rather than growing with every command ever
-/// applied, so the Raft log can be compacted without unbounded memory growth).
+/// File-backed [`SnapshotData`](RaftConfig::SnapshotData) so a partition snapshot
+/// is serialized to / streamed from disk instead of being materialized as a
+/// `Cursor<Vec<u8>>` in RAM. This keeps snapshot build, cache and transfer memory
+/// bounded (a handful of chunk buffers) rather than holding a full multi-gigabyte
+/// copy of every resident variable — *twice*, once for the returned reader and
+/// once for the cached `current_snapshot` — per partition. That eager double copy
+/// (`serde_json::to_vec` + `data.clone()`) was the "fat snapshot" the lean design
+/// removes. The `path` rides along with the tokio [`File`](tokio::fs::File) so the
+/// state machine can persist / reopen the exact file openraft hands back through
+/// [`install_snapshot`](RaftStateMachine::install_snapshot).
+///
+/// All three async traits simply delegate to the inner file, which is `Unpin`, so
+/// the wrapper is `Unpin` too and can be pin-projected with [`Pin::new`].
+pub struct SnapshotFile {
+    file: tokio::fs::File,
+    path: PathBuf,
+}
+
+impl tokio::io::AsyncRead for SnapshotFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for SnapshotFile {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().file).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().file).poll_shutdown(cx)
+    }
+}
+
+impl tokio::io::AsyncSeek for SnapshotFile {
+    fn start_seek(self: Pin<&mut Self>, position: std::io::SeekFrom) -> std::io::Result<()> {
+        Pin::new(&mut self.get_mut().file).start_seek(position)
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        Pin::new(&mut self.get_mut().file).poll_complete(cx)
+    }
+}
+
+/// A persisted snapshot: the metadata plus the on-disk path of the serialized
+/// [`EngineSnapshot`] that reconstructs the engine directly (state-based, not
+/// event-replay — its size tracks the live working set rather than growing with
+/// every command ever applied, so the Raft log can be compacted without unbounded
+/// memory growth). The body lives on disk (not a cached `Vec<u8>`) so holding the
+/// current snapshot for the follower catch-up path costs a path, not a full copy
+/// of the state in RAM.
 #[derive(Debug, Clone)]
 struct StoredSnapshot {
     meta: SnapshotMeta<NodeId, BasicNode>,
-    data: Vec<u8>,
+    path: PathBuf,
 }
 
 /// Metadata held by the Raft state machine: the last applied log id and
@@ -290,12 +352,37 @@ pub struct PartitionStateMachine {
     engine: DeepthiHandle,
     inner: Mutex<SmMeta>,
     snapshot_idx: AtomicU64,
+    /// Monotonic sequence for uniquely naming in-flight received snapshot files
+    /// (one partition can receive successive snapshots over its lifetime).
+    recv_idx: AtomicU64,
     current_snapshot: Mutex<Option<StoredSnapshot>>,
+    /// Directory holding this partition's snapshot files (both the current cached
+    /// snapshot and transient incoming ones). Created on construction.
+    snapshot_dir: PathBuf,
 }
 
 impl PartitionStateMachine {
-    fn new(engine: DeepthiHandle, partition_id: u64) -> Self {
-        Self {
+    fn new(engine: DeepthiHandle, partition_id: u64, snapshot_dir: PathBuf) -> std::io::Result<Self> {
+        std::fs::create_dir_all(&snapshot_dir)?;
+        // Clear any stale snapshot files left by a previous process: on boot the
+        // engine state is reconstructed by replaying the durable log (or a fresh
+        // network install), and `current_snapshot` starts empty, so any file on
+        // disk here is dead. Removing it also reconciles a crash mid-install that
+        // left an orphan `incoming-*` file.
+        if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let ours = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("snap-") || n.starts_with("incoming-"))
+                    .unwrap_or(false);
+                if ours {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        Ok(Self {
             engine,
             inner: Mutex::new(SmMeta {
                 partition_id,
@@ -303,8 +390,30 @@ impl PartitionStateMachine {
                 last_membership: StoredMembership::default(),
             }),
             snapshot_idx: AtomicU64::new(0),
+            recv_idx: AtomicU64::new(0),
             current_snapshot: Mutex::new(None),
-        }
+            snapshot_dir,
+        })
+    }
+
+    /// A unique per-process, per-partition snapshot directory under the system
+    /// temp dir, for in-memory deployments and tests that have no durable log dir
+    /// to anchor snapshots to.
+    fn temp_snapshot_dir(partition_id: u64) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "nanobpmn-raftsnap-{}-p{partition_id}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    /// [`new`](Self::new) with a fresh temp snapshot directory. Used by the
+    /// in-memory (volatile-log) bootstraps and the unit tests.
+    fn new_temp(engine: DeepthiHandle, partition_id: u64) -> std::io::Result<Self> {
+        Self::new(engine, partition_id, Self::temp_snapshot_dir(partition_id))
     }
 }
 
@@ -322,9 +431,6 @@ pub struct PartitionSnapshotBuilder {
 
 impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<RaftConfig>, StorageError<NodeId>> {
-        let data = serde_json::to_vec(&self.captured)
-            .map_err(|e| StorageIOError::read_state_machine(&e))?;
-
         let snapshot_idx = self.sm.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = if let Some(last) = self.last_applied {
             format!("{}-{}-{}", last.leader_id, last.index, snapshot_idx)
@@ -337,14 +443,49 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             last_membership: self.last_membership.clone(),
             snapshot_id,
         };
-        *self.sm.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        });
 
+        // Stream the state capture straight to disk (bounded memory) rather than
+        // building a full `Vec<u8>` plus a second cached clone. `serde_json` here
+        // runs the same blocking serialize the old `to_vec` did — but into a
+        // buffered writer, so the peak transient is one buffer, not the whole
+        // serialized state twice.
+        let path = self.sm.snapshot_dir.join(format!("snap-{snapshot_idx}.bin"));
+        let file = std::fs::File::create(&path)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &self.captured)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e.into_error()))?;
+        // Durable enough to serve to a follower even across a crash: the log is
+        // still the authoritative tier, but a torn snapshot must never be shipped.
+        file.sync_all()
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+
+        // Publish as the current snapshot and unlink the file it replaces.
+        let previous = self
+            .sm
+            .current_snapshot
+            .lock()
+            .unwrap()
+            .replace(StoredSnapshot {
+                meta: meta.clone(),
+                path: path.clone(),
+            });
+        if let Some(previous) = previous.filter(|p| p.path != path) {
+            let _ = std::fs::remove_file(&previous.path);
+        }
+
+        let tokio_file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(SnapshotFile {
+                file: tokio_file,
+                path,
+            }),
         })
     }
 }
@@ -457,20 +598,48 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         }
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
+        // A fresh, empty on-disk file that openraft streams the incoming snapshot
+        // chunks into (AsyncWrite + AsyncSeek), so the receiving side never buffers
+        // the whole snapshot in RAM either.
+        let seq = self.recv_idx.fetch_add(1, Ordering::Relaxed);
+        let path = self
+            .snapshot_dir
+            .join(format!("incoming-{}-{seq}.tmp", std::process::id()));
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        Ok(Box::new(SnapshotFile { file, path }))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<NodeId>> {
-        let data = snapshot.into_inner();
-        let captured: nanobpmn_engine_core::EngineSnapshot = serde_json::from_slice(&data)
-            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+        let SnapshotFile { file, path } = *snapshot;
+
+        // Stream-deserialize the received file from a blocking task (bounded
+        // memory: a BufReader, not the whole body as a `Vec<u8>`). openraft leaves
+        // the write cursor at the end, so rewind first.
+        let std_file = file.into_std().await;
+        let captured: nanobpmn_engine_core::EngineSnapshot = tokio::task::spawn_blocking(
+            move || -> std::io::Result<nanobpmn_engine_core::EngineSnapshot> {
+                use std::io::Seek;
+                let mut f = std_file;
+                f.seek(std::io::SeekFrom::Start(0))?;
+                serde_json::from_reader(std::io::BufReader::new(f))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            },
+        )
+        .await
+        .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?
+        .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
         // Rebuild the engine actor's state directly from the captured snapshot.
         // The engine journal is in-memory under Raft (the Raft log is the durable
@@ -487,25 +656,49 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             inner.last_membership = meta.last_membership.clone();
         }
 
-        *self.current_snapshot.lock().unwrap() = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data,
-        });
+        // Promote the received file to the current snapshot (a rename within the
+        // same dir — cheap, no re-serialize, no extra copy) and drop the old one.
+        let snapshot_idx = self.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
+        let current_path = self
+            .snapshot_dir
+            .join(format!("snap-installed-{snapshot_idx}.bin"));
+        std::fs::rename(&path, &current_path)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let previous = self
+            .current_snapshot
+            .lock()
+            .unwrap()
+            .replace(StoredSnapshot {
+                meta: meta.clone(),
+                path: current_path,
+            });
+        if let Some(previous) = previous {
+            let _ = std::fs::remove_file(&previous.path);
+        }
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<RaftConfig>>, StorageError<NodeId>> {
-        Ok(self
-            .current_snapshot
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| Snapshot {
-                meta: s.meta.clone(),
-                snapshot: Box::new(Cursor::new(s.data.clone())),
-            }))
+        // Copy the small (meta, path) pair out from under the lock so the file
+        // open can `.await` without holding the std mutex.
+        let entry = {
+            let guard = self.current_snapshot.lock().unwrap();
+            guard.as_ref().map(|s| (s.meta.clone(), s.path.clone()))
+        };
+        match entry {
+            Some((meta, path)) => {
+                let file = tokio::fs::File::open(&path)
+                    .await
+                    .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
+                Ok(Some(Snapshot {
+                    meta,
+                    snapshot: Box::new(SnapshotFile { file, path }),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -652,7 +845,7 @@ impl RaftPartition {
         );
 
         let log_store = MemLogStore::default();
-        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
+        let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
         let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
@@ -692,8 +885,13 @@ impl RaftPartition {
             .validate()?,
         );
 
-        let log_store = crate::raft_logstore::RaftLogStore::open(log_dir)?;
-        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
+        let log_dir = log_dir.as_ref().to_path_buf();
+        let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
+        let state_machine = Arc::new(PartitionStateMachine::new(
+            engine,
+            partition_id,
+            log_dir.join("snapshots"),
+        )?);
         let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
@@ -737,7 +935,13 @@ impl RaftPartition {
         log_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(raft_config().validate()?);
-        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id));
+        // Anchor snapshots next to the durable log when there is one, else a temp
+        // dir for the volatile (in-memory-log) deployments.
+        let snapshot_dir = match log_dir.as_ref() {
+            Some(dir) => dir.join("snapshots"),
+            None => PartitionStateMachine::temp_snapshot_dir(partition_id),
+        };
+        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id, snapshot_dir)?);
         let network = PartitionNetwork::new(transport, partition_id);
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
@@ -937,23 +1141,43 @@ mod tests {
         .await;
 
         let mut src_sm: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new(src.clone(), 0));
+            Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
         let mut builder = src_sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.expect("build snapshot");
-        let bytes = (*snap.snapshot).into_inner();
 
-        // The body is a compact EngineSnapshot, not an event log: it deserializes
-        // straight back into an EngineSnapshot.
+        // The body is a compact EngineSnapshot on disk, not an event log: reading
+        // the file-backed snapshot back deserializes straight into an
+        // EngineSnapshot.
+        let mut reader = snap.snapshot;
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .expect("read snapshot body");
+        }
         let _: nanobpmn_engine_core::EngineSnapshot =
             serde_json::from_slice(&bytes).expect("snapshot body is a state capture");
 
         // A brand-new, empty replica installs the snapshot and ends up with
         // byte-for-byte identical engine state — the cross-node catch-up path.
+        // Drive the receive→write→install sequence openraft's chunked transfer
+        // performs: begin a receiving file, stream the body in, then install.
         let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), None);
         let mut dst_sm: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new(dst.clone(), 0));
+            Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("snapshot dir"));
+        let mut received = dst_sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving snapshot");
+        {
+            use tokio::io::AsyncWriteExt;
+            received.write_all(&bytes).await.expect("write snapshot body");
+            received.flush().await.expect("flush snapshot body");
+        }
         dst_sm
-            .install_snapshot(&snap.meta, Box::new(Cursor::new(bytes)))
+            .install_snapshot(&snap.meta, received)
             .await
             .expect("install snapshot");
 
