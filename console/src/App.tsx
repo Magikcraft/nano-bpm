@@ -8,7 +8,8 @@ import {
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
-import { api } from "./lib/api";
+import { api, projectsApi } from "./lib/api";
+import { registerFileTypesFromOverview } from "./lib/editorLang";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -206,6 +207,22 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  // Register every installed lang pack's `fileTypes[]` with the Monaco
+  // ext→language map at boot, and again whenever the user navigates — so a
+  // pack installed via the Extensions view during this session takes effect
+  // as soon as they open a project, without a hard reload. Extensions.tsx
+  // also calls the same helper right after install/remove, which is the
+  // fast path; this navigation-triggered refetch is the safety net for any
+  // other codepath that might mutate the extension set.
+  useEffect(() => {
+    projectsApi
+      .extensions()
+      .then(registerFileTypesFromOverview)
+      .catch(() => {
+        /* ignore — the static fallback table still covers the common cases */
+      });
+  }, [location.pathname]);
 
   return (
     <div className="flex h-full bg-app text-fg">
