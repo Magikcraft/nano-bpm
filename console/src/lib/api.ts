@@ -593,6 +593,14 @@ export interface ProjectConfig {
   lang: string;
   /** App/output pack id (`console`, or e.g. `deno-gui`). */
   app: string;
+  /** Snapshotted toolchain (run/compile argv). Set at scaffold time by any
+   * app pack that declares its own toolchain; otherwise resolved live from
+   * the lang pack. Hand-editable in `nanobpm.project.json`. */
+  toolchain?: { run: string[]; compile: string[] };
+  /** Origin pack + version at scaffold time. Purely informational, but the
+   * server uses it to gate trust — approving `<scaffoldedFrom.pack>` covers
+   * the snapshotted argv only when the installed pack still declares it. */
+  scaffoldedFrom?: { pack: string; version?: string };
   createdMs: number;
   updatedMs: number;
 }

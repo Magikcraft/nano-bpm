@@ -159,6 +159,24 @@ export default function ProjectWorkspace() {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
+  // The Deno cross-compile picker only makes sense when the toolchain is Deno.
+  // Any project with a snapshotted toolchain (Java/Rust/…) has one canonical
+  // compile invocation — skip the modal and run it directly.
+  const handleCompile = async () => {
+    const hasSnapshot =
+      !!detail?.config.toolchain?.compile?.length ||
+      (detail?.config.lang && detail.config.lang !== "deno");
+    if (hasSnapshot) {
+      try {
+        await projectsApi.compileProject(name, []);
+        void load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      return;
+    }
+    setShowCompile(true);
+  };
 
   if (error) {
     return (
@@ -208,7 +226,10 @@ export default function ProjectWorkspace() {
             ▶ Run
           </ToolbarButton>
         )}
-        <ToolbarButton onClick={() => setShowCompile(true)} disabled={!runnable || compiling}>
+        <ToolbarButton
+          onClick={() => void handleCompile()}
+          disabled={!runnable || compiling}
+        >
           Compile
         </ToolbarButton>
         <ToolbarButton onClick={() => setShowConfig(true)}>Configure</ToolbarButton>
