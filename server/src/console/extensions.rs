@@ -588,7 +588,58 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
         })
         .collect();
     entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
+    // npm's search index lags publication by minutes to hours. For any pack
+    // the user has installed, hit `npm view <name> version --prefer-online`
+    // to get the actual published latest — otherwise a freshly-published fix
+    // won't surface an "Update" affordance in the console for a long time.
+    // Bounded by the installed-pack count so this stays cheap.
+    refresh_installed_latest(&npm, &mut entries);
     Ok(entries)
+}
+
+/// For each installed entry, overlay the current `latest` via `npm view` and
+/// recompute `update_available`. `npm view --prefer-online` bypasses the local
+/// metadata cache and hits registry.npmjs.org directly. Failures are ignored
+/// (the search result stands).
+fn refresh_installed_latest(npm: &std::path::Path, entries: &mut [MarketEntry]) {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    let updates: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let handles: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.installed)
+        .map(|(idx, e)| {
+            let name = e.name.clone();
+            let npm = npm.to_path_buf();
+            let updates = Arc::clone(&updates);
+            thread::spawn(move || {
+                let out = std::process::Command::new(&npm)
+                    .args(["view", &name, "version", "--prefer-online", "--silent"])
+                    .output();
+                if let Ok(o) = out
+                    && o.status.success()
+                {
+                    let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !v.is_empty() {
+                        updates.lock().unwrap().push((idx, v));
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+    for (idx, latest) in updates.lock().unwrap().drain(..) {
+        let e = &mut entries[idx];
+        e.version = latest;
+        e.update_available = e
+            .installed_version
+            .as_deref()
+            .map(|iv| !iv.is_empty() && !e.version.is_empty() && iv != e.version)
+            .unwrap_or(false);
+    }
 }
 
 /// Find a program on PATH (and the Cargo bin dir for Rust). Mirrors

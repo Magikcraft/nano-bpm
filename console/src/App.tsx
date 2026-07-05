@@ -208,6 +208,40 @@ export default function App() {
     };
   }, []);
 
+  // Marketplace update poll (30s cadence) so the Extensions rail item can wear
+  // a badge with the current available-updates count on every page — the user
+  // doesn't have to open Extensions to notice a freshly-published fix. Skipped
+  // while the tab is hidden (background tabs shouldn't hammer npm). The
+  // server-side marketplace() also probes `npm view` per installed pack so
+  // this is not gated by npm's search-index lag.
+  const [updateCount, setUpdateCount] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      projectsApi
+        .marketplace()
+        .then((m) => {
+          if (cancelled) return;
+          setUpdateCount(m.entries.filter((e) => e.updateAvailable).length);
+        })
+        .catch(() => {
+          /* offline or npm missing — leave the badge as-is */
+        });
+    };
+    poll();
+    const id = window.setInterval(poll, 30_000);
+    const onVis = () => {
+      if (!document.hidden) poll();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
+
   // Register every installed lang pack's `fileTypes[]` with the Monaco
   // ext→language map at boot, and again whenever the user navigates — so a
   // pack installed via the Extensions view during this session takes effect
@@ -261,6 +295,16 @@ export default function App() {
                 <ActiveBar show={active} />
                 {item.icon}
                 {item.label}
+                {item.to === "/extensions" && updateCount > 0 && (
+                  <span
+                    className="ml-auto inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white"
+                    style={{ height: "18px" }}
+                    title={`${updateCount} extension update${updateCount === 1 ? "" : "s"} available`}
+                    aria-label={`${updateCount} extension updates available`}
+                  >
+                    {updateCount > 99 ? "99+" : updateCount}
+                  </span>
+                )}
               </NavLink>
             );
           })}
