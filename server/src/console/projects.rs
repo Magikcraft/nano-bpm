@@ -2249,11 +2249,17 @@ mod tests {
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
         let cfg = create_project("jt", "", "java-throughput").expect("create");
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
-        assert_eq!(cfg.lang, "java", "lang must come from the pack, not the Deno fallback");
+        assert_eq!(
+            cfg.lang, "java",
+            "lang must come from the pack, not the Deno fallback"
+        );
         let dir = root.join("jt");
         assert!(dir.join("pom.xml").is_file(), "pack files must be copied");
         assert!(dir.join("src/main/java/Main.java").is_file());
-        assert!(!dir.join("main.ts").exists(), "must not fall back to the Deno starter");
+        assert!(
+            !dir.join("main.ts").exists(),
+            "must not fall back to the Deno starter"
+        );
         assert!(!dir.join("deno.json").exists());
     }
 
