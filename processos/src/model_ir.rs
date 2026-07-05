@@ -36,16 +36,18 @@
 //! a new engine element kind fails to compile until the IR learns to render it — the
 //! coverage guarantee ADR 0001 relies on.
 
-// Phase 1 is the pretty-printer only. Its public API (`definition_to_ir`/`xml_to_ir`) is exercised
-// by this module's tests now and wired to a `read_model_ir` LLM tool in ADR 0001 Phase 6; until
-// then it has no non-test caller in the binary.
+// Phase 1 is the pretty-printer and Phase 2 the inverse parser. Their public API
+// (`definition_to_ir`/`xml_to_ir`, `ir_to_definition`/`analyze_ir`) is exercised by this module's
+// tests now and wired to `read_model_ir`/`write_model_ir` LLM tools in ADR 0001 Phase 4; until then
+// it has no non-test caller in the binary.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    Element, ElementKind, ProcessDefinition, SequenceFlow, TimerDef, TimerDefKind,
+    Condition, Element, ElementKind, IoMapping, Mapping, MultiInstance, ProcessDefinition,
+    SequenceFlow, TimerDef, TimerDefKind,
 };
 
 /// Render a process definition to canonical IR text. `names` maps element id → human label (as
@@ -362,6 +364,634 @@ fn quote(s: &str) -> String {
     out
 }
 
+// ===========================================================================================
+// Phase 2 (ADR 0001): the total, validating parser `IR text → ProcessDefinition`.
+//
+// This is the inverse of `definition_to_ir`. It shares the same concrete notation, so the pair is a
+// bijection over the executable core: `emit(parse(ir)) == ir` for any IR this module emits (checked
+// at unit level here; ADR 0001 phase 3 extends it to a corpus replay property). The parser is
+// *total* — every input yields a `Result`, never a panic — and *validating*: it enforces structural
+// invariants itself and reuses `analyze_model` (via `analyze_ir`) for semantic advisories.
+// ===========================================================================================
+
+/// A parsed IR document: the executable model plus the element id → human name map the IR carried
+/// (the names the engine model itself drops).
+#[derive(Debug, Clone)]
+pub struct ParsedIr {
+    pub definition: ProcessDefinition,
+    pub names: HashMap<String, String>,
+}
+
+/// Parse canonical IR text into a [`ProcessDefinition`] and its element-name map, validating
+/// structure along the way. Returns a human-readable error (never panics) on malformed input,
+/// unknown element kinds, missing required attributes, or dangling references.
+pub fn ir_to_definition(ir: &str) -> Result<ParsedIr, String> {
+    let tokens = tokenize(ir)?;
+    let mut p = Parser::new(&tokens);
+    p.parse_document()
+}
+
+/// Parse IR and run the existing semantic analyzer over it, reusing `analyze_model`. The IR is
+/// lowered to BPMN via `definition_to_xml_labeled` (which `parse_bpmn` round-trips) and handed to
+/// [`crate::bpmn_model::analyze_model`], so IR authoring gets the same advisories (unguarded tasks,
+/// gateways without a default, unreachable nodes, …) as XML authoring.
+pub fn analyze_ir(ir: &str) -> Result<serde_json::Value, String> {
+    let parsed = ir_to_definition(ir)?;
+    let xml = crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
+    crate::bpmn_model::analyze_model(&xml)
+}
+
+// --- tokenizer ------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    /// A bareword: an id, keyword, boolean, or a number-with-unit like `5000ms`.
+    Word(String),
+    /// A decoded (unescaped) double-quoted string.
+    Str(String),
+    Arrow,  // ->
+    LArrow, // <-
+    LBrace, // {
+    RBrace, // }
+    Comma,  // ,
+}
+
+/// Whether `c` may appear in a bareword (element ids can contain `-`, `.`, `:`, `_`).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')
+}
+
+fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
+    let mut toks = Vec::new();
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            c if c.is_whitespace() => i += 1,
+            '"' => {
+                let (s, next) = read_string(&chars, i)?;
+                toks.push(Tok::Str(s));
+                i = next;
+            }
+            '{' => {
+                toks.push(Tok::LBrace);
+                i += 1;
+            }
+            '}' => {
+                toks.push(Tok::RBrace);
+                i += 1;
+            }
+            ',' => {
+                toks.push(Tok::Comma);
+                i += 1;
+            }
+            '-' if chars.get(i + 1) == Some(&'>') => {
+                toks.push(Tok::Arrow);
+                i += 2;
+            }
+            '<' if chars.get(i + 1) == Some(&'-') => {
+                toks.push(Tok::LArrow);
+                i += 2;
+            }
+            c if is_word_char(c) => {
+                let start = i;
+                while i < chars.len() && is_word_char(chars[i]) {
+                    // A `-` immediately followed by `>` begins an arrow, not part of the word.
+                    if chars[i] == '-' && chars.get(i + 1) == Some(&'>') {
+                        break;
+                    }
+                    i += 1;
+                }
+                toks.push(Tok::Word(chars[start..i].iter().collect()));
+            }
+            other => return Err(format!("unexpected character '{other}' in IR")),
+        }
+    }
+    Ok(toks)
+}
+
+/// Read a double-quoted string starting at `start` (the opening quote). Returns the decoded value
+/// and the index just past the closing quote.
+fn read_string(chars: &[char], start: usize) -> Result<(String, usize), String> {
+    let mut s = String::new();
+    let mut i = start + 1;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => return Ok((s, i + 1)),
+            '\\' => {
+                i += 1;
+                match chars.get(i) {
+                    Some('"') => s.push('"'),
+                    Some('\\') => s.push('\\'),
+                    Some('n') => s.push('\n'),
+                    Some(other) => return Err(format!("invalid escape '\\{other}' in IR string")),
+                    None => break,
+                }
+                i += 1;
+            }
+            c => {
+                s.push(c);
+                i += 1;
+            }
+        }
+    }
+    Err("unterminated string literal in IR".to_string())
+}
+
+// --- parser ---------------------------------------------------------------------------------
+
+/// Attributes gathered from a node's `{ … }` block before they are lowered into an `ElementKind`
+/// and element-level fields.
+#[derive(Default)]
+struct NodeAttrs {
+    /// Scalar `key value` attributes (value already unquoted); keyed by attribute name.
+    scalars: HashMap<String, String>,
+    inputs: Vec<Mapping>,
+    outputs: Vec<Mapping>,
+    timer: Option<TimerDef>,
+    multi_instance: Option<MultiInstance>,
+}
+
+impl NodeAttrs {
+    fn take(&mut self, key: &str) -> Option<String> {
+        self.scalars.remove(key)
+    }
+    fn require(&mut self, key: &str, node: &str) -> Result<String, String> {
+        self.take(key)
+            .ok_or_else(|| format!("element '{node}' is missing required attribute '{key}'"))
+    }
+    fn bool_or(&mut self, key: &str, default: bool) -> Result<bool, String> {
+        match self.take(key) {
+            None => Ok(default),
+            Some(v) => parse_bool(&v, key),
+        }
+    }
+}
+
+fn parse_bool(v: &str, key: &str) -> Result<bool, String> {
+    match v {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "attribute '{key}' expects true/false, got '{other}'"
+        )),
+    }
+}
+
+/// Parse a `<n>ms` duration word into milliseconds.
+fn parse_millis(v: &str, key: &str) -> Result<u64, String> {
+    let digits = v
+        .strip_suffix("ms")
+        .ok_or_else(|| format!("attribute '{key}' expects a '<n>ms' duration, got '{v}'"))?;
+    digits
+        .parse::<u64>()
+        .map_err(|_| format!("attribute '{key}' has a non-numeric duration '{v}'"))
+}
+
+struct Parser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(toks: &'a [Tok]) -> Self {
+        Parser { toks, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+
+    fn next(&mut self) -> Option<&Tok> {
+        let t = self.toks.get(self.pos);
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn expect_word(&mut self, ctx: &str) -> Result<String, String> {
+        match self.next() {
+            Some(Tok::Word(w)) => Ok(w.clone()),
+            other => Err(format!("expected an identifier {ctx}, found {other:?}")),
+        }
+    }
+
+    fn expect_str(&mut self, ctx: &str) -> Result<String, String> {
+        match self.next() {
+            Some(Tok::Str(s)) => Ok(s.clone()),
+            other => Err(format!("expected a quoted string {ctx}, found {other:?}")),
+        }
+    }
+
+    fn expect_tok(&mut self, want: &Tok, ctx: &str) -> Result<(), String> {
+        match self.next() {
+            Some(t) if t == want => Ok(()),
+            other => Err(format!("expected {want:?} {ctx}, found {other:?}")),
+        }
+    }
+
+    fn parse_document(&mut self) -> Result<ParsedIr, String> {
+        // Header: process "<id>" {
+        let kw = self.expect_word("at the start of the document")?;
+        if kw != "process" {
+            return Err(format!(
+                "expected the document to start with `process`, found `{kw}`"
+            ));
+        }
+        let process_id = self.expect_str("for the process id")?;
+        self.expect_tok(&Tok::LBrace, "after the process id")?;
+
+        // start <id>
+        let start_kw = self.expect_word("for the `start` declaration")?;
+        if start_kw != "start" {
+            return Err(format!("expected `start <id>` first, found `{start_kw}`"));
+        }
+        let start_event = self.expect_word("for the start event id")?;
+
+        let mut elements: HashMap<String, Element> = HashMap::new();
+        let mut names: HashMap<String, String> = HashMap::new();
+        // Collect flows until every node is known, then attach (so forward references resolve).
+        let mut pending_flows: Vec<(String, SequenceFlow)> = Vec::new();
+
+        loop {
+            match self.peek() {
+                Some(Tok::RBrace) => {
+                    self.next();
+                    break;
+                }
+                None => return Err("unexpected end of input: missing closing `}`".to_string()),
+                // A statement is a flow iff its second token is `->`; otherwise it is a node
+                // statement (so an unrecognised leading word is reported as an unknown kind rather
+                // than a malformed flow).
+                Some(Tok::Word(_)) if self.toks.get(self.pos + 1) == Some(&Tok::Arrow) => {
+                    let (from, flow) = self.parse_flow()?;
+                    pending_flows.push((from, flow));
+                }
+                Some(Tok::Word(_)) => {
+                    let (id, name, el) = self.parse_node()?;
+                    if elements.contains_key(&id) {
+                        return Err(format!("duplicate element id '{id}'"));
+                    }
+                    if let Some(n) = name {
+                        names.insert(id.clone(), n);
+                    }
+                    elements.insert(id, el);
+                }
+                other => return Err(format!("unexpected token {other:?} at statement start")),
+            }
+        }
+
+        // Attach flows to their source elements, validating both endpoints exist.
+        for (from, flow) in pending_flows {
+            if !elements.contains_key(&flow.to) {
+                return Err(format!(
+                    "flow from '{from}' targets unknown element '{}'",
+                    flow.to
+                ));
+            }
+            let src = elements
+                .get_mut(&from)
+                .ok_or_else(|| format!("flow references unknown source element '{from}'"))?;
+            src.outgoing.push(flow);
+        }
+
+        // Structural validation: start event and every `attachedTo`/`parent` reference must exist.
+        if !elements.contains_key(&start_event) {
+            return Err(format!(
+                "start event '{start_event}' is not a declared element"
+            ));
+        }
+        for el in elements.values() {
+            if let Some(target) = attached_to(&el.kind) {
+                if !elements.contains_key(target) {
+                    return Err(format!(
+                        "boundary event '{}' is attached to unknown element '{target}'",
+                        el.id
+                    ));
+                }
+            }
+            if let Some(parent) = &el.parent {
+                if !elements.contains_key(parent) {
+                    return Err(format!(
+                        "element '{}' names unknown parent '{parent}'",
+                        el.id
+                    ));
+                }
+            }
+        }
+
+        Ok(ParsedIr {
+            definition: ProcessDefinition {
+                id: process_id,
+                elements,
+                start_event,
+                xml: String::new(),
+            },
+            names,
+        })
+    }
+
+    /// Parse one node statement: `<keyword> <id> ["<name>"] [{ <attrs> }]`.
+    fn parse_node(&mut self) -> Result<(String, Option<String>, Element), String> {
+        let keyword = self.expect_word("for a node kind")?;
+        let id = self.expect_word("for a node id")?;
+        let mut name = None;
+        if let Some(Tok::Str(_)) = self.peek() {
+            name = Some(self.expect_str("for a node name")?);
+        }
+        let mut attrs = NodeAttrs::default();
+        if let Some(Tok::LBrace) = self.peek() {
+            self.parse_attr_block(&mut attrs)?;
+        }
+
+        let kind = build_kind(&keyword, &id, &mut attrs)?;
+        let parent = attrs.take("parent");
+        let retries = attrs.take("retries");
+        let element = Element {
+            id: id.clone(),
+            kind,
+            outgoing: Vec::new(),
+            parent,
+            io: IoMapping {
+                inputs: std::mem::take(&mut attrs.inputs),
+                outputs: std::mem::take(&mut attrs.outputs),
+            },
+            timer: attrs.timer.take(),
+            retries,
+            multi_instance: attrs.multi_instance.take(),
+        };
+        if let Some((leftover, _)) = attrs.scalars.iter().next() {
+            return Err(format!(
+                "element '{id}' has an unknown attribute '{leftover}'"
+            ));
+        }
+        Ok((id, name, element))
+    }
+
+    /// Parse a `{ … }` attribute block into `attrs`.
+    fn parse_attr_block(&mut self, attrs: &mut NodeAttrs) -> Result<(), String> {
+        self.expect_tok(&Tok::LBrace, "to open an attribute block")?;
+        loop {
+            match self.peek() {
+                Some(Tok::RBrace) => {
+                    self.next();
+                    return Ok(());
+                }
+                None => return Err("unterminated attribute block".to_string()),
+                _ => self.parse_attr(attrs)?,
+            }
+        }
+    }
+
+    /// Parse a single attribute line inside a `{ … }` block.
+    fn parse_attr(&mut self, attrs: &mut NodeAttrs) -> Result<(), String> {
+        let key = self.expect_word("for an attribute name")?;
+        match key.as_str() {
+            "input" | "output" => {
+                let target = self.expect_word("for an io mapping target")?;
+                self.expect_tok(&Tok::LArrow, "in an io mapping")?;
+                let source = self.expect_str("for an io mapping source")?;
+                let mapping = Mapping { source, target };
+                if key == "input" {
+                    attrs.inputs.push(mapping);
+                } else {
+                    attrs.outputs.push(mapping);
+                }
+            }
+            "timer" => {
+                let kind_word = self.expect_word("for a timer kind")?;
+                let kind = match kind_word.as_str() {
+                    "duration" => TimerDefKind::Duration,
+                    "cycle" => TimerDefKind::Cycle,
+                    "date" => TimerDefKind::Date,
+                    other => return Err(format!("unknown timer kind '{other}'")),
+                };
+                let expr = self.expect_str("for a timer expression")?;
+                attrs.timer = Some(TimerDef { kind, expr });
+            }
+            "multiInstance" => {
+                attrs.multi_instance = Some(self.parse_multi_instance()?);
+            }
+            // Scalar attributes: `<key> <value>` where the value is a quoted string or a bareword
+            // (id, boolean, or `<n>ms` duration).
+            _ => {
+                let value = match self.next() {
+                    Some(Tok::Str(s)) => s.clone(),
+                    Some(Tok::Word(w)) => w.clone(),
+                    other => {
+                        return Err(format!(
+                            "attribute '{key}' expects a value, found {other:?}"
+                        ))
+                    }
+                };
+                attrs.scalars.insert(key, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse `multiInstance { collection "…", inputElement "…", …, sequential <bool> }`.
+    fn parse_multi_instance(&mut self) -> Result<MultiInstance, String> {
+        self.expect_tok(&Tok::LBrace, "to open a multiInstance block")?;
+        let mut mi = MultiInstance::default();
+        let mut have_collection = false;
+        loop {
+            match self.next() {
+                Some(Tok::RBrace) => break,
+                Some(Tok::Comma) => continue,
+                Some(Tok::Word(key)) => {
+                    let key = key.clone();
+                    match key.as_str() {
+                        "sequential" => {
+                            let v = self.expect_word("for multiInstance sequential")?;
+                            mi.sequential = parse_bool(&v, "sequential")?;
+                        }
+                        "collection" => {
+                            mi.input_collection =
+                                self.expect_str("for multiInstance collection")?;
+                            have_collection = true;
+                        }
+                        "inputElement" => {
+                            mi.input_element =
+                                Some(self.expect_str("for multiInstance inputElement")?);
+                        }
+                        "outputCollection" => {
+                            mi.output_collection =
+                                Some(self.expect_str("for multiInstance outputCollection")?);
+                        }
+                        "outputElement" => {
+                            mi.output_element =
+                                Some(self.expect_str("for multiInstance outputElement")?);
+                        }
+                        "completionCondition" => {
+                            mi.completion_condition =
+                                Some(self.expect_str("for multiInstance completionCondition")?);
+                        }
+                        other => return Err(format!("unknown multiInstance attribute '{other}'")),
+                    }
+                }
+                other => return Err(format!("unexpected token {other:?} in multiInstance block")),
+            }
+        }
+        if !have_collection {
+            return Err("multiInstance is missing required attribute 'collection'".to_string());
+        }
+        Ok(mi)
+    }
+
+    /// Parse one flow statement: `<from> -> <to> [when "<expr>"] [default]`.
+    fn parse_flow(&mut self) -> Result<(String, SequenceFlow), String> {
+        let from = self.expect_word("for a flow source")?;
+        self.expect_tok(&Tok::Arrow, "in a flow statement")?;
+        let to = self.expect_word("for a flow target")?;
+        let mut condition = None;
+        let mut is_default = false;
+        loop {
+            match self.peek() {
+                Some(Tok::Word(w)) if w == "when" => {
+                    self.next();
+                    let expr = self.expect_str("for a flow condition")?;
+                    condition = Some(Condition::new(expr));
+                }
+                Some(Tok::Word(w)) if w == "default" => {
+                    self.next();
+                    is_default = true;
+                }
+                _ => break,
+            }
+        }
+        Ok((
+            from,
+            SequenceFlow {
+                to,
+                condition,
+                is_default,
+            },
+        ))
+    }
+}
+
+/// Lower a node keyword + attribute block into an [`ElementKind`]. Exhaustive over the kind keywords
+/// `kind_keyword` emits, so the printer and parser stay in lockstep.
+fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementKind, String> {
+    let kind = match keyword {
+        "startEvent" => ElementKind::StartEvent,
+        "endEvent" => ElementKind::EndEvent,
+        "exclusiveGateway" => ElementKind::ExclusiveGateway,
+        "parallelGateway" => ElementKind::ParallelGateway,
+        "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
+        "serviceTask" => ElementKind::ServiceTask {
+            job_type: attrs.require("jobType", id)?,
+            priority: attrs.take("priority"),
+        },
+        "userTask" => ElementKind::UserTask(nanobpmn_engine_core::UserTaskProps {
+            assignee: attrs.take("assignee"),
+            candidate_groups: attrs.take("candidateGroups"),
+            candidate_users: attrs.take("candidateUsers"),
+            due_date: attrs.take("dueDate"),
+            follow_up_date: attrs.take("followUpDate"),
+            priority: attrs.take("priority"),
+        }),
+        "errorBoundaryEvent" => ElementKind::ErrorBoundaryEvent {
+            attached_to: attrs.require("attachedTo", id)?,
+            error_code: attrs.require("errorCode", id)?,
+        },
+        "timerIntermediateCatchEvent" => {
+            let d = attrs.require("duration", id)?;
+            ElementKind::TimerIntermediateCatchEvent {
+                duration_millis: parse_millis(&d, "duration")?,
+            }
+        }
+        "timerBoundaryEvent" => {
+            let d = attrs.require("duration", id)?;
+            ElementKind::TimerBoundaryEvent {
+                attached_to: attrs.require("attachedTo", id)?,
+                duration_millis: parse_millis(&d, "duration")?,
+                interrupting: attrs.bool_or("interrupting", true)?,
+                repeating: attrs.bool_or("repeating", false)?,
+            }
+        }
+        "messageIntermediateCatchEvent" => ElementKind::MessageIntermediateCatchEvent {
+            message_name: attrs.require("message", id)?,
+            correlation_key: attrs.require("correlationKey", id)?,
+        },
+        "messageBoundaryEvent" => ElementKind::MessageBoundaryEvent {
+            attached_to: attrs.require("attachedTo", id)?,
+            message_name: attrs.require("message", id)?,
+            correlation_key: attrs.require("correlationKey", id)?,
+            interrupting: attrs.bool_or("interrupting", true)?,
+        },
+        "messageStartEvent" => ElementKind::MessageStartEvent {
+            message_name: attrs.require("message", id)?,
+        },
+        "timerStartEvent" => {
+            let interval = attrs.require("interval", id)?;
+            ElementKind::TimerStartEvent {
+                interval_millis: parse_millis(&interval, "interval")?,
+                repeating: attrs.bool_or("repeating", false)?,
+            }
+        }
+        "subProcess" => ElementKind::SubProcess {
+            start_event: attrs.require("startEvent", id)?,
+        },
+        "scriptTask" => ElementKind::ScriptTask {
+            expression: attrs.require("expression", id)?,
+            result_variable: attrs.require("resultVariable", id)?,
+        },
+        "callActivity" => ElementKind::CallActivity {
+            called_process_id: attrs.require("calledElement", id)?,
+        },
+        "signalIntermediateCatchEvent" => ElementKind::SignalIntermediateCatchEvent {
+            signal_name: attrs.require("signal", id)?,
+        },
+        "signalBoundaryEvent" => ElementKind::SignalBoundaryEvent {
+            attached_to: attrs.require("attachedTo", id)?,
+            signal_name: attrs.require("signal", id)?,
+            interrupting: attrs.bool_or("interrupting", true)?,
+        },
+        "conditionalIntermediateCatchEvent" => ElementKind::ConditionalIntermediateCatchEvent {
+            condition: attrs.require("condition", id)?,
+        },
+        "conditionalBoundaryEvent" => ElementKind::ConditionalBoundaryEvent {
+            attached_to: attrs.require("attachedTo", id)?,
+            condition: attrs.require("condition", id)?,
+            interrupting: attrs.bool_or("interrupting", true)?,
+        },
+        other => return Err(format!("unknown element kind '{other}'")),
+    };
+    Ok(kind)
+}
+
+/// The activity a boundary event is attached to, if this kind is a boundary event. Used to validate
+/// `attachedTo` references resolve. Exhaustive so a new boundary kind is caught at compile time.
+fn attached_to(kind: &ElementKind) -> Option<&str> {
+    match kind {
+        ElementKind::ErrorBoundaryEvent { attached_to, .. }
+        | ElementKind::TimerBoundaryEvent { attached_to, .. }
+        | ElementKind::MessageBoundaryEvent { attached_to, .. }
+        | ElementKind::SignalBoundaryEvent { attached_to, .. }
+        | ElementKind::ConditionalBoundaryEvent { attached_to, .. } => Some(attached_to),
+        ElementKind::StartEvent
+        | ElementKind::EndEvent
+        | ElementKind::ServiceTask { .. }
+        | ElementKind::UserTask(_)
+        | ElementKind::ExclusiveGateway
+        | ElementKind::ParallelGateway
+        | ElementKind::TimerIntermediateCatchEvent { .. }
+        | ElementKind::MessageIntermediateCatchEvent { .. }
+        | ElementKind::MessageStartEvent { .. }
+        | ElementKind::TimerStartEvent { .. }
+        | ElementKind::SubProcess { .. }
+        | ElementKind::IntermediateThrowEvent
+        | ElementKind::ScriptTask { .. }
+        | ElementKind::CallActivity { .. }
+        | ElementKind::SignalIntermediateCatchEvent { .. }
+        | ElementKind::ConditionalIntermediateCatchEvent { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nanobpmn_engine_core::ProcessBuilder;
@@ -543,6 +1173,157 @@ mod tests {
         assert!(
             ir.contains("startEvent Start \"the \\\"real\\\" start\"\n"),
             "\n{ir}"
+        );
+    }
+
+    // --- Phase 2: parser + round-trip -----------------------------------------------------
+
+    #[test]
+    fn round_trips_the_loan_model_through_emit_parse_emit() {
+        // The reversibility guarantee at unit level: emit(parse(emit(model))) == emit(model).
+        let ir1 = xml_to_ir(LOAN_BPMN).expect("emit");
+        let parsed = ir_to_definition(&ir1).expect("parse");
+        let ir2 = definition_to_ir(&parsed.definition, &parsed.names);
+        assert_eq!(ir1, ir2, "IR must survive a parse/emit round-trip");
+    }
+
+    #[test]
+    fn parses_structure_default_condition_and_names() {
+        let ir = xml_to_ir(LOAN_BPMN).expect("emit");
+        let parsed = ir_to_definition(&ir).expect("parse");
+        let def = &parsed.definition;
+        assert_eq!(def.id, "loan-approval");
+        assert_eq!(def.start_event, "Start");
+        assert_eq!(
+            parsed.names.get("Start").map(String::as_str),
+            Some("Application received")
+        );
+        // The service task's job type survived.
+        match &def.elements["CheckCredit"].kind {
+            ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, "check-credit"),
+            other => panic!("expected serviceTask, got {other:?}"),
+        }
+        // The gateway's default + conditional flows parsed with the right semantics.
+        let gate = &def.elements["Decision"];
+        let approve = gate.outgoing.iter().find(|f| f.to == "Approve").unwrap();
+        let manual = gate.outgoing.iter().find(|f| f.to == "Manual").unwrap();
+        assert_eq!(
+            approve.condition.as_ref().map(|c| c.expression.as_str()),
+            Some("= amount >= 1000")
+        );
+        assert!(!approve.is_default);
+        assert!(manual.is_default);
+        assert!(manual.condition.is_none());
+    }
+
+    #[test]
+    fn round_trips_a_synthetic_model_with_boundary_io_and_mi() {
+        // A model exercising element-level annotations (io, retries, multi-instance) and a boundary
+        // event, built directly and round-tripped emit -> parse -> emit.
+        let mut def = ProcessBuilder::new("Rich")
+            .start_event("Start")
+            .service_task("Work", "do-work")
+            .error_boundary_event("OnFail", "Work", "BOOM")
+            .end_event("Done")
+            .end_event("Failed")
+            .connect("Start", "Work")
+            .connect("Work", "Done")
+            .connect("OnFail", "Failed")
+            .build()
+            .unwrap();
+        {
+            let work = def.elements.get_mut("Work").unwrap();
+            work.retries = Some("5".into());
+            work.io.inputs.push(Mapping {
+                source: "=order.items".into(),
+                target: "items".into(),
+            });
+            work.multi_instance = Some(MultiInstance {
+                input_collection: "=items".into(),
+                input_element: Some("item".into()),
+                output_collection: Some("results".into()),
+                output_element: Some("=out".into()),
+                completion_condition: None,
+                sequential: true,
+            });
+        }
+        let ir1 = definition_to_ir(&def, &HashMap::new());
+        let parsed = ir_to_definition(&ir1).expect("parse");
+        let ir2 = definition_to_ir(&parsed.definition, &parsed.names);
+        assert_eq!(ir1, ir2, "annotations must survive the round-trip:\n{ir1}");
+        // Spot-check the reconstructed model rather than only its text.
+        let work = &parsed.definition.elements["Work"];
+        assert_eq!(work.retries.as_deref(), Some("5"));
+        assert_eq!(work.io.inputs.len(), 1);
+        let mi = work.multi_instance.as_ref().unwrap();
+        assert_eq!(mi.input_collection, "=items");
+        assert!(mi.sequential);
+        match &parsed.definition.elements["OnFail"].kind {
+            ElementKind::ErrorBoundaryEvent {
+                attached_to,
+                error_code,
+            } => {
+                assert_eq!(attached_to, "Work");
+                assert_eq!(error_code, "BOOM");
+            }
+            other => panic!("expected error boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_gateway_flow_order_through_parse() {
+        let def = ProcessBuilder::new("Priority")
+            .start_event("Start")
+            .exclusive_gateway("Gate")
+            .end_event("Zeta")
+            .end_event("Alpha")
+            .connect("Start", "Gate")
+            .connect_when("Gate", "Zeta", "= amount > 100")
+            .connect_default("Gate", "Alpha")
+            .build()
+            .unwrap();
+        let ir = definition_to_ir(&def, &HashMap::new());
+        let parsed = ir_to_definition(&ir).expect("parse");
+        let gate = &parsed.definition.elements["Gate"];
+        // First declared flow (the conditional) must remain first after parsing.
+        assert_eq!(gate.outgoing[0].to, "Zeta");
+        assert_eq!(gate.outgoing[1].to, "Alpha");
+        assert!(gate.outgoing[1].is_default);
+    }
+
+    #[test]
+    fn parser_is_total_and_reports_clear_errors() {
+        // Unknown kind.
+        let e = ir_to_definition("process \"p\" {\n start S\n frobnicate S\n}").unwrap_err();
+        assert!(e.contains("unknown element kind 'frobnicate'"), "{e}");
+        // Missing required attribute.
+        let e = ir_to_definition("process \"p\" {\n start S\n startEvent S\n serviceTask T\n}")
+            .unwrap_err();
+        assert!(e.contains("missing required attribute 'jobType'"), "{e}");
+        // Dangling flow target.
+        let e = ir_to_definition("process \"p\" {\n start S\n startEvent S\n S -> Ghost\n}")
+            .unwrap_err();
+        assert!(e.contains("unknown element 'Ghost'"), "{e}");
+        // Start event not declared.
+        let e = ir_to_definition("process \"p\" {\n start Missing\n endEvent E\n}").unwrap_err();
+        assert!(e.contains("start event 'Missing'"), "{e}");
+        // Unterminated string.
+        let e = ir_to_definition("process \"p").unwrap_err();
+        assert!(e.contains("unterminated string"), "{e}");
+    }
+
+    #[test]
+    fn analyze_ir_surfaces_semantic_warnings() {
+        // A gateway with two conditional flows and no default should trip the existing
+        // `exclusive-no-default` advisory, proving analyze_model is reused over the parsed IR.
+        let ir = "process \"p\" {\n  start S\n  startEvent S\n  exclusiveGateway G\n  \
+                  endEvent A\n  endEvent B\n  S -> G\n  G -> A when \"= x > 1\"\n  \
+                  G -> B when \"= x <= 1\"\n}";
+        let analysis = analyze_ir(ir).expect("analyze");
+        let text = analysis.to_string();
+        assert!(
+            text.contains("default"),
+            "expected a no-default advisory, got: {text}"
         );
     }
 }
