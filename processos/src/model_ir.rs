@@ -1326,4 +1326,94 @@ mod tests {
             "expected a no-default advisory, got: {text}"
         );
     }
+
+    /// Phase 3 (ADR 0001): corpus replay property test. For every model in the recorded customer
+    /// corpus, the reversible pipeline `fromXml → emit → parse → toXml` must preserve the executable
+    /// `ProcessDefinition`. Structural equality of the executable core (id, start event, and every
+    /// element with its outgoing-flow order) is strictly stronger than "`simulate()` outcomes match":
+    /// an identical model simulates identically for all inputs. We assert two closures:
+    ///   1. IR round-trip: `def → definition_to_ir → ir_to_definition` reproduces `def`.
+    ///   2. Full pipeline: additionally `→ definition_to_xml_labeled → parse_bpmn` reproduces `def`.
+    ///
+    /// A corpus-size floor guards against the test silently passing if the corpus dir moves/empties.
+    #[test]
+    fn corpus_models_survive_the_ir_roundtrip() {
+        use std::path::PathBuf;
+        fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    collect(&p, out);
+                } else if p.extension().map(|x| x == "bpmn").unwrap_or(false) {
+                    out.push(p);
+                }
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus-packs");
+        let mut files = Vec::new();
+        collect(&root, &mut files);
+        files.sort();
+
+        let mut checked = 0usize;
+        for f in &files {
+            let name = f.file_name().unwrap().to_string_lossy().to_string();
+            let xml = std::fs::read_to_string(f).unwrap();
+            let defs = parse_bpmn(&xml)
+                .unwrap_or_else(|e| panic!("corpus model {name} failed to parse: {e:?}"));
+            let names = crate::bpmn_model::parse_element_names(&xml);
+            for def in &defs {
+                // 1. IR round-trip closure.
+                let ir = definition_to_ir(def, &names);
+                let parsed = ir_to_definition(&ir).unwrap_or_else(|e| {
+                    panic!(
+                        "IR for {name} [{}] failed to parse back:\n{e}\n--- IR ---\n{ir}",
+                        def.id
+                    )
+                });
+                assert_eq!(
+                    parsed.definition.id, def.id,
+                    "IR round-trip changed process id for {name}"
+                );
+                assert_eq!(
+                    parsed.definition.start_event, def.start_event,
+                    "IR round-trip changed start event for {name} [{}]",
+                    def.id
+                );
+                assert_eq!(
+                    parsed.definition.elements, def.elements,
+                    "IR round-trip changed elements for {name} [{}]",
+                    def.id
+                );
+
+                // 2. Full ADR pipeline closure: fromXml -> emit -> parse -> toXml -> fromXml.
+                let xml2 =
+                    crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
+                let round = parse_bpmn(&xml2).unwrap_or_else(|e| {
+                    panic!(
+                        "re-emitted XML for {name} [{}] failed to parse: {e:?}",
+                        def.id
+                    )
+                });
+                let r = round.first().unwrap_or_else(|| {
+                    panic!("re-emitted XML for {name} [{}] had no process", def.id)
+                });
+                assert_eq!(r.id, def.id, "full pipeline changed process id for {name}");
+                assert_eq!(
+                    r.start_event, def.start_event,
+                    "full pipeline changed start event for {name} [{}]",
+                    def.id
+                );
+                assert_eq!(
+                    r.elements, def.elements,
+                    "full pipeline changed elements for {name} [{}]",
+                    def.id
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 11,
+            "expected at least 11 corpus models, only checked {checked} — has corpus-packs moved?"
+        );
+    }
 }

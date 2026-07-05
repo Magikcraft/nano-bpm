@@ -1578,9 +1578,36 @@ fn emit_multi_instance(el: &Element, out: &mut String) {
     out.push_str("      </bpmn:multiInstanceLoopCharacteristics>\n");
 }
 
+/// Emit a `zeebe:ioMapping` block (with its nested `zeebe:input`/`zeebe:output`) if the element
+/// carries any variable mappings. Emitted INSIDE the owner's `<bpmn:extensionElements>` so the
+/// engine parser (which only reads input/output within an open ioMapping on an activity) round-trips
+/// them. A no-op when both directions are empty, so nodes without mappings stay terse.
+fn emit_io_mapping(el: &Element, out: &mut String) {
+    if el.io.inputs.is_empty() && el.io.outputs.is_empty() {
+        return;
+    }
+    out.push_str("        <zeebe:ioMapping>\n");
+    for m in &el.io.inputs {
+        out.push_str(&format!(
+            "          <zeebe:input source=\"{}\" target=\"{}\"/>\n",
+            xml_escape(&m.source),
+            xml_escape(&m.target)
+        ));
+    }
+    for m in &el.io.outputs {
+        out.push_str(&format!(
+            "          <zeebe:output source=\"{}\" target=\"{}\"/>\n",
+            xml_escape(&m.source),
+            xml_escape(&m.target)
+        ));
+    }
+    out.push_str("        </zeebe:ioMapping>\n");
+}
+
 /// Serialize one element (and, for a sub-process, its contained children) as BPMN XML. Sequence
 /// flows are emitted separately and flat, so this only renders the node and its event/extension
 /// definitions. `errors`/`messages`/`signals` provide the synthesized declaration ids to reference.
+/// `default_flows` maps a gateway id to the synthesized id of its default outgoing flow.
 #[allow(clippy::too_many_arguments)]
 fn emit_element(
     def: &ProcessDefinition,
@@ -1590,6 +1617,7 @@ fn emit_element(
     signals: &BTreeMap<String, String>,
     children_by_parent: &HashMap<String, Vec<String>>,
     labels: &HashMap<String, String>,
+    default_flows: &HashMap<String, String>,
     out: &mut String,
 ) {
     let el = &def.elements[id];
@@ -1624,6 +1652,7 @@ fn emit_element(
                 xml_escape(expression),
                 xml_escape(result_variable)
             ));
+            emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:scriptTask>\n");
         }
@@ -1634,7 +1663,13 @@ fn emit_element(
             ));
         }
         ElementKind::ExclusiveGateway => {
-            out.push_str(&format!("    <bpmn:exclusiveGateway id=\"{eid}\"{na}/>\n"));
+            let da = default_flows
+                .get(id)
+                .map(|f| format!(" default=\"{}\"", xml_escape(f)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "    <bpmn:exclusiveGateway id=\"{eid}\"{na}{da}/>\n"
+            ));
         }
         ElementKind::ParallelGateway => {
             out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
@@ -1642,8 +1677,13 @@ fn emit_element(
         ElementKind::ServiceTask { job_type, priority } => {
             out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
+            let retries_attr = el
+                .retries
+                .as_deref()
+                .map(|r| format!(" retries=\"{}\"", xml_escape(r)))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "        <zeebe:taskDefinition type=\"{}\"/>\n",
+                "        <zeebe:taskDefinition type=\"{}\"{retries_attr}/>\n",
                 xml_escape(job_type)
             ));
             if let Some(p) = priority {
@@ -1652,6 +1692,7 @@ fn emit_element(
                     xml_escape(p)
                 ));
             }
+            emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             out.push_str("    </bpmn:serviceTask>\n");
@@ -1908,6 +1949,7 @@ fn emit_element(
                         signals,
                         children_by_parent,
                         labels,
+                        default_flows,
                         out,
                     );
                 }
@@ -2009,6 +2051,24 @@ pub fn definition_to_xml_labeled(
         "  <bpmn:process id=\"{}\" isExecutable=\"true\">\n",
         xml_escape(&def.id)
     ));
+    // Precompute the synthesized id of each source's default outgoing flow, replicating the exact
+    // numbering the sequence-flow loop below uses (sorted sources, outgoing in declaration order,
+    // `Flow_{n}` starting at 1). A gateway then emits `default="Flow_N"` referencing the same id,
+    // so the parser re-flags the branch as the default fallback on the round-trip.
+    let mut default_flows: HashMap<String, String> = HashMap::new();
+    {
+        let mut sources: Vec<&String> = def.elements.keys().collect();
+        sources.sort();
+        let mut k = 0usize;
+        for src in sources {
+            for flow in &def.elements[src].outgoing {
+                k += 1;
+                if flow.is_default {
+                    default_flows.insert(src.clone(), format!("Flow_{k}"));
+                }
+            }
+        }
+    }
     // Emit top-level nodes (parent == None) in a stable order; sub-processes recurse.
     let mut top: Vec<&String> = def
         .elements
@@ -2026,6 +2086,7 @@ pub fn definition_to_xml_labeled(
             &signals,
             &children_by_parent,
             &labels,
+            &default_flows,
             &mut out,
         );
     }
@@ -3289,6 +3350,96 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "Approve" && f.condition.is_some()));
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_a_gateway_default_flow() {
+        // The original motivating bug: a gateway `default` fallback was DROPPED by the serializer
+        // (no `default="…"` attribute emitted), so an authored default flow silently degraded to a
+        // plain unconditioned branch on deploy. The serializer must now emit `default="Flow_N"` and
+        // the re-parse must re-flag exactly that branch as the default.
+        let def = nanobpmn_engine_core::ProcessBuilder::new("Routed")
+            .start_event("Start")
+            .exclusive_gateway("Gate")
+            .service_task("Approve", "approve")
+            .service_task("Review", "review")
+            .end_event("DoneA")
+            .end_event("DoneR")
+            .connect("Start", "Gate")
+            .connect_when("Gate", "Approve", "= score >= 700")
+            .connect_default("Gate", "Review")
+            .connect("Approve", "DoneA")
+            .connect("Review", "DoneR")
+            .build()
+            .unwrap();
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:exclusiveGateway id=\"Gate\"") && xml.contains(" default=\"Flow_"),
+            "gateway must emit a default=\"Flow_N\" attribute, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let gate = &reparsed[0].elements["Gate"];
+        let default_branch = gate
+            .outgoing
+            .iter()
+            .find(|f| f.is_default)
+            .expect("a default branch survives the round trip");
+        assert_eq!(
+            default_branch.to, "Review",
+            "the Review branch is the default"
+        );
+        assert!(
+            gate.outgoing
+                .iter()
+                .find(|f| f.to == "Approve")
+                .is_some_and(|f| !f.is_default && f.condition.is_some()),
+            "the guarded branch stays conditioned and non-default"
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_task_retries_and_io_mappings() {
+        // A service task carrying a `retries` expression plus `zeebe:ioMapping` input/output
+        // variable mappings must round-trip: all three were previously dropped by the serializer,
+        // which would silently change retry + variable-flow behavior (i.e. simulate() outcomes).
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Mapped")
+            .start_event("Start")
+            .service_task("Call", "io.camunda:http-json:1")
+            .end_event("Done")
+            .connect("Start", "Call")
+            .connect("Call", "Done")
+            .with_retries("Call", "=maxRetries")
+            .build()
+            .unwrap();
+        {
+            let el = def.elements.get_mut("Call").unwrap();
+            el.io.inputs.push(nanobpmn_engine_core::Mapping {
+                source: "=orderId".into(),
+                target: "id".into(),
+            });
+            el.io.outputs.push(nanobpmn_engine_core::Mapping {
+                source: "=response.body".into(),
+                target: "result".into(),
+            });
+        }
+        let xml = definition_to_xml(&def);
+        assert!(xml.contains("retries=\"=maxRetries\""), "emits retries");
+        assert!(xml.contains("<zeebe:ioMapping>"), "emits ioMapping");
+        assert!(
+            xml.contains("<zeebe:input source=\"=orderId\" target=\"id\"/>"),
+            "emits the input mapping"
+        );
+        assert!(
+            xml.contains("<zeebe:output source=\"=response.body\" target=\"result\"/>"),
+            "emits the output mapping"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let call = &reparsed[0].elements["Call"];
+        assert_eq!(call.retries.as_deref(), Some("=maxRetries"));
+        assert_eq!(call.io.inputs.len(), 1);
+        assert_eq!(call.io.outputs.len(), 1);
     }
 
     #[test]
