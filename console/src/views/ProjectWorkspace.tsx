@@ -470,6 +470,15 @@ function EditorPane({ name, path }: { name: string; path: string }) {
   const [testXml, setTestXml] = useState<string | null>(null);
   // Markdown files open in a rendered Preview tab; the user can switch to Edit.
   const [mdView, setMdView] = useState<"preview" | "edit">("preview");
+  // BPMN files open in the graphical modeler; the user can switch to a raw XML
+  // editor to inspect/tweak the underlying document. The modeler stays mounted
+  // when the XML tab is active so canvas state is preserved across toggles.
+  const [bpmnView, setBpmnView] = useState<"visual" | "xml">("visual");
+  const [bpmnXml, setBpmnXml] = useState<string>("");
+  // Tracks whether `bpmnXml` was edited in the XML tab since it was pulled from
+  // the modeler. On switch back to Visual we import it so both surfaces stay in
+  // sync; on Save from the XML tab we persist `bpmnXml` directly.
+  const bpmnXmlDirtyRef = useRef(false);
 
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   const kind: "bpmn" | "dmn" | "form" | "md" | "code" =
@@ -490,6 +499,9 @@ function EditorPane({ name, path }: { name: string; path: string }) {
     setDirty(false);
     setLoadError(null);
     setMdView("preview");
+    setBpmnView("visual");
+    setBpmnXml("");
+    bpmnXmlDirtyRef.current = false;
     projectsApi
       .projectFileEx(name, path)
       .then((f) => {
@@ -521,18 +533,53 @@ function EditorPane({ name, path }: { name: string; path: string }) {
     setSaving(true);
     try {
       let body = content ?? "";
-      if (kind === "bpmn" && bpmnRef.current) body = await bpmnRef.current.getXml();
+      if (kind === "bpmn" && bpmnView === "xml") body = bpmnXml;
+      else if (kind === "bpmn" && bpmnRef.current) body = await bpmnRef.current.getXml();
       else if (kind === "dmn" && dmnRef.current) body = await dmnRef.current.getXml();
       else if (kind === "form" && formRef.current) body = await formRef.current.getSchema();
       await projectsApi.saveProjectFile(name, path, body);
       setContent(body);
       setDirty(false);
+      if (kind === "bpmn") {
+        // Persisted body is now authoritative in both surfaces.
+        setBpmnXml(body);
+        bpmnXmlDirtyRef.current = false;
+      }
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
-  }, [content, kind, name, path]);
+  }, [content, kind, name, path, bpmnView, bpmnXml]);
+
+  // Switches the BPMN editor between the graphical canvas and the raw XML tab.
+  // Visual → XML: pull the current serialized document from the modeler.
+  // XML → Visual: if the XML was edited in the textarea, import it back so the
+  // canvas reflects the edits (any import error surfaces via alert so the user
+  // can fix the XML rather than silently losing changes).
+  const switchBpmnView = useCallback(
+    async (next: "visual" | "xml") => {
+      if (next === bpmnView) return;
+      if (next === "xml") {
+        const xml = (await bpmnRef.current?.getXml()) ?? "";
+        setBpmnXml(xml);
+        bpmnXmlDirtyRef.current = false;
+        setBpmnView("xml");
+      } else {
+        if (bpmnXmlDirtyRef.current && bpmnRef.current) {
+          try {
+            await bpmnRef.current.importXml(bpmnXml);
+            bpmnXmlDirtyRef.current = false;
+          } catch (e) {
+            alert(`Could not import XML: ${e instanceof Error ? e.message : String(e)}`);
+            return;
+          }
+        }
+        setBpmnView("visual");
+      }
+    },
+    [bpmnView, bpmnXml],
+  );
 
   // Cmd/Ctrl+S saves graphical editors too (CodeEditor has its own binding).
   useEffect(() => {
@@ -596,9 +643,28 @@ function EditorPane({ name, path }: { name: string; path: string }) {
           </div>
         )}
         {kind === "bpmn" && (
+          <div className="flex overflow-hidden rounded-md border border-edge-strong">
+            {(["visual", "xml"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => void switchBpmnView(mode)}
+                className={`px-3 py-1 text-xs font-medium uppercase transition-colors ${
+                  bpmnView === mode
+                    ? "bg-accent text-on-accent"
+                    : "text-fg-muted hover:bg-hover"
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+        )}
+        {kind === "bpmn" && (
           <button
             onClick={async () => {
-              const xml = await bpmnRef.current?.getXml();
+              // Pull from whichever surface currently holds the latest doc.
+              const xml =
+                bpmnView === "xml" ? bpmnXml : ((await bpmnRef.current?.getXml()) ?? "");
               if (xml) setTestXml(xml);
             }}
             className="rounded-md border border-edge-strong px-3 py-1 text-xs font-medium text-fg transition-colors hover:border-ok hover:text-ok"
@@ -608,7 +674,7 @@ function EditorPane({ name, path }: { name: string; path: string }) {
         )}
         <button
           onClick={() => void save()}
-          disabled={saving || ((kind === "code" || kind === "md") && !dirty)}
+          disabled={saving || ((kind === "code" || kind === "md" || kind === "bpmn") && !dirty)}
           className="rounded-md bg-accent px-3 py-1 text-xs font-medium text-on-accent transition-colors hover:bg-accent-strong disabled:opacity-40"
         >
           {saving ? "Saving…" : "Save"}
@@ -617,7 +683,29 @@ function EditorPane({ name, path }: { name: string; path: string }) {
       <div className="min-h-0 flex-1">
         {kind === "bpmn" && (
           <div className="relative h-full">
-            <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} />
+            {/*
+              Keep the modeler mounted while the XML tab is active so canvas
+              state (selection, viewport, in-flight edits) survives toggling.
+              The XML editor is layered above via absolute positioning.
+            */}
+            <div className={bpmnView === "visual" ? "h-full" : "h-full invisible"}>
+              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} />
+            </div>
+            {bpmnView === "xml" && (
+              <div className="absolute inset-0 bg-app">
+                <CodeEditor
+                  value={bpmnXml}
+                  language="xml"
+                  path={`file:///bpmn-xml-view/${path}`}
+                  onChange={(v) => {
+                    setBpmnXml(v);
+                    bpmnXmlDirtyRef.current = true;
+                    setDirty(true);
+                  }}
+                  onSave={() => void save()}
+                />
+              </div>
+            )}
             {testXml && (
               <div className="absolute inset-0 z-10 bg-app">
                 <Suspense
