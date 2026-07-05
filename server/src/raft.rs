@@ -745,18 +745,34 @@ struct Submission {
 
 /// Command intake classification for the propose batcher's two-tier priority.
 ///
-/// Mirrors Zeebe's `WhiteListedCommands`: the only thing deprioritized is fresh
-/// *demand entering* the system — process creation ([`Command::CreateInstance`]).
-/// Everything else — job completion, failure, thrown errors, activation, timer
-/// and lock-expiry ticks, message/signal correlation, cancellation, deploys and
-/// all administrative commands — is *progress on already-admitted work* and rides
-/// the high-priority lane. This guarantees a flood of creates can never sit in
-/// the Raft log ahead of the drain path: the cluster always makes progress on
-/// (and frees the resources of) work it has already accepted, which in turn
-/// reopens admission. It matches the engine actor's High/Low mailbox
-/// (`deepthi::Priority`) one layer down, so the two agree end to end.
+/// Returns `true` for fresh *demand entering* the system — process creation,
+/// job **activation** (a poll, which Zeebe likewise does NOT whitelist), and
+/// start-event instance dispatch. These take the low-priority lane. Everything
+/// else — job/user-task finalization, cancellation, incident resolution, timer
+/// and lock-expiry ticks, deploys, and message/signal correlation — is *progress
+/// on already-admitted work* and takes the high lane.
+///
+/// Two properties make this safe in both directions, mirroring Zeebe's
+/// `WhiteListedCommands`:
+/// - **Drain can't be starved by intake:** completes/activation never sit in the
+///   Raft log behind a backlog of creates, so the cluster always frees the
+///   resources of work it accepted (which reopens admission).
+/// - **Intake can't be starved by drain:** the high lane's volume is bounded by
+///   low-lane admission — you cannot complete/correlate more work than you
+///   created — so a create can never be permanently starved. Crucially,
+///   *activation* is intake, not drain: a flood of empty activation polls from
+///   idle workers stays on the low lane and interleaves with creates FIFO
+///   instead of monopolising the high lane and starving creation.
+///
+/// It matches the engine actor's High/Low mailbox (`deepthi::Priority`) one layer
+/// down, so the two agree end to end.
 fn is_creation_intake(command: &Command) -> bool {
-    matches!(command, Command::CreateInstance { .. })
+    matches!(
+        command,
+        Command::CreateInstance { .. }
+            | Command::ActivateJobs { .. }
+            | Command::DispatchStartInstance { .. }
+    )
 }
 
 /// Coalesces concurrently-proposed commands for one partition into batched Raft
@@ -1121,22 +1137,25 @@ mod tests {
     }
 
     #[test]
-    fn only_process_creation_is_low_priority_intake() {
+    fn creation_and_activation_are_low_priority_intake() {
         use std::collections::HashMap;
-        // Fresh demand entering the system is the sole low-priority (deprioritized)
-        // command — the log-layer analogue of Zeebe's `WhiteListedCommands`.
+        // Fresh demand entering the system — process creation AND job activation
+        // (a poll) — takes the low-priority lane. Putting activation on the high
+        // lane lets a flood of empty polls from idle workers starve creation,
+        // which is exactly what Zeebe avoids by NOT whitelisting JobBatch.ACTIVATE.
         assert!(is_creation_intake(&Command::CreateInstance {
             process_id: "p".into(),
             variables: HashMap::new(),
             tags: vec![],
             business_id: None,
         }));
+        assert!(is_creation_intake(&Command::activate_jobs("t", "w", 1, 1, 0)));
 
-        // The drain / progress path takes the high-priority lane so a create flood
-        // can never starve it in the Raft log.
+        // The drain / progress path (finalization, cancellation, maintenance)
+        // takes the high-priority lane; its volume is bounded by low-lane
+        // admission, so it can never permanently starve a create.
         assert!(!is_creation_intake(&Command::complete_job_with(1, HashMap::new())));
         assert!(!is_creation_intake(&Command::fail_job(1, 0, "e")));
-        assert!(!is_creation_intake(&Command::activate_jobs("t", "w", 1, 1, 0)));
         assert!(!is_creation_intake(&Command::ExpireJobs { now: 0 }));
         assert!(!is_creation_intake(&Command::TriggerTimers { now: 0 }));
         assert!(!is_creation_intake(&Command::CancelInstance { instance_key: 1 }));
