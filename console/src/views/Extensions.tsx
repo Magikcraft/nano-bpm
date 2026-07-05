@@ -81,33 +81,37 @@ export default function Extensions() {
             <SectionLabel>{cat.label}</SectionLabel>
             <div className="grid gap-2">
               {items.map((m) => (
-                <Card key={m.name} className="flex items-center justify-between p-3">
-                  <div className="min-w-0">
-                    <span className="font-medium text-fg">{m.name}</span>
-                    <span className="ml-2 text-xs text-fg-faint">
-                      {m.installed && m.installedVersion && m.installedVersion !== m.version
-                        ? `${m.installedVersion} → ${m.version}`
-                        : m.version}
-                    </span>
-                    <div className="truncate text-xs text-fg-faint">{m.description}</div>
+                <Card key={m.name} className="flex items-start justify-between gap-3 p-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-baseline gap-x-2">
+                      <span className="break-all font-medium text-fg">{m.name}</span>
+                      <span className="text-xs text-fg-faint">
+                        {m.installed && m.installedVersion && m.installedVersion !== m.version
+                          ? `${m.installedVersion} → ${m.version}`
+                          : m.version}
+                      </span>
+                    </div>
+                    <div className="mt-0.5 whitespace-normal break-words text-xs text-fg-faint">
+                      {m.description}
+                    </div>
                   </div>
                   {m.updateAvailable ? (
                     <Button
                       variant="secondary"
                       size="sm"
-                      className="ml-3 shrink-0 border-warn/40 text-warn"
+                      className="shrink-0 border-warn/40 text-warn"
                       onClick={() => void install(m.name)}
                       disabled={busy === m.name}
                     >
                       {busy === m.name ? "Updating…" : "Update"}
                     </Button>
                   ) : m.installed ? (
-                    <span className="ml-3 shrink-0 text-xs text-ok">installed</span>
+                    <span className="shrink-0 text-xs text-ok">installed</span>
                   ) : (
                     <Button
                       variant="primary"
                       size="sm"
-                      className="ml-3 shrink-0"
+                      className="shrink-0"
                       onClick={() => void install(m.name)}
                       disabled={busy === m.name}
                     >
@@ -127,18 +131,20 @@ export default function Extensions() {
       <div className="grid gap-3">
         {ov?.extensions.map((e) => (
           <Card key={e.id} className="p-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <span className="font-medium text-fg">{e.displayName}</span>
-                <Badge tone={e.kind === "theme" ? "accent" : "neutral"} className="ml-2">
-                  {e.kind}
-                </Badge>
-                {e.builtin && <span className="ml-2 text-xs text-fg-faint">built-in</span>}
-                {e.kind !== "theme" && !e.toolchainAvailable && (
-                  <span className="ml-2 text-xs text-warn">toolchain missing</span>
-                )}
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                  <span className="break-all font-medium text-fg">{e.displayName}</span>
+                  <Badge tone={e.kind === "theme" ? "accent" : "neutral"}>
+                    {e.kind}
+                  </Badge>
+                  {e.builtin && <span className="text-xs text-fg-faint">built-in</span>}
+                  {e.kind !== "theme" && !e.toolchainAvailable && (
+                    <span className="text-xs text-warn">toolchain missing</span>
+                  )}
+                </div>
               </div>
-              <div className="flex items-center gap-3 text-xs">
+              <div className="flex flex-wrap items-center gap-3 text-xs">
                 {!e.builtin && (
                   <label className="flex items-center gap-1 text-fg-muted">
                     <input type="checkbox" checked={e.trusted} onChange={(c) => void approve(e.id, c.target.checked)} />
@@ -153,7 +159,7 @@ export default function Extensions() {
               </div>
             </div>
             {(e.fileTypes.length > 0 || e.templates.length > 0) && (
-              <div className="mt-1 text-xs text-fg-faint">
+              <div className="mt-1 whitespace-normal break-words text-xs text-fg-faint">
                 {e.fileTypes.map((f) => f.ext).join(" ")} {e.templates.map((t) => t.id).join(", ")}
               </div>
             )}
