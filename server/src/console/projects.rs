@@ -1020,6 +1020,52 @@ pub fn create_project(
         return Err("a project with that name already exists".into());
     }
     let mk = |p: PathBuf| std::fs::create_dir_all(&p).map_err(|e| format!("create {p:?}: {e}"));
+
+    // ── Pack template short-circuit ───────────────────────────────────────
+    // If `template` names an installed pack template (or an example pack's
+    // own id), stamp out ONLY that pack's contents. The Deno-flavoured
+    // built-in files below would otherwise leak into a Java/Rust/etc.
+    // project — the caller ended up with a Deno starter with pack files
+    // sprinkled on top, and any BPMN the pack shipped got shadowed by
+    // resources/processes/*.bpmn from the built-in fallthrough.
+    let is_builtin_template = matches!(
+        template,
+        "starter" | "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter"
+    );
+    if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
+        mk(dir.clone())?;
+        super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
+        let cfg_lang = m
+            .requires
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "deno".to_string());
+        // Best-effort detection of the "main" entrypoint the console
+        // surfaces in the workspace toolbar. Ordered from most specific
+        // to least so multi-module Java packs prefer the actual module
+        // POM over an aggregator root POM. `is_file()` (not `exists()`)
+        // so a same-named directory can't masquerade as the entrypoint.
+        let candidates: &[&str] = &[
+            "src/main.rs",
+            "microservice/pom.xml",
+            "app/pom.xml",
+            "pom.xml",
+            "main.ts",
+        ];
+        let cfg_main = candidates
+            .iter()
+            .find(|c| dir.join(c).is_file())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "main.ts".to_string());
+        let mut cfg = ProjectConfig::new(name, description);
+        cfg.lang = cfg_lang;
+        cfg.app = "console".to_string();
+        cfg.main = cfg_main;
+        write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
+        return Ok(cfg);
+    }
+
+    // ── Built-in (Deno-flavoured) scaffolds ───────────────────────────────
     mk(dir.join("resources").join("processes"))?;
     mk(dir.join("resources").join("decisions"))?;
     mk(dir.join("resources").join("forms"))?;
@@ -1098,26 +1144,6 @@ pub fn create_project(
         )?;
         w(starter_worker.join("worker.ts"), STARTER_WORKER_TS)?;
         w(starter_worker.join("deno.json"), WORKER_DENO_JSON)?;
-    }
-
-    // Installed packs may contribute templates/example apps; copy theirs in and
-    // adopt their lang. Built-ins above win on id collision (offline baseline).
-    let is_builtin_template = matches!(
-        template,
-        "starter" | "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter"
-    );
-    if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
-        super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
-        if let Some(lang) = m.requires.first() {
-            cfg_lang = lang.clone();
-        }
-        if std::path::Path::new(&dir)
-            .join("src")
-            .join("main.rs")
-            .exists()
-        {
-            cfg_main = "src/main.rs".to_string();
-        }
     }
 
     let mut cfg = ProjectConfig::new(name, description);
@@ -2128,6 +2154,93 @@ mod tests {
         let dir = root.join("exdemo");
         assert!(dir.join("Cargo.toml").is_file());
         assert!(dir.join("src/main.rs").is_file());
+    }
+
+    /// Regression: a Java pack scaffold must NOT get the Deno-flavoured
+    /// built-in files (main.ts, deno.json, workers/do-work, lib/nano.ts,
+    /// .nanobpm/worker-sdk.ts, resources/processes/*.bpmn from the built-in
+    /// starter). Everything must come from the pack.
+    #[test]
+    fn java_pack_scaffold_does_not_get_deno_files() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__example-throughput-jvm");
+        std::fs::create_dir_all(pack.join("app/src/main/java/com/example")).unwrap();
+        std::fs::create_dir_all(pack.join("app/src/main/resources")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"throughput-jvm","kind":"example","displayName":"T","requires":["java","maven"],"appDir":"app"}"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("app/pom.xml"), "<project/>\n").unwrap();
+        std::fs::write(
+            pack.join("app/src/main/java/com/example/Main.java"),
+            "class Main{}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("app/src/main/resources/throughput.bpmn"),
+            "<bpmn/>",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let cfg = create_project("jbench", "", "throughput-jvm").expect("create");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        assert_eq!(cfg.lang, "java");
+        assert_eq!(cfg.main, "pom.xml");
+        let dir = root.join("jbench");
+        // Pack contents made it in (appDir contents copied to project root).
+        assert!(dir.join("pom.xml").is_file());
+        assert!(dir.join("src/main/java/com/example/Main.java").is_file());
+        assert!(dir.join("src/main/resources/throughput.bpmn").is_file());
+        // Deno-flavoured built-ins must NOT be present.
+        assert!(!dir.join("main.ts").exists(), "Deno main.ts leaked");
+        assert!(!dir.join("deno.json").exists(), "Deno deno.json leaked");
+        assert!(!dir.join("lib/nano.ts").exists(), "Deno lib/nano.ts leaked");
+        assert!(
+            !dir.join(".nanobpm/worker-sdk.ts").exists(),
+            ".nanobpm/worker-sdk.ts leaked"
+        );
+        assert!(
+            !dir.join("workers/do-work").exists(),
+            "workers/do-work leaked"
+        );
+        assert!(
+            !dir.join("resources/processes/jbench.bpmn").exists(),
+            "built-in starter BPMN shadowed the pack BPMN"
+        );
+    }
+
+    /// Regression: when a pack ships an aggregator `pom.xml` alongside a
+    /// module `microservice/pom.xml`, `cfg.main` must point at the module
+    /// POM (most specific) rather than the aggregator.
+    #[test]
+    fn multi_module_java_pack_prefers_module_pom_over_root_pom() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__app-embedded-multi");
+        std::fs::create_dir_all(pack.join("templates/multi-starter/microservice")).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"multi","kind":"app","displayName":"Multi","requires":["java","maven"],"templates":[{"id":"multi-starter","label":"Multi starter"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("templates/multi-starter/pom.xml"),
+            "<aggregator/>\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("templates/multi-starter/microservice/pom.xml"),
+            "<module/>\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let cfg = create_project("multiproj", "", "multi-starter").expect("create");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        assert_eq!(cfg.main, "microservice/pom.xml");
     }
 
     #[test]
