@@ -86,7 +86,7 @@ jobs:
       - name: Show manifest
         run: cat dist/engine-wasm-ffi/manifest.json
       - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: engine-wasm-ffi
           path: dist/engine-wasm-ffi/
@@ -106,7 +106,7 @@ jobs:
         with:
           node-version: '20'
       - name: Download engine-wasm-ffi artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: engine-wasm-ffi
           path: dist/engine-wasm-ffi/
@@ -128,13 +128,13 @@ jobs:
         working-directory: clients/nano-bernd-jvm
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
       - name: Download engine-wasm-ffi artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: engine-wasm-ffi
           path: dist/engine-wasm-ffi/
