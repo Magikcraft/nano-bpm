@@ -450,21 +450,30 @@ pub fn read_model_ir(xml: &str, target: Option<&str>) -> Result<serde_json::Valu
 /// hand-written XML. `ir_to_definition` validates structure (unknown kinds, missing attributes,
 /// dangling flow targets) with a human-readable error before anything is emitted.
 ///
-/// With no `base`, the IR *is* the whole model and compiles standalone. Pass `base` (the full
-/// document) and `process` (the phase id) to splice the IR back into a multi-stage model in place,
-/// preserving the other phase definitions and the authored overview — the same capability as
-/// `edit_model process:"<id>"`, but IR-driven. The result mirrors `edit_model`: a ready-to-simulate
-/// `model` plus the post-write `analyze_model` findings/metrics.
+/// With no `base`, the IR *is* the whole model and compiles standalone; when `di_source` (the XML
+/// the model was read from) carries a hand-authored diagram and the edit left the node + flow
+/// topology unchanged, that layout is preserved verbatim (ADR 0001 Phase 5), else it is auto-laid.
+/// Pass `base` (the full document) and `process` (the phase id) to splice the IR back into a
+/// multi-stage model in place, preserving the other phase definitions and the authored overview —
+/// the same capability as `edit_model process:"<id>"`, but IR-driven (the spliced phase is
+/// auto-laid). The result mirrors `edit_model`: a ready-to-simulate `model` plus the post-write
+/// `analyze_model` findings/metrics.
 pub fn write_model_ir(
     ir: &str,
     base: Option<&str>,
     process: Option<&str>,
+    di_source: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let parsed = ir_to_definition(ir)?;
     let (xml, edited_process) = match base {
         None => {
-            let xml =
-                crate::bpmn_model::definition_to_xml_labeled(&parsed.definition, &parsed.names);
+            // Single-process write: re-attach the original hand layout when the edit left the node
+            // and flow topology unchanged (ADR 0001 Phase 5), else auto-layout.
+            let xml = crate::bpmn_model::definition_to_xml_preserving_di(
+                &parsed.definition,
+                &parsed.names,
+                di_source,
+            );
             let id = parsed.definition.id.clone();
             (xml, id)
         }
@@ -1549,7 +1558,7 @@ mod tests {
     fn write_model_ir_compiles_ir_to_a_deployable_model() {
         // Round-trip through the tools: read -> write reproduces a deployable, engine-valid model.
         let ir = xml_to_ir(LOAN_BPMN).expect("emit ir");
-        let v = write_model_ir(&ir, None, None).expect("write ir");
+        let v = write_model_ir(&ir, None, None, None).expect("write ir");
         assert_eq!(v["ok"], true);
         assert_eq!(v["process"], "loan-approval");
         let model = v["model"].as_str().expect("model xml");
@@ -1579,7 +1588,7 @@ mod tests {
              Gate -> Hit when \"= score >= 700\"\n  \
              Gate -> Miss\n}";
         // Sanity: without `default`, the Miss branch is a plain flow.
-        let before = write_model_ir(ir, None, None).expect("write baseline");
+        let before = write_model_ir(ir, None, None, None).expect("write baseline");
         let before_model = before["model"].as_str().unwrap();
         let before_def = parse_bpmn(before_model).expect("parse baseline");
         assert!(
@@ -1591,7 +1600,7 @@ mod tests {
         );
         // Now the edit an LLM would make: append ` default` to the Miss branch.
         let edited = ir.replace("Gate -> Miss\n", "Gate -> Miss default\n");
-        let after = write_model_ir(&edited, None, None).expect("write with default");
+        let after = write_model_ir(&edited, None, None, None).expect("write with default");
         let after_model = after["model"].as_str().unwrap();
         let after_def = parse_bpmn(after_model).expect("parse edited");
         let gate = &after_def[0].elements["Gate"];
@@ -1607,7 +1616,7 @@ mod tests {
     fn write_model_ir_reports_a_clear_error_on_a_dangling_flow() {
         // A flow to an undeclared node must fail validation with a readable error, not a panic.
         let ir = "process \"p\" {\n  start S\n  startEvent S\n  S -> Nope\n}";
-        let err = write_model_ir(ir, None, None).unwrap_err();
+        let err = write_model_ir(ir, None, None, None).unwrap_err();
         assert!(
             err.to_lowercase().contains("nope") || err.to_lowercase().contains("declared"),
             "error should name the dangling target: {err}"
@@ -1650,7 +1659,8 @@ mod tests {
         assert!(phase_ir.contains("process \"Phase\" {"), "\n{phase_ir}");
         // Edit the phase: change the job type, then splice it back.
         let edited = phase_ir.replace("\"work\"", "\"work-v2\"");
-        let v = write_model_ir(&edited, Some(base), Some("Phase")).expect("splice write");
+        let v =
+            write_model_ir(&edited, Some(base), Some("Phase"), Some(base)).expect("splice write");
         assert_eq!(v["process"], "Phase");
         let model = v["model"].as_str().expect("model");
         let defs = parse_bpmn(model).expect("spliced model parses");
@@ -1667,5 +1677,118 @@ mod tests {
             ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, "work-v2"),
             other => panic!("Work should stay a service task, got {other:?}"),
         }
+    }
+
+    /// A hand-laid diagram with deliberately non-generatable coordinates and custom flow ids, so a
+    /// preserved round-trip is observable (auto-layout would never reproduce these exact bounds).
+    const HAND_LAID_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI">
+  <bpmn:process id="router" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>f_sg</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gate"><bpmn:incoming>f_sg</bpmn:incoming><bpmn:outgoing>f_hit</bpmn:outgoing><bpmn:outgoing>f_miss</bpmn:outgoing></bpmn:exclusiveGateway>
+    <bpmn:endEvent id="Hit"><bpmn:incoming>f_hit</bpmn:incoming></bpmn:endEvent>
+    <bpmn:endEvent id="Miss"><bpmn:incoming>f_miss</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="f_sg" sourceRef="Start" targetRef="Gate" />
+    <bpmn:sequenceFlow id="f_hit" sourceRef="Gate" targetRef="Hit"><bpmn:conditionExpression>= score &gt;= 700</bpmn:conditionExpression></bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f_miss" sourceRef="Gate" targetRef="Miss" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diag">
+    <bpmndi:BPMNPlane id="Plane" bpmnElement="router">
+      <bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="152" y="82" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gate_di" bpmnElement="Gate" isMarkerVisible="true"><dc:Bounds x="251" y="73" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Hit_di" bpmnElement="Hit"><dc:Bounds x="403" y="41" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Miss_di" bpmnElement="Miss"><dc:Bounds x="403" y="121" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f_sg_di" bpmnElement="f_sg"><di:waypoint x="188" y="100" /><di:waypoint x="251" y="98" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_hit_di" bpmnElement="f_hit"><di:waypoint x="276" y="73" /><di:waypoint x="276" y="59" /><di:waypoint x="403" y="59" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f_miss_di" bpmnElement="f_miss"><di:waypoint x="276" y="123" /><di:waypoint x="276" y="139" /><di:waypoint x="403" y="139" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn write_model_ir_preserves_hand_layout_on_an_unchanged_topology_edit() {
+        // ADR 0001 Phase 5: an attribute-only edit (add a gateway default flow) must NOT re-lay the
+        // customer's diagram. Read -> edit the IR -> write with the original as the DI source, and
+        // confirm the exact hand-laid bounds AND the original flow ids survive verbatim.
+        let ir = read_model_ir(HAND_LAID_BPMN, None).expect("read ir")["ir"]
+            .as_str()
+            .expect("ir string")
+            .to_string();
+        let edited = ir.replace("Gate -> Miss\n", "Gate -> Miss default\n");
+        assert_ne!(edited, ir, "the edit must actually change the IR");
+        let v = write_model_ir(&edited, None, None, Some(HAND_LAID_BPMN)).expect("write");
+        let model = v["model"].as_str().expect("model xml");
+
+        // The exact hand-laid coordinates and the marker flag survive byte-for-byte.
+        assert!(
+            model.contains(r#"bpmnElement="Gate" isMarkerVisible="true""#),
+            "gateway shape preserved verbatim:\n{model}"
+        );
+        assert!(
+            model.contains(r#"<dc:Bounds x="251" y="73" width="50" height="50" />"#),
+            "hand-laid gateway bounds preserved:\n{model}"
+        );
+        assert!(
+            model.contains(r#"<dc:Bounds x="403" y="121" width="36" height="36" />"#),
+            "hand-laid Miss bounds preserved:\n{model}"
+        );
+        // Original flow ids are reused (not re-synthesized as Flow_N), so the preserved DI edges
+        // still resolve and the gateway's default references the original id.
+        assert!(
+            model.contains(r#"id="f_sg""#),
+            "original flow id reused:\n{model}"
+        );
+        assert!(
+            model.contains(r#"default="f_miss""#),
+            "gateway default references the reused flow id:\n{model}"
+        );
+        assert!(
+            !model.contains("Flow_1"),
+            "no synthesized flow ids on the preserved path:\n{model}"
+        );
+        // The edit still took: the compiled model flags Miss as the gateway default.
+        let def = parse_bpmn(model).expect("written model parses");
+        let default = def[0].elements["Gate"]
+            .outgoing
+            .iter()
+            .find(|f| f.is_default)
+            .expect("Miss is now the default");
+        assert_eq!(default.to, "Miss");
+    }
+
+    #[test]
+    fn write_model_ir_auto_lays_out_when_the_topology_changes() {
+        // Adding a node changes the topology, so the hand layout can no longer be re-attached
+        // verbatim (it would dangle / miss shapes). The serializer falls back to a clean auto-layout
+        // — synthesized flow ids and a freshly generated diagram — and the model still parses.
+        let ir = read_model_ir(HAND_LAID_BPMN, None).expect("read ir")["ir"]
+            .as_str()
+            .expect("ir string")
+            .to_string();
+        // Reroute Miss through a new task, adding a node + flow.
+        let edited = ir
+            .replace("Gate -> Miss\n", "Gate -> Extra\n  Extra -> Miss\n")
+            .replace(
+                "exclusiveGateway Gate\n",
+                "exclusiveGateway Gate\n  serviceTask Extra {\n    jobType \"extra\"\n  }\n",
+            );
+        let v = write_model_ir(&edited, None, None, Some(HAND_LAID_BPMN)).expect("write");
+        let model = v["model"].as_str().expect("model xml");
+        // Fell back to auto-layout: the original hand-laid ids and bounds are gone.
+        assert!(
+            !model.contains(r#"id="f_sg""#),
+            "topology change must not reuse original flow ids:\n{model}"
+        );
+        assert!(
+            model.contains("Flow_1"),
+            "auto-layout synthesizes Flow_N ids:\n{model}"
+        );
+        // The new node is present and the model deploys.
+        let def = parse_bpmn(model).expect("auto-laid model parses");
+        assert!(def[0].elements.contains_key("Extra"), "new node present");
     }
 }

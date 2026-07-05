@@ -930,7 +930,10 @@ impl ToolBox for AnalysisTools {
                     .ok_or("write_model_ir requires an 'ir' string argument")?;
                 let base = args.get("base").and_then(|v| v.as_str());
                 let process = args.get("process").and_then(|v| v.as_str());
-                let v = crate::model_ir::write_model_ir(ir, base, process)?;
+                // Preserve the customer's hand layout on an unchanged-topology edit: the DI source is
+                // the base document (multi-phase) or, for a single-process write, the current model.
+                let di_source = base.or(self.model.as_deref());
+                let v = crate::model_ir::write_model_ir(ir, base, process, di_source)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise write ir: {e}"))
             }
             "conformance_check" => {
