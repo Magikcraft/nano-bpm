@@ -133,6 +133,63 @@ Identical replay outcomes mean the round-trip preserved everything that matters,
 by construction — a far stronger signal than unit tests, and a CI gate for the
 IR compiler.
 
+### Mapping the possibility space: an engine-derived grammar
+
+Rendering a model to IR shows the LLM a *sample* of the language, not its
+*extent*. Reasoning from samples alone, a model can only recombine constructs it
+has seen — so if no rendered model happens to contain a default flow, the model
+may never invent one. That is precisely the default-flow failure that motivated
+this ADR. The rendered model is one coordinate in the space; the **grammar is the
+map of the space**, and it must be handed to the LLM explicitly.
+
+Two complementary maps are required, and the default-flow case needs both:
+
+| Map | Question it answers | Source |
+|-----|--------------------|--------|
+| **Context-free grammar** | "What *can* be expressed anywhere?" (default flows exist; here is the syntax) | derived from the engine's type surface |
+| **Context-sensitive affordances** | "What is missing / available *here*?" (this gateway's branches are all conditional and it has no default) | `analyze_model` — already exists |
+
+The LLM composes them: the grammar says `[default]` is a legal edge annotation;
+`analyze_model` says *"review_gw has no default and every branch is
+conditional"*; the model writes `review_gw -> manual_review [default]`. Neither
+map alone suffices — the context-sensitive half already exists (the
+`exclusive-no-default` warning); the context-free half is what this ADR adds.
+
+**The grammar is generated from the engine surface, not hand-maintained.** The
+engine's possibility space is a closed algebraic data type — `ElementKind` (its
+variants and each variant's fields), `SequenceFlow` (`condition`, `is_default`),
+boundary-event kinds, multi-instance, IO mappings. An ADT maps directly onto an
+EBNF: variants → alternations, fields → attributes, `Option` → optional. The
+space is finite and enumerable because the enum is closed. The single-source-of-
+truth discipline (the same anti-drift guarantee the IR itself relies on):
+
+- Derive a machine schema from the IR types (`#[derive(schemars::JsonSchema)]`)
+  → exhaustive by construction; this is what the grammar tool returns.
+- The **concrete notation** (keywords, layout) is authored once — an ADT yields
+  *abstract* syntax, not surface syntax. What is derived-and-checked is
+  **coverage**: the pretty-printer and parser are exhaustive `match`es over
+  `ElementKind`, so the Rust compiler refuses to build if a new variant is added
+  without a production. A parity test asserts every variant and field has a
+  notation. The grammar therefore cannot silently fall behind the engine.
+
+**The grammar does triple duty**, which is why generating it from the engine
+surface pays off disproportionately:
+
+1. **Tool result** — `describe_ir_grammar` returns the productions, mapping the
+   latent space for reasoning ("here is everything you can say").
+2. **Parser / validator** — the same grammar drives parse-time compile errors on
+   write.
+3. **GBNF constrained decoding** — converted to a llama.cpp GBNF grammar, it
+   constrains the sampler so a local model *cannot emit a token sequence that is
+   not valid IR*. For a 4–8B local model this eliminates invalid-syntax failures
+   at the decoding layer rather than catching them post-hoc.
+
+Caveat — **tier the grammar to protect small-model context.** A large grammar
+dumped every turn degrades tool-selection and reasoning the same way too many
+tools do. The default tool result is a compact one-page production cheat-sheet;
+`analyze_model` does the contextual narrowing. The grammar tells the model that
+default flows *exist*; the analyzer tells it *which* gateway needs one.
+
 ## Consequences
 
 - **The per-op treadmill ends.** The LLM's loop becomes the read-modify-write
