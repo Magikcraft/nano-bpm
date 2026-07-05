@@ -38,6 +38,24 @@ export default function Extensions() {
   };
   useEffect(() => { void load(); void loadMarket(); }, []);
 
+  // Poll the marketplace every 30s while this view is mounted so freshly
+  // published pack versions (and thus the "Update" affordance next to each
+  // installed pack) surface without the user having to leave and come back.
+  // The left-rail badge is refreshed on the same cadence from App.tsx.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      if (!document.hidden) void loadMarket();
+    }, 30_000);
+    const onVis = () => {
+      if (!document.hidden) void loadMarket();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
+
   const install = async (pkg: string) => {
     setBusy(pkg); setErr(null);
     try { await projectsApi.installExtension(pkg); await load(); await loadMarket(); }
