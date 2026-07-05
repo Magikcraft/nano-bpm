@@ -286,6 +286,41 @@ pub fn lang_pack(id: &str) -> Option<ExtManifest> {
         .find(|e| e.kind == ExtKind::Lang && e.id == id)
 }
 
+/// Resolve any installed extension (lang/app/example/theme) by manifest id.
+/// Used for the trust check on a project's snapshotted toolchain (approving
+/// `embedded-jvm` covers Run/Compile on projects it scaffolded).
+pub fn find_ext(id: &str) -> Option<ExtManifest> {
+    all_extensions().into_iter().find(|e| e.id == id)
+}
+
+/// Best-effort version of the pack whose manifest id is `ext_id`, read from
+/// its bundled `package.json`. Returns `None` for built-in packs (no npm
+/// tarball) or when the pack dir isn't found. Used as the `scaffoldedFrom.
+/// version` breadcrumb on a project — never as a run-time gate.
+pub fn pack_version(ext_id: &str) -> Option<String> {
+    let rd = std::fs::read_dir(extensions_root()).ok()?;
+    for entry in rd.flatten() {
+        let base = entry.path();
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        if m.id != ext_id {
+            continue;
+        }
+        let pkg = std::fs::read_to_string(base.join("package.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&pkg).ok()?;
+        return v
+            .get("version")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+    }
+    None
+}
+
 /// Locate the on-disk source dir for a scaffold template contributed by an
 /// installed pack: `templates/<template_id>` for lang/app packs, or the
 /// example's `appDir`. Returns (manifest, dir) so the scaffolder can copy it.
