@@ -10305,6 +10305,30 @@ async fn main() {
         tracing::info!("DEBUG_REST enabled: logging every REST request and response");
     }
 
+    // CORS: the gateway is often addressed cross-origin (Nano IDE Deno GUI on
+    // its own port, vite dev at :5173, a hosted console). The REST /v2 surface
+    // is a *dev-target* API — the same-origin restriction browsers apply by
+    // default is more friction than protection here (the alternative is asking
+    // every consumer to run its own proxy). Permissive by default; disable
+    // with NANOBPM_CORS=off if you're deploying to an untrusted origin.
+    if std::env::var("NANOBPM_CORS")
+        .map(|v| v.to_ascii_lowercase())
+        .ok()
+        .as_deref()
+        != Some("off")
+    {
+        use tower_http::cors::{Any, CorsLayer};
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .expose_headers(Any);
+        app = app.layer(cors);
+        tracing::info!(
+            "CORS enabled on all routes (Access-Control-Allow-Origin: *). Set NANOBPM_CORS=off to disable."
+        );
+    }
+
     // Background "tick": drives the host clock into the engine so timers fire and
     // activation locks expire without an inbound request. Timer firing is durable
     // (journaled); lock expiry is volatile (not journaled). Wakes any long-polling

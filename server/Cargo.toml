@@ -54,6 +54,7 @@ flate2 = "1.1.9"
 # in the lock as a transitive flate2 dep, so promoting it is offline-safe.
 crc32fast = "1"
 base64 = "0.22.1"
+tower-http = { version = "0.7.0", features = ["cors"] }
 # Unix filesystem stats (statvfs) for the disk-relative adaptive read-model
 # retention watermark. Unix-only; the feature falls back to a fixed default off
 # Unix (e.g. MSVC).
