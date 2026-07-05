@@ -1356,8 +1356,9 @@ mod tests {
 
         let mut checked = 0usize;
         for f in &files {
-            let name = f.file_name().unwrap().to_string_lossy().to_string();
-            let xml = std::fs::read_to_string(f).unwrap();
+            let name = f.strip_prefix(&root).unwrap_or(f).display().to_string();
+            let xml = std::fs::read_to_string(f)
+                .unwrap_or_else(|e| panic!("corpus model {name} failed to read: {e}"));
             let defs = parse_bpmn(&xml)
                 .unwrap_or_else(|e| panic!("corpus model {name} failed to parse: {e:?}"));
             let names = crate::bpmn_model::parse_element_names(&xml);
