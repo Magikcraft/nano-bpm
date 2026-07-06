@@ -193,6 +193,12 @@ fmt-check: ## Verify formatting with the pinned nightly rustfmt (CI gate; fails 
 		(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check) || exit 1; \
 	done
 
+.PHONY: install-hooks
+install-hooks: ## Activate the tracked git hooks (.githooks) — adds a pre-push rustfmt gate
+	git config core.hooksPath .githooks
+	@chmod +x .githooks/* 2>/dev/null || true
+	@echo "git hooks installed: core.hooksPath -> .githooks (pre-push runs 'make fmt-check')"
+
 .PHONY: clippy
 clippy: $(GENERATED_DIR)/Cargo.toml ## Lint the generated crate, the stub server and engine-core
 	cd $(GENERATED_DIR) && cargo clippy
