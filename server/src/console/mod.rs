@@ -78,6 +78,14 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/docs/{*path}", get(docs_asset))
         .route("/whitepaper", get(whitepaper_index))
         .route("/whitepaper/", get(whitepaper_index))
+        .route(
+            "/console/api/gateway-proxy/{*path}",
+            get(gateway_proxy)
+                .post(gateway_proxy)
+                .put(gateway_proxy)
+                .delete(gateway_proxy)
+                .patch(gateway_proxy),
+        )
         .route("/console/api/topology", get(topology))
         .route("/console/api/cluster/health", get(cluster_health))
         .route("/console/api/metrics", get(metrics_snapshot))
@@ -642,6 +650,122 @@ async fn probe_peer(base_url: &str) -> Result<(Option<String>, Duration), String
         });
 
     Ok((version, started.elapsed()))
+}
+
+// ---------------------------------------------------------------------------
+// Cross-origin gateway proxy
+// ---------------------------------------------------------------------------
+
+/// Same-origin proxy for arbitrary Camunda REST calls (e.g. `/v2/deployments`,
+/// `/v2/process-instances`) targeting a **foreign** gateway — typically a
+/// Camunda 8 self-managed cluster running on a different port than the Nano
+/// console. Browsers block direct cross-origin `fetch()` unless the target
+/// gateway serves CORS headers, which stock `c8run` does not; routing the
+/// request through this proxy sidesteps that requirement by making the call
+/// server-side.
+///
+/// Contract:
+/// - Client sends `{METHOD} /console/api/gateway-proxy/{path}` with header
+///   `X-Gateway-Target: http(s)://host[:port]` and the original request body.
+/// - Server forwards `{METHOD} {target}/{path}` verbatim (body + content-type +
+///   authorization pass through) and streams the upstream status + body back.
+/// - No caching, no rewriting — this is a dumb pass-through so the Camunda
+///   REST semantics are unchanged.
+///
+/// This is deliberately generic (one handler for all `/v2/*`) rather than
+/// endpoint-specific: we don't want to grow a shim every time the Camunda REST
+/// surface adds a route.
+async fn gateway_proxy(
+    Path(rest): Path<String>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let target = match headers
+        .get("x-gateway-target")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+    {
+        Some(t) if !t.is_empty() => t.trim_end_matches('/').to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing or empty X-Gateway-Target header",
+            )
+                .into_response();
+        }
+    };
+
+    if !(target.starts_with("http://") || target.starts_with("https://")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "X-Gateway-Target must be an absolute http(s) URL",
+        )
+            .into_response();
+    }
+
+    let url = format!("{target}/{rest}");
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("proxy client init: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let up_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("bad method: {e}")).into_response();
+        }
+    };
+
+    let mut req = client.request(up_method, &url);
+    // Forward only the request-shaping headers we actually need. Hop-by-hop
+    // headers (Host, Connection, Content-Length) are dropped so reqwest can
+    // recompute them for the upstream connection.
+    for name in [header::CONTENT_TYPE, header::ACCEPT, header::AUTHORIZATION] {
+        if let Some(v) = headers.get(&name) {
+            req = req.header(name, v);
+        }
+    }
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+
+    let upstream = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("upstream {url}: {e}")).into_response();
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let ct = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let cd = upstream.headers().get(header::CONTENT_DISPOSITION).cloned();
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("upstream read: {e}")).into_response();
+        }
+    };
+
+    let mut out = Response::new(axum::body::Body::from(bytes));
+    *out.status_mut() = status;
+    if let Some(v) = ct {
+        out.headers_mut().insert(header::CONTENT_TYPE, v);
+    }
+    if let Some(v) = cd {
+        out.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
