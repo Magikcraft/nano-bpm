@@ -34,6 +34,139 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## 2026-07-07 — First validly-measured RF=3 **Raft-ON** ceiling (replicated, leader-durable)
+
+The first throughput measurement with Raft actually **on** (`NANOBPMN_RAFT=1` +
+`NANOBPMN_REPLICATION=leader-durable`), i.e. real cross-node partition ownership
+with the observability fix from PR #52 (`nanobpm_raft_partition_shutdown` gauge)
+live. This is the replicated re-measurement the correction note above was waiting
+for.
+
+### Environment
+- 3× GCP `n2` nodes (`10.128.0.19/.20/.18`), `NANOBPMN_RF=3`, `NANOBPMN_PARTITIONS=12`,
+  `NANOBPMN_RAFT=1`, `NANOBPMN_REPLICATION=leader-durable` (acks=1, single-voter
+  async replication window), segmented journal, lean snapshots.
+- Binary `nano-gw` sha `aa88ee0a1b532fb7`, release `--features console`, source ==
+  `main` @ `7545d23` (#52) byte-for-byte.
+- Load: `loadgen` (`ts-performance-matrix/rust-worker`), **RATE-paced with
+  `MAX_INFLIGHT=0`** (client-side inflight gate disabled; the server's own
+  submission-credit scheme is the only backpressure). One loadgen per node IP.
+  `WORKERS=140–160`, `PROD_CONNS=96–128`, `MAXPAR=140–160`, `TRANSPORT=stream`.
+- Method: stepped offered-load ramp; per step the **global** completion rate is
+  measured from `/metrics` deltas across all 3 nodes (independent of loadgen
+  per-instance accounting), and `Shutdown` partitions counted from `/debug/raft`.
+
+### Results — offered vs. completed (global, RF=3 Raft-ON, leader-durable)
+
+| Offered/s | Completed/s | ratio | p50 | p90 | p99 | Shutdown |
+|----------:|------------:|------:|----:|----:|----:|:--------:|
+| 600       | 596         | 0.99  | –   | –   | –     | 0 |
+| 900       | 884         | 0.98  | –   | –   | –     | 0 |
+| 1,200     | 1,178       | 0.98  | –   | –   | –     | 0 |
+| 1,500     | 1,472       | 0.98  | –   | –   | –     | 0 |
+| 1,950     | 1,910       | 0.98  | –   | –   | –     | 0 |
+| 2,400     | 2,344       | 0.98  | –   | –   | –     | 0 |
+| 3,000     | 2,928       | 0.98  | –   | –   | –     | 0 |
+| **3,900** | **3,813**   | **0.98** | 22ms | – | –  | 0 |
+| 4,800     | 4,280       | 0.89  | 22ms | 343ms | 1,541ms | 0 |
+| 6,000     | 4,765       | 0.79  | 23ms | 247ms | 1,590ms | 0 |
+| 7,800     | 5,999       | 0.77  | 25ms | 652ms | 2,858ms | 0 |
+| 9,600     | 6,768       | 0.70  | 29ms | 578ms | 2,093ms | 0 |
+| 12,600    | 8,581       | 0.68  | 30ms | 972ms | 2,838ms | 0 |
+| *uncapped flood* | **862** | –  | –   | –   | –     | 0 |
+
+### Findings
+- **Sustainable (balanced, no backlog growth): ~3,800 completions/s**, p50 ~22ms —
+  offered==completed at ratio ≥0.98 all the way from 600 → 3,900/s. One job == one
+  process instance, so this is ~3,800 PI/s replicated.
+- **Knee ~4,000–4,800/s** offered (ratio falls to 0.89 at 4,800). Above the knee
+  the median stays low (p50 22–30ms) but the tail grows (p99 1.5–2.9s) as a
+  server-side backlog builds.
+- **Peak drain with queueing: ~8,600 completions/s** at 12,600/s offered — the
+  engine's raw drain capacity, sustained only while working down backlog.
+- **Congestion collapse under unbounded flooding → 862/s.** With producers
+  uncapped (`MAX_INFLIGHT=0` *and* no `RATE`), create pressure starves the
+  single-writer engine actor (creation and job activation/completion share it),
+  cutting completion throughput ~4×. Always drive load **RATE-paced**.
+- **Zero `Shutdown` partitions at every level, 600 → 12,600/s offered.** Raft-ON
+  leader-durable never flatlined; the `nanobpm_raft_partition_shutdown` gauge
+  (PR #52) read 0 throughout and correctly lit up 8/node during a deliberately
+  mis-ordered restart, validating the alarm live.
+
+> **Harness note.** A clean RF=3 restart must be **stop-ALL → wait-all-exit →
+> wipe-ALL → start-ALL**. Per-node interleaved restart (stop+wipe+start one node
+> at a time) races: a freshly-formed node replays membership from index 0 while a
+> peer still holds a long divergent log for that partition → openraft Defensive
+> `LogIndexNotFound{want:0}` → the partition's RaftCore enters `Shutdown`
+> permanently. The per-node wait-for-exit guard is necessary but not sufficient;
+> the collision is cross-node.
+
+### Reproduce
+```bash
+# On each node (stop-all, wait-exit, wipe-all, then start-all — NOT interleaved):
+NANOBPMN_RAFT=1 NANOBPMN_REPLICATION=leader-durable NANOBPMN_RF=3 \
+  NANOBPMN_PARTITIONS=12 ... nano-gw   # see ~/node-start-raft.sh
+# From the load box, one loadgen per node IP, RATE-paced, MAX_INFLIGHT=0:
+for ip in <n0> <n1> <n2>; do
+  BASE_URL=http://$ip:8080 PDK=$PDK WORKERS=140 PROD_CONNS=96 MAXPAR=140 \
+    RATE=1300 MAX_INFLIGHT=0 TRANSPORT=stream DURATION_S=80 loadgen &
+done
+# Ceiling = highest RATE where global completed/offered stays ≥ ~0.97.
+```
+
+### SLA-mode A/B (`latency` vs `admission`) — the modes converge on this workload
+
+Apples-to-apples A/B of `NANOBPMN_SLA_MODE=latency` (default; sheds admission to
+preserve e2e latency) vs `admission` (keep admitting, accept latency), both with
+`NANOBPMN_ADMISSION_MAX_BACKLOG=2000`, differing **only** in `SLA_MODE`. Same
+cluster/binary as above, fresh **stop-all → wipe-all → launch-all** per mode,
+RATE-paced open-loop (`MAX_INFLIGHT=0`), 25s steady windows at three offered
+levels straddling the ~3,800/s knee. Per level: global completed/s, net backlog
+added over the window (`Δcreate_frames − Δcompletions`), `ceiling_active{throughput}`,
+peak node RSS.
+
+| Offered/s | `latency`: comp/s · backlog · RSS | `admission`: comp/s · backlog · RSS |
+|----------:|:---------------------------------:|:-----------------------------------:|
+| 3,000     | 2,781 · 3,039 · 629 MB            | 2,679 · 3,083 · 638 MB              |
+| 4,200     | 3,855 · 4,214 · 842 MB            | 3,700 · 4,277 · 873 MB              |
+| 5,400     | 4,976 · 6,130 · 996 MB            | 4,737 · 6,224 · 995 MB              |
+
+Loadgen e2e latency at 5,400/s offered (per-node): **`latency` p50 22 / p90 36 /
+p99 58 ms vs `admission` p50 22 / p90 37 / p99 56 ms** — identical. `ceiling_active`
+read 0 throughout both modes; peak RSS ≤ 1 GB; 0 `Shutdown`.
+
+**Finding — the two modes are statistically indistinguishable** across throughput,
+backlog growth, RSS, and latency percentiles. The `MAX_BACKLOG=2000` gate **never
+engaged** in either mode (backlog freely grew past 2,000). This reproduces the
+ADR 0013 "modes converge" result with fresh RF=3 Raft-ON data.
+
+**Root cause of the dead gate (code-verified).** The latency-mode active-backlog
+gate (`admission_shed`, `main.rs:8764`) keys off `self.inflight` — an atomic
+seeded from `active_instance_count()` and updated **only in the read-model exporter
+projection loop** as `created − completed` per projected batch (`main.rs:1108`).
+For `test-job` (one service task, worker completes in ~22 ms) instances are created
+and completed almost immediately, so each projected batch nets `created − completed
+≈ 0` and `self.inflight` stays near zero — it never approaches 2,000. The gate
+measures **parked active instances**, but throughput-bound pressure here is
+**transient in-flight pipeline work** (uncommitted creates, queued/activating jobs)
+that the gate cannot see. So latency mode is a no-op for a fast create→complete
+workload; it would only bite when instances genuinely park active (slow/absent
+workers, timers, waiting events). A latency/backpressure control that protects
+throughput-bound clusters must trigger on a **saturation** signal (create-queue
+depth, job-type activation-wait, journal-fsync latency, engine-mailbox delay),
+not on projected active-instance count.
+
+### Reproduce (SLA A/B)
+```bash
+# Per mode: stop-all -> wait-exit -> wipe-all -> launch-all with
+#   NANOBPMN_SLA_MODE=<latency|admission> NANOBPMN_ADMISSION_MAX_BACKLOG=2000
+# then RATE-paced open-loop at RATE=1000/1400/1800 per node (offered 3k/4.2k/5.4k),
+# WORKERS=160 PROD_CONNS=128 MAX_INFLIGHT=0 TRANSPORT=stream DURATION_S=25.
+# Compare comp/s, (Δcreate_frames − Δcompletions), ceiling_active, RSS, loadgen p99.
+```
+
+---
+
 ## 2026-07-01 — Ceiling diagnosed: the single per-node read-model exporter
 
 Follow-up to the ceiling hunt below. The earlier sweep proved the ~12k PI/s/node
