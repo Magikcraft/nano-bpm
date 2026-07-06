@@ -118,7 +118,7 @@ export default function Extensions() {
             <SectionLabel>{cat.label}</SectionLabel>
             <div className="grid gap-2">
               {items.map((m) => (
-                <Card key={m.name} className="flex items-start justify-between gap-3 p-3">
+                <Card key={m.name} className="group flex items-start justify-between gap-3 p-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-baseline gap-x-2">
                       <span className="break-all font-medium text-fg">{m.name}</span>
@@ -133,17 +133,35 @@ export default function Extensions() {
                     </div>
                   </div>
                   {m.updateAvailable ? (
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      className="shrink-0 border-warn/40 text-warn"
-                      onClick={() => void install(m.name)}
-                      disabled={busy === m.name}
-                    >
-                      {busy === m.name ? "Updating…" : "Update"}
-                    </Button>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="border-warn/40 text-warn"
+                        onClick={() => void install(m.name)}
+                        disabled={busy === m.name}
+                      >
+                        {busy === m.name ? "Updating…" : "Update"}
+                      </Button>
+                      <button
+                        onClick={() => void remove(m.name, m.name)}
+                        className="text-xs text-danger opacity-0 transition-opacity hover:underline focus:opacity-100 group-hover:opacity-100"
+                        aria-label={`Uninstall ${m.name}`}
+                      >
+                        remove
+                      </button>
+                    </div>
                   ) : m.installed ? (
-                    <span className="shrink-0 text-xs text-ok">installed</span>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <span className="text-xs text-ok">installed</span>
+                      <button
+                        onClick={() => void remove(m.name, m.name)}
+                        className="text-xs text-danger opacity-0 transition-opacity hover:underline focus:opacity-100 group-hover:opacity-100"
+                        aria-label={`Uninstall ${m.name}`}
+                      >
+                        remove
+                      </button>
+                    </div>
                   ) : (
                     <Button
                       variant="primary"
@@ -187,11 +205,6 @@ export default function Extensions() {
                     <input type="checkbox" checked={e.trusted} onChange={(c) => void approve(e.id, c.target.checked)} />
                     approve
                   </label>
-                )}
-                {!e.builtin && (
-                  <button onClick={() => void remove(e.id, e.displayName)} className="text-danger hover:underline">
-                    remove
-                  </button>
                 )}
               </div>
             </div>
