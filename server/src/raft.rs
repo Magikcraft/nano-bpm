@@ -1135,6 +1135,15 @@ impl RaftPartition {
     ) -> anyhow::Result<ReplicatedItem> {
         self.batcher.submit(command, now).await
     }
+
+    /// Whether this partition's Raft core has entered `Shutdown` — it has
+    /// terminated (e.g. on an unrecoverable storage error) and no longer applies
+    /// committed entries, so every instance/job routed here is stranded. A healthy
+    /// partition is `Learner`/`Follower`/`Candidate`/`Leader`; only a dead one is
+    /// `Shutdown`. Read on-demand from the openraft metrics watch (cheap borrow).
+    pub fn is_shutdown(&self) -> bool {
+        self.raft.metrics().borrow().state == openraft::ServerState::Shutdown
+    }
 }
 
 /// The set of Raft groups this node hosts, keyed by partition id. A node hosts a
@@ -1169,6 +1178,15 @@ impl RaftRegistry {
     /// Whether this node hosts no Raft groups (the non-Raft default).
     pub fn is_empty(&self) -> bool {
         self.partitions.lock().unwrap().is_empty()
+    }
+
+    /// A snapshot of every hosted partition, ordered by partition id. Used by the
+    /// `/debug/raft` diagnostic endpoint to dump per-partition replication indices.
+    pub fn all(&self) -> Vec<Arc<RaftPartition>> {
+        let mut parts: Vec<Arc<RaftPartition>> =
+            self.partitions.lock().unwrap().values().cloned().collect();
+        parts.sort_by_key(|p| p.partition_id);
+        parts
     }
 }
 
