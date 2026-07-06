@@ -702,29 +702,79 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     }
 }
 
-/// The shared openraft tuning for a nanobpmn partition group: a brisk cadence so
-/// elections settle quickly. All three are env-overridable for tuning (read once
-/// at bootstrap, never in the hot path) — on a heavily contended box a calmer
-/// cadence can avoid heartbeat-miss election churn, but the brisk defaults are
-/// what the failover tests and the A/B benchmark are validated against.
-fn raft_config() -> Config {
-    fn env_u64(key: &str, default: u64) -> u64 {
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
+fn raft_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// The per-partition snapshot cadence, in applied log entries, with a bounded
+/// deterministic jitter so the partition replicas a single node hosts do not all
+/// cross their snapshot threshold in the same instant.
+///
+/// Each partition's engine runs on its own single-threaded actor, and building a
+/// snapshot briefly blocks that actor on an `O(working set)` `state.clone()` (the
+/// serialize itself already runs off the actor, in `build_snapshot`). With a
+/// uniform `LogsSinceLast(N)` every co-hosted partition reaches `N` at nearly the
+/// same wall-clock time under steady load, so all of their engine actors stall
+/// their creates/completes at once and aggregate throughput drops to a sharp
+/// notch. Spreading the threshold by a per-partition-deterministic offset
+/// staggers those clones so at most one or two partitions pause at a time — the
+/// notch flattens into ripple.
+///
+/// The jitter is a percentage of the base (`NANOBPMN_RAFT_SNAPSHOT_JITTER_PCT`,
+/// default 25, capped at 90; `0` disables it for an exact base, which keeps tests
+/// that pin a small `NANOBPMN_RAFT_SNAPSHOT_LOGS` deterministic). It is centered
+/// on the base, so the average snapshot frequency — and thus the memory/IO vs
+/// log-length trade-off — is unchanged.
+fn snapshot_logs_for_partition(partition_id: u64) -> u64 {
+    let base = raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_LOGS", 5000).max(1);
+    let pct = raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_JITTER_PCT", 25).min(90);
+    jitter_snapshot_logs(base, pct, partition_id)
+}
+
+/// The pure, env-free core of [`snapshot_logs_for_partition`]: offset `base` by a
+/// bounded, per-partition-deterministic amount within `± base * pct%`, centered on
+/// `base`. `pct == 0` returns `base` unchanged. Split out so the jitter's
+/// properties (bounded, centered, deterministic, well-spread) are unit-testable
+/// without touching process-wide env.
+fn jitter_snapshot_logs(base: u64, pct: u64, partition_id: u64) -> u64 {
+    let base = base.max(1);
+    let pct = pct.min(90);
+    if pct == 0 {
+        return base;
     }
+    // ± this many entries around the base.
+    let range = (base.saturating_mul(pct) / 100).max(1);
+    // A Knuth multiplicative hash spreads consecutive partition ids evenly across
+    // the whole [-range, +range] window, so neighbouring partitions (which a node
+    // hosts as a contiguous block) land far apart rather than adjacent.
+    let span = range.saturating_mul(2).saturating_add(1);
+    let hashed = partition_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let offset = (hashed % span) as i64 - range as i64;
+    (base as i64 + offset).max(1) as u64
+}
+
+/// The shared openraft tuning for a nanobpmn partition group: a brisk cadence so
+/// elections settle quickly. All three timings are env-overridable for tuning
+/// (read once at bootstrap, never in the hot path) — on a heavily contended box a
+/// calmer cadence can avoid heartbeat-miss election churn, but the brisk defaults
+/// are what the failover tests and the A/B benchmark are validated against. The
+/// snapshot cadence is jittered per partition (see
+/// [`snapshot_logs_for_partition`]) so co-hosted partitions do not snapshot in
+/// lockstep.
+fn raft_config(partition_id: u64) -> Config {
     Config {
-        heartbeat_interval: env_u64("NANOBPMN_RAFT_HEARTBEAT_MS", 250),
-        election_timeout_min: env_u64("NANOBPMN_RAFT_ELECTION_MIN_MS", 500),
-        election_timeout_max: env_u64("NANOBPMN_RAFT_ELECTION_MAX_MS", 1000),
+        heartbeat_interval: raft_env_u64("NANOBPMN_RAFT_HEARTBEAT_MS", 250),
+        election_timeout_min: raft_env_u64("NANOBPMN_RAFT_ELECTION_MIN_MS", 500),
+        election_timeout_max: raft_env_u64("NANOBPMN_RAFT_ELECTION_MAX_MS", 1000),
         // Snapshot every N applied log entries to compact the log (openraft
         // default 5000). Env-tunable so a deployment can trade snapshot frequency
         // (memory/IO) against log length, and so tests can force the snapshot
         // build/install path with a small threshold.
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(env_u64(
-            "NANOBPMN_RAFT_SNAPSHOT_LOGS",
-            5000,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_logs_for_partition(
+            partition_id,
         )),
         ..Default::default()
     }
@@ -904,17 +954,11 @@ impl RaftPartition {
         addr: String,
         engine: DeepthiHandle,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(
-            Config {
-                // RF=1 single voter: keep the cadence brisk so the self-election
-                // completes promptly; no peers means no real heartbeating.
-                heartbeat_interval: 250,
-                election_timeout_min: 500,
-                election_timeout_max: 1000,
-                ..Default::default()
-            }
-            .validate()?,
-        );
+        // RF=1 single voter: the brisk cadence lets the self-election complete
+        // promptly (no peers means no real heartbeating), and the shared config
+        // also carries the (jittered) snapshot policy so a solo replica compacts
+        // its log on the same env-tunable cadence as a group member.
+        let config = Arc::new(raft_config(partition_id).validate()?);
 
         let log_store = MemLogStore::default();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
@@ -947,15 +991,7 @@ impl RaftPartition {
         engine: DeepthiHandle,
         log_dir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(
-            Config {
-                heartbeat_interval: 250,
-                election_timeout_min: 500,
-                election_timeout_max: 1000,
-                ..Default::default()
-            }
-            .validate()?,
-        );
+        let config = Arc::new(raft_config(partition_id).validate()?);
 
         let log_dir = log_dir.as_ref().to_path_buf();
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
@@ -1006,7 +1042,7 @@ impl RaftPartition {
         transport: Arc<dyn RaftTransport>,
         log_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
-        let config = Arc::new(raft_config().validate()?);
+        let config = Arc::new(raft_config(partition_id).validate()?);
         // Anchor snapshots next to the durable log when there is one, else a temp
         // dir for the volatile (in-memory-log) deployments.
         let snapshot_dir = match log_dir.as_ref() {
@@ -1134,6 +1170,52 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    #[test]
+    fn snapshot_jitter_is_bounded_centered_and_desynchronizes_partitions() {
+        let base = 5000u64;
+        let pct = 25u64;
+        let range = base * pct / 100; // ±1250
+
+        // Bounded: every partition stays within ± range of the base.
+        let vals: Vec<u64> = (0..12).map(|p| jitter_snapshot_logs(base, pct, p)).collect();
+        for (p, &v) in vals.iter().enumerate() {
+            assert!(
+                v >= base - range && v <= base + range,
+                "partition {p} jittered to {v}, outside [{}, {}]",
+                base - range,
+                base + range
+            );
+        }
+
+        // Deterministic: same inputs → same output.
+        assert_eq!(vals[3], jitter_snapshot_logs(base, pct, 3));
+
+        // Desynchronizes: the 12 co-hosted partitions do not all share one
+        // threshold — the whole point of the jitter. Expect a wide spread.
+        let mut sorted = vals.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert!(
+            sorted.len() >= 10,
+            "expected the 12 partitions to spread across distinct thresholds, got {sorted:?}"
+        );
+
+        // Roughly centered: the mean offset should be near zero, not skewed to
+        // one side (which would defeat the "average cadence unchanged" property).
+        let sum: i64 = vals.iter().map(|&v| v as i64 - base as i64).sum();
+        let mean = sum / vals.len() as i64;
+        assert!(mean.abs() < range as i64 / 2, "jitter mean {mean} too skewed");
+
+        // pct == 0 disables jitter for an exact, test-pinnable base.
+        for p in 0..12 {
+            assert_eq!(jitter_snapshot_logs(base, 0, p), base);
+        }
+
+        // Never returns 0 even with an absurdly small base (openraft would reject
+        // a zero snapshot threshold).
+        assert!(jitter_snapshot_logs(1, 90, 7) >= 1);
     }
 
     #[test]
