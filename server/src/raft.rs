@@ -758,11 +758,14 @@ fn jitter_snapshot_logs(base: u64, pct: u64, partition_id: u64) -> u64 {
     let range = (base.saturating_mul(pct) / 100).max(1);
     // A Knuth multiplicative hash spreads consecutive partition ids evenly across
     // the whole [-range, +range] window, so neighbouring partitions (which a node
-    // hosts as a contiguous block) land far apart rather than adjacent.
+    // hosts as a contiguous block) land far apart rather than adjacent. The offset
+    // arithmetic is done in i128 so it stays exact across the full u64 input
+    // domain (a `base` near u64::MAX would overflow i64), then clamped back into
+    // [1, u64::MAX].
     let span = range.saturating_mul(2).saturating_add(1);
     let hashed = partition_id.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let offset = (hashed % span) as i64 - range as i64;
-    (base as i64 + offset).max(1) as u64
+    let offset = (hashed % span) as i128 - range as i128;
+    (base as i128 + offset).clamp(1, u64::MAX as i128) as u64
 }
 
 /// The shared openraft tuning for a nanobpmn partition group: a brisk cadence so
@@ -813,7 +816,7 @@ struct Submission {
 ///
 /// Two properties make this safe in both directions, mirroring Zeebe's
 /// `WhiteListedCommands`:
-/// - **Drain can't be starved by intake:** completes/activation never sit in the
+/// - **Drain can't be starved by intake:** completes never sit in the
 ///   Raft log behind a backlog of creates, so the cluster always frees the
 ///   resources of work it accepted (which reopens admission).
 /// - **Intake can't be starved by drain:** the high lane's volume is bounded by
@@ -845,7 +848,7 @@ fn is_creation_intake(command: &Command) -> bool {
 ///
 /// Two lanes give the drain path priority over creation intake (see
 /// [`is_creation_intake`]): every batch is filled from the `hi` lane first, so
-/// completes/activation always ride the next entry even while a backlog of
+/// completes always ride the next entry even while a backlog of
 /// creates waits in the `lo` lane. Creation is admitted only with the batch
 /// capacity the drain path leaves — the log-layer analogue of Zeebe's
 /// `WhiteListedCommands`, and the fix for the credit-starvation latch where a
@@ -874,7 +877,7 @@ impl Batcher {
                 };
                 let mut subs = vec![first];
                 // Drain ALL pending high-priority (drain) commands into this
-                // batch first, bounded by the cap — so a completion or activation
+                // batch first, bounded by the cap — so a completion
                 // never queues behind a backlog of creates in a later entry.
                 while subs.len() < MAX_PROPOSE_BATCH {
                     match hi_rx.try_recv() {
@@ -928,7 +931,7 @@ impl Batcher {
     async fn submit(&self, command: Command, now: u64) -> anyhow::Result<ReplicatedItem> {
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
-        // (completes, fails, activation, ticks, admin) takes the high lane so it
+        // (completes, fails, ticks, admin) takes the high lane so it
         // is never queued behind a backlog of creates in the Raft log.
         let tx = if is_creation_intake(&command) {
             &self.lo_tx

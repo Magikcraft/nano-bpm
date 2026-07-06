@@ -69,10 +69,13 @@ and needs no per-language stub generation.
 > "taking the quorum round-trip off the completion path" is **incorrect**: no quorum
 > round-trip was present, and the only dial that actually varied between the two
 > tiers below was the local *journal* (`sync` vs `async`). No validly-measured
-> *replicated* throughput exists yet: enabling Raft currently wedges the cluster
-> under sustained load (single-voter groups stall in an openraft snapshot/purge loop
-> at ~10k log entries; creates and completions freeze). Treat all quorum/replication
-> figures here as unverified pending a Raft-under-load fix and re-measurement.
+> *replicated* throughput exists yet: the published figures are Raft-off (no
+> replication ran). Enabling Raft was found to wedge leader-durable clusters at
+> **cold start** — a formation-time split-brain that trips openraft's `has_log_id`
+> invariant on release builds, not the snapshot/purge loop first suspected — which
+> is **fixed** as of the cold-start split-brain guard (validated: clean formation
+> plus a 150s under-load soak). Treat all quorum/replication
+> figures here as unverified pending a published *replicated* re-measurement.
 
 On a cluster of 3× `c2-standard-16` (RF=3, 12 partitions), Nano sustains roughly
 **95,000 process instances/s aggregate (~30,000 per node)** — one job per

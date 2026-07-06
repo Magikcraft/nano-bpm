@@ -24,9 +24,13 @@ cluster keeps up with the create rate (no growing backlog).
 > Statements below implying the "Raft quorum-commit path" was exercised or that
 > peers' partitions were "replicated" are inaccurate and have been annotated. The
 > throughput/latency numbers themselves stand — they just reflect the Raft-off
-> (single-homed, forward-on-create) topology, which is the only configuration that
-> currently sustains load: enabling Raft wedges the cluster under sustained load
-> (single-voter groups stall in a snapshot/purge loop; see the engine notes).
+> (single-homed, forward-on-create) topology, which is the configuration these
+> numbers were measured on. Enabling Raft was separately found to wedge
+> leader-durable clusters at **cold start** — a formation-time split-brain that
+> trips an openraft invariant on release builds, not the snapshot/purge loop first
+> suspected — which is **fixed** as of the cold-start split-brain guard (validated:
+> clean 12-partition formation plus a 150s under-load soak). A validly-measured
+> *replicated* throughput number is still pending a published re-measurement.
 
 ---
 
