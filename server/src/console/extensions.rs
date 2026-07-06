@@ -795,8 +795,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         // Point the extensions root at a unique temp dir and drop a pack with a
         // package.json, then confirm installed_version reads its version.
-        let root = std::env::temp_dir()
-            .join(format!("nano-ext-ver-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("nano-ext-ver-{}", std::process::id()));
         let pkg = "@nanobpm/nano-ide-lang-rust";
         // SAFETY: test-local env set; other tests in this module don't depend on
         // the extensions-root *value* (only on path suffixes / builtins).
@@ -821,8 +820,7 @@ mod tests {
         // overview payload, so remove() must accept it and reverse-lookup the
         // pack dir via its bundled nano-ide.ext.json — otherwise the button
         // 400s with "not installed" for every non-builtin pack.
-        let root = std::env::temp_dir()
-            .join(format!("nano-ext-remove-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("nano-ext-remove-{}", std::process::id()));
         let pkg = "@nanobpm/nano-ide-example-throughput-demo";
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
         let dir = safe_pkg_dir(pkg).unwrap();
