@@ -65,7 +65,19 @@ export default function Extensions() {
   const toggleYolo = async () => setOv(await projectsApi.trustExtension({ yolo: !ov?.yolo }));
   const approve = async (id: string, on: boolean) =>
     setOv(await projectsApi.trustExtension(on ? { approve: id } : { revoke: id }));
-  const remove = async (id: string) => { await projectsApi.removeExtension(id); await load(); await loadMarket(); };
+  const remove = async (id: string, label: string) => {
+    if (!window.confirm(`Uninstall extension "${label}"?\n\nProjects scaffolded from it will keep their files but lose their toolchain (Run/Compile may fall back to Deno).`)) {
+      return;
+    }
+    setErr(null);
+    try {
+      await projectsApi.removeExtension(id);
+      await load();
+      await loadMarket();
+    } catch (e) {
+      setErr(String(e));
+    }
+  };
 
   const filtered = useMemo(() => {
     const t = q.trim().toLowerCase();
@@ -177,7 +189,7 @@ export default function Extensions() {
                   </label>
                 )}
                 {!e.builtin && (
-                  <button onClick={() => void remove(e.id)} className="text-danger hover:underline">
+                  <button onClick={() => void remove(e.id, e.displayName)} className="text-danger hover:underline">
                     remove
                   </button>
                 )}
