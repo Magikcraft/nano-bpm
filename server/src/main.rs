@@ -10764,6 +10764,31 @@ async fn main() {
                 throughput_lit = throughput;
                 memory_lit = memory;
 
+                // Publish the raw input signals + configured thresholds behind the
+                // ceiling LED, so a dashboard can see pressure climb toward each shed
+                // point (and how much headroom is left) rather than only a 0/1 LED.
+                crate::metrics::set_admission_signals(
+                    monitor_server.engine.pending_create_queue() as i64,
+                    monitor_server.active_backlog(),
+                    monitor_server.mem_pressure_bytes.load(Ordering::Relaxed) as i64,
+                );
+                crate::metrics::set_admission_limit(
+                    "backlog",
+                    monitor_server.admission_max_backlog as i64,
+                );
+                crate::metrics::set_admission_limit(
+                    "create_queue",
+                    monitor_server.admission_max_create_queue as i64,
+                );
+                crate::metrics::set_admission_limit(
+                    "pipeline_bytes",
+                    monitor_server.pipeline_bytes_watermark as i64,
+                );
+                crate::metrics::set_admission_limit(
+                    "mem_watermark",
+                    monitor_server.mem_watermark_bytes as i64,
+                );
+
                 let activatable = monitor_server.engine.activatable_job_counts().await;
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =

@@ -120,6 +120,29 @@ struct Metrics {
     /// dashboard confirm that overload is being *shed* rather than silently
     /// accumulated in memory, and which rail is doing the shedding.
     admission_shed_total: prometheus::IntCounterVec,
+
+    // ---- Admission-ceiling input signals (the numbers behind the LED) ----
+    /// Live depth of the submitted-but-not-yet-applied create queue — the
+    /// create-apply backlog that holds resident memory under an arrival flood and
+    /// the `create_queue` / `create_backlog` shed signal. The single most useful
+    /// number for "is the engine gathering creates toward OOM?"; plot against
+    /// `nanobpm_admission_limit{limit="create_queue"}`.
+    pending_create_queue: IntGauge,
+    /// Live active-instance backlog (the read-model exporter's projected
+    /// `created − completed`) — the `active_backlog` latency-rail signal. Stays ~0
+    /// for fast create→complete workloads; climbs when instances park (absent/slow
+    /// workers, timers, waiting events). Plot against
+    /// `nanobpm_admission_limit{limit="backlog"}`.
+    active_backlog: IntGauge,
+    /// Cached resident-memory estimate (refreshed by the mem-pressure tick) that the
+    /// `mem_watermark` rail keys off. Plot against
+    /// `nanobpm_admission_limit{limit="mem_watermark"}`.
+    mem_pressure_bytes: IntGauge,
+    /// The configured admission thresholds the ceiling rails trip at, labelled by
+    /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
+    /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
+    /// can show each pressure signal's headroom to its shed point.
+    admission_limit: prometheus::IntGaugeVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -351,6 +374,30 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let pending_create_queue = IntGauge::new(
+        "nanobpm_pending_create_queue",
+        "Submitted-but-not-yet-applied create-queue depth: the create-apply backlog that holds resident memory under an arrival flood (the create_queue/create_backlog shed signal).",
+    )
+    .expect("valid gauge");
+    let active_backlog = IntGauge::new(
+        "nanobpm_active_backlog",
+        "Active-instance backlog (exporter-projected created-minus-completed); the active_backlog latency-rail signal. ~0 for fast create->complete; climbs when instances park (absent/slow workers).",
+    )
+    .expect("valid gauge");
+    let mem_pressure_bytes = IntGauge::new(
+        "nanobpm_mem_pressure_bytes",
+        "Cached resident-memory estimate the mem_watermark admission rail keys off.",
+    )
+    .expect("valid gauge");
+    let admission_limit = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_admission_limit",
+            "Configured admission shed thresholds (limit=backlog|create_queue are counts; pipeline_bytes|mem_watermark are bytes; 0 = disabled). Reference lines for each pressure signal's headroom.",
+        ),
+        &["limit"],
+    )
+    .expect("valid gauge vec");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -381,6 +428,10 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_starved.clone())))
         .and(registry.register(Box::new(raft_partition_shutdown.clone())))
         .and(registry.register(Box::new(admission_shed_total.clone())))
+        .and(registry.register(Box::new(pending_create_queue.clone())))
+        .and(registry.register(Box::new(active_backlog.clone())))
+        .and(registry.register(Box::new(mem_pressure_bytes.clone())))
+        .and(registry.register(Box::new(admission_limit.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -414,6 +465,10 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_starved,
         raft_partition_shutdown,
         admission_shed_total,
+        pending_create_queue,
+        active_backlog,
+        mem_pressure_bytes,
+        admission_limit,
     }
 });
 
@@ -517,6 +572,31 @@ pub fn set_ceiling_active(ceiling: &str, active: bool, previously_active: bool) 
             .with_label_values(&[ceiling])
             .inc();
     }
+}
+
+/// Publishes the admission-ceiling input signals — the raw numbers behind the
+/// `nanobpm_ceiling_active` LED: the create-apply queue depth, the active-instance
+/// backlog, and the resident-memory estimate. Called ~1 Hz from the monitor loop,
+/// off the hot path. Pair each with its `nanobpm_admission_limit` reference line to
+/// watch pressure climb toward (and headroom shrink to) the shed point.
+pub fn set_admission_signals(
+    pending_create_queue: i64,
+    active_backlog: i64,
+    mem_pressure_bytes: i64,
+) {
+    METRICS.pending_create_queue.set(pending_create_queue);
+    METRICS.active_backlog.set(active_backlog);
+    METRICS.mem_pressure_bytes.set(mem_pressure_bytes);
+}
+
+/// Publishes one configured admission threshold as a reference line
+/// (`backlog`/`create_queue` are counts, `pipeline_bytes`/`mem_watermark` are
+/// bytes; `0` = that rail is disabled).
+pub fn set_admission_limit(limit: &str, value: i64) {
+    METRICS
+        .admission_limit
+        .with_label_values(&[limit])
+        .set(value);
 }
 
 /// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live
