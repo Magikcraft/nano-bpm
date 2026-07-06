@@ -169,7 +169,10 @@ fn seg_path(dir: &Path, start: u64) -> PathBuf {
 
 /// Parses a segment file name (`seg-<start>.ndjson`) back to its start index.
 fn parse_seg_start(name: &str) -> Option<u64> {
-    name.strip_prefix("seg-")?.strip_suffix(".ndjson")?.parse().ok()
+    name.strip_prefix("seg-")?
+        .strip_suffix(".ndjson")?
+        .parse()
+        .ok()
 }
 
 struct Inner {
@@ -404,7 +407,10 @@ impl RaftLogStore {
 
         // Ensure there is always an active segment to append to.
         if segments.is_empty() {
-            segments.push(SegMeta { start: 0, last: None });
+            segments.push(SegMeta {
+                start: 0,
+                last: None,
+            });
             active_bytes = 0;
         }
         let active_start = segments.last().map(|s| s.start).unwrap_or(0);
@@ -862,7 +868,10 @@ mod tests {
         write_segment(&dir, 6, &[6, 7, 8]);
 
         let mut store = RaftLogStore::open(&dir).unwrap();
-        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            indices_in(&mut store).await,
+            vec![0, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
 
         // Capture the live segment's bytes to prove purge never rewrites it.
         let live_before = std::fs::read(seg_path(&dir, 6)).unwrap();
@@ -928,7 +937,10 @@ mod tests {
         assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3]);
         // Segment starting at/after the cut is unlinked; the earlier untouched
         // segment is byte-identical; the straddled seg-3 was rewritten to just {3}.
-        assert!(!seg_path(&dir, 6).exists(), "seg-6 (>=4) should be unlinked");
+        assert!(
+            !seg_path(&dir, 6).exists(),
+            "seg-6 (>=4) should be unlinked"
+        );
         assert_eq!(
             std::fs::read(seg_path(&dir, 0)).unwrap(),
             untouched_before,
@@ -957,8 +969,14 @@ mod tests {
         let mut store = RaftLogStore::open(&dir).unwrap();
 
         assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3]);
-        assert!(!log_path(&dir).exists(), "legacy file should be migrated away");
-        assert!(seg_path(&dir, 0).exists(), "migrated into a start-0 segment");
+        assert!(
+            !log_path(&dir).exists(),
+            "legacy file should be migrated away"
+        );
+        assert!(
+            seg_path(&dir, 0).exists(),
+            "migrated into a start-0 segment"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

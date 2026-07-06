@@ -362,7 +362,11 @@ pub struct PartitionStateMachine {
 }
 
 impl PartitionStateMachine {
-    fn new(engine: DeepthiHandle, partition_id: u64, snapshot_dir: PathBuf) -> std::io::Result<Self> {
+    fn new(
+        engine: DeepthiHandle,
+        partition_id: u64,
+        snapshot_dir: PathBuf,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&snapshot_dir)?;
         // Clear any stale snapshot files left by a previous process: on boot the
         // engine state is reconstructed by replaying the durable log (or a fresh
@@ -449,7 +453,10 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // runs the same blocking serialize the old `to_vec` did — but into a
         // buffered writer, so the peak transient is one buffer, not the whole
         // serialized state twice.
-        let path = self.sm.snapshot_dir.join(format!("snap-{snapshot_idx}.bin"));
+        let path = self
+            .sm
+            .snapshot_dir
+            .join(format!("snap-{snapshot_idx}.bin"));
         let file = std::fs::File::create(&path)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let mut writer = std::io::BufWriter::new(file);
@@ -598,7 +605,9 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
         // A fresh, empty on-disk file that openraft streams the incoming snapshot
         // chunks into (AsyncWrite + AsyncSeek), so the receiving side never buffers
         // the whole snapshot in RAM either.
@@ -1049,7 +1058,11 @@ impl RaftPartition {
             Some(dir) => dir.join("snapshots"),
             None => PartitionStateMachine::temp_snapshot_dir(partition_id),
         };
-        let state_machine = Arc::new(PartitionStateMachine::new(engine, partition_id, snapshot_dir)?);
+        let state_machine = Arc::new(PartitionStateMachine::new(
+            engine,
+            partition_id,
+            snapshot_dir,
+        )?);
         let network = PartitionNetwork::new(transport, partition_id);
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
@@ -1179,7 +1192,9 @@ mod tests {
         let range = base * pct / 100; // ±1250
 
         // Bounded: every partition stays within ± range of the base.
-        let vals: Vec<u64> = (0..12).map(|p| jitter_snapshot_logs(base, pct, p)).collect();
+        let vals: Vec<u64> = (0..12)
+            .map(|p| jitter_snapshot_logs(base, pct, p))
+            .collect();
         for (p, &v) in vals.iter().enumerate() {
             assert!(
                 v >= base - range && v <= base + range,
@@ -1206,7 +1221,10 @@ mod tests {
         // one side (which would defeat the "average cadence unchanged" property).
         let sum: i64 = vals.iter().map(|&v| v as i64 - base as i64).sum();
         let mean = sum / vals.len() as i64;
-        assert!(mean.abs() < range as i64 / 2, "jitter mean {mean} too skewed");
+        assert!(
+            mean.abs() < range as i64 / 2,
+            "jitter mean {mean} too skewed"
+        );
 
         // pct == 0 disables jitter for an exact, test-pinnable base.
         for p in 0..12 {
@@ -1231,16 +1249,23 @@ mod tests {
             tags: vec![],
             business_id: None,
         }));
-        assert!(is_creation_intake(&Command::activate_jobs("t", "w", 1, 1, 0)));
+        assert!(is_creation_intake(&Command::activate_jobs(
+            "t", "w", 1, 1, 0
+        )));
 
         // The drain / progress path (finalization, cancellation, maintenance)
         // takes the high-priority lane; its volume is bounded by low-lane
         // admission, so it can never permanently starve a create.
-        assert!(!is_creation_intake(&Command::complete_job_with(1, HashMap::new())));
+        assert!(!is_creation_intake(&Command::complete_job_with(
+            1,
+            HashMap::new()
+        )));
         assert!(!is_creation_intake(&Command::fail_job(1, 0, "e")));
         assert!(!is_creation_intake(&Command::ExpireJobs { now: 0 }));
         assert!(!is_creation_intake(&Command::TriggerTimers { now: 0 }));
-        assert!(!is_creation_intake(&Command::CancelInstance { instance_key: 1 }));
+        assert!(!is_creation_intake(&Command::CancelInstance {
+            instance_key: 1
+        }));
         assert!(!is_creation_intake(&deploy_command()));
     }
 
@@ -1353,7 +1378,10 @@ mod tests {
             .expect("begin receiving snapshot");
         {
             use tokio::io::AsyncWriteExt;
-            received.write_all(&bytes).await.expect("write snapshot body");
+            received
+                .write_all(&bytes)
+                .await
+                .expect("write snapshot body");
             received.flush().await.expect("flush snapshot body");
         }
         dst_sm

@@ -6773,7 +6773,6 @@ impl ServerImpl {
         }
     }
 
-
     /// follow-on). A no-op unless Raft is enabled AND the replication tier is
     /// [`ReplicationMode::LeaderDurable`] with real peers: in every other
     /// configuration failover is either irrelevant (single node / RF=1) or already
@@ -6805,8 +6804,7 @@ impl ServerImpl {
             // still in initial formation (its owner may just be booting), not a
             // failover, so promoting it would race the owner's `initialize` into a
             // split-brain (two committed leaders in one term -> openraft wedge).
-            let mut established: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
+            let mut established: std::collections::HashSet<u64> = std::collections::HashSet::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 server
@@ -14144,8 +14142,12 @@ mod clustered_startup_tests {
         };
         let mut both = false;
         for _ in 0..200 {
-            node1.leader_durable_recovery_tick(1, &mut m1, &mut est1).await;
-            node2.leader_durable_recovery_tick(1, &mut m2, &mut est2).await;
+            node1
+                .leader_durable_recovery_tick(1, &mut m1, &mut est1)
+                .await;
+            node2
+                .leader_durable_recovery_tick(1, &mut m2, &mut est2)
+                .await;
             if leads(&node1, 1) && leads(&node2, 2) {
                 both = true;
                 break;

@@ -762,7 +762,9 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
         subs: Mutex::new(HashMap::new()),
         submission_outstanding: AtomicI64::new(0),
         submission_window,
-        create_slots: Arc::new(tokio::sync::Semaphore::new(submission_window.max(0) as usize)),
+        create_slots: Arc::new(tokio::sync::Semaphore::new(
+            submission_window.max(0) as usize
+        )),
         closed: AtomicBool::new(false),
         wants_redispatch: Arc::new(AtomicBool::new(false)),
         last_seen_ms: AtomicU64::new(now_millis()),
@@ -1036,8 +1038,8 @@ async fn handle_client_frame(
             // (the completion wait must read this node's read store). The non-Raft
             // single-node fast path is likewise unchanged.
             if should_spawn_fire_and_forget(awaiting, raft_active, create_permit.is_some()) {
-                let permit = create_permit
-                    .expect("permit is Some whenever the spawn decision is true");
+                let permit =
+                    create_permit.expect("permit is Some whenever the spawn decision is true");
                 let server = server.clone();
                 let conn = conn.clone();
                 tokio::spawn(async move {
