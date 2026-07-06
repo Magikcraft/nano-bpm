@@ -825,6 +825,15 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
 /// state; the processor never mutates [`State`] directly.
 pub fn apply(state: &mut State, event: &Event) {
     match event {
+        Event::DeploymentCreated { .. } => {
+            // No-op today. The event exists so every deploy has a persisted
+            // deployment key (issue #47, Option B) — the key counter is
+            // advanced via mint_key() at emit time, and replay derives it
+            // from the max key in the log, so simply having the event in
+            // the journal is enough. Applier promotion to record deployment
+            // metadata (resource keys, timestamp, audit hooks) is Option A.
+        }
+
         Event::ProcessDeployed {
             process_definition_key,
             version,
