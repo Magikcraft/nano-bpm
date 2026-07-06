@@ -28,9 +28,7 @@ pub enum Event {
     /// [`Event::ProcessDeployed`] — is what keeps the spec's
     /// `DeploymentKey: LongKey` (pattern `^-?[0-9]+$`) contract satisfied. An
     /// empty deploymentKey trips `Long.parseLong` in every stock C8 client.
-    DeploymentCreated {
-        deployment_key: Key,
-    },
+    DeploymentCreated { deployment_key: Key },
 
     /// A process definition was registered as part of a deployment. The engine
     /// assigns the `deployment_key` (shared by every resource in the same
