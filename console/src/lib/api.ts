@@ -1,6 +1,8 @@
 // Typed client for the nanobpmn console API (served by the gateway under
 // /console/api, separate from the generated Camunda REST surface).
 
+import { debug } from "./debugBus";
+
 export interface NodeInfo {
   node_id: number;
   address: string;
@@ -507,11 +509,36 @@ export async function deployXml(
     `${name}.bpmn`,
   );
   const url = joinBase(baseUrl, "/v2/deployments");
-  const res = await fetch(url, { method: "POST", body: form });
+  const started = performance.now();
+  debug("deploy", "info", `POST ${url}`, {
+    baseUrl: baseUrl ?? "(relative)",
+    resource: `${name}.bpmn`,
+    bytes: xml.length,
+    sameOrigin: url.startsWith("/"),
+  });
+  let res: Response;
+  try {
+    res = await fetch(url, { method: "POST", body: form });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    debug("deploy", "error", `fetch failed: ${msg}`, {
+      url,
+      hint:
+        url.startsWith("http") && !url.startsWith(window.location.origin)
+          ? "Cross-origin request — the gateway may lack CORS headers, or be unreachable. Try setting deployTarget to '' (relative) if the console is served by the same gateway."
+          : "Is the gateway running on this port? Check `curl " + url + "`.",
+    });
+    throw new Error(`fetch failed: ${msg}`);
+  }
+  const ms = Math.round(performance.now() - started);
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
+    debug("deploy", "error", `HTTP ${res.status} in ${ms}ms`, {
+      body: detail.slice(0, 500),
+    });
     throw new Error(detail || `deploy → HTTP ${res.status}`);
   }
+  debug("deploy", "ok", `HTTP ${res.status} in ${ms}ms`);
 }
 
 /// The result of starting a process instance, as returned by the Camunda
@@ -542,23 +569,53 @@ export async function createProcessInstance(opts: {
   };
   if (opts.awaitCompletion) body.awaitCompletion = true;
   const url = joinBase(opts.baseUrl, "/v2/process-instances");
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+  const started = performance.now();
+  debug("startInstance", "info", `POST ${url}`, {
+    processId: opts.processId,
+    variables: opts.variables ?? {},
   });
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    debug("startInstance", "error", `fetch failed: ${msg}`, { url });
+    throw new Error(`fetch failed: ${msg}`);
+  }
+  const ms = Math.round(performance.now() - started);
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
+    debug("startInstance", "error", `HTTP ${res.status} in ${ms}ms`, {
+      body: detail.slice(0, 500),
+    });
     throw new Error(detail || `start instance → HTTP ${res.status}`);
   }
-  return (await res.json()) as CreateInstanceResult;
+  const parsed = (await res.json()) as CreateInstanceResult;
+  debug("startInstance", "ok", `HTTP ${res.status} in ${ms}ms`, {
+    processInstanceKey: parsed.processInstanceKey,
+    processDefinitionVersion: parsed.processDefinitionVersion,
+  });
+  return parsed;
 }
 
 /// Concats a Camunda-relative path with an optional base URL. When `base` is
-/// missing or empty the path is returned verbatim, so fetch() targets the
-/// console's own gateway. Trailing/leading slashes are normalised.
+/// missing or empty, or its origin matches the console's own, the path is
+/// returned verbatim so fetch() stays same-origin (no CORS preflight,
+/// cookies pass through). Trailing/leading slashes are normalised.
 function joinBase(base: string | undefined, path: string): string {
   if (!base) return path;
+  try {
+    const u = new URL(base, window.location.href);
+    if (u.origin === window.location.origin) {
+      return `${u.pathname.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+    }
+  } catch {
+    // Malformed base — fall through and let the caller see the fetch error.
+  }
   return `${base.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
@@ -574,8 +631,13 @@ export async function fetchDeployedXmlByProcessId(
   processId: string,
   baseUrl?: string,
 ): Promise<string | null> {
+  const searchUrl = joinBase(baseUrl, "/v2/process-definitions/search");
+  const started = performance.now();
+  debug("probe", "info", `POST ${searchUrl}`, {
+    processId,
+    baseUrl: baseUrl ?? "(relative)",
+  });
   try {
-    const searchUrl = joinBase(baseUrl, "/v2/process-definitions/search");
     const res = await fetch(searchUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -585,18 +647,48 @@ export async function fetchDeployedXmlByProcessId(
         page: { from: 0, limit: 1 },
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      debug("probe", "warn", `search → HTTP ${res.status}`, {
+        processId,
+        hint: "Start Instance will stay disabled; deploy first.",
+      });
+      return null;
+    }
     const body = (await res.json()) as {
       items?: Array<{ processDefinitionKey?: string }>;
     };
     const key = body.items?.[0]?.processDefinitionKey;
-    if (!key) return null;
-    const xmlRes = await fetch(
-      joinBase(baseUrl, `/v2/process-definitions/${key}/xml`),
+    if (!key) {
+      debug("probe", "info", "no prior deployment found", { processId });
+      return null;
+    }
+    const xmlUrl = joinBase(baseUrl, `/v2/process-definitions/${key}/xml`);
+    const xmlRes = await fetch(xmlUrl);
+    if (xmlRes.status !== 200) {
+      debug("probe", "warn", `xml → HTTP ${xmlRes.status}`, {
+        processDefinitionKey: key,
+      });
+      return null;
+    }
+    const xml = await xmlRes.text();
+    const ms = Math.round(performance.now() - started);
+    debug(
+      "probe",
+      "ok",
+      `deployed XML loaded (${xml.length} bytes, ${ms}ms)`,
+      { processId, processDefinitionKey: key },
     );
-    if (xmlRes.status !== 200) return null;
-    return await xmlRes.text();
-  } catch {
+    return xml;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    debug("probe", "error", `fetch failed: ${msg}`, {
+      url: searchUrl,
+      hint:
+        searchUrl.startsWith("http") &&
+        !searchUrl.startsWith(window.location.origin)
+          ? "Cross-origin request — the gateway may lack CORS headers, or be unreachable."
+          : "Is the gateway running on this port?",
+    });
     return null;
   }
 }
@@ -634,6 +726,27 @@ export interface ProjectSummary {
   running: boolean;
 }
 
+/// One named way to run/compile a project — mirrors the server's
+/// `ProjectRunConfig`. Populated when a pack ships a `toolchain.runConfigs`
+/// matrix (e.g. `example-java-throughput` has four transport combos).
+export interface ProjectRunConfig {
+  id: string;
+  label: string;
+  /** When no `activeRunConfig` is pinned, the `default: true` entry wins. */
+  default?: boolean;
+  run: string[];
+  compile: string[];
+  /** Env vars layered on top of the base spawn env (last wins on key clash). */
+  env?: Record<string, string>;
+}
+
+/// Response of `GET /projects/:name/run-configs` — the pack-snapshotted
+/// configs plus the currently-pinned id (or `null` when unset).
+export interface ProjectRunConfigsResponse {
+  runConfigs: ProjectRunConfig[];
+  active: string | null;
+}
+
 export interface ProjectConfig {
   name: string;
   description: string;
@@ -647,10 +760,21 @@ export interface ProjectConfig {
   lang: string;
   /** App/output pack id (`console`, or e.g. `deno-gui`). */
   app: string;
-  /** Snapshotted toolchain (run/compile argv). Set at scaffold time by any
-   * app pack that declares its own toolchain; otherwise resolved live from
-   * the lang pack. Hand-editable in `nanobpm.project.json`. */
-  toolchain?: { run: string[]; compile: string[] };
+  /** Snapshotted toolchain (run/compile argv + named run configs). Set at
+   * scaffold time by any app pack that declares its own toolchain; otherwise
+   * resolved live from the lang pack. Hand-editable in `nanobpm.project.json`. */
+  toolchain?: {
+    run: string[];
+    compile: string[];
+    /** Named run configurations (see Magikcraft/nano-bpm#42). When set, the
+     * Run/Compile buttons use the active one; the flat `run`/`compile` are
+     * a fallback for older gateways / hand-edited projects. */
+    runConfigs?: ProjectRunConfig[];
+    /** Id of the config currently pinned by the user. When `null` and
+     * `runConfigs` is non-empty, the server picks the `default: true`
+     * entry, else the first. */
+    activeRunConfig?: string | null;
+  };
   /** Origin pack + version at scaffold time. Purely informational, but the
    * server uses it to gate trust — approving `<scaffoldedFrom.pack>` covers
    * the snapshotted argv only when the installed pack still declares it. */
@@ -835,6 +959,22 @@ export const projectsApi = {
       "POST",
       `/projects/${encodeURIComponent(name)}/compile`,
       JSON.stringify({ targets }),
+      "application/json",
+    ),
+  /// List the pack-snapshotted run configurations + the currently-pinned id.
+  /// Returns `{ runConfigs: [], active: null }` for projects without a
+  /// runConfigs-shaped toolchain — the caller can hide its picker.
+  getRunConfigs: (name: string) =>
+    getJson<ProjectRunConfigsResponse>(
+      `/projects/${encodeURIComponent(name)}/run-configs`,
+    ),
+  /// Pin (or clear, with `null`) the active run configuration. Rejects unknown
+  /// ids so a stale picker can't silently persist a typo.
+  setActiveRunConfig: (name: string, id: string | null) =>
+    send<{ active: string | null }>(
+      "PUT",
+      `/projects/${encodeURIComponent(name)}/active-run-config`,
+      JSON.stringify({ id }),
       "application/json",
     ),
 };

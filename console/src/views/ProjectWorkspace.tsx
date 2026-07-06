@@ -21,6 +21,13 @@ import {
   type ProjectFile,
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
+import {
+  subscribe as subscribeDebug,
+  snapshot as debugSnapshot,
+  clear as clearDebug,
+  debug,
+  type DebugEntry,
+} from "../lib/debugBus";
 
 /// One project's workspace: file browser, graphical/code editors, the run
 /// console, and the Run/Stop/Compile/Configure/Export toolbar.
@@ -146,6 +153,28 @@ export default function ProjectWorkspace() {
   const lang = detail?.config.lang ?? "deno";
   const running = runState?.status === "running" || runState?.status === "starting";
   const compiling = runState?.compiling ?? false;
+  const runConfigs = detail?.config.toolchain?.runConfigs ?? [];
+  // The server resolves the same fallback (pinned → default:true → first) at
+  // resolve_run_argv time, but we mirror it here so the picker's initial
+  // value matches what Run would actually spawn. Also validate the pinned
+  // id against the current runConfigs — a hand-edited nanobpm.project.json
+  // could name an unknown id, in which case the server falls back but the
+  // controlled <select> would render blank/out-of-sync without this check.
+  const pinnedId = detail?.config.toolchain?.activeRunConfig ?? null;
+  const activeRunConfigId =
+    (pinnedId && runConfigs.some((c) => c.id === pinnedId) ? pinnedId : null) ??
+    runConfigs.find((c) => c.default)?.id ??
+    runConfigs[0]?.id ??
+    null;
+
+  const changeRunConfig = async (id: string | null) => {
+    try {
+      await projectsApi.setActiveRunConfig(name, id);
+      void load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const run = async () => {
     setLogs([]);
@@ -170,8 +199,16 @@ export default function ProjectWorkspace() {
   // way there's one canonical compile invocation and no per-platform variant
   // for the user to choose from.
   const handleCompile = async () => {
+    // A project is Deno-scaffolded when neither the snapshotted toolchain
+    // (flat `compile` or any runConfig with compile argv) nor its lang pack
+    // drives compile — i.e. lang == "deno" and no argv override. Anything
+    // else has a canonical compile and skips the cross-compile modal.
+    const hasRunConfigCompile = (detail?.config.toolchain?.runConfigs ?? []).some(
+      (c) => (c.compile?.length ?? 0) > 0,
+    );
     const isDenoProject =
       !detail?.config.toolchain?.compile?.length &&
+      !hasRunConfigCompile &&
       (!detail?.config.lang || detail.config.lang === "deno");
     if (!isDenoProject) {
       try {
@@ -224,6 +261,26 @@ export default function ProjectWorkspace() {
           </span>
         )}
         <div className="flex-1" />
+        {runConfigs.length > 0 && (
+          <label
+            className="flex items-center gap-1.5 text-xs text-fg-faint"
+            title="Named run configuration from the pack — drives Run and Compile. Persists in nanobpm.project.json."
+          >
+            <span className="hidden sm:inline">Config:</span>
+            <select
+              value={activeRunConfigId ?? ""}
+              onChange={(e) => void changeRunConfig(e.target.value || null)}
+              disabled={running || compiling}
+              className="rounded-md border border-edge-strong bg-bg-subtle px-2 py-1 text-sm text-fg hover:bg-hover disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {runConfigs.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {running ? (
           <ToolbarButton onClick={() => void stop()} kind="danger">
             ■ Stop
@@ -636,29 +693,54 @@ function EditorPane({
       return;
     }
     let alive = true;
+    debug("modeler", "info", `priming deployed XML for '${primaryProcessId}'`, {
+      file: path,
+      deployTarget,
+    });
     void fetchDeployedXmlByProcessId(primaryProcessId, deployTarget).then(
-      (xml) => alive && setLastDeployedXml(xml),
+      (xml) => {
+        if (!alive) return;
+        setLastDeployedXml(xml);
+        if (xml != null) {
+          debug(
+            "modeler",
+            "ok",
+            `primed lastDeployedXml (${xml.length} bytes); Start Instance ${xml === content ? "enabled" : "stays disabled — saved XML differs from deployed"}`,
+          );
+        }
+      },
     );
     return () => {
       alive = false;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind, primaryProcessId, deployTarget]);
 
   const deploy = useCallback(async () => {
     if (content == null) return;
     setDeploying(true);
+    const modelName = path.split("/").pop()?.replace(/\.bpmn$/i, "") || name;
+    debug("modeler", "info", `deploy '${modelName}' clicked`, {
+      file: path,
+      bytes: content.length,
+      primaryProcessId,
+    });
     try {
-      // Deploy the saved on-disk XML — the user has to Save first if they
-      // want their in-flight edits deployed (dirty guard disables the button).
-      const modelName = path.split("/").pop()?.replace(/\.bpmn$/i, "") || name;
       await deployXml(modelName, content, deployTarget);
       setLastDeployedXml(content);
+      debug(
+        "modeler",
+        "ok",
+        `deployed; Start Instance is now enabled for '${primaryProcessId ?? "(unknown)"}'`,
+      );
     } catch (e) {
-      alert(`Deploy failed: ${e instanceof Error ? e.message : String(e)}`);
+      const msg = e instanceof Error ? e.message : String(e);
+      debug("modeler", "error", `deploy failed: ${msg}`);
+      alert(`Deploy failed: ${msg}\n\nSee the Debug tab for the request URL and diagnostic hints.`);
     } finally {
       setDeploying(false);
     }
-  }, [content, deployTarget, name, path]);
+  }, [content, deployTarget, name, path, primaryProcessId]);
 
   // Switches the BPMN editor between the graphical canvas and the raw XML tab.
   // Visual → XML: pull the current serialized document from the modeler.
@@ -919,34 +1001,129 @@ function RunConsole({
   onClear: () => void;
   height: number;
 }) {
+  const [tab, setTab] = useState<"output" | "debug">("output");
+  const [debugLog, setDebugLog] = useState<DebugEntry[]>(() => debugSnapshot());
+  const debugRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const unsub = subscribeDebug((entry) => {
+      setDebugLog((prev) => {
+        const next = prev.length >= 500 ? prev.slice(-499) : prev.slice();
+        next.push(entry);
+        return next;
+      });
+    });
+    return unsub;
+  }, []);
+
+  useEffect(() => {
+    if (tab === "debug") debugRef.current?.scrollTo({ top: 1e9 });
+  }, [debugLog, tab]);
+
+  const tabCls = (active: boolean) =>
+    `border-b-2 px-3 py-1 text-xs uppercase tracking-wider transition-colors ${
+      active
+        ? "border-accent text-fg"
+        : "border-transparent text-fg-faint hover:text-fg-muted"
+    }`;
+
   return (
     <div className="flex shrink-0 flex-col bg-inset" style={{ height }}>
-      <div className="flex items-center justify-between border-b border-edge px-3 py-1 text-xs uppercase tracking-wider text-fg-faint">
-        <span>Output</span>
-        <button onClick={onClear} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg-muted">
+      <div className="flex items-center justify-between border-b border-edge pr-3">
+        <div className="flex">
+          <button className={tabCls(tab === "output")} onClick={() => setTab("output")}>
+            Output
+          </button>
+          <button className={tabCls(tab === "debug")} onClick={() => setTab("debug")}>
+            Debug{debugLog.length ? ` · ${debugLog.length}` : ""}
+          </button>
+        </div>
+        <button
+          onClick={() => {
+            if (tab === "output") onClear();
+            else {
+              clearDebug();
+              setDebugLog([]);
+            }
+          }}
+          className="rounded px-1.5 py-0.5 text-xs uppercase tracking-wider text-fg-faint hover:bg-hover hover:text-fg-muted"
+        >
           Clear
         </button>
       </div>
-      <div ref={forwardRef} className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed">
-        {logs.length === 0 ? (
-          <div className="text-fg-faint">No output yet. Run the application to see logs.</div>
-        ) : (
-          logs.map((l, i) => (
-            <div
-              key={i}
-              className={
-                l.stream === "err"
-                  ? "whitespace-pre-wrap text-danger"
-                  : l.stream === "sys"
-                    ? "whitespace-pre-wrap text-info"
-                    : "whitespace-pre-wrap text-fg-muted"
-              }
-            >
-              {l.text}
+      {tab === "output" ? (
+        <div
+          ref={forwardRef}
+          className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed"
+        >
+          {logs.length === 0 ? (
+            <div className="text-fg-faint">
+              No output yet. Run the application to see logs.
             </div>
-          ))
-        )}
-      </div>
+          ) : (
+            logs.map((l, i) => (
+              <div
+                key={i}
+                className={
+                  l.stream === "err"
+                    ? "whitespace-pre-wrap text-danger"
+                    : l.stream === "sys"
+                      ? "whitespace-pre-wrap text-info"
+                      : "whitespace-pre-wrap text-fg-muted"
+                }
+              >
+                {l.text}
+              </div>
+            ))
+          )}
+        </div>
+      ) : (
+        <div
+          ref={debugRef}
+          className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed"
+        >
+          {debugLog.length === 0 ? (
+            <div className="text-fg-faint">
+              No debug traces yet. Deploy, Start Instance and probe requests
+              log their URL, response, and timing here.
+            </div>
+          ) : (
+            debugLog.map((e) => <DebugRow key={e.id} entry={e} />)
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DebugRow({ entry }: { entry: DebugEntry }) {
+  const [open, setOpen] = useState(false);
+  const hasDetail = entry.detail && Object.keys(entry.detail).length > 0;
+  const color =
+    entry.level === "error"
+      ? "text-danger"
+      : entry.level === "warn"
+        ? "text-warn"
+        : entry.level === "ok"
+          ? "text-ok"
+          : "text-fg-muted";
+  const time = new Date(entry.ts).toISOString().slice(11, 23);
+  return (
+    <div className="whitespace-pre-wrap">
+      <button
+        onClick={() => hasDetail && setOpen((o) => !o)}
+        className={`w-full text-left ${color} ${hasDetail ? "cursor-pointer hover:bg-hover" : "cursor-default"}`}
+      >
+        <span className="text-fg-faint">{time}</span>{" "}
+        <span className="text-fg-faint">[{entry.scope}]</span>{" "}
+        {hasDetail ? (open ? "▾ " : "▸ ") : "  "}
+        {entry.message}
+      </button>
+      {open && hasDetail && (
+        <pre className="ml-8 border-l-2 border-edge px-2 text-fg-muted">
+{JSON.stringify(entry.detail, null, 2)}
+        </pre>
+      )}
     </div>
   );
 }

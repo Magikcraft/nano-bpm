@@ -15,6 +15,21 @@ use crate::state::{IncidentKind, Key, MessageSubscriptionKind, TimerKind};
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Event {
+    /// A `POST /v2/deployments` command was accepted. Emitted **once per deploy
+    /// call**, unconditionally, before any [`Event::ProcessDeployed`] events
+    /// that may follow — mirroring Zeebe's `DeploymentIntent.CREATED` (see
+    /// `DeploymentCreateProcessor.java:224`). The key identifies the API call
+    /// (not the artefact), is what the client sees in the response envelope,
+    /// and is the handle used by audit-log filters. The applier is a strict
+    /// no-op today; state persistence for later `GET /deployments/{key}`
+    /// retrieval is tracked separately (issue #47, Option A).
+    ///
+    /// Emitting on every call — even a pure-duplicate deploy that mints no
+    /// [`Event::ProcessDeployed`] — is what keeps the spec's
+    /// `DeploymentKey: LongKey` (pattern `^-?[0-9]+$`) contract satisfied. An
+    /// empty deploymentKey trips `Long.parseLong` in every stock C8 client.
+    DeploymentCreated { deployment_key: Key },
+
     /// A process definition was registered as part of a deployment. The engine
     /// assigns the `deployment_key` (shared by every resource in the same
     /// deployment), a unique `process_definition_key`, and a `version` that
@@ -649,6 +664,7 @@ impl Event {
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
+            | Event::DeploymentCreated { .. }
             | Event::MessagePublished { .. }
             | Event::SignalBroadcast { .. }
             | Event::MessageStartSubscriptionCreated { .. }
@@ -674,6 +690,7 @@ impl Event {
                 process_definition_key,
                 ..
             } => m = m.max(*deployment_key).max(*process_definition_key),
+            Event::DeploymentCreated { deployment_key } => m = m.max(*deployment_key),
             Event::ElementActivating {
                 element_instance_key,
                 ..

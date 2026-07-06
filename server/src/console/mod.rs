@@ -168,6 +168,14 @@ pub fn router(server: ServerImpl) -> Router {
             "/console/api/projects/{name}/compile",
             axum::routing::post(project_compile),
         )
+        .route(
+            "/console/api/projects/{name}/run-configs",
+            get(project_run_configs_list),
+        )
+        .route(
+            "/console/api/projects/{name}/active-run-config",
+            axum::routing::put(project_active_run_config_put),
+        )
         .route("/console/api/projects/{name}/export", get(project_export))
         .route("/console/api/extensions", get(extensions_list))
         .route(
@@ -2168,6 +2176,69 @@ async fn project_config_put(
     cfg.updated_ms = now_ms_proj();
     match projects::write_config(&name, &cfg) {
         Ok(()) => Json(cfg).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not save config: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /console/api/projects/{name}/run-configs` — list the named run
+/// configurations snapshotted from the scaffolding pack and the id of the
+/// active one (or `null` when none is set — in which case the resolver picks
+/// the `default: true` entry, else the first).
+async fn project_run_configs_list(Path(name): Path<String>) -> Response {
+    let Some(cfg) = projects::read_config(&name) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let (configs, active) = match cfg.toolchain.as_ref() {
+        Some(tc) => (tc.run_configs.clone(), tc.active_run_config.clone()),
+        None => (vec![], None),
+    };
+    Json(serde_json::json!({ "runConfigs": configs, "active": active })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveRunConfigBody {
+    id: Option<String>,
+}
+
+/// `PUT /console/api/projects/{name}/active-run-config` — set which run config
+/// the Run/Compile buttons should use. Body: `{ "id": "stock-rest" }`; pass
+/// `null` (or omit) to clear the pin and revert to `default: true` / first.
+/// Rejects unknown ids so the picker can't silently persist a typo.
+async fn project_active_run_config_put(
+    Path(name): Path<String>,
+    Json(body): Json<ActiveRunConfigBody>,
+) -> Response {
+    let Some(mut cfg) = projects::read_config(&name) else {
+        return (StatusCode::NOT_FOUND, "no such project").into_response();
+    };
+    let Some(tc) = cfg.toolchain.as_mut() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "project has no toolchain (no run configs to select)",
+        )
+            .into_response();
+    };
+    if let Some(id) = body.id.as_deref()
+        && !tc.run_configs.iter().any(|rc| rc.id == id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("no run config with id '{id}'"),
+        )
+            .into_response();
+    }
+    tc.active_run_config = body.id;
+    cfg.updated_ms = now_ms_proj();
+    match projects::write_config(&name, &cfg) {
+        Ok(()) => Json(serde_json::json!({
+            "active": cfg.toolchain.as_ref().and_then(|t| t.active_run_config.clone()),
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save config: {e}"),

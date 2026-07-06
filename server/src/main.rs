@@ -6343,15 +6343,17 @@ impl ServerImpl {
         // replicated create of this definition applies on every replica.
         self.install_into_raft_replicas(&events).await;
 
-        // The deployment key rides on the emitted ProcessDeployed event(s); a
-        // pure idempotent redeploy emits none and reports an empty key.
+        // Every deploy emits a DeploymentCreated first (issue #47, Option B):
+        // the engine mints the shared deployment key unconditionally so the
+        // response envelope always carries a valid LongKey — even on a pure
+        // idempotent redeploy that produces no ProcessDeployed events.
         let deployment_key = events
             .iter()
             .find_map(|e| match e {
-                Event::ProcessDeployed { deployment_key, .. } => Some(deployment_key.to_string()),
+                Event::DeploymentCreated { deployment_key } => Some(deployment_key.to_string()),
                 _ => None,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| "0".to_string());
         let deployments = resolved
             .into_iter()
             .map(|(process_id, process_definition_key, version)| {
@@ -10421,6 +10423,30 @@ async fn main() {
     if debug_rest_enabled() {
         app = app.layer(axum::middleware::from_fn(log_rest));
         tracing::info!("DEBUG_REST enabled: logging every REST request and response");
+    }
+
+    // CORS: the gateway is often addressed cross-origin (Nano IDE Deno GUI on
+    // its own port, vite dev at :5173, a hosted console). The REST /v2 surface
+    // is a *dev-target* API — the same-origin restriction browsers apply by
+    // default is more friction than protection here (the alternative is asking
+    // every consumer to run its own proxy). Permissive by default; disable
+    // with NANOBPM_CORS=off if you're deploying to an untrusted origin.
+    if std::env::var("NANOBPM_CORS")
+        .map(|v| v.to_ascii_lowercase())
+        .ok()
+        .as_deref()
+        != Some("off")
+    {
+        use tower_http::cors::{Any, CorsLayer};
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .expose_headers(Any);
+        app = app.layer(cors);
+        tracing::info!(
+            "CORS enabled on all routes (Access-Control-Allow-Origin: *). Set NANOBPM_CORS=off to disable."
+        );
     }
 
     // Background "tick": drives the host clock into the engine so timers fire and
