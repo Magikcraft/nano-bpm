@@ -519,7 +519,11 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
     Ok(m)
 }
 
-/// Remove an installed (non-builtin) extension by package name.
+/// Uninstall a non-builtin extension. Accepts either the npm package name
+/// (e.g. `@nanobpm/nano-ide-lang-rust`) or the manifest id (`rust`) — the
+/// latter is what the Console's Extensions overview payload carries, so
+/// the UI's remove button uses it. Returns `Err("not installed")` if
+/// neither form resolves to an installed pack directory.
 pub fn remove(pkg: &str) -> Result<(), String> {
     // Accept either the npm package name (e.g. `@nanobpm/nano-ide-lang-rust`)
     // or the manifest id (`rust`). The Console's Extensions view only knows
@@ -746,6 +750,13 @@ pub fn toolchain_available(m: &ExtManifest) -> bool {
 mod tests {
     use super::*;
 
+    /// Tests that mutate `NANOBPMN_EXTENSIONS_DIR` (a process-global env var)
+    /// must serialize on this mutex — cargo test runs them in parallel by
+    /// default, so two concurrent tests would race on the env var and read
+    /// each other's temp dirs. Use `let _guard = ENV_LOCK.lock().unwrap();`
+    /// at the top of any such test.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn builtins_cover_deno_rust_gui() {
         let ids: BTreeSet<_> = builtin_extensions().into_iter().map(|e| e.id).collect();
@@ -781,9 +792,11 @@ mod tests {
 
     #[test]
     fn installed_version_reads_package_json() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Point the extensions root at a unique temp dir and drop a pack with a
         // package.json, then confirm installed_version reads its version.
-        let root = std::env::temp_dir().join(format!("nano-ext-test-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("nano-ext-ver-{}", std::process::id()));
         let pkg = "@nanobpm/nano-ide-lang-rust";
         // SAFETY: test-local env set; other tests in this module don't depend on
         // the extensions-root *value* (only on path suffixes / builtins).
@@ -803,11 +816,13 @@ mod tests {
 
     #[test]
     fn remove_resolves_manifest_id_when_npm_name_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Console UI has only the manifest id (e.g. "throughput-jvm") from the
         // overview payload, so remove() must accept it and reverse-lookup the
         // pack dir via its bundled nano-ide.ext.json — otherwise the button
         // 400s with "not installed" for every non-builtin pack.
-        let root = std::env::temp_dir().join(format!("nano-ext-remove-{}", std::process::id()));
+        let root = std::env::temp_dir()
+            .join(format!("nano-ext-remove-{}", std::process::id()));
         let pkg = "@nanobpm/nano-ide-example-throughput-demo";
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
         let dir = safe_pkg_dir(pkg).unwrap();
