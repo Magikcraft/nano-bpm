@@ -1449,19 +1449,60 @@ fn admission_max_backlog_from_env() -> usize {
         .unwrap_or(0)
 }
 
-/// Resolves the create-queue-depth admission limit, or `0` (off) by default.
+/// Nominal resident bytes charged per submitted-but-unapplied create when
+/// deriving the default create-queue depth cap from the memory budget: a small
+/// create envelope plus a few variables. Deliberately conservative so the
+/// count cap lands at a bounded, safe footprint.
+const NOMINAL_CREATE_BYTES: u64 = 8 * 1024;
+/// Never auto-derive a create-queue cap below this — a tiny cap would shed
+/// against legitimate short bursts on a small host.
+const MIN_CREATE_QUEUE_CAP: usize = 20_000;
+/// Never auto-derive a create-queue cap above this — beyond it the coarse
+/// pipeline-byte / resident-memory rails are the right backstop.
+const MAX_CREATE_QUEUE_CAP: usize = 500_000;
+
+/// Computes the default create-queue depth cap from a detected memory `limit`:
+/// budget the same fraction the in-flight-byte rail uses, expressed as a *count*
+/// of nominal creates, clamped to `[MIN_CREATE_QUEUE_CAP, MAX_CREATE_QUEUE_CAP]`.
+/// This proactive count rail trips *earlier* than the byte rail — it counts
+/// submitted creates before their payloads are all resident — so a flood is shed
+/// before memory balloons. Pure so it can be unit-tested without the environment.
+fn create_queue_cap_default_from_limit(limit_bytes: u64) -> usize {
+    let budget = pipeline_bytes_watermark_default_from_limit(limit_bytes);
+    ((budget / NOMINAL_CREATE_BYTES) as usize).clamp(MIN_CREATE_QUEUE_CAP, MAX_CREATE_QUEUE_CAP)
+}
+
+/// Resolves the create-queue-depth admission limit.
 ///
 /// `NANOBPMN_ADMISSION_MAX_CREATE_QUEUE=<n>` caps the standing backlog of
 /// submitted-but-not-yet-applied creates across all partitions; once it is reached,
 /// `createProcessInstance` is shed with a 503 `RESOURCE_EXHAUSTED`. Because
 /// completion-priority makes creates yield to completion, this queue is what grows
-/// under overload, so bounding it bounds create-side latency. Unset or `0`
-/// disables it (the default).
+/// under overload, so bounding it bounds create-side latency **and** caps the
+/// resident balloon of unapplied-create payloads before an OOM.
+///
+/// - `NANOBPMN_ADMISSION_MAX_CREATE_QUEUE=off` (or `0`/`false`/`no`): disabled.
+/// - `=<n>`: explicit depth cap.
+/// - unset / `adaptive` / `on`: a count derived from the detected cgroup/host
+///   memory limit ([`create_queue_cap_default_from_limit`]), or
+///   [`MIN_CREATE_QUEUE_CAP`] when no limit can be read. **On by default**: this
+///   is the proactive rail that makes an arrival flood *shed* rather than gather
+///   in memory, in both SLA modes.
 fn admission_max_create_queue_from_env() -> usize {
-    std::env::var("NANOBPMN_ADMISSION_MAX_CREATE_QUEUE")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+    if let Ok(v) = std::env::var("NANOBPMN_ADMISSION_MAX_CREATE_QUEUE") {
+        let t = v.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "off" | "false" | "no") {
+            return 0;
+        }
+        if let Ok(n) = t.parse::<usize>() {
+            // Explicit number wins, including `0` = off.
+            return n;
+        }
+        // "on"/"adaptive"/anything else falls through to the adaptive default.
+    }
+    detect_memory_limit_bytes()
+        .map(create_queue_cap_default_from_limit)
+        .unwrap_or(MIN_CREATE_QUEUE_CAP)
 }
 
 /// Default memory-pressure admission watermark as a percentage of the detected
@@ -8756,22 +8797,56 @@ impl ServerImpl {
     ///   latency gate would have.
     pub(crate) fn admission_shed(&self) -> Option<String> {
         let cq_limit = self.admission_max_create_queue;
-        if cq_limit > 0 {
-            let depth = self.engine.pending_create_queue();
-            if depth >= cq_limit {
-                return Some(format!(
-                    "Admission control: create queue depth {depth} at or above the \
-                     configured limit of {cq_limit}. Retry after a backoff."
-                ));
-            }
-        }
         let backlog_limit = self.admission_max_backlog;
-        if self.sla_mode.get().sheds_for_latency() && backlog_limit > 0 {
+        let latency_mode = self.sla_mode.get().sheds_for_latency();
+        // The standing create-queue depth (submitted-but-not-yet-applied creates)
+        // is the backlog that actually grows under overload — completion-priority
+        // makes creates yield, so this queue is where excess arrival piles up and
+        // holds resident memory. Both the memory rail and the latency rail key off
+        // it. Computed at most once, and only when a rail that needs it is armed,
+        // so the fully-unconfigured hot path stays a few relaxed atomic loads.
+        let need_create_queue = cq_limit > 0 || (latency_mode && backlog_limit > 0);
+        let create_queue = if need_create_queue {
+            self.engine.pending_create_queue()
+        } else {
+            0
+        };
+
+        // Memory rail (always on, both SLA modes): a proactive, count-based cap on
+        // the unapplied-create backlog. It sheds *before* those creates' payloads
+        // become resident, so an arrival flood is rejected early rather than
+        // gathered in memory toward an OOM — the coarse resident-byte rails below
+        // are the late backstop, this is the early one.
+        if cq_limit > 0 && create_queue >= cq_limit {
+            crate::metrics::record_admission_shed("create_queue");
+            return Some(format!(
+                "Admission control: create queue depth {create_queue} at or above the \
+                 configured limit of {cq_limit}. Retry after a backoff."
+            ));
+        }
+        // Latency-preservation rail (latency SLA mode only): shed once either the
+        // parked active-instance backlog *or* the create-side backlog reaches the
+        // configured limit, so end-to-end latency stays bounded. The create-side
+        // term is the one that bites for fast create->complete workloads: their
+        // active-instance count (`self.inflight`, projected by the read-model
+        // exporter) stays ~0 because instances complete as fast as they're
+        // projected, so the active-instance term alone was a no-op under a create
+        // flood. Bounding the create queue bounds create->apply latency, which is
+        // the dominant queue an overloaded producer waits behind.
+        if latency_mode && backlog_limit > 0 {
             let backlog = self.inflight.load(Ordering::Relaxed);
             if backlog >= backlog_limit {
+                crate::metrics::record_admission_shed("active_backlog");
                 return Some(format!(
                     "Admission control: {backlog} active instances at or above the \
                      configured backlog limit of {backlog_limit}. Retry after a backoff."
+                ));
+            }
+            if create_queue >= backlog_limit {
+                crate::metrics::record_admission_shed("create_backlog");
+                return Some(format!(
+                    "Admission control: create backlog {create_queue} at or above the \
+                     configured latency backlog limit of {backlog_limit}. Retry after a backoff."
                 ));
             }
         }
@@ -8783,6 +8858,7 @@ impl ServerImpl {
         // saturated — never blocking the shared journal writer. A shed create is
         // never journaled, so durability/at-least-once are intact.
         if self.engine.exporter_all_saturated() {
+            crate::metrics::record_admission_shed("exporter");
             return Some(
                 "Admission control: all read-model export queues are at capacity. \
                  Retry after a backoff."
@@ -8800,6 +8876,7 @@ impl ServerImpl {
         if self.pipeline_bytes_watermark > 0 {
             let bytes = self.pipeline_bytes.load(Ordering::Relaxed);
             if bytes >= self.pipeline_bytes_watermark {
+                crate::metrics::record_admission_shed("pipeline_bytes");
                 return Some(format!(
                     "Admission control: in-flight create payload {} MiB at or above the \
                      configured watermark of {} MiB. Retry after a backoff.",
@@ -8822,6 +8899,7 @@ impl ServerImpl {
         if self.mem_watermark_bytes > 0 {
             let resident = self.mem_pressure_bytes.load(Ordering::Relaxed);
             if resident >= self.mem_watermark_bytes {
+                crate::metrics::record_admission_shed("mem_watermark");
                 return Some(format!(
                     "Admission control: resident memory {} MiB at or above the \
                      configured watermark of {} MiB. Retry after a backoff.",
@@ -8871,8 +8949,12 @@ impl ServerImpl {
         let processing = self.processing.load(Ordering::Relaxed);
         let mut throughput = self.backpressure.should_shed(processing);
         let backlog_limit = self.admission_max_backlog;
-        if !throughput && backlog_limit > 0 {
-            throughput = self.inflight.load(Ordering::Relaxed) >= backlog_limit;
+        if !throughput && backlog_limit > 0 && self.sla_mode.get().sheds_for_latency() {
+            // Mirror the latency-preservation rail in `admission_shed`: it trips on
+            // either the parked active-instance backlog or the create-side backlog
+            // (the term that bites for fast create->complete workloads).
+            throughput = self.inflight.load(Ordering::Relaxed) >= backlog_limit
+                || self.engine.pending_create_queue() >= backlog_limit;
         }
 
         let mut memory = false;
@@ -11044,6 +11126,33 @@ mod clustered_startup_tests {
         // Tiny limit below the floor -> capped at the limit, never above it.
         let tiny = 128 * 1024 * 1024; // 128 MiB
         assert_eq!(pipeline_bytes_watermark_default_from_limit(tiny), tiny);
+    }
+
+    #[test]
+    fn create_queue_cap_default_scales_and_clamps() {
+        // 64 GiB host: byte budget 8% = ~5.1 GiB; /8 KiB per create is ~670k,
+        // clamped down to the 500k ceiling.
+        let big = 64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            create_queue_cap_default_from_limit(big),
+            MAX_CREATE_QUEUE_CAP
+        );
+
+        // Mid host where the derived count lands inside the band: 4 GiB -> byte
+        // rail floored at MIN_PIPELINE_BYTES (512 MiB) -> 512 MiB / 8 KiB = 65_536,
+        // within [20k, 500k].
+        let mid = 4 * 1024 * 1024 * 1024;
+        let cap = create_queue_cap_default_from_limit(mid);
+        assert_eq!(cap, (MIN_PIPELINE_BYTES / NOMINAL_CREATE_BYTES) as usize);
+        assert!((MIN_CREATE_QUEUE_CAP..=MAX_CREATE_QUEUE_CAP).contains(&cap));
+
+        // Tiny limit -> byte budget = the whole tiny limit; /8 KiB is far below
+        // the 20k floor -> clamped up to MIN_CREATE_QUEUE_CAP.
+        let tiny = 64 * 1024 * 1024; // 64 MiB
+        assert_eq!(
+            create_queue_cap_default_from_limit(tiny),
+            MIN_CREATE_QUEUE_CAP
+        );
     }
 
     /// Builds an in-memory clustered `ServerImpl` for `node_id` of a 2-node,

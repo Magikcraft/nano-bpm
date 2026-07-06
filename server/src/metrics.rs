@@ -112,6 +112,14 @@ struct Metrics {
     /// applying, else 0. A stuck-at-1 partition strands its share of instances and
     /// jobs — the signal behind the RF>1 completion-freeze. Labelled by partition.
     raft_partition_shutdown: prometheus::IntGaugeVec,
+
+    /// Cumulative count of admission sheds — one per `createProcessInstance`
+    /// rejected by [`admission_shed`](crate::AppServer::admission_shed), labelled
+    /// by `reason` (which rail tripped: `create_queue`, `active_backlog`,
+    /// `create_backlog`, `exporter`, `pipeline_bytes`, `mem_watermark`). Lets a
+    /// dashboard confirm that overload is being *shed* rather than silently
+    /// accumulated in memory, and which rail is doing the shedding.
+    admission_shed_total: prometheus::IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -334,6 +342,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["partition"],
     )
     .expect("valid gauge vec");
+    let admission_shed_total = prometheus::IntCounterVec::new(
+        Opts::new(
+            "nanobpm_admission_shed_total",
+            "Cumulative createProcessInstance sheds by admission control, labelled by the rail that tripped.",
+        ),
+        &["reason"],
+    )
+    .expect("valid counter vec");
 
     registry
         .register(Box::new(commit_batch_size.clone()))
@@ -364,6 +380,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_workers.clone())))
         .and(registry.register(Box::new(job_type_starved.clone())))
         .and(registry.register(Box::new(raft_partition_shutdown.clone())))
+        .and(registry.register(Box::new(admission_shed_total.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -396,6 +413,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_workers,
         job_type_starved,
         raft_partition_shutdown,
+        admission_shed_total,
     }
 });
 
@@ -526,6 +544,17 @@ pub fn set_raft_partition_shutdown(partition: u64, down: bool) {
         .raft_partition_shutdown
         .with_label_values(&[&partition.to_string()])
         .set(i64::from(down));
+}
+
+/// Records one admission shed (a `createProcessInstance` rejected to protect
+/// latency or memory), labelled by the rail that tripped. Delta-scraping this
+/// counter shows shed rate and which rail is active — the observability that
+/// makes "is the cluster shedding or silently gathering?" answerable.
+pub fn record_admission_shed(reason: &str) {
+    METRICS
+        .admission_shed_total
+        .with_label_values(&[reason])
+        .inc();
 }
 
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
