@@ -504,10 +504,21 @@ fn redeploying_an_identical_definition_is_idempotent() {
     let third = engine
         .apply_command(Command::DeployProcess(linear_with_task()))
         .unwrap();
-    assert!(
-        second.is_empty() && third.is_empty(),
-        "an identical redeploy emits no events"
-    );
+    // Since issue #47 (Option B) every deploy emits a single DeploymentCreated
+    // to guarantee the response envelope carries a valid LongKey — the
+    // *idempotent* invariant is now specifically that no ProcessDeployed is
+    // emitted (no new version, no new state).
+    for events in [&second, &third] {
+        assert_eq!(
+            events.len(),
+            1,
+            "identical redeploy emits only the DeploymentCreated envelope event",
+        );
+        assert!(
+            matches!(events[0], Event::DeploymentCreated { .. }),
+            "the sole event on an identical redeploy is DeploymentCreated",
+        );
+    }
 
     // State still holds exactly the original version and key.
     let current = engine.state().processes.get("order").unwrap();

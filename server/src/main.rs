@@ -6343,15 +6343,17 @@ impl ServerImpl {
         // replicated create of this definition applies on every replica.
         self.install_into_raft_replicas(&events).await;
 
-        // The deployment key rides on the emitted ProcessDeployed event(s); a
-        // pure idempotent redeploy emits none and reports an empty key.
+        // Every deploy emits a DeploymentCreated first (issue #47, Option B):
+        // the engine mints the shared deployment key unconditionally so the
+        // response envelope always carries a valid LongKey — even on a pure
+        // idempotent redeploy that produces no ProcessDeployed events.
         let deployment_key = events
             .iter()
             .find_map(|e| match e {
-                Event::ProcessDeployed { deployment_key, .. } => Some(deployment_key.to_string()),
+                Event::DeploymentCreated { deployment_key } => Some(deployment_key.to_string()),
                 _ => None,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| "0".to_string());
         let deployments = resolved
             .into_iter()
             .map(|(process_id, process_definition_key, version)| {

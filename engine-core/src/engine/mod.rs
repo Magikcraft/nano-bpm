@@ -477,10 +477,14 @@ impl Engine {
             }
         }
 
-        // Mint the shared deployment key lazily, only once we know at least one
-        // process actually changed — a deploy of nothing but duplicates emits no
-        // events and therefore must mint no keys.
-        let mut deployment_key: Option<Key> = None;
+        // Emit DeploymentCreated FIRST, unconditionally — this is the C8-spec
+        // handle the client sees in the response envelope (LongKey pattern,
+        // never empty) and mirrors Zeebe's DeploymentIntent.CREATED. The
+        // shared deployment_key is minted here and stamped onto every
+        // ProcessDeployed that follows in the same call (issue #47).
+        let deployment_key = self.mint_key();
+        self.emit(log, Event::DeploymentCreated { deployment_key });
+
         for process in processes {
             if self
                 .state
@@ -492,7 +496,6 @@ impl Engine {
                 // and skip it entirely (no event, no new subscription/timer).
                 continue;
             }
-            let deployment_key = *deployment_key.get_or_insert_with(|| self.mint_key());
             let version = self.next_version(&process.id);
             let process_definition_key = self.mint_key();
             let process_id = process.id.clone();
