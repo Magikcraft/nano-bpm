@@ -65,6 +65,10 @@ struct Metrics {
     creates_total: prometheus::IntCounterVec,
     /// Job completions, split by protocol (rest vs stream).
     job_completions_total: prometheus::IntCounterVec,
+    /// Diagnostic: stream CompleteJob outcomes by decision point, to localize a
+    /// load-induced completion freeze (route_forward|route_local|leader_reject|
+    /// propose_err|apply_err|forward_ok|forward_err).
+    stream_complete_outcome_total: prometheus::IntCounterVec,
 
     /// Serialized bytes of all uncompacted Raft log entries currently held in the
     /// in-memory log indexes, summed across every owned partition. Under a burst
@@ -103,6 +107,11 @@ struct Metrics {
     /// `job_type_activatable` / `job_type_workers` to spot soft under-provisioning
     /// (workers present but backlog growing).
     job_type_starved: prometheus::IntGaugeVec,
+    /// Per-partition Raft liveness alarm: 1 when the partition's openraft core has
+    /// entered `Shutdown` (terminated, e.g. on a storage error) and is no longer
+    /// applying, else 0. A stuck-at-1 partition strands its share of instances and
+    /// jobs — the signal behind the RF>1 completion-freeze. Labelled by partition.
+    raft_partition_shutdown: prometheus::IntGaugeVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -234,6 +243,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let stream_complete_outcome_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_stream_complete_outcome_total",
+            "Stream CompleteJob outcomes by decision point (diagnostic).",
+        ),
+        &["outcome"],
+    )
+    .expect("valid counter vec");
+
     let raft_log_bytes = IntGauge::new(
         "nanobpm_raft_log_bytes",
         "Serialized bytes of uncompacted in-memory Raft log entries (all partitions).",
@@ -308,6 +326,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge vec");
 
+    let raft_partition_shutdown = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_raft_partition_shutdown",
+            "1 when a partition's Raft core has entered Shutdown (terminated, no longer applying) and is stranding its jobs/instances, else 0.",
+        ),
+        &["partition"],
+    )
+    .expect("valid gauge vec");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -325,6 +352,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
         .and(registry.register(Box::new(creates_total.clone())))
         .and(registry.register(Box::new(job_completions_total.clone())))
+        .and(registry.register(Box::new(stream_complete_outcome_total.clone())))
         .and(registry.register(Box::new(raft_log_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
@@ -335,6 +363,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_activatable.clone())))
         .and(registry.register(Box::new(job_type_workers.clone())))
         .and(registry.register(Box::new(job_type_starved.clone())))
+        .and(registry.register(Box::new(raft_partition_shutdown.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -355,6 +384,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         stream_frame_processing_seconds,
         creates_total,
         job_completions_total,
+        stream_complete_outcome_total,
         raft_log_bytes,
         raft_log_entries,
         exporter_queue_bytes,
@@ -365,6 +395,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_activatable,
         job_type_workers,
         job_type_starved,
+        raft_partition_shutdown,
     }
 });
 
@@ -488,6 +519,15 @@ pub fn set_job_type_provisioning(job_type: &str, activatable: i64, workers: i64)
         .set(starved);
 }
 
+/// Publishes the per-partition Raft `Shutdown` alarm: `down = true` sets the gauge
+/// to 1 (the partition's core has terminated and stopped applying), else 0.
+pub fn set_raft_partition_shutdown(partition: u64, down: bool) {
+    METRICS
+        .raft_partition_shutdown
+        .with_label_values(&[&partition.to_string()])
+        .set(i64::from(down));
+}
+
 /// Accounts one writer-loop iteration: `idle` is the time blocked awaiting the
 /// first request, `busy` is the time spent draining/lingering/fsyncing/acking
 /// that batch. Delta-scraping the two counters yields the writer's duty cycle.
@@ -549,6 +589,15 @@ pub fn record_job_completion(protocol: &str) {
     METRICS
         .job_completions_total
         .with_label_values(&[protocol])
+        .inc();
+}
+
+/// Diagnostic: records where a stream CompleteJob landed (route_forward,
+/// route_local, leader_reject, propose_err, apply_err, forward_ok, forward_err).
+pub fn record_complete_outcome(outcome: &str) {
+    METRICS
+        .stream_complete_outcome_total
+        .with_label_values(&[outcome])
         .inc();
 }
 

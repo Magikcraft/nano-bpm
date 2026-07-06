@@ -1248,13 +1248,21 @@ async fn handle_client_frame(
             // (job aggregation). Forward to the owner; local jobs stay on the
             // pipelined fast path. Single-node always owns every key.
             if let Some(node) = server.job_route(key) {
+                crate::metrics::record_complete_outcome("route_forward");
                 let server = server.clone();
                 spawn_forward_stream_reply(conn, corr, async move {
-                    server
+                    let outcome = server
                         .forward_complete_job_stream(node, key, variables)
-                        .await
+                        .await;
+                    crate::metrics::record_complete_outcome(if outcome.0 < 300 {
+                        "forward_ok"
+                    } else {
+                        "forward_err"
+                    });
+                    outcome
                 });
             } else {
+                crate::metrics::record_complete_outcome("route_local");
                 let vars = to_engine_vars(variables);
                 if server.raft_registry().is_empty() {
                     pipeline_job_command(

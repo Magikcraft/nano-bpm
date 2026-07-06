@@ -8559,13 +8559,18 @@ impl ServerImpl {
         };
         let node_id = self.engine.topology().node_id as u64;
         if part.raft.metrics().borrow().current_leader != Some(node_id) {
+            crate::metrics::record_complete_outcome("leader_reject");
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
         let response = part
             .propose_result(command, now_millis())
             .await
-            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+            .map_err(|e| {
+                crate::metrics::record_complete_outcome("propose_err");
+                (500, format!("raft propose failed: {e}"))
+            })?;
         if let Some((status, message)) = response.error {
+            crate::metrics::record_complete_outcome("apply_err");
             return Err((status, message));
         }
         self.spawn_routing_if_needed(&response.events);
@@ -9508,6 +9513,45 @@ const REST_LOG_BODY_PREVIEW: usize = 4096;
 /// metrics (commit batch size, fsync/commit-wait latency, pipeline depth). Served
 /// unauthenticated alongside the REST API; scrape it while benchmarking to see
 /// how many writes share each fsync.
+/// Read-on-demand diagnostic dump of every hosted Raft partition's replication
+/// indices, for root-causing load-induced commit stalls. Deliberately reads the
+/// live openraft metrics watch (no sampler) so it's accurate even when the
+/// engine actor is wedged. Compare across nodes to classify a stall:
+///   - leader `last_log` flat            → propose/append stall (nothing enters the log)
+///   - follower `last_log` lags leader's → replication stall (followers not appending)
+///   - `applied` lags `last_log`         → state-machine/apply (engine-actor) stall
+fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for part in reg.all() {
+        let m = part.raft.metrics().borrow().clone();
+        let last_log = m.last_log_index.map(|i| i as i128).unwrap_or(-1);
+        let applied = m.last_applied.map(|l| l.index as i128).unwrap_or(-1);
+        let snapshot = m.snapshot.map(|l| l.index as i128).unwrap_or(-1);
+        let purged = m.purged.map(|l| l.index as i128).unwrap_or(-1);
+        let leader = m.current_leader.map(|n| n as i128).unwrap_or(-1);
+        let _ = writeln!(
+            body,
+            "partition={} node={} state={:?} term={} leader={} last_log={} applied={} apply_lag={} snapshot={} purged={}",
+            part.partition_id,
+            part.node_id,
+            m.state,
+            m.current_term,
+            leader,
+            last_log,
+            applied,
+            last_log - applied,
+            snapshot,
+            purged,
+        );
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("raft debug response builds")
+}
+
 async fn metrics_handler() -> Response {
     let mut body = metrics::gather();
     // jemalloc memory decomposition: resident (≈RSS) vs allocated (true live
@@ -9755,7 +9799,21 @@ fn gateway_usage() -> String {
 #[tokio::main]
 async fn main() {
     handle_cli_flags();
-    tracing_subscriber::fmt().init();
+    // Structured logging. Route through a non-blocking (lossy) writer so a burst
+    // of log lines can never stall the emitting task on synchronous stdout/journald
+    // I/O — critical on the Raft replication hot path, where openraft can emit
+    // thousands of WARN/ERROR lines under transient load and a blocked write would
+    // push AppendEntries past its RPC deadline, wedging commits. The filter honors
+    // RUST_LOG and otherwise defaults to a quiet-but-useful level (openraft capped
+    // at WARN so per-RPC replication chatter stays off the hot path). The returned
+    // guard must outlive the program so buffered lines flush on shutdown.
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
+    let log_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,openraft=warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter)
+        .with_writer(log_writer)
+        .init();
     // Enable jemalloc's background page-decay thread where supported (Linux), so
     // freed memory returns to the OS automatically; on macOS the idle-purge tick
     // forces it instead.
@@ -10404,9 +10462,64 @@ async fn main() {
     #[cfg(feature = "console")]
     let console_router = crate::console::router(server.clone());
 
+    // Captured for the /debug/raft diagnostic route before `server` is moved into
+    // the generated router below.
+    let raft_reg_dbg = server.raft_registry().clone();
+
+    // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
+    // (e.g. on an unrecoverable storage error) and then silently stop applying,
+    // stranding that partition's share of instances/jobs — the mechanism behind
+    // the RF>1 completion-freeze. This makes the failure LOUD: it polls every
+    // partition on a slow cadence, publishes the `nanobpm_raft_partition_shutdown`
+    // gauge, and logs a rate-limited ERROR (once per partition per shutdown edge)
+    // so a dead partition can never again fail silently.
+    {
+        let reg = server.raft_registry().clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut alarmed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            loop {
+                ticker.tick().await;
+                if reg.is_empty() {
+                    continue;
+                }
+                for part in reg.all() {
+                    let pid = part.partition_id;
+                    let down = part.is_shutdown();
+                    metrics::set_raft_partition_shutdown(pid, down);
+                    if down {
+                        if alarmed.insert(pid) {
+                            let m = part.raft.metrics().borrow().clone();
+                            let applied = m.last_applied.map(|l| l.index as i128).unwrap_or(-1);
+                            let last_log = m.last_log_index.map(|i| i as i128).unwrap_or(-1);
+                            tracing::error!(
+                                partition = pid,
+                                term = m.current_term,
+                                last_log = last_log as i64,
+                                applied = applied as i64,
+                                "raft partition core is SHUTDOWN and no longer applying; \
+                                 its instances/jobs are stranded (RF>1 completion-freeze) — \
+                                 the node must be restarted (clean) to recover this partition"
+                            );
+                        }
+                    } else {
+                        alarmed.remove(&pid);
+                    }
+                }
+            }
+        });
+    }
+
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route("/metrics", axum::routing::get(metrics_handler))
+        .route(
+            "/debug/raft",
+            axum::routing::get(move || {
+                let reg = raft_reg_dbg.clone();
+                async move { raft_debug_body(&reg) }
+            }),
+        )
         .route(
             "/v2/system/memory",
             axum::routing::get(system_memory_handler),
