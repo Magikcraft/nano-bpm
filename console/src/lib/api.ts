@@ -518,14 +518,17 @@ export async function deployXml(
   });
   let res: Response;
   try {
-    res = await fetch(url, { method: "POST", body: form });
+    res = await gatewayFetch(baseUrl, "/v2/deployments", {
+      method: "POST",
+      body: form,
+    });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     debug("deploy", "error", `fetch failed: ${msg}`, {
       url,
       hint:
         url.startsWith("http") && !url.startsWith(window.location.origin)
-          ? "Cross-origin request — the gateway may lack CORS headers, or be unreachable. Try setting deployTarget to '' (relative) if the console is served by the same gateway."
+          ? "Cross-origin request routed through /console/api/gateway-proxy — the Nano server could not reach the upstream gateway."
           : "Is the gateway running on this port? Check `curl " + url + "`.",
     });
     throw new Error(`fetch failed: ${msg}`);
@@ -576,7 +579,7 @@ export async function createProcessInstance(opts: {
   });
   let res: Response;
   try {
-    res = await fetch(url, {
+    res = await gatewayFetch(opts.baseUrl, "/v2/process-instances", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -619,6 +622,41 @@ function joinBase(base: string | undefined, path: string): string {
   return `${base.replace(/\/+$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
+/// Decides how to reach a Camunda REST endpoint on a possibly-foreign gateway.
+///
+/// - Same-origin (or no base): a plain relative fetch, no proxy needed.
+/// - Cross-origin: routes through the console's `/console/api/gateway-proxy/*`
+///   endpoint, packing the upstream base URL into `X-Gateway-Target`. This
+///   sidesteps browser CORS entirely because the browser only ever talks to
+///   the Nano server that shipped this SPA. Stock `c8run` doesn't expose CORS
+///   headers, so this is the only way the Console can deploy/start against a
+///   Camunda 8 cluster running on a different port.
+///
+/// Callers should NOT set `X-Gateway-Target` themselves; the helper merges it
+/// into `init.headers` when routing through the proxy.
+function gatewayFetch(
+  baseUrl: string | undefined,
+  path: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const normalisedPath = path.startsWith("/") ? path : `/${path}`;
+  if (!baseUrl) return fetch(normalisedPath, init);
+  let target: URL;
+  try {
+    target = new URL(baseUrl, window.location.href);
+  } catch {
+    return fetch(joinBase(baseUrl, normalisedPath), init);
+  }
+  if (target.origin === window.location.origin) {
+    return fetch(joinBase(baseUrl, normalisedPath), init);
+  }
+  const proxyPath = `/console/api/gateway-proxy${normalisedPath}`;
+  const upstreamBase = `${target.origin}${target.pathname.replace(/\/+$/, "")}`;
+  const headers = new Headers(init?.headers);
+  headers.set("X-Gateway-Target", upstreamBase);
+  return fetch(proxyPath, { ...init, headers });
+}
+
 /// Fetches the deployed BPMN XML for a process id from a specific gateway.
 /// Used by the modeler to decide whether the on-disk file matches the deployed
 /// definition. Camunda's REST API needs the deployment *key* to serve XML; we
@@ -638,7 +676,7 @@ export async function fetchDeployedXmlByProcessId(
     baseUrl: baseUrl ?? "(relative)",
   });
   try {
-    const res = await fetch(searchUrl, {
+    const res = await gatewayFetch(baseUrl, "/v2/process-definitions/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -662,8 +700,10 @@ export async function fetchDeployedXmlByProcessId(
       debug("probe", "info", "no prior deployment found", { processId });
       return null;
     }
-    const xmlUrl = joinBase(baseUrl, `/v2/process-definitions/${key}/xml`);
-    const xmlRes = await fetch(xmlUrl);
+    const xmlRes = await gatewayFetch(
+      baseUrl,
+      `/v2/process-definitions/${key}/xml`,
+    );
     if (xmlRes.status !== 200) {
       debug("probe", "warn", `xml → HTTP ${xmlRes.status}`, {
         processDefinitionKey: key,
