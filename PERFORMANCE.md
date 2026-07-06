@@ -165,6 +165,47 @@ not on projected active-instance count.
 # Compare comp/s, (Δcreate_frames − Δcompletions), ceiling_active, RSS, loadgen p99.
 ```
 
+### Fix deployed + re-validated at scale (binary `aa88ee0a`, PR #54)
+
+The admission fix (latency gate also trips on `pending_create_queue()`;
+`admission_max_create_queue` adaptive default-**on** as an OOM guard;
+`nanobpm_admission_shed_total{reason}` counter; `ceiling_state` mirror) was built
+release, deployed to all three RF=3 nodes, and re-run. Cluster came up healthy
+(12/12 leaders, 0 `Shutdown`). Findings — all with the **closed-loop** loadgen
+(create↔complete coupled, `MAXPAR`-bounded per connection):
+
+| offered/s | completed/s | loadgen p99 | node RSS | `ceiling_active{throughput}` | sheds |
+|-----------|-------------|-------------|----------|------------------------------|-------|
+| 5,400     | 4,800       | 55 ms       | 0.22 GB  | 0                            | 0     |
+| 7,200     | 7,205       | 49 ms       | 0.51 GB  | 0                            | 0     |
+| 9,600     | 9,581       | 52 ms       | 0.92 GB  | 0                            | 0     |
+| 12,600    | 12,508      | 87 ms       | 1.06 GB  | 0                            | 0     |
+| 15,600    | 15,523      | 58 ms       | 1.31 GB  | 0                            | 0     |
+| 30,000    | ~18,000     | 133 ms      | 2.10 GB  | **1** (saturated)            | 0     |
+
+**Corrected ceiling.** The earlier "~3,800/s" figure was **loadgen-limited**, not
+the engine. With `PROD_CONNS` 160–256 across three loadgens the cluster sustains
+**~15,500/s completions at p99 < 60 ms** and only presses its throughput ceiling
+(`ceiling_active{throughput}=1`) at ~30k/s offered (≈18k/s completed, p99 133 ms).
+The new `ceiling_active` LED tracks this correctly — dark below the knee, lit at it.
+
+**Why no sheds fired — and why that is correct.** RSS stayed **flat (~2.1 GB, no
+balloon) even at 30k/s offered**. A closed-loop client cannot build a server-side
+backlog: unacked stream creates are throttled by TCP/reader-loop backpressure, so
+`pending_create_queue()` never grows and the active set never runs away — there is
+correctly nothing to shed. The admission rails are **belt-and-suspenders** for the
+*open-loop* pathology (the original "memory climbing, no instances starting"
+incident, driven by an unbounded producer). That path is validated **locally**:
+30 direct creates with no workers → exactly 10 admitted (=`MAX_BACKLOG`), 20 shed,
+`nanobpm_admission_shed_total{reason="active_backlog"} 20`; plus the unit test
+`create_queue_cap_default_scales_and_clamps` pins the OOM-guard cap math.
+
+**Takeaway.** First-line OOM protection is the client backpressure already inherent
+in the stream transport; the create-queue rail (now default-on) and the fixed
+latency gate are the second line that bounds memory when a misbehaving open-loop
+producer defeats backpressure. Neither is the binding constraint for well-behaved
+load, so throughput and latency are unaffected in the common case.
+
 ---
 
 ## 2026-07-01 — Ceiling diagnosed: the single per-node read-model exporter
