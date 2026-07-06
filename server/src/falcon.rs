@@ -521,6 +521,16 @@ struct Connection {
     submission_outstanding: AtomicI64,
     /// Target submission window this connection is topped up to.
     submission_window: i64,
+    /// Bounds the number of in-flight fire-and-forget creates this connection may
+    /// have spawned concurrently. A non-await create takes the non-blocking spawn
+    /// path only while a permit is free; once `submission_window` creates are in
+    /// flight it falls back to the inline commit-wait, bounding the per-socket
+    /// balloon of pinned variable payloads to ~one window. Gating on in-flight
+    /// count rather than on submission *credit* means a connection whose creation
+    /// credits were withheld under server pressure still spawns — so a multiplexed
+    /// producer+worker socket never head-of-line-blocks its own job completions
+    /// behind a credit-starved create awaiting a Raft commit.
+    create_slots: Arc<tokio::sync::Semaphore>,
     closed: AtomicBool,
     /// Set by the dispatcher when it had credited demand but the outbound socket
     /// buffer was full; the writer task clears it and wakes the dispatcher once a
@@ -752,6 +762,9 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
         subs: Mutex::new(HashMap::new()),
         submission_outstanding: AtomicI64::new(0),
         submission_window,
+        create_slots: Arc::new(tokio::sync::Semaphore::new(
+            submission_window.max(0) as usize
+        )),
         closed: AtomicBool::new(false),
         wants_redispatch: Arc::new(AtomicBool::new(false)),
         last_seen_ms: AtomicU64::new(now_millis()),
@@ -878,17 +891,20 @@ async fn reader_loop(
 /// We only spawn when all three hold:
 /// - `!awaiting`: `awaitCompletion` creates must stay inline (the completion wait
 ///   reads this node's read store).
-/// - `credit_before > 0`: the connection held a real submission credit — i.e. it
-///   is operating *within* its granted window. A client that ignores credits and
-///   over-sends drives `submission_outstanding` non-positive; those creates fall
-///   to the inline path, which awaits the commit and blocks the connection's
-///   reader, applying TCP backpressure to just that misbehaving socket and
-///   bounding its spawned-task balloon to ~one window. Self-enforcing flow
-///   control — no 503, no retry, no herd, and compliant producers are untouched.
 /// - `raft_active`: the spawn path only exists under Raft; single-node creates are
 ///   already inline (and thus naturally serialized) below.
-fn should_spawn_fire_and_forget(awaiting: bool, credit_before: i64, raft_active: bool) -> bool {
-    !awaiting && credit_before > 0 && raft_active
+/// - `has_permit`: the connection held a free **in-flight-create slot**
+///   (`create_slots`). This bounds the concurrent spawned-create balloon to
+///   ~one submission window per socket. A client that over-sends past its window
+///   exhausts its slots; those creates fall to the inline path, which awaits the
+///   commit and blocks *this* connection's reader, applying TCP backpressure to
+///   just the offending socket. Crucially the bound keys off in-flight *count*,
+///   not submission *credit*: a connection whose creation credits were withheld
+///   under server pressure (not by over-sending) keeps free slots, so it still
+///   spawns and never head-of-line-blocks its own completions — self-enforcing
+///   flow control that no longer conflates "out of credit" with "over budget".
+fn should_spawn_fire_and_forget(awaiting: bool, raft_active: bool, has_permit: bool) -> bool {
+    !awaiting && raft_active && has_permit
 }
 
 /// Dispatches one client frame. Engine-bound writes are awaited inline so a single
@@ -997,6 +1013,20 @@ async fn handle_client_frame(
             // create below. The forwarded create is counted on the owner (its
             // `create_forwarded`), so per-node metrics reflect the real placement.
             let awaiting = await_completion.unwrap_or(false);
+            let raft_active = !server.raft_registry().is_empty();
+            // Acquire an in-flight-create slot if this create is eligible for the
+            // spawn path (non-await, under Raft). The permit is moved into the
+            // spawned task and held until the create resolves, so the concurrent
+            // balloon of pinned variable payloads stays bounded to ~one window per
+            // socket. Gating here on slot availability (not submission credit)
+            // keeps a credit-starved-by-pressure connection's completions flowing:
+            // it still holds free slots and so still spawns rather than serializing
+            // its reader. See `should_spawn_fire_and_forget`.
+            let create_permit = if !awaiting && raft_active {
+                conn.create_slots.clone().try_acquire_owned().ok()
+            } else {
+                None
+            };
             // Under Raft, both `create_for_stream` (local propose) and
             // `create_forwarded_stream` (peer round-trip) await a full quorum
             // commit. Awaiting them inline serializes a producer's connection one
@@ -1007,22 +1037,15 @@ async fn handle_client_frame(
             // Raft Batcher. `awaitCompletion` creates stay on the inline path below
             // (the completion wait must read this node's read store). The non-Raft
             // single-node fast path is likewise unchanged.
-            //
-            // Self-enforcing credit window: only spawn while the connection is
-            // *within* its granted submission window (`before > 0` — it held a real
-            // credit). A client that ignores the window and over-sends drives
-            // `submission_outstanding` non-positive; those creates fall through to
-            // the inline path below, which awaits the commit and so blocks this
-            // connection's reader — TCP backpressure fills the offending socket's
-            // buffer and throttles it to the engine's commit rate. That bounds the
-            // per-connection balloon of spawned create tasks (each pinning its
-            // variables payload before `admission_shed`/`pipeline_bytes` can see
-            // it) to ~one window, without a 503, a retry, or a herd, and without
-            // touching compliant producers or other connections.
-            if should_spawn_fire_and_forget(awaiting, before, !server.raft_registry().is_empty()) {
+            if should_spawn_fire_and_forget(awaiting, raft_active, create_permit.is_some()) {
+                let permit =
+                    create_permit.expect("permit is Some whenever the spawn decision is true");
                 let server = server.clone();
                 let conn = conn.clone();
                 tokio::spawn(async move {
+                    // Held for the life of the spawned create; released on drop,
+                    // freeing the in-flight slot for the next create on this socket.
+                    let _create_permit = permit;
                     if let Some(node) = server.stream_create_placement() {
                         match server
                             .create_forwarded_stream_rerouting(
@@ -2457,32 +2480,25 @@ mod registry_tests {
     use super::*;
 
     #[test]
-    fn fire_and_forget_spawns_only_within_the_credit_window() {
-        // Compliant producer under Raft: held a credit (before > 0) -> spawn the
-        // concurrent fire-and-forget path.
-        assert!(should_spawn_fire_and_forget(false, 4, true));
+    fn fire_and_forget_spawns_only_with_an_in_flight_slot() {
+        // Compliant producer under Raft holding a free in-flight-create slot ->
+        // spawn the concurrent fire-and-forget path.
+        assert!(should_spawn_fire_and_forget(false, true, true));
+
+        // No free slot (the connection has a full window of creates already in
+        // flight — genuinely over budget): fall to the inline (serialized) path so
+        // the reader blocks and TCP backpressure throttles just this socket.
         assert!(
-            should_spawn_fire_and_forget(false, 1, true),
-            "the last credit (before == 1) still spawns"
+            !should_spawn_fire_and_forget(false, true, false),
+            "no in-flight slot must not spawn"
         );
 
-        // Over-budget: the client ignored the window and over-sent, so the credit
-        // went non-positive. Fall to the inline (serialized) path so the reader
-        // blocks and TCP backpressure throttles just this socket.
-        assert!(
-            !should_spawn_fire_and_forget(false, 0, true),
-            "no credit held (before == 0) must not spawn"
-        );
-        assert!(
-            !should_spawn_fire_and_forget(false, -5, true),
-            "deeply over-budget must not spawn"
-        );
-
-        // awaitCompletion always stays inline (completion wait needs local reads).
-        assert!(!should_spawn_fire_and_forget(true, 4, true));
+        // awaitCompletion always stays inline (completion wait needs local reads),
+        // regardless of slot availability.
+        assert!(!should_spawn_fire_and_forget(true, true, true));
 
         // Single-node (no Raft): the spawn path does not apply; creates are inline.
-        assert!(!should_spawn_fire_and_forget(false, 4, false));
+        assert!(!should_spawn_fire_and_forget(false, false, true));
     }
 
     fn test_connection(id: ConnId) -> Arc<Connection> {
@@ -2493,6 +2509,7 @@ mod registry_tests {
             subs: Mutex::new(HashMap::new()),
             submission_outstanding: AtomicI64::new(0),
             submission_window: 0,
+            create_slots: Arc::new(tokio::sync::Semaphore::new(0)),
             closed: AtomicBool::new(false),
             wants_redispatch: Arc::new(AtomicBool::new(false)),
             last_seen_ms: AtomicU64::new(0),

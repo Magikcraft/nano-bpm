@@ -6612,6 +6612,19 @@ impl ServerImpl {
                 }
             }
 
+            // Settle barrier (ADR 0003): before forming any group, wait until the
+            // peers this node replicates with are reachable. A staggered startup
+            // otherwise lets a leader `initialize` + `add_learner` as the SOLE
+            // reachable voter, committing membership entries into the void while
+            // peers are still down; when a peer later boots and its fresh
+            // per-partition Raft briefly self-votes before catching the leader's
+            // append, the cluster hits a term-`T` split-brain (two committed
+            // leaders in one term) that trips openraft's `has_log_id` invariant —
+            // a permanent wedge in release (the debug_assert is compiled out, so
+            // replication silently stalls). Holding until peers are up collapses a
+            // staggered boot into the simultaneous-boot case, which forms cleanly.
+            server.settle_before_forming(&topology).await;
+
             // Form each group this node leads from its replica set. `initialize`
             // is idempotent and does not require peers to be up (they catch up via
             // replication), but we retry to ride out a transient failure.
@@ -6684,7 +6697,82 @@ impl ServerImpl {
         }
     }
 
-    /// Spawns the leader-durable auto-recovery supervisor (ADR 0003, option-2
+    /// Settle barrier for Raft group formation (ADR 0003). Blocks until every
+    /// peer this node shares a Raft group with is reachable (its Falcon endpoint
+    /// answers a `link`), then waits a short grace so those peers can finish
+    /// hosting their own per-partition members before this node `initialize`s and
+    /// `add_learner`s. This prevents the staggered-startup term-split-brain that
+    /// wedges openraft (see the call site). Bounded by a deadline so a genuinely
+    /// absent peer never hangs boot — past the deadline we proceed best-effort
+    /// (openraft's own retry/replication then rides out the laggard).
+    ///
+    /// Tunables: `NANOBPMN_RAFT_SETTLE_MS` (max wait, default 30000; `0` disables
+    /// the barrier) and `NANOBPMN_RAFT_SETTLE_GRACE_MS` (post-reachability grace,
+    /// default 1500).
+    async fn settle_before_forming(&self, topology: &crate::cluster::Topology) {
+        let deadline_ms: u64 = std::env::var("NANOBPMN_RAFT_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30_000);
+        if deadline_ms == 0 || !self.peers.has_peers() {
+            return;
+        }
+        // The distinct set of peer nodes this node forms Raft groups with.
+        let mut peer_nodes: Vec<u32> = topology
+            .replica_partitions()
+            .into_iter()
+            .flat_map(|p| topology.replicas_of(p))
+            .filter(|&n| n != topology.node_id)
+            .collect();
+        peer_nodes.sort_unstable();
+        peer_nodes.dedup();
+        if peer_nodes.is_empty() {
+            return;
+        }
+
+        let grace_ms: u64 = std::env::var("NANOBPMN_RAFT_SETTLE_GRACE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_500);
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(deadline_ms);
+        let mut pending = peer_nodes.clone();
+        while !pending.is_empty() {
+            let mut still = Vec::new();
+            for &n in &pending {
+                if self.peers.link(n).await.is_err() {
+                    still.push(n);
+                }
+            }
+            pending = still;
+            if pending.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "raft settle: node {} proceeding after {}ms with peers {:?} still unreachable; \
+                     forming best-effort",
+                    topology.node_id,
+                    deadline_ms,
+                    pending,
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        tracing::info!(
+            "raft settle: node {} sees all {} raft peer(s) reachable after {}ms; \
+             grace {}ms then forming",
+            topology.node_id,
+            peer_nodes.len(),
+            start.elapsed().as_millis(),
+            grace_ms,
+        );
+        if grace_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(grace_ms)).await;
+        }
+    }
+
     /// follow-on). A no-op unless Raft is enabled AND the replication tier is
     /// [`ReplicationMode::LeaderDurable`] with real peers: in every other
     /// configuration failover is either irrelevant (single node / RF=1) or already
@@ -6710,10 +6798,17 @@ impl ServerImpl {
             let grace_ticks = leader_durable_recovery_grace_ticks();
             let mut leaderless: std::collections::HashMap<u64, u32> =
                 std::collections::HashMap::new();
+            // Partitions this node has observed with a real (formed) leader at
+            // least once. Recovery only fails a partition OVER to a successor once
+            // it has been established — a partition that has NEVER had a leader is
+            // still in initial formation (its owner may just be booting), not a
+            // failover, so promoting it would race the owner's `initialize` into a
+            // split-brain (two committed leaders in one term -> openraft wedge).
+            let mut established: std::collections::HashSet<u64> = std::collections::HashSet::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 server
-                    .leader_durable_recovery_tick(grace_ticks, &mut leaderless)
+                    .leader_durable_recovery_tick(grace_ticks, &mut leaderless, &mut established)
                     .await;
             }
         });
@@ -6721,9 +6816,18 @@ impl ServerImpl {
 
     /// One pass of the leader-durable recovery supervisor. For every partition this
     /// node replicates: if the group is leaderless (no current leader, and the
-    /// original leader's peer link is down) for `grace_ticks` consecutive passes
-    /// and this node is the deterministic surviving successor, promote it. `misses`
-    /// carries the per-partition consecutive-leaderless counter across passes.
+    /// original leader's peer link is down) for `grace_ticks` consecutive passes,
+    /// the partition has already been ESTABLISHED (seen a real leader at least
+    /// once), and this node is the deterministic surviving successor, promote it.
+    /// `misses` carries the per-partition consecutive-leaderless counter and
+    /// `established` the set of partitions ever seen with a leader, both across
+    /// passes.
+    ///
+    /// The establishment gate is what keeps recovery from firing during a
+    /// staggered cold start: before a partition's owner has formed the group,
+    /// every replica sees it as leaderless, and each would otherwise self-promote
+    /// the partitions it is the first-reachable replica of — racing formation into
+    /// a term split-brain that trips openraft's `has_log_id` invariant.
     ///
     /// Factored out (and not gated on the env) so a test can drive recovery
     /// deterministically without spawning the loop.
@@ -6731,6 +6835,7 @@ impl ServerImpl {
         &self,
         grace_ticks: u32,
         misses: &mut std::collections::HashMap<u64, u32>,
+        established: &mut std::collections::HashSet<u64>,
     ) {
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
@@ -6739,6 +6844,11 @@ impl ServerImpl {
                 .raft
                 .get(p)
                 .and_then(|part| part.raft.metrics().borrow().current_leader);
+            // Any named leader (live or since-dead) proves the group was formed
+            // once -> this partition is established and thus a failover candidate.
+            if leader.is_some() {
+                established.insert(p);
+            }
             // A live leader resets the counter. "Live" means present AND, if it is
             // a peer, reachable — a metric still naming a dead leader does not count.
             let leader_live = match leader {
@@ -6753,6 +6863,12 @@ impl ServerImpl {
             let n = misses.entry(p).or_insert(0);
             *n += 1;
             if *n < grace_ticks {
+                continue;
+            }
+            // Never fail over a partition still in initial formation: only an
+            // established group (its owner formed it, then its leader was lost) is
+            // a genuine failover. This is the cold-start split-brain guard.
+            if !established.contains(&p) {
                 continue;
             }
             // Leaderless past the grace window. Promote iff this node is the
@@ -13863,10 +13979,16 @@ mod clustered_startup_tests {
         // sees node 1 alive and stands down. Use grace_ticks = 1 for a prompt test.
         let mut misses1 = std::collections::HashMap::new();
         let mut misses2 = std::collections::HashMap::new();
+        let mut established1 = std::collections::HashSet::new();
+        let mut established2 = std::collections::HashSet::new();
         let mut promoted = false;
         for _ in 0..200 {
-            node1.leader_durable_recovery_tick(1, &mut misses1).await;
-            node2.leader_durable_recovery_tick(1, &mut misses2).await;
+            node1
+                .leader_durable_recovery_tick(1, &mut misses1, &mut established1)
+                .await;
+            node2
+                .leader_durable_recovery_tick(1, &mut misses2, &mut established2)
+                .await;
             if node1
                 .raft_registry()
                 .get(0)
@@ -14010,6 +14132,8 @@ mod clustered_startup_tests {
         // cross-delivery happens yet; both end up leaders. That is the split-brain.)
         let mut m1 = std::collections::HashMap::new();
         let mut m2 = std::collections::HashMap::new();
+        let mut est1 = std::collections::HashSet::new();
+        let mut est2 = std::collections::HashSet::new();
         let leads = |node: &ServerImpl, who: u64| -> bool {
             node.raft_registry()
                 .get(0)
@@ -14018,8 +14142,12 @@ mod clustered_startup_tests {
         };
         let mut both = false;
         for _ in 0..200 {
-            node1.leader_durable_recovery_tick(1, &mut m1).await;
-            node2.leader_durable_recovery_tick(1, &mut m2).await;
+            node1
+                .leader_durable_recovery_tick(1, &mut m1, &mut est1)
+                .await;
+            node2
+                .leader_durable_recovery_tick(1, &mut m2, &mut est2)
+                .await;
             if leads(&node1, 1) && leads(&node2, 2) {
                 both = true;
                 break;
@@ -14074,6 +14202,82 @@ mod clustered_startup_tests {
         }
         for h in handles.drain(..) {
             h.abort();
+        }
+    }
+
+    /// Regression: the recovery supervisor must NOT promote a partition that has
+    /// never been established (no leader ever), even when this node is the
+    /// first-reachable replica and its owner is unreachable — that is initial
+    /// formation, not failover. Promoting it would race the owner's `initialize`
+    /// into a term split-brain that trips openraft's `has_log_id` invariant and
+    /// permanently wedges the partition (the cold-start bug this fix targets).
+    #[tokio::test]
+    async fn leader_durable_recovery_ignores_a_never_established_partition() {
+        use crate::raft::RaftPartition;
+
+        // A lone node 0 in an RF=3, 3-partition cluster. It replicates every
+        // partition but OWNS only partition 0; partition 1's owner is node 1.
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".into(),
+                "http://127.0.0.1:2".into(),
+                "http://127.0.0.1:3".into(),
+            ],
+            num_partitions: 3,
+            replication_factor: 3,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let mut node0 = build_server_in_memory(journals, topology);
+        node0.replication_mode = ReplicationMode::LeaderDurable;
+
+        // Host a Raft member for partition 1 (node 0 is a mere replica/learner of
+        // it) but NEVER form the group — its owner (node 1) is absent, exactly as
+        // in a staggered cold start. Its `current_leader` therefore stays `None`.
+        let engine = node0.replica_engine_for(1).await;
+        let part = RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None)
+            .await
+            .expect("host a replica member for partition 1");
+        node0.raft_registry().insert(Arc::new(part));
+
+        // The other replicas are unreachable, so node 0 IS the first-reachable
+        // replica for partition 1 (replicas_of(1) = [1, 2, 0]) — without the
+        // establishment gate it would self-promote here.
+        node0.peers.fail_node(1).await;
+        node0.peers.fail_node(2).await;
+
+        let mut misses = std::collections::HashMap::new();
+        let mut established = std::collections::HashSet::new();
+        for _ in 0..50 {
+            node0
+                .leader_durable_recovery_tick(1, &mut misses, &mut established)
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            !established.contains(&1),
+            "a never-led partition is never marked established"
+        );
+        assert!(
+            node0.promotion_epoch.lock().unwrap().get(&1).is_none(),
+            "the never-established partition is NOT promoted (no epoch reserved)"
+        );
+        assert_eq!(
+            node0
+                .raft_registry()
+                .get(1)
+                .and_then(|p| p.raft.metrics().borrow().current_leader),
+            None,
+            "the partition stays leaderless — recovery leaves initial formation alone"
+        );
+
+        if let Some(part) = node0.raft_registry().get(1) {
+            part.raft.shutdown().await.ok();
         }
     }
 }

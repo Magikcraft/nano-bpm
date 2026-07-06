@@ -1,0 +1,39 @@
+#!/bin/sh
+# Pre-push gate: run the pinned-nightly rustfmt check that CI enforces, so a
+# formatting drift is caught locally instead of failing the `rustfmt (pinned
+# nightly)` CI job after the push.
+#
+# Install with `make install-hooks` (sets core.hooksPath to this directory).
+# Bypass in an emergency with `git push --no-verify`.
+set -e
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# rustfmt must resolve the server crate's module tree, which includes the
+# gitignored codegen module `stub_impls`. In a built tree the real file exists;
+# if it does not (e.g. a fresh clone before the first build) drop a throwaway
+# one-line stub for the parse-only check and remove it afterwards, exactly as
+# the CI fmt job does — never clobbering a real generated file.
+stub="server/src/stub_impls.rs"
+created_stub=0
+if [ ! -f "$stub" ]; then
+	printf '// fmt stub\n' > "$stub"
+	created_stub=1
+fi
+
+status=0
+make fmt-check || status=$?
+
+if [ "$created_stub" -eq 1 ]; then
+	rm -f "$stub"
+fi
+
+if [ "$status" -ne 0 ]; then
+	echo "" >&2
+	echo "pre-push: rustfmt check failed (this is the same gate CI runs)." >&2
+	echo "  Fix with:   make fmt" >&2
+	echo "  Then:       git add -u && git commit --amend --no-edit  (or a new commit)" >&2
+	echo "  Bypass:     git push --no-verify   (not recommended — CI will still fail)" >&2
+	exit 1
+fi
