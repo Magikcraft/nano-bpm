@@ -268,6 +268,56 @@ latency gate are the second line that bounds memory when a misbehaving open-loop
 producer defeats backpressure. Neither is the binding constraint for well-behaved
 load, so throughput and latency are unaffected in the common case.
 
+### 2026-07-07 — Open-loop 24k reject soak: the backlog gate bounds **memory**, not **throughput**
+
+The closed-loop table above never builds a server backlog, so it never exercised
+the shed path at scale. This run does: three **open-loop** loadgens
+(`RATE=8000`/node = **24,000 offered PI/s**, `MAX_INFLIGHT=0` fire-and-forget, 600
+workers total) against `NANOBPMN_SLA_MODE=latency` +
+`NANOBPMN_ADMISSION_MAX_BACKLOG=300000` on the v0.0.7 shed binary
+(`f43f94ea`), fresh 4/4/4 cluster. Loadbox sampler (60 s), `netBklog` = created −
+completed, `rssMB` = max node jemalloc resident:
+
+| mm:ss | comp/s | shed/s | offered | netBacklog | node RSS |
+|-------|--------|--------|---------|------------|----------|
+| 01:00 | 24,076 | 0      | 24,000  |    72,668  | 3.1 GB   |
+| 02:04 | 21,926 | 0      | 24,000  |   217,254  | 5.5 GB   |
+| 03:09 | 18,806 | 0      | 24,000  |   541,325  | 6.3 GB   |
+| 04:13 | 12,171 | 6,561  | 24,000  | 1,305,389  | 11.2 GB  |
+| 05:17 |      0 | 24,080 | 24,000  | 2,846,942  | 9.0 GB   |
+| 06:21 |      0 | 24,061 | 24,000  | 4,386,409  | 9.0 GB   |
+
+**24k offered is above the drain ceiling for this worker count.** Completion
+starts decaying from the very first sample (24k → 22k → 18.8k) while backlog
+climbs monotonically — offered simply exceeds what 600 workers can drain
+(sustainable completion is ~15–18k/s, consistent with the closed-loop knee at
+~15.5k/s). Once the backlog is large enough, the per-op cost of a bloated engine
+hot-state (bigger snapshot clones, allocator pressure) drags the single-writer
+apply lane and completion **collapses to 0** — the same positive-feedback spiral,
+now measured end-to-end.
+
+**The `active_backlog` gate fired, but too late to save throughput.** Shedding
+engaged (`shed/s` 0 → 6.5k → 24k) only after backlog crossed the 300k threshold —
+by which point completion had already decayed into the collapse. The gate then
+sheds *new* admits but cannot drain the ~1.3M already-admitted instances that are
+suppressing completion, so `comp/s` stays at 0. **A backlog gate is a memory
+backstop, not a throughput regulator:** it prevents OOM but does not restore
+throughput once you are over the drain ceiling.
+
+**Memory was protected.** Node RSS peaked ~11 GB and *fell* to ~9 GB once
+shedding engaged (vs the **20–25 GB** unbounded runs with the gate disabled) —
+far under the 51 GB watermark; no node OOM'd even as backlog hit 4.4M. The
+open-loop *loadbox* is the component that died (~06:21), OOM'd by its own
+unbounded fire-and-forget create buffers — a client-side limit, not a server one.
+
+**Takeaways.** (1) To *sustain* throughput, offer at or below the drain ceiling
+(~15–18k/s here) or add workers — the server cannot manufacture drain capacity by
+shedding. (2) `MAX_BACKLOG` should be set well below the collapse knee (300k was
+too loose: by the time it trips, the decay has begun); a tighter cap keeps the
+active set small enough that per-op cost stays flat and completion holds. (3) The
+shed gate delivered on its actual contract — memory stayed bounded and no server
+node fell over under a 24k open-loop flood.
+
 ---
 
 ## 2026-07-01 — Ceiling diagnosed: the single per-node read-model exporter
