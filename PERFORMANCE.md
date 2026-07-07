@@ -34,6 +34,68 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## 2026-07-07 — Durability A/B ceiling: the "journal-writer wall" is a **misdiagnosis**
+
+**Question:** how much of the RF=3 ceiling is the journal-writer fsync barrier?
+Ran a 3-arm stepped open-loop ceiling probe on the live GCP cluster (3× c2-std-16,
+RF=3, 12 partitions, leader-durable, lean-snapshot, deployed v0.0.6 binary
+`aa88ee0a` which honors the durability knobs). Harness: `~/dur-ceil.sh` — per arm,
+clean staggered restart (stop → wait-for-exit → wipe → `node-launch-dur.sh <arm>`),
+fresh fixture (PDK=4), then a per-node `RATE` ladder 2k→12k (offered 6k→36k
+aggregate), `MAX_INFLIGHT=0` open-loop, 25 s windows. Recorded aggregate
+completed/s (server `job_completions_total` delta), ratio, worst p99, **journal-
+writer duty cycle** (`journal_writer_busy_seconds`/(busy+idle) delta, max of 3
+nodes), and peak RSS.
+
+| arm | durability | offered→ | 6k | 12k | 18k | 24k | 30k | 36k |
+|-----|-----------|----------|----|-----|-----|-----|-----|-----|
+| **baseline_sync** | sync, linger 0 | comp/s | 5556 | 11034 | 16759 | 21963 | **27249** | 10544 ✗ |
+| | | ratio | .93 | .92 | .93 | .92 | **.91** | .29 |
+| | | p99 ms | 99 | 99 | 143 | 333 | **349** | 30218 |
+| | | writer % | 37 | 33 | 45 | 43 | **46** | 37 |
+| **async** | async, flush 10ms/8MiB | comp/s | 5573 | 11187 | 14808 | 11535 ✗ | 1833 | 1679 |
+| | | ratio | .93 | .93 | .82 | .48 | .06 | .05 |
+| | | p99 ms | 99 | 118 | 660 | 30678 | 34887 | 47118 |
+| | | writer % | 16 | 17 | 27 | 19 | 19 | 24 |
+| **sync_linger** | sync, linger 500µs | comp/s | 5337 | 10932 | 15999 | 21026 | **26624** | 12682 |
+| | | ratio | .89 | .91 | .89 | .88 | **.89** | .35 |
+| | | p99 ms | 99 | 99 | 101 | 285 | **249** | 3911 |
+| | | writer % | 76 | 62 | 74 | 48 | **41** | 46 |
+
+(✗ = past the knee / collapsed.) All three arms formed cleanly (0 Shutdown
+partitions, PDK=4). The `s+:` awk warning in the log is a cosmetic empty-scrape
+transient; completed counts are monotonic and consistent.
+
+**Findings (decisive):**
+1. **The journal writer is NOT the throughput wall.** In the sync baseline the
+   writer duty cycle never exceeds **~46%** at the ceiling — and is only **37%**
+   at the 36k collapse. A component that is idle >50% of the time at the ceiling
+   cannot be the bottleneck. The p99 cliff (349 ms → 30 s) between 30k and 36k
+   offered is a classic **queue collapse when offered load exceeds the serial
+   drain rate**, not fsync saturation.
+2. **async durability makes it WORSE, not better.** Deferring fsync to the page
+   cache *halved* writer duty (16–27%) exactly as designed — yet throughput did
+   **not** rise, and the ceiling *dropped* from ~27k to ~11–15k with an earlier,
+   harder collapse (already degrading at 18k, gone by 24k). Removing the fsync
+   from the ack path buys nothing because fsync wasn't the constraint; the async
+   flush machinery (10 ms/8 MiB bursts) adds its own bursty backlog under RF=3
+   leader-durable replication. **Do not enable async here.**
+3. **sync + 500µs linger ≈ baseline throughput** (26.6k vs 27.2k) with a *slightly*
+   better tail at high load (p99 249 vs 349 ms) and a **much softer collapse**
+   (3.9 s vs 30 s p99 at 36k). Linger coalesces entries into fewer, larger fsyncs
+   (duty higher at low load, 76%, but *lower*, 41%, at the ceiling). A minor
+   graceful-degradation / tail win, **not** a throughput lever.
+
+**Verdict:** the ~27k PI/s RF=3 ceiling is **not** the fsync barrier. Durability
+tuning cannot break it (writer <50% busy at the ceiling; async lowers it). The
+real constraint is downstream of the journal: the **single-writer engine actor
+(Deepthi) serial apply lane shared by create/complete/state-apply**, plus the
+RF=3 quorum-commit round-trip. Breaking through means **parallelizing that serial
+lane** (per-partition engine actors / a dedicated apply task so a create flood
+can't starve commit+apply) or scaling out partitions/nodes — the same horizontal
+answer Zeebe reaches. Keep `sync` as the default; `sync_linger=500µs` is a
+candidate default purely for tail-latency/graceful-degradation, not throughput.
+
 ## 2026-07-07 — First validly-measured RF=3 **Raft-ON** ceiling (replicated, leader-durable)
 
 The first throughput measurement with Raft actually **on** (`NANOBPMN_RAFT=1` +
