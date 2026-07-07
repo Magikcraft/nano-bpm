@@ -64,6 +64,10 @@ const K_HARD_OVERLAP: f64 = 6000.0;
 /// distance). A restoring force, so the system can converge — the earlier
 /// constant LTR drift never let terminal velocity reach zero.
 const K_LTR_SPRING: f64 = 8.0;
+/// Spring toward each node's flow-kind band y. Weaker than the LTR spring
+/// (nodes are freer along y to accommodate cluster/repel pushes) but strong
+/// enough to keep exception nodes below and escalation nodes above.
+const K_BAND_SPRING: f64 = 4.0;
 /// Column spacing for `target_x` (px). 160 matches the row-bias solver.
 const COL_SPACING: f64 = 160.0;
 /// First-column x, so target_x = FIRST_COL_X + graph_dist * COL_SPACING.
@@ -118,6 +122,10 @@ pub struct Particle {
     /// Target x from the LTR spring (derived from graph distance). Zero for
     /// edge segments (they're free to slide along x, held by chain springs).
     pub target_x: f64,
+    /// Target y from the flow-kind band spring (nodes only). Same y-offsets
+    /// as the row-bias solver — keeps nodes in their semantic band without
+    /// forcing a hard row constraint.
+    pub target_y: f64,
     /// Net force applied in the *last* integrator step. Used by the debug
     /// SVG's force-vector overlay; otherwise informational.
     pub last_force: (f64, f64),
@@ -244,6 +252,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
         let target_x = FIRST_COL_X + d * COL_SPACING;
         let init_x = target_x;
         let init_y = 200.0 + kind.map(|k| k.target_row()).unwrap_or(0.0) * 110.0;
+        let target_y = init_y;
         let mut charges = Charges {
             flow_kind: Charges::flow_kind_from(kind),
             cluster: cluster_membership.get(id).cloned().unwrap_or_default(),
@@ -264,6 +273,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
             charges,
             size: node_dims(&def.elements[id]),
             target_x,
+            target_y,
             last_force: (0.0, 0.0),
             edge_anchors: None,
             history: Vec::new(),
@@ -312,6 +322,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
                     charges: charges.clone(),
                     size: (0.0, 0.0),
                     target_x: 0.0,
+                    target_y: 0.0,
                     last_force: (0.0, 0.0),
                     edge_anchors: Some(EdgeAnchors {
                         edge_id: edge_id.clone(),
@@ -338,11 +349,26 @@ fn compute_all_forces(particles: &[Particle]) -> Vec<(f64, f64)> {
         // is nonzero and the system never converges.
         if particles[i].kind == ParticleKind::Node {
             let dx = particles[i].target_x - particles[i].pos.0;
+            let dy = particles[i].target_y - particles[i].pos.1;
             forces[i].0 += K_LTR_SPRING * dx;
+            forces[i].1 += K_BAND_SPRING * dy;
         }
 
         for j in 0..n {
             if i == j {
+                continue;
+            }
+            // Skip node↔edge-segment pairwise interactions. Edge segments
+            // are already coupled to their host nodes via the chain springs
+            // and endpoint perimeter projection; letting the pairwise
+            // flow-kind attraction/repulsion also act between them just
+            // yanks nodes around when edges drift.
+            let cross = matches!(
+                (particles[i].kind, particles[j].kind),
+                (ParticleKind::Node, ParticleKind::EdgeSegment { .. })
+                    | (ParticleKind::EdgeSegment { .. }, ParticleKind::Node)
+            );
+            if cross {
                 continue;
             }
             let (fx, fy) = pairwise_force(&particles[i], &particles[j]);
@@ -476,6 +502,34 @@ fn project_endpoints(particles: &mut [Particle]) {
         .map(|p| (p.id.clone(), (p.pos.0, p.pos.1, p.size.0, p.size.1)))
         .collect();
 
+    // Snapshot the position of each edge's interior neighbour segment so
+    // endpoints can be projected in the direction the edge is actually
+    // heading, not their own stale position. Endpoints are `fixed=true` and
+    // otherwise never move — without this the source endpoint sits at the
+    // node centre forever and always projects onto the right face (the
+    // fallback branch below), which is exactly the "both flows leave the
+    // gateway from the same point" bug.
+    // Key: (edge_id, endpoint_index). Value: interior neighbour position.
+    let mut neighbour_pos: HashMap<(String, usize), (f64, f64)> = HashMap::new();
+    for p in particles.iter() {
+        if let ParticleKind::EdgeSegment { index, chain_len } = p.kind {
+            let is_endpoint = index == 0 || index == chain_len - 1;
+            if is_endpoint {
+                continue;
+            }
+            if let Some(a) = &p.edge_anchors {
+                // Segment at index i is the neighbour of endpoint 0 iff i==1,
+                // and neighbour of the last endpoint iff i == chain_len-2.
+                if index == 1 {
+                    neighbour_pos.insert((a.edge_id.clone(), 0), p.pos);
+                }
+                if index == chain_len - 2 {
+                    neighbour_pos.insert((a.edge_id.clone(), chain_len - 1), p.pos);
+                }
+            }
+        }
+    }
+
     for p in particles.iter_mut() {
         if let ParticleKind::EdgeSegment { index, chain_len } = p.kind {
             let is_endpoint = index == 0 || index == chain_len - 1;
@@ -493,19 +547,35 @@ fn project_endpoints(particles: &mut [Particle]) {
             let Some(&(cx, cy, w, h)) = node_rects.get(host_id) else {
                 continue;
             };
-            // Project p.pos onto the nearest edge of the rect centered at (cx, cy).
-            let dx = p.pos.0 - cx;
-            let dy = p.pos.1 - cy;
+            // Aim toward the interior-neighbour segment if we've seen it;
+            // otherwise fall back to the *other end's* host node so at init
+            // the projection is still directional rather than at the centre.
+            let aim = neighbour_pos
+                .get(&(anchor.edge_id.clone(), index))
+                .copied()
+                .or_else(|| {
+                    let other_host = if index == 0 {
+                        &anchor.target_node
+                    } else {
+                        &anchor.source_node
+                    };
+                    node_rects.get(other_host).map(|&(x, y, _, _)| (x, y))
+                })
+                .unwrap_or((cx + w, cy));
+            let dx = aim.0 - cx;
+            let dy = aim.1 - cy;
             let hw = w * 0.5;
             let hh = h * 0.5;
             let projected = if dx.abs() * hh > dy.abs() * hw {
                 // Cross the vertical edge (left or right face).
                 let sx = if dx > 0.0 { cx + hw } else { cx - hw };
-                (sx, (cy + dy * hw / dx.abs()).clamp(cy - hh, cy + hh))
-            } else if dy.abs() > 0.0 {
+                let denom = dx.abs().max(1e-6);
+                (sx, (cy + dy * hw / denom).clamp(cy - hh, cy + hh))
+            } else if dy.abs() > 1e-6 {
                 // Cross the horizontal edge (top or bottom face).
                 let sy = if dy > 0.0 { cy + hh } else { cy - hh };
-                ((cx + dx * hh / dy.abs()).clamp(cx - hw, cx + hw), sy)
+                let denom = dy.abs().max(1e-6);
+                ((cx + dx * hh / denom).clamp(cx - hw, cx + hw), sy)
             } else {
                 (cx + hw, cy)
             };
