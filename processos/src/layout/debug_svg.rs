@@ -36,6 +36,18 @@ const CLUSTER_STROKE: &str = "#7c3aed";
 ///   the input has no diagram, so callers can still write the file).
 /// * `ann` — the annotations that drove the layout, used to colour and band.
 pub fn render_debug_svg(bpmn_xml: &str, ann: &SemanticAnnotations) -> String {
+    render_debug_svg_with_forces(bpmn_xml, ann, None)
+}
+
+/// Same as [`render_debug_svg`] but overlays a small arrow at each node
+/// showing its net force vector from the last simulation step. Only used by
+/// the Fromme (field) solver output. `node_forces` maps `node_id -> (fx, fy)`
+/// in the same coordinate system as the BPMN DI.
+pub fn render_debug_svg_with_forces(
+    bpmn_xml: &str,
+    ann: &SemanticAnnotations,
+    node_forces: Option<&HashMap<String, (f64, f64)>>,
+) -> String {
     let shapes = parse_shapes(bpmn_xml);
     let edges = parse_edges(bpmn_xml);
     let node_kinds = flatten_flow_kinds(ann);
@@ -53,6 +65,11 @@ pub fn render_debug_svg(bpmn_xml: &str, ann: &SemanticAnnotations) -> String {
         out,
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
          viewBox=\"0 0 {w:.0} {h:.0}\" font-family=\"system-ui, sans-serif\" font-size=\"11\">"
+    );
+    out.push_str(
+        "  <defs>\n    <marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" \
+         markerUnits=\"strokeWidth\" markerWidth=\"6\" markerHeight=\"6\" orient=\"auto\">\n\
+         \x20     <path d=\"M0,0 L10,5 L0,10 z\" fill=\"#7c3aed\"/>\n    </marker>\n  </defs>\n",
     );
 
     // --- Semantic band backgrounds ---------------------------------------
@@ -164,8 +181,104 @@ pub fn render_debug_svg(bpmn_xml: &str, ann: &SemanticAnnotations) -> String {
         );
     }
 
+    // --- Force-vector overlay (Fromme diagnostics) ----------------------
+    // Draw a small arrow at each node's centre pointing along its last-step
+    // net force vector. Magnitude is scaled so the biggest arrow is ~60px.
+    if let Some(forces) = node_forces {
+        let max_mag = forces
+            .values()
+            .map(|(fx, fy)| (fx * fx + fy * fy).sqrt())
+            .fold(0.0_f64, f64::max)
+            .max(1e-6);
+        let scale = 60.0 / max_mag;
+        for (id, s) in &shapes {
+            if let Some(&(fx, fy)) = forces.get(id) {
+                let cx = s.x + s.w / 2.0 + shift_x;
+                let cy = s.y + s.h / 2.0 + shift_y;
+                let ex = cx + fx * scale;
+                let ey = cy + fy * scale;
+                if (fx * fx + fy * fy).sqrt() > max_mag * 0.02 {
+                    let _ = writeln!(
+                        out,
+                        "  <line x1=\"{cx:.0}\" y1=\"{cy:.0}\" x2=\"{ex:.0}\" y2=\"{ey:.0}\" \
+                         stroke=\"#7c3aed\" stroke-width=\"1.5\" marker-end=\"url(#arrow)\" opacity=\"0.85\"/>"
+                    );
+                }
+            }
+        }
+    }
+
     out.push_str("</svg>\n");
     out
+}
+
+/// Combine two independently-rendered debug SVGs side by side into a single
+/// document. Each pane is captioned. Used by
+/// [`super::layout_side_by_side`] to compare the row-bias and Fromme solvers
+/// on the same fixture.
+pub fn stitch_side_by_side(
+    left_svg: &str,
+    left_label: &str,
+    right_svg: &str,
+    right_label: &str,
+) -> String {
+    let (lw, lh) = svg_dims(left_svg);
+    let (rw, rh) = svg_dims(right_svg);
+    let gap = 40.0;
+    let cap_h = 24.0;
+    let w = lw + gap + rw;
+    let h = lh.max(rh) + cap_h;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:.0}\" height=\"{h:.0}\" \
+         viewBox=\"0 0 {w:.0} {h:.0}\" font-family=\"system-ui, sans-serif\" font-size=\"12\">"
+    );
+    let _ = writeln!(
+        out,
+        "  <text x=\"8\" y=\"16\" font-weight=\"700\" fill=\"#111827\">{}</text>",
+        xml_escape(left_label)
+    );
+    let _ = writeln!(
+        out,
+        "  <text x=\"{lx:.0}\" y=\"16\" font-weight=\"700\" fill=\"#111827\">{lbl}</text>",
+        lx = lw + gap + 8.0,
+        lbl = xml_escape(right_label)
+    );
+    let _ = writeln!(out, "  <g transform=\"translate(0,{:.0})\">", cap_h);
+    out.push_str(&strip_svg_wrapper(left_svg));
+    out.push_str("  </g>\n");
+    let _ = writeln!(
+        out,
+        "  <g transform=\"translate({tx:.0},{ty:.0})\">",
+        tx = lw + gap,
+        ty = cap_h
+    );
+    out.push_str(&strip_svg_wrapper(right_svg));
+    out.push_str("  </g>\n");
+    out.push_str("</svg>\n");
+    out
+}
+
+fn svg_dims(svg: &str) -> (f64, f64) {
+    let w = attr_f64(svg, "width").unwrap_or(800.0);
+    let h = attr_f64(svg, "height").unwrap_or(600.0);
+    (w, h)
+}
+
+fn attr_f64(s: &str, name: &str) -> Option<f64> {
+    let needle = format!(" {name}=\"");
+    let start = s.find(&needle)? + needle.len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    rest[..end].parse().ok()
+}
+
+fn strip_svg_wrapper(svg: &str) -> String {
+    // Drop the outer <svg ...> and </svg> tags so the body can be embedded.
+    let open_end = svg.find('>').map(|i| i + 1).unwrap_or(0);
+    let close_start = svg.rfind("</svg>").unwrap_or(svg.len());
+    svg[open_end..close_start].to_string()
 }
 
 #[derive(Debug, Clone, Copy)]

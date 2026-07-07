@@ -317,7 +317,7 @@ fn usage() -> String {
          infer <dataset-dir> [target-p99-wait-ms]   Infer insights from a dataset\n  \
          import-camunda <records.json|dir> <out-dir> [--no-tier2]\n  \
          {pad}Import a Camunda 8 record export\n  \
-         layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg] [--solver rowbias|field]\n  \
+         layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg] [--solver rowbias|field] [--side-by-side sxs.svg]\n  \
          {pad}Run the semantic BPMN layout (see docs/layout.md)\n\n\
          OPTIONS:\n  \
          -h, --help       Print this help\n  \
@@ -792,6 +792,7 @@ fn run_cli_layout(args: &[String]) {
         .unwrap_or("out");
     let out_bpmn = opt("--out").unwrap_or_else(|| format!("{stem}.laid-out.bpmn"));
     let out_svg = opt("--debug-svg").unwrap_or_else(|| format!("{stem}.debug.svg"));
+    let side_by_side_path = opt("--side-by-side");
     let solver = opt("--solver")
         .as_deref()
         .map(layout::Solver::parse)
@@ -830,12 +831,23 @@ fn run_cli_layout(args: &[String]) {
     println!("wrote {out_svg}");
     if let Some(d) = &out.field_diagnostics {
         println!(
-            "field sim: {steps} steps, KE={ke:.2}, converged={conv}, pinned={pinned}",
+            "Fromme sim: {steps} steps, KE={ke:.2}, converged={conv}, pinned={pinned}",
             steps = d.steps,
             ke = d.final_kinetic_energy,
             conv = d.converged,
             pinned = d.pinned_by_oscillation.len(),
         );
+    }
+    if let Some(path) = side_by_side_path {
+        let sxs = layout::layout_side_by_side(&bpmn_xml, &ann).unwrap_or_else(|e| {
+            eprintln!("side-by-side render failed: {e}");
+            std::process::exit(1);
+        });
+        std::fs::write(&path, &sxs).unwrap_or_else(|e| {
+            eprintln!("write {path}: {e}");
+            std::process::exit(1);
+        });
+        println!("wrote {path} (side-by-side)");
     }
 }
 

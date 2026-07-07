@@ -1,5 +1,8 @@
-//! **Field solver (v2, experimental)** — unified charged-particle simulation
-//! where nodes and edges are both particles in the same 2D field.
+//! **Fromme engine (v2, experimental)** — unified charged-particle simulation
+//! where nodes and edges are both particles in the same 2D field. The Fromme
+//! engine is a physics-based BPMN DI layout solver; nodes carry semantic
+//! charges (flow-kind, cluster, graph-distance) and settle into a diagram
+//! under pairwise attraction/repulsion and a longitudinal (LTR) spring.
 //!
 //! ## Model
 //!
@@ -53,16 +56,27 @@ use super::schema::{FlowKind, SemanticAnnotations};
 // magic numbers in the solver — every other threshold is derived from these
 // or from node dimensions. If the layout misbehaves, this is the first place
 // to look.
-const K_ATTRACT: f64 = 40.0;
-const K_REPEL: f64 = 4000.0;
-const K_CLUSTER: f64 = 60.0;
-const K_HARD_OVERLAP: f64 = 8000.0;
-const K_LTR_DRIFT: f64 = 30.0;
+const K_ATTRACT: f64 = 20.0;
+const K_REPEL: f64 = 3000.0;
+const K_CLUSTER: f64 = 40.0;
+const K_HARD_OVERLAP: f64 = 6000.0;
+/// Spring toward each node's target x (derived from longest-path graph
+/// distance). A restoring force, so the system can converge — the earlier
+/// constant LTR drift never let terminal velocity reach zero.
+const K_LTR_SPRING: f64 = 8.0;
+/// Column spacing for `target_x` (px). 160 matches the row-bias solver.
+const COL_SPACING: f64 = 160.0;
+/// First-column x, so target_x = FIRST_COL_X + graph_dist * COL_SPACING.
+const FIRST_COL_X: f64 = 120.0;
+/// Soft-core repulsion between edge segments — prevents unrelated edges from
+/// occupying the same coordinates while still letting same-kind ones bundle.
+const K_EDGE_REPEL: f64 = 200.0;
+const EDGE_MIN_R: f64 = 28.0;
 const K_EDGE_SPRING: f64 = 6.0;
 const EDGE_REST_LEN: f64 = 30.0;
 
 const DT: f64 = 0.05;
-const DAMPING: f64 = 0.85;
+const DAMPING: f64 = 0.90;
 const EPS_KINETIC: f64 = 0.5;
 const SETTLED_STEPS: usize = 20;
 const MAX_STEPS: usize = 2000;
@@ -101,6 +115,12 @@ pub struct Particle {
     pub charges: Charges,
     /// For nodes only — the bounding rect (width, height). Zero for edge segments.
     pub size: (f64, f64),
+    /// Target x from the LTR spring (derived from graph distance). Zero for
+    /// edge segments (they're free to slide along x, held by chain springs).
+    pub target_x: f64,
+    /// Net force applied in the *last* integrator step. Used by the debug
+    /// SVG's force-vector overlay; otherwise informational.
+    pub last_force: (f64, f64),
     /// For edge segments only — the parent edge's id, and which node ids the
     /// endpoints must stay anchored to. `None` for nodes.
     pub edge_anchors: Option<EdgeAnchors>,
@@ -151,6 +171,9 @@ pub struct FieldOutput {
     /// `edge_id -> polyline of waypoints`. First and last waypoints sit on
     /// the source/target node perimeter respectively.
     pub edges: HashMap<String, Vec<(f64, f64)>>,
+    /// Per-node net force from the *last* integrator step. Used by the debug
+    /// SVG force-vector overlay.
+    pub node_forces: HashMap<String, (f64, f64)>,
     /// Diagnostic — steps until convergence, kinetic energy trace, pinned particle ids.
     pub diagnostics: SimDiagnostics,
 }
@@ -218,7 +241,8 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
     for id in def.elements.keys() {
         let kind = node_kind.get(id).copied();
         let d = graph_dist.get(id).copied().unwrap_or(0.0);
-        let init_x = 100.0 + (d / max_dist) * 800.0;
+        let target_x = FIRST_COL_X + d * COL_SPACING;
+        let init_x = target_x;
         let init_y = 200.0 + kind.map(|k| k.target_row()).unwrap_or(0.0) * 110.0;
         let mut charges = Charges {
             flow_kind: Charges::flow_kind_from(kind),
@@ -239,6 +263,8 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
             fixed: false,
             charges,
             size: node_dims(&def.elements[id]),
+            target_x,
+            last_force: (0.0, 0.0),
             edge_anchors: None,
             history: Vec::new(),
         });
@@ -285,6 +311,8 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
                     fixed: is_endpoint, // endpoints pinned every step to node perimeter
                     charges: charges.clone(),
                     size: (0.0, 0.0),
+                    target_x: 0.0,
+                    last_force: (0.0, 0.0),
                     edge_anchors: Some(EdgeAnchors {
                         edge_id: edge_id.clone(),
                         source_node: src_id.clone(),
@@ -305,8 +333,13 @@ fn compute_all_forces(particles: &[Particle]) -> Vec<(f64, f64)> {
     let n = particles.len();
     let mut forces = vec![(0.0_f64, 0.0_f64); n];
     for i in 0..n {
-        // LTR drift (per-particle, not pairwise).
-        forces[i].0 += particles[i].charges.graph_dist * K_LTR_DRIFT;
+        // LTR spring — nodes are pulled toward their target x (from graph
+        // distance). This is a restoring force; without it terminal velocity
+        // is nonzero and the system never converges.
+        if particles[i].kind == ParticleKind::Node {
+            let dx = particles[i].target_x - particles[i].pos.0;
+            forces[i].0 += K_LTR_SPRING * dx;
+        }
 
         for j in 0..n {
             if i == j {
@@ -320,12 +353,10 @@ fn compute_all_forces(particles: &[Particle]) -> Vec<(f64, f64)> {
         // Intra-edge spring forces (only for edge segments).
         if let ParticleKind::EdgeSegment { index, chain_len } = particles[i].kind {
             if let Some(anchor) = &particles[i].edge_anchors {
-                for (di, other_idx) in [(-1i32, index as i32 - 1), (1, index as i32 + 1)] {
-                    let _ = di;
+                for other_idx in [index as i32 - 1, index as i32 + 1] {
                     if other_idx < 0 || other_idx as usize >= chain_len {
                         continue;
                     }
-                    // Find the neighbour in the same edge chain.
                     let neighbour = particles.iter().find(|p| {
                         matches!(
                             p.kind,
@@ -387,6 +418,21 @@ fn pairwise_force(a: &Particle, b: &Particle) -> (f64, f64) {
         }
     }
 
+    // Cross-edge soft repulsion — prevents unrelated edge chains from
+    // occupying the same coordinates. Only kicks in below EDGE_MIN_R and
+    // only between segments belonging to *different* parent edges (same-edge
+    // chain neighbours are handled by the spring force elsewhere).
+    if let (ParticleKind::EdgeSegment { .. }, ParticleKind::EdgeSegment { .. }) = (a.kind, b.kind) {
+        let same_edge = match (&a.edge_anchors, &b.edge_anchors) {
+            (Some(ea), Some(eb)) => ea.edge_id == eb.edge_id,
+            _ => false,
+        };
+        if !same_edge && r < EDGE_MIN_R {
+            let mag = K_EDGE_REPEL * (EDGE_MIN_R - r) / EDGE_MIN_R;
+            net -= mag / r;
+        }
+    }
+
     (dx / r * net, dy / r * net)
 }
 
@@ -400,6 +446,7 @@ fn integrate(particles: &mut [Particle], forces: &[(f64, f64)]) -> f64 {
 
     let mut ke = 0.0;
     for (p, &(fx, fy)) in particles.iter_mut().zip(forces.iter()) {
+        p.last_force = (fx, fy);
         if p.fixed {
             p.vel = (0.0, 0.0);
             continue;
@@ -502,9 +549,11 @@ fn mean(pts: &[(f64, f64)]) -> (f64, f64) {
 
 fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldOutput {
     let mut nodes = HashMap::new();
+    let mut node_forces = HashMap::new();
     for p in particles {
         if p.kind == ParticleKind::Node {
             nodes.insert(p.id.clone(), p.pos);
+            node_forces.insert(p.id.clone(), p.last_force);
         }
     }
 
@@ -530,6 +579,7 @@ fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldO
     FieldOutput {
         nodes,
         edges,
+        node_forces,
         diagnostics,
     }
 }

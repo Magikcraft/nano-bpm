@@ -85,25 +85,47 @@ pub fn layout_with(
         .into_iter()
         .next()
         .ok_or_else(|| "no process definition in BPMN document".to_string())?;
-    let (out_xml, diagnostics) = match solver {
+    let (out_xml, diagnostics, node_forces) = match solver {
         Solver::RowBias => {
             let bias = solver::compute_row_bias(ann);
             let xml =
                 definition_to_xml_with_row_bias(&def, &std::collections::HashMap::new(), &bias);
-            (xml, None)
+            (xml, None, None)
         }
         Solver::Field => {
             let field_out = field::simulate(&def, ann);
             let xml = emit_bpmn_from_field(&def, &field_out);
-            (xml, Some(field_out.diagnostics))
+            (
+                xml,
+                Some(field_out.diagnostics),
+                Some(field_out.node_forces),
+            )
         }
     };
-    let svg = debug_svg::render_debug_svg(&out_xml, ann);
+    let svg = match &node_forces {
+        Some(forces) => debug_svg::render_debug_svg_with_forces(&out_xml, ann, Some(forces)),
+        None => debug_svg::render_debug_svg(&out_xml, ann),
+    };
     Ok(LayoutOutput {
         bpmn_xml: out_xml,
         debug_svg: svg,
         field_diagnostics: diagnostics,
+        node_forces,
     })
+}
+
+/// Run *both* solvers on the same input and stitch their debug SVGs into a
+/// single side-by-side document — handy for eyeballing which physics choice
+/// wins on a given fixture.
+pub fn layout_side_by_side(xml: &str, ann: &SemanticAnnotations) -> Result<String, String> {
+    let rb = layout_with(xml, ann, Solver::RowBias)?;
+    let fs = layout_with(xml, ann, Solver::Field)?;
+    Ok(debug_svg::stitch_side_by_side(
+        &rb.debug_svg,
+        "rowbias",
+        &fs.debug_svg,
+        "field (Fromme)",
+    ))
 }
 
 /// Convert a settled field simulation into a BPMN XML document. Field
@@ -213,6 +235,9 @@ pub struct LayoutOutput {
     /// pinned oscillators, final kinetic energy. Handy for debugging the sim
     /// without instrumenting it.
     pub field_diagnostics: Option<field::SimDiagnostics>,
+    /// Present only when the field solver was used — the last-step net force
+    /// vector per node. Sourced from [`field::FieldOutput::node_forces`].
+    pub node_forces: Option<std::collections::HashMap<String, (f64, f64)>>,
 }
 
 #[cfg(test)]
