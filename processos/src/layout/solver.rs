@@ -128,7 +128,7 @@ mod tests {
     #[test]
     fn unannotated_nodes_are_absent_so_caller_falls_back() {
         let b = compute_row_bias(&ann());
-        assert!(b.get("SomeOtherNode").is_none());
+        assert!(!b.contains_key("SomeOtherNode"));
     }
 
     #[test]

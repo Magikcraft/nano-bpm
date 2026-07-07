@@ -63,11 +63,11 @@ pub struct AnnotatedFlow {
 /// The four narrative kinds v0 knows about. Each maps to a target y-band the
 /// solver pulls its member nodes toward.
 ///
-/// Precedence when a node appears in multiple flows: **exception > escalation
-/// > compensation > primary**. Rationale: if a node is genuinely part of the
-/// happy path but is *also* how you handle a specific error, the diagram is
-/// more useful with the node off the centerline (the exception context is the
-/// interesting one).
+/// Precedence when a node appears in multiple flows:
+/// exception, then escalation, then compensation, then primary. Rationale: if
+/// a node is genuinely part of the happy path but is *also* how you handle a
+/// specific error, the diagram is more useful with the node off the
+/// centerline (the exception context is the interesting one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlowKind {

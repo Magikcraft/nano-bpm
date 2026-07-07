@@ -70,6 +70,7 @@ impl Solver {
 }
 
 /// End-to-end using the default (row-bias) solver.
+#[allow(dead_code)] // convenience wrapper for library consumers; CLI uses layout_with
 pub fn layout(xml: &str, ann: &SemanticAnnotations) -> Result<LayoutOutput, String> {
     layout_with(xml, ann, Solver::RowBias)
 }
@@ -283,6 +284,7 @@ pub struct LayoutOutput {
     pub field_diagnostics: Option<field::SimDiagnostics>,
     /// Present only when the field solver was used — the last-step net force
     /// vector per node. Sourced from [`field::FieldOutput::node_forces`].
+    #[allow(dead_code)] // exposed for library consumers; not read by CLI directly
     pub node_forces: Option<std::collections::HashMap<String, (f64, f64)>>,
 }
 

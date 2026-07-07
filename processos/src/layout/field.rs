@@ -158,6 +158,7 @@ pub struct Charges {
     pub cluster: HashMap<String, f64>,
     /// Normalized longest-path distance from a source event, 0..1. Higher =
     /// further right (a constant +x drift is applied proportional to this).
+    #[allow(dead_code)] // retained for future force-tuning experiments
     pub graph_dist: f64,
 }
 
@@ -683,8 +684,8 @@ fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldO
 
     // Collect edge segments keyed by parent edge id, then sort by segment
     // index so waypoint order matches the chain direction (source → target).
-    let mut per_edge: HashMap<String, (Vec<(usize, (f64, f64))>, Option<EdgeAnchors>)> =
-        HashMap::new();
+    type EdgeBucket = (Vec<(usize, (f64, f64))>, Option<EdgeAnchors>);
+    let mut per_edge: HashMap<String, EdgeBucket> = HashMap::new();
     for p in particles {
         if let ParticleKind::EdgeSegment { index, .. } = p.kind {
             if let Some(a) = &p.edge_anchors {
@@ -743,8 +744,9 @@ fn clip_edge_polyline(
     // filter interior waypoints that sit inside either rect.
     let mut kept: Vec<(f64, f64)> = Vec::with_capacity(raw.len());
     kept.push(raw[0]);
-    for i in 1..raw.len() - 1 {
-        let p = raw[i];
+    let interior_end = raw.len().saturating_sub(1);
+    for p in raw.iter().take(interior_end).skip(1) {
+        let p = *p;
         let in_src = src_rect.map(|r| inside(p, r)).unwrap_or(false);
         let in_tgt = tgt_rect.map(|r| inside(p, r)).unwrap_or(false);
         if !in_src && !in_tgt {
@@ -762,7 +764,7 @@ fn clip_edge_polyline(
 /// diamond-shaped gateways or circular events even though the coordinates
 /// lie on the bounding rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NodeShape {
+pub enum NodeShape {
     Rect,
     Diamond,
     Circle,
@@ -883,7 +885,7 @@ mod tests {
         assert!(out.nodes.contains_key("HandleError"));
         // Every sequence flow gets a waypoint chain.
         assert!(!out.edges.is_empty());
-        for (_, waypoints) in &out.edges {
+        for waypoints in out.edges.values() {
             assert!(waypoints.len() >= 2, "each edge has at least two endpoints");
         }
     }
