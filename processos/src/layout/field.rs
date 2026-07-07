@@ -119,6 +119,10 @@ pub struct Particle {
     pub charges: Charges,
     /// For nodes only — the bounding rect (width, height). Zero for edge segments.
     pub size: (f64, f64),
+    /// For nodes only — the visual shape (rect/diamond/circle). Determines
+    /// how edge endpoints project onto the perimeter. Meaningless for edge
+    /// segments (defaults to Rect).
+    pub shape: NodeShape,
     /// Target x from the LTR spring (derived from graph distance). Zero for
     /// edge segments (they're free to slide along x, held by chain springs).
     pub target_x: f64,
@@ -272,6 +276,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
             fixed: false,
             charges,
             size: node_dims(&def.elements[id]),
+            shape: node_shape(&def.elements[id]),
             target_x,
             target_y,
             last_force: (0.0, 0.0),
@@ -321,6 +326,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
                     fixed: is_endpoint, // endpoints pinned every step to node perimeter
                     charges: charges.clone(),
                     size: (0.0, 0.0),
+                    shape: NodeShape::Rect,
                     target_x: 0.0,
                     target_y: 0.0,
                     last_force: (0.0, 0.0),
@@ -495,11 +501,17 @@ fn integrate(particles: &mut [Particle], forces: &[(f64, f64)]) -> f64 {
 
 fn project_endpoints(particles: &mut [Particle]) {
     // Snapshot node rects (Node particles) so we can perimeter-project edge
-    // endpoints against them without an aliasing borrow.
-    let node_rects: HashMap<String, (f64, f64, f64, f64)> = particles
+    // endpoints against them without an aliasing borrow. The shape is
+    // captured too so gateways and events use diamond/circle projection.
+    let node_rects: HashMap<String, (f64, f64, f64, f64, NodeShape)> = particles
         .iter()
         .filter(|p| p.kind == ParticleKind::Node)
-        .map(|p| (p.id.clone(), (p.pos.0, p.pos.1, p.size.0, p.size.1)))
+        .map(|p| {
+            (
+                p.id.clone(),
+                (p.pos.0, p.pos.1, p.size.0, p.size.1, p.shape),
+            )
+        })
         .collect();
 
     // Snapshot the position of each edge's interior neighbour segment so
@@ -544,7 +556,7 @@ fn project_endpoints(particles: &mut [Particle]) {
             } else {
                 &anchor.target_node
             };
-            let Some(&(cx, cy, w, h)) = node_rects.get(host_id) else {
+            let Some(&(cx, cy, w, h, shape)) = node_rects.get(host_id) else {
                 continue;
             };
             // Aim toward the interior-neighbour segment if we've seen it;
@@ -559,27 +571,65 @@ fn project_endpoints(particles: &mut [Particle]) {
                     } else {
                         &anchor.source_node
                     };
-                    node_rects.get(other_host).map(|&(x, y, _, _)| (x, y))
+                    node_rects.get(other_host).map(|&(x, y, _, _, _)| (x, y))
                 })
                 .unwrap_or((cx + w, cy));
             let dx = aim.0 - cx;
             let dy = aim.1 - cy;
             let hw = w * 0.5;
             let hh = h * 0.5;
-            let projected = if dx.abs() * hh > dy.abs() * hw {
-                // Cross the vertical edge (left or right face).
+            let projected = project_to_shape(shape, cx, cy, hw, hh, dx, dy);
+            p.pos = projected;
+        }
+    }
+}
+
+/// Project a ray from `(cx, cy)` in direction `(dx, dy)` onto the perimeter
+/// of a shape (rect / diamond / circle) inscribed in the bounding box
+/// (`2·hw`, `2·hh`). This is what puts edge endpoints on the shape actually
+/// rendered by Modeler rather than on the invisible bounding rect.
+fn project_to_shape(
+    shape: NodeShape,
+    cx: f64,
+    cy: f64,
+    hw: f64,
+    hh: f64,
+    dx: f64,
+    dy: f64,
+) -> (f64, f64) {
+    match shape {
+        NodeShape::Rect => {
+            if dx.abs() * hh > dy.abs() * hw {
                 let sx = if dx > 0.0 { cx + hw } else { cx - hw };
                 let denom = dx.abs().max(1e-6);
                 (sx, (cy + dy * hw / denom).clamp(cy - hh, cy + hh))
             } else if dy.abs() > 1e-6 {
-                // Cross the horizontal edge (top or bottom face).
                 let sy = if dy > 0.0 { cy + hh } else { cy - hh };
                 let denom = dy.abs().max(1e-6);
                 ((cx + dx * hh / denom).clamp(cx - hw, cx + hw), sy)
             } else {
                 (cx + hw, cy)
-            };
-            p.pos = projected;
+            }
+        }
+        NodeShape::Diamond => {
+            // Diamond perimeter satisfies |x'/hw| + |y'/hh| = 1 (in local
+            // coordinates). Ray param t solves t·(|dx|/hw + |dy|/hh) = 1.
+            let denom = dx.abs() / hw + dy.abs() / hh;
+            if denom < 1e-6 {
+                return (cx + hw, cy);
+            }
+            let t = 1.0 / denom;
+            (cx + dx * t, cy + dy * t)
+        }
+        NodeShape::Circle => {
+            // Ellipse perimeter (equals circle when hw == hh). Ray param t
+            // solves (t·dx/hw)² + (t·dy/hh)² = 1.
+            let denom = ((dx / hw).powi(2) + (dy / hh).powi(2)).sqrt();
+            if denom < 1e-6 {
+                return (cx + hw, cy);
+            }
+            let t = 1.0 / denom;
+            (cx + dx * t, cy + dy * t)
         }
     }
 }
@@ -620,30 +670,37 @@ fn mean(pts: &[(f64, f64)]) -> (f64, f64) {
 fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldOutput {
     let mut nodes = HashMap::new();
     let mut node_forces = HashMap::new();
+    // Snapshot node rects so we can clip edge polylines out of source/target
+    // rectangles below.
+    let mut node_rects: HashMap<String, (f64, f64, f64, f64)> = HashMap::new();
     for p in particles {
         if p.kind == ParticleKind::Node {
             nodes.insert(p.id.clone(), p.pos);
             node_forces.insert(p.id.clone(), p.last_force);
+            node_rects.insert(p.id.clone(), (p.pos.0, p.pos.1, p.size.0, p.size.1));
         }
     }
 
     // Collect edge segments keyed by parent edge id, then sort by segment
     // index so waypoint order matches the chain direction (source → target).
-    let mut per_edge: HashMap<String, Vec<(usize, (f64, f64))>> = HashMap::new();
+    let mut per_edge: HashMap<String, (Vec<(usize, (f64, f64))>, Option<EdgeAnchors>)> =
+        HashMap::new();
     for p in particles {
         if let ParticleKind::EdgeSegment { index, .. } = p.kind {
             if let Some(a) = &p.edge_anchors {
-                per_edge
+                let entry = per_edge
                     .entry(a.edge_id.clone())
-                    .or_default()
-                    .push((index, p.pos));
+                    .or_insert((Vec::new(), Some(a.clone())));
+                entry.0.push((index, p.pos));
             }
         }
     }
     let mut edges: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
-    for (edge_id, mut list) in per_edge {
+    for (edge_id, (mut list, anchors)) in per_edge {
         list.sort_by_key(|&(i, _)| i);
-        edges.insert(edge_id, list.into_iter().map(|(_, p)| p).collect());
+        let raw: Vec<(f64, f64)> = list.into_iter().map(|(_, p)| p).collect();
+        let clipped = clip_edge_polyline(&raw, anchors.as_ref(), &node_rects);
+        edges.insert(edge_id, clipped);
     }
 
     FieldOutput {
@@ -654,11 +711,67 @@ fn extract_output(particles: &[Particle], diagnostics: SimDiagnostics) -> FieldO
     }
 }
 
+/// Trim the raw waypoint chain into a valid perimeter-to-perimeter polyline:
+/// drop any interior waypoint that sits inside the source rect *or* the
+/// target rect, then drop trailing waypoints on the source side that lie
+/// "behind" the source face (i.e., on the interior-side of its outward
+/// normal), and equivalently on the target side.
+///
+/// Without this pass, interior segments initialised at `t = 1/4` between two
+/// close nodes could sit inside a rectangle, producing polylines that dived
+/// into a node before exiting — which Modeler renders as an arrow pointing
+/// backward with its head inside the target.
+fn clip_edge_polyline(
+    raw: &[(f64, f64)],
+    anchors: Option<&EdgeAnchors>,
+    node_rects: &HashMap<String, (f64, f64, f64, f64)>,
+) -> Vec<(f64, f64)> {
+    if raw.len() < 2 {
+        return raw.to_vec();
+    }
+    let src_rect = anchors.and_then(|a| node_rects.get(&a.source_node).copied());
+    let tgt_rect = anchors.and_then(|a| node_rects.get(&a.target_node).copied());
+
+    let inside = |pt: (f64, f64), rect: (f64, f64, f64, f64)| -> bool {
+        let (cx, cy, w, h) = rect;
+        let hw = w * 0.5;
+        let hh = h * 0.5;
+        pt.0 > cx - hw && pt.0 < cx + hw && pt.1 > cy - hh && pt.1 < cy + hh
+    };
+
+    // Always keep the two endpoints (they were projected onto perimeters);
+    // filter interior waypoints that sit inside either rect.
+    let mut kept: Vec<(f64, f64)> = Vec::with_capacity(raw.len());
+    kept.push(raw[0]);
+    for i in 1..raw.len() - 1 {
+        let p = raw[i];
+        let in_src = src_rect.map(|r| inside(p, r)).unwrap_or(false);
+        let in_tgt = tgt_rect.map(|r| inside(p, r)).unwrap_or(false);
+        if !in_src && !in_tgt {
+            kept.push(p);
+        }
+    }
+    kept.push(raw[raw.len() - 1]);
+    kept
+}
+
 // --- Helpers --------------------------------------------------------------
 
-fn node_dims(el: &Element) -> (f64, f64) {
+/// The visual shape of a node in Modeler-style BPMN rendering. Endpoint
+/// projection has to match, otherwise edges appear disconnected from
+/// diamond-shaped gateways or circular events even though the coordinates
+/// lie on the bounding rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeShape {
+    Rect,
+    Diamond,
+    Circle,
+}
+
+fn node_shape(el: &Element) -> NodeShape {
     use nanobpmn_engine_core::ElementKind::*;
     match el.kind {
+        ExclusiveGateway | ParallelGateway => NodeShape::Diamond,
         StartEvent
         | EndEvent
         | IntermediateThrowEvent
@@ -672,9 +785,16 @@ fn node_dims(el: &Element) -> (f64, f64) {
         | TimerBoundaryEvent { .. }
         | MessageBoundaryEvent { .. }
         | SignalBoundaryEvent { .. }
-        | ConditionalBoundaryEvent { .. } => (36.0, 36.0),
-        ExclusiveGateway | ParallelGateway => (50.0, 50.0),
-        _ => (NODE_W, NODE_H),
+        | ConditionalBoundaryEvent { .. } => NodeShape::Circle,
+        _ => NodeShape::Rect,
+    }
+}
+
+fn node_dims(el: &Element) -> (f64, f64) {
+    match node_shape(el) {
+        NodeShape::Circle => (36.0, 36.0),
+        NodeShape::Diamond => (50.0, 50.0),
+        NodeShape::Rect => (NODE_W, NODE_H),
     }
 }
 
