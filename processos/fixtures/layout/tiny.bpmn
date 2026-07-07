@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_tiny"
+                  targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="TinyProcess" isExecutable="true">
+    <bpmn:startEvent id="Start_1">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="TaskA" name="Task A">
+      <bpmn:extensionElements><zeebe:taskDefinition type="a"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="GwCheck" name="ok?" default="Flow_3">
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+      <bpmn:outgoing>Flow_3</bpmn:outgoing>
+      <bpmn:outgoing>Flow_err</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="TaskB" name="Task B">
+      <bpmn:extensionElements><zeebe:taskDefinition type="b"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_3</bpmn:incoming>
+      <bpmn:outgoing>Flow_4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End_ok">
+      <bpmn:incoming>Flow_4</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:serviceTask id="HandleError" name="Handle error">
+      <bpmn:extensionElements><zeebe:taskDefinition type="handle-error"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_err</bpmn:incoming>
+      <bpmn:outgoing>Flow_5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End_err">
+      <bpmn:incoming>Flow_5</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1"   sourceRef="Start_1"     targetRef="TaskA"/>
+    <bpmn:sequenceFlow id="Flow_2"   sourceRef="TaskA"       targetRef="GwCheck"/>
+    <bpmn:sequenceFlow id="Flow_3"   sourceRef="GwCheck"     targetRef="TaskB"/>
+    <bpmn:sequenceFlow id="Flow_err" sourceRef="GwCheck"     targetRef="HandleError">
+      <bpmn:conditionExpression>=status="error"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="Flow_4"   sourceRef="TaskB"       targetRef="End_ok"/>
+    <bpmn:sequenceFlow id="Flow_5"   sourceRef="HandleError" targetRef="End_err"/>
+  </bpmn:process>
+</bpmn:definitions>
