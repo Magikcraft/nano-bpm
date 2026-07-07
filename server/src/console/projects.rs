@@ -229,6 +229,15 @@ pub struct ProjectConfig {
     /// own resources at boot.
     #[serde(default = "default_auto_deploy")]
     pub auto_deploy: Vec<String>,
+    /// Project-scoped environment variables layered on top of the base spawn
+    /// env for every Run/Compile (regardless of active run config). Used to
+    /// point the app at whichever gateway URL the user has *this* project
+    /// wired up to — Nano and Camunda 8 both default to `:8080`, so there's
+    /// no universal per-pack default and the target belongs on the project.
+    /// Precedence: process env < project `env` < active run config `env`
+    /// (last-wins on key collisions).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
     /// Toolchain snapshotted from the scaffolding pack — the *project* is the
     /// authority for how it runs and compiles, not the pack (which can change
     /// or be uninstalled). Precedence for Run/Compile:
@@ -372,6 +381,7 @@ impl ProjectConfig {
             lang: default_lang(),
             app: default_app(),
             auto_deploy: default_auto_deploy(),
+            env: std::collections::BTreeMap::new(),
             toolchain: None,
             scaffolded_from: None,
             created_ms: ts,
@@ -1800,14 +1810,19 @@ fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
     None
 }
 
-/// Env vars to layer on top of the base environment when spawning Run/Compile
-/// — the active [`ProjectRunConfig`]'s `env`, or empty when no run configs.
+/// Env vars to layer on top of the base environment when spawning Run/Compile.
+/// Precedence (low → high, last wins):
+///   1. base spawn env (set by the runner at the `Command::env` calls above)
+///   2. project-scoped `cfg.env` (applies to every run config)
+///   3. active [`ProjectRunConfig`]'s `env` (per-config overrides)
 fn resolve_run_env(cfg: &ProjectConfig) -> std::collections::BTreeMap<String, String> {
-    cfg.toolchain
-        .as_ref()
-        .and_then(active_run_config)
-        .map(|rc| rc.env.clone())
-        .unwrap_or_default()
+    let mut out = cfg.env.clone();
+    if let Some(rc) = cfg.toolchain.as_ref().and_then(active_run_config) {
+        for (k, v) in &rc.env {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
 }
 
 pub fn supervisor() -> &'static ProjectSupervisor {
@@ -3211,6 +3226,51 @@ mod tests {
             active_run_config: None,
         });
         assert!(resolve_run_env(&cfg).is_empty());
+    }
+
+    #[test]
+    fn resolve_run_env_merges_project_env_under_run_config_env() {
+        // Project env provides the base (CAMUNDA_REST_ADDRESS pointing at the
+        // user's chosen gateway); run config env can *override* a project-level
+        // key but a project-only key must survive. This is the whole point of
+        // exposing project env — so a user can set the gateway URL once and
+        // have every run config inherit it.
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.env.insert(
+            "CAMUNDA_REST_ADDRESS".into(),
+            "http://localhost:8081".into(),
+        );
+        cfg.env.insert("PROJECT_ONLY".into(), "kept".into());
+        cfg.toolchain = Some(tc_with_configs(vec![rc("falcon", true, "falcon")]));
+        let env = resolve_run_env(&cfg);
+        assert_eq!(env.get("PROJECT_ONLY").map(String::as_str), Some("kept"));
+        assert_eq!(env.get("PROFILE").map(String::as_str), Some("falcon"));
+        assert_eq!(
+            env.get("CAMUNDA_REST_ADDRESS").map(String::as_str),
+            Some("http://localhost:8081"),
+            "run config didn't override this key so project env wins"
+        );
+    }
+
+    #[test]
+    fn resolve_run_env_run_config_overrides_project_env() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.env.insert("PROFILE".into(), "project-default".into());
+        cfg.toolchain = Some(tc_with_configs(vec![rc("falcon", true, "falcon")]));
+        let env = resolve_run_env(&cfg);
+        assert_eq!(env.get("PROFILE").map(String::as_str), Some("falcon"));
+    }
+
+    #[test]
+    fn resolve_run_env_project_env_alone_without_run_configs() {
+        let mut cfg = ProjectConfig::new("p", "");
+        cfg.env
+            .insert("NANOBPMN_BASE_URL".into(), "http://x:1234".into());
+        let env = resolve_run_env(&cfg);
+        assert_eq!(
+            env.get("NANOBPMN_BASE_URL").map(String::as_str),
+            Some("http://x:1234")
+        );
     }
 
     #[test]

@@ -800,6 +800,12 @@ export interface ProjectConfig {
   lang: string;
   /** App/output pack id (`console`, or e.g. `deno-gui`). */
   app: string;
+  /** Project-scoped env vars layered onto every Run/Compile spawn. Applied
+   * *under* the active run config's env, so a run config can override a
+   * project-level key. Typical use: pin `CAMUNDA_REST_ADDRESS` for this
+   * project's gateway — since Nano and C8 both default to `:8080`, no
+   * per-pack default can be universally right in side-by-side setups. */
+  env?: Record<string, string>;
   /** Snapshotted toolchain (run/compile argv + named run configs). Set at
    * scaffold time by any app pack that declares its own toolchain; otherwise
    * resolved live from the lang pack. Hand-editable in `nanobpm.project.json`. */
