@@ -107,6 +107,14 @@ struct Metrics {
     /// `job_type_activatable` / `job_type_workers` to spot soft under-provisioning
     /// (workers present but backlog growing).
     job_type_starved: prometheus::IntGaugeVec,
+    /// Cumulative jobs actually dispatched to a worker per `job_type` — the drain
+    /// throughput. Counted where a job is delivered to the worker socket (stream)
+    /// or returned to the REST client, so peer-pulled jobs are attributed once, at
+    /// the gateway that feeds the worker. Delta-scraping gives the per-type drain
+    /// rate D; combined with the backlog level + slope and the server-saturation
+    /// signals it answers "are workers the bottleneck for this type, and would more
+    /// help?" (Little's Law) rather than just "is the backlog growing?".
+    job_type_dispatched_total: prometheus::IntCounterVec,
     /// Per-partition Raft liveness alarm: 1 when the partition's openraft core has
     /// entered `Shutdown` (terminated, e.g. on a storage error) and is no longer
     /// applying, else 0. A stuck-at-1 partition strands its share of instances and
@@ -357,6 +365,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge vec");
 
+    let job_type_dispatched_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_job_type_dispatched_total",
+            "Cumulative jobs dispatched to a worker per job type (the drain throughput); delta-scrape for the per-type drain rate.",
+        ),
+        &["job_type"],
+    )
+    .expect("valid counter vec");
+
     let raft_partition_shutdown = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_raft_partition_shutdown",
@@ -426,6 +443,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_activatable.clone())))
         .and(registry.register(Box::new(job_type_workers.clone())))
         .and(registry.register(Box::new(job_type_starved.clone())))
+        .and(registry.register(Box::new(job_type_dispatched_total.clone())))
         .and(registry.register(Box::new(raft_partition_shutdown.clone())))
         .and(registry.register(Box::new(admission_shed_total.clone())))
         .and(registry.register(Box::new(pending_create_queue.clone())))
@@ -463,6 +481,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_activatable,
         job_type_workers,
         job_type_starved,
+        job_type_dispatched_total,
         raft_partition_shutdown,
         admission_shed_total,
         pending_create_queue,
@@ -615,6 +634,21 @@ pub fn set_job_type_provisioning(job_type: &str, activatable: i64, workers: i64)
         .job_type_starved
         .with_label_values(&[job_type])
         .set(starved);
+}
+
+/// Records `n` jobs dispatched to a worker for `job_type` — the per-type drain
+/// throughput. Called once per stream dispatch pass (with the jobs sent to the
+/// socket) and once per REST activation (with the jobs returned), so a job is
+/// counted exactly once, on the gateway that fed the worker. A no-op when `n==0`
+/// to avoid instantiating series for types that never actually drained.
+pub fn record_jobs_dispatched(job_type: &str, n: u64) {
+    if n == 0 {
+        return;
+    }
+    METRICS
+        .job_type_dispatched_total
+        .with_label_values(&[job_type])
+        .inc_by(n);
 }
 
 /// Publishes the per-partition Raft `Shutdown` alarm: `down = true` sets the gauge
@@ -834,6 +868,22 @@ mod tests {
         assert!(out.contains("nanobpm_job_type_starved{job_type=\"test-served-type\"} 0"));
         // No waiting jobs -> not starved even with idle workers.
         assert!(out.contains("nanobpm_job_type_starved{job_type=\"test-idle-type\"} 0"));
+    }
+
+    #[test]
+    fn dispatched_counter_accumulates_per_type_and_ignores_zero() {
+        // A zero-count dispatch must not instantiate a series (keeps the metric
+        // surface free of types that never actually drained).
+        record_jobs_dispatched("test-dispatch-zero", 0);
+        assert!(!gather().contains("test-dispatch-zero"));
+
+        // Non-zero dispatches accumulate for the type (drain throughput).
+        record_jobs_dispatched("test-dispatch-type", 5);
+        record_jobs_dispatched("test-dispatch-type", 3);
+        assert!(
+            gather()
+                .contains("nanobpm_job_type_dispatched_total{job_type=\"test-dispatch-type\"} 8")
+        );
     }
 
     #[test]
