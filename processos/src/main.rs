@@ -317,7 +317,7 @@ fn usage() -> String {
          infer <dataset-dir> [target-p99-wait-ms]   Infer insights from a dataset\n  \
          import-camunda <records.json|dir> <out-dir> [--no-tier2]\n  \
          {pad}Import a Camunda 8 record export\n  \
-         layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg]\n  \
+         layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg] [--solver rowbias|field]\n  \
          {pad}Run the semantic BPMN layout (see docs/layout.md)\n\n\
          OPTIONS:\n  \
          -h, --help       Print this help\n  \
@@ -792,6 +792,15 @@ fn run_cli_layout(args: &[String]) {
         .unwrap_or("out");
     let out_bpmn = opt("--out").unwrap_or_else(|| format!("{stem}.laid-out.bpmn"));
     let out_svg = opt("--debug-svg").unwrap_or_else(|| format!("{stem}.debug.svg"));
+    let solver = opt("--solver")
+        .as_deref()
+        .map(layout::Solver::parse)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        })
+        .unwrap_or(layout::Solver::RowBias);
 
     let bpmn_xml = std::fs::read_to_string(in_bpmn).unwrap_or_else(|e| {
         eprintln!("read {}: {e}", in_bpmn.display());
@@ -805,7 +814,7 @@ fn run_cli_layout(args: &[String]) {
         eprintln!("parse annotations JSON: {e}");
         std::process::exit(1);
     });
-    let out = layout::layout(&bpmn_xml, &ann).unwrap_or_else(|e| {
+    let out = layout::layout_with(&bpmn_xml, &ann, solver).unwrap_or_else(|e| {
         eprintln!("layout failed: {e}");
         std::process::exit(1);
     });
@@ -819,6 +828,15 @@ fn run_cli_layout(args: &[String]) {
     });
     println!("wrote {out_bpmn}");
     println!("wrote {out_svg}");
+    if let Some(d) = &out.field_diagnostics {
+        println!(
+            "field sim: {steps} steps, KE={ke:.2}, converged={conv}, pinned={pinned}",
+            steps = d.steps,
+            ke = d.final_kinetic_energy,
+            conv = d.converged,
+            pinned = d.pinned_by_oscillation.len(),
+        );
+    }
 }
 
 async fn shutdown_signal() {

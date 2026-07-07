@@ -35,37 +35,169 @@
 //! re-run layout → eyeball the debug SVG.
 
 pub mod debug_svg;
+pub mod field;
 pub mod schema;
 pub mod solver;
 
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 #[allow(unused_imports)] // re-exported public API
 pub use schema::{AnnotatedFlow, Cluster, FlowKind, Role, SemanticAnnotations};
 
-use nanobpmn_engine_core::bpmn::parse_bpmn;
-
 use crate::bpmn_model::definition_to_xml_with_row_bias;
 
-/// End-to-end: `(bpmn_xml, annotations) -> (bpmn_xml_with_semantic_di, debug_svg)`.
-///
-/// The output BPMN is a full, engine-parseable document — a caller can hand
-/// it straight to any BPMN renderer or the Nano gateway's deployment endpoint.
-/// The debug SVG is a separate artifact intended for human eyeballing.
+/// Which layout solver to use. `RowBias` is the deterministic
+/// Sugiyama-adjacent row-bias projection (production default). `Field` is
+/// the experimental unified charged-particle simulation — same semantic
+/// annotations, very different aesthetics. See [`field`] for the physics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Solver {
+    RowBias,
+    Field,
+}
+
+impl Solver {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "rowbias" | "row-bias" | "row_bias" => Ok(Solver::RowBias),
+            "field" | "physics" => Ok(Solver::Field),
+            other => Err(format!(
+                "unknown solver '{other}'; expected 'rowbias' or 'field'"
+            )),
+        }
+    }
+}
+
+/// End-to-end using the default (row-bias) solver.
 pub fn layout(xml: &str, ann: &SemanticAnnotations) -> Result<LayoutOutput, String> {
+    layout_with(xml, ann, Solver::RowBias)
+}
+
+/// End-to-end with an explicitly chosen solver. Output shape is identical
+/// regardless of solver.
+pub fn layout_with(
+    xml: &str,
+    ann: &SemanticAnnotations,
+    solver: Solver,
+) -> Result<LayoutOutput, String> {
     let defs = parse_bpmn(xml).map_err(|e| format!("parse_bpmn: {e:?}"))?;
-    // parse_bpmn returns a Vec<ProcessDefinition>; v0 handles the first one
-    // (the only case the existing serializer supports). Multi-process
-    // definitions can layer semantic layout later.
+    // parse_bpmn returns a Vec<ProcessDefinition>; v0 handles the first one.
     let def = defs
         .into_iter()
         .next()
         .ok_or_else(|| "no process definition in BPMN document".to_string())?;
-    let bias = solver::compute_row_bias(ann);
-    let out_xml = definition_to_xml_with_row_bias(&def, &std::collections::HashMap::new(), &bias);
+    let (out_xml, diagnostics) = match solver {
+        Solver::RowBias => {
+            let bias = solver::compute_row_bias(ann);
+            let xml =
+                definition_to_xml_with_row_bias(&def, &std::collections::HashMap::new(), &bias);
+            (xml, None)
+        }
+        Solver::Field => {
+            let field_out = field::simulate(&def, ann);
+            let xml = emit_bpmn_from_field(&def, &field_out);
+            (xml, Some(field_out.diagnostics))
+        }
+    };
     let svg = debug_svg::render_debug_svg(&out_xml, ann);
     Ok(LayoutOutput {
         bpmn_xml: out_xml,
         debug_svg: svg,
+        field_diagnostics: diagnostics,
     })
+}
+
+/// Convert a settled field simulation into a BPMN XML document. Field
+/// positions become BPMNShape bounds; settled edge chains become BPMNEdge
+/// waypoints *verbatim* — no post-orthogonalisation in this pass, since the
+/// point of the emergent-orthogonality experiment is to see what actually
+/// settles rather than snap it to a grid.
+fn emit_bpmn_from_field(
+    def: &nanobpmn_engine_core::ProcessDefinition,
+    out: &field::FieldOutput,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    s.push_str(
+        "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
+         xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" \
+         xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" \
+         xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" ",
+    );
+    let _ = writeln!(
+        s,
+        "id=\"Definitions_{id}\" targetNamespace=\"http://bpmn.io/schema/bpmn\">",
+        id = def.id
+    );
+    let _ = writeln!(
+        s,
+        "  <bpmn:process id=\"{}\" isExecutable=\"true\"/>",
+        def.id
+    );
+    let _ = writeln!(s, "  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">");
+    let _ = writeln!(
+        s,
+        "    <bpmndi:BPMNPlane id=\"BPMNPlane_1\" bpmnElement=\"{}\">",
+        def.id
+    );
+    for id in def.elements.keys() {
+        if let Some(&(cx, cy)) = out.nodes.get(id) {
+            let (w, h) = field_node_dims(&def.elements[id]);
+            let _ = writeln!(
+                s,
+                "      <bpmndi:BPMNShape id=\"{0}_di\" bpmnElement=\"{0}\">\n\
+                 \x20       <dc:Bounds x=\"{1:.0}\" y=\"{2:.0}\" width=\"{3:.0}\" height=\"{4:.0}\"/>\n\
+                 \x20     </bpmndi:BPMNShape>",
+                id,
+                cx - w * 0.5,
+                cy - h * 0.5,
+                w,
+                h,
+            );
+        }
+    }
+    for (src_id, el) in &def.elements {
+        for f in &el.outgoing {
+            let edge_id = format!("{}__{}", src_id, f.to);
+            if let Some(waypoints) = out.edges.get(&edge_id) {
+                let _ = writeln!(
+                    s,
+                    "      <bpmndi:BPMNEdge id=\"{eid}_di\" bpmnElement=\"{eid}\">",
+                    eid = edge_id
+                );
+                for &(x, y) in waypoints {
+                    let _ = writeln!(s, "        <di:waypoint x=\"{x:.0}\" y=\"{y:.0}\"/>");
+                }
+                let _ = writeln!(s, "      </bpmndi:BPMNEdge>");
+            }
+        }
+    }
+    let _ = writeln!(s, "    </bpmndi:BPMNPlane>");
+    let _ = writeln!(s, "  </bpmndi:BPMNDiagram>");
+    s.push_str("</bpmn:definitions>\n");
+    s
+}
+
+fn field_node_dims(el: &nanobpmn_engine_core::Element) -> (f64, f64) {
+    use nanobpmn_engine_core::ElementKind::*;
+    match el.kind {
+        StartEvent
+        | EndEvent
+        | IntermediateThrowEvent
+        | TimerIntermediateCatchEvent { .. }
+        | MessageIntermediateCatchEvent { .. }
+        | SignalIntermediateCatchEvent { .. }
+        | ConditionalIntermediateCatchEvent { .. }
+        | MessageStartEvent { .. }
+        | TimerStartEvent { .. }
+        | ErrorBoundaryEvent { .. }
+        | TimerBoundaryEvent { .. }
+        | MessageBoundaryEvent { .. }
+        | SignalBoundaryEvent { .. }
+        | ConditionalBoundaryEvent { .. } => (36.0, 36.0),
+        ExclusiveGateway | ParallelGateway => (50.0, 50.0),
+        _ => (110.0, 80.0),
+    }
 }
 
 /// Result of a semantic layout run.
@@ -77,6 +209,10 @@ pub struct LayoutOutput {
     /// nodes coloured by their annotated flow kind. Never embedded in the
     /// BPMN document; write to a sidecar file for inspection.
     pub debug_svg: String,
+    /// Present only when the field solver was used — steps to convergence,
+    /// pinned oscillators, final kinetic energy. Handy for debugging the sim
+    /// without instrumenting it.
+    pub field_diagnostics: Option<field::SimDiagnostics>,
 }
 
 #[cfg(test)]
