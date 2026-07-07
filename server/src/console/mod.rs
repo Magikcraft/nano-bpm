@@ -820,6 +820,22 @@ struct MetricsDto {
     /// tracks the process's real footprint. `null` on non-jemalloc targets.
     #[serde(default)]
     resident_bytes: Option<u64>,
+
+    // Capacity-ceiling "clipping" LEDs + the signals behind them (ADR 0013).
+    /// 1 while this node is pressed against the throughput ceiling (create
+    /// concurrency / active-backlog limiter) — the amber/red clipping LED.
+    ceiling_throughput: bool,
+    /// 1 while pressed against the always-on memory-safety rails.
+    ceiling_memory: bool,
+    /// Live submitted-but-not-yet-applied create-queue depth (the OOM signal).
+    pending_create_queue: i64,
+    /// Live active-instance backlog (created − completed).
+    active_backlog: i64,
+    /// Configured shed thresholds (0 = rail disabled) so the UI can show headroom.
+    admission_backlog_limit: i64,
+    admission_create_queue_limit: i64,
+    /// Cumulative admissions shed since boot (summed across all rails).
+    admission_shed_total: u64,
 }
 
 /// Builds this node's metrics snapshot DTO. Shared by `GET /console/api/metrics`
@@ -877,6 +893,14 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
         writer_busy_ratio: busy_ratio,
 
         resident_bytes: crate::memory::resident_bytes().map(|b| b as u64),
+
+        ceiling_throughput: s.ceiling_throughput_active,
+        ceiling_memory: s.ceiling_memory_active,
+        pending_create_queue: s.pending_create_queue,
+        active_backlog: s.active_backlog,
+        admission_backlog_limit: s.admission_backlog_limit,
+        admission_create_queue_limit: s.admission_create_queue_limit,
+        admission_shed_total: s.admission_shed_total,
     }
 }
 

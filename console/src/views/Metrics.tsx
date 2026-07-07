@@ -59,6 +59,45 @@ export default function Metrics() {
             <Stat label="Connected clients" value={data.connectionsActive.toLocaleString()} />
           </section>
 
+          {/* Capacity ceiling — the clipping LEDs (ADR 0013) */}
+          <section>
+            <SectionLabel>Capacity ceiling</SectionLabel>
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+              <CeilingLed
+                label="Throughput"
+                active={data.ceilingThroughput}
+                detail={
+                  data.admissionBacklogLimit > 0
+                    ? `backlog ${data.activeBacklog.toLocaleString()} / ${data.admissionBacklogLimit.toLocaleString()}`
+                    : `backlog ${data.activeBacklog.toLocaleString()} · rail off`
+                }
+              />
+              <CeilingLed
+                label="Memory"
+                active={data.ceilingMemory}
+                detail={
+                  data.admissionCreateQueueLimit > 0
+                    ? `create queue ${data.pendingCreateQueue.toLocaleString()} / ${data.admissionCreateQueueLimit.toLocaleString()}`
+                    : `create queue ${data.pendingCreateQueue.toLocaleString()} · rail off`
+                }
+              />
+              <Stat
+                label="Create queue"
+                value={data.pendingCreateQueue.toLocaleString()}
+                sub={
+                  data.admissionCreateQueueLimit > 0
+                    ? `shed at ${data.admissionCreateQueueLimit.toLocaleString()}`
+                    : "unbounded"
+                }
+              />
+              <Stat
+                label="Admissions shed"
+                value={data.admissionShedTotal.toLocaleString()}
+                sub={data.admissionShedTotal > 0 ? "load being shed" : undefined}
+              />
+            </div>
+          </section>
+
           {/* Throughput charts */}
           <section className="grid gap-4 lg:grid-cols-2">
             <Chart
@@ -195,6 +234,37 @@ export default function Metrics() {
         </div>
       )}
     </div>
+  );
+}
+
+/// A capacity-ceiling "clipping" LED, styled like a mixing-desk gain-reduction
+/// indicator: a green dot while there is headroom, a pulsing red dot + "CLIPPING"
+/// while the node is pressed against the limit. `detail` shows the live pressure
+/// vs. its shed threshold.
+function CeilingLed({
+  label,
+  active,
+  detail,
+}: {
+  label: string;
+  active: boolean;
+  detail: string;
+}) {
+  return (
+    <Card className="px-4 py-3">
+      <div className="text-xs uppercase tracking-wide text-fg-faint">{label} ceiling</div>
+      <div className="mt-1 flex items-center gap-2">
+        <span
+          className={`inline-block h-3 w-3 rounded-full ${
+            active ? "bg-danger animate-pulse" : "bg-ok"
+          }`}
+        />
+        <span className={`text-lg font-semibold ${active ? "text-danger" : "text-ok"}`}>
+          {active ? "CLIPPING" : "clear"}
+        </span>
+      </div>
+      <div className="mt-0.5 text-xs text-fg-faint tabular-nums">{detail}</div>
+    </Card>
   );
 }
 

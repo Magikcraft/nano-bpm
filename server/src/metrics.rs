@@ -750,7 +750,29 @@ pub struct MetricsSnapshot {
     // Writer duty-cycle counters (busy / (busy+idle) = saturation).
     pub writer_idle_seconds: f64,
     pub writer_busy_seconds: f64,
+
+    // Capacity-ceiling LED + admission-ceiling input signals (ADR 0013). The
+    // `*_active` bools are the lit "clipping" LEDs; the rest are the numbers
+    // behind them so a dashboard can show pressure vs. its shed threshold.
+    pub ceiling_throughput_active: bool,
+    pub ceiling_memory_active: bool,
+    pub pending_create_queue: i64,
+    pub active_backlog: i64,
+    pub admission_backlog_limit: i64,
+    pub admission_create_queue_limit: i64,
+    pub admission_shed_total: u64,
 }
+
+/// The shed rails (labels of `nanobpm_admission_shed_total`), summed into a
+/// single total for the dashboard's "shed since boot" counter.
+const SHED_REASONS: [&str; 6] = [
+    "create_queue",
+    "active_backlog",
+    "create_backlog",
+    "exporter",
+    "pipeline_bytes",
+    "mem_watermark",
+];
 
 /// Reads every metric handle once and returns a point-in-time snapshot.
 #[cfg_attr(not(feature = "console"), allow(dead_code))]
@@ -781,6 +803,17 @@ pub fn snapshot() -> MetricsSnapshot {
 
         writer_idle_seconds: m.writer_idle_seconds.get(),
         writer_busy_seconds: m.writer_busy_seconds.get(),
+
+        ceiling_throughput_active: m.ceiling_active.with_label_values(&["throughput"]).get() != 0,
+        ceiling_memory_active: m.ceiling_active.with_label_values(&["memory"]).get() != 0,
+        pending_create_queue: m.pending_create_queue.get(),
+        active_backlog: m.active_backlog.get(),
+        admission_backlog_limit: m.admission_limit.with_label_values(&["backlog"]).get(),
+        admission_create_queue_limit: m.admission_limit.with_label_values(&["create_queue"]).get(),
+        admission_shed_total: SHED_REASONS
+            .iter()
+            .map(|r| m.admission_shed_total.with_label_values(&[r]).get())
+            .sum(),
     }
 }
 
