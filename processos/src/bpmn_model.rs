@@ -2079,7 +2079,7 @@ pub fn definition_to_xml_labeled(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
 ) -> String {
-    serialize_definition(def, overrides, None)
+    serialize_definition(def, overrides, None, None)
 }
 
 /// Like [`definition_to_xml_labeled`], but when `di_source` (the original XML the model was read
@@ -2094,13 +2094,27 @@ pub fn definition_to_xml_preserving_di(
     di_source: Option<&str>,
 ) -> String {
     let di = di_source.and_then(extract_preserved_di);
-    serialize_definition(def, overrides, di.as_ref())
+    serialize_definition(def, overrides, di.as_ref(), None)
+}
+
+/// Auto-layout serializer that additionally accepts a `row_bias` map from the
+/// [`layout`](crate::layout) module — the semantic solver's preferred y-row per node id, honoured
+/// by [`desired_row`] to pull annotated nodes into their band. Any node not in the map falls back
+/// to the predecessor-mean heuristic. Never re-attaches a preserved diagram (semantic layout is
+/// always regenerated — the point of running it is to relay out to the new bands).
+pub fn definition_to_xml_with_row_bias(
+    def: &ProcessDefinition,
+    overrides: &HashMap<String, String>,
+    row_bias: &HashMap<String, f64>,
+) -> String {
+    serialize_definition(def, overrides, None, Some(row_bias))
 }
 
 fn serialize_definition(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
     di: Option<&PreservedDi>,
+    row_bias: Option<&HashMap<String, f64>>,
 ) -> String {
     let errors = collect_error_ids(def);
     let (messages, msg_lookup) = collect_messages(def);
@@ -2289,7 +2303,7 @@ fn serialize_definition(
             out.push_str(d.diagram_block.trim_end());
             out.push('\n');
         }
-        None => append_diagram(def, &flows, &mut out),
+        None => append_diagram(def, &flows, &mut out, row_bias),
     }
     out.push_str("</bpmn:definitions>\n");
     out
@@ -2352,11 +2366,19 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
 
 /// Mean assigned row of a node's already-placed (main-flow) predecessors, or 0 when it has none —
 /// the target row the node "wants" so a flow tends to run straight left-to-right.
+///
+/// When `bias.get(id)` is `Some`, the caller-supplied target row wins outright — this is the seam
+/// the [`layout`](crate::layout) module uses to pull semantically-annotated nodes into their band
+/// (primary→0, exception→+H, escalation→−H, …) instead of drifting toward their predecessors.
 fn desired_row(
     id: &str,
     preds: &HashMap<String, Vec<String>>,
     row_of: &HashMap<String, f64>,
+    bias: Option<&HashMap<String, f64>>,
 ) -> f64 {
+    if let Some(b) = bias.and_then(|m| m.get(id).copied()) {
+        return b;
+    }
     let mut sum = 0.0;
     let mut cnt = 0.0;
     if let Some(ps) = preds.get(id) {
@@ -2513,7 +2535,12 @@ fn route_avoiding(
 /// distance from a source (a back-edge in a loop just caps the rank); within a column, rows are
 /// assigned to follow predecessors and resolve collisions downward. Boundary events ride on their
 /// host's bottom edge. It is not optimal, but it reads as a normal horizontal BPMN flow.
-fn append_diagram(def: &ProcessDefinition, flows: &[FlowEdge], out: &mut String) {
+fn append_diagram(
+    def: &ProcessDefinition,
+    flows: &[FlowEdge],
+    out: &mut String,
+    bias: Option<&HashMap<String, f64>>,
+) {
     let mut ids: Vec<String> = def.elements.keys().cloned().collect();
     ids.sort();
     let n = ids.len();
@@ -2557,15 +2584,15 @@ fn append_diagram(def: &ProcessDefinition, flows: &[FlowEdge], out: &mut String)
             .map(|id| (*id).clone())
             .collect();
         here.sort_by(|a, b| {
-            let da = desired_row(a, &preds, &row_of);
-            let db = desired_row(b, &preds, &row_of);
+            let da = desired_row(a, &preds, &row_of, bias);
+            let db = desired_row(b, &preds, &row_of, bias);
             da.partial_cmp(&db)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.cmp(b))
         });
         let mut used: Vec<i64> = Vec::new();
         for id in &here {
-            let mut row = desired_row(id, &preds, &row_of).round() as i64;
+            let mut row = desired_row(id, &preds, &row_of, bias).round() as i64;
             if row < 0 {
                 row = 0;
             }

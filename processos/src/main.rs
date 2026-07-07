@@ -26,6 +26,7 @@ mod experiment;
 mod gguf;
 mod harness;
 mod investigate;
+mod layout;
 mod llama;
 mod model_ir;
 mod monitor;
@@ -315,7 +316,9 @@ fn usage() -> String {
          gen <pack.json> <out-dir>                  Generate a synthetic dataset\n  \
          infer <dataset-dir> [target-p99-wait-ms]   Infer insights from a dataset\n  \
          import-camunda <records.json|dir> <out-dir> [--no-tier2]\n  \
-         {pad}Import a Camunda 8 record export\n\n\
+         {pad}Import a Camunda 8 record export\n  \
+         layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg]\n  \
+         {pad}Run the semantic BPMN layout (see docs/layout.md)\n\n\
          OPTIONS:\n  \
          -h, --help       Print this help\n  \
          -V, --version    Print version\n",
@@ -349,6 +352,10 @@ async fn main() {
             }
             "import-camunda" => {
                 run_cli_import_camunda(&args[2..]);
+                return;
+            }
+            "layout" => {
+                run_cli_layout(&args[2..]);
                 return;
             }
             other => {
@@ -751,6 +758,67 @@ fn run_cli_import_camunda(args: &[String]) {
         "{}",
         serde_json::to_string_pretty(&summary).unwrap_or_default()
     );
+}
+
+/// `processos layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg]`
+///
+/// Runs the semantic BPMN layout: parses the input model, reads the annotations
+/// (see `docs/layout.md` for the schema), lays out with the row-bias solver,
+/// and writes both the re-DI'd BPMN and a debug SVG. When `--out`/`--debug-svg`
+/// aren't given, sensible defaults derived from the input filename are used.
+fn run_cli_layout(args: &[String]) {
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    if positional.len() < 2 {
+        eprintln!(
+            "usage: processos layout <in.bpmn> <annotations.json> \
+             [--out out.bpmn] [--debug-svg out.svg]"
+        );
+        std::process::exit(2);
+    }
+    let in_bpmn = std::path::Path::new(positional[0].as_str());
+    let in_ann = std::path::Path::new(positional[1].as_str());
+    let opt = |flag: &str| -> Option<String> {
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            if a == flag {
+                return it.next().cloned();
+            }
+        }
+        None
+    };
+    let stem = in_bpmn
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let out_bpmn = opt("--out").unwrap_or_else(|| format!("{stem}.laid-out.bpmn"));
+    let out_svg = opt("--debug-svg").unwrap_or_else(|| format!("{stem}.debug.svg"));
+
+    let bpmn_xml = std::fs::read_to_string(in_bpmn).unwrap_or_else(|e| {
+        eprintln!("read {}: {e}", in_bpmn.display());
+        std::process::exit(1);
+    });
+    let ann_json = std::fs::read_to_string(in_ann).unwrap_or_else(|e| {
+        eprintln!("read {}: {e}", in_ann.display());
+        std::process::exit(1);
+    });
+    let ann: layout::SemanticAnnotations = serde_json::from_str(&ann_json).unwrap_or_else(|e| {
+        eprintln!("parse annotations JSON: {e}");
+        std::process::exit(1);
+    });
+    let out = layout::layout(&bpmn_xml, &ann).unwrap_or_else(|e| {
+        eprintln!("layout failed: {e}");
+        std::process::exit(1);
+    });
+    std::fs::write(&out_bpmn, &out.bpmn_xml).unwrap_or_else(|e| {
+        eprintln!("write {out_bpmn}: {e}");
+        std::process::exit(1);
+    });
+    std::fs::write(&out_svg, &out.debug_svg).unwrap_or_else(|e| {
+        eprintln!("write {out_svg}: {e}");
+        std::process::exit(1);
+    });
+    println!("wrote {out_bpmn}");
+    println!("wrote {out_svg}");
 }
 
 async fn shutdown_signal() {

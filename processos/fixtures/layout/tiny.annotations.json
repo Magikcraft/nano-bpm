@@ -1,0 +1,18 @@
+{
+  "flows": [
+    {
+      "id": "happy",
+      "kind": "primary",
+      "nodes": ["Start_1", "TaskA", "GwCheck", "TaskB", "End_ok"]
+    },
+    {
+      "id": "on-error",
+      "kind": "exception",
+      "nodes": ["HandleError", "End_err"]
+    }
+  ],
+  "clusters": [],
+  "roles": {
+    "GwCheck": "decision"
+  }
+}
