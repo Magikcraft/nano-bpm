@@ -504,6 +504,7 @@
       <a href="/workspace">Workspaces</a>
       <a data-view="cockpit">Cockpit</a>
       <a data-view="console">Console</a>
+      <a data-view="advisor" title="Worker-scaling advisor — per job-type, whether adding workers would raise throughput (and when the server itself is the wall)">Scaling</a>
       <a data-view="processes">Processes</a>
       <a data-view="prompts">Prompts</a>
       <a data-view="pairings" title="LLM Pairings — named Pair AI configs (mode + second model + its prompt) you select per investigation">Pairings</a>
@@ -809,6 +810,77 @@ function procTile(p){
     + '<div class="meta">'+p.instances+' instances · '+p.completed+' completed · avg '+ms(p.avgDurationMs)+' · p95 '+ms(p.p95DurationMs)+'</div>'
     + '<div class="meta" style="margin-top:6px">'+(p.bottleneck?('bottleneck <b style="color:var(--po-danger-soft)">'+esc(p.bottleneck)+'</b> · '):'')
     + '<b style="color:var(--po-accent-soft)">'+p.experiments+'</b> experiment'+(p.experiments===1?'':'s')+'</div></div>';
+}
+
+// ---- Worker-scaling advisor ----
+// Polls GET /api/advisor (~2s) for the active live instance and renders, per job
+// type, whether adding workers would raise throughput — refusing to recommend it
+// when the single-writer server is itself the bottleneck. Advisory only.
+let ADVISOR_TIMER = null;
+const ADVISOR_CLASS = {
+  'starved':          { label:'STARVED',          color:'var(--po-danger-soft)'  },
+  'under-provisioned':{ label:'UNDER-PROVISIONED', color:'#d9a441'                },
+  'server-bound':     { label:'SERVER-BOUND',      color:'#9a7cf0'                },
+  'adequate':         { label:'ADEQUATE',          color:'var(--po-accent-soft)'  },
+  'warming':          { label:'WARMING…',          color:'var(--po-muted,#8a8a8a)'},
+};
+function renderAdvisor(){
+  STATE.view='advisor'; setActive();
+  main.innerHTML = '<h1>Worker-scaling advisor</h1>'
+    + '<p class="lede">Per job type on the active live instance: whether adding workers would raise throughput — sized by drain rate (Little’s Law) — and when the server itself is the wall, so you don’t scale workers into a saturated engine. Advisory only; it never actuates.</p>'
+    + '<div id="advisorBody">Sampling…</div>';
+  if(ADVISOR_TIMER) clearInterval(ADVISOR_TIMER);
+  pollAdvisor();
+  ADVISOR_TIMER = setInterval(pollAdvisor, 2000);
+}
+async function pollAdvisor(){
+  if(STATE.view!=='advisor'){ if(ADVISOR_TIMER){ clearInterval(ADVISOR_TIMER); ADVISOR_TIMER=null; } return; }
+  let a;
+  try { a = await api('/api/advisor'); } catch(e){
+    const body=$('#advisorBody'); if(body) body.innerHTML='<div class="err">'+esc(e.message||e)+'</div>';
+    return;
+  }
+  const body=$('#advisorBody'); if(!body) return;
+  body.innerHTML = advisorGlobals(a) + advisorRecs(a.recommendations||[]);
+}
+function advisorGlobals(a){
+  const busyPct = Math.round((a.writerBusyRatio||0)*100);
+  const led = (on,label) => '<span style="display:inline-flex;align-items:center;gap:6px;margin-right:16px">'
+    + '<span style="width:10px;height:10px;border-radius:50%;background:'+(on?'var(--po-danger-soft)':'var(--po-accent-soft)')+'"></span>'+esc(label)+'</span>';
+  let banner='';
+  if(a.serverBound){
+    banner = '<div class="err" style="margin:10px 0">⛔ <b>Server-bound.</b> The engine is at its throughput ceiling'
+      + (a.ceilingThroughput?' (clipping LED lit)':'')+' — the journal writer is '+busyPct+'% busy. Adding workers will <b>not</b> raise aggregate throughput; relieve the server (admission/shed, more partitions, or a lower create rate).</div>';
+  }
+  return banner
+    + '<div class="cards" style="margin:8px 0 14px">'
+    + card(busyPct+'%','journal writer busy')
+    + card((a.pendingCreateQueue||0),'pending create queue')
+    + card((a.shedDelta||0),'admissions shed (window)')
+    + card((a.windowS||0)+'s','sample window')
+    + '</div>'
+    + '<div style="margin-bottom:10px">'+led(a.ceilingThroughput,'throughput ceiling')+led(a.serverBound,'server-bound')+'</div>';
+}
+function advisorRecs(recs){
+  if(!recs.length) return '<p class="muted">No job types reported by the active instance yet. Deploy a process and start some instances.</p>';
+  let h = '<table><thead><tr><th>Job type</th><th>Assessment</th><th class="num">backlog</th><th class="num">growth/s</th><th class="num">drain/s</th><th class="num">workers</th><th class="num">suggest</th><th>Why</th></tr></thead><tbody>';
+  for(const r of recs){
+    const c = ADVISOR_CLASS[r.class] || ADVISOR_CLASS['warming'];
+    const badge = '<span class="pill" style="background:'+c.color+'22;color:'+c.color+';border:1px solid '+c.color+'55">'+c.label+'</span>'
+      + ' <span class="muted" style="font-size:11px">'+esc(r.confidence)+'</span>';
+    const delta = r.suggestWorkerDelta>0 ? '<b style="color:'+c.color+'">+'+r.suggestWorkerDelta+'</b>' : '—';
+    h += '<tr>'
+      + '<td style="font-family:ui-monospace,monospace;color:var(--po-accent-soft)">'+esc(r.jobType)+'</td>'
+      + '<td>'+badge+'</td>'
+      + '<td class="num">'+r.backlog+'</td>'
+      + '<td class="num">'+(r.backlogSlopePerS>0?'+':'')+r.backlogSlopePerS+'</td>'
+      + '<td class="num">'+r.drainPerS+'</td>'
+      + '<td class="num">'+r.workers+'</td>'
+      + '<td class="num">'+delta+'</td>'
+      + '<td class="muted" style="font-size:12px">'+esc(r.rationale)+'</td>'
+      + '</tr>';
+  }
+  return h+'</tbody></table>';
 }
 
 // ---- Processes ----
@@ -4382,6 +4454,7 @@ function showView(v){
   $('#cockpitHost').style.display='none';
   $('#viewHost').style.display='';
   if(v==='processes') return renderProcesses();
+  if(v==='advisor') return renderAdvisor();
   if(v==='prompts') return renderPrompts();
   if(v==='pairings') return renderPairings();
   if(v==='tools') return renderTools();

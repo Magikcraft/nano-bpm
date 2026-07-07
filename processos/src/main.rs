@@ -9,6 +9,7 @@
 //! links or knows about ProcessOS. Run a Nano cluster without this binary and
 //! production is unaffected.
 
+mod advisor;
 mod agent;
 mod analysis;
 mod bpmn_model;
@@ -154,6 +155,9 @@ struct AppState {
     /// The supervised local llama.cpp `llama-server` sidecar (start/stop/status/logs). Optional at
     /// runtime — nothing runs until the operator presses Start for a `sidecar:true` profile.
     llama: llama::LlamaManager,
+    /// The previous `/metrics` scrape per live-instance base URL, so the worker-scaling advisor
+    /// (`GET /api/advisor`) can measure backlog growth and per-job-type drain rate across polls.
+    advisor_prev: Arc<std::sync::Mutex<std::collections::HashMap<String, advisor::Snapshot>>>,
 }
 
 impl AppState {
@@ -436,6 +440,7 @@ async fn main() {
         chat_debug: Arc::new(chat::DebugStore::open(cfg.data_dir.join("chat"))),
         chat_live: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         llama: llama::LlamaManager::new(),
+        advisor_prev: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
     // A handle to stop the llama sidecar on shutdown (the router takes ownership of `state`).
@@ -451,6 +456,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/insights", get(insights))
         .route("/api/cockpit/overview", get(cockpit_overview))
+        .route("/api/advisor", get(advisor_advise))
         .route(
             "/api/cockpit/experiments",
             get(cockpit_experiments).post(cockpit_create),
@@ -1030,7 +1036,31 @@ async fn cockpit_overview(
     }
 }
 
-/// `GET /api/cockpit/experiments` — every experiment (pilot instance), newest first.
+/// `GET /api/advisor` — the worker-scaling advisory for the active live instance.
+///
+/// Scrapes the instance's raw Prometheus `/metrics`, diffs it against the previous
+/// scrape (kept per base URL in [`AppState::advisor_prev`]) and returns, per job
+/// type, whether adding workers would raise throughput — and refuses to recommend
+/// scaling when the single-writer server is the real bottleneck. Advisory only; it
+/// never actuates. Poll it ~1–2 Hz from the cockpit to build the rate window.
+async fn advisor_advise(State(state): State<AppState>) -> impl IntoResponse {
+    let target = state.active_target();
+    let key = target.base_url().to_string();
+    let text = match target.get_text("/metrics").await {
+        Ok(t) => t,
+        Err(e) => return bad_gateway(format!("scrape {key}/metrics: {e}")),
+    };
+    let cur = advisor::parse_snapshot(&text, chat_now_ms());
+    // Diff against the previous scrape for this instance, then remember this one.
+    let prev = {
+        let mut map = state.advisor_prev.lock().unwrap();
+        let prev = map.get(&key).cloned().unwrap_or_default();
+        map.insert(key, cur.clone());
+        prev
+    };
+    Json(advisor::advise(&prev, &cur)).into_response()
+}
+
 async fn cockpit_experiments(
     State(state): State<AppState>,
     Query(q): Query<InsightsQuery>,
