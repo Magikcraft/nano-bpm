@@ -2498,6 +2498,37 @@ fn route_avoiding(
     let ty = t.cy();
 
     let mut candidates: Vec<Vec<(f64, f64)>> = Vec::new();
+
+    // If the target is significantly above or below the source (more than the
+    // source's own height, i.e. clearly on a different row band — as happens
+    // when a semantic-layout exception drops below the happy path), prefer
+    // leaving the source from the top / bottom face rather than the right.
+    // This keeps a gateway's happy-path and error-path edges from stacking on
+    // the same right-edge exit point.
+    let dy = ty - sy;
+    let vertical_dominant = dy.abs() > s.h;
+    if vertical_dominant {
+        let (sy_face, ty_side) = if dy > 0.0 {
+            (s.y + s.h, ty) // leave bottom, run down to target row
+        } else {
+            (s.y, ty) // leave top, run up to target row
+        };
+        let sxc = s.cx();
+        // Drop / rise straight into the target row, then across to the target's left gutter.
+        candidates.push(vec![
+            (sxc, sy_face),
+            (sxc, ty_side),
+            (tx - G, ty_side),
+            (tx, ty),
+        ]);
+        // Same, but hit the target's top/bottom face directly (useful when the
+        // target sits directly beneath / above the source column).
+        let tface = if dy > 0.0 { t.y } else { t.y + t.h };
+        if (t.cx() - sxc).abs() < G * 0.5 {
+            candidates.push(vec![(sxc, sy_face), (t.cx(), tface)]);
+        }
+    }
+
     // 1) Straight shot when the two share a row.
     if (sy - ty).abs() < 0.5 {
         candidates.push(vec![(sx, sy), (tx, ty)]);
