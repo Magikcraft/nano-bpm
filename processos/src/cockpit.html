@@ -447,7 +447,9 @@
   .modelcard .mc-tabs { display: inline-flex; gap: 2px; background: var(--po-raised); border-radius: 7px; padding: 2px; }
   .modelcard .mc-tab { background: none; border: 0; color: var(--po-text-faint); cursor: pointer; padding: 3px 11px; border-radius: 5px; font: 600 11px/1.2 inherit; }
   .modelcard .mc-tab.active { background: var(--po-hover); color: var(--po-text); }
-  .modelcard .mc-actions { margin-left: auto; display: inline-flex; gap: 4px; }
+  .modelcard .mc-actions { margin-left: auto; display: inline-flex; gap: 4px; align-items: center; }
+  .modelcard .mc-renderer { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; height: 24px; padding: 0 6px; font: 600 11px/1.2 inherit; cursor: pointer; }
+  .modelcard .mc-renderer:hover { background: var(--po-hover); }
   .modelcard .mc-btn { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; height: 24px; min-width: 24px; padding: 0 6px; line-height: 1; cursor: pointer; font-size: 13px; }
   .modelcard .mc-btn:hover { background: var(--po-hover); }
   .modelcard .mc-body { position: relative; }
@@ -3051,7 +3053,7 @@ function suggestedModelsHtml(items){
 }
 
 function modelCardHtml(m){
-  return '<div class="modelcard" data-rendered="0">'+
+  return '<div class="modelcard" data-rendered="0" data-renderer="elk">'+
     '<div class="mc-head">'+
       '<span class="mc-name" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'+
       '<div class="mc-tabs">'+
@@ -3059,6 +3061,11 @@ function modelCardHtml(m){
         '<button class="mc-tab" data-mc-tab="xml">XML</button>'+
       '</div>'+
       '<div class="mc-actions">'+
+        '<select class="mc-renderer" title="Layout renderer">'+
+          '<option value="elk" selected>ELK (client)</option>'+
+          '<option value="rowbias">Row-Bias (server)</option>'+
+          '<option value="field">Field / Fromme (server)</option>'+
+        '</select>'+
         '<button class="mc-btn mc-edit" title="Edit this model on the Workbench canvas">\u270e</button>'+
         '<button class="mc-btn mc-expand" title="Expand">\u2922</button>'+
         '<button class="mc-btn mc-dl" title="Download .bpmn">\u2913</button>'+
@@ -3257,13 +3264,42 @@ async function ensureBpmnLayout(xml){
   return semantic;
 }
 
+// Fetch a server-side layout (row-bias or Fromme field) and return BPMN xml
+// with fresh DI. Throws on any error so callers can fall back.
+async function serverLayoutBpmn(xml, solver){
+  const semantic = ensureBpmnDefinitions(xml);
+  const res = await fetch('/api/layout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ xml: semantic, solver })
+  });
+  if(!res.ok){
+    let msg = 'HTTP '+res.status;
+    try { const j = await res.json(); if(j && j.error) msg = j.error; } catch(_){}
+    throw new Error(msg);
+  }
+  const j = await res.json();
+  return j.bpmn_xml;
+}
+
 // Render BPMN xml into a container with a fresh viewer; returns the viewer or null.
-async function renderBpmnInto(el, xml){
+// `renderer` selects the layout: 'elk' (default, client-side ELK), 'rowbias', or 'field'.
+async function renderBpmnInto(el, xml, renderer){
   if(!el) return null;
   if(typeof BpmnJS === 'undefined'){ el.innerHTML = '<div class="mc-err">diagram viewer unavailable</div>'; return null; }
+  const which = renderer || 'elk';
   try {
     el.innerHTML = '';
-    const ready = await ensureBpmnLayout(xml);
+    let ready;
+    if(which === 'elk'){
+      ready = await ensureBpmnLayout(xml);
+    } else {
+      try { ready = await serverLayoutBpmn(xml, which); }
+      catch(e){
+        el.innerHTML = '<div class="mc-err">'+esc(which)+' layout failed: '+esc((e&&e.message)||e)+'</div>';
+        return null;
+      }
+    }
     const viewer = new BpmnJS({ container: el });
     await viewer.importXML(ready);
     try { viewer.get('canvas').zoom('fit-viewport', 'auto'); } catch(_){}
@@ -3279,9 +3315,16 @@ function modelNameOf(card){ const n = card.querySelector('.mc-name'); return (n 
 function slugify(s){ return String(s||'model').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,60) || 'model'; }
 
 async function downloadModel(card){
-  // Export the ELK-laid-out XML (fresh DI) so the file opens cleanly in other BPMN tools.
+  // Export the currently-selected-renderer's XML (fresh DI) so the file opens
+  // cleanly in other BPMN tools. Falls back to the client-side ELK layout.
   let xml = modelXmlOf(card);
-  try { xml = await ensureBpmnLayout(xml); } catch(_){}
+  const renderer = (card && card.dataset.renderer) || 'elk';
+  try {
+    if(renderer === 'elk') xml = await ensureBpmnLayout(xml);
+    else xml = await serverLayoutBpmn(xml, renderer);
+  } catch(_){
+    try { xml = await ensureBpmnLayout(xml); } catch(_){}
+  }
   const blob = new Blob([xml], { type: 'application/xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -3290,11 +3333,25 @@ async function downloadModel(card){
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-// Render a card's diagram on demand (once), when first shown.
+// Render a card's diagram on demand, honouring the currently selected renderer.
+// Re-renders whenever the renderer changes (dataset.renderedWith tracks the
+// last renderer used so we don't do redundant work).
 function ensureCardDiagram(card){
-  if(!card || card.dataset.rendered === '1') return;
+  if(!card) return;
+  const renderer = card.dataset.renderer || 'elk';
+  if(card.dataset.renderedWith === renderer) return;
   card.dataset.rendered = '1';
-  renderBpmnInto(card.querySelector('.mc-diagram'), modelXmlOf(card));
+  card.dataset.renderedWith = renderer;
+  renderBpmnInto(card.querySelector('.mc-diagram'), modelXmlOf(card), renderer);
+}
+
+function setCardRenderer(card, renderer){
+  if(!card) return;
+  card.dataset.renderer = renderer;
+  // Force a re-render on the next tab-diagram visit.
+  card.dataset.renderedWith = '';
+  const dia = card.querySelector('.mc-diagram');
+  if(dia && dia.style.display !== 'none') ensureCardDiagram(card);
 }
 
 function switchModelTab(card, tab){
@@ -3307,10 +3364,11 @@ function switchModelTab(card, tab){
 // Big popover: a large diagram with an XML toggle + download, over a dark backdrop.
 function openModelModal(card){
   const xml = modelXmlOf(card), name = modelNameOf(card);
+  const renderer = (card && card.dataset.renderer) || 'elk';
   const back = document.createElement('div');
   back.className = 'model-modal';
   back.innerHTML = '<div class="mm-box">'+
-    '<div class="mm-head"><span class="mm-title">'+esc(name)+'</span>'+
+    '<div class="mm-head"><span class="mm-title">'+esc(name)+' <span class="muted" style="font-weight:400">('+esc(renderer)+')</span></span>'+
       '<div class="mm-actions">'+
         '<button class="btn mm-tab-dia">Diagram</button>'+
         '<button class="btn mm-tab-xml">XML</button>'+
@@ -3328,7 +3386,7 @@ function openModelModal(card){
   back.querySelector('.mm-tab-dia').onclick = () => { pre.style.display='none'; dia.style.display=''; };
   back.querySelector('.mm-tab-xml').onclick = () => { dia.style.display='none'; pre.style.display=''; };
   document.addEventListener('keydown', function esc(e){ if(e.key==='Escape'){ close(); document.removeEventListener('keydown', esc); } });
-  renderBpmnInto(dia, xml);
+  renderBpmnInto(dia, xml, renderer);
 }
 
 // Lazily render diagrams as cards scroll into view (cheap + avoids rendering a
@@ -3359,6 +3417,10 @@ if(!window.__modelCardsWired){
     if(dl){ downloadModel(dl.closest('.modelcard')); return; }
     const ed = t.closest && t.closest('.mc-edit');
     if(ed){ editModelOnWorkbench(modelXmlOf(ed.closest('.modelcard')), modelNameOf(ed.closest('.modelcard'))); return; }
+  });
+  document.addEventListener('change', e => {
+    const sel = e.target && e.target.closest && e.target.closest('.mc-renderer');
+    if(sel){ setCardRenderer(sel.closest('.modelcard'), sel.value); }
   });
 }
 
