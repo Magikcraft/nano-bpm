@@ -290,6 +290,15 @@ export interface MetricsSnapshot {
 
   writerBusyRatio: number;
   residentBytes: number | null;
+
+  // Capacity-ceiling "clipping" LEDs + the signals behind them.
+  ceilingThroughput: boolean;
+  ceilingMemory: boolean;
+  pendingCreateQueue: number;
+  activeBacklog: number;
+  admissionBacklogLimit: number;
+  admissionCreateQueueLimit: number;
+  admissionShedTotal: number;
 }
 
 /// Per-node metrics + cluster aggregate from `/console/api/cluster/metrics`.
