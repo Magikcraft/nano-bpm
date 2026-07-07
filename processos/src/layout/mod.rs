@@ -39,6 +39,8 @@ pub mod field;
 pub mod schema;
 pub mod solver;
 
+use std::collections::HashMap;
+
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 #[allow(unused_imports)] // re-exported public API
 pub use schema::{AnnotatedFlow, Cluster, FlowKind, Role, SemanticAnnotations};
@@ -128,37 +130,54 @@ pub fn layout_side_by_side(xml: &str, ann: &SemanticAnnotations) -> Result<Strin
     ))
 }
 
-/// Convert a settled field simulation into a BPMN XML document. Field
-/// positions become BPMNShape bounds; settled edge chains become BPMNEdge
-/// waypoints *verbatim* — no post-orthogonalisation in this pass, since the
-/// point of the emergent-orthogonality experiment is to see what actually
-/// settles rather than snap it to a grid.
+/// Convert a settled field simulation into a BPMN XML document. Reuses the
+/// existing serializer for the process body (so we get a full, valid BPMN
+/// with sequence-flow declarations Camunda Modeler etc. can resolve) and
+/// swaps its auto-generated `<bpmndi:BPMNDiagram>` for one built from the
+/// field output. Edge waypoints are written *verbatim* — no
+/// post-orthogonalisation, since the point of the emergent-orthogonality
+/// experiment is to see what actually settles rather than snap it to a grid.
 fn emit_bpmn_from_field(
     def: &nanobpmn_engine_core::ProcessDefinition,
     out: &field::FieldOutput,
 ) -> String {
     use std::fmt::Write as _;
-    let mut s = String::new();
-    s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    s.push_str(
-        "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" \
-         xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" \
-         xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" \
-         xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" ",
+
+    // 1) Get a complete, valid BPMN via the existing serializer. It emits the
+    //    process body (events/tasks/gateways/sequence flows) and an
+    //    auto-generated DI we're about to replace.
+    let base = definition_to_xml_with_row_bias(
+        def,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
     );
+
+    // 2) Extract the serializer's `(sourceRef, targetRef) -> flow_id` map so
+    //    we can rewrite our synthesized `SRC__TGT` edge ids to match. Without
+    //    this the DI would reference edges the model doesn't declare and
+    //    Modeler would show `unresolved reference` warnings.
+    let mut flow_id_by_pair: HashMap<(String, String), String> = HashMap::new();
+    for chunk in base.split("<bpmn:sequenceFlow ").skip(1) {
+        let attrs_end = chunk.find(['>', '/']).unwrap_or(chunk.len());
+        let attrs = &chunk[..attrs_end];
+        let extract = |key: &str| -> Option<String> {
+            let needle = format!("{key}=\"");
+            let s = attrs.find(&needle)? + needle.len();
+            let e = attrs[s..].find('"')? + s;
+            Some(attrs[s..e].to_string())
+        };
+        if let (Some(id), Some(src), Some(tgt)) =
+            (extract("id"), extract("sourceRef"), extract("targetRef"))
+        {
+            flow_id_by_pair.insert((src, tgt), id);
+        }
+    }
+
+    // 3) Build the replacement DI block from the field output.
+    let mut di = String::new();
+    let _ = writeln!(di, "  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">");
     let _ = writeln!(
-        s,
-        "id=\"Definitions_{id}\" targetNamespace=\"http://bpmn.io/schema/bpmn\">",
-        id = def.id
-    );
-    let _ = writeln!(
-        s,
-        "  <bpmn:process id=\"{}\" isExecutable=\"true\"/>",
-        def.id
-    );
-    let _ = writeln!(s, "  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">");
-    let _ = writeln!(
-        s,
+        di,
         "    <bpmndi:BPMNPlane id=\"BPMNPlane_1\" bpmnElement=\"{}\">",
         def.id
     );
@@ -166,7 +185,7 @@ fn emit_bpmn_from_field(
         if let Some(&(cx, cy)) = out.nodes.get(id) {
             let (w, h) = field_node_dims(&def.elements[id]);
             let _ = writeln!(
-                s,
+                di,
                 "      <bpmndi:BPMNShape id=\"{0}_di\" bpmnElement=\"{0}\">\n\
                  \x20       <dc:Bounds x=\"{1:.0}\" y=\"{2:.0}\" width=\"{3:.0}\" height=\"{4:.0}\"/>\n\
                  \x20     </bpmndi:BPMNShape>",
@@ -180,24 +199,51 @@ fn emit_bpmn_from_field(
     }
     for (src_id, el) in &def.elements {
         for f in &el.outgoing {
-            let edge_id = format!("{}__{}", src_id, f.to);
-            if let Some(waypoints) = out.edges.get(&edge_id) {
-                let _ = writeln!(
-                    s,
-                    "      <bpmndi:BPMNEdge id=\"{eid}_di\" bpmnElement=\"{eid}\">",
-                    eid = edge_id
-                );
-                for &(x, y) in waypoints {
-                    let _ = writeln!(s, "        <di:waypoint x=\"{x:.0}\" y=\"{y:.0}\"/>");
-                }
-                let _ = writeln!(s, "      </bpmndi:BPMNEdge>");
+            let synthesized_key = format!("{}__{}", src_id, f.to);
+            let Some(waypoints) = out.edges.get(&synthesized_key) else {
+                continue;
+            };
+            let flow_id = flow_id_by_pair
+                .get(&(src_id.clone(), f.to.clone()))
+                .cloned()
+                .unwrap_or(synthesized_key);
+            let _ = writeln!(
+                di,
+                "      <bpmndi:BPMNEdge id=\"{eid}_di\" bpmnElement=\"{eid}\">",
+                eid = flow_id
+            );
+            for &(x, y) in waypoints {
+                let _ = writeln!(di, "        <di:waypoint x=\"{x:.0}\" y=\"{y:.0}\"/>");
             }
+            let _ = writeln!(di, "      </bpmndi:BPMNEdge>");
         }
     }
-    let _ = writeln!(s, "    </bpmndi:BPMNPlane>");
-    let _ = writeln!(s, "  </bpmndi:BPMNDiagram>");
-    s.push_str("</bpmn:definitions>\n");
-    s
+    let _ = writeln!(di, "    </bpmndi:BPMNPlane>");
+    let _ = writeln!(di, "  </bpmndi:BPMNDiagram>");
+
+    // 4) Splice: replace the base document's `<bpmndi:BPMNDiagram>...</bpmndi:BPMNDiagram>`
+    //    block with the freshly-built one. If the base has no diagram (shouldn't
+    //    happen but be defensive), append before `</bpmn:definitions>`.
+    let open_tag = "<bpmndi:BPMNDiagram";
+    let close_tag = "</bpmndi:BPMNDiagram>";
+    if let (Some(open), Some(close_rel)) = (base.find(open_tag), base.find(close_tag)) {
+        let close = close_rel + close_tag.len();
+        // Trim any leading whitespace on the same line as the open tag so we
+        // don't leave a ragged indent behind.
+        let line_start = base[..open].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let mut result = String::with_capacity(base.len() + di.len());
+        result.push_str(&base[..line_start]);
+        result.push_str(&di);
+        // Skip trailing newline after the closing tag if the DI already ends with one.
+        let mut tail_start = close;
+        if base.as_bytes().get(tail_start).copied() == Some(b'\n') {
+            tail_start += 1;
+        }
+        result.push_str(&base[tail_start..]);
+        result
+    } else {
+        base.replace("</bpmn:definitions>", &format!("{di}</bpmn:definitions>"))
+    }
 }
 
 fn field_node_dims(el: &nanobpmn_engine_core::Element) -> (f64, f64) {
