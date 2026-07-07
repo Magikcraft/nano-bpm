@@ -447,7 +447,10 @@
   .modelcard .mc-tabs { display: inline-flex; gap: 2px; background: var(--po-raised); border-radius: 7px; padding: 2px; }
   .modelcard .mc-tab { background: none; border: 0; color: var(--po-text-faint); cursor: pointer; padding: 3px 11px; border-radius: 5px; font: 600 11px/1.2 inherit; }
   .modelcard .mc-tab.active { background: var(--po-hover); color: var(--po-text); }
-  .modelcard .mc-actions { margin-left: auto; display: inline-flex; gap: 4px; }
+  .modelcard .mc-actions { margin-left: auto; display: inline-flex; gap: 4px; align-items: center; }
+  .modelcard .mc-renderer { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; height: 24px; padding: 0 6px; font: 600 11px/1.2 inherit; cursor: pointer; }
+  .modelcard .mc-renderer:hover { background: var(--po-hover); }
+  .modelcard .mc-ann-badge { color: var(--po-accent-strong); font-size: 12px; opacity: .8; margin-left: -2px; cursor: help; }
   .modelcard .mc-btn { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; height: 24px; min-width: 24px; padding: 0 6px; line-height: 1; cursor: pointer; font-size: 13px; }
   .modelcard .mc-btn:hover { background: var(--po-hover); }
   .modelcard .mc-body { position: relative; }
@@ -3007,12 +3010,16 @@ function chatBub(t){
 // was never simulated would leave no downloadable artefact.
 function extractSuggestedModels(items){
   const out = [], seen = new Set();
-  const add = (name, xml) => {
+  const add = (name, xml, annotations) => {
     if(typeof xml !== 'string') return;
     const x = xml.trim();
     if(!x || x.indexOf('<') === -1 || seen.has(x)) return;
     seen.add(x);
-    out.push({ name: (name && String(name).trim()) || ('variant '+(out.length+1)), xml: x });
+    out.push({
+      name: (name && String(name).trim()) || ('variant '+(out.length+1)),
+      xml: x,
+      annotations: (annotations && typeof annotations === 'object') ? annotations : null,
+    });
   };
   // A tool result may be a JSON string (persisted timeline) or an already-parsed object (live).
   const asObj = (r) => {
@@ -3030,13 +3037,13 @@ function extractSuggestedModels(items){
       if(r && typeof r.model === 'string'){
         const ops = Array.isArray(r.appliedOps) ? r.appliedOps : [];
         const name = (a && a.name) || (ops.length ? ('edited: '+ops[0]) : 'edited variant');
-        add(name, r.model);
+        add(name, r.model, a && a.annotations);
       }
     }
     if(!a || typeof a !== 'object') return;
-    if(it.tool === 'simulate') add(a.name, a.model);
+    if(it.tool === 'simulate') add(a.name, a.model, a.annotations);
     else if(it.tool === 'compare_variants' && Array.isArray(a.candidates)){
-      a.candidates.forEach(c => { if(c && typeof c === 'object') add(c.name, c.model); });
+      a.candidates.forEach(c => { if(c && typeof c === 'object') add(c.name, c.model, c.annotations); });
     }
   });
   return out;
@@ -3051,14 +3058,23 @@ function suggestedModelsHtml(items){
 }
 
 function modelCardHtml(m){
-  return '<div class="modelcard" data-rendered="0">'+
+  const annJson = m.annotations ? JSON.stringify(m.annotations) : '';
+  const hasAnn = annJson && annJson !== '{}';
+  const annBadge = hasAnn ? '<span class="mc-ann-badge" title="Semantic annotations authored by the LLM — used by the Row-Bias / Field renderers">\u25CE</span>' : '';
+  return '<div class="modelcard" data-rendered="0" data-renderer="elk"'+(hasAnn?' data-has-annotations="1"':'')+'>'+
     '<div class="mc-head">'+
       '<span class="mc-name" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'+
+      annBadge+
       '<div class="mc-tabs">'+
         '<button class="mc-tab active" data-mc-tab="diagram">Diagram</button>'+
         '<button class="mc-tab" data-mc-tab="xml">XML</button>'+
       '</div>'+
       '<div class="mc-actions">'+
+        '<select class="mc-renderer" title="Layout renderer">'+
+          '<option value="elk" selected>ELK (client)</option>'+
+          '<option value="rowbias">Row-Bias (server)</option>'+
+          '<option value="field">Field / Fromme (server)</option>'+
+        '</select>'+
         '<button class="mc-btn mc-edit" title="Edit this model on the Workbench canvas">\u270e</button>'+
         '<button class="mc-btn mc-expand" title="Expand">\u2922</button>'+
         '<button class="mc-btn mc-dl" title="Download .bpmn">\u2913</button>'+
@@ -3067,6 +3083,7 @@ function modelCardHtml(m){
     '<div class="mc-body">'+
       '<div class="mc-pane mc-diagram"></div>'+
       '<pre class="mc-pane mc-xml" style="display:none">'+esc(m.xml)+'</pre>'+
+      (annJson ? '<script type="application/json" class="mc-annotations">'+esc(annJson)+'<\/script>' : '')+
     '</div></div>';
 }
 
@@ -3257,13 +3274,44 @@ async function ensureBpmnLayout(xml){
   return semantic;
 }
 
+// Fetch a server-side layout (row-bias or Fromme field) and return BPMN xml
+// with fresh DI. Throws on any error so callers can fall back.
+async function serverLayoutBpmn(xml, solver, annotations){
+  const semantic = ensureBpmnDefinitions(xml);
+  const body = { xml: semantic, solver };
+  if(annotations && typeof annotations === 'object') body.annotations = annotations;
+  const res = await fetch('/api/layout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if(!res.ok){
+    let msg = 'HTTP '+res.status;
+    try { const j = await res.json(); if(j && j.error) msg = j.error; } catch(_){}
+    throw new Error(msg);
+  }
+  const j = await res.json();
+  return j.bpmn_xml;
+}
+
 // Render BPMN xml into a container with a fresh viewer; returns the viewer or null.
-async function renderBpmnInto(el, xml){
+// `renderer` selects the layout: 'elk' (default, client-side ELK), 'rowbias', or 'field'.
+async function renderBpmnInto(el, xml, renderer, annotations){
   if(!el) return null;
   if(typeof BpmnJS === 'undefined'){ el.innerHTML = '<div class="mc-err">diagram viewer unavailable</div>'; return null; }
+  const which = renderer || 'elk';
   try {
     el.innerHTML = '';
-    const ready = await ensureBpmnLayout(xml);
+    let ready;
+    if(which === 'elk'){
+      ready = await ensureBpmnLayout(xml);
+    } else {
+      try { ready = await serverLayoutBpmn(xml, which, annotations); }
+      catch(e){
+        el.innerHTML = '<div class="mc-err">'+esc(which)+' layout failed: '+esc((e&&e.message)||e)+'</div>';
+        return null;
+      }
+    }
     const viewer = new BpmnJS({ container: el });
     await viewer.importXML(ready);
     try { viewer.get('canvas').zoom('fit-viewport', 'auto'); } catch(_){}
@@ -3276,12 +3324,25 @@ async function renderBpmnInto(el, xml){
 
 function modelXmlOf(card){ const p = card.querySelector('.mc-xml'); return p ? p.textContent : ''; }
 function modelNameOf(card){ const n = card.querySelector('.mc-name'); return (n ? n.textContent : 'model') || 'model'; }
+function modelAnnotationsOf(card){
+  const s = card && card.querySelector && card.querySelector('.mc-annotations');
+  if(!s) return null;
+  try { const j = JSON.parse(s.textContent || 'null'); return (j && typeof j === 'object') ? j : null; }
+  catch(_){ return null; }
+}
 function slugify(s){ return String(s||'model').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,60) || 'model'; }
 
 async function downloadModel(card){
-  // Export the ELK-laid-out XML (fresh DI) so the file opens cleanly in other BPMN tools.
+  // Export the currently-selected-renderer's XML (fresh DI) so the file opens
+  // cleanly in other BPMN tools. Falls back to the client-side ELK layout.
   let xml = modelXmlOf(card);
-  try { xml = await ensureBpmnLayout(xml); } catch(_){}
+  const renderer = (card && card.dataset.renderer) || 'elk';
+  try {
+    if(renderer === 'elk') xml = await ensureBpmnLayout(xml);
+    else xml = await serverLayoutBpmn(xml, renderer, modelAnnotationsOf(card));
+  } catch(_){
+    try { xml = await ensureBpmnLayout(xml); } catch(_){}
+  }
   const blob = new Blob([xml], { type: 'application/xml' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -3290,11 +3351,25 @@ async function downloadModel(card){
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
-// Render a card's diagram on demand (once), when first shown.
+// Render a card's diagram on demand, honouring the currently selected renderer.
+// Re-renders whenever the renderer changes (dataset.renderedWith tracks the
+// last renderer used so we don't do redundant work).
 function ensureCardDiagram(card){
-  if(!card || card.dataset.rendered === '1') return;
+  if(!card) return;
+  const renderer = card.dataset.renderer || 'elk';
+  if(card.dataset.renderedWith === renderer) return;
   card.dataset.rendered = '1';
-  renderBpmnInto(card.querySelector('.mc-diagram'), modelXmlOf(card));
+  card.dataset.renderedWith = renderer;
+  renderBpmnInto(card.querySelector('.mc-diagram'), modelXmlOf(card), renderer, modelAnnotationsOf(card));
+}
+
+function setCardRenderer(card, renderer){
+  if(!card) return;
+  card.dataset.renderer = renderer;
+  // Force a re-render on the next tab-diagram visit.
+  card.dataset.renderedWith = '';
+  const dia = card.querySelector('.mc-diagram');
+  if(dia && dia.style.display !== 'none') ensureCardDiagram(card);
 }
 
 function switchModelTab(card, tab){
@@ -3307,10 +3382,11 @@ function switchModelTab(card, tab){
 // Big popover: a large diagram with an XML toggle + download, over a dark backdrop.
 function openModelModal(card){
   const xml = modelXmlOf(card), name = modelNameOf(card);
+  const renderer = (card && card.dataset.renderer) || 'elk';
   const back = document.createElement('div');
   back.className = 'model-modal';
   back.innerHTML = '<div class="mm-box">'+
-    '<div class="mm-head"><span class="mm-title">'+esc(name)+'</span>'+
+    '<div class="mm-head"><span class="mm-title">'+esc(name)+' <span class="muted" style="font-weight:400">('+esc(renderer)+')</span></span>'+
       '<div class="mm-actions">'+
         '<button class="btn mm-tab-dia">Diagram</button>'+
         '<button class="btn mm-tab-xml">XML</button>'+
@@ -3328,7 +3404,7 @@ function openModelModal(card){
   back.querySelector('.mm-tab-dia').onclick = () => { pre.style.display='none'; dia.style.display=''; };
   back.querySelector('.mm-tab-xml').onclick = () => { dia.style.display='none'; pre.style.display=''; };
   document.addEventListener('keydown', function esc(e){ if(e.key==='Escape'){ close(); document.removeEventListener('keydown', esc); } });
-  renderBpmnInto(dia, xml);
+  renderBpmnInto(dia, xml, renderer, modelAnnotationsOf(card));
 }
 
 // Lazily render diagrams as cards scroll into view (cheap + avoids rendering a
@@ -3359,6 +3435,10 @@ if(!window.__modelCardsWired){
     if(dl){ downloadModel(dl.closest('.modelcard')); return; }
     const ed = t.closest && t.closest('.mc-edit');
     if(ed){ editModelOnWorkbench(modelXmlOf(ed.closest('.modelcard')), modelNameOf(ed.closest('.modelcard'))); return; }
+  });
+  document.addEventListener('change', e => {
+    const sel = e.target && e.target.closest && e.target.closest('.mc-renderer');
+    if(sel){ setCardRenderer(sel.closest('.modelcard'), sel.value); }
   });
 }
 

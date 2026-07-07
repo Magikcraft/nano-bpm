@@ -493,6 +493,7 @@ async fn main() {
         .route("/api/prompts/{id}", get(prompts_get).delete(prompts_delete))
         .route("/api/pilot", get(pilot_get).put(pilot_put))
         .route("/api/pilot/reset", post(pilot_reset))
+        .route("/api/layout", post(layout_relayout))
         .route("/workspace", get(workspace_page))
         .route(
             "/api/workspaces",
@@ -917,6 +918,59 @@ async fn insights(
 /// The standalone marketing landing page for Nano Process OS (self-contained:
 /// inline canvas particle field, no external assets). Served at `/`.
 const LANDING_HTML: &str = include_str!("landing.html");
+
+/// `POST /api/layout` — re-lay-out a BPMN document with the semantic solver of
+/// choice. Powers the chat model card's renderer drop-down so authors can
+/// eyeball how a proposed model looks under the ELK client-side layout vs. the
+/// server-side row-bias or Fromme (field) semantic layouts.
+///
+/// Request body:
+/// ```json
+/// { "xml": "<bpmn:definitions>…</bpmn:definitions>",
+///   "solver": "rowbias" | "field",
+///   "annotations": { … optional SemanticAnnotations … } }
+/// ```
+/// Response body:
+/// ```json
+/// { "bpmn_xml": "<bpmn:definitions>… with fresh DI …</bpmn:definitions>",
+///   "debug_svg": "<svg …/>",
+///   "solver": "rowbias" }
+/// ```
+/// Errors return 400 with `{ "error": "…" }`.
+#[derive(Deserialize)]
+struct LayoutRequest {
+    xml: String,
+    solver: String,
+    #[serde(default)]
+    annotations: Option<layout::SemanticAnnotations>,
+}
+
+async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
+    let solver = match layout::Solver::parse(&req.solver) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    let ann = req.annotations.unwrap_or_default();
+    match layout::layout_with(&req.xml, &ann, solver) {
+        Ok(out) => Json(serde_json::json!({
+            "bpmn_xml": out.bpmn_xml,
+            "debug_svg": out.debug_svg,
+            "solver": req.solver,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
 
 /// The features page, leading with the two flagship capabilities. Served at
 /// `/features`.
