@@ -23,6 +23,69 @@ use crate::harness::llm::LlmConfig;
 use crate::pyrunner::{self, PyConfig, PYTHON_TOOL_DOC};
 use crate::tools::{ToolBackend, ToolDef};
 
+/// JSON-schema fragment describing the optional `annotations` object each
+/// model-authoring tool accepts. Matches [`crate::layout::SemanticAnnotations`]
+/// — the LLM authoring a variant can attach a compact narrative-role sidecar
+/// so the chat's suggested-model card can re-render it with the semantic
+/// (Row-Bias / Fromme) layouts, not just ELK. The tool executor doesn't consume
+/// the field; it rides on the tool-call arguments so the frontend can pick it
+/// up alongside the XML.
+fn layout_annotations_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "OPTIONAL semantic-layout sidecar for the candidate model. \
+            Emit it when you're proposing a model whose narrative shape (happy path, \
+            errors, escalations) is meaningful — the chat's model card will use it \
+            to re-render the diagram with the Row-Bias or Fromme (field/physics) \
+            solvers alongside the default ELK layout. Everything is optional and \
+            unrecognised nodes are ignored, so partial annotations still help.",
+        "properties": {
+            "flows": {
+                "type": "array",
+                "description": "Named node sequences grouped by narrative kind. \
+                    The primary flow becomes a horizontal centerline; exceptions \
+                    drop below, escalations rise above, compensations sit below \
+                    the exception band. Order within a flow is a hint.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id":   { "type": "string" },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["primary", "exception", "escalation", "compensation"]
+                        },
+                        "nodes": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["id", "kind", "nodes"]
+                }
+            },
+            "clusters": {
+                "type": "array",
+                "description": "Soft groups whose members get pulled toward a \
+                    shared centroid (e.g. a validation cluster).",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id":       { "type": "string" },
+                        "nodes":    { "type": "array", "items": { "type": "string" } },
+                        "affinity": { "type": "number", "description": "0..1 spring stiffness (default 0.5)." }
+                    },
+                    "required": ["id", "nodes"]
+                }
+            },
+            "roles": {
+                "type": "object",
+                "description": "Per-node role hints (colour cues on the debug SVG). \
+                    Values: decision | review | notification | compensation | external.",
+                "additionalProperties": {
+                    "type": "string",
+                    "enum": ["decision", "review", "notification", "compensation", "external"]
+                }
+            }
+        }
+    })
+}
+
 /// The optional Python escape hatch attached to a toolbox: a CSV workdir + config. The
 /// workdir is removed on drop.
 struct PyEnv {
@@ -516,7 +579,11 @@ impl ToolBox for AnalysisTools {
                     e.g. from read_model's calledElement or read_model_xml) to edit that phase; \
                     its node ids are then the LOCAL ones (the part after `$` in a Parent$Child \
                     trace id). Omit `process` to edit the orchestrator itself. The other phases \
-                    and the overview diagram are preserved."
+                    and the overview diagram are preserved. Ops that produce or restructure a new \
+                    variant can be paired with an optional top-level `annotations` narrative-role \
+                    sidecar (happy path / exceptions / escalations / clusters) — the chat's model \
+                    card uses it to re-render the returned model with the Row-Bias or Fromme \
+                    semantic solvers."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -538,7 +605,8 @@ impl ToolBox for AnalysisTools {
                             "description": "For a multi-stage model: the called phase (process id / \
                                 callActivity calledElement) whose LOCAL node ids the ops address. \
                                 Omit to edit the orchestrator."
-                        }
+                        },
+                        "annotations": layout_annotations_schema()
                     },
                     "required": ["ops"]
                 }),
@@ -643,7 +711,9 @@ impl ToolBox for AnalysisTools {
                     'mocked-replay', a Level-3 assumption-based result) instead of being unscorable. \
                     Needs recorded-input capture; if none is available it returns replayable=false \
                     with the reason. Args: model (BPMN XML, required), name, rationale, mockWorkers, \
-                    limit (replay only the first N instances — for a quick smoke before the full run)."
+                    limit (replay only the first N instances — for a quick smoke before the full run), \
+                    annotations (optional narrative-role sidecar — the chat's model card uses it to \
+                    re-render with the Row-Bias or Fromme semantic solvers)."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -678,7 +748,8 @@ impl ToolBox for AnalysisTools {
                                 whose errorRef resolves to CREDIT_DECLINED. Supply one entry per new \
                                 job type; existing (recorded) job types do not need a mock.",
                             "additionalProperties": { "type": "object" }
-                        }
+                        },
+                        "annotations": layout_annotations_schema()
                     },
                     "required": ["model"]
                 }),
@@ -699,8 +770,10 @@ impl ToolBox for AnalysisTools {
                     adds a NEW worker can be scored by supplying a generative mock for it — either \
                     per candidate (mockWorkers on that item) or a top-level mockWorkers shared by \
                     all. Args: candidates (array of {name, model (BPMN XML), rationale?, \
-                    mockWorkers?}), includeBaseline (bool), mockWorkers (shared map), limit \
-                    (replay only the first N instances)."
+                    mockWorkers?, annotations?}), includeBaseline (bool), mockWorkers (shared map), \
+                    limit (replay only the first N instances). Per-candidate `annotations` (an \
+                    optional narrative-role sidecar) let the chat's model card re-render each \
+                    variant with the Row-Bias or Fromme semantic solvers."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -725,7 +798,8 @@ impl ToolBox for AnalysisTools {
                                             \"output\" — the worker raises that BPMN business error so \
                                             an error boundary is exercised.",
                                         "additionalProperties": { "type": "object" }
-                                    }
+                                    },
+                                    "annotations": layout_annotations_schema()
                                 },
                                 "required": ["model"]
                             }
