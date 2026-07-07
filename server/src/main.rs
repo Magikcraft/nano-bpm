@@ -7472,6 +7472,7 @@ impl ServerImpl {
             }
 
             if !jobs.is_empty() {
+                crate::metrics::record_jobs_dispatched(&job_type, jobs.len() as u64);
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
                 ));

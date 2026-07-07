@@ -2194,6 +2194,7 @@ async fn dispatch_to_connection(
 
         if pushed > 0 {
             sub.credits.fetch_sub(pushed, Ordering::Relaxed);
+            crate::metrics::record_jobs_dispatched(&job_type, pushed as u64);
         }
     }
 }
