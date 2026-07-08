@@ -453,6 +453,17 @@
   .modelcard .mc-ann-badge { color: var(--po-accent-strong); font-size: 12px; opacity: .8; margin-left: -2px; cursor: help; }
   .modelcard .mc-btn { background: var(--po-raised); border: 1px solid var(--po-edge-strong); color: var(--po-accent-soft); border-radius: 6px; height: 24px; min-width: 24px; padding: 0 6px; line-height: 1; cursor: pointer; font-size: 13px; }
   .modelcard .mc-btn:hover { background: var(--po-hover); }
+  .modelcard .mc-sem-btn.active { background: var(--po-hover); color: var(--po-accent-strong); }
+  .modelcard .mc-semantics { border-top: 1px dashed var(--po-edge); background: var(--po-inset); padding: 8px 12px; max-height: 260px; overflow: auto; }
+  .modelcard .mc-semantics[hidden] { display: none; }
+  .modelcard .mc-sem-empty { color: var(--po-text-faint); font-style: italic; font-size: 11.5px; }
+  .modelcard .mc-sem-note { color: var(--po-text-faint); font-size: 10.5px; margin-bottom: 6px; }
+  .modelcard .mc-sem-group { margin: 4px 0 8px; }
+  .modelcard .mc-sem-h { font: 700 10.5px/1.4 inherit; text-transform: uppercase; letter-spacing: .06em; color: var(--po-text-faint); margin-bottom: 3px; }
+  .modelcard .mc-sem-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; font-size: 11.5px; }
+  .modelcard .mc-sem-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+  .modelcard .mc-sem-row input { accent-color: var(--po-accent-strong); margin: 0; }
+  .modelcard .mc-sem-tag { font-family: ui-monospace, monospace; color: var(--po-accent-soft); padding: 0 5px; border-radius: 3px; background: var(--po-raised); font-size: 10.5px; }
   .modelcard .mc-body { position: relative; }
   .modelcard .mc-diagram { background: #fafafa; height: 300px; }
   .modelcard .mc-diagram .djs-container { height: 100%; }
@@ -3075,6 +3086,7 @@ function modelCardHtml(m){
           '<option value="rowbias">Row-Bias (server)</option>'+
           '<option value="field">Field / Fromme (server)</option>'+
         '</select>'+
+        '<button class="mc-btn mc-sem-btn" title="Show inferred semantic annotations">\u25D0</button>'+
         '<button class="mc-btn mc-edit" title="Edit this model on the Workbench canvas">\u270e</button>'+
         '<button class="mc-btn mc-expand" title="Expand">\u2922</button>'+
         '<button class="mc-btn mc-dl" title="Download .bpmn">\u2913</button>'+
@@ -3084,6 +3096,7 @@ function modelCardHtml(m){
       '<div class="mc-pane mc-diagram"></div>'+
       '<pre class="mc-pane mc-xml" style="display:none">'+esc(m.xml)+'</pre>'+
       (annJson ? '<script type="application/json" class="mc-annotations">'+esc(annJson)+'<\/script>' : '')+
+      '<div class="mc-semantics" hidden></div>'+
     '</div></div>';
 }
 
@@ -3325,6 +3338,10 @@ async function renderBpmnInto(el, xml, renderer, annotations){
 function modelXmlOf(card){ const p = card.querySelector('.mc-xml'); return p ? p.textContent : ''; }
 function modelNameOf(card){ const n = card.querySelector('.mc-name'); return (n ? n.textContent : 'model') || 'model'; }
 function modelAnnotationsOf(card){
+  // Prefer any live filter the semantics panel has applied over the raw
+  // annotations stored in <script class="mc-annotations"> — that's how a
+  // checkbox toggle in the panel takes effect on the next re-render.
+  if(card && card._semAnn) return card._semAnn;
   const s = card && card.querySelector && card.querySelector('.mc-annotations');
   if(!s) return null;
   try { const j = JSON.parse(s.textContent || 'null'); return (j && typeof j === 'object') ? j : null; }
@@ -3367,6 +3384,134 @@ function setCardRenderer(card, renderer){
   if(!card) return;
   card.dataset.renderer = renderer;
   // Force a re-render on the next tab-diagram visit.
+  card.dataset.renderedWith = '';
+  const dia = card.querySelector('.mc-diagram');
+  if(dia && dia.style.display !== 'none') ensureCardDiagram(card);
+}
+
+// ── Semantics slide-out (ADR 0002 slice 3) ─────────────────────────────────────────
+// A per-card panel that lists the inferred SemanticAnnotations (flows, roles,
+// clusters) and lets a human accept/reject each one. Toggling a row filters
+// the working annotation set and forces a re-render — the interaction pattern
+// we want to prove before building the standalone Semantics Workbench.
+
+async function toggleSemanticsPanel(card){
+  if(!card) return;
+  const panel = card.querySelector('.mc-semantics');
+  const btn = card.querySelector('.mc-sem-btn');
+  if(!panel) return;
+  const showing = !panel.hasAttribute('hidden');
+  if(showing){
+    panel.setAttribute('hidden','');
+    if(btn) btn.classList.remove('active');
+    return;
+  }
+  panel.removeAttribute('hidden');
+  if(btn) btn.classList.add('active');
+  await populateSemanticsPanel(card);
+}
+
+async function populateSemanticsPanel(card){
+  const panel = card.querySelector('.mc-semantics');
+  if(!panel) return;
+  let ann = null;
+  const rawScript = card.querySelector('.mc-annotations');
+  if(rawScript){
+    try { ann = JSON.parse(rawScript.textContent || 'null'); } catch(_){ ann = null; }
+  }
+  const hasContent = ann && (
+    (ann.flows && ann.flows.length) ||
+    (ann.roles && Object.keys(ann.roles).length) ||
+    (ann.clusters && ann.clusters.length)
+  );
+  if(!hasContent){
+    panel.innerHTML = '<div class="mc-sem-note">inferring annotations…</div>';
+    try {
+      const xml = ensureBpmnDefinitions(modelXmlOf(card));
+      const solver = card.dataset.renderer === 'elk' ? 'rowbias' : (card.dataset.renderer || 'rowbias');
+      const res = await fetch('/api/layout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ xml, solver })
+      });
+      const j = await res.json();
+      if(!res.ok){ throw new Error((j && j.error) || ('HTTP '+res.status)); }
+      ann = j.annotations_used || {};
+      writeCardAnnotations(card, ann);
+    } catch(e){
+      panel.innerHTML = '<div class="mc-sem-empty">could not infer: '+esc((e&&e.message)||e)+'</div>';
+      return;
+    }
+  }
+  card._semAnnBase = ann;
+  panel.innerHTML = semanticsPanelHtml(ann);
+}
+
+function writeCardAnnotations(card, ann){
+  let s = card.querySelector('.mc-annotations');
+  if(!s){
+    s = document.createElement('script');
+    s.type = 'application/json';
+    s.className = 'mc-annotations';
+    (card.querySelector('.mc-body') || card).appendChild(s);
+  }
+  s.textContent = JSON.stringify(ann || {});
+  if(ann && ((ann.flows && ann.flows.length) || (ann.roles && Object.keys(ann.roles).length) || (ann.clusters && ann.clusters.length))){
+    card.dataset.hasAnnotations = '1';
+  }
+}
+
+function semanticsPanelHtml(ann){
+  const flowsHtml = (ann.flows || []).map((f, i) => {
+    const kind = (f.kind || 'primary').toLowerCase();
+    const id = f.id || ('flow_'+i);
+    const n = (f.nodes && f.nodes.length) || 0;
+    return '<div class="mc-sem-row"><label>'+
+      '<input type="checkbox" class="mc-sem-flow" data-i="'+i+'" checked> '+
+      '<span class="mc-sem-tag">'+esc(kind)+'</span> '+esc(id)+
+      ' <span class="muted">('+n+' node'+(n===1?'':'s')+')</span></label></div>';
+  }).join('');
+  const roleEntries = Object.entries(ann.roles || {});
+  const rolesHtml = roleEntries.map(([id, role]) =>
+    '<div class="mc-sem-row"><label>'+
+      '<input type="checkbox" class="mc-sem-role" data-id="'+esc(id)+'" checked> '+
+      '<span class="mc-sem-tag">'+esc(String(role))+'</span> '+esc(id)+
+    '</label></div>').join('');
+  const clustersHtml = (ann.clusters || []).map((c, i) => {
+    const n = (c.nodes && c.nodes.length) || 0;
+    return '<div class="mc-sem-row"><label>'+
+      '<input type="checkbox" class="mc-sem-cluster" data-i="'+i+'" checked> '+
+      '<span class="mc-sem-tag">cluster</span> '+esc(c.id || ('cluster_'+i))+
+      ' <span class="muted">('+n+')</span></label></div>';
+  }).join('');
+  if(!flowsHtml && !rolesHtml && !clustersHtml){
+    return '<div class="mc-sem-empty">no annotations to display.</div>';
+  }
+  return '<div class="mc-sem-note">Toggle to include / exclude items. The current renderer re-runs on change.</div>'+
+    (flowsHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Flows</div>'+flowsHtml+'</div>' : '')+
+    (rolesHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Roles</div>'+rolesHtml+'</div>' : '')+
+    (clustersHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Clusters</div>'+clustersHtml+'</div>' : '');
+}
+
+function applySemanticsFilter(card){
+  const base = card._semAnnBase;
+  if(!base){ return; }
+  const panel = card.querySelector('.mc-semantics');
+  if(!panel){ return; }
+  const flows = (base.flows || []).filter((_, i) => {
+    const cb = panel.querySelector('.mc-sem-flow[data-i="'+i+'"]');
+    return !cb || cb.checked;
+  });
+  const roles = {};
+  Object.entries(base.roles || {}).forEach(([id, role]) => {
+    const cb = panel.querySelector('.mc-sem-role[data-id="'+CSS.escape(id)+'"]');
+    if(!cb || cb.checked) roles[id] = role;
+  });
+  const clusters = (base.clusters || []).filter((_, i) => {
+    const cb = panel.querySelector('.mc-sem-cluster[data-i="'+i+'"]');
+    return !cb || cb.checked;
+  });
+  card._semAnn = { flows, roles, clusters };
   card.dataset.renderedWith = '';
   const dia = card.querySelector('.mc-diagram');
   if(dia && dia.style.display !== 'none') ensureCardDiagram(card);
@@ -3435,10 +3580,14 @@ if(!window.__modelCardsWired){
     if(dl){ downloadModel(dl.closest('.modelcard')); return; }
     const ed = t.closest && t.closest('.mc-edit');
     if(ed){ editModelOnWorkbench(modelXmlOf(ed.closest('.modelcard')), modelNameOf(ed.closest('.modelcard'))); return; }
+    const sem = t.closest && t.closest('.mc-sem-btn');
+    if(sem){ toggleSemanticsPanel(sem.closest('.modelcard')); return; }
   });
   document.addEventListener('change', e => {
     const sel = e.target && e.target.closest && e.target.closest('.mc-renderer');
-    if(sel){ setCardRenderer(sel.closest('.modelcard'), sel.value); }
+    if(sel){ setCardRenderer(sel.closest('.modelcard'), sel.value); return; }
+    const semCb = e.target && e.target.closest && e.target.closest('.mc-semantics input[type=checkbox]');
+    if(semCb){ applySemanticsFilter(semCb.closest('.modelcard')); }
   });
 }
 
