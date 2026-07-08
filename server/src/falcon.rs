@@ -1632,11 +1632,29 @@ async fn handle_client_frame(
         } => {
             // Peer-side of the Raft network: feed the inbound RPC into the local
             // replica of `partition` and answer with the serialized response.
-            let (status, body) = match server.dispatch_raft_rpc(partition, &rpc, zip).await {
-                Ok(resp) => (200u16, Some(resp)),
-                Err((status, message)) => (status, Some(Value::String(message))),
-            };
-            conn.send(ServerFrame::CommandResult { corr, status, body });
+            //
+            // SPAWN, don't await inline. One `?raft=1` socket per peer multiplexes
+            // every partition's AppendEntries/Vote, and `dispatch_raft_rpc` awaits
+            // the follower's `raft.append_entries` (a log-store fsync + apply hop).
+            // Awaiting it inline serializes all 12 replicas through this single
+            // reader loop, so one partition's slow append head-of-line-blocks every
+            // other partition's RPC behind it — under sustained load the queued
+            // frames blow past openraft's 250ms AppendEntries deadline and both
+            // followers time out bidirectionally (the observed replication
+            // collapse). Spawning lets the reader loop read the next frame at once,
+            // so partitions replicate concurrently. Safe: the RPC is corr-tagged
+            // (the client matches the reply out of order) and openraft serializes
+            // per-group internally while log-matching makes any reordered/stale
+            // append idempotent — exactly a real network's concurrent delivery.
+            let server = server.clone();
+            let conn = conn.clone();
+            tokio::spawn(async move {
+                let (status, body) = match server.dispatch_raft_rpc(partition, &rpc, zip).await {
+                    Ok(resp) => (200u16, Some(resp)),
+                    Err((status, message)) => (status, Some(Value::String(message))),
+                };
+                conn.send(ServerFrame::CommandResult { corr, status, body });
+            });
         }
         ClientFrame::LeaseDigest {
             partition,
