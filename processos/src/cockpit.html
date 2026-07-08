@@ -293,6 +293,13 @@
   .sc-bad .sc-verdict { color: var(--po-danger-soft); font: 700 11px/1 inherit; text-transform: uppercase; letter-spacing: .05em; }
   .sc-bad .sc-err { color: var(--po-danger-soft); font: 11.5px/1.5 ui-monospace, monospace; margin-top: 5px; white-space: pre-wrap; word-break: break-word; }
   .sc-bad .sc-hint { color: var(--po-warn-soft); font-size: 11.5px; margin-top: 5px; }
+  .sc-delta { font-size: 11px; font-weight: 500; margin-left: 4px; color: var(--po-text-faint); }
+  .sc-delta.good { color: var(--po-good-soft, #2b7a2b); }
+  .sc-delta.bad { color: var(--po-danger-soft, #b04040); }
+  .sc-cov { font-size: 10px; color: var(--po-text-faint); margin-left: 4px; }
+  .mc-pareto { padding: 10px 12px; background: var(--po-inset); border-radius: 6px; }
+  .pareto-empty { color: var(--po-text-faint); font-size: 12px; padding: 12px 6px; line-height: 1.5; }
+  .pareto-note { margin-top: 4px; color: var(--po-text-faint); font-size: 10.5px; }
   .chatlog { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; min-height: 160px; }
   .chatlog .empty { color: var(--po-text-faint); font-size: 13px; margin: auto; text-align: center; max-width: 420px; }
   .bub { padding: 10px 13px; border-radius: 12px; font-size: var(--chat-font, 15px); line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-width: 88%; }
@@ -2494,11 +2501,66 @@ function scorecardSummaryHtml(sc){
     ['avg latency', fmtSimMs(rep.avgE2eLatencyMs)],
     ['p99 latency', fmtSimMs(rep.p99E2eLatencyMs)],
   ];
+  // Slice 7: annotated per-instance cost/time deltas from the semantics sidecar.
+  const cA = sc.costAnnotated;
+  if(cA && cA.variant && Object.keys(cA.variant).length){
+    const curs = Object.keys(cA.variant);
+    const parts = curs.map(cur => {
+      const v = Number(cA.variant[cur] || 0);
+      const label = cur || 'unit';
+      let s = fmtSimCost(v, label);
+      if(cA.delta && (cur in cA.delta)){
+        const d = Number(cA.delta[cur] || 0);
+        s += ' <span class="sc-delta '+(d<0?'good':(d>0?'bad':''))+'">('+(d>=0?'+':'')+fmtSimCost(d, label).replace(/^[^\-\d]*/, m=>m)+')</span>';
+      }
+      return s;
+    }).join(' \u00b7 ');
+    const cov = cA.coverage ? ' <span class="sc-cov" title="elements with cost annotation / total elements">'+cA.coverage.measured+'/'+cA.coverage.total+'</span>' : '';
+    rows.push(['cost/inst', parts + cov]);
+  }
+  const tA = sc.timeAnnotated;
+  if(tA && tA.variant && (tA.variant.p50Ms != null || tA.variant.p99Ms != null)){
+    const bits = [];
+    if(tA.variant.p50Ms != null){
+      let s = 'p50 '+fmtSimMs(tA.variant.p50Ms);
+      if(tA.delta && tA.delta.p50Ms != null){
+        const d = Number(tA.delta.p50Ms);
+        s += ' <span class="sc-delta '+(d<0?'good':(d>0?'bad':''))+'">('+(d>=0?'+':'')+fmtSimMs(Math.abs(d))+(d<0?' faster':d>0?' slower':'')+')</span>';
+      }
+      bits.push(s);
+    }
+    if(tA.variant.p99Ms != null){
+      let s = 'p99 '+fmtSimMs(tA.variant.p99Ms);
+      if(tA.delta && tA.delta.p99Ms != null){
+        const d = Number(tA.delta.p99Ms);
+        s += ' <span class="sc-delta '+(d<0?'good':(d>0?'bad':''))+'">('+(d>=0?'+':'')+fmtSimMs(Math.abs(d))+(d<0?' faster':d>0?' slower':'')+')</span>';
+      }
+      bits.push(s);
+    }
+    const cov = tA.coverage ? ' <span class="sc-cov" title="elements with time annotation / total elements (sequential upper-bound)">'+tA.coverage.measured+'/'+tA.coverage.total+'</span>' : '';
+    rows.push(['time/inst', bits.join(' \u00b7 ') + cov]);
+  }
   if(sc.requiresNewWorkers && sc.requiresNewWorkers.length) rows.push(['needs workers', esc(sc.requiresNewWorkers.join(', '))]);
   if(sc.mockedWorkers && sc.mockedWorkers.length) rows.push(['mocked', esc(sc.mockedWorkers.join(', '))]);
   if(rep.divergentKeys && rep.divergentKeys.length) rows.push(['divergent', esc(rep.divergentKeys.map(k => (k && k.key) || JSON.stringify(k)).join(', '))]);
   const cells = rows.map(([k,v]) => '<div class="sc-cell"><span class="sc-k">'+k+'</span><span class="sc-v">'+v+'</span></div>').join('');
   return '<div class="sc"><div class="sc-grid">'+cells+'</div>'+(sc.confidence?'<div class="sc-conf">'+esc(sc.confidence)+'</div>':'')+'</div>';
+}
+
+// Format a per-instance cost in a currency-aware way: known ISO 4217 codes use
+// their symbol; everything else is rendered as "<value> <unit>".
+function fmtSimCost(v, unit){
+  if(v == null || isNaN(v)) return '\u2014';
+  const n = Number(v);
+  const sign = n < 0 ? '-' : '';
+  const abs = Math.abs(n);
+  const digits = abs >= 100 ? 0 : abs >= 1 ? 2 : 4;
+  const body = abs.toFixed(digits);
+  const u = (unit || '').toUpperCase();
+  if(u === 'USD') return sign + '$' + body;
+  if(u === 'EUR') return sign + '\u20ac' + body;
+  if(u === 'GBP') return sign + '\u00a3' + body;
+  return sign + body + (unit ? ' ' + unit : '');
 }
 
 // Render simulation runs: one <details> per simulate/compare_variants call, each with its
@@ -2529,7 +2591,7 @@ function renderSims(runs){
     const note = (res && res.replayable === false)
       ? '<div class="sim-note">'+esc(res.note || 'not replayable \u2014 needs Tier-2 recorded-input capture (c8 nano --capture)')+'</div>' : '';
     const body = candidates.map(c => {
-      const card = c.xml ? modelCardHtml({ name: c.name, xml: c.xml })
+      const card = c.xml ? modelCardHtml({ name: c.name, xml: c.xml, scorecard: c.sc })
         : '<div class="sim-baseline">'+esc(c.name||'baseline')+' <span class="dim">(current model)</span></div>';
       return '<div class="simcand'+(c.best?' best':'')+'">'+(c.best?'<span class="sim-badge">best</span>':'')+card+scorecardSummaryHtml(c.sc)+'</div>';
     }).join('');
@@ -3074,13 +3136,24 @@ function modelCardHtml(m){
   const annJson = m.annotations ? JSON.stringify(m.annotations) : '';
   const hasAnn = annJson && annJson !== '{}';
   const annBadge = hasAnn ? '<span class="mc-ann-badge" title="Semantic annotations authored by the LLM — used by the Row-Bias / Field renderers">\u25CE</span>' : '';
-  return '<div class="modelcard" data-rendered="0" data-renderer="elk"'+(hasAnn?' data-has-annotations="1"':'')+'>'+
+  // Slice 7: stash the cost/time deltas from the paired scorecard so the Pareto
+  // tab can render them without another network round-trip.
+  let paretoAttr = '';
+  const sc = m.scorecard;
+  if(sc && (sc.costAnnotated || sc.timeAnnotated)){
+    const payload = { name: m.name };
+    if(sc.costAnnotated) payload.costAnnotated = sc.costAnnotated;
+    if(sc.timeAnnotated) payload.timeAnnotated = sc.timeAnnotated;
+    try { paretoAttr = ' data-pareto-json="'+esc(JSON.stringify(payload))+'"'; } catch(_){}
+  }
+  return '<div class="modelcard" data-rendered="0" data-renderer="elk"'+(hasAnn?' data-has-annotations="1"':'')+paretoAttr+'>'+
     '<div class="mc-head">'+
       '<span class="mc-name" title="'+esc(m.name)+'">'+esc(m.name)+'</span>'+
       annBadge+
       '<div class="mc-tabs">'+
         '<button class="mc-tab active" data-mc-tab="diagram">Diagram</button>'+
         '<button class="mc-tab" data-mc-tab="xml">XML</button>'+
+        '<button class="mc-tab" data-mc-tab="pareto" title="Cost vs time trade-off from the annotations sidecar">Pareto</button>'+
       '</div>'+
       '<div class="mc-actions">'+
         '<select class="mc-renderer" title="Layout renderer">'+
@@ -3097,6 +3170,7 @@ function modelCardHtml(m){
     '<div class="mc-body">'+
       '<div class="mc-pane mc-diagram"></div>'+
       '<pre class="mc-pane mc-xml" style="display:none">'+esc(m.xml)+'</pre>'+
+      '<div class="mc-pane mc-pareto" style="display:none"></div>'+
       (annJson ? '<script type="application/json" class="mc-annotations">'+esc(annJson)+'<\/script>' : '')+
       '<div class="mc-semantics" hidden></div>'+
     '</div></div>';
@@ -3549,9 +3623,114 @@ function applySemanticsFilter(card){
 
 function switchModelTab(card, tab){
   card.querySelectorAll('.mc-tab').forEach(b => b.classList.toggle('active', b.dataset.mcTab === tab));
-  const dia = card.querySelector('.mc-diagram'), xml = card.querySelector('.mc-xml');
-  if(tab === 'xml'){ dia.style.display = 'none'; xml.style.display = ''; }
-  else { xml.style.display = 'none'; dia.style.display = ''; ensureCardDiagram(card); }
+  const dia = card.querySelector('.mc-diagram');
+  const xml = card.querySelector('.mc-xml');
+  const par = card.querySelector('.mc-pareto');
+  const hide = el => { if(el) el.style.display = 'none'; };
+  hide(dia); hide(xml); hide(par);
+  if(tab === 'xml'){ xml.style.display = ''; }
+  else if(tab === 'pareto'){ par.style.display = ''; ensureCardPareto(card); }
+  else { dia.style.display = ''; ensureCardDiagram(card); }
+}
+
+// Render (once, then reuse) the Pareto scatter for a model card. Reads the card's
+// stashed cost/time scorecard blocks (attached by attachScorecardToCard when a
+// simulate/compare run lands) and plots baseline vs variant as x=p99 time / y=cost.
+// When either axis has no measurement, we say so plainly — no fake dots.
+function ensureCardPareto(card){
+  const host = card.querySelector('.mc-pareto');
+  if(!host || host.dataset.rendered === '1') return;
+  const raw = card.dataset.paretoJson || '';
+  let data = null;
+  if(raw){ try { data = JSON.parse(raw); } catch(_){} }
+  host.innerHTML = renderParetoSvg(data);
+  host.dataset.rendered = '1';
+}
+
+// Build the Pareto SVG for a single card. `data` shape (all optional):
+//   { costAnnotated: { variant:{USD:0.42,...}, baseline:{...}, delta:{...}, coverage:{measured,total} },
+//     timeAnnotated: { variant:{p50Ms, p99Ms}, baseline:{...}, delta:{...}, coverage:{...} },
+//     name: string }
+// The chart is deliberately tiny — this is a card, not a dashboard. When there
+// isn't enough signal (no cost or no p99 time), we fall back to an honest
+// "no data" message rather than plotting a single point in an empty plane.
+function renderParetoSvg(data){
+  if(!data) return '<div class="pareto-empty">Run a simulate/compare with a semantic annotations sidecar to populate the Pareto view.</div>';
+  const cA = data.costAnnotated || {};
+  const tA = data.timeAnnotated || {};
+  const curs = cA.variant ? Object.keys(cA.variant) : [];
+  const cur = curs[0]; // primary currency
+  const variantCost = cur != null ? Number(cA.variant[cur] || 0) : null;
+  const baselineCost = (cur != null && cA.baseline && (cur in cA.baseline)) ? Number(cA.baseline[cur]) : null;
+  const variantTime = tA.variant && tA.variant.p99Ms != null ? Number(tA.variant.p99Ms) : (tA.variant && tA.variant.p50Ms != null ? Number(tA.variant.p50Ms) : null);
+  const baselineTime = tA.baseline && tA.baseline.p99Ms != null ? Number(tA.baseline.p99Ms) : (tA.baseline && tA.baseline.p50Ms != null ? Number(tA.baseline.p50Ms) : null);
+  if(variantCost == null && variantTime == null){
+    return '<div class="pareto-empty">No cost or time annotations landed on this variant. Author them in the Semantics workbench, then re-simulate.</div>';
+  }
+  const points = [];
+  if(baselineTime != null && baselineCost != null) points.push({x: baselineTime, y: baselineCost, kind: 'baseline', label: 'baseline'});
+  if(variantTime != null && variantCost != null) points.push({x: variantTime, y: variantCost, kind: 'variant', label: (data.name || 'variant')});
+  if(points.length === 0){
+    // Show whichever axis we have and be explicit about the missing one.
+    const parts = [];
+    if(variantCost != null) parts.push('cost/inst: '+fmtSimCost(variantCost, cur));
+    if(variantTime != null) parts.push((tA.variant.p99Ms != null ? 'p99' : 'p50')+' '+fmtSimMs(variantTime));
+    return '<div class="pareto-empty">Not enough coverage for a full trade-off view. Measured this variant only: <b>'+parts.join(' \u00b7 ')+'</b>. Add the other axis in the Semantics workbench.</div>';
+  }
+  const W = 320, H = 180, PAD_L = 44, PAD_R = 10, PAD_T = 10, PAD_B = 26;
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  const xMin = Math.min.apply(null, xs), xMax = Math.max.apply(null, xs);
+  const yMin = Math.min.apply(null, ys), yMax = Math.max.apply(null, ys);
+  const padSpan = (lo, hi) => {
+    if(hi > lo) return [lo - (hi-lo)*0.15, hi + (hi-lo)*0.15];
+    const v = Math.abs(hi) || 1;
+    return [hi - v*0.15, hi + v*0.15];
+  };
+  const [xLo, xHi] = padSpan(xMin, xMax);
+  const [yLo, yHi] = padSpan(yMin, yMax);
+  const sx = v => PAD_L + (v - xLo) / (xHi - xLo || 1) * (W - PAD_L - PAD_R);
+  const sy = v => H - PAD_B - (v - yLo) / (yHi - yLo || 1) * (H - PAD_T - PAD_B);
+  let dots = '', labels = '', linkLine = '';
+  if(points.length === 2){
+    const [a, b] = points;
+    linkLine = '<line x1="'+sx(a.x)+'" y1="'+sy(a.y)+'" x2="'+sx(b.x)+'" y2="'+sy(b.y)+'" stroke="#888" stroke-dasharray="3,3" />';
+  }
+  points.forEach(p => {
+    const cx = sx(p.x), cy = sy(p.y);
+    const fill = p.kind === 'baseline' ? '#888' : '#2b7a2b';
+    dots += '<circle cx="'+cx+'" cy="'+cy+'" r="5" fill="'+fill+'"><title>'+esc(p.label)+': '+fmtSimMs(p.x)+' \u00b7 '+fmtSimCost(p.y, cur)+'</title></circle>';
+    labels += '<text x="'+(cx+7)+'" y="'+(cy-6)+'" font-size="10" fill="#333">'+esc(p.label)+'</text>';
+  });
+  const timeAxis = tA.variant && tA.variant.p99Ms != null ? 'p99 time (ms)' : 'p50 time (ms)';
+  const costAxis = 'cost/inst'+(cur?' ('+esc(cur)+')':'');
+  const svg = ''
+    + '<svg viewBox="0 0 '+W+' '+H+'" width="100%" height="180" style="max-width:'+W+'px">'
+    + '<rect x="'+PAD_L+'" y="'+PAD_T+'" width="'+(W-PAD_L-PAD_R)+'" height="'+(H-PAD_T-PAD_B)+'" fill="none" stroke="#ddd" />'
+    + linkLine + dots + labels
+    + '<text x="'+((PAD_L+W-PAD_R)/2)+'" y="'+(H-6)+'" font-size="10" fill="#666" text-anchor="middle">'+esc(timeAxis)+'</text>'
+    + '<text x="10" y="'+((PAD_T+H-PAD_B)/2)+'" font-size="10" fill="#666" transform="rotate(-90 10,'+((PAD_T+H-PAD_B)/2)+')" text-anchor="middle">'+esc(costAxis)+'</text>'
+    + '</svg>';
+  const cov = [];
+  if(cA.coverage) cov.push('cost coverage '+cA.coverage.measured+'/'+cA.coverage.total);
+  if(tA.coverage) cov.push('time coverage '+tA.coverage.measured+'/'+tA.coverage.total);
+  const covLine = cov.length ? '<div class="pareto-note">'+esc(cov.join(' \u00b7 '))+' \u00b7 time is a sequential upper bound</div>' : '';
+  return svg + covLine;
+}
+
+// Attach the cost/time annotation blocks from a scorecard onto an already-rendered
+// model card so its Pareto tab picks them up on next click. Not used in the current
+// render pipeline (payload is inlined via modelCardHtml's data-pareto-json), but
+// kept for future dynamic scorecard updates (e.g. streamed compare_variants results).
+// eslint-disable-next-line no-unused-vars
+function attachScorecardToCard(card, sc, name){
+  if(!card || !sc) return;
+  const payload = {};
+  if(sc.costAnnotated) payload.costAnnotated = sc.costAnnotated;
+  if(sc.timeAnnotated) payload.timeAnnotated = sc.timeAnnotated;
+  if(name) payload.name = name;
+  if(payload.costAnnotated || payload.timeAnnotated){
+    try { card.dataset.paretoJson = JSON.stringify(payload); } catch(_){}
+  }
 }
 
 // Big popover: a large diagram with an XML toggle + download, over a dark backdrop.

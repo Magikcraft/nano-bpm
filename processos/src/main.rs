@@ -3263,6 +3263,24 @@ fn chat_cancel_key(key: &str, session_id: &str) -> String {
     format!("{key}::{session_id}")
 }
 
+/// Fetch the current-revision semantic annotations for a process, or `None`
+/// if no sidecar exists / the current pointer is missing. Used to plumb
+/// annotations into `run_chat_turn` so the `read_annotations` tool and
+/// `simulate`'s cost/time deltas are available in chat turns.
+fn current_annotations(
+    state: &AppState,
+    workspace: &str,
+    process: &str,
+) -> Option<crate::layout::SemanticAnnotations> {
+    let side = state
+        .workspaces
+        .read_annotations(workspace, process)
+        .ok()
+        .flatten()?;
+    let current = side.current.as_deref()?;
+    side.revisions.get(current).map(|r| r.annotations.clone())
+}
+
 /// Resolve the session to act on: the explicit `?session=` id if it exists, else the most
 /// recently active session, creating a first one if the dataset has none yet.
 fn resolve_session(state: &AppState, key: &str, wanted: Option<&str>) -> chat::SessionMeta {
@@ -3532,8 +3550,18 @@ async fn cockpit_workbench_simulate(
         args["mockWorkers"] = m.clone();
     }
     let args_for_record = args.clone();
+    let ann = state
+        .workspaces
+        .read_annotations(&workspace, &process)
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            s.current
+                .clone()
+                .and_then(|k| s.revisions.get(&k).map(|r| r.annotations.clone()))
+        });
     let result = run_dataset_op(src, move |ds| {
-        crate::experiment::simulate(model.as_deref(), &ds, &args)
+        crate::experiment::simulate(model.as_deref(), &ds, &args, ann.as_ref())
     })
     .await;
     match result {
@@ -3605,8 +3633,18 @@ async fn cockpit_workbench_compare(
     }
     let args_for_record = args.clone();
     let model_cloned = model.clone();
+    let ann = state
+        .workspaces
+        .read_annotations(&workspace, &process)
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            s.current
+                .clone()
+                .and_then(|k| s.revisions.get(&k).map(|r| r.annotations.clone()))
+        });
     let result = run_dataset_op(src, move |ds| {
-        crate::experiment::compare_variants(model_cloned.as_deref(), &ds, &args)
+        crate::experiment::compare_variants(model_cloned.as_deref(), &ds, &args, ann.as_ref())
     })
     .await;
     match result {
@@ -3664,6 +3702,7 @@ async fn cockpit_workbench_review(
         .get_process(&workspace, &process)
         .and_then(|p| p.config.objective);
     let model = state.workspaces.read_model(&workspace, &process);
+    let annotations = current_annotations(&state, &workspace, &process);
     let key = chat::session_key(&workspace, &process);
     let sid = resolve_session(&state, &key, Some(&id)).id;
     let (persona_id, persona_system) = state.personas.resolve(req.persona_id.as_deref());
@@ -3701,6 +3740,7 @@ async fn cockpit_workbench_review(
             objective.as_deref(),
             Some(&persona_system),
             model,
+            annotations,
             None,
             None,
             &mut sink,
@@ -4308,6 +4348,7 @@ async fn cockpit_chat_send(
         .and_then(|p| p.config.objective);
     // The process's BPMN model (if any) unlocks the structural read_model/analyze_model tools.
     let model = state.workspaces.read_model(&workspace, &process);
+    let annotations = current_annotations(&state, &workspace, &process);
     let key = chat::session_key(&workspace, &process);
     let sid = resolve_session(&state, &key, q.session.as_deref()).id;
     let cancel_key = chat_cancel_key(&key, &sid);
@@ -4372,6 +4413,7 @@ async fn cockpit_chat_send(
                 objective.as_deref(),
                 Some(&persona_system),
                 model,
+                annotations,
                 Some(&cancel),
                 None,
                 &mut sink,
@@ -4453,6 +4495,7 @@ async fn cockpit_chat_stream(
         .get_process(&workspace, &process)
         .and_then(|p| p.config.objective);
     let model = state.workspaces.read_model(&workspace, &process);
+    let annotations = current_annotations(&state, &workspace, &process);
     let key = chat::session_key(&workspace, &process);
     let sid = resolve_session(&state, &key, q.session.as_deref()).id;
     let cancel_key = chat_cancel_key(&key, &sid);
@@ -4638,6 +4681,7 @@ async fn cockpit_chat_stream(
             objective.as_deref(),
             Some(&persona_system),
             model,
+            annotations,
             Some(&cancel),
             Some(&steer),
             &mut sink,

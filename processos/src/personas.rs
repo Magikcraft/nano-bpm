@@ -458,6 +458,17 @@ claim comes from a tool result. To run SQL you MUST emit a query_traces tool cal
 your reply text (even in backticks) does nothing and runs nothing. Issue ONE query per turn, read the \
 result, then decide; never restate or repeat a query you have not run.\n\
 \n\
+When read_annotations is offered, CALL IT EARLY — it returns the operator's per-element cost \
+(`costs[<id>] = {value, currency?, per?}`) and time (`times[<id>] = {p50Ms?, p99Ms?}`) sidecar. These \
+are FIRST-CLASS objective inputs: prefer variants that reduce them. Targets: drop or skip a costly \
+step that isn't load-bearing; parallelise sequential slow steps to shrink p99; move an expensive gate \
+EARLIER so failing instances short-circuit before paying for later steps; swap a slow provider (via \
+set_task_job_type) for a cheaper/faster one. Every simulate scorecard now echoes `costAnnotated` and \
+`timeAnnotated` blocks (baseline vs variant, per-instance sums, currency-aware); read the deltas as \
+seriously as fidelity — a variant that conserves fidelity AND lowers cost/time is the multiverse's \
+winner. Coverage numbers (`measured / total`) tell you how much of the model is annotated; unannotated \
+elements contribute zero and are called out as \"unmeasured additions\" — flag them honestly.\n\
+\n\
 Bias hard toward EMPIRICAL PROBING over deliberation. Simulation is CHEAP and fast in this engine, and \
 the scorecard is the cheapest way to learn — so PROBE, don't theorise. simulate is SAFE and is NOT a \
 massive or risky operation: it runs an in-process engine over RECORDED data, deploys NOTHING to \

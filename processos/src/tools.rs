@@ -41,6 +41,7 @@ pub const BUILTIN_NAMES: &[&str] = &[
     "simulate",
     "compare_variants",
     "conformance_check",
+    "read_annotations",
     "delegate",
 ];
 
@@ -328,6 +329,11 @@ pub fn builtin_catalog() -> Vec<ToolDef> {
             "conformance_check",
             "Check the trace against the model for conformance.",
             "model present",
+        ),
+        (
+            "read_annotations",
+            "Return the semantic-annotation sidecar (flows/roles/costs/times) for the current process.",
+            "annotations sidecar present",
         ),
         (
             "delegate",
