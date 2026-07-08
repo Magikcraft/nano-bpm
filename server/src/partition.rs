@@ -581,7 +581,7 @@ mod tests {
 
     fn spawn_partitions(n: u64) -> Partitions {
         let handles = (0..n)
-            .map(|i| DeepthiHandle::spawn(Journal::in_memory_partition(i), None))
+            .map(|i| DeepthiHandle::spawn(Journal::in_memory_partition(i), i, None))
             .collect();
         Partitions::new(handles)
     }
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(owned, vec![0, 2]);
         let handles: Vec<DeepthiHandle> = owned
             .iter()
-            .map(|p| DeepthiHandle::spawn(Journal::in_memory_partition(*p), None))
+            .map(|p| DeepthiHandle::spawn(Journal::in_memory_partition(*p), *p, None))
             .collect();
         let parts = Partitions::with_topology(topology, handles);
 

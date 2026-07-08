@@ -576,7 +576,8 @@ impl ServerImpl {
             .enumerate()
             .map(|(i, journal)| {
                 let ctrl = if i == 0 { controller.take() } else { None };
-                DeepthiHandle::spawn(journal, ctrl)
+                let partition = journal.partition_id();
+                DeepthiHandle::spawn(journal, partition, ctrl)
             })
             .collect();
         // Build peer uplinks before `topology` is consumed by the engine. A
@@ -7264,7 +7265,7 @@ impl ServerImpl {
         if !seed.is_empty() {
             journal.install_deployment(&seed);
         }
-        let handle = DeepthiHandle::spawn(journal, None);
+        let handle = DeepthiHandle::spawn(journal, p, None);
         self.raft_replicas
             .lock()
             .unwrap()
@@ -9897,6 +9898,7 @@ async fn main() {
         .with_env_filter(log_filter)
         .with_writer(log_writer)
         .init();
+    install_panic_hook();
     // Enable jemalloc's background page-decay thread where supported (Linux), so
     // freed memory returns to the OS automatically; on macOS the idle-purge tick
     // forces it instead.
@@ -10808,6 +10810,21 @@ async fn main() {
                     crate::metrics::set_job_type_provisioning(job_type, 0, 0);
                 }
                 seen_job_types = current;
+
+                // Engine-actor (deepthi) heartbeat per owned partition: the
+                // dead/wedged/idle discriminator for the sustained-load
+                // completion-freeze.
+                for handle in monitor_server.engine.all() {
+                    let s = handle.stats();
+                    crate::metrics::set_actor_stats(
+                        s.partition,
+                        s.alive.load(std::sync::atomic::Ordering::Relaxed),
+                        s.jobs.load(std::sync::atomic::Ordering::Relaxed),
+                        s.current_job_ms(),
+                        s.hi_depth.load(std::sync::atomic::Ordering::Relaxed),
+                        s.lo_depth.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
             }
         });
     }
@@ -10919,6 +10936,39 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
+}
+
+/// Routes every panic through `tracing::error!` (thread name, location, payload,
+/// backtrace) *before* delegating to the default hook, so a panic on a detached
+/// worker thread — above all the **`nanobpmn-engine` single-writer actor**, whose
+/// death silently freezes all completions on its partition — is captured in the
+/// structured log (journald) instead of vanishing to a stderr nobody reads. This
+/// is the other half of the [`deepthi::ActorStats::alive`] alarm: the gauge says
+/// *that* the writer died; this hook says *why*.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(
+            thread = name,
+            location = %location,
+            payload = %payload,
+            "PANIC on thread '{name}' at {location}: {payload}\n{backtrace}"
+        );
+        default(info);
+    }));
 }
 
 async fn shutdown_signal() {
@@ -12441,7 +12491,7 @@ mod clustered_startup_tests {
             RaftPartition::bootstrap_member(
                 0,
                 0,
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 node0.raft_transport(),
                 None,
             )
@@ -12454,7 +12504,7 @@ mod clustered_startup_tests {
             RaftPartition::bootstrap_member(
                 1,
                 0,
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 node1.raft_transport(),
                 None,
             )

@@ -1296,7 +1296,7 @@ mod tests {
             0,
             0,
             "http://self".into(),
-            DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
         )
         .await
         .expect("bootstrap single-voter raft");
@@ -1344,7 +1344,7 @@ mod tests {
     async fn snapshot_captures_compact_state_and_installs_into_a_fresh_replica() {
         // A source state machine accrues live state directly through its engine
         // actor (the same effect `apply` has), then snapshots it.
-        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), None);
+        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         src.with(|j| {
             let _ = j
                 .apply_command_at(deploy_command(), 1)
@@ -1390,7 +1390,7 @@ mod tests {
         // byte-for-byte identical engine state — the cross-node catch-up path.
         // Drive the receive→write→install sequence openraft's chunked transfer
         // performs: begin a receiving file, stream the body in, then install.
-        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), None);
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         let mut dst_sm: Arc<PartitionStateMachine> =
             Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("snapshot dir"));
         let mut received = dst_sm
@@ -1445,7 +1445,7 @@ mod tests {
                 0,
                 0,
                 "http://self".into(),
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 &log_dir,
             )
             .await
@@ -1470,7 +1470,7 @@ mod tests {
                 0,
                 0,
                 "http://self".into(),
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 &log_dir,
             )
             .await
@@ -1530,7 +1530,7 @@ mod tests {
             let p = RaftPartition::bootstrap_member(
                 id,
                 0,
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), None),
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 transport.clone(),
                 None,
             )

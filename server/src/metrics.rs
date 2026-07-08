@@ -121,6 +121,28 @@ struct Metrics {
     /// jobs — the signal behind the RF>1 completion-freeze. Labelled by partition.
     raft_partition_shutdown: prometheus::IntGaugeVec,
 
+    /// Per-partition engine-actor (deepthi) heartbeat: `1` while the single-writer
+    /// thread is alive, `0` the instant it exits/panics. A stuck-at-0 partition
+    /// has a DEAD single writer — every create/complete on it hangs forever (the
+    /// sustained-load completion-freeze). Labelled by partition.
+    actor_alive: prometheus::IntGaugeVec,
+    /// Per-partition cumulative count of engine-actor jobs executed. Flat under
+    /// any freeze; its delta is the actor's true throughput. Labelled by partition.
+    actor_jobs_total: prometheus::IntGaugeVec,
+    /// Per-partition elapsed milliseconds of the engine actor's currently-running
+    /// job (`0` when idle/parked). An unbounded climb is the signature of a
+    /// *wedged* single writer (stuck inside one command); flat-at-0 with a frozen
+    /// `actor_jobs_total` means the stall is upstream (idle actor, no work
+    /// arriving). Labelled by partition.
+    actor_current_job_ms: prometheus::IntGaugeVec,
+    /// Per-partition depth of the engine actor's High (completion/read) queue.
+    /// Piling up while `actor_jobs_total` is frozen confirms a wedge with work
+    /// queued behind it. Labelled by partition.
+    actor_hi_depth: prometheus::IntGaugeVec,
+    /// Per-partition depth of the engine actor's Low (creation) queue. Labelled by
+    /// partition.
+    actor_lo_depth: prometheus::IntGaugeVec,
+
     /// Cumulative count of admission sheds — one per `createProcessInstance`
     /// rejected by [`admission_shed`](crate::AppServer::admission_shed), labelled
     /// by `reason` (which rail tripped: `create_queue`, `active_backlog`,
@@ -382,6 +404,46 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["partition"],
     )
     .expect("valid gauge vec");
+    let actor_alive = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_actor_alive",
+            "1 while a partition's engine-actor (single-writer) thread is alive; 0 the instant it exits/panics (a dead single writer freezes all completions on that partition).",
+        ),
+        &["partition"],
+    )
+    .expect("valid gauge vec");
+    let actor_jobs_total = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_actor_jobs_total",
+            "Cumulative engine-actor jobs executed per partition; flat under any completion-freeze, its delta is the actor's true throughput.",
+        ),
+        &["partition"],
+    )
+    .expect("valid gauge vec");
+    let actor_current_job_ms = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_actor_current_job_ms",
+            "Elapsed milliseconds of the engine actor's currently-running job per partition (0 = idle). An unbounded climb is a wedged single writer.",
+        ),
+        &["partition"],
+    )
+    .expect("valid gauge vec");
+    let actor_hi_depth = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_actor_hi_depth",
+            "Depth of the engine actor's High (completion/read) queue per partition.",
+        ),
+        &["partition"],
+    )
+    .expect("valid gauge vec");
+    let actor_lo_depth = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_actor_lo_depth",
+            "Depth of the engine actor's Low (creation) queue per partition.",
+        ),
+        &["partition"],
+    )
+    .expect("valid gauge vec");
     let admission_shed_total = prometheus::IntCounterVec::new(
         Opts::new(
             "nanobpm_admission_shed_total",
@@ -445,6 +507,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_starved.clone())))
         .and(registry.register(Box::new(job_type_dispatched_total.clone())))
         .and(registry.register(Box::new(raft_partition_shutdown.clone())))
+        .and(registry.register(Box::new(actor_alive.clone())))
+        .and(registry.register(Box::new(actor_jobs_total.clone())))
+        .and(registry.register(Box::new(actor_current_job_ms.clone())))
+        .and(registry.register(Box::new(actor_hi_depth.clone())))
+        .and(registry.register(Box::new(actor_lo_depth.clone())))
         .and(registry.register(Box::new(admission_shed_total.clone())))
         .and(registry.register(Box::new(pending_create_queue.clone())))
         .and(registry.register(Box::new(active_backlog.clone())))
@@ -483,6 +550,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_starved,
         job_type_dispatched_total,
         raft_partition_shutdown,
+        actor_alive,
+        actor_jobs_total,
+        actor_current_job_ms,
+        actor_hi_depth,
+        actor_lo_depth,
         admission_shed_total,
         pending_create_queue,
         active_backlog,
@@ -658,6 +730,44 @@ pub fn set_raft_partition_shutdown(partition: u64, down: bool) {
         .raft_partition_shutdown
         .with_label_values(&[&partition.to_string()])
         .set(i64::from(down));
+}
+
+/// Publishes one partition's engine-actor (deepthi) heartbeat, sampled ~1 Hz by
+/// the metrics monitor. Together these gauges make the sustained-load
+/// completion-freeze diagnosable at a glance: `alive=0` = the single writer died
+/// (see the actor-exit error log + panic hook); `alive=1` with a frozen `jobs`
+/// and a climbing `current_job_ms` = wedged inside one command; `alive=1`, frozen
+/// `jobs`, `current_job_ms=0`, depths 0 = idle (the stall is upstream in Raft
+/// commit, not the actor).
+pub fn set_actor_stats(
+    partition: u64,
+    alive: bool,
+    jobs: u64,
+    current_job_ms: u64,
+    hi_depth: usize,
+    lo_depth: usize,
+) {
+    let p = partition.to_string();
+    METRICS
+        .actor_alive
+        .with_label_values(&[&p])
+        .set(i64::from(alive));
+    METRICS
+        .actor_jobs_total
+        .with_label_values(&[&p])
+        .set(jobs as i64);
+    METRICS
+        .actor_current_job_ms
+        .with_label_values(&[&p])
+        .set(current_job_ms as i64);
+    METRICS
+        .actor_hi_depth
+        .with_label_values(&[&p])
+        .set(hi_depth as i64);
+    METRICS
+        .actor_lo_depth
+        .with_label_values(&[&p])
+        .set(lo_depth as i64);
 }
 
 /// Records one admission shed (a `createProcessInstance` rejected to protect
