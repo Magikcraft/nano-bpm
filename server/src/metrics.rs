@@ -168,6 +168,14 @@ struct Metrics {
     /// `mem_watermark` rail keys off. Plot against
     /// `nanobpm_admission_limit{limit="mem_watermark"}`.
     mem_pressure_bytes: IntGauge,
+    /// Live runnable (task-job) backlog — the parked-excluded count of
+    /// created-but-uncompleted service-task jobs this node holds, refreshed each
+    /// ~1 Hz monitor tick. This is the signal the `active_backlog` latency rail
+    /// and the self-optimizing backlog governor actually gate on (parked
+    /// instances create no jobs, so they never appear here). Plot against
+    /// `nanobpm_admission_limit{limit="backlog"}` to watch the governor hold the
+    /// runnable backlog at the throughput knee.
+    runnable_backlog: IntGauge,
     /// The configured admission thresholds the ceiling rails trip at, labelled by
     /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
@@ -468,6 +476,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Cached resident-memory estimate the mem_watermark admission rail keys off.",
     )
     .expect("valid gauge");
+    let runnable_backlog = IntGauge::new(
+        "nanobpm_runnable_backlog",
+        "Runnable (task-job) backlog: parked-excluded count of created-but-uncompleted service-task jobs this node holds; the signal the active_backlog rail and the backlog governor gate on.",
+    )
+    .expect("valid gauge");
     let admission_limit = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_admission_limit",
@@ -516,6 +529,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(pending_create_queue.clone())))
         .and(registry.register(Box::new(active_backlog.clone())))
         .and(registry.register(Box::new(mem_pressure_bytes.clone())))
+        .and(registry.register(Box::new(runnable_backlog.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .expect("register metrics");
 
@@ -559,6 +573,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         pending_create_queue,
         active_backlog,
         mem_pressure_bytes,
+        runnable_backlog,
         admission_limit,
     }
 });
@@ -674,10 +689,12 @@ pub fn set_admission_signals(
     pending_create_queue: i64,
     active_backlog: i64,
     mem_pressure_bytes: i64,
+    runnable_backlog: i64,
 ) {
     METRICS.pending_create_queue.set(pending_create_queue);
     METRICS.active_backlog.set(active_backlog);
     METRICS.mem_pressure_bytes.set(mem_pressure_bytes);
+    METRICS.runnable_backlog.set(runnable_backlog);
 }
 
 /// Publishes one configured admission threshold as a reference line

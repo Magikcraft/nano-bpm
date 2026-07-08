@@ -1380,3 +1380,51 @@ Reads:
 Deploy note: the GCP nodes are Linux x86_64; a macOS build is an Exec-format-error
 there. Built the release binary natively on the loadbox (16-core x86_64) after
 `rustup` + `build-essential`, then fanned `nano-gw-new` out to the nodes.
+
+## 2026-07-09 — SELF-OPTIMIZING admission-backlog governor (build 0146c188)
+
+Replaced the *static* per-node backlog cap with a self-tuning **backlog governor**:
+the proven latency-driven `AimdLimit` (self-calibrated baseline, already used for the
+create limiter) now also drives the admission-backlog cap between a floor
+(`MIN_BACKLOG_GOVERNOR_CAP=2000`) and a memory-derived ceiling, stepped off the same
+per-command engine-latency window. Enabled **by default** (`NANOBPMN_ADMISSION_MAX_BACKLOG`
+unset → `auto`; a number pins a static cap; `off` disables). So the previously-proven
+peak throughput is delivered out of the box, and the cap only grows while the engine is
+*healthy and loaded* — never by shedding legitimately-parked instances.
+
+**Parked-safety by construction:** the gate/governor signal is the **runnable task-job
+backlog** = total jobs the engine holds (`jobs.len()`, Created + Activated), summed across
+owned partitions. Only `ServiceTask` mints a job (`create_job_for`), so timer/message/
+signal/conditional parks never appear. This replaces the old `self.inflight` (which
+counted parked instances).
+
+**Signal fix (this build):** the first cut summed only `activatable_jobs` (Created/waiting)
+and read ~0 under worker starvation (jobs were *leased* into the activated set), so the
+governor flew blind and active ran to 190k. Switched the signal to total `jobs.len()`
+(`Partitions::job_backlog()`), which counts leased-but-uncompleted jobs — the real
+O(active) congestion driver.
+
+Verification (default/auto; two regimes):
+
+| run | offered | workers/node | tput/s | p50 | p99 | engine actor max ms | runnable (steady) | active peak | collapse? |
+|-----|---------|-------------:|-------:|----:|----:|--------------------:|------------------:|------------:|:---------:|
+| **govAuto** (healthy) | MI=20000, 200 w | ~24,000 | ~low | — | ~0 | ~0 | ~150 | **no** |
+| **starveAuto2** (flood) | RATE=20k×3, MI=400k | ~13.9k (worker-bound) | 43s | 50s | **428** | **~2000/node (floor)** | 669k (exporter lag) | **no** |
+
+Reads:
+- **Healthy (govAuto):** default/auto holds the **~24k/s peak** (matches the explicit
+  cap=4000 verifyB run, beats uncapped verifyA 19.4k/s) with the governor **dormant at
+  the floor** — runnable ~0, active ~150, zero spurious shedding. Peak by default.
+- **Flood (starveAuto2):** with only 15 workers/node the throughput is worker-bound
+  (~13.9k/s), but the **engine never collapses** — `actor_current_job_ms` maxed at
+  **428ms** (p50 ≈ 0) and completions held steady ~13–17k/s across the whole sustained
+  phase. The corrected signal held the **runnable backlog at the ~2000/node floor** by
+  shedding creates (752,900 `active_backlog` sheds cluster-wide). The 447k–669k
+  `active_backlog` is exporter-projected instance lag (admitted-but-not-yet-exported-
+  complete), *not* live engine congestion — the job map (the O(active) collapse driver)
+  is bounded.
+
+Net: the governor delivers the proven +21% peak by default, is parked-safe by
+construction, and bounds the engine's live backlog under a worst-case worker-starved
+flood without any static tuning. 187 bin tests (incl. 4 new governor tests) + clippy
+`--all-targets` clean.

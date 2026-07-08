@@ -165,7 +165,21 @@ pub struct ServerImpl {
     /// retry signal instead of queueing them for seconds. Durability and
     /// at-least-once are unaffected: a shed create is never journaled, and accepted
     /// instances' jobs retain their lease/replay guarantees.
-    admission_max_backlog: usize,
+    /// The live per-node active-backlog admission cap the gate compares the
+    /// *runnable* (task-job) backlog against; `0` = off. Held behind an atomic
+    /// because in `AdmissionBacklog::Auto` mode the engine thread's
+    /// [`crate::backpressure::AdaptiveController`] backlog governor retunes it
+    /// each latency window to hold the system just left of the congestion-collapse
+    /// knee. In `Fixed`/`Off` mode it is a constant. Read on the hot admission
+    /// path with a relaxed load.
+    backlog_cap: Arc<AtomicUsize>,
+    /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
+    /// completed *service-task* jobs, summed across owned partitions. This is the
+    /// parked-excluded load signal the admission gate and the backlog governor
+    /// read — instances parked on timers/messages create subscriptions/timers,
+    /// not jobs, so they never appear here and are never shed against. Refreshed
+    /// by the ~1 Hz monitor tick; read with a relaxed load.
+    runnable_backlog: Arc<AtomicUsize>,
     /// Create-queue-depth admission limit (0 = off, the default). When set,
     /// `createProcessInstance` is shed once the standing backlog of submitted-but-
     /// not-yet-applied creates (summed across partitions' `Low` queues) is at or
@@ -429,17 +443,18 @@ impl ServerImpl {
         // boot, regardless of how large the replayed backlog is.
         let processing = Arc::new(AtomicUsize::new(0));
 
-        // Resolve the backpressure mode and, for adaptive mode, build the
-        // latency controller that the engine thread will drive. The controller
-        // owns the shared limit atomic; the server keeps the read side. The
-        // controller's "is the limit being used" signal reads the processing
-        // gauge (the gated quantity), not the backlog.
-        let (backpressure, mut controller) = match backpressure_setting_from_env() {
-            BackpressureSetting::Disabled => (Backpressure::Disabled, None),
-            BackpressureSetting::Fixed(n) => (Backpressure::Fixed(n), None),
+        // Resolve the backpressure mode and the admission-backlog policy, then
+        // build the single latency controller the engine thread drives. It hosts
+        // up to two AIMD limiters off the one per-command latency signal: the
+        // create-concurrency watermark (adaptive backpressure) and the
+        // self-optimizing active-backlog governor (auto admission-backlog). The
+        // controller owns the shared atomics; the server keeps the read sides.
+        let mut controller = AdaptiveController::new();
+        let backpressure = match backpressure_setting_from_env() {
+            BackpressureSetting::Disabled => Backpressure::Disabled,
+            BackpressureSetting::Fixed(n) => Backpressure::Fixed(n),
             BackpressureSetting::Adaptive => {
-                let (ctrl, limit) = AdaptiveController::new(processing.clone());
-                (Backpressure::Adaptive(limit), Some(ctrl))
+                Backpressure::Adaptive(controller.with_create_limiter(processing.clone()))
             }
         };
         tracing::info!("backpressure: {}", backpressure.describe());
@@ -448,12 +463,38 @@ impl ServerImpl {
         tracing::info!("SLA mode at ceiling: {}", sla_mode.describe());
         let sla_mode = SharedSlaMode::new(sla_mode);
 
-        let admission_max_backlog = admission_max_backlog_from_env();
-        if admission_max_backlog > 0 {
-            tracing::info!(
-                "admission control: on, max active backlog {admission_max_backlog} instance(s)"
-            );
-        }
+        // Runnable (task-job) backlog: the parked-excluded load signal the
+        // admission gate and the backlog governor read. Refreshed by the ~1 Hz
+        // monitor tick from `activatable_job_counts` (parked instances create no
+        // jobs, so they are excluded by construction). Seeded at 0.
+        let runnable_backlog = Arc::new(AtomicUsize::new(0));
+        // `backlog_cap` is the live active-backlog admission cap the gate reads
+        // (0 = off). Its value comes from one of three policies:
+        //  - Off:   a fixed 0 (never sheds on backlog).
+        //  - Fixed: a fixed operator-set cap.
+        //  - Auto:  a self-optimizing governor tunes it between the knee floor and
+        //           the memory-derived ceiling from the engine's latency signal.
+        let backlog_cap = match admission_backlog_from_env() {
+            AdmissionBacklog::Off => Arc::new(AtomicUsize::new(0)),
+            AdmissionBacklog::Fixed(n) => {
+                tracing::info!(
+                    "admission control: on, fixed active-backlog cap {n} runnable job(s)/node"
+                );
+                Arc::new(AtomicUsize::new(n))
+            }
+            AdmissionBacklog::Auto { floor, ceiling } => {
+                tracing::info!(
+                    "admission control: on, self-optimizing active-backlog governor \
+                     (floor {floor}, ceiling {ceiling} runnable jobs/node)"
+                );
+                controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone())
+            }
+        };
+        let mut controller = if controller.is_active() {
+            Some(controller)
+        } else {
+            None
+        };
         let admission_max_create_queue = admission_max_create_queue_from_env();
         if admission_max_create_queue > 0 {
             tracing::info!(
@@ -614,7 +655,8 @@ impl ServerImpl {
             inflight,
             processing,
             activity: Arc::new(AtomicU64::new(0)),
-            admission_max_backlog,
+            backlog_cap,
+            runnable_backlog,
             admission_max_create_queue,
             mem_watermark_bytes,
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
@@ -1445,46 +1487,75 @@ struct ReceivedDigest {
     leases: Vec<(u64, u64)>,
 }
 
-/// Resolves the active-instance-backlog admission limit, or `0` (off).
+/// The resolved active-backlog admission policy (see
+/// [`admission_backlog_from_env`]). The quantity bounded is the **runnable
+/// (task-job) backlog** per node — parked instances (timers/messages) create no
+/// jobs and are excluded by construction, so the cap never sheds against a
+/// legitimately parked population.
+enum AdmissionBacklog {
+    /// Never shed on backlog (`off`/`0`/`false`/`no`).
+    Off,
+    /// A fixed operator-set cap on the runnable backlog.
+    Fixed(usize),
+    /// Self-optimizing: a latency-driven governor tunes the cap between `floor`
+    /// (≈ the throughput knee) and `ceiling` (the memory-derived backstop).
+    Auto { floor: usize, ceiling: usize },
+}
+
+/// Resolves the active-backlog admission policy from `NANOBPMN_ADMISSION_MAX_BACKLOG`.
 ///
-/// `NANOBPMN_ADMISSION_MAX_BACKLOG=<n>` caps the number of active (created-but-not-
-/// terminal) instances **per node**: once the backlog reaches `n`,
-/// `createProcessInstance` is shed with a 503 `RESOURCE_EXHAUSTED` so clients back
-/// off, keeping end-to-end latency and memory bounded under sustained overload.
+/// The cap bounds the **runnable (task-job) backlog** per node: once it is
+/// reached, `createProcessInstance` is shed with a 503 `RESOURCE_EXHAUSTED` so
+/// clients back off, keeping end-to-end latency and memory bounded under
+/// sustained overload. Because only service tasks create jobs, parked instances
+/// (waiting on timers/messages) are never counted and never shed against.
 ///
-/// - `NANOBPMN_ADMISSION_MAX_BACKLOG=off` (or `0`/`false`/`no`): disabled —
-///   appropriate for workloads with a legitimately large parked population (e.g.
-///   many instances waiting on timers/messages) that exceeds the auto-derived
-///   floor, where the standing backlog is not a load signal.
-/// - `=<n>`: explicit per-node cap. Tune to the **throughput knee** (a few
-///   thousand/node) to pin the system at its peak sustained throughput — bounding
-///   the active set keeps the engine actor's per-command cost off its O(active)
-///   tail (see PERFORMANCE.md, congestion collapse).
-/// - unset / `adaptive` / `on`: a generous count derived from the detected
-///   cgroup/host memory limit ([`active_backlog_cap_default_from_limit`]), clamped
-///   to `[MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP]`, or
-///   [`MIN_ACTIVE_BACKLOG_CAP`] when no limit can be read. **On by default** as a
-///   self-protecting backstop: it caps an unbounded active runaway (the
-///   congestion-collapse / OOM path) well above typical parked populations, while
-///   only shedding in [`SlaMode::Latency`] (the memory-safety rails handle
-///   admission mode). It is a *safety* default, not the throughput-peak pin — set
-///   an explicit lower cap at the knee for maximum sustained throughput.
-fn admission_max_backlog_from_env() -> usize {
+/// - `off` (or `0`/`false`/`no`): [`AdmissionBacklog::Off`] — disabled.
+/// - `=<n>`: [`AdmissionBacklog::Fixed`], an explicit per-node cap. Tune to the
+///   **throughput knee** (a few thousand/node) to pin the system at its peak
+///   sustained throughput — bounding the runnable set keeps the engine actor's
+///   per-command cost off its O(active) tail (see PERFORMANCE.md, congestion
+///   collapse).
+/// - unset / `adaptive` / `auto` / `on`: [`AdmissionBacklog::Auto`] — **the
+///   default**. A self-optimizing governor (the engine thread's
+///   [`crate::backpressure::AdaptiveController`]) tunes the cap from the measured
+///   per-command latency, holding the system just left of the congestion knee so
+///   the peak sustained throughput is delivered *by default* — no manual knee
+///   tuning. It floors at [`MIN_BACKLOG_GOVERNOR_CAP`] (never starving the
+///   workers or shedding a modest parked burst) and ceilings at the memory-derived
+///   [`active_backlog_cap_default_from_limit`] (the OOM backstop). Only sheds in
+///   [`SlaMode::Latency`]; the memory-safety rails handle admission mode.
+fn admission_backlog_from_env() -> AdmissionBacklog {
     if let Ok(v) = std::env::var("NANOBPMN_ADMISSION_MAX_BACKLOG") {
         let t = v.trim().to_ascii_lowercase();
         if matches!(t.as_str(), "off" | "false" | "no") {
-            return 0;
+            return AdmissionBacklog::Off;
         }
         if let Ok(n) = t.parse::<usize>() {
             // Explicit number wins, including `0` = off.
-            return n;
+            return if n == 0 {
+                AdmissionBacklog::Off
+            } else {
+                AdmissionBacklog::Fixed(n)
+            };
         }
-        // "on"/"adaptive"/anything else falls through to the adaptive default.
+        // "on"/"adaptive"/"auto"/anything else falls through to the auto governor.
     }
-    detect_memory_limit_bytes()
+    let ceiling = detect_memory_limit_bytes()
         .map(active_backlog_cap_default_from_limit)
-        .unwrap_or(MIN_ACTIVE_BACKLOG_CAP)
+        .unwrap_or(MIN_ACTIVE_BACKLOG_CAP);
+    // The governor floor is the knee target, but never above the memory ceiling
+    // (on a tiny host the ceiling could clamp below the nominal floor).
+    let floor = MIN_BACKLOG_GOVERNOR_CAP.min(ceiling);
+    AdmissionBacklog::Auto { floor, ceiling }
 }
+
+/// The self-optimizing floor for the [`AdmissionBacklog::Auto`] governor: the
+/// lowest cap it will tune down to under congestion. Set near the measured
+/// throughput knee (a few thousand runnable jobs/node — see PERFORMANCE.md) so
+/// the governor holds the system just left of the congestion-collapse point
+/// without starving the workers or shedding a modest parked/burst backlog.
+const MIN_BACKLOG_GOVERNOR_CAP: usize = 2_000;
 
 /// Nominal resident bytes charged per active (created-but-not-terminal) instance
 /// when deriving the default backlog cap from the memory budget: an instance
@@ -8873,7 +8944,7 @@ impl ServerImpl {
     ///   latency gate would have.
     pub(crate) fn admission_shed(&self) -> Option<String> {
         let cq_limit = self.admission_max_create_queue;
-        let backlog_limit = self.admission_max_backlog;
+        let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
         let latency_mode = self.sla_mode.get().sheds_for_latency();
         // The standing create-queue depth (submitted-but-not-yet-applied creates)
         // is the backlog that actually grows under overload — completion-priority
@@ -8901,21 +8972,24 @@ impl ServerImpl {
             ));
         }
         // Latency-preservation rail (latency SLA mode only): shed once either the
-        // parked active-instance backlog *or* the create-side backlog reaches the
-        // configured limit, so end-to-end latency stays bounded. The create-side
-        // term is the one that bites for fast create->complete workloads: their
-        // active-instance count (`self.inflight`, projected by the read-model
-        // exporter) stays ~0 because instances complete as fast as they're
-        // projected, so the active-instance term alone was a no-op under a create
-        // flood. Bounding the create queue bounds create->apply latency, which is
-        // the dominant queue an overloaded producer waits behind.
+        // runnable (task-job) backlog *or* the create-side backlog reaches the
+        // cap, so end-to-end latency stays bounded. The runnable-backlog term is
+        // the congestion-collapse guard: it is the parked-excluded load signal
+        // (only service tasks create jobs), so bounding it holds the engine
+        // actor's per-command cost off its O(active) tail *without* shedding a
+        // legitimately parked population. The create-side term is the one that
+        // bites for fast create->complete workloads: their runnable backlog drains
+        // as fast as it's created, so bounding the create queue bounds
+        // create->apply latency, the dominant queue an overloaded producer waits
+        // behind. In `AdmissionBacklog::Auto` mode `backlog_limit` is retuned live
+        // by the backlog governor to sit just left of the throughput knee.
         if latency_mode && backlog_limit > 0 {
-            let backlog = self.inflight.load(Ordering::Relaxed);
+            let backlog = self.runnable_backlog.load(Ordering::Relaxed);
             if backlog >= backlog_limit {
                 crate::metrics::record_admission_shed("active_backlog");
                 return Some(format!(
-                    "Admission control: {backlog} active instances at or above the \
-                     configured backlog limit of {backlog_limit}. Retry after a backoff."
+                    "Admission control: {backlog} runnable jobs at or above the \
+                     active-backlog cap of {backlog_limit}. Retry after a backoff."
                 ));
             }
             if create_queue >= backlog_limit {
@@ -9024,12 +9098,12 @@ impl ServerImpl {
     pub(crate) fn ceiling_state(&self) -> (bool, bool) {
         let processing = self.processing.load(Ordering::Relaxed);
         let mut throughput = self.backpressure.should_shed(processing);
-        let backlog_limit = self.admission_max_backlog;
+        let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
         if !throughput && backlog_limit > 0 && self.sla_mode.get().sheds_for_latency() {
             // Mirror the latency-preservation rail in `admission_shed`: it trips on
-            // either the parked active-instance backlog or the create-side backlog
+            // either the runnable (task-job) backlog or the create-side backlog
             // (the term that bites for fast create->complete workloads).
-            throughput = self.inflight.load(Ordering::Relaxed) >= backlog_limit
+            throughput = self.runnable_backlog.load(Ordering::Relaxed) >= backlog_limit
                 || self.engine.pending_create_queue() >= backlog_limit;
         }
 
@@ -10848,10 +10922,11 @@ async fn main() {
                     monitor_server.engine.pending_create_queue() as i64,
                     monitor_server.active_backlog(),
                     monitor_server.mem_pressure_bytes.load(Ordering::Relaxed) as i64,
+                    monitor_server.runnable_backlog.load(Ordering::Relaxed) as i64,
                 );
                 crate::metrics::set_admission_limit(
                     "backlog",
-                    monitor_server.admission_max_backlog as i64,
+                    monitor_server.backlog_cap.load(Ordering::Relaxed) as i64,
                 );
                 crate::metrics::set_admission_limit(
                     "create_queue",
@@ -10867,6 +10942,19 @@ async fn main() {
                 );
 
                 let activatable = monitor_server.engine.activatable_job_counts().await;
+                // Refresh the runnable (task-job) backlog the admission gate and
+                // backlog governor read: the total count of task jobs the engine
+                // holds (Created + Activated), summed across owned partitions.
+                // Parked instances create no jobs, so this excludes them by
+                // construction — and it counts leased-but-uncompleted jobs, so a
+                // worker-starved backlog that has drained into the activated set is
+                // still seen (activatable alone would miss it). The governor can
+                // pull the cap toward the knee without ever shedding a legitimately
+                // parked population.
+                let runnable = monitor_server.engine.job_backlog().await;
+                monitor_server
+                    .runnable_backlog
+                    .store(runnable, Ordering::Relaxed);
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =
                     std::collections::HashSet::with_capacity(activatable.len() + workers.len());
