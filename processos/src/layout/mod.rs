@@ -44,7 +44,7 @@ use std::collections::HashMap;
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 #[allow(unused_imports)] // re-exported public API
-pub use schema::{AnnotatedFlow, Cluster, FlowKind, Role, SemanticAnnotations};
+pub use schema::{AnnotatedFlow, Cluster, Cost, FlowKind, Role, SemanticAnnotations, Time};
 
 use crate::bpmn_model::definition_to_xml_with_row_bias;
 

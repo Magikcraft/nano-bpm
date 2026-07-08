@@ -50,6 +50,17 @@ pub struct SemanticAnnotations {
     /// solver ignores this; only the debug SVG uses it to colour-code shapes.
     #[serde(default)]
     pub roles: BTreeMap<String, Role>,
+
+    /// Per-node expected cost. Slice 6 (Semantics Workbench) authors these;
+    /// slice 7 feeds them into the cost/time-aware optimisation prompt.
+    /// The solver v0 ignores them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub costs: BTreeMap<String, Cost>,
+
+    /// Per-node expected duration (p50/p99). Same lifecycle as `costs` —
+    /// authored in the workbench, consumed by the optimisation prompt.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub times: BTreeMap<String, Time>,
 }
 
 /// A named sequence of node ids the LLM claims belongs to one narrative flow.
@@ -133,4 +144,40 @@ pub enum Role {
     Notification,
     Compensation,
     External,
+}
+
+/// Expected cost of a node — money-per-invocation is the common case.
+///
+/// This is deliberately a triple of `(value, currency, per)` rather than a
+/// scalar because the useful comparisons downstream (slice 7's Pareto tab)
+/// need to know both the unit and whether the number is per-invocation,
+/// per-hour, per-instance, etc. Mirrors the `nano:Cost` moddle type
+/// (`processos/assets/bpmn/nano-moddle.json`) so a workbench save can also
+/// round-trip through the BPMN `nano:` extension namespace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cost {
+    pub value: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// Free-form unit: `"invocation"`, `"instance"`, `"hour"`, `"month"`, …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per: Option<String>,
+}
+
+/// Expected duration of a node with a p50/p99 pair, in milliseconds.
+///
+/// Two percentiles rather than a single average because the optimisation
+/// prompt in slice 7 needs to distinguish "always slow" from "usually fast
+/// but with a long tail" — different optimisation strategies apply. The
+/// `source` field carries provenance for the number itself (e.g.
+/// `"telemetry"`, `"vendor-sla"`, `"guess"`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Time {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }

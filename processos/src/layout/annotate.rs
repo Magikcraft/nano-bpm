@@ -350,10 +350,26 @@ pub fn merge(
     } else {
         supplied.roles
     };
+    // Costs and times are authored in the workbench (slice 6) and consumed
+    // by the optimisation prompt (slice 7); the structural inference pass
+    // never emits them, so "supplied wins, else empty" collapses to
+    // "supplied wins" and no field-by-field check is needed.
+    let costs = if supplied.costs.is_empty() {
+        structural.costs
+    } else {
+        supplied.costs
+    };
+    let times = if supplied.times.is_empty() {
+        structural.times
+    } else {
+        supplied.times
+    };
     SemanticAnnotations {
         flows,
         clusters,
         roles,
+        costs,
+        times,
     }
 }
 

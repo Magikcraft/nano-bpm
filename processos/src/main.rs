@@ -496,6 +496,7 @@ async fn main() {
         .route("/api/pilot/reset", post(pilot_reset))
         .route("/api/layout", post(layout_relayout))
         .route("/workspace", get(workspace_page))
+        .route("/semantics", get(semantics_page))
         .route(
             "/api/workspaces",
             get(ws_workspaces).post(ws_create_workspace),
@@ -1420,6 +1421,7 @@ fn unprocessable(e: String) -> axum::response::Response {
 
 /// The single-file workspace browser. Served at `/workspace`.
 const WORKSPACE_HTML: &str = include_str!("workspace.html");
+const SEMANTICS_HTML: &str = include_str!("semantics.html");
 
 /// Vendored bpmn-js viewer assets (self-contained, served at `/assets/bpmn/*`), so
 /// the workspace console can render a real BPMN diagram with no CDN/build step.
@@ -1591,6 +1593,15 @@ fn demo_dataset(id: &str) -> Option<&'static DemoDataset> {
 /// `GET /workspace` — browse workspaces, drill into a process, view its Insights.
 async fn workspace_page() -> Html<&'static str> {
     Html(WORKSPACE_HTML)
+}
+
+/// `GET /semantics` — the Semantics Workbench (ADR 0002 slice 6). A standalone
+/// route for authoring the annotations sidecar for a single process. The
+/// workspace/process are picked either from the URL query (?workspace=…&process=…)
+/// or the hash (#/c/<ws>/p/<proc>) so the same page can be linked from the
+/// workspace tile as well as the cockpit's rail nav.
+async fn semantics_page() -> Html<&'static str> {
+    Html(SEMANTICS_HTML)
 }
 
 #[derive(Debug, Deserialize)]
