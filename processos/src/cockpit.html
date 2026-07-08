@@ -464,6 +464,8 @@
   .modelcard .mc-sem-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
   .modelcard .mc-sem-row input { accent-color: var(--po-accent-strong); margin: 0; }
   .modelcard .mc-sem-tag { font-family: ui-monospace, monospace; color: var(--po-accent-soft); padding: 0 5px; border-radius: 3px; background: var(--po-raised); font-size: 10.5px; }
+  .modelcard .mc-sem-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--po-edge); }
+  .modelcard .mc-sem-status { font-size: 10.5px; }
   .modelcard .mc-body { position: relative; }
   .modelcard .mc-diagram { background: #fafafa; height: 300px; }
   .modelcard .mc-diagram .djs-container { height: 100%; }
@@ -3490,7 +3492,35 @@ function semanticsPanelHtml(ann){
   return '<div class="mc-sem-note">Toggle to include / exclude items. The current renderer re-runs on change.</div>'+
     (flowsHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Flows</div>'+flowsHtml+'</div>' : '')+
     (rolesHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Roles</div>'+rolesHtml+'</div>' : '')+
-    (clustersHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Clusters</div>'+clustersHtml+'</div>' : '');
+    (clustersHtml ? '<div class="mc-sem-group"><div class="mc-sem-h">Clusters</div>'+clustersHtml+'</div>' : '')+
+    '<div class="mc-sem-actions"><button type="button" class="btn ghost mc-sem-save" title="Persist these annotations to this process\'s annotations.json">💾 Save to process</button> <span class="mc-sem-status muted"></span></div>';
+}
+
+// Persist a card's accepted semantic annotations to the process's
+// annotations.json sidecar (slice 5 of ADR 0002). The revision key is
+// computed server-side from the process's current model.bpmn, so what
+// we're recording is "these are the annotations to use with the saved
+// canonical model". Chat cards are proposed variants — this action
+// commits their semantic decisions upstream to the process, not the
+// card's own draft XML.
+async function saveCardSemanticsToProcess(card){
+  const ws = STATE.ws || WB.ws; const proc = STATE.wsProc || WB.proc;
+  const status = card.querySelector('.mc-sem-status');
+  if(!ws || !proc){ if(status) status.textContent = 'no process selected'; return; }
+  const ann = card._semAnn || card._semAnnBase || modelAnnotationsOf(card) || { flows:[], roles:{}, clusters:[] };
+  const btn = card.querySelector('.mc-sem-save');
+  if(btn) btn.disabled = true;
+  if(status) status.textContent = 'saving…';
+  try {
+    const res = await api('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/annotations',
+      { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ annotations: ann, provenance: 'human' }) });
+    const rev = (res && res.revision) ? String(res.revision).slice(0, 8) : '?';
+    if(status) status.textContent = 'saved @ '+rev;
+  } catch(e){
+    if(status) status.textContent = 'save failed: '+((e&&e.message)||e);
+  } finally {
+    if(btn) btn.disabled = false;
+  }
 }
 
 function applySemanticsFilter(card){
@@ -3582,6 +3612,8 @@ if(!window.__modelCardsWired){
     if(ed){ editModelOnWorkbench(modelXmlOf(ed.closest('.modelcard')), modelNameOf(ed.closest('.modelcard'))); return; }
     const sem = t.closest && t.closest('.mc-sem-btn');
     if(sem){ toggleSemanticsPanel(sem.closest('.modelcard')); return; }
+    const semSave = t.closest && t.closest('.mc-sem-save');
+    if(semSave){ saveCardSemanticsToProcess(semSave.closest('.modelcard')); return; }
   });
   document.addEventListener('change', e => {
     const sel = e.target && e.target.closest && e.target.closest('.mc-renderer');

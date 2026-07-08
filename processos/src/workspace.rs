@@ -308,6 +308,72 @@ impl WorkspaceCatalog {
         std::fs::write(dir.join("model.bpmn"), xml).map_err(|e| format!("write model.bpmn: {e}"))
     }
 
+    // --- annotations sidecar ------------------------------------------------
+
+    /// Compute the content-addressable revision key of the process's current
+    /// `model.bpmn`, or `None` when there is no model yet.
+    ///
+    /// Callers that write the model *and* then persist annotations should
+    /// compute the key against the bytes they just wrote, rather than
+    /// re-reading from disk, so a concurrent overwrite can't slip a
+    /// different revision under them.
+    pub fn current_model_revision(&self, workspace: &str, process: &str) -> Option<String> {
+        let dir = self.process_dir(workspace, process)?;
+        let bytes = std::fs::read(dir.join("model.bpmn")).ok()?;
+        Some(crate::annotations::revision_key(&bytes))
+    }
+
+    /// Read the annotations sidecar. Returns `Ok(None)` when the process
+    /// has no sidecar yet (the common case for a fresh process); returns
+    /// `Err` only when the file exists but is unreadable or malformed —
+    /// those we want to surface, not silently paper over.
+    pub fn read_annotations(
+        &self,
+        workspace: &str,
+        process: &str,
+    ) -> Result<Option<crate::annotations::AnnotationsSidecar>, String> {
+        let dir = self
+            .process_dir(workspace, process)
+            .ok_or_else(|| "invalid slug".to_string())?;
+        if !dir.is_dir() {
+            return Err(format!("no such process: {workspace}/{process}"));
+        }
+        let path = dir.join("annotations.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("read annotations.json: {e}")),
+        };
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| format!("parse annotations.json: {e}"))
+    }
+
+    /// Write (or replace) the sidecar entry for `revision`, then persist.
+    /// The `current` pointer is updated to `revision` — writing annotations
+    /// implicitly declares "this is the revision they belong to".
+    pub fn write_annotations(
+        &self,
+        workspace: &str,
+        process: &str,
+        revision: &str,
+        annotations: crate::layout::SemanticAnnotations,
+        provenance: &str,
+    ) -> Result<crate::annotations::AnnotationsSidecar, String> {
+        let dir = self
+            .process_dir(workspace, process)
+            .ok_or_else(|| "invalid slug".to_string())?;
+        if !dir.is_dir() {
+            return Err(format!("no such process: {workspace}/{process}"));
+        }
+        let mut side = self
+            .read_annotations(workspace, process)?
+            .unwrap_or_default();
+        side.upsert(revision, annotations, provenance);
+        write_json(&dir.join("annotations.json"), &side)?;
+        Ok(side)
+    }
+
     /// The `traces/` dataset directory beside a process's `process.json` (created on
     /// demand), used when loading captured traces into a process.
     pub fn process_traces_dir(&self, workspace: &str, process: &str) -> Result<PathBuf, String> {
@@ -550,6 +616,91 @@ mod tests {
         // display name falls back to the slug
         assert_eq!(customers[0].config.display_name, "manual-workspace");
         assert_eq!(ws.list_processes("manual-workspace").len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn annotations_sidecar_round_trip_and_revision_key() {
+        let root = tmp();
+        let ws = WorkspaceCatalog::open(&root);
+        ws.create_workspace("Acme", None).unwrap();
+        ws.create_process("acme", "P", ProcessConfig::default())
+            .unwrap();
+
+        // No model yet → no current revision key.
+        assert!(ws.current_model_revision("acme", "p").is_none());
+        assert!(ws.read_annotations("acme", "p").unwrap().is_none());
+
+        // Write a model, revision key becomes stable & content-addressable.
+        let xml_v1 =
+            "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\"/>";
+        ws.write_model("acme", "p", xml_v1).unwrap();
+        let r1 = ws.current_model_revision("acme", "p").unwrap();
+        assert_eq!(r1.len(), 64);
+        assert_eq!(
+            r1,
+            ws.current_model_revision("acme", "p").unwrap(),
+            "same bytes → same revision"
+        );
+
+        // Write annotations at revision 1.
+        let side = ws
+            .write_annotations(
+                "acme",
+                "p",
+                &r1,
+                crate::layout::SemanticAnnotations::default(),
+                "human",
+            )
+            .unwrap();
+        assert_eq!(side.current.as_deref(), Some(r1.as_str()));
+        assert_eq!(side.revisions.len(), 1);
+
+        // Round-trip through disk.
+        let loaded = ws.read_annotations("acme", "p").unwrap().unwrap();
+        assert_eq!(loaded.current.as_deref(), Some(r1.as_str()));
+        assert_eq!(
+            loaded.revision(&r1).map(|e| e.provenance.clone()),
+            Some("human".into())
+        );
+
+        // Change the model → new revision key; historic entry preserved.
+        let xml_v2 = "<bpmn:definitions xmlns:bpmn=\"http://www.omg.org/spec/BPMN/20100524/MODEL\"><!--v2--></bpmn:definitions>";
+        ws.write_model("acme", "p", xml_v2).unwrap();
+        let r2 = ws.current_model_revision("acme", "p").unwrap();
+        assert_ne!(r1, r2, "different bytes → different revision");
+
+        ws.write_annotations(
+            "acme",
+            "p",
+            &r2,
+            crate::layout::SemanticAnnotations::default(),
+            "inferred",
+        )
+        .unwrap();
+        let loaded = ws.read_annotations("acme", "p").unwrap().unwrap();
+        assert_eq!(loaded.current.as_deref(), Some(r2.as_str()));
+        assert_eq!(loaded.revisions.len(), 2, "revision 1 is retained");
+        assert!(loaded.revision(&r1).is_some(), "revert-back is possible");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn annotations_sidecar_rejects_unsafe_slugs() {
+        let root = tmp();
+        let ws = WorkspaceCatalog::open(&root);
+        assert!(ws.read_annotations("../escape", "p").is_err());
+        assert!(ws
+            .write_annotations(
+                "../escape",
+                "p",
+                "abc",
+                crate::layout::SemanticAnnotations::default(),
+                "human",
+            )
+            .is_err());
+        assert!(ws.current_model_revision("../escape", "p").is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 }

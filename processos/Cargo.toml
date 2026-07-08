@@ -44,6 +44,12 @@ zip = { version = "6", default-features = false, features = ["deflate"] }
 # the repository `README.md` (single source of truth) by `build.rs`, which chunks
 # it on H2 headings and renders each section to HTML. Pinned to the offline-cached
 # release; `html` is the only feature we need (no getopts/simd).
+# Content-addressable revision keys for the annotations sidecar
+# (`workspaces/<ws>/processes/<proc>/annotations.json`) so accepted
+# semantic annotations survive across model revisions without a manual
+# version counter. sha2 is a small, well-vetted pure-Rust crate.
+sha2 = "0.10"
+
 [build-dependencies]
 pulldown-cmark = { version = "=0.13.3", default-features = false, features = ["html"] }
 
