@@ -12,6 +12,7 @@
 mod advisor;
 mod agent;
 mod analysis;
+mod annotations;
 mod bpmn_model;
 mod camunda_import;
 mod chat;
@@ -516,6 +517,10 @@ async fn main() {
         .route(
             "/api/workspaces/{workspace}/processes/{process}/model",
             get(ws_process_model).put(ws_set_process_model),
+        )
+        .route(
+            "/api/workspaces/{workspace}/processes/{process}/annotations",
+            get(ws_process_annotations).put(ws_set_process_annotations),
         )
         .route(
             "/api/workspaces/{workspace}/processes/{process}/insights",
@@ -1812,6 +1817,97 @@ async fn ws_set_process_model(
         Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
         Err(e) => unprocessable(e),
     }
+}
+
+/// `GET /api/workspaces/{workspace}/processes/{process}/annotations` — the
+/// semantic-annotation sidecar for a process, plus the current model's
+/// revision key so callers can tell whether the entry they're looking at
+/// still applies (see [`annotations`][crate::annotations] for the format
+/// and rationale).
+///
+/// Response body (always 200, even when the sidecar is empty — the model
+/// may have a valid revision key with no annotations yet):
+/// ```json
+/// {
+///   "revision": "<hex-sha256 of the current model.bpmn, or null when no model>",
+///   "sidecar": { "revisions": {…}, "current": "…" },
+///   "entry":   { "annotations": {…}, "provenance": "human", "updatedAt": "…" } | null
+/// }
+/// ```
+async fn ws_process_annotations(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let revision = state
+        .workspaces
+        .current_model_revision(&workspace, &process);
+    let sidecar = match state.workspaces.read_annotations(&workspace, &process) {
+        Ok(s) => s.unwrap_or_default(),
+        Err(e) => return unprocessable(e),
+    };
+    let entry = revision
+        .as_deref()
+        .and_then(|r| sidecar.revision(r).cloned());
+    Json(serde_json::json!({
+        "revision": revision,
+        "sidecar": sidecar,
+        "entry": entry,
+    }))
+    .into_response()
+}
+
+/// `PUT /api/workspaces/{workspace}/processes/{process}/annotations` — write
+/// (or replace) the sidecar entry for the *current* model revision. The
+/// revision key is computed server-side from `model.bpmn`, not accepted
+/// from the client, so a stale UI can't accidentally overwrite entries for
+/// the wrong bytes.
+///
+/// Request body:
+/// ```json
+/// {
+///   "annotations": { … SemanticAnnotations … },
+///   "provenance":  "human" | "inferred" | "mixed" | "llm"   // optional, default "human"
+/// }
+/// ```
+/// Response mirrors the GET shape.
+#[derive(Deserialize)]
+struct SetAnnotationsRequest {
+    annotations: layout::SemanticAnnotations,
+    #[serde(default)]
+    provenance: Option<String>,
+}
+
+async fn ws_set_process_annotations(
+    State(state): State<AppState>,
+    Path((workspace, process)): Path<(String, String)>,
+    Json(req): Json<SetAnnotationsRequest>,
+) -> impl IntoResponse {
+    let Some(revision) = state
+        .workspaces
+        .current_model_revision(&workspace, &process)
+    else {
+        return unprocessable(format!(
+            "process {workspace}/{process} has no model.bpmn to annotate"
+        ));
+    };
+    let provenance = req.provenance.as_deref().unwrap_or("human");
+    let sidecar = match state.workspaces.write_annotations(
+        &workspace,
+        &process,
+        &revision,
+        req.annotations,
+        provenance,
+    ) {
+        Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let entry = sidecar.revision(&revision).cloned();
+    Json(serde_json::json!({
+        "revision": revision,
+        "sidecar": sidecar,
+        "entry": entry,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Default, Deserialize)]
