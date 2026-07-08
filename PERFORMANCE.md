@@ -1351,3 +1351,32 @@ Three changes land the findings above (all in `server/src/main.rs`, `+` console/
 
 Tests: `active_backlog_cap_default_scales_and_clamps` added; full server unit suite
 (183) + clippy `--all-targets` clean.
+
+## 2026-07-08 (cont. 4) — LIVE VERIFICATION on the RF=3 cluster (new binary 8a45d06a)
+
+Deployed the fixed binary to all 3 nodes under `leader-durable` with the NEW
+defaults (activation env UNSET -> leader-local; admission as noted) and re-ran the
+MI=20000 point with 1Hz capture.
+
+| run | build / mode | tput/s | p50 | p90 | mean | steady active | actorOps/s | µs/op |
+|-----|--------------|-------:|----:|----:|-----:|--------------:|-----------:|------:|
+| pre-fix   | old, MI=20000, no admission | 18,119 | 247ms | 4379ms | 1989ms | 34,231 | 424,685 | 85 |
+| **verifyA** | **new, MI=20000, admission off** | **19,425** | **41ms** | 4245ms | 1377ms | 12,985 | 796,788 | 45 |
+| **verifyB** | **new, MI=20000, admission cap=4000/node** | **23,597** | **27ms** | **52ms** | **48ms** | ~757 (peak node ~4.9k) | — | — |
+
+Reads:
+- **Tick pre-check fix (verifyA vs pre-fix, same offered load):** the engine actor
+  sustains ~1.9× the ops/s (797k vs 425k) at ~half the per-op cost (45 vs 85µs) and
+  holds <½ the active backlog (13k vs 34k) — p50 latency 247 -> 41ms. The O(active)
+  actor scan is gone.
+- **Admission cap (verifyB):** an explicit per-node cap of 4,000 holds the ~23.6k/s
+  peak at p50 27ms / **p90 52ms** even under a 20k-inflight flood (vs p90 4,245ms
+  uncapped — ~80× lower). Peak single-node active stayed ~4.9k (the gate bites),
+  avg cluster active ~757. This is the proven congestion-collapse remedy.
+- **Lease-leak default:** the cluster booted and ran healthy under `leader-durable`
+  with `NANOBPMN_REPLICATE_ACTIVATION` UNSET (new default = leader-local) — no
+  freeze across all runs.
+
+Deploy note: the GCP nodes are Linux x86_64; a macOS build is an Exec-format-error
+there. Built the release binary natively on the loadbox (16-core x86_64) after
+`rustup` + `build-essential`, then fanned `nano-gw-new` out to the nodes.
