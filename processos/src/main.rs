@@ -1429,6 +1429,11 @@ const BPMN_EMBEDDED_CSS: &str = include_str!("../assets/bpmn/bpmn-embedded.css")
 /// Zeebe moddle descriptor, so the Workbench's bpmn-js Modeler binds `zeebe:` extension elements
 /// (e.g. `zeebe:taskDefinition`) and preserves them across an edit instead of dropping them.
 const BPMN_ZEEBE_MODDLE_JSON: &str = include_str!("../assets/bpmn/zeebe-moddle.json");
+/// Nano semantic-annotation moddle descriptor (ADR 0002 slice 4). Registers
+/// the `nano:*` extension namespace with the Workbench's bpmn-js Modeler so
+/// `nano:cost` / `nano:time` / `nano:role` / `nano:flowClass` elements
+/// round-trip across a Modeler save/load instead of being dropped.
+const BPMN_NANO_MODDLE_JSON: &str = include_str!("../assets/bpmn/nano-moddle.json");
 const SETTINGS_JS: &str = include_str!("../assets/settings.js");
 const THEME_CSS: &str = include_str!("../assets/theme.css");
 const THEME_JS: &str = include_str!("../assets/theme.js");
@@ -1710,6 +1715,7 @@ async fn bpmn_asset(Path(file): Path<String>) -> impl IntoResponse {
         "diagram-js.css" => (BPMN_DIAGRAM_CSS, "text/css; charset=utf-8"),
         "bpmn-embedded.css" => (BPMN_EMBEDDED_CSS, "text/css; charset=utf-8"),
         "zeebe-moddle.json" => (BPMN_ZEEBE_MODDLE_JSON, "application/json; charset=utf-8"),
+        "nano-moddle.json" => (BPMN_NANO_MODDLE_JSON, "application/json; charset=utf-8"),
         _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     (
