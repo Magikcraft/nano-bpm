@@ -273,6 +273,7 @@ async function viewProcess(workspace, process) {
     </p>
     <div class="btnrow">
       <a href="${cockpitUrl}"><button class="primary">Reason in cockpit →</button></a>
+      <a href="/semantics#/c/${encodeURIComponent(workspace)}/p/${encodeURIComponent(process)}"><button ${p.hasModel ? '' : 'disabled title="needs a model.bpmn"'}>Edit semantics →</button></a>
       <button id="load" ${p.binding === 'unbound' ? 'disabled' : ''}>Load insights</button>
     </div>
     ${p.hasModel ? `<h2>Process model</h2><div class="model" id="model"></div>` : '<p class="muted" style="margin-top:14px">No <code>model.bpmn</code> for this process yet.</p>'}

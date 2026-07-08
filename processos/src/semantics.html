@@ -1,0 +1,630 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Nano ProcessOS — Semantics Workbench</title>
+<link rel="stylesheet" href="/assets/theme.css" />
+<script src="/assets/theme.js"></script>
+<link rel="stylesheet" href="/assets/bpmn/diagram-js.css" />
+<link rel="stylesheet" href="/assets/bpmn/bpmn-embedded.css" />
+<style>
+  /*
+   * Semantics Workbench (slice 6 of ADR 0002) — a standalone editor for the
+   * annotations sidecar that slice 5 lands. Two-column layout: bpmn-js
+   * canvas on the left with a tab bar underneath (Flows / Costs & Times /
+   * Provenance), per-selection properties panel on the right. All values
+   * resolve through the design tokens in /assets/theme.css so light/dark
+   * behave consistently with the rest of the app.
+   */
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, sans-serif; background: var(--po-app); color: var(--po-text); }
+  a { color: inherit; text-decoration: none; }
+  .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  .rail { border-right: 1px solid var(--po-edge); padding: 18px 14px; background: var(--po-panel); }
+  .rail .brand { display: block; font-weight: 700; font-size: 16px; margin-bottom: 2px; }
+  .brand .dot { color: var(--po-accent-strong); }
+  .rail .tag { color: var(--po-text-faint); font-size: 11px; margin-bottom: 20px; display: block; }
+  .nav a { display: block; padding: 7px 10px; border-radius: 7px; color: var(--po-text-muted); font-weight: 500; margin-bottom: 2px; }
+  .nav a:hover { background: var(--po-hover); color: var(--po-text); }
+  .nav a.active { background: var(--po-hover); color: var(--po-accent-soft); }
+  main { padding: 20px 24px; min-width: 0; }
+  .crumbs { color: var(--po-text-faint); font-size: 12px; margin-bottom: 10px; }
+  .crumbs a { color: var(--po-accent-strong); cursor: pointer; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .lede { color: var(--po-text-muted); font-size: 13px; margin: 0 0 12px; max-width: 780px; }
+  h2 { font-size: 12px; color: var(--po-text-muted); text-transform: uppercase; letter-spacing: .06em; margin: 20px 0 8px; }
+  .muted { color: var(--po-text-faint); }
+  code { font-family: ui-monospace, monospace; color: var(--po-accent-soft); font-size: 12px; }
+  .err { color: var(--po-danger-soft); font-size: 13px; margin: 10px 0; }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--po-edge-strong); background: var(--po-hover); color: var(--po-text); padding: 6px 12px; }
+  button.primary { background: var(--po-accent); border-color: var(--po-accent); color: var(--po-on-accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button:not(:disabled):hover { filter: brightness(1.1); }
+  input, select, textarea { font: inherit; background: var(--po-inset); border: 1px solid var(--po-edge); color: var(--po-text); border-radius: 6px; padding: 4px 8px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .btnrow { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.inferred { background: var(--po-info-wash); color: var(--po-info-soft); }
+  .pill.human    { background: var(--po-ok-wash);   color: var(--po-ok-soft); }
+  .pill.mixed    { background: var(--po-hover);      color: var(--po-text-muted); }
+  .pill.llm      { background: var(--po-accent-wash, var(--po-hover)); color: var(--po-accent-soft); }
+
+  /* Two-column workbench. Grid gives the canvas + tab column all the room
+     it can take, then a fixed 340px selection panel on the right. */
+  .wb { display: grid; grid-template-columns: 1fr 340px; gap: 14px; align-items: start; }
+  .wb-canvas { background: #fbfbfd; border: 1px solid var(--po-edge); border-radius: 10px; height: 460px; overflow: hidden; }
+  .wb-canvas .djs-container { background: #fbfbfd; }
+  .wb-selpanel { background: var(--po-raised); border: 1px solid var(--po-edge); border-radius: 10px; padding: 12px 14px; position: sticky; top: 12px; }
+  .wb-selpanel h3 { margin: 0 0 6px; font-size: 13px; color: var(--po-accent-soft); }
+  .wb-selpanel .field { margin: 10px 0 4px; }
+  .wb-selpanel label { display: block; font-size: 11px; color: var(--po-text-muted); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+  .wb-selpanel select, .wb-selpanel input { width: 100%; }
+  .wb-selpanel .split { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .wb-selpanel .split-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .wb-selpanel .hint { color: var(--po-text-faint); font-size: 11px; margin-top: 4px; }
+
+  /* Tab strip below the canvas. */
+  .wb-tabs { border: 1px solid var(--po-edge); border-radius: 10px; overflow: hidden; background: var(--po-raised); }
+  .wb-tabbar { display: flex; border-bottom: 1px solid var(--po-edge); background: var(--po-inset); }
+  .wb-tabbar button { border: 0; background: transparent; padding: 8px 14px; border-radius: 0; color: var(--po-text-muted); font-weight: 500; border-bottom: 2px solid transparent; }
+  .wb-tabbar button.active { color: var(--po-accent-soft); border-bottom-color: var(--po-accent-strong); background: var(--po-raised); }
+  .wb-tabbody { padding: 12px 14px; min-height: 140px; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--po-edge); vertical-align: top; }
+  th { color: var(--po-text-faint); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
+  td .element-link { color: var(--po-accent-strong); cursor: pointer; font-family: ui-monospace, monospace; }
+  td .element-link:hover { text-decoration: underline; }
+
+  /* Save-with-diff modal. */
+  .modal-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal { background: var(--po-raised); border: 1px solid var(--po-edge-strong); border-radius: 12px; width: 88vw; max-width: 720px; max-height: 82vh; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { padding: 12px 16px; border-bottom: 1px solid var(--po-edge); display: flex; align-items: center; gap: 10px; }
+  .modal-body { padding: 12px 16px; overflow: auto; }
+  .modal-foot { padding: 10px 16px; border-top: 1px solid var(--po-edge); display: flex; justify-content: flex-end; gap: 8px; }
+  .diff { font: 11.5px/1.45 ui-monospace, monospace; }
+  .diff .add { color: var(--po-ok-soft); }
+  .diff .rem { color: var(--po-danger-soft); }
+  .diff .ctx { color: var(--po-text-muted); }
+  .diff pre { margin: 4px 0; padding: 6px 10px; background: var(--po-inset); border-radius: 6px; white-space: pre-wrap; }
+
+  /* Save status line + drift banner. */
+  .status { font-size: 12px; color: var(--po-text-muted); margin-left: 8px; }
+  .drift { background: var(--po-warn-wash, var(--po-inset)); border: 1px solid var(--po-warn, var(--po-edge)); color: var(--po-warn-soft, var(--po-text)); padding: 8px 12px; border-radius: 8px; font-size: 12.5px; margin: 8px 0 4px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <a class="brand" href="/">Nano Process<span class="dot">OS</span></a>
+    <span class="tag">the cockpit</span>
+    <nav class="nav">
+      <a href="/workspace">Workspaces</a>
+      <a href="/cockpit?view=processes">Processes</a>
+      <a href="/semantics" class="active">Semantics</a>
+      <a href="/cockpit?view=experiments">Experiments</a>
+      <a href="/cockpit?view=prompts">Prompts</a>
+      <a href="/cockpit?view=sidecars">LLMs</a>
+    </nav>
+    <div id="railTheme" style="margin-top:18px"></div>
+  </aside>
+  <main id="app">Loading…</main>
+</div>
+
+<script src="/assets/bpmn/bpmn-navigated-viewer.js"></script>
+<script>
+/*
+ * Semantics Workbench — ADR 0002, slice 6.
+ *
+ * Reads and writes the annotations sidecar (slice 5) for a single process,
+ * shown alongside its BPMN canvas. The three tabs (Flows / Costs & Times /
+ * Provenance) each read from a single in-memory `S` structure and dispatch
+ * back through `mutate()` so undo/save-with-diff can operate on one place.
+ */
+const $ = sel => document.querySelector(sel);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const ROLES = ['decision','review','notification','compensation','external'];
+
+// Everything the page needs — updated by loader + mutate(), read by render().
+const S = {
+  ws: null, proc: null,          // path context
+  process: null,                  // /api/workspaces/.../processes/... GETrsp
+  revision: null,                 // sha256 hex of the current model.bpmn
+  sidecar: null,                  // AnnotationsSidecar as loaded
+  loaded: null,                   // AnnotationRevision.annotations at load time (baseline for diff)
+  ann: emptyAnn(),                // working copy (what the user is editing)
+  provenance: 'inferred',          // provenance of the loaded entry, if any
+  loadedAt: null,                 // updatedAt of the loaded entry
+  tab: 'flows',
+  selection: null,                // { id, name, type } | null
+  modeler: null,                  // bpmn-js viewer
+  elements: [],                    // list of BPMN element {id, name, type} from bpmn-js
+  driftBanner: false,             // true when the sidecar's current entry is for a different revision
+};
+function emptyAnn(){ return { flows: [], clusters: [], roles: {}, costs: {}, times: {} }; }
+function deepClone(v){ return JSON.parse(JSON.stringify(v)); }
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if(!r.ok) throw new Error(body.error || (r.status+' '+r.statusText));
+  return body;
+}
+
+// ── Loader ──────────────────────────────────────────────────────────────
+async function load(ws, proc){
+  S.ws = ws; S.proc = proc;
+  $('#app').innerHTML = 'Loading…';
+  const base = `/api/workspaces/${encodeURIComponent(ws)}/processes/${encodeURIComponent(proc)}`;
+  try {
+    S.process = await api(base);
+  } catch(e){ $('#app').innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+
+  renderShell();
+  if(!S.process.hasModel){
+    $('#wbHost').innerHTML = '<p class="muted">This process has no <code>model.bpmn</code> yet. Send one from the cockpit or drop one on disk to annotate.</p>';
+    return;
+  }
+  await loadModelAndAnnotations(base);
+}
+
+async function loadModelAndAnnotations(base){
+  let xml, ann;
+  try { xml = await (await fetch(base+'/model')).text(); }
+  catch(e){ $('#wbHost').innerHTML = `<div class="err">could not load model.bpmn: ${esc(e.message||e)}</div>`; return; }
+  try { ann = await api(base+'/annotations'); }
+  catch(e){ $('#wbHost').innerHTML = `<div class="err">could not load annotations: ${esc(e.message||e)}</div>`; return; }
+
+  S.revision = ann.revision;
+  S.sidecar = ann.sidecar;
+  const entry = ann.entry;
+  // If there is no entry for the current model revision, seed from the
+  // structural + heuristic inference the layout endpoint performs. This
+  // gives the user a starting point rather than a blank slate — they can
+  // then keep, tweak, or drop items and save-with-diff to persist.
+  if(entry){
+    S.loaded = deepClone(entry.annotations);
+    S.ann = deepClone(entry.annotations);
+    S.provenance = entry.provenance || 'inferred';
+    S.loadedAt = entry.updatedAt || null;
+    S.driftBanner = false;
+  } else {
+    let inferred = emptyAnn();
+    try {
+      const seed = await api('/api/layout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ xml, solver: 'field' }),
+      });
+      inferred = normAnn(seed.annotations_used);
+    } catch(_){}
+    S.loaded = null; // nothing saved yet ⇒ every field is "add"
+    S.ann = deepClone(inferred);
+    S.provenance = 'inferred';
+    S.loadedAt = null;
+    // Show a heads-up when the sidecar has a `current` entry for a *different*
+    // revision — the user's model changed and the previous annotations may
+    // still be worth reviewing.
+    S.driftBanner = !!(S.sidecar && S.sidecar.current && S.sidecar.current !== S.revision);
+  }
+  await mountModeler(xml);
+  render();
+}
+
+function normAnn(a){
+  a = a || {};
+  return {
+    flows: Array.isArray(a.flows) ? a.flows : [],
+    clusters: Array.isArray(a.clusters) ? a.clusters : [],
+    roles: a.roles && typeof a.roles === 'object' ? a.roles : {},
+    costs: a.costs && typeof a.costs === 'object' ? a.costs : {},
+    times: a.times && typeof a.times === 'object' ? a.times : {},
+  };
+}
+
+// ── Shell ────────────────────────────────────────────────────────────────
+function renderShell(){
+  const p = S.process;
+  const wsName = esc(p.displayName || S.proc);
+  $('#app').innerHTML = `
+    <div class="crumbs">
+      <a onclick="location.href='/workspace'">Workspaces</a> /
+      <a onclick="location.href='/workspace#/c/${encodeURIComponent(S.ws)}'">${esc(S.ws)}</a> /
+      <a onclick="location.href='/workspace#/c/${encodeURIComponent(S.ws)}/p/${encodeURIComponent(S.proc)}'">${wsName}</a> /
+      Semantics
+    </div>
+    <h1>${wsName} — Semantics</h1>
+    <p class="lede">Curate the semantic annotations for this process's <code>model.bpmn</code>. Click a shape on the canvas to edit its role, cost, and time. Changes persist to the <code>annotations.json</code> sidecar keyed by the current model revision.</p>
+    <div class="btnrow">
+      <button class="primary" id="btnSave">💾 Save</button>
+      <button id="btnRevert" title="Discard local edits, reload the on-disk sidecar">Revert</button>
+      <span class="status" id="saveStatus"></span>
+    </div>
+    <div id="wbHost"></div>`;
+
+  $('#btnSave').onclick = openSaveDialog;
+  $('#btnRevert').onclick = revert;
+}
+
+async function mountModeler(xml){
+  $('#wbHost').innerHTML = `
+    ${S.driftBanner ? `<div class="drift">⚠︎ The sidecar's <code>current</code> entry is for a different model revision. Editing starts from the inferred baseline; saving records a new entry for the current revision (${esc((S.revision||'').slice(0,10))}…). Historic entries are kept.</div>` : ''}
+    <div class="wb">
+      <div>
+        <div class="wb-canvas" id="wbCanvas"></div>
+        <div class="wb-tabs" style="margin-top:12px">
+          <div class="wb-tabbar">
+            <button data-tab="flows"    class="active">Flows</button>
+            <button data-tab="costtime">Costs &amp; Times</button>
+            <button data-tab="prov">Provenance</button>
+          </div>
+          <div class="wb-tabbody" id="wbTabBody"></div>
+        </div>
+      </div>
+      <div class="wb-selpanel" id="wbSelPanel"><p class="muted">Click a shape on the canvas to edit its annotations.</p></div>
+    </div>`;
+
+  $$('#wbHost .wb-tabbar button').forEach(b => b.onclick = () => setTab(b.dataset.tab));
+
+  if(typeof BpmnJS === 'undefined'){
+    $('#wbCanvas').innerHTML = '<p class="err" style="padding:12px">bpmn-js viewer bundle unavailable</p>';
+    return;
+  }
+  try {
+    S.modeler = new BpmnJS({ container: $('#wbCanvas') });
+    await S.modeler.importXML(xml);
+    S.modeler.get('canvas').zoom('fit-viewport', 'auto');
+    S.elements = collectElements(S.modeler);
+    // Selection wiring — clicking a shape populates the right-hand panel.
+    S.modeler.get('eventBus').on('element.click', e => {
+      const el = e && e.element;
+      if(!el || el.type === 'label' || (el.type||'').indexOf('bpmn:') !== 0) return;
+      // Skip the SubProcess-parent-of-canvas root selection.
+      if(el.id && el.id.indexOf('_Plane') === -1 && el.type !== 'bpmn:Process' && el.type !== 'bpmn:Definitions'){
+        S.selection = { id: el.id, name: (el.businessObject && el.businessObject.name) || '', type: el.type };
+        renderSelPanel();
+      }
+    });
+  } catch(e){
+    $('#wbCanvas').innerHTML = `<p class="err" style="padding:12px">could not render model: ${esc(e.message||e)}</p>`;
+  }
+}
+
+const $$ = sel => Array.from(document.querySelectorAll(sel));
+
+function collectElements(modeler){
+  const registry = modeler.get('elementRegistry');
+  const out = [];
+  registry.forEach(el => {
+    const t = el.type || '';
+    if(!t.startsWith('bpmn:')) return;
+    if(t === 'bpmn:Process' || t === 'bpmn:Definitions' || t === 'bpmn:Collaboration' || t === 'label') return;
+    out.push({ id: el.id, name: (el.businessObject && el.businessObject.name) || '', type: t });
+  });
+  out.sort((a, b) => a.id.localeCompare(b.id));
+  return out;
+}
+
+// ── Render ───────────────────────────────────────────────────────────────
+function render(){
+  renderTab();
+  renderSelPanel();
+}
+
+function setTab(t){
+  S.tab = t;
+  $$('#wbHost .wb-tabbar button').forEach(b => b.classList.toggle('active', b.dataset.tab === t));
+  renderTab();
+}
+
+function renderTab(){
+  const host = $('#wbTabBody');
+  if(!host) return;
+  if(S.tab === 'flows') host.innerHTML = flowsTabHtml();
+  else if(S.tab === 'costtime') host.innerHTML = costTimeTabHtml();
+  else host.innerHTML = provenanceTabHtml();
+  // Delegate row-clicks on element ids to selection.
+  host.querySelectorAll('[data-el]').forEach(el =>
+    el.onclick = () => selectElementById(el.dataset.el));
+}
+
+function selectElementById(id){
+  const el = S.elements.find(e => e.id === id);
+  if(!el) return;
+  S.selection = el;
+  try { S.modeler.get('selection').select(S.modeler.get('elementRegistry').get(id)); } catch(_){}
+  renderSelPanel();
+}
+
+function flowsTabHtml(){
+  const flows = S.ann.flows || [];
+  if(!flows.length) return '<p class="muted">No named flows yet. Selecting a shape and choosing a flow kind will add one.</p>';
+  const rows = flows.map((f, i) => {
+    const kind = f.kind || 'primary';
+    const nodes = (f.nodes||[]).map(n => `<span class="element-link" data-el="${esc(n)}">${esc(n)}</span>`).join(', ');
+    return `<tr>
+      <td><code>${esc(f.id || 'flow_'+i)}</code></td>
+      <td><span class="pill inferred">${esc(kind)}</span></td>
+      <td>${nodes}</td>
+    </tr>`;
+  }).join('');
+  return `<table><thead><tr><th>id</th><th>kind</th><th>nodes</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function costTimeTabHtml(){
+  const ids = new Set([...Object.keys(S.ann.costs||{}), ...Object.keys(S.ann.times||{})]);
+  if(!ids.size) return '<p class="muted">No costs or times authored yet. Click a shape and add them from the right-hand panel.</p>';
+  const rows = Array.from(ids).sort().map(id => {
+    const c = (S.ann.costs||{})[id];
+    const t = (S.ann.times||{})[id];
+    const cellCost = c ? `${esc(c.value)}${c.currency?' '+esc(c.currency):''}${c.per?' / '+esc(c.per):''}` : '<span class="muted">—</span>';
+    const cellTime = t ? `p50 ${t.p50Ms??'—'}ms · p99 ${t.p99Ms??'—'}ms${t.source?' <span class="muted">('+esc(t.source)+')</span>':''}` : '<span class="muted">—</span>';
+    return `<tr><td><span class="element-link" data-el="${esc(id)}">${esc(id)}</span></td><td>${cellCost}</td><td>${cellTime}</td></tr>`;
+  }).join('');
+  return `<table><thead><tr><th>element</th><th>cost</th><th>time</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function provenanceTabHtml(){
+  const rev = S.revision || '(no model)';
+  const short = rev === '(no model)' ? rev : rev.slice(0, 16)+'…';
+  const rows = Object.entries((S.sidecar && S.sidecar.revisions) || {})
+    .sort((a,b) => (b[1].updatedAt||'').localeCompare(a[1].updatedAt||''))
+    .map(([r, e]) => `<tr>
+      <td><code>${esc(r.slice(0, 16))}…</code>${r===S.revision?' <span class="pill human">current</span>':''}</td>
+      <td><span class="pill ${esc(e.provenance||'inferred')}">${esc(e.provenance||'inferred')}</span></td>
+      <td>${esc(e.updatedAt||'—')}</td>
+    </tr>`).join('');
+  const loadedNote = S.loaded
+    ? `Loaded from sidecar entry stamped <code>${esc(S.loadedAt||'—')}</code> (provenance <span class="pill ${esc(S.provenance)}">${esc(S.provenance)}</span>).`
+    : `No sidecar entry for this revision yet. The workbench seeded the working copy from the inferred baseline; saving will create the first entry.`;
+  return `
+    <div style="margin-bottom:10px"><b>Current model revision:</b> <code>${esc(short)}</code></div>
+    <p class="muted">${loadedNote}</p>
+    <table><thead><tr><th>revision</th><th>provenance</th><th>updated</th></tr></thead><tbody>${rows || '<tr><td colspan="3" class="muted">— no revisions stored yet</td></tr>'}</tbody></table>`;
+}
+
+function renderSelPanel(){
+  const host = $('#wbSelPanel');
+  if(!host) return;
+  const sel = S.selection;
+  if(!sel){ host.innerHTML = '<p class="muted">Click a shape on the canvas to edit its annotations.</p>'; return; }
+
+  const id = sel.id;
+  const role = (S.ann.roles||{})[id] || '';
+  const cost = (S.ann.costs||{})[id] || null;
+  const time = (S.ann.times||{})[id] || null;
+  const flowsWith = (S.ann.flows||[]).filter(f => (f.nodes||[]).includes(id));
+
+  const roleOpts = ['<option value="">— none —</option>']
+    .concat(ROLES.map(r => `<option value="${r}"${r===role?' selected':''}>${r}</option>`))
+    .join('');
+
+  host.innerHTML = `
+    <h3>${esc(sel.name || sel.id)}</h3>
+    <div class="muted" style="font-size:11.5px">${esc(sel.type.replace('bpmn:',''))} · <code>${esc(sel.id)}</code></div>
+
+    <div class="field">
+      <label>Role</label>
+      <select id="fRole">${roleOpts}</select>
+    </div>
+
+    <div class="field">
+      <label>Cost</label>
+      <div class="split-3">
+        <input id="fCostVal" type="number" step="any" placeholder="value" value="${cost && cost.value != null ? esc(cost.value) : ''}">
+        <input id="fCostCcy" placeholder="USD" value="${esc((cost&&cost.currency)||'')}">
+        <input id="fCostPer" placeholder="per" value="${esc((cost&&cost.per)||'')}">
+      </div>
+      <div class="hint">value + optional currency + free-form unit (invocation, hour, month…)</div>
+    </div>
+
+    <div class="field">
+      <label>Time</label>
+      <div class="split">
+        <input id="fTimeP50" type="number" min="0" step="1" placeholder="p50 ms" value="${time && time.p50Ms != null ? esc(time.p50Ms) : ''}">
+        <input id="fTimeP99" type="number" min="0" step="1" placeholder="p99 ms" value="${time && time.p99Ms != null ? esc(time.p99Ms) : ''}">
+      </div>
+      <input id="fTimeSrc" placeholder="source (telemetry, sla, guess…)" value="${esc((time&&time.source)||'')}" style="margin-top:6px">
+    </div>
+
+    <div class="field">
+      <label>In flows</label>
+      <div class="muted" style="font-size:11.5px">${flowsWith.length ? flowsWith.map(f => `${esc(f.id)} <span class="pill inferred">${esc(f.kind||'primary')}</span>`).join(' · ') : '—'}</div>
+    </div>
+
+    <div class="btnrow" style="margin-top:12px">
+      <button class="primary" id="fApply">Apply</button>
+      <button id="fClear">Clear all</button>
+    </div>
+    <p class="hint">Apply updates the working copy. Nothing hits disk until you press Save.</p>`;
+
+  $('#fApply').onclick = () => applySelPanel(id);
+  $('#fClear').onclick = () => clearSel(id);
+}
+
+function applySelPanel(id){
+  const roleVal = $('#fRole').value;
+  const cVal = $('#fCostVal').value.trim();
+  const cCcy = $('#fCostCcy').value.trim();
+  const cPer = $('#fCostPer').value.trim();
+  const tP50 = $('#fTimeP50').value.trim();
+  const tP99 = $('#fTimeP99').value.trim();
+  const tSrc = $('#fTimeSrc').value.trim();
+
+  mutate(a => {
+    a.roles = a.roles || {}; a.costs = a.costs || {}; a.times = a.times || {};
+    if(roleVal) a.roles[id] = roleVal; else delete a.roles[id];
+    if(cVal !== ''){
+      const v = Number(cVal);
+      if(!isFinite(v)){ toast('cost value must be a number'); return; }
+      const c = { value: v };
+      if(cCcy) c.currency = cCcy;
+      if(cPer) c.per = cPer;
+      a.costs[id] = c;
+    } else { delete a.costs[id]; }
+    if(tP50 !== '' || tP99 !== '' || tSrc){
+      const t = {};
+      if(tP50 !== ''){ const n = Number(tP50); if(!Number.isInteger(n)||n<0){ toast('p50 must be a non-negative integer'); return; } t.p50Ms = n; }
+      if(tP99 !== ''){ const n = Number(tP99); if(!Number.isInteger(n)||n<0){ toast('p99 must be a non-negative integer'); return; } t.p99Ms = n; }
+      if(tSrc) t.source = tSrc;
+      if(Object.keys(t).length) a.times[id] = t; else delete a.times[id];
+    } else { delete a.times[id]; }
+  });
+  toast('applied — remember to Save');
+}
+
+function clearSel(id){
+  mutate(a => {
+    if(a.roles) delete a.roles[id];
+    if(a.costs) delete a.costs[id];
+    if(a.times) delete a.times[id];
+  });
+  renderSelPanel();
+  toast('cleared — remember to Save');
+}
+
+function mutate(fn){
+  const next = deepClone(S.ann);
+  fn(next);
+  S.ann = next;
+  renderTab();
+}
+
+function toast(msg){
+  const el = $('#saveStatus');
+  if(!el) return;
+  el.textContent = msg;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { if(el.textContent === msg) el.textContent = ''; }, 3500);
+}
+
+// ── Revert + Save ────────────────────────────────────────────────────────
+async function revert(){
+  const base = `/api/workspaces/${encodeURIComponent(S.ws)}/processes/${encodeURIComponent(S.proc)}`;
+  await loadModelAndAnnotations(base);
+  toast('reloaded from disk');
+}
+
+function openSaveDialog(){
+  const diff = computeDiff(S.loaded || emptyAnn(), S.ann);
+  const nothing = !diff.length;
+  const scrim = document.createElement('div');
+  scrim.className = 'modal-scrim';
+  scrim.innerHTML = `
+    <div class="modal">
+      <div class="modal-head">
+        <b>Save annotations</b>
+        <span class="muted">for revision <code>${esc((S.revision||'').slice(0, 16))}…</code></span>
+      </div>
+      <div class="modal-body">
+        <div class="row" style="margin-bottom:10px">
+          <label>Provenance</label>
+          <select id="dlgProv">
+            <option value="human" selected>human</option>
+            <option value="mixed">mixed</option>
+            <option value="inferred">inferred</option>
+            <option value="llm">llm</option>
+          </select>
+        </div>
+        ${nothing ? '<p class="muted">No changes since the last load. Saving now will re-stamp <code>updatedAt</code> and (optionally) change provenance.</p>' : `<div class="diff">${diff.map(diffBlockHtml).join('')}</div>`}
+      </div>
+      <div class="modal-foot">
+        <button id="dlgCancel">Cancel</button>
+        <button class="primary" id="dlgSave">${nothing ? 'Re-save' : 'Save'}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(scrim);
+  scrim.querySelector('#dlgCancel').onclick = () => scrim.remove();
+  scrim.addEventListener('click', e => { if(e.target === scrim) scrim.remove(); });
+  scrim.querySelector('#dlgSave').onclick = async () => {
+    const provenance = scrim.querySelector('#dlgProv').value;
+    const btn = scrim.querySelector('#dlgSave');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      const res = await api(`/api/workspaces/${encodeURIComponent(S.ws)}/processes/${encodeURIComponent(S.proc)}/annotations`, {
+        method: 'PUT',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ annotations: S.ann, provenance }),
+      });
+      // Refresh baseline from the server's response so subsequent diffs are
+      // relative to what actually landed on disk.
+      S.sidecar = res.sidecar;
+      S.revision = res.revision;
+      S.loaded = deepClone((res.entry && res.entry.annotations) || S.ann);
+      S.provenance = (res.entry && res.entry.provenance) || provenance;
+      S.loadedAt = (res.entry && res.entry.updatedAt) || null;
+      S.driftBanner = false;
+      scrim.remove();
+      render();
+      toast(`saved @ ${(res.revision||'').slice(0,8)}`);
+    } catch(e){
+      btn.disabled = false; btn.textContent = 'Save';
+      const foot = scrim.querySelector('.modal-foot');
+      const err = document.createElement('span'); err.className = 'err'; err.textContent = ' '+((e&&e.message)||e); err.style.marginRight = 'auto';
+      foot.prepend(err);
+    }
+  };
+}
+
+// ── Diff ────────────────────────────────────────────────────────────────
+// Reports each per-key delta in the three per-element maps (roles / costs /
+// times) plus a coarse-grained flows/clusters summary. Kept simple —
+// exhaustive per-flow diffs are noisy and slice 6 doesn't yet edit flows
+// from the panel, so a count-based summary is honest enough.
+function computeDiff(a, b){
+  const items = [];
+  diffMap('roles', a.roles || {}, b.roles || {}, items, v => String(v));
+  diffMap('costs', a.costs || {}, b.costs || {}, items, v => JSON.stringify(v));
+  diffMap('times', a.times || {}, b.times || {}, items, v => JSON.stringify(v));
+  const flowsBefore = (a.flows||[]).length, flowsAfter = (b.flows||[]).length;
+  if(flowsBefore !== flowsAfter) items.push({ head: 'flows', lines: [ctx(`count ${flowsBefore} → ${flowsAfter}`)] });
+  const clustersBefore = (a.clusters||[]).length, clustersAfter = (b.clusters||[]).length;
+  if(clustersBefore !== clustersAfter) items.push({ head: 'clusters', lines: [ctx(`count ${clustersBefore} → ${clustersAfter}`)] });
+  return items;
+}
+
+function diffMap(name, before, after, items, fmt){
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const lines = [];
+  Array.from(keys).sort().forEach(k => {
+    const inA = k in before, inB = k in after;
+    if(inA && inB && fmt(before[k]) !== fmt(after[k])){
+      lines.push(rem(`${k}: ${fmt(before[k])}`));
+      lines.push(add(`${k}: ${fmt(after[k])}`));
+    } else if(!inA && inB){
+      lines.push(add(`${k}: ${fmt(after[k])}`));
+    } else if(inA && !inB){
+      lines.push(rem(`${k}: ${fmt(before[k])}`));
+    }
+  });
+  if(lines.length) items.push({ head: name, lines });
+}
+const add = t => ({ kind:'add', text:t });
+const rem = t => ({ kind:'rem', text:t });
+const ctx = t => ({ kind:'ctx', text:t });
+function diffBlockHtml(item){
+  return `<div><b>${esc(item.head)}</b><pre>${item.lines.map(l => `<span class="${l.kind}">${l.kind==='add'?'+ ':l.kind==='rem'?'- ':'  '}${esc(l.text)}</span>`).join('\n')}</pre></div>`;
+}
+
+// ── Router + boot ────────────────────────────────────────────────────────
+function route(){
+  const h = location.hash.replace(/^#/, '');
+  const m = h.match(/^\/c\/([^/]+)\/p\/([^/]+)/);
+  if(m) return load(decodeURIComponent(m[1]), decodeURIComponent(m[2]));
+  const qs = new URLSearchParams(location.search);
+  const ws = qs.get('workspace'); const proc = qs.get('process');
+  if(ws && proc) return load(ws, proc);
+  $('#app').innerHTML = `
+    <h1>Semantics Workbench</h1>
+    <p class="lede">Pick a process to annotate. The workbench reads and writes <code>annotations.json</code> in the process folder.</p>
+    <p class="muted">Open a process from the <a href="/workspace" style="color:var(--po-accent-strong)">Workspaces</a> page, then click Semantics — or jump straight in via <code>#/c/&lt;workspace&gt;/p/&lt;process&gt;</code>.</p>`;
+}
+window.addEventListener('hashchange', route);
+route();
+
+if(window.poMountThemeToggle) poMountThemeToggle(document.getElementById('railTheme'));
+</script>
+</body>
+</html>

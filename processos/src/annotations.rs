@@ -240,4 +240,56 @@ mod tests {
         // 2026-07-08 → day 20642
         assert_eq!(civil_from_days(20642), (2026, 7, 8));
     }
+
+    #[test]
+    fn sidecar_round_trips_cost_and_time_annotations() {
+        // Slice 6: the Semantics Workbench authors per-element Cost and Time
+        // objects. Persisting them through the sidecar is exactly the shape
+        // the workbench sends over the wire, so this test doubles as a
+        // contract check for the /annotations endpoint payload.
+        use crate::layout::{Cost, Time};
+        let mut ann = SemanticAnnotations::default();
+        ann.costs.insert(
+            "Task_Review".into(),
+            Cost {
+                value: 0.42,
+                currency: Some("USD".into()),
+                per: Some("invocation".into()),
+            },
+        );
+        ann.times.insert(
+            "Task_Review".into(),
+            Time {
+                p50_ms: Some(1200),
+                p99_ms: Some(4800),
+                source: Some("telemetry".into()),
+            },
+        );
+        let mut side = AnnotationsSidecar::default();
+        side.upsert("rev1", ann, "human");
+
+        let json = serde_json::to_string(&side).unwrap();
+        let round: AnnotationsSidecar = serde_json::from_str(&json).unwrap();
+        let entry = round.revision("rev1").expect("revision persisted");
+        let cost = entry.annotations.costs.get("Task_Review").unwrap();
+        assert_eq!(cost.value, 0.42);
+        assert_eq!(cost.currency.as_deref(), Some("USD"));
+        assert_eq!(cost.per.as_deref(), Some("invocation"));
+        let time = entry.annotations.times.get("Task_Review").unwrap();
+        assert_eq!(time.p50_ms, Some(1200));
+        assert_eq!(time.p99_ms, Some(4800));
+        assert_eq!(time.source.as_deref(), Some("telemetry"));
+    }
+
+    #[test]
+    fn sidecar_parses_pre_slice6_documents_missing_cost_and_time() {
+        // Sidecars written by slice 5 don't have `costs`/`times` fields. The
+        // schema uses `#[serde(default, skip_serializing_if = "…is_empty")]`
+        // so old documents must load cleanly with empty maps.
+        let old = r#"{"revisions":{"r1":{"annotations":{"flows":[],"clusters":[],"roles":{}},"provenance":"human","updatedAt":"2026-07-08T00:00:00.000Z"}},"current":"r1"}"#;
+        let side: AnnotationsSidecar = serde_json::from_str(old).expect("legacy sidecar loads");
+        let entry = side.revision("r1").unwrap();
+        assert!(entry.annotations.costs.is_empty());
+        assert!(entry.annotations.times.is_empty());
+    }
 }

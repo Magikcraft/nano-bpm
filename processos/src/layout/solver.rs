@@ -101,6 +101,8 @@ mod tests {
             ],
             clusters: vec![],
             roles: Default::default(),
+            costs: Default::default(),
+            times: Default::default(),
         }
     }
 
@@ -154,6 +156,8 @@ mod tests {
                 affinity: 1.0,
             }],
             roles: Default::default(),
+            costs: Default::default(),
+            times: Default::default(),
         };
         let b = compute_row_bias(&a);
         let centroid = (0.0 + FlowKind::Exception.target_row()) / 2.0;
@@ -175,6 +179,8 @@ mod tests {
                 affinity: 0.0,
             }],
             roles: Default::default(),
+            costs: Default::default(),
+            times: Default::default(),
         };
         let b = compute_row_bias(&a);
         assert_eq!(b["N1"], 0.0);
