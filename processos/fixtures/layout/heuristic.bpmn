@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_heuristic"
+                  targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="HeuristicProcess" isExecutable="true">
+    <bpmn:startEvent id="Start_1">
+      <bpmn:outgoing>Flow_1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="ReviewApplication" name="Review application">
+      <bpmn:extensionElements><zeebe:taskDefinition type="review"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_1</bpmn:incoming>
+      <bpmn:outgoing>Flow_2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="CheckCreditBureau" name="Call external credit bureau API">
+      <bpmn:extensionElements><zeebe:taskDefinition type="http-call"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_2</bpmn:incoming>
+      <bpmn:outgoing>Flow_3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="SendConfirmationEmail" name="Send confirmation email">
+      <bpmn:extensionElements><zeebe:taskDefinition type="notify"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_3</bpmn:incoming>
+      <bpmn:outgoing>Flow_4</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="NotifyCustomer" name="Notify customer">
+      <bpmn:extensionElements><zeebe:taskDefinition type="notify"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_4</bpmn:incoming>
+      <bpmn:outgoing>Flow_5</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="ArchiveRecord" name="Archive record">
+      <bpmn:extensionElements><zeebe:taskDefinition type="archive"/></bpmn:extensionElements>
+      <bpmn:incoming>Flow_5</bpmn:incoming>
+      <bpmn:outgoing>Flow_6</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End_1">
+      <bpmn:incoming>Flow_6</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1"              targetRef="ReviewApplication"/>
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="ReviewApplication"    targetRef="CheckCreditBureau"/>
+    <bpmn:sequenceFlow id="Flow_3" sourceRef="CheckCreditBureau"    targetRef="SendConfirmationEmail"/>
+    <bpmn:sequenceFlow id="Flow_4" sourceRef="SendConfirmationEmail" targetRef="NotifyCustomer"/>
+    <bpmn:sequenceFlow id="Flow_5" sourceRef="NotifyCustomer"       targetRef="ArchiveRecord"/>
+    <bpmn:sequenceFlow id="Flow_6" sourceRef="ArchiveRecord"        targetRef="End_1"/>
+  </bpmn:process>
+</bpmn:definitions>
