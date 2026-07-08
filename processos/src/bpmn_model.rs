@@ -1353,6 +1353,350 @@ pub(crate) fn parse_element_names(xml: &str) -> HashMap<String, String> {
     names
 }
 
+// ── Slice 4 (ADR 0002): nano:* extension preservation across re-emission ────────
+//
+// The serialiser reconstructs BPMN from the parsed `ProcessDefinition`, and
+// engine-core deliberately keeps no state for extension elements outside a
+// small hand-picked set (zeebe:taskDefinition, zeebe:ioMapping, …). Anything
+// under `<bpmn:extensionElements>` from an unknown namespace — the whole
+// `nano:*` semantic-annotation namespace this ADR introduces, and anything
+// else authored by a tool we don't know about — silently disappears on the
+// next re-serialisation. That's the loss we're closing here.
+//
+// Approach: a pair of pure-string helpers over the retained source XML
+// (`ProcessDefinition::xml` is exactly this — the original bytes as parsed,
+// kept for round-trip purposes). We scan the source for every
+// `<bpmn:extensionElements>` block and record, per element id, the raw XML
+// of every `nano:*` (or configurably any unknown-namespace) child element.
+// After the serialiser has emitted its fresh XML we splice those fragments
+// back into the emitted `<extensionElements>` blocks — creating one if the
+// element didn't previously have any known extensions — and ensure the
+// definitions root declares the `nano` namespace.
+//
+// Being a post-pass on emitted text has two important properties: it never
+// touches engine-core (this slice is scoped to `processos`) and it degrades
+// safely to a no-op when the source is empty (fresh models authored
+// programmatically) or contains no `nano:*` content.
+
+/// The canonical namespace URI for `nano:*` semantic-annotation extensions
+/// per ADR 0002.
+pub const NANO_NAMESPACE_URI: &str = "http://nano.camunda.io/schema/semantic/1.0";
+
+/// Parse `xml` for `nano:*` extension children of `<bpmn:extensionElements>`
+/// and return a map from *owning-element id* to the concatenated raw XML of
+/// those children (verbatim, indentation-agnostic — we re-indent on inject).
+///
+/// The owning element is the nearest ancestor with an `id=` attribute at the
+/// same nesting position as the `<extensionElements>` block (that is, its
+/// parent). This is a lightweight XML scan — no full parser — because the
+/// serialiser we're pairing with is also lightweight and BPMN documents in
+/// this codebase are small.
+pub(crate) fn extract_nano_extensions(xml: &str) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    // A stack of open elements: (id, whether we already recorded a nano
+    // block for this element). We only ever need the id of the immediate
+    // parent of a `<bpmn:extensionElements>` block.
+    let mut open_ids: Vec<Option<String>> = Vec::new();
+    let bytes = xml.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip past any content that isn't a tag start.
+        let Some(rel) = xml[i..].find('<') else { break };
+        let start = i + rel;
+        // Comments / declarations / CDATA — skip whole span.
+        if xml[start..].starts_with("<!--") {
+            match xml[start..].find("-->") {
+                Some(k) => {
+                    i = start + k + 3;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if xml[start..].starts_with("<![CDATA[") {
+            match xml[start..].find("]]>") {
+                Some(k) => {
+                    i = start + k + 3;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if xml[start..].starts_with("<?") || xml[start..].starts_with("<!") {
+            match xml[start..].find('>') {
+                Some(k) => {
+                    i = start + k + 1;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let Some(grel) = xml[start..].find('>') else {
+            break;
+        };
+        let end = start + grel;
+        let inner = &xml[start + 1..end];
+        i = end + 1;
+
+        if let Some(name) = inner.strip_prefix('/') {
+            // Closing tag: pop the matching open. We only track ids so it's
+            // fine if names aren't validated — a mismatched document would
+            // fail to parse anyway.
+            let _ = name;
+            open_ids.pop();
+            continue;
+        }
+        let self_closing = inner.ends_with('/');
+        let inner_trim = if self_closing {
+            inner.trim_end_matches('/').trim_end()
+        } else {
+            inner
+        };
+        let local_name = inner_trim
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or(inner_trim);
+
+        // If this is an <extensionElements> open tag, look at its content
+        // (from `end + 1` to the matching close) and pull out every
+        // top-level `nano:*` child.
+        if local_name.ends_with(":extensionElements") || local_name == "extensionElements" {
+            if self_closing {
+                continue;
+            }
+            let owner = open_ids.iter().rev().find_map(|o| o.clone());
+            if let Some(owner_id) = owner {
+                let close_tag_needle = format!("</{local_name}>");
+                if let Some(k) = xml[i..].find(&close_tag_needle) {
+                    let block = &xml[i..i + k];
+                    let mut buf = String::new();
+                    collect_nano_children(block, &mut buf);
+                    if !buf.is_empty() {
+                        out.entry(owner_id).or_default().push_str(&buf);
+                    }
+                    // Consume everything up to (but not including) the
+                    // closing tag; the outer loop will handle the close.
+                    i += k;
+                    continue;
+                }
+            }
+            // No id in scope, or no close tag found — treat as opaque open
+            // and let the normal scan continue (an id will not be needed
+            // for its content).
+            open_ids.push(None);
+            continue;
+        }
+
+        if !self_closing {
+            let id = tag_attr(inner_trim, "id");
+            open_ids.push(id);
+        }
+    }
+    out
+}
+
+/// Walk the interior of an `<extensionElements>` block and append every
+/// top-level `nano:*` child element (in source form) to `buf`.
+fn collect_nano_children(block: &str, buf: &mut String) {
+    let mut i = 0usize;
+    while i < block.len() {
+        let Some(rel) = block[i..].find('<') else {
+            break;
+        };
+        let start = i + rel;
+        if block[start..].starts_with("<!--") {
+            match block[start..].find("-->") {
+                Some(k) => {
+                    i = start + k + 3;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        let Some(grel) = block[start..].find('>') else {
+            break;
+        };
+        let end = start + grel;
+        let inner = &block[start + 1..end];
+        i = end + 1;
+        if inner.starts_with('/') {
+            continue;
+        }
+        let local_name = inner
+            .trim_end_matches('/')
+            .trim_end()
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("");
+        if !local_name.starts_with("nano:") {
+            // Skip past a non-nano element and its close (if any).
+            if !inner.ends_with('/') {
+                let close_needle = format!("</{local_name}>");
+                if let Some(k) = block[i..].find(&close_needle) {
+                    i += k + close_needle.len();
+                }
+            }
+            continue;
+        }
+        // Capture the nano element and its content up to the matching close.
+        if inner.ends_with('/') {
+            buf.push_str(&block[start..end + 1]);
+            buf.push('\n');
+        } else {
+            let close_needle = format!("</{local_name}>");
+            if let Some(k) = block[i..].find(&close_needle) {
+                let element_end = i + k + close_needle.len();
+                buf.push_str(&block[start..element_end]);
+                buf.push('\n');
+                i = element_end;
+            } else {
+                // Malformed — bail on this element.
+                break;
+            }
+        }
+    }
+}
+
+/// Post-process `emitted` XML to splice preserved `nano:*` extensions back
+/// into the corresponding `<bpmn:extensionElements>` blocks, creating one
+/// per element that has extensions but no emitted `<extensionElements>`,
+/// and ensuring the definitions root declares `xmlns:nano`.
+///
+/// Returns `emitted` unchanged when `extensions` is empty.
+pub(crate) fn preserve_nano_extensions_in(
+    emitted: String,
+    extensions: &HashMap<String, String>,
+) -> String {
+    if extensions.is_empty() {
+        return emitted;
+    }
+    let mut out = ensure_nano_namespace(emitted);
+    // Splice per element id. We do a simple find-and-replace against the
+    // opening tag with `id="<id>"`, which is unambiguous because BPMN ids
+    // are unique within a document.
+    for (id, fragment) in extensions {
+        let needle_id = format!("id=\"{}\"", xml_escape_attr(id));
+        let Some(open_start) = out.find(&needle_id) else {
+            continue;
+        };
+        // Walk backwards from the id attribute to find the '<' that opens
+        // the element; forwards to find its '>'.
+        let Some(lt_offset) = out[..open_start].rfind('<') else {
+            continue;
+        };
+        let Some(gt_offset_rel) = out[open_start..].find('>') else {
+            continue;
+        };
+        let open_end = open_start + gt_offset_rel;
+        let open_tag = &out[lt_offset..=open_end];
+        let self_closing = open_tag.ends_with("/>");
+        let local_name = open_tag[1..]
+            .trim_end_matches("/>")
+            .trim_end_matches('>')
+            .trim_end()
+            .split_ascii_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if local_name.is_empty() {
+            continue;
+        }
+
+        let indent = "        "; // Inside an <extensionElements> block.
+        let indented_fragment = fragment
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| format!("{indent}{}\n", l.trim()))
+            .collect::<String>();
+
+        if self_closing {
+            // Convert self-closing to open+close and insert a fresh
+            // <extensionElements> with just the nano block.
+            let replacement = format!(
+                "{}>\n      <bpmn:extensionElements>\n{}      </bpmn:extensionElements>\n    </{}>",
+                &open_tag[..open_tag.len() - 2].trim_end(),
+                indented_fragment,
+                local_name
+            );
+            out.replace_range(lt_offset..=open_end, &replacement);
+            continue;
+        }
+
+        // Non-self-closing: find the matching close.
+        let close_needle = format!("</{local_name}>");
+        let search_from = open_end + 1;
+        let Some(close_rel) = out[search_from..].find(&close_needle) else {
+            continue;
+        };
+        let close_start = search_from + close_rel;
+        let interior = &out[search_from..close_start];
+
+        // If there's already an <extensionElements> block, splice the nano
+        // fragment before its closing tag. Otherwise create a fresh one
+        // right after the element's opening tag.
+        if let Some(ext_rel) = interior.find("<bpmn:extensionElements") {
+            let ext_open_start = search_from + ext_rel;
+            let Some(ext_open_gt_rel) = out[ext_open_start..].find('>') else {
+                continue;
+            };
+            let ext_open_end = ext_open_start + ext_open_gt_rel;
+            // Self-closing <bpmn:extensionElements/> -> expand.
+            if out[ext_open_start..=ext_open_end].ends_with("/>") {
+                let replacement = format!(
+                    "<bpmn:extensionElements>\n{}      </bpmn:extensionElements>",
+                    indented_fragment
+                );
+                out.replace_range(ext_open_start..=ext_open_end, &replacement);
+                continue;
+            }
+            let ext_close_needle = "</bpmn:extensionElements>";
+            let Some(ext_close_rel) = out[ext_open_end + 1..].find(ext_close_needle) else {
+                continue;
+            };
+            let ext_close_start = ext_open_end + 1 + ext_close_rel;
+            out.insert_str(ext_close_start, &indented_fragment);
+        } else {
+            let insertion = format!(
+                "\n      <bpmn:extensionElements>\n{}      </bpmn:extensionElements>",
+                indented_fragment
+            );
+            out.insert_str(open_end + 1, &insertion);
+        }
+    }
+    out
+}
+
+/// Add `xmlns:nano="…"` to the `<bpmn:definitions>` open tag if it isn't
+/// already declared. Idempotent — repeated invocations don't accumulate.
+fn ensure_nano_namespace(mut xml: String) -> String {
+    if xml.contains("xmlns:nano=") {
+        return xml;
+    }
+    let Some(open_start) = xml.find("<bpmn:definitions") else {
+        return xml;
+    };
+    let Some(gt_rel) = xml[open_start..].find('>') else {
+        return xml;
+    };
+    let insertion_point = open_start + "<bpmn:definitions".len();
+    xml.insert_str(
+        insertion_point,
+        &format!(" xmlns:nano=\"{NANO_NAMESPACE_URI}\""),
+    );
+    // Silence unused warning if the compiler can't prove the tag was closed.
+    let _ = gt_rel;
+    xml
+}
+
+/// Escape a string for use inside an XML attribute value delimited by `"`.
+/// Kept separate from [`xml_escape`] because attribute values need `"`
+/// escaped as well.
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('"', "&quot;")
+}
+
 /// Turn a machine id into a readable label: strip a leading kind prefix (`Task_`, `Gateway_`,
 /// `Event_`, `Activity_`, `Flow_`…), then split camelCase / snake_case / kebab-case / digit runs
 /// into Title-Cased words. `CreditCheck` -> "Credit Check", `verify_kyc` -> "Verify Kyc",
@@ -2079,7 +2423,9 @@ pub fn definition_to_xml_labeled(
     def: &ProcessDefinition,
     overrides: &HashMap<String, String>,
 ) -> String {
-    serialize_definition(def, overrides, None, None)
+    let emitted = serialize_definition(def, overrides, None, None);
+    let extensions = extract_nano_extensions(&def.xml);
+    preserve_nano_extensions_in(emitted, &extensions)
 }
 
 /// Like [`definition_to_xml_labeled`], but when `di_source` (the original XML the model was read
@@ -2094,7 +2440,13 @@ pub fn definition_to_xml_preserving_di(
     di_source: Option<&str>,
 ) -> String {
     let di = di_source.and_then(extract_preserved_di);
-    serialize_definition(def, overrides, di.as_ref(), None)
+    let emitted = serialize_definition(def, overrides, di.as_ref(), None);
+    // Prefer the DI source for nano:* preservation when the caller supplied
+    // one (that's the "the customer's authored file" input the DI lens is
+    // designed around); fall back to the retained ProcessDefinition.xml.
+    let source_for_ext = di_source.unwrap_or(&def.xml);
+    let extensions = extract_nano_extensions(source_for_ext);
+    preserve_nano_extensions_in(emitted, &extensions)
 }
 
 /// Auto-layout serializer that additionally accepts a `row_bias` map from the
@@ -2107,7 +2459,9 @@ pub fn definition_to_xml_with_row_bias(
     overrides: &HashMap<String, String>,
     row_bias: &HashMap<String, f64>,
 ) -> String {
-    serialize_definition(def, overrides, None, Some(row_bias))
+    let emitted = serialize_definition(def, overrides, None, Some(row_bias));
+    let extensions = extract_nano_extensions(&def.xml);
+    preserve_nano_extensions_in(emitted, &extensions)
 }
 
 fn serialize_definition(
@@ -4263,5 +4617,107 @@ mod tests {
             err.contains("Process02DocumentRequest"),
             "lists known ids: {err}"
         );
+    }
+
+    // ── Slice 4 (ADR 0002): nano:* extension round-trip ─────────────────────────
+
+    const NANO_BPMN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:nano="http://nano.camunda.io/schema/semantic/1.0">
+  <bpmn:process id="Proc" isExecutable="true">
+    <bpmn:startEvent id="Start"><bpmn:outgoing>F1</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="Credit" name="Credit check">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="credit"/>
+        <nano:cost value="0.50" currency="USD" per="invocation"/>
+        <nano:time p50="2s" p99="8s"/>
+        <nano:role>external</nano:role>
+      </bpmn:extensionElements>
+      <bpmn:incoming>F1</bpmn:incoming>
+      <bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="End"><bpmn:incoming>F2</bpmn:incoming></bpmn:endEvent>
+    <bpmn:sequenceFlow id="F1" sourceRef="Start" targetRef="Credit"/>
+    <bpmn:sequenceFlow id="F2" sourceRef="Credit" targetRef="End"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[test]
+    fn extract_nano_extensions_captures_all_nano_children() {
+        let ext = extract_nano_extensions(NANO_BPMN);
+        let block = ext.get("Credit").expect("Credit task has nano extensions");
+        assert!(block.contains("<nano:cost"), "captured nano:cost: {block}");
+        assert!(block.contains("<nano:time"), "captured nano:time: {block}");
+        assert!(
+            block.contains("<nano:role>external</nano:role>"),
+            "captured nano:role with content: {block}"
+        );
+        // The zeebe:taskDefinition sibling must NOT be captured — that's the
+        // engine parser's territory.
+        assert!(
+            !block.contains("taskDefinition"),
+            "did not capture zeebe children: {block}"
+        );
+    }
+
+    #[test]
+    fn extract_nano_extensions_returns_empty_for_a_model_without_nano() {
+        let ext = extract_nano_extensions(LOAN_BPMN);
+        assert!(
+            ext.is_empty(),
+            "no nano:* content in loan fixture, got {:?}",
+            ext.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn definition_to_xml_labeled_preserves_nano_extensions_across_round_trip() {
+        let def = parse_bpmn(NANO_BPMN)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        let emitted = definition_to_xml_labeled(&def, &HashMap::new());
+        assert!(
+            emitted.contains("xmlns:nano="),
+            "definitions root re-declares nano namespace: {emitted}"
+        );
+        assert!(
+            emitted.contains("<nano:cost value=\"0.50\""),
+            "nano:cost survives the round trip: {emitted}"
+        );
+        assert!(
+            emitted.contains("<nano:time p50=\"2s\""),
+            "nano:time survives: {emitted}"
+        );
+        assert!(
+            emitted.contains("<nano:role>external</nano:role>"),
+            "nano:role with text content survives: {emitted}"
+        );
+        // The re-emitted document must still parse as valid BPMN.
+        let redef = parse_bpmn(&emitted).expect("re-parse");
+        assert_eq!(redef.len(), 1);
+    }
+
+    #[test]
+    fn definition_to_xml_with_row_bias_preserves_nano_extensions() {
+        let def = parse_bpmn(NANO_BPMN)
+            .expect("parse")
+            .into_iter()
+            .next()
+            .expect("one process");
+        let out = definition_to_xml_with_row_bias(&def, &HashMap::new(), &HashMap::new());
+        assert!(
+            out.contains("<nano:cost"),
+            "row-bias emit preserves nano:cost"
+        );
+        assert!(out.contains("<nano:role>external</nano:role>"));
+    }
+
+    #[test]
+    fn preserve_nano_extensions_in_is_a_no_op_when_map_is_empty() {
+        let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &HashMap::new());
+        assert_eq!(same, "<bpmn:definitions/>");
     }
 }

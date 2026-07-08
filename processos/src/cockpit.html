@@ -3595,7 +3595,7 @@ if(!window.__modelCardsWired){
 // A bpmn-js Modeler canvas bound to the open investigation. The human-edited model is a
 // first-class variant: validated by the same deterministic gate the agent uses, then simulated /
 // compared against the SAME recorded dataset, landing in the Simulations tab tagged by provenance.
-const WB = { modeler: null, ws: null, proc: null, prov: 'you', zeebe: null, debounce: null, deployable: false, busy: false };
+const WB = { modeler: null, ws: null, proc: null, prov: 'you', zeebe: null, nano: null, debounce: null, deployable: false, busy: false };
 
 function wbBase(){
   return '/api/workspaces/'+encodeURIComponent(WB.ws)+'/processes/'+encodeURIComponent(WB.proc)+
@@ -3612,7 +3612,13 @@ async function openWorkbench(ws, proc){
     try {
       if(!WB.zeebe){ WB.zeebe = await (await fetch('/assets/bpmn/zeebe-moddle.json')).json(); }
     } catch(_){ WB.zeebe = null; }
-    WB.modeler = new BpmnModeler({ container: $('#wbCanvas'), moddleExtensions: WB.zeebe ? { zeebe: WB.zeebe } : {} });
+    try {
+      if(!WB.nano){ WB.nano = await (await fetch('/assets/bpmn/nano-moddle.json')).json(); }
+    } catch(_){ WB.nano = null; }
+    const moddleExtensions = {};
+    if(WB.zeebe) moddleExtensions.zeebe = WB.zeebe;
+    if(WB.nano) moddleExtensions.nano = WB.nano;
+    WB.modeler = new BpmnModeler({ container: $('#wbCanvas'), moddleExtensions });
     WB.modeler.on('commandStack.changed', () => wbScheduleValidate());
     wbWireToolbar();
     await wbNewDiagram();

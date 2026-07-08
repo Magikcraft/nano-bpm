@@ -1,0 +1,116 @@
+{
+  "name": "nano",
+  "prefix": "nano",
+  "uri": "http://nano.camunda.io/schema/semantic/1.0",
+  "xml": {
+    "tagAlias": "lowerCase"
+  },
+  "associations": [],
+  "types": [
+    {
+      "name": "Cost",
+      "superClass": [
+        "Element"
+      ],
+      "meta": {
+        "allowedIn": [
+          "bpmn:ServiceTask",
+          "bpmn:BusinessRuleTask",
+          "bpmn:ScriptTask",
+          "bpmn:SendTask",
+          "bpmn:UserTask",
+          "bpmn:CallActivity"
+        ]
+      },
+      "properties": [
+        {
+          "name": "value",
+          "type": "String",
+          "isAttr": true
+        },
+        {
+          "name": "currency",
+          "type": "String",
+          "isAttr": true,
+          "default": "USD"
+        },
+        {
+          "name": "per",
+          "type": "String",
+          "isAttr": true,
+          "default": "invocation"
+        }
+      ]
+    },
+    {
+      "name": "Time",
+      "superClass": [
+        "Element"
+      ],
+      "meta": {
+        "allowedIn": [
+          "bpmn:ServiceTask",
+          "bpmn:BusinessRuleTask",
+          "bpmn:ScriptTask",
+          "bpmn:SendTask",
+          "bpmn:UserTask",
+          "bpmn:CallActivity"
+        ]
+      },
+      "properties": [
+        {
+          "name": "p50",
+          "type": "String",
+          "isAttr": true
+        },
+        {
+          "name": "p99",
+          "type": "String",
+          "isAttr": true
+        },
+        {
+          "name": "source",
+          "type": "String",
+          "isAttr": true
+        }
+      ]
+    },
+    {
+      "name": "Role",
+      "superClass": [
+        "Element"
+      ],
+      "meta": {
+        "allowedIn": [
+          "bpmn:FlowNode"
+        ]
+      },
+      "properties": [
+        {
+          "name": "text",
+          "isBody": true,
+          "type": "String"
+        }
+      ]
+    },
+    {
+      "name": "FlowClass",
+      "superClass": [
+        "Element"
+      ],
+      "meta": {
+        "allowedIn": [
+          "bpmn:SequenceFlow"
+        ]
+      },
+      "properties": [
+        {
+          "name": "text",
+          "isBody": true,
+          "type": "String"
+        }
+      ]
+    }
+  ],
+  "enumerations": []
+}
