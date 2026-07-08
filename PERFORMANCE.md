@@ -1149,3 +1149,62 @@ deterministic, non-flaky guard that a future change cannot silently put an
 allocation on the flat-activation hot path. Steady-state throughput A/B (flat
 workloads) is therefore expected to be unchanged; the released cluster soaks
 above ran on the flat path and show no regression.
+
+---
+
+## 2026-07-08 — The sustained-load "completion-freeze" is NOT the engine actor (instrumented + probed)
+
+Earlier notes above attributed the RF=3 sustained-load throughput ceiling — under
+any load ≥~10k/s, completions decelerate to **0** after ~3–4 min — to the
+**single-writer engine actor (Deepthi) serial apply lane**. Direct instrumentation
+of that actor, shipped to the live cluster and observed across a reproduced freeze,
+**disproves that hypothesis** and repoints at the Raft/stream transport.
+
+### What was instrumented (commit `7032663`)
+Per-partition, lock-free `deepthi::ActorStats` (alive / jobs_total / current_job_ms
+/ hi_depth / lo_depth) with an `AliveGuard` drop-guard that fires on clean exit
+**or** panic-unwind, plus a global panic hook logging thread/location/payload/
+backtrace via `tracing`. Exposed as `nanobpm_actor_*` gauges sampled ~1 Hz in the
+monitor loop. Discriminator by design: `alive=0` ⇒ actor DEAD (panic/exit);
+`alive=1` + jobs frozen + `current_job_ms` climbing ⇒ WEDGED in one job;
+`alive=1` + all flat + depth 0 ⇒ IDLE (stall is upstream of the actor).
+
+### What the freeze actually showed
+Reproduced a freeze under a closed-loop soak (`MAX_INFLIGHT=20000`). At the freeze,
+on every node:
+- **`nanobpm_actor_alive=1`, `current_job_ms=0`, `hi_depth=0`, `lo_depth=0`, yet
+  `actor_jobs_total` STILL CLIMBING (~160/s).** ⇒ the actor is **alive, idle, and
+  fast** — servicing activate-polls that return empty. Not DEAD, not WEDGED, not
+  starved. The "IDLE (stall upstream)" arm of the discriminator.
+- `commit_inflight=0` on all nodes; `raft_log_entries` ~33.8k and **balanced**
+  across the three nodes (logs not diverged).
+
+### The decisive probe (server has spare capacity during the "freeze")
+A manual REST round-trip against the leader **during the freeze**:
+- `createProcessInstance` → **HTTP 200 in 6 ms**
+- `activateJobs` → returns a fresh job immediately
+- job completion → **HTTP 204 in 2.8 ms**
+
+The full create→activate→complete pipeline is healthy and *fast* while the
+closed-loop stream load reads 0 completions. The engine is not the bottleneck; it
+is >50% idle with headroom to spare at the exact moment throughput reads zero.
+
+### Where the stall actually is
+Node journals during the freeze are flooded with openraft **`AppendEntries timeout
+after 250 ms`**, **bidirectionally between all peers** (0↔1, 0↔2, 1↔2), while the
+`type="raft"` stream-frame counter is nearly stalled (~21/s vs thousands of client
+frames). Inter-node Raft replication has **collapsed under sustained load**, and the
+closed-loop loadgen then deadlocks downstream (producer pinned at `MAX_INFLIGHT`
+awaiting completions that never arrive; stream workers hold leased jobs and go
+silent; the liveness reaper removes them ~10 min later — an effect, not a cause).
+
+**Reframed verdict.** The sustained-load completion-freeze is a **Raft/stream
+transport failure, not a Deepthi serial-apply-lane failure.** Parallelizing the
+engine actor would not have fixed it. The open root-cause question is now: *why do
+AppendEntries RPCs time out at 250 ms under load?* — leading candidates: the
+inter-node Raft transport starved / head-of-line-blocked behind client frames on
+the shared falcon stream, follower apply-lane ack latency, or a 250 ms deadline
+that is simply too tight for a 12-partition (4 leader + 8 follower replicas/node)
+Raft fan-out at load. That is where the next debugging round should focus. The
+`7032663` observability is a keeper regardless: it converted a silent, ambiguous
+"actor stall" into a decisively falsified hypothesis.
