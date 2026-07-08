@@ -1,62 +1,86 @@
-//! **Semantic annotation inference (slice 1)** — derive a [`SemanticAnnotations`]
-//! sidecar from the BPMN structure alone, so the [`layout::Solver::RowBias`]
-//! and [`layout::Solver::Field`] renderers have real bands to spread nodes
-//! across even when nobody authored annotations by hand.
+//! **Semantic annotation inference (slices 1 & 2)** — derive a
+//! [`SemanticAnnotations`] sidecar from the BPMN structure alone, so the
+//! [`crate::layout::Solver::RowBias`] and [`crate::layout::Solver::Field`]
+//! renderers have real bands / role hints / clusters to work with even when
+//! nobody authored annotations by hand.
 //!
 //! The demo case that motivated this pass authored a loan-approval variant,
 //! ran it through the Fromme renderer, and saw a flat line — because the LLM
 //! authoring the variant had emitted zero annotations and both solvers
 //! defaulted every node to the primary band. See ADR 0002 for the pipeline
-//! this fits into; this module is *slice 1*'s structural-only pass.
+//! this fits into.
 //!
-//! # What we infer today
+//! # Inference passes
 //!
-//! From the parsed [`ProcessDefinition`] we recover, deterministically:
+//! [`infer_from_xml`] runs three deterministic passes in order and merges
+//! their outputs into a single [`SemanticAnnotations`]:
 //!
-//! * A **primary flow** by tracing from `start_event` through every
-//!   non-gateway element's single outgoing flow, and taking each exclusive
-//!   gateway's `is_default` outgoing (or its first outgoing if none is
-//!   marked default). Parallel gateways contribute every outgoing branch to
-//!   the primary flow. The trace terminates at every `EndEvent` it reaches
-//!   and refuses to visit a node twice, so cycles cannot wedge it.
-//! * An **exception flow** per interrupting boundary event
-//!   (error / timer / message / signal / conditional). Everything reachable
-//!   downstream of the boundary becomes a member of that flow. Boundary
-//!   events themselves join their flow so the diagram's exception band picks
-//!   them up cleanly.
-//! * **Role hints**: `ExclusiveGateway → decision`, `UserTask → review`.
-//!   Everything else stays unlabelled — the layout solver only uses roles
-//!   for colour cues on the debug SVG, so under-labelling is safe.
+//! 1. **Structural** ([`infer`], slice 1): tracing from `start_event` through
+//!    every non-gateway element's outgoing flows and each exclusive
+//!    gateway's `is_default` (or first) outgoing yields the *primary flow*.
+//!    Every interrupting boundary event (error / timer / message / signal /
+//!    conditional) seeds an *exception flow* spanning everything reachable
+//!    downstream. `ExclusiveGateway → decision`, `UserTask → review`.
+//! 2. **Heuristic** ([`heuristic_roles_and_clusters`], slice 2): name and
+//!    `jobType` regex matching upgrades tasks to
+//!    [`Role::Notification`] (`notify|send.?email|send.?sms|escalate`),
+//!    [`Role::External`] (`external|api|http|remote|third.?party`), and
+//!    refines [`Role::Review`] on service/user tasks whose name mentions
+//!    review-like verbs (`review|verify|manual|approve|check|inspect`). Any
+//!    `ServiceTask.job_type` shared by two or more tasks becomes a
+//!    [`Cluster`] so the field solver draws them together.
+//! 3. **Merge** ([`merge`]): a supplied (LLM- or human-authored) sidecar is
+//!    layered over the inferred one per non-empty field, so any explicit
+//!    annotation wins over inference without the caller needing per-field
+//!    emptiness checks.
 //!
 //! # What we deliberately leave for later slices
 //!
-//! * Cluster inference (sub-process / call-activity / shared-jobType) —
-//!   these belong on the reader-scoped sidecar in the ADR's model, not on
-//!   the model-authored side we're bootstrapping here.
-//! * Name-heuristic classification of tasks as `notification` / `external`
-//!   — cheap, but wants the raw XML for `<bpmn:task name="…">`. Slice 2's
-//!   full module will fold it in alongside the telemetry pass.
+//! * Telemetry-source overrides for time / variance defaults (slice 2 in
+//!   ADR 0002 mentions this, but the [`SemanticAnnotations`] schema doesn't
+//!   yet carry cost / time — that's slice 4's `nano:*` extension work).
 //! * Escalation and compensation flow classes — Nano's engine surface
-//!   doesn't model dedicated escalation / compensation boundary events
-//!   today, so there's nothing structural to key on. Reintroduce when the
-//!   engine grows them.
+//!   doesn't yet model dedicated escalation / compensation boundary events.
+//! * Provenance / confidence per annotation — slice 5/6 workbench feature.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{ElementKind, ProcessDefinition};
 
-use crate::layout::schema::{AnnotatedFlow, FlowKind, Role, SemanticAnnotations};
+use crate::bpmn_model::parse_element_names;
+use crate::layout::schema::{AnnotatedFlow, Cluster, FlowKind, Role, SemanticAnnotations};
 
-/// Run the structural inference pass against `def` and return the resulting
-/// [`SemanticAnnotations`]. Pure function of the process definition — no
-/// telemetry, no LLM, no naming heuristics — so every call on the same input
-/// returns the same output.
+/// Run every inference pass against `xml` and return the resulting
+/// [`SemanticAnnotations`], degrading to an empty sidecar if the XML fails
+/// to parse. This is the entry point [`crate::layout`] callers should use.
+pub fn infer_from_xml(xml: &str) -> SemanticAnnotations {
+    let Ok(defs) = parse_bpmn(xml) else {
+        return SemanticAnnotations::default();
+    };
+    let Some(def) = defs.into_iter().next() else {
+        return SemanticAnnotations::default();
+    };
+    let names = parse_element_names(xml);
+    let mut ann = infer(&def);
+    let (roles, clusters) = heuristic_roles_and_clusters(&def, &names);
+    // Heuristic roles override the structural default (a `ServiceTask`
+    // classified as `notification` beats the structural pass's silence);
+    // this is intentional — the heuristic pass has strictly more signal.
+    for (id, role) in roles {
+        ann.roles.insert(id, role);
+    }
+    ann.clusters = clusters;
+    ann
+}
+
+/// Run the structural inference pass against `def` alone. Pure function of
+/// the process definition — no telemetry, no LLM, no naming heuristics — so
+/// every call on the same input returns the same output.
 ///
-/// The returned annotations are deliberately conservative: they only claim
-/// nodes the structure makes obvious. Everything else stays unclassified so
-/// the layout solver treats it as primary by default (which matches the
-/// pre-inference behaviour, so overlaying inference on a model that has
-/// no boundary events is a no-op).
+/// Callers that want the full inference should use [`infer_from_xml`]; this
+/// entry point exists mainly for the slice-1 tests and any future caller
+/// that only has a [`ProcessDefinition`] in hand.
 pub fn infer(def: &ProcessDefinition) -> SemanticAnnotations {
     let mut ann = SemanticAnnotations::default();
     if let Some(primary) = trace_primary(def) {
@@ -189,6 +213,115 @@ fn infer_roles(def: &ProcessDefinition) -> std::collections::BTreeMap<String, Ro
         }
     }
     roles
+}
+
+/// Slice-2 heuristic pass. Walks tasks and applies substring rules against
+/// each element's lowercased name and (for `ServiceTask`) `job_type` to
+/// upgrade [`Role::Notification`] / [`Role::External`] / [`Role::Review`],
+/// and groups every `ServiceTask` sharing a `job_type` into a [`Cluster`].
+///
+/// Returns `(roles, clusters)` — the caller decides how to fold roles into
+/// the structural output (today: overwriting). Everything here is pure
+/// substring matching (no regex crate) so slice 2 introduces no new
+/// dependency.
+fn heuristic_roles_and_clusters(
+    def: &ProcessDefinition,
+    names: &HashMap<String, String>,
+) -> (BTreeMap<String, Role>, Vec<Cluster>) {
+    let mut roles: BTreeMap<String, Role> = BTreeMap::new();
+    // job_type → list of element ids sharing that type. We build it while
+    // walking so we don't traverse the process twice.
+    let mut by_job_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for el in def.elements.values() {
+        let name_lc = names
+            .get(&el.id)
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        let (job_type_lc, job_type_raw) = match &el.kind {
+            ElementKind::ServiceTask { job_type, .. } => (job_type.to_lowercase(), Some(job_type)),
+            _ => (String::new(), None),
+        };
+        if let Some(jt) = job_type_raw {
+            by_job_type
+                .entry(jt.clone())
+                .or_default()
+                .push(el.id.clone());
+        }
+        // Match against the combined haystack so a service task named
+        // "Send confirmation email" with job_type="notify-email" is caught
+        // by either signal.
+        let haystack = format!("{name_lc} {job_type_lc}");
+        if let Some(role) = classify_role(&haystack, &el.kind) {
+            roles.insert(el.id.clone(), role);
+        }
+    }
+    // Only emit clusters when the job_type is genuinely shared (2+ tasks) —
+    // a singleton cluster would just add a phantom attractor with itself
+    // as its only member.
+    let mut clusters: Vec<Cluster> = by_job_type
+        .into_iter()
+        .filter(|(_, ids)| ids.len() >= 2)
+        .map(|(jt, mut ids)| {
+            ids.sort(); // Determinism across HashMap iteration orders.
+            Cluster {
+                id: format!("cluster.{jt}"),
+                nodes: ids,
+                affinity: 0.5,
+            }
+        })
+        .collect();
+    clusters.sort_by(|a, b| a.id.cmp(&b.id));
+    (roles, clusters)
+}
+
+/// Apply the substring rules to a lowercased `haystack` (name + jobType)
+/// and return the resulting [`Role`], or `None` when the heuristic has no
+/// opinion. Notification / external win over review because a task named
+/// "Send review reminder" is more usefully banded as a notification.
+fn classify_role(haystack: &str, kind: &ElementKind) -> Option<Role> {
+    if is_notification(haystack) {
+        return Some(Role::Notification);
+    }
+    if is_external(haystack) {
+        return Some(Role::External);
+    }
+    if is_review(haystack) {
+        return Some(Role::Review);
+    }
+    // Preserve the structural default for user tasks even when nothing in
+    // the name matches, so we never *demote* a user task by classifying it.
+    if matches!(kind, ElementKind::UserTask(_)) {
+        return Some(Role::Review);
+    }
+    None
+}
+
+fn is_notification(h: &str) -> bool {
+    h.contains("notify")
+        || h.contains("notification")
+        || h.contains("escalate")
+        || (h.contains("send") && (h.contains("email") || h.contains("sms") || h.contains("mail")))
+}
+
+fn is_external(h: &str) -> bool {
+    h.contains("external")
+        || h.contains("http")
+        || h.contains("remote")
+        || h.contains("third-party")
+        || h.contains("third party")
+        || h.contains("thirdparty")
+        // "api" would match "capital" or "apiary"; match it only as a
+        // whole word or hyphen-separated token.
+        || h.split(|c: char| !c.is_alphanumeric()).any(|w| w == "api")
+}
+
+fn is_review(h: &str) -> bool {
+    h.contains("review")
+        || h.contains("verify")
+        || h.contains("manual")
+        || h.contains("approve")
+        || h.contains("approval")
+        || h.contains("inspect")
 }
 
 /// Merge a `structural` inferred annotation set with a `supplied` one, letting
@@ -351,5 +484,111 @@ mod tests {
             assert_eq!(fa.nodes, fb.nodes);
         }
         assert_eq!(a.roles, b.roles);
+    }
+
+    // ------------------- slice 2: heuristic + cluster passes -------------------
+
+    const HEURISTIC_XML: &str = include_str!("../../fixtures/layout/heuristic.bpmn");
+
+    #[test]
+    fn heuristic_classifies_notification_external_and_review_tasks() {
+        let ann = infer_from_xml(HEURISTIC_XML);
+        assert_eq!(
+            ann.roles.get("SendConfirmationEmail").copied(),
+            Some(Role::Notification),
+            "'Send confirmation email' should be a notification role, got roles={:?}",
+            ann.roles
+        );
+        assert_eq!(
+            ann.roles.get("NotifyCustomer").copied(),
+            Some(Role::Notification),
+            "'Notify customer' should be a notification role"
+        );
+        assert_eq!(
+            ann.roles.get("CheckCreditBureau").copied(),
+            Some(Role::External),
+            "'Call external credit bureau API' should be external"
+        );
+        assert_eq!(
+            ann.roles.get("ReviewApplication").copied(),
+            Some(Role::Review),
+            "'Review application' should be review"
+        );
+        // ArchiveRecord has no matching name/jobType heuristic and isn't a
+        // gateway or user task — it stays unclassified.
+        assert!(
+            !ann.roles.contains_key("ArchiveRecord"),
+            "ArchiveRecord should remain unclassified, got {:?}",
+            ann.roles.get("ArchiveRecord")
+        );
+    }
+
+    #[test]
+    fn heuristic_notification_beats_review_when_name_overlaps() {
+        // A "Send review reminder" service task is more usefully banded as
+        // notification than as review — classify_role's ordering enforces
+        // that; regression-test it.
+        let role = classify_role(
+            "send review reminder email",
+            &ElementKind::ServiceTask {
+                job_type: "notify".into(),
+                priority: None,
+            },
+        );
+        assert_eq!(role, Some(Role::Notification));
+    }
+
+    #[test]
+    fn heuristic_external_matches_api_as_a_word_not_substring() {
+        // "capital" contains "api" as a substring but is not an external
+        // call; is_external must not fire on it.
+        assert!(!is_external("collect capital reserves"));
+        assert!(is_external("call external api"));
+        assert!(is_external("post to remote http endpoint"));
+        assert!(is_external("send to third-party service"));
+    }
+
+    #[test]
+    fn cluster_groups_shared_job_types_and_ignores_singletons() {
+        let ann = infer_from_xml(HEURISTIC_XML);
+        // Fixture has two `notify` service tasks and one each of `review`,
+        // `http-call`, `archive`; only `notify` should produce a cluster.
+        assert_eq!(
+            ann.clusters.len(),
+            1,
+            "one shared-jobType cluster expected, got {:?}",
+            ann.clusters.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+        let notify = &ann.clusters[0];
+        assert_eq!(notify.id, "cluster.notify");
+        assert_eq!(
+            notify.nodes,
+            vec![
+                "NotifyCustomer".to_string(),
+                "SendConfirmationEmail".to_string()
+            ],
+            "cluster nodes are sorted for determinism"
+        );
+        assert_eq!(notify.affinity, 0.5);
+    }
+
+    #[test]
+    fn infer_from_xml_is_deterministic_across_runs() {
+        let a = infer_from_xml(HEURISTIC_XML);
+        let b = infer_from_xml(HEURISTIC_XML);
+        assert_eq!(a.roles, b.roles);
+        assert_eq!(a.clusters.len(), b.clusters.len());
+        for (ca, cb) in a.clusters.iter().zip(b.clusters.iter()) {
+            assert_eq!(ca.id, cb.id);
+            assert_eq!(ca.nodes, cb.nodes);
+        }
+    }
+
+    #[test]
+    fn infer_from_xml_degrades_gracefully_on_parse_failure() {
+        let ann = infer_from_xml("<not-bpmn/>");
+        assert!(ann.flows.is_empty());
+        assert!(ann.roles.is_empty());
+        assert!(ann.clusters.is_empty());
     }
 }
