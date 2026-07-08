@@ -963,6 +963,7 @@ async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
             "bpmn_xml": out.bpmn_xml,
             "debug_svg": out.debug_svg,
             "solver": req.solver,
+            "annotations_used": ann,
         }))
         .into_response(),
         Err(e) => (
