@@ -1208,3 +1208,146 @@ that is simply too tight for a 12-partition (4 leader + 8 follower replicas/node
 Raft fan-out at load. That is where the next debugging round should focus. The
 `7032663` observability is a keeper regardless: it converted a silent, ambiguous
 "actor stall" into a decisively falsified hypothesis.
+
+---
+
+## 2026-07-08 (cont.) — ROOT CAUSE FOUND: raft-coupled activation lease-leak
+
+The transport reframe above was half the story. The HOL fix `7d78b21` (spawn the
+inbound `ClientFrame::Raft` dispatch instead of awaiting it inline in `reader_loop`)
+was deployed and **did** unstick the raft lane — raft stream-frames went from ~21/s
+to ~1428/s — **but the completion-freeze reproduced identically anyway.** So the
+250 ms AppendEntries timeouts were a *symptom* of a downstream stall, not the cause.
+
+### The decisive A/B
+With the HOL fix in place, the *only* variable changed was activation coupling:
+
+| variable | `REPLICATE_ACTIVATION=1` (default) | `REPLICATE_ACTIVATION=0` (leader-local) |
+|---|---|---|
+| completions at ~9 min | **0/s (frozen)** | **14,410/s (holding)** |
+| active_backlog | pinned at 60,001, frozen | ~20k/node, flowing |
+| admission_shed | 0 | 0 |
+
+Same binary (`110381033f95864e`), same closed-loop loadgen (3× `MAX_INFLIGHT=20000`,
+200 workers, stream transport), same cluster. Flipping activation from a Raft
+proposal to a leader-local lock made the collapse **vanish** and throughput hold
+sustained past the ~4-min mark where it had frozen every prior run.
+
+### Mechanism (lease-leak)
+Under `replicate_activation=true`, **every** worker activation is a Raft
+`ActivateJobs` proposal (`try_activate` → `activate_on_raft`, main.rs:7706) that
+LOCKS the leased jobs. Those locks are ephemeral, leader-only, and never
+journaled/exported. During ramp, dispatch leases jobs via raft faster than workers
+receive+complete them; when a worker's outbound channel fills, `send_job` drops
+already-locked jobs → the lease leaks. Reclaim (`ExpireJobs`) is *also* a raft tick
+on the same commit lane and cannot keep pace. The activatable pool drains
+monotonically to 0 → permanent starvation. Meanwhile `activate_on_raft` **silently
+returns empty on any propose error** (main.rs:7731-7732), so the freeze is invisible
+in the read model (jobs show `state:"Created", worker:null` even while locked).
+Leader-local activation (`activate_on_local`, main.rs:7688) locks directly on the
+leader without a quorum round-trip and uses lenient follower completion, so
+activation is never gated on the partition's commit budget and cannot leak this way.
+
+### Fix direction
+Make `replicate_activation=0` the default under `leader-durable` replication (the
+completion path is already lenient there), OR bound leases to available outbound
+room so dispatch never leases a job it cannot deliver, OR make lease reclaim
+leader-local + fast. A locked/leaked-lease gauge would make this observable — none
+exists today, so the leak was inferred from the A/B, not directly measured.
+
+The keeper commits from this arc: `9744685` (actor liveness observability),
+`7d78b21` (raft inbound HOL fix — real transport win regardless), and this finding.
+
+## 2026-07-08 (cont. 2) — CONGESTION COLLAPSE is the real ceiling (1Hz DuckDB time-series)
+
+Built a 1Hz Prometheus scraper (`/tmp/prom-scrape.sh`, all 3 nodes → long-format
+`ts_ms,node,metric,labels,value` CSV) + a DuckDB analysis harness
+(`session-state/.../files/promts.py`: counter rates via LAG, gauge summaries,
+histogram avg-latency from Δsum/Δcount, knee detection). This replaced the broken
+in-soak sampler (`soakclh.log` was garbage — `s+: syntax error`, used a nonexistent
+create metric), which is why the ceiling had looked "flat" before.
+
+### Finding: the saturation ceiling is NOT flat — it is congestion collapse
+Time-series of two fresh 10-min instrumented soaks (mode-0 replicate_activation=0,
+mode-1 =1) plus a decisive `MAX_INFLIGHT` sweep overturned the "flat ceiling" framing.
+
+**Steady-state congestion curve (sec 60–170 avg, same binary `110381033f95864e`,
+same closed-loop loadgen, only MAX_INFLIGHT/node varied):**
+
+| MAX_INFLIGHT/node | completions/s | actorOps/s | active | µs per actor-op |
+|------------------:|--------------:|-----------:|-------:|----------------:|
+| 1,000  | 23,016 | 997,749 | 569    | 36  |
+| 4,000  | 23,380 | 976,505 | 602    | 37  |
+| 20,000 | 16,329 | 228,288 | 44,860 | 158 |
+
+Latency (loadgen p50/p90): MI=1000 → 23ms/—; MI=4000 → 25ms/—;
+MI=20000 → 247ms / 4,379ms (and sinks further to ~14k/s @ ~3.9s p50 over a full
+10-min run as `active` keeps climbing to the ~58k cap).
+
+**Mechanism — the engine actor's per-command cost is O(active).** As the active set
+grows 569 → 44,860 (79×), cost-per-actor-op grows 36µs → 158µs (4.4×), so actorOps/s
+collapses 998k → 228k (−77%) and completion throughput falls 23k → 16k (−29%). This is
+a runaway negative feedback loop: active↑ → per-op cost↑ → throughput↓ → active↑,
+which drives the system to the in-flight cap.
+
+**Ruled out** (all measured, not inferred):
+- Durability lane: `commit_wait` avg 85µs (clean) → 30µs (congested) — *faster* when
+  slower; the raft commit path is not the bottleneck.
+- Memory: 19–37GB of the 54GB watermark, climbs smoothly through the knee, zero
+  shedding events.
+- Raft transport: balanced log entries, `commit_inflight`≈0 in mode-0.
+
+**Prime code suspect for O(active):** `engine-core/src/engine/mod.rs` `Command::ActivateJobs`
+walk (~L811–854): designed O(max_jobs) but the `job_activatable` `.filter(...).take(max_jobs)`
+degrades to O(scan depth) when the activatable-index front fills with locked/expiring
+jobs — not yet proven with scan-depth instrumentation.
+
+### Two distinct phenomena, now cleanly separated
+1. **Congestion collapse (both modes)** — the real ceiling above. Fix = admission
+   control on the *active/in-flight* backlog (not just the create queue), holding the
+   cluster left of the knee (~few thousand active/node) to keep it at its ~23k/s peak;
+   secondary = fix the O(active) activatable scan if confirmed.
+2. **Raft-coupled activation lease-leak (mode-1 only)** — the hard freeze, fixed by
+   `replicate_activation=0` (prior section). Under mode-1, active climbs monotonically
+   from t=0 and hard-freezes at ~60k (comp=0, actor churns futile ~1,500 ops/s).
+   `replicate_activation=0` removes the FREEZE but not the congestion ceiling.
+
+### Actionable conclusion
+Bounding in-flight recovers **+41% throughput (16.3k → 23.4k/s) and ~170× lower p50
+latency (3.9s → 23ms)** vs the unbounded cap. The sweet spot is broad — anything
+keeping cluster active below ~12k holds ~23k/s. Add admission control on active
+in-flight backlog to pin the system at its peak.
+
+## 2026-07-08 (cont. 3) — FIXES SHIPPED for congestion collapse + lease-leak
+
+Three changes land the findings above (all in `server/src/main.rs`, `+` console/config):
+
+1. **Tick pre-check no longer O(active).** `tick_partition_via_raft`'s per-tick
+   `jobs_due` gate scanned `state.jobs.values()` (every job in the backlog) every
+   ~500ms on the single-writer engine actor per led partition — an O(active) walk
+   that starves activation/completion as the backlog grows. Replaced with an
+   O(activated) walk over the `activated_jobs` index (only `Activated` jobs hold a
+   lease deadline, and `ExpireJobs` already reclaims exactly that set), so the gate
+   is bounded by concurrently-leased jobs, not total backlog.
+
+2. **Active-backlog admission is on by default (adaptive backstop).**
+   `NANOBPMN_ADMISSION_MAX_BACKLOG` now auto-derives a generous per-node cap from
+   the detected memory limit (`active_backlog_cap_default_from_limit`, clamped
+   `[50k, 1M]`), latency-SLA-mode only, env-overridable (explicit number, or
+   `off`). This self-protects against an unbounded active runaway / OOM out of the
+   box. It is a *safety* backstop above typical parked populations — to pin the
+   ~23k/s throughput peak, set an explicit lower cap at the knee (a few
+   thousand/node), which the sweep showed recovers +41% throughput and ~170× lower
+   p50 latency.
+
+3. **`replicate_activation` defaults to leader-local under `leader-durable`.**
+   The raft-coupled activation lease-leak (phenomenon 2) only occurs when
+   activation is a per-job Raft proposal. Under `leader-durable` replication the
+   tier already acks leader-locally with lenient follower completion, so
+   replicating activation adds only a lease-leaking quorum proposal. The default is
+   now mode-dependent: leader-local (`false`) under `leader-durable`, fully
+   replicated (`true`) under `quorum` (unchanged, node-loss-durable). Force with
+   `NANOBPMN_REPLICATE_ACTIVATION=1` when failover must honor in-flight leases.
+
+Tests: `active_backlog_cap_default_scales_and_clamps` added; full server unit suite
+(183) + clippy `--all-targets` clean.

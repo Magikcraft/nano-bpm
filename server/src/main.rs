@@ -371,9 +371,9 @@ impl ServerImpl {
         // engine places message subscriptions on the partition owning their
         // correlation key (`hash(correlation_key)`). With a single partition this
         // is `1`, so placement stays local and behaviour is unchanged.
-        let replicate_activation = replicate_activation_from_env();
-        let lease_digest = lease_digest_from_env();
         let replication_mode = replication_mode_from_env();
+        let replicate_activation = replicate_activation_from_env(replication_mode);
+        let lease_digest = lease_digest_from_env();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
             // Leader-local activation mode: replicas must accept a replicated
@@ -1306,14 +1306,23 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
     )
 }
 
-/// Whether the job activation lock is replicated through Raft. `true` (the
-/// default) keeps the original fully-replicated lifecycle. Setting
-/// `NANOBPMN_REPLICATE_ACTIVATION=0` (or `false`/`off`/`no`) makes the lock
-/// leader-local: activation and lock-expiry stay off the Raft log, so each job
-/// costs 2 quorum commits instead of 3 and per-worker activation commits stop
-/// fragmenting the per-partition commit budget. Replicas then run with lenient
-/// completion so a replicated completion applies without having seen the
+/// Whether the job activation lock is replicated through Raft. When set,
+/// `NANOBPMN_REPLICATE_ACTIVATION` is honored explicitly: `1`/`true`/`on`/`yes`
+/// keeps the fully-replicated lifecycle; `0`/`false`/`off`/`no`/`digest` makes
+/// the lock leader-local, so activation and lock-expiry stay off the Raft log —
+/// each job costs 2 quorum commits instead of 3 and per-worker activation commits
+/// stop fragmenting the per-partition commit budget. Replicas then run with
+/// lenient completion so a replicated completion applies without having seen the
 /// activation. No effect without Raft (single node / RF=1).
+///
+/// DEFAULT (env unset) is mode-dependent: under `leader-durable` replication the
+/// default is leader-local (`false`), because that tier already acks on the leader
+/// alone with lenient follower completion — replicating activation there only adds
+/// a per-job quorum proposal that LOCKS jobs faster than they complete under
+/// sustained load, leaking leases until the activatable pool drains to zero and
+/// completions freeze (proven by the 2026-07-08 A/B; see PERFORMANCE.md). Under
+/// `quorum` replication the default stays fully-replicated (`true`) to preserve
+/// the node-loss-durable lease semantics every existing benchmark validates.
 ///
 /// DURABILITY TRADE-OFF: the lease (`Activated`/`worker`/`deadline`) then lives
 /// ONLY in the leader's in-memory engine — it is NOT durable and does NOT survive
@@ -1323,9 +1332,9 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
 /// the replicated lease deadline to expire. Both modes are at-least-once (jobs
 /// must be idempotent); this mode merely widens the failover redelivery window to
 /// "immediate". Durable PROGRESS (create/complete/fail/throw/timers) is still
-/// fully replicated. Prefer the default for workloads that need failover to honor
-/// in-flight lease deadlines; opt in for throughput-bound, idempotent workloads.
-fn replicate_activation_from_env() -> bool {
+/// fully replicated. Set `NANOBPMN_REPLICATE_ACTIVATION=1` to force the replicated
+/// lease under leader-durable when failover must honor in-flight lease deadlines.
+fn replicate_activation_from_env(replication_mode: ReplicationMode) -> bool {
     match std::env::var("NANOBPMN_REPLICATE_ACTIVATION")
         .ok()
         .as_deref()
@@ -1334,7 +1343,10 @@ fn replicate_activation_from_env() -> bool {
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no" | "digest"
         ),
-        None => true,
+        // Leader-durable already acks leader-locally with lenient follower
+        // completion; replicating activation there leaks leases under load. Quorum
+        // keeps the durable replicated lease.
+        None => !matches!(replication_mode, ReplicationMode::LeaderDurable),
     }
 }
 
@@ -1433,21 +1445,72 @@ struct ReceivedDigest {
     leases: Vec<(u64, u64)>,
 }
 
-/// Resolves the active-instance-backlog admission limit, or `0` (off) by default.
+/// Resolves the active-instance-backlog admission limit, or `0` (off).
 ///
 /// `NANOBPMN_ADMISSION_MAX_BACKLOG=<n>` caps the number of active (created-but-not-
-/// terminal) instances: once the backlog reaches `n`, `createProcessInstance` is
-/// shed with a 503 `RESOURCE_EXHAUSTED` so clients back off, keeping end-to-end
-/// latency and memory bounded under sustained overload. Unset or `0` disables it
-/// (the default) — appropriate for workloads with a legitimately large parked
-/// population (e.g. many instances waiting on timers/messages), where the backlog
-/// is not a load signal. Distinct from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`, which
-/// gates on create-processing *concurrency*, not the standing backlog.
+/// terminal) instances **per node**: once the backlog reaches `n`,
+/// `createProcessInstance` is shed with a 503 `RESOURCE_EXHAUSTED` so clients back
+/// off, keeping end-to-end latency and memory bounded under sustained overload.
+///
+/// - `NANOBPMN_ADMISSION_MAX_BACKLOG=off` (or `0`/`false`/`no`): disabled —
+///   appropriate for workloads with a legitimately large parked population (e.g.
+///   many instances waiting on timers/messages) that exceeds the auto-derived
+///   floor, where the standing backlog is not a load signal.
+/// - `=<n>`: explicit per-node cap. Tune to the **throughput knee** (a few
+///   thousand/node) to pin the system at its peak sustained throughput — bounding
+///   the active set keeps the engine actor's per-command cost off its O(active)
+///   tail (see PERFORMANCE.md, congestion collapse).
+/// - unset / `adaptive` / `on`: a generous count derived from the detected
+///   cgroup/host memory limit ([`active_backlog_cap_default_from_limit`]), clamped
+///   to `[MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP]`, or
+///   [`MIN_ACTIVE_BACKLOG_CAP`] when no limit can be read. **On by default** as a
+///   self-protecting backstop: it caps an unbounded active runaway (the
+///   congestion-collapse / OOM path) well above typical parked populations, while
+///   only shedding in [`SlaMode::Latency`] (the memory-safety rails handle
+///   admission mode). It is a *safety* default, not the throughput-peak pin — set
+///   an explicit lower cap at the knee for maximum sustained throughput.
 fn admission_max_backlog_from_env() -> usize {
-    std::env::var("NANOBPMN_ADMISSION_MAX_BACKLOG")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+    if let Ok(v) = std::env::var("NANOBPMN_ADMISSION_MAX_BACKLOG") {
+        let t = v.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "off" | "false" | "no") {
+            return 0;
+        }
+        if let Ok(n) = t.parse::<usize>() {
+            // Explicit number wins, including `0` = off.
+            return n;
+        }
+        // "on"/"adaptive"/anything else falls through to the adaptive default.
+    }
+    detect_memory_limit_bytes()
+        .map(active_backlog_cap_default_from_limit)
+        .unwrap_or(MIN_ACTIVE_BACKLOG_CAP)
+}
+
+/// Nominal resident bytes charged per active (created-but-not-terminal) instance
+/// when deriving the default backlog cap from the memory budget: an instance
+/// record plus a small live variable set and a parked job. Larger than
+/// [`NOMINAL_CREATE_BYTES`] because an active instance is longer-lived and carries
+/// more resting state; deliberately conservative so the derived count is a
+/// generous safety backstop rather than a tight throughput clip.
+const NOMINAL_ACTIVE_BYTES: u64 = 16 * 1024;
+/// Never auto-derive a backlog cap below this — a lower floor would shed against a
+/// legitimately large parked population (timers/messages) or a modest burst on a
+/// small host. Well above the create-queue floor because parked instances are a
+/// normal steady state, not a load signal.
+const MIN_ACTIVE_BACKLOG_CAP: usize = 50_000;
+/// Never auto-derive a backlog cap above this — beyond it the coarse resident-
+/// memory / pipeline-byte rails are the right OOM backstop.
+const MAX_ACTIVE_BACKLOG_CAP: usize = 1_000_000;
+
+/// Computes the default per-node active-backlog cap from a detected memory
+/// `limit`: budget the same fraction the in-flight-byte rail uses, expressed as a
+/// *count* of nominal active instances, clamped to
+/// `[MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP]`. Pure so it can be
+/// unit-tested without the environment.
+fn active_backlog_cap_default_from_limit(limit_bytes: u64) -> usize {
+    let budget = pipeline_bytes_watermark_default_from_limit(limit_bytes);
+    ((budget / NOMINAL_ACTIVE_BYTES) as usize)
+        .clamp(MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP)
 }
 
 /// Nominal resident bytes charged per submitted-but-unapplied create when
@@ -7831,10 +7894,21 @@ impl ServerImpl {
                 journal.maybe_cold_spill();
                 let state = journal.engine().state();
                 let timers_due = state.timers.values().any(|t| t.due_at <= now);
-                let jobs_due = state
-                    .jobs
-                    .values()
-                    .any(|j| j.deadline.is_some_and(|d| d <= now));
+                // Only `Activated` jobs hold a lease deadline, and `ExpireJobs`
+                // reclaims exactly that set (it iterates `activated_jobs`). Gate on
+                // the same index rather than scanning every job: this pre-check runs
+                // on the single-writer engine actor every tick (~2 Hz) per led
+                // partition, so a full `jobs.values()` walk is O(total backlog) —
+                // O(active) — and starves activation/completion on the actor as the
+                // in-flight backlog grows (the congestion-collapse hot path). The
+                // indexed walk is O(activated), bounded by concurrently-leased jobs.
+                let jobs_due = state.activated_jobs.iter().any(|k| {
+                    state
+                        .jobs
+                        .get(k)
+                        .and_then(|j| j.deadline)
+                        .is_some_and(|d| d <= now)
+                });
                 (timers_due, jobs_due)
             })
             .await;
@@ -11228,6 +11302,36 @@ mod clustered_startup_tests {
         assert_eq!(
             create_queue_cap_default_from_limit(tiny),
             MIN_CREATE_QUEUE_CAP
+        );
+    }
+
+    #[test]
+    fn active_backlog_cap_default_scales_and_clamps() {
+        // 64 GiB host: byte budget 8% = ~5.1 GiB; /16 KiB per active is ~335k,
+        // within [50k, 1M].
+        let big = 64 * 1024 * 1024 * 1024;
+        let cap = active_backlog_cap_default_from_limit(big);
+        assert_eq!(
+            cap,
+            (pipeline_bytes_watermark_default_from_limit(big) / NOMINAL_ACTIVE_BYTES) as usize
+        );
+        assert!((MIN_ACTIVE_BACKLOG_CAP..=MAX_ACTIVE_BACKLOG_CAP).contains(&cap));
+
+        // Mid host: 4 GiB -> byte budget floored at MIN_PIPELINE_BYTES (512 MiB);
+        // 512 MiB / 16 KiB = 32_768, below the 50k floor -> clamped up.
+        let mid = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            active_backlog_cap_default_from_limit(mid),
+            ((MIN_PIPELINE_BYTES / NOMINAL_ACTIVE_BYTES) as usize)
+                .clamp(MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP)
+        );
+
+        // Tiny limit -> budget is the whole tiny limit; /16 KiB is far below the
+        // 50k floor -> clamped up to MIN_ACTIVE_BACKLOG_CAP.
+        let tiny = 64 * 1024 * 1024; // 64 MiB
+        assert_eq!(
+            active_backlog_cap_default_from_limit(tiny),
+            MIN_ACTIVE_BACKLOG_CAP
         );
     }
 

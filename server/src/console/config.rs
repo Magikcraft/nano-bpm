@@ -62,8 +62,8 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
         "NANOBPMN_ADMISSION_MAX_BACKLOG",
         "Admission & SLA",
         "Max active backlog",
-        "off",
-        "Active-instance backlog above which creates are shed (latency mode). Off by default.",
+        "adaptive",
+        "Per-node active-instance backlog above which creates are shed (latency mode). Adaptive default derived from the memory limit as a safety backstop; set an explicit lower cap (a few thousand/node) to pin peak sustained throughput, or 'off' to disable.",
     ),
     (
         "NANOBPMN_ADMISSION_MAX_CREATE_QUEUE",
