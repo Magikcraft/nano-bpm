@@ -34,6 +34,7 @@
 //! LLM iteration loop is fast: change the prompt → regenerate annotations →
 //! re-run layout → eyeball the debug SVG.
 
+pub mod annotate;
 pub mod debug_svg;
 pub mod field;
 pub mod schema;

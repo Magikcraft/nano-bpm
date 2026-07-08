@@ -956,7 +956,15 @@ async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
                 .into_response();
         }
     };
-    let ann = req.annotations.unwrap_or_default();
+    let structural = match nanobpmn_engine_core::bpmn::parse_bpmn(&req.xml) {
+        Ok(defs) => defs
+            .into_iter()
+            .next()
+            .map(|d| layout::annotate::infer(&d))
+            .unwrap_or_default(),
+        Err(_) => layout::SemanticAnnotations::default(),
+    };
+    let ann = layout::annotate::merge(req.annotations, structural);
     match layout::layout_with(&req.xml, &ann, solver) {
         Ok(out) => Json(serde_json::json!({
             "bpmn_xml": out.bpmn_xml,
