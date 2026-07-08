@@ -116,6 +116,105 @@ impl AnnotationsSidecar {
     }
 }
 
+/// A per-instance rollup of the semantic annotations that fall on a given set of
+/// element ids. Slice 7 uses this to score a candidate variant on cost/time.
+///
+/// Aggregation is deliberately naïve — sum over the element ids that intersect
+/// the sidecar's `costs` / `times` maps. Rationale:
+///
+/// * **Cost** is summed **by currency** (a mixed-currency model is honestly
+///   reported as two rollups; deltas only compare within-currency). Only
+///   entries whose `per` is empty or `"invocation"`/`"instance"` are summed
+///   — hourly / monthly costs are ignored here because they aren't per-instance.
+///   The count of ignored-by-unit entries is reported in `cost_unit_skipped`
+///   so callers can surface a caveat.
+/// * **Time** is summed as a sequential upper bound (p50 and p99 separately).
+///   For parallel branches this over-counts — slice 8+ will refine using the
+///   flow graph. Elements missing a p50/p99 contribute 0 to that percentile
+///   only (a partial time annotation is still worth reporting).
+///
+/// `coverage` records how many of the surveyed elements had *any* cost / time
+/// annotation, so the UI can honestly say "N of M elements measured".
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotatedRollup {
+    /// Sum of `cost.value` per currency (empty string = "unspecified").
+    /// Empty when no per-instance cost annotations were found.
+    pub costs: BTreeMap<String, f64>,
+    /// Sum of `time.p50Ms` over elements with a p50 annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<u64>,
+    /// Sum of `time.p99Ms` over elements with a p99 annotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<u64>,
+    /// How many surveyed element ids carried a cost annotation.
+    pub cost_covered: usize,
+    /// How many surveyed element ids carried a time annotation.
+    pub time_covered: usize,
+    /// How many total element ids were surveyed (denominator for coverage).
+    pub total_elements: usize,
+    /// Cost entries skipped because their `per` unit isn't per-instance
+    /// (e.g. `"hour"`, `"month"`). Surfaces the honesty caveat to the UI.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub cost_unit_skipped: usize,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+impl AnnotatedRollup {
+    /// Sum annotations for the given element ids. Ids not present in the
+    /// annotations maps contribute nothing.
+    pub fn from_ids<'a, I>(element_ids: I, ann: &SemanticAnnotations) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut out = Self::default();
+        for id in element_ids {
+            out.total_elements += 1;
+            if let Some(cost) = ann.costs.get(id) {
+                let per_ok = cost
+                    .per
+                    .as_deref()
+                    .map(|p| {
+                        let p = p.trim().to_ascii_lowercase();
+                        p.is_empty() || p == "invocation" || p == "instance"
+                    })
+                    .unwrap_or(true);
+                if per_ok {
+                    let key = cost.currency.clone().unwrap_or_default();
+                    *out.costs.entry(key).or_insert(0.0) += cost.value;
+                    out.cost_covered += 1;
+                } else {
+                    out.cost_unit_skipped += 1;
+                }
+            }
+            if let Some(time) = ann.times.get(id) {
+                let mut any = false;
+                if let Some(p50) = time.p50_ms {
+                    out.p50_ms = Some(out.p50_ms.unwrap_or(0).saturating_add(p50));
+                    any = true;
+                }
+                if let Some(p99) = time.p99_ms {
+                    out.p99_ms = Some(out.p99_ms.unwrap_or(0).saturating_add(p99));
+                    any = true;
+                }
+                if any {
+                    out.time_covered += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// True when there is nothing worth reporting (no coverage at all).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.cost_covered == 0 && self.time_covered == 0 && self.cost_unit_skipped == 0
+    }
+}
+
 /// Compute the content-addressable revision key for a BPMN model.
 ///
 /// SHA-256 is overkill for collision resistance at this scale (dozens of
@@ -279,6 +378,83 @@ mod tests {
         assert_eq!(time.p50_ms, Some(1200));
         assert_eq!(time.p99_ms, Some(4800));
         assert_eq!(time.source.as_deref(), Some("telemetry"));
+    }
+
+    #[test]
+    fn rollup_sums_costs_by_currency_and_times_across_percentiles() {
+        use crate::layout::{Cost, Time};
+        let mut ann = SemanticAnnotations::default();
+        ann.costs.insert(
+            "A".into(),
+            Cost {
+                value: 0.10,
+                currency: Some("USD".into()),
+                per: Some("invocation".into()),
+            },
+        );
+        ann.costs.insert(
+            "B".into(),
+            Cost {
+                value: 0.05,
+                currency: Some("USD".into()),
+                per: None, // treated as per-invocation
+            },
+        );
+        ann.costs.insert(
+            "C".into(),
+            Cost {
+                value: 12.0,
+                currency: Some("USD".into()),
+                per: Some("hour".into()), // skipped — not per-instance
+            },
+        );
+        ann.costs.insert(
+            "D".into(),
+            Cost {
+                value: 1.5,
+                currency: Some("EUR".into()),
+                per: Some("instance".into()),
+            },
+        );
+        ann.times.insert(
+            "A".into(),
+            Time {
+                p50_ms: Some(100),
+                p99_ms: Some(500),
+                source: None,
+            },
+        );
+        ann.times.insert(
+            "B".into(),
+            Time {
+                p50_ms: Some(200),
+                p99_ms: None,
+                source: None,
+            },
+        );
+        // "unknown" not in the sidecar — contributes 0 but counts to total_elements.
+        let ids = ["A", "B", "C", "D", "unknown"];
+        let r = AnnotatedRollup::from_ids(ids.iter().copied(), &ann);
+        assert_eq!(r.total_elements, 5);
+        assert_eq!(r.cost_covered, 3);
+        assert_eq!(r.cost_unit_skipped, 1);
+        assert!((r.costs.get("USD").copied().unwrap_or(0.0) - 0.15).abs() < 1e-9);
+        assert!((r.costs.get("EUR").copied().unwrap_or(0.0) - 1.5).abs() < 1e-9);
+        assert_eq!(r.time_covered, 2);
+        assert_eq!(r.p50_ms, Some(300));
+        assert_eq!(r.p99_ms, Some(500));
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn rollup_is_empty_when_no_annotations_intersect() {
+        let ann = SemanticAnnotations::default();
+        let r = AnnotatedRollup::from_ids(["A", "B"].iter().copied(), &ann);
+        assert_eq!(r.total_elements, 2);
+        assert!(r.is_empty());
+        assert!(r.costs.is_empty());
+        assert_eq!(r.p50_ms, None);
+        assert_eq!(r.p99_ms, None);
     }
 
     #[test]

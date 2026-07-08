@@ -215,9 +215,10 @@ fn surface_job_type_hints(scorecard: &mut Value, healed: &str) {
 
 /// `simulate` — replay one candidate model against the recorded dataset.
 pub fn simulate(
-    _base_model: Option<&str>,
+    base_model: Option<&str>,
     dataset: &RecordedDataset,
     args: &Value,
+    annotations: Option<&crate::layout::SemanticAnnotations>,
 ) -> Result<Value, String> {
     let model = args["model"]
         .as_str()
@@ -235,7 +236,7 @@ pub fn simulate(
     let candidate = CandidateModel {
         name,
         rationale,
-        model: healed,
+        model: healed.clone(),
         mock_workers,
     };
     let instances = sample_slice(&dataset.instances, args);
@@ -251,6 +252,9 @@ pub fn simulate(
         surface_job_type_hints(c, &candidate.model);
         if !fixes.is_empty() {
             c["authoringFixes"] = json!(fixes);
+        }
+        if let Some(ann) = annotations {
+            attach_annotation_deltas(c, base_model, &healed, ann);
         }
         return Ok(json!({
             "replayable": true,
@@ -268,6 +272,96 @@ pub fn simulate(
         "sampled": sampled,
         "scorecard": Value::Null,
     }))
+}
+
+/// Compute per-instance cost/time rollups for the baseline and the (healed) variant,
+/// then attach `costAnnotated` / `timeAnnotated` blocks to the scorecard. The delta
+/// only makes sense within a currency, so cost deltas are keyed by currency; time
+/// deltas are absolute p50/p99 sums (upper-bound, sequential — flagged as such in
+/// the UI). Elements that appear in the variant XML but aren't in the sidecar
+/// contribute 0 — the coverage numbers make the "unmeasured additions" honest.
+fn attach_annotation_deltas(
+    scorecard: &mut Value,
+    base_model: Option<&str>,
+    variant_model: &str,
+    ann: &crate::layout::SemanticAnnotations,
+) {
+    let variant_ids = element_ids(variant_model);
+    let variant_roll =
+        crate::annotations::AnnotatedRollup::from_ids(variant_ids.iter().map(String::as_str), ann);
+    let base_roll = base_model.map(|xml| {
+        let ids = element_ids(xml);
+        crate::annotations::AnnotatedRollup::from_ids(ids.iter().map(String::as_str), ann)
+    });
+
+    // Cost delta per currency (only report currencies that appear in either rollup).
+    let mut cost_deltas: BTreeMap<String, f64> = BTreeMap::new();
+    if let Some(b) = &base_roll {
+        for (cur, base_v) in &b.costs {
+            let var_v = variant_roll.costs.get(cur).copied().unwrap_or(0.0);
+            cost_deltas.insert(cur.clone(), var_v - base_v);
+        }
+        for (cur, var_v) in &variant_roll.costs {
+            cost_deltas
+                .entry(cur.clone())
+                .or_insert_with(|| var_v - b.costs.get(cur).copied().unwrap_or(0.0));
+        }
+    }
+
+    let mut cost_block = json!({
+        "variant": variant_roll.costs,
+        "coverage": {
+            "measured": variant_roll.cost_covered,
+            "total": variant_roll.total_elements,
+        },
+    });
+    if variant_roll.cost_unit_skipped > 0 {
+        cost_block["unitSkipped"] = json!(variant_roll.cost_unit_skipped);
+    }
+    if let Some(b) = &base_roll {
+        cost_block["baseline"] = json!(b.costs);
+        cost_block["delta"] = json!(cost_deltas);
+    }
+    scorecard["costAnnotated"] = cost_block;
+
+    let mut time_block = json!({
+        "variant": {
+            "p50Ms": variant_roll.p50_ms,
+            "p99Ms": variant_roll.p99_ms,
+        },
+        "coverage": {
+            "measured": variant_roll.time_covered,
+            "total": variant_roll.total_elements,
+        },
+        "aggregation": "sequential-upper-bound",
+    });
+    if let Some(b) = &base_roll {
+        time_block["baseline"] = json!({
+            "p50Ms": b.p50_ms,
+            "p99Ms": b.p99_ms,
+        });
+        let dp50 = match (variant_roll.p50_ms, b.p50_ms) {
+            (Some(v), Some(bv)) => Some(v as i64 - bv as i64),
+            _ => None,
+        };
+        let dp99 = match (variant_roll.p99_ms, b.p99_ms) {
+            (Some(v), Some(bv)) => Some(v as i64 - bv as i64),
+            _ => None,
+        };
+        time_block["delta"] = json!({
+            "p50Ms": dp50,
+            "p99Ms": dp99,
+        });
+    }
+    scorecard["timeAnnotated"] = time_block;
+}
+
+/// Best-effort element-id list for a BPMN XML fragment. On a parse error we return
+/// an empty list — the caller then reports zero coverage, which is honest.
+fn element_ids(xml: &str) -> Vec<String> {
+    crate::bpmn_model::inline_definition(xml, None)
+        .map(|def| def.elements.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Resolve how many recorded instances to replay this call. `limit` (alias
@@ -292,6 +386,7 @@ pub fn compare_variants(
     base_model: Option<&str>,
     dataset: &RecordedDataset,
     args: &Value,
+    annotations: Option<&crate::layout::SemanticAnnotations>,
 ) -> Result<Value, String> {
     let raw = args["candidates"]
         .as_array()
@@ -369,6 +464,12 @@ pub fn compare_variants(
             }
             if let Some(fixes) = c["name"].as_str().and_then(|n| fixes_by_name.get(n)) {
                 c["authoringFixes"] = json!(fixes);
+            }
+            if let Some(ann) = annotations {
+                if let Some(healed) = c["name"].as_str().and_then(|n| healed_by_name.get(n)) {
+                    let healed = healed.clone();
+                    attach_annotation_deltas(c, base_model, &healed, ann);
+                }
             }
         }
     }
@@ -468,7 +569,13 @@ mod tests {
     #[test]
     fn simulate_scores_a_conserving_variant() {
         let ds = dataset();
-        let v = simulate(None, &ds, &json!({ "model": TWO_TASK, "name": "identity" })).unwrap();
+        let v = simulate(
+            None,
+            &ds,
+            &json!({ "model": TWO_TASK, "name": "identity" }),
+            None,
+        )
+        .unwrap();
         assert_eq!(v["replayable"], true);
         assert_eq!(v["datasetSize"], 3);
         let sc = &v["scorecard"];
@@ -512,6 +619,7 @@ mod tests {
             None,
             &ds,
             &json!({ "model": TWO_TASK_ERR_BOUNDARY, "name": "err" }),
+            None,
         )
         .unwrap();
         // It deployed and scored (not infeasible) because the deploy boundary healed the XML,
@@ -527,7 +635,7 @@ mod tests {
     #[test]
     fn simulate_reports_total_and_unsampled_by_default() {
         let ds = dataset();
-        let v = simulate(None, &ds, &json!({ "model": TWO_TASK })).unwrap();
+        let v = simulate(None, &ds, &json!({ "model": TWO_TASK }), None).unwrap();
         assert_eq!(v["datasetSize"], 3);
         assert_eq!(v["populationTotal"], 3);
         assert_eq!(v["sampled"], false);
@@ -538,7 +646,7 @@ mod tests {
         // A capped/distilled dataset: only 3 instances loaded, but the source population is 6553.
         let mut ds = dataset();
         ds.population = Some(6553);
-        let v = simulate(None, &ds, &json!({ "model": TWO_TASK })).unwrap();
+        let v = simulate(None, &ds, &json!({ "model": TWO_TASK }), None).unwrap();
         assert_eq!(v["datasetSize"], 3, "replayed what was loaded");
         assert_eq!(
             v["populationTotal"], 6553,
@@ -551,16 +659,22 @@ mod tests {
     fn simulate_limit_replays_only_a_sample() {
         let ds = dataset();
         // limit:1 — the cheap single-run smoke.
-        let v = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 1 })).unwrap();
+        let v = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 1 }), None).unwrap();
         assert_eq!(v["datasetSize"], 1, "only one instance replayed");
         assert_eq!(v["populationTotal"], 3, "full population still reported");
         assert_eq!(v["sampled"], true);
         assert_eq!(v["scorecard"]["report"]["instancesTotal"], 1);
 
         // sampleSize alias works too; an oversized limit falls back to the full set.
-        let s = simulate(None, &ds, &json!({ "model": TWO_TASK, "sampleSize": 2 })).unwrap();
+        let s = simulate(
+            None,
+            &ds,
+            &json!({ "model": TWO_TASK, "sampleSize": 2 }),
+            None,
+        )
+        .unwrap();
         assert_eq!(s["datasetSize"], 2);
-        let full = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 999 })).unwrap();
+        let full = simulate(None, &ds, &json!({ "model": TWO_TASK, "limit": 999 }), None).unwrap();
         assert_eq!(full["datasetSize"], 3);
         assert_eq!(full["sampled"], false);
     }
@@ -572,6 +686,7 @@ mod tests {
             Some(TWO_TASK),
             &ds,
             &json!({ "candidates": [ { "name": "identity", "model": TWO_TASK } ], "limit": 1 }),
+            None,
         )
         .unwrap();
         assert_eq!(v["datasetSize"], 1);
@@ -593,7 +708,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let v = simulate(None, &empty, &json!({ "model": TWO_TASK })).unwrap();
+        let v = simulate(None, &empty, &json!({ "model": TWO_TASK }), None).unwrap();
         assert_eq!(v["replayable"], false);
         assert_eq!(v["skipped"], 5);
     }
@@ -605,6 +720,7 @@ mod tests {
             Some(TWO_TASK),
             &ds,
             &json!({ "candidates": [ { "name": "drop-summarize", "model": ONE_TASK } ] }),
+            None,
         )
         .unwrap();
         assert_eq!(v["datasetSize"], 3);
@@ -660,6 +776,7 @@ mod tests {
                 "name": "mocked",
                 "mockWorkers": { "summarize": { "summary": "M" } }
             }),
+            None,
         )
         .unwrap();
         assert_eq!(v["replayable"], true);
@@ -713,5 +830,91 @@ mod tests {
         let mut sc = json!({ "divergentWorkers": [] });
         surface_divergence_hint(&mut sc);
         assert!(sc.get("structuralDivergence").is_none());
+    }
+
+    #[test]
+    fn simulate_attaches_cost_and_time_deltas_from_annotations_sidecar() {
+        use crate::layout::{Cost, SemanticAnnotations, Time};
+        let ds = dataset();
+        let mut ann = SemanticAnnotations::default();
+        // Baseline (TWO_TASK) has Classify + Summarize. Variant (ONE_TASK) drops Summarize.
+        ann.costs.insert(
+            "Classify".into(),
+            Cost {
+                value: 0.10,
+                currency: Some("USD".into()),
+                per: Some("invocation".into()),
+            },
+        );
+        ann.costs.insert(
+            "Summarize".into(),
+            Cost {
+                value: 0.20,
+                currency: Some("USD".into()),
+                per: Some("invocation".into()),
+            },
+        );
+        ann.times.insert(
+            "Classify".into(),
+            Time {
+                p50_ms: Some(100),
+                p99_ms: Some(300),
+                source: None,
+            },
+        );
+        ann.times.insert(
+            "Summarize".into(),
+            Time {
+                p50_ms: Some(500),
+                p99_ms: Some(1500),
+                source: None,
+            },
+        );
+
+        let v = simulate(
+            Some(TWO_TASK),
+            &ds,
+            &json!({ "model": ONE_TASK, "name": "drop-summarize" }),
+            Some(&ann),
+        )
+        .unwrap();
+        let sc = &v["scorecard"];
+        let cost = &sc["costAnnotated"];
+        assert!(
+            !cost.is_null(),
+            "expected costAnnotated block on scorecard: {sc}"
+        );
+        assert!((cost["variant"]["USD"].as_f64().unwrap() - 0.10).abs() < 1e-9);
+        assert!((cost["baseline"]["USD"].as_f64().unwrap() - 0.30).abs() < 1e-9);
+        assert!((cost["delta"]["USD"].as_f64().unwrap() - (-0.20)).abs() < 1e-9);
+        let time = &sc["timeAnnotated"];
+        assert_eq!(time["variant"]["p50Ms"].as_u64(), Some(100));
+        assert_eq!(time["variant"]["p99Ms"].as_u64(), Some(300));
+        assert_eq!(time["baseline"]["p50Ms"].as_u64(), Some(600));
+        assert_eq!(time["baseline"]["p99Ms"].as_u64(), Some(1800));
+        assert_eq!(time["delta"]["p50Ms"].as_i64(), Some(-500));
+        assert_eq!(time["delta"]["p99Ms"].as_i64(), Some(-1500));
+        assert_eq!(time["aggregation"].as_str(), Some("sequential-upper-bound"));
+    }
+
+    #[test]
+    fn simulate_omits_cost_and_time_blocks_when_no_annotations_provided() {
+        let ds = dataset();
+        let v = simulate(
+            Some(TWO_TASK),
+            &ds,
+            &json!({ "model": TWO_TASK, "name": "identity" }),
+            None,
+        )
+        .unwrap();
+        let sc = &v["scorecard"];
+        assert!(
+            sc.get("costAnnotated").is_none(),
+            "no annotations => no costAnnotated block"
+        );
+        assert!(
+            sc.get("timeAnnotated").is_none(),
+            "no annotations => no timeAnnotated block"
+        );
     }
 }

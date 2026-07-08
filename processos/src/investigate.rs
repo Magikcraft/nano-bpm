@@ -136,6 +136,10 @@ pub struct AnalysisTools {
     custom_data: Option<PathBuf>,
     /// The bound model XML written to a temp file for `subprocess` tools (`PROCESSOS_MODEL`).
     model_path: Option<PathBuf>,
+    /// Optional per-element semantic annotations (from the sidecar's `current`
+    /// revision) — enables the `read_annotations` tool and cost/time deltas
+    /// on `simulate` scorecards. `None` means "no sidecar for this process yet".
+    annotations: Option<crate::layout::SemanticAnnotations>,
 }
 
 impl Drop for AnalysisTools {
@@ -164,6 +168,7 @@ impl AnalysisTools {
             custom: Vec::new(),
             custom_data: None,
             model_path: None,
+            annotations: None,
         }
     }
 
@@ -195,6 +200,7 @@ impl AnalysisTools {
             custom: Vec::new(),
             custom_data: None,
             model_path: None,
+            annotations: None,
         }
     }
 
@@ -330,6 +336,13 @@ impl AnalysisTools {
     /// (`simulate` / `compare_variants`) become available.
     pub fn set_recorded(&mut self, ds: Option<crate::experiment::RecordedDataset>) {
         self.recorded = ds;
+    }
+
+    /// Attach the semantic annotations sidecar's current-revision entry. When set,
+    /// the `read_annotations` tool becomes available and `simulate` scorecards
+    /// carry `costAnnotated` / `timeAnnotated` deltas.
+    pub fn set_annotations(&mut self, ann: Option<crate::layout::SemanticAnnotations>) {
+        self.annotations = ann;
     }
 }
 
@@ -829,6 +842,23 @@ impl ToolBox for AnalysisTools {
                 }),
             });
         }
+        if self.annotations.is_some() {
+            specs.push(ToolSpec {
+                name: "read_annotations".into(),
+                description: "Return the semantic-annotation sidecar for the current process — \
+                    per-element narrative flows (primary / exception / escalation / compensation), \
+                    clusters, roles, and — most importantly for optimisation — per-element expected \
+                    COST (`costs[<elementId>] = {value, currency?, per?}`) and TIME \
+                    (`times[<elementId>] = {p50Ms?, p99Ms?, source?}`). These are the objective \
+                    inputs for cost/time-aware variants: read them BEFORE authoring an edit_model \
+                    variant so you can target the expensive / slow steps first (drop, parallelise, \
+                    cheapen, gate). Element ids join to read_model / read_model_xml (and simulate \
+                    scorecards will echo per-instance `costAnnotated` and `timeAnnotated` blocks \
+                    that let you SCORE your variant against the baseline). Takes no arguments."
+                    .into(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            });
+        }
         if self.sub.is_some() {
             specs.push(ToolSpec {
                 name: "delegate".into(),
@@ -1018,19 +1048,35 @@ impl ToolBox for AnalysisTools {
                 let v = crate::conformance::conformance_check(&self.analysis, xml)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise conformance: {e}"))
             }
+            "read_annotations" => {
+                let ann = self.annotations.as_ref().ok_or(
+                    "read_annotations is not available: no annotations sidecar for this process",
+                )?;
+                serde_json::to_string(ann).map_err(|e| format!("serialise annotations: {e}"))
+            }
             "simulate" => {
                 let ds = self
                     .recorded
                     .as_ref()
                     .ok_or("simulate is not available: no recorded dataset for this process")?;
-                let v = crate::experiment::simulate(self.model.as_deref(), ds, args)?;
+                let v = crate::experiment::simulate(
+                    self.model.as_deref(),
+                    ds,
+                    args,
+                    self.annotations.as_ref(),
+                )?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise simulation: {e}"))
             }
             "compare_variants" => {
                 let ds = self.recorded.as_ref().ok_or(
                     "compare_variants is not available: no recorded dataset for this process",
                 )?;
-                let v = crate::experiment::compare_variants(self.model.as_deref(), ds, args)?;
+                let v = crate::experiment::compare_variants(
+                    self.model.as_deref(),
+                    ds,
+                    args,
+                    self.annotations.as_ref(),
+                )?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise comparison: {e}"))
             }
             "delegate" => {
@@ -1373,6 +1419,7 @@ pub async fn run_chat_turn(
     objective: Option<&str>,
     persona_system: Option<&str>,
     model_xml: Option<String>,
+    annotations: Option<crate::layout::SemanticAnnotations>,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     steer: Option<&std::sync::Mutex<Vec<String>>>,
     sink: &mut dyn FnMut(AgentEvent),
@@ -1416,6 +1463,7 @@ pub async fn run_chat_turn(
         s
     }));
     tools.set_custom_tools(custom_tools);
+    tools.set_annotations(annotations);
     let model = OpenAiAgent { cfg };
 
     // Seed the system message (with one-time dataset framing) only at the start of a
