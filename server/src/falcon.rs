@@ -494,6 +494,16 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
     },
+    /// Server-advised worker concurrency: the active dispatch width the
+    /// worker-concurrency governor has converged on. A cooperating SDK can park
+    /// (idle) its subscribers down toward this target so an over-provisioned fleet
+    /// stops swamping the single push dispatcher (which halves throughput past the
+    /// ~50-worker/node knee). `0` = no advice (governor disabled). Edge-triggered:
+    /// broadcast once each time the target changes, so clients self-size without
+    /// polling. Purely advisory — the server also enforces the cap by truncating
+    /// each job type's per-pass fan-out, so uncooperative clients are still bounded.
+    #[serde(rename_all = "camelCase")]
+    WorkerAdvice { recommended_concurrency: i64 },
     Heartbeat,
 }
 
@@ -629,11 +639,15 @@ impl Registry {
             .collect()
     }
 
-    /// Builds a round-robin–ordered dispatch plan: for each job type, the live
-    /// subscriptions to attempt this tick, with the cursor advanced so a different
-    /// stream leads next time. Snapshotted under the locks; all engine work then
-    /// happens lock-free.
-    fn dispatch_plan(&self) -> Vec<(String, Vec<DispatchTarget>)> {
+    /// Builds a round-robin–ordered dispatch plan: for each job type, up to
+    /// `per_type_cap` live subscriptions to attempt this tick (`0` = no cap → all),
+    /// with the cursor advanced so a different stream leads next time. Capping the
+    /// fan-out is the worker-concurrency governor's enforcement point: under an
+    /// over-provisioned fleet it narrows each pass to the `per_type_cap` subscribers
+    /// that keep the drain saturated, parking the rest — and because the round-robin
+    /// cursor advances every pass, the parked subset rotates, so no subscriber is
+    /// starved. Snapshotted under the locks; all engine work then happens lock-free.
+    fn dispatch_plan(&self, per_type_cap: usize) -> Vec<(String, Vec<DispatchTarget>)> {
         let conns = self.conns.lock().expect("registry poisoned");
         let by_type = self.by_type.lock().expect("registry poisoned");
         let mut rr = self.rr.lock().expect("registry poisoned");
@@ -645,8 +659,18 @@ impl Registry {
             let cursor = rr.entry(job_type.clone()).or_insert(0);
             let start = *cursor % ids.len();
             *cursor = start + 1;
-            let mut targets = Vec::with_capacity(ids.len());
+            // How many of this type's subscribers to service this pass: the whole
+            // roster unless the governor has narrowed the active width.
+            let width = if per_type_cap == 0 {
+                ids.len()
+            } else {
+                per_type_cap.min(ids.len())
+            };
+            let mut targets = Vec::with_capacity(width);
             for offset in 0..ids.len() {
+                if targets.len() >= width {
+                    break;
+                }
                 let id = ids[(start + offset) % ids.len()];
                 let Some(conn) = conns.get(&id) else { continue };
                 let sub = conn
@@ -1892,6 +1916,7 @@ pub fn spawn_dispatcher(server: ServerImpl, registry: Arc<Registry>) {
         let mut tick = tokio::time::interval(Duration::from_millis(DISPATCH_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_pressure = false;
+        let mut last_worker_target: usize = usize::MAX;
         loop {
             tokio::select! {
                 _ = jobs_available.notified() => {}
@@ -1918,6 +1943,22 @@ pub fn spawn_dispatcher(server: ServerImpl, registry: Arc<Registry>) {
                 };
                 broadcast(&registry, &frame);
                 last_pressure = pressure;
+            }
+
+            // Edge-triggered worker-concurrency advice: whenever the governor
+            // moves its active dispatch width, tell the fleet the new target so
+            // cooperating clients can self-size their subscriber pools. Only
+            // broadcast on a real change (the cap is stable at steady state), and
+            // only when the governor is enabled (cap != 0).
+            let worker_target = server.active_worker_cap();
+            if worker_target != 0 && worker_target != last_worker_target {
+                broadcast(
+                    &registry,
+                    &ServerFrame::WorkerAdvice {
+                        recommended_concurrency: worker_target as i64,
+                    },
+                );
+                last_worker_target = worker_target;
             }
         }
     });
@@ -1987,7 +2028,12 @@ async fn dispatch_jobs(server: &ServerImpl, registry: &Arc<Registry>) {
     #[allow(clippy::type_complexity)]
     let mut by_conn: Vec<(Arc<Connection>, Vec<(String, Arc<Subscription>)>)> = Vec::new();
     let mut index: HashMap<ConnId, usize> = HashMap::new();
-    for (job_type, targets) in registry.dispatch_plan() {
+    // The worker governor's active dispatch width: cap each job type's per-pass
+    // subscriber fan-out so a fixed job supply is concentrated on the streams that
+    // keep the drain saturated, instead of diluted across an over-provisioned fleet
+    // (which swamps completions with High-priority activations). 0 = no cap.
+    let per_type_cap = server.active_worker_cap();
+    for (job_type, targets) in registry.dispatch_plan(per_type_cap) {
         for (conn, sub) in targets {
             let slot = *index.entry(conn.id).or_insert_with(|| {
                 by_conn.push((conn.clone(), Vec::new()));

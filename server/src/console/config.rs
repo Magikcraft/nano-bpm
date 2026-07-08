@@ -73,6 +73,13 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
         "Create-queue depth rail — a memory-safety guard active in every SLA mode.",
     ),
     (
+        "NANOBPMN_WORKER_CONCURRENCY",
+        "Admission & SLA",
+        "Worker concurrency governor",
+        "auto",
+        "Active dispatch width: how many subscribers the push dispatcher fans each job type out to per pass. Over-provisioning past the ~50-worker/node knee roughly halves throughput (activation is High-priority in the shared engine mailbox). Default `auto` runs a self-optimizing governor that converges the active width on the completion-throughput knee from measured latency; excess subscribers are parked (round-robin, never starved). Set an explicit fixed width, or 'off' for no cap. See ADR 0017.",
+    ),
+    (
         "NANOBPMN_BACKPRESSURE_MAX_INFLIGHT",
         "Admission & SLA",
         "Max in-flight (AIMD ceiling)",

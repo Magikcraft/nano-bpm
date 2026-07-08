@@ -373,6 +373,7 @@ impl LatencyLimiter {
 pub struct AdaptiveController {
     create: Option<LatencyLimiter>,
     backlog: Option<LatencyLimiter>,
+    workers: Option<LatencyLimiter>,
     count: u64,
     sum_us: f64,
     window_start: Instant,
@@ -396,6 +397,7 @@ impl AdaptiveController {
         Self {
             create: None,
             backlog: None,
+            workers: None,
             count: 0,
             sum_us: 0.0,
             window_start: Instant::now(),
@@ -443,9 +445,36 @@ impl AdaptiveController {
         shared
     }
 
-    /// Whether any limiter is installed (so the engine thread should drive it).
+    /// Install the self-optimizing worker-concurrency governor: it tunes the
+    /// number of subscribers the push dispatcher fans a job type out to per pass
+    /// between `floor` and `ceiling`, from the same per-command latency signal,
+    /// gated on the current `backlog` (runnable task-jobs waiting to drain). The
+    /// push dispatcher is the throughput ceiling — activation is High-priority in
+    /// the engine mailbox, so fanning a fixed job supply across too many
+    /// subscribers swamps completions and inflates per-command latency. Starting
+    /// at `floor`, the governor slow-starts the active-subscriber width upward
+    /// while there is backlog to drain and latency is healthy, and backs off
+    /// multiplicatively the moment latency inflates past its self-calibrated
+    /// baseline — converging on the worker concurrency that maximizes completion
+    /// throughput. Excess subscribers are parked (rotated round-robin, never
+    /// starved). Returns the shared width handle the dispatcher reads.
+    pub fn with_worker_governor(
+        &mut self,
+        floor: usize,
+        ceiling: usize,
+        backlog: Arc<AtomicUsize>,
+    ) -> Arc<AtomicUsize> {
+        let shared = Arc::new(AtomicUsize::new(floor));
+        self.workers = Some(LatencyLimiter {
+            aimd: AimdLimit::new(floor, floor, ceiling),
+            shared: shared.clone(),
+            signal: backlog,
+            label: "worker-governor",
+        });
+        shared
+    }
     pub fn is_active(&self) -> bool {
-        self.create.is_some() || self.backlog.is_some()
+        self.create.is_some() || self.backlog.is_some() || self.workers.is_some()
     }
 
     /// Record one command's processing latency. Evaluates the window (and updates
@@ -460,6 +489,9 @@ impl AdaptiveController {
             }
             if let Some(b) = self.backlog.as_mut() {
                 b.step(avg, self.verbose);
+            }
+            if let Some(w) = self.workers.as_mut() {
+                w.step(avg, self.verbose);
             }
             self.count = 0;
             self.sum_us = 0.0;
@@ -759,5 +791,72 @@ mod tests {
         let mut c = AdaptiveController::new();
         c.with_backlog_governor(2_000, 200_000, Arc::new(AtomicUsize::new(0)));
         assert!(c.is_active());
+        let mut c = AdaptiveController::new();
+        c.with_worker_governor(16, 4_096, Arc::new(AtomicUsize::new(0)));
+        assert!(c.is_active());
+    }
+
+    // --- self-optimizing worker-concurrency governor -------------------------
+
+    #[test]
+    fn worker_governor_grows_active_width_while_healthy_and_loaded() {
+        // Backlog well above the width => there is work to fan out across more
+        // subscribers, and latency stays healthy, so the governor slow-starts the
+        // active dispatch width upward from the floor.
+        let backlog = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let width = c.with_worker_governor(16, 4_096, backlog.clone());
+        assert_eq!(width.load(Ordering::Relaxed), 16, "starts at the floor");
+
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
+        let after_baseline = width.load(Ordering::Relaxed);
+        drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy + loaded => grow
+        assert!(
+            width.load(Ordering::Relaxed) > after_baseline,
+            "healthy loaded windows must widen the fan-out: {after_baseline} -> {}",
+            width.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn worker_governor_backs_off_to_floor_under_congestion() {
+        // Over-provisioning past the knee inflates per-command latency; the
+        // governor must narrow the active width back to the floor so excess
+        // subscribers stop swamping the push dispatcher.
+        let backlog = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let width = c.with_worker_governor(16, 4_096, backlog.clone());
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
+        for _ in 0..5 {
+            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // grow a bit first
+        }
+        assert!(width.load(Ordering::Relaxed) > 16);
+        for _ in 0..200 {
+            drive_window(&mut c, 5_000, WINDOW_MIN_SAMPLES); // sustained congestion
+        }
+        assert_eq!(
+            width.load(Ordering::Relaxed),
+            16,
+            "congestion must hold the active width at the knee floor"
+        );
+    }
+
+    #[test]
+    fn worker_governor_does_not_widen_without_backlog() {
+        // No runnable backlog (workers idle / nothing to drain): widening the
+        // fan-out would only add dispatcher overhead, so growth is gated on the
+        // backlog signal and the width must stay pinned at the floor.
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let mut c = AdaptiveController::new();
+        let width = c.with_worker_governor(16, 4_096, backlog.clone());
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
+        for _ in 0..20 {
+            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
+        }
+        assert_eq!(
+            width.load(Ordering::Relaxed),
+            16,
+            "no backlog to drain must never widen the active fan-out"
+        );
     }
 }

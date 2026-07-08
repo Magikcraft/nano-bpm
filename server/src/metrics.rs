@@ -176,6 +176,14 @@ struct Metrics {
     /// `nanobpm_admission_limit{limit="backlog"}` to watch the governor hold the
     /// runnable backlog at the throughput knee.
     runnable_backlog: IntGauge,
+    /// The live per-job-type active dispatch width the worker-concurrency governor
+    /// holds the push dispatcher's per-pass subscriber fan-out at (`0` = no cap).
+    /// In `WorkerConcurrency::Auto` mode this tracks the governor converging on the
+    /// worker concurrency that maximizes completion throughput; watch it against
+    /// the subscribed-worker roster to see how much of an over-provisioned fleet is
+    /// being parked. Also the value the server advertises to cooperating clients so
+    /// their worker pools can self-size.
+    active_worker_target: IntGauge,
     /// The configured admission thresholds the ceiling rails trip at, labelled by
     /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
@@ -481,6 +489,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Runnable (task-job) backlog: parked-excluded count of created-but-uncompleted service-task jobs this node holds; the signal the active_backlog rail and the backlog governor gate on.",
     )
     .expect("valid gauge");
+    let active_worker_target = IntGauge::new(
+        "nanobpm_active_worker_target",
+        "Worker-concurrency governor's active dispatch width: max subscribers the push dispatcher fans each job type out to per pass (0 = no cap). Tracks the governor converging on the worker concurrency that maximizes completion throughput; also advertised to clients for self-sizing.",
+    )
+    .expect("valid gauge");
     let admission_limit = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_admission_limit",
@@ -530,6 +543,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(active_backlog.clone())))
         .and(registry.register(Box::new(mem_pressure_bytes.clone())))
         .and(registry.register(Box::new(runnable_backlog.clone())))
+        .and(registry.register(Box::new(active_worker_target.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .expect("register metrics");
 
@@ -574,6 +588,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         active_backlog,
         mem_pressure_bytes,
         runnable_backlog,
+        active_worker_target,
         admission_limit,
     }
 });
@@ -695,6 +710,14 @@ pub fn set_admission_signals(
     METRICS.active_backlog.set(active_backlog);
     METRICS.mem_pressure_bytes.set(mem_pressure_bytes);
     METRICS.runnable_backlog.set(runnable_backlog);
+}
+
+/// Publishes the worker-concurrency governor's live active dispatch width
+/// (`nanobpm_active_worker_target`; `0` = no cap). Called ~1 Hz from the monitor
+/// loop. Pair with the subscribed-worker roster to see how much of the fleet the
+/// governor is parking, and export to cooperating clients for self-sizing.
+pub fn set_active_worker_target(width: i64) {
+    METRICS.active_worker_target.set(width);
 }
 
 /// Publishes one configured admission threshold as a reference line

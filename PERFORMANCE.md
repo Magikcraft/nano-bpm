@@ -1428,3 +1428,41 @@ Net: the governor delivers the proven +21% peak by default, is parked-safe by
 construction, and bounds the engine's live backlog under a worst-case worker-starved
 flood without any static tuning. 187 bin tests (incl. 4 new governor tests) + clippy
 `--all-targets` clean.
+
+## 2026-07-09 (cont.) — WORKER-CONCURRENCY GOVERNOR (dispatcher right-sizing)
+
+The backlog governor tunes *how much work is admitted*. A well-provisioned high-worker
+soak showed the actual ceiling on this architecture is elsewhere: **worker
+over-provisioning of the single push dispatcher.** Dispatch is push-based (falcon.rs) —
+workers subscribe per job type and park; one server-wide dispatcher fans jobs out per
+connection, and each lease is a **High-priority** activation in the shared single-writer
+engine mailbox. Fan a fixed job supply across too many subscribers and activation swamps
+completions (engine threads measured ~16% busy at the knee — the dispatcher, not engine
+CPU, is the wall).
+
+### Sweep: over-provisioning roughly halves throughput (non-monotonic)
+Same binary, fixed `MAXPAR=50`/`RATE=30000` flood, only workers/node varied:
+
+| workers/node | cluster tput | max p99 |
+|-------------:|-------------:|--------:|
+| **50**       | **46,694/s** | 29.3 s  |
+| 100          | 12,083/s     | 85.9 s  |
+| 200          | 23,672/s     | 57.4 s  |
+| 400          | 17,946/s     | 60.7 s  |
+
+Knee ~50 workers/node; past it throughput ~halves and tail latency triples.
+
+### Fix: a third shared-signal AIMD limiter
+`AdaptiveController` now runs three limiters off the SAME partition-0 latency window:
+create limiter + backlog governor (ADR 0014) + **worker governor**. The worker governor
+(`with_worker_governor`, floor=16, ceiling=4096) tunes the **active dispatch width** —
+subscribers fanned out per job type per pass — gated on the runnable task-job backlog
+(grow only while there's work to drain, back off when latency inflates). Enforcement:
+`dispatch_plan(per_type_cap)` truncates each type's targets to the width, round-robin
+cursor rotating so excess subscribers are parked, never starved (`0` = no cap).
+Advisory: edge-triggered `ServerFrame::WorkerAdvice { recommended_concurrency }`
+broadcast on width change so cooperating SDKs can self-size. Gauge:
+`nanobpm_active_worker_target`. Env `NANOBPMN_WORKER_CONCURRENCY=auto|<n>|off`.
+
+3 new worker-governor unit tests (grow / back-off / gate-on-backlog) + clippy
+`--all-targets` clean; release build green. See ADR 0017.

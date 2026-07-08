@@ -180,6 +180,14 @@ pub struct ServerImpl {
     /// not jobs, so they never appear here and are never shed against. Refreshed
     /// by the ~1 Hz monitor tick; read with a relaxed load.
     runnable_backlog: Arc<AtomicUsize>,
+    /// The live per-job-type active dispatch width the push dispatcher caps its
+    /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
+    /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
+    /// thread's [`crate::backpressure::AdaptiveController`] worker governor retunes
+    /// it each latency window, holding the fan-out just left of the point where
+    /// High-priority activation swamps completions. In `Fixed`/`Off` mode it is a
+    /// constant. Read on the dispatch path with a relaxed load.
+    active_worker_cap: Arc<AtomicUsize>,
     /// Create-queue-depth admission limit (0 = off, the default). When set,
     /// `createProcessInstance` is shed once the standing backlog of submitted-but-
     /// not-yet-applied creates (summed across partitions' `Low` queues) is at or
@@ -490,6 +498,27 @@ impl ServerImpl {
                 controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone())
             }
         };
+        // `active_worker_cap` is the live per-job-type active dispatch width the
+        // push dispatcher reads (0 = no cap). Resolved from one of three policies,
+        // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
+        // governor tuned off the same engine latency signal, gated on the runnable
+        // backlog (grow the fan-out only while there is work to drain).
+        let active_worker_cap = match worker_concurrency_from_env() {
+            WorkerConcurrency::Off => Arc::new(AtomicUsize::new(0)),
+            WorkerConcurrency::Fixed(n) => {
+                tracing::info!(
+                    "worker concurrency: on, fixed active dispatch width {n} subscriber(s)/job type"
+                );
+                Arc::new(AtomicUsize::new(n))
+            }
+            WorkerConcurrency::Auto { floor, ceiling } => {
+                tracing::info!(
+                    "worker concurrency: on, self-optimizing worker governor \
+                     (floor {floor}, ceiling {ceiling} subscribers/job type)"
+                );
+                controller.with_worker_governor(floor, ceiling, runnable_backlog.clone())
+            }
+        };
         let mut controller = if controller.is_active() {
             Some(controller)
         } else {
@@ -657,6 +686,7 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
             runnable_backlog,
+            active_worker_cap,
             admission_max_create_queue,
             mem_watermark_bytes,
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
@@ -1556,6 +1586,69 @@ fn admission_backlog_from_env() -> AdmissionBacklog {
 /// the governor holds the system just left of the congestion-collapse point
 /// without starving the workers or shedding a modest parked/burst backlog.
 const MIN_BACKLOG_GOVERNOR_CAP: usize = 2_000;
+
+/// The resolved worker-concurrency (active dispatch width) policy — see
+/// [`worker_concurrency_from_env`]. Bounds how many subscribers the push
+/// dispatcher fans a given job type out to per pass. The push dispatcher, not the
+/// engine CPU, is the throughput ceiling (activation is High-priority in the
+/// engine mailbox and swamps completions when spread across too many
+/// subscribers), so right-sizing this width is the primary lever for sustained
+/// completion throughput. Excess subscribers are parked, rotated round-robin so
+/// none is starved.
+enum WorkerConcurrency {
+    /// No cap — dispatch to every subscriber every pass (the historical behavior).
+    Off,
+    /// A fixed operator-set active-dispatch width per job type.
+    Fixed(usize),
+    /// Self-optimizing: a latency-driven governor tunes the width between `floor`
+    /// and `ceiling` from the engine's per-command latency, gated on the runnable
+    /// backlog (grow only while there is work to drain).
+    Auto { floor: usize, ceiling: usize },
+}
+
+/// The self-optimizing floor for the [`WorkerConcurrency::Auto`] governor: the
+/// fewest subscribers per job type the dispatcher will narrow to under congestion.
+/// Small so the governor can throttle a worst-case over-provisioned fleet hard
+/// (concentrating a fixed job supply on few, fully-utilized streams), but not so
+/// small that a single slow worker stalls the drain.
+const MIN_WORKER_GOVERNOR_WIDTH: usize = 16;
+/// The ceiling for the [`WorkerConcurrency::Auto`] governor: effectively "all
+/// subscribers" for any realistic fleet, so a genuinely healthy, drain-bound
+/// workload is never throttled below the number of workers that keep completing.
+const MAX_WORKER_GOVERNOR_WIDTH: usize = 4_096;
+
+/// Resolves the worker-concurrency (active dispatch width) policy from
+/// `NANOBPMN_WORKER_CONCURRENCY`.
+///
+/// - `off` (or `0`/`false`/`no`): [`WorkerConcurrency::Off`] — no cap (dispatch to
+///   every subscriber every pass).
+/// - `=<n>`: [`WorkerConcurrency::Fixed`], an explicit per-job-type active width.
+/// - unset / `adaptive` / `auto` / `on`: [`WorkerConcurrency::Auto`] — **the
+///   default**. A self-optimizing governor (the engine thread's
+///   [`crate::backpressure::AdaptiveController`], third limiter) tunes the width
+///   from the measured per-command latency, holding the fan-out just left of the
+///   point where activation swamps completions. Floors at
+///   [`MIN_WORKER_GOVERNOR_WIDTH`], ceilings at [`MAX_WORKER_GOVERNOR_WIDTH`].
+fn worker_concurrency_from_env() -> WorkerConcurrency {
+    if let Ok(v) = std::env::var("NANOBPMN_WORKER_CONCURRENCY") {
+        let t = v.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "off" | "false" | "no") {
+            return WorkerConcurrency::Off;
+        }
+        if let Ok(n) = t.parse::<usize>() {
+            return if n == 0 {
+                WorkerConcurrency::Off
+            } else {
+                WorkerConcurrency::Fixed(n)
+            };
+        }
+        // "on"/"adaptive"/"auto"/anything else falls through to the auto governor.
+    }
+    WorkerConcurrency::Auto {
+        floor: MIN_WORKER_GOVERNOR_WIDTH,
+        ceiling: MAX_WORKER_GOVERNOR_WIDTH,
+    }
+}
 
 /// Nominal resident bytes charged per active (created-but-not-terminal) instance
 /// when deriving the default backlog cap from the memory budget: an instance
@@ -9182,6 +9275,15 @@ impl ServerImpl {
     pub(crate) fn dispatch_wake_handle(&self) -> Arc<tokio::sync::Notify> {
         self.dispatch_wake.clone()
     }
+
+    /// The live per-job-type active dispatch width the push dispatcher caps its
+    /// per-pass subscriber fan-out at; `0` = no cap. In [`WorkerConcurrency::Auto`]
+    /// mode the engine thread's worker governor retunes this each latency window
+    /// to hold the fan-out just left of activation swamping completions. Read with
+    /// a relaxed load on the dispatch path.
+    pub(crate) fn active_worker_cap(&self) -> usize {
+        self.active_worker_cap.load(Ordering::Relaxed)
+    }
 }
 
 /// Current wall-clock time in milliseconds since the Unix epoch. The engine is
@@ -10939,6 +11041,9 @@ async fn main() {
                 crate::metrics::set_admission_limit(
                     "mem_watermark",
                     monitor_server.mem_watermark_bytes as i64,
+                );
+                crate::metrics::set_active_worker_target(
+                    monitor_server.active_worker_cap.load(Ordering::Relaxed) as i64,
                 );
 
                 let activatable = monitor_server.engine.activatable_job_counts().await;
