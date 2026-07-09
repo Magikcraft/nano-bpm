@@ -7886,8 +7886,11 @@ impl ServerImpl {
         let worker_for_trace = worker.clone();
         let activated: Vec<ActivatedJobWithIdentity> = handle
             .with(move |engine| {
+                // Leader-local activation bypasses the Raft `apply_command_at`
+                // path, so it is profiled here directly on the engine thread.
+                let timer = cmd_profile::start();
                 let now = now_millis();
-                engine
+                let out: Vec<ActivatedJobWithIdentity> = engine
                     .activate_jobs(&job_type, &worker, want, timeout, now)
                     .into_iter()
                     .map(|job| {
@@ -7909,7 +7912,9 @@ impl ServerImpl {
                             process_definition_key,
                         }
                     })
-                    .collect()
+                    .collect();
+                cmd_profile::finish(timer, "activate_jobs");
+                out
             })
             .await;
         #[cfg(feature = "console")]
@@ -8061,6 +8066,10 @@ impl ServerImpl {
         // now. Only the leader runs this gate; followers never propose, so safe.
         let (timers_due, jobs_due) = handle
             .with(move |journal| {
+                // The tick pre-check gate runs on the single-writer engine actor
+                // every tick per led partition; profiled here to attribute its
+                // share of the actor hold under load.
+                let timer = cmd_profile::start();
                 // Shed active-backlog variables first (cheaper, instance stays
                 // live), then whole dormant instances — both gated on RAM pressure.
                 journal.maybe_var_spill_pressure();
@@ -8082,6 +8091,7 @@ impl ServerImpl {
                         .and_then(|j| j.deadline)
                         .is_some_and(|d| d <= now)
                 });
+                cmd_profile::finish(timer, "tick_precheck");
                 (timers_due, jobs_due)
             })
             .await;
@@ -8128,7 +8138,14 @@ impl ServerImpl {
                 // emit `JobLockExpired` on the leader (job is Activated) but nothing
                 // on followers (their job is still Created), diverging the replicated
                 // event stream. Expire directly on the leader's engine actor.
-                let expired = handle.with(move |journal| journal.expire_jobs(now)).await;
+                let expired = handle
+                    .with(move |journal| {
+                        let timer = cmd_profile::start();
+                        let expired = journal.expire_jobs(now);
+                        cmd_profile::finish(timer, "expire_jobs");
+                        expired
+                    })
+                    .await;
                 if !expired.is_empty() {
                     produced = true;
                 }
