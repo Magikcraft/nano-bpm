@@ -270,6 +270,7 @@ async function mountModeler(xml){
         <div class="wb-tabs" style="margin-top:12px">
           <div class="wb-tabbar">
             <button data-tab="flows"    class="active">Flows</button>
+            <button data-tab="clusters">Clusters</button>
             <button data-tab="costtime">Costs &amp; Times</button>
             <button data-tab="prov">Provenance</button>
           </div>
@@ -336,9 +337,11 @@ function renderTab(){
   const host = $('#wbTabBody');
   if(!host) return;
   if(S.tab === 'flows') host.innerHTML = flowsTabHtml();
+  else if(S.tab === 'clusters') host.innerHTML = clustersTabHtml();
   else if(S.tab === 'costtime') host.innerHTML = costTimeTabHtml();
   else host.innerHTML = provenanceTabHtml();
   if(S.tab === 'flows') wireFlowsTab(host);
+  else if(S.tab === 'clusters') wireClustersTab(host);
   // Delegate row-clicks on element ids to selection.
   host.querySelectorAll('[data-el]').forEach(el =>
     el.onclick = () => selectElementById(el.dataset.el));
@@ -406,6 +409,60 @@ function wireFlowsTab(host){
   });
   const newBtn = host.querySelector('#flowNew');
   if(newBtn) newBtn.onclick = () => createFlow();
+}
+
+// Clusters tab: same shape as flows but no `kind` (soft groups are one
+// bucket), plus an `affinity` slider (0..1, default 0.5). Nodes have no
+// meaningful order — clusters pull members toward a shared centroid — so
+// only an × control per node (no ▲/▼ reorder).
+function clustersTabHtml(){
+  const clusters = S.ann.clusters || [];
+  const empty = !clusters.length
+    ? '<p class="muted" style="margin:6px 0 10px">No clusters yet. Create one below, or select a shape and use its "Clusters" chips.</p>'
+    : '';
+  const rows = clusters.map((c, i) => {
+    const aff = (typeof c.affinity === 'number') ? c.affinity : 0.5;
+    const nodes = (c.nodes||[]).map((n, ni) => `
+      <span class="flow-node">
+        <span class="element-link" data-el="${esc(n)}">${esc(n)}</span>
+        <button class="flow-node-btn" title="Remove" data-ci="${i}" data-ni="${ni}" data-act="rm">×</button>
+      </span>`).join(' ');
+    return `<tr>
+      <td><input class="cluster-id" data-ci="${i}" value="${esc(c.id || 'cluster_'+i)}" style="width:150px"></td>
+      <td><input class="cluster-aff" data-ci="${i}" type="number" min="0" max="1" step="0.05" value="${esc(aff)}" style="width:80px"><div class="hint" style="margin-top:2px">0..1 (spring stiffness)</div></td>
+      <td>${nodes || '<span class="muted">(empty — add nodes from the sel panel)</span>'}</td>
+      <td><button class="cluster-del" data-ci="${i}" title="Delete this cluster">🗑</button></td>
+    </tr>`;
+  }).join('');
+  const table = clusters.length
+    ? `<table><thead><tr><th>id</th><th>affinity</th><th>nodes</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    : '';
+  return empty + table + `
+    <div class="btnrow" style="margin-top:10px">
+      <button id="clusterNew" class="primary">+ New cluster</button>
+      <span class="hint muted">Clusters are soft groups. Members are pulled toward a shared centroid after flow bias is applied. Affinity is the spring stiffness — higher = tighter.</span>
+    </div>`;
+}
+
+function wireClustersTab(host){
+  host.querySelectorAll('.cluster-id').forEach(inp => {
+    inp.onchange = () => setClusterId(+inp.dataset.ci, inp.value.trim());
+  });
+  host.querySelectorAll('.cluster-aff').forEach(inp => {
+    inp.onchange = () => setClusterAffinity(+inp.dataset.ci, inp.value);
+  });
+  host.querySelectorAll('.cluster-del').forEach(btn => {
+    btn.onclick = () => deleteCluster(+btn.dataset.ci);
+  });
+  host.querySelectorAll('.flow-node-btn[data-ci]').forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      const ci = +btn.dataset.ci, ni = +btn.dataset.ni;
+      if(btn.dataset.act === 'rm') removeClusterNode(ci, ni);
+    };
+  });
+  const newBtn = host.querySelector('#clusterNew');
+  if(newBtn) newBtn.onclick = () => createCluster();
 }
 
 function costTimeTabHtml(){
@@ -501,6 +558,22 @@ function renderSelPanel(){
       <div class="hint">Click a chip to toggle membership. Rename, reorder, and delete on the Flows tab.</div>
     </div>
 
+    <div class="field">
+      <label>Clusters</label>
+      <div class="flow-chips">
+        ${(S.ann.clusters||[]).map((c, i) => {
+          const inCluster = (c.nodes||[]).includes(id);
+          const cls = inCluster ? 'flow-chip on' : 'flow-chip';
+          const aff = (typeof c.affinity === 'number') ? c.affinity : 0.5;
+          return `<button type="button" class="${cls}" data-ci="${i}" title="${inCluster?'Remove from':'Add to'} ${esc(c.id)} (affinity ${aff})">${esc(c.id)} <span class="pill inferred">${esc(aff)}</span></button>`;
+        }).join(' ') || '<span class="muted">no clusters yet</span>'}
+      </div>
+      <div class="row" style="margin-top:6px; gap:6px">
+        <button type="button" id="fNewCluster" title="Create a new cluster seeded with this element">+ new cluster</button>
+      </div>
+      <div class="hint">Click a chip to toggle membership. Rename and tune affinity on the Clusters tab.</div>
+    </div>
+
     <div class="btnrow" style="margin-top:12px">
       <button class="primary" id="fApply">Apply</button>
       <button id="fClear">Clear all</button>
@@ -509,11 +582,16 @@ function renderSelPanel(){
 
   $('#fApply').onclick = () => applySelPanel(id);
   $('#fClear').onclick = () => clearSel(id);
-  host.querySelectorAll('.flow-chip').forEach(btn => {
+  host.querySelectorAll('.flow-chip[data-fi]').forEach(btn => {
     btn.onclick = () => toggleFlowMember(+btn.dataset.fi, id);
+  });
+  host.querySelectorAll('.flow-chip[data-ci]').forEach(btn => {
+    btn.onclick = () => toggleClusterMember(+btn.dataset.ci, id);
   });
   const newBtn = $('#fNewFlow');
   if(newBtn) newBtn.onclick = () => createFlow($('#fNewFlowKind').value, id);
+  const newCBtn = $('#fNewCluster');
+  if(newCBtn) newCBtn.onclick = () => createCluster(id);
 }
 
 function applySelPanel(id){
@@ -655,6 +733,84 @@ function moveFlowNode(idx, nodeIdx, dir){
   });
 }
 
+// ── Cluster mutators ─────────────────────────────────────────────────────
+// Mirror the flow mutators but without a `kind` axis; clusters carry an
+// `affinity` (0..1, default 0.5) that scales the spring stiffness pulling
+// members toward the group centroid.
+
+function nextClusterId(existing){
+  const taken = new Set((existing || []).map(c => c.id));
+  const base = 'cluster';
+  if(!taken.has(base)) return base;
+  let n = 2;
+  while(taken.has(`${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+function createCluster(seedNodeId){
+  mutate(a => {
+    a.clusters = a.clusters || [];
+    const id = nextClusterId(a.clusters);
+    const nodes = seedNodeId ? [seedNodeId] : [];
+    a.clusters.push({ id, nodes, affinity: 0.5 });
+  });
+  renderSelPanel();
+  toast('added cluster');
+}
+
+function deleteCluster(idx){
+  mutate(a => {
+    if(!Array.isArray(a.clusters) || idx < 0 || idx >= a.clusters.length) return;
+    a.clusters.splice(idx, 1);
+  });
+  renderSelPanel();
+}
+
+function setClusterId(idx, id){
+  const clean = (id || '').replace(/\s+/g, '_');
+  if(!clean){ toast('cluster id cannot be empty'); renderTab(); return; }
+  mutate(a => {
+    if(!Array.isArray(a.clusters) || idx < 0 || idx >= a.clusters.length) return;
+    if(a.clusters.some((c, i) => i !== idx && c.id === clean)){
+      toast(`another cluster already uses id "${clean}"`);
+      return;
+    }
+    a.clusters[idx].id = clean;
+  });
+  renderSelPanel();
+}
+
+function setClusterAffinity(idx, val){
+  const n = Number(val);
+  if(!isFinite(n) || n < 0 || n > 1){ toast('affinity must be a number in [0, 1]'); renderTab(); return; }
+  mutate(a => {
+    if(!Array.isArray(a.clusters) || idx < 0 || idx >= a.clusters.length) return;
+    a.clusters[idx].affinity = n;
+  });
+}
+
+function toggleClusterMember(idx, elId){
+  mutate(a => {
+    if(!Array.isArray(a.clusters) || idx < 0 || idx >= a.clusters.length) return;
+    const c = a.clusters[idx];
+    c.nodes = Array.isArray(c.nodes) ? c.nodes.slice() : [];
+    const at = c.nodes.indexOf(elId);
+    if(at >= 0) c.nodes.splice(at, 1);
+    else c.nodes.push(elId);
+  });
+  renderSelPanel();
+}
+
+function removeClusterNode(idx, nodeIdx){
+  mutate(a => {
+    if(!Array.isArray(a.clusters) || idx < 0 || idx >= a.clusters.length) return;
+    const c = a.clusters[idx];
+    if(!Array.isArray(c.nodes) || nodeIdx < 0 || nodeIdx >= c.nodes.length) return;
+    c.nodes.splice(nodeIdx, 1);
+  });
+  renderSelPanel();
+}
+
 function toast(msg){
   const el = $('#saveStatus');
   if(!el) return;
@@ -733,16 +889,15 @@ function openSaveDialog(){
 
 // ── Diff ────────────────────────────────────────────────────────────────
 // Reports each per-key delta in the three per-element maps (roles / costs /
-// times) and enumerates per-flow adds / removes / renames / kind changes /
-// node membership changes. Clusters remain a coarse count-diff.
+// times) and enumerates per-flow / per-cluster adds / removes / renames /
+// kind or affinity changes / node membership changes.
 function computeDiff(a, b){
   const items = [];
   diffMap('roles', a.roles || {}, b.roles || {}, items, v => String(v));
   diffMap('costs', a.costs || {}, b.costs || {}, items, v => JSON.stringify(v));
   diffMap('times', a.times || {}, b.times || {}, items, v => JSON.stringify(v));
   diffFlows(a.flows || [], b.flows || [], items);
-  const clustersBefore = (a.clusters||[]).length, clustersAfter = (b.clusters||[]).length;
-  if(clustersBefore !== clustersAfter) items.push({ head: 'clusters', lines: [ctx(`count ${clustersBefore} → ${clustersAfter}`)] });
+  diffClusters(a.clusters || [], b.clusters || [], items);
   return items;
 }
 
@@ -770,6 +925,32 @@ function diffFlows(before, after, items){
     }
   });
   if(lines.length) items.push({ head: 'flows', lines });
+}
+
+// Same shape as diffFlows but with `affinity` instead of `kind`.
+function diffClusters(before, after, items){
+  const lines = [];
+  const affOf = c => (typeof c.affinity === 'number') ? c.affinity : 0.5;
+  const byIdA = new Map(before.map((c, i) => [c.id || 'cluster_'+i, c]));
+  const byIdB = new Map(after.map((c, i)  => [c.id || 'cluster_'+i, c]));
+  const keys = new Set([...byIdA.keys(), ...byIdB.keys()]);
+  Array.from(keys).sort().forEach(k => {
+    const ca = byIdA.get(k), cb = byIdB.get(k);
+    if(ca && !cb){
+      lines.push(rem(`${k} (affinity ${affOf(ca)}): ${JSON.stringify(ca.nodes||[])}`));
+    } else if(!ca && cb){
+      lines.push(add(`${k} (affinity ${affOf(cb)}): ${JSON.stringify(cb.nodes||[])}`));
+    } else if(ca && cb){
+      const affA = affOf(ca), affB = affOf(cb);
+      const nodesA = JSON.stringify(ca.nodes||[]), nodesB = JSON.stringify(cb.nodes||[]);
+      if(affA !== affB) lines.push(ctx(`${k}: affinity ${affA} → ${affB}`));
+      if(nodesA !== nodesB){
+        lines.push(rem(`${k}.nodes: ${nodesA}`));
+        lines.push(add(`${k}.nodes: ${nodesB}`));
+      }
+    }
+  });
+  if(lines.length) items.push({ head: 'clusters', lines });
 }
 
 function diffMap(name, before, after, items, fmt){
