@@ -268,40 +268,44 @@ latency gate are the second line that bounds memory when a misbehaving open-loop
 producer defeats backpressure. Neither is the binding constraint for well-behaved
 load, so throughput and latency are unaffected in the common case.
 
-### 2026-07-10 — `admission` keeps the AIMD valve armed (open-loop collapse A/B)
+### 2026-07-10 — `admission` keeps the AIMD guard armed (clean 3-way A/B)
 
-The "modes converge" A/B above ran a **gentle** open-loop offered load; this one
-drives the cluster **hard past** the drain ceiling to separate the two latency rails
-`SlaMode` controls: the proactive **backlog governor** and the **AIMD concurrency
-limiter**. Same RF=3 / 12-partition GCP cluster, bounded-spill build, three
-open-loop loadgens (`WORKERS=400`/node, `PROD_CONNS=256`, `RATE=30000`,
-`MAX_INFLIGHT=400000`), `SLA_MODE` flipped live via the console
-(`PUT /console/api/config/server/sla`, broadcasts cluster-wide).
+Console build `a42ced29`, RF=3 / 12-partition GCP cluster, **journal wiped fresh
+between every run**, three open-loop loadgens (`WORKERS=400`/node, `PROD_CONNS=256`,
+`RATE=30000`, `MAX_INFLIGHT=400000`). Three configs, same flood:
 
-| Config | AIMD | backlog gov. | agg comp/s | p50 | p90 | p99 | per-node backlog |
-|--------|:----:|:------------:|-----------:|----:|----:|----:|-----------------:|
-| `latency` (default) | on | on | ~14,000 | 32 ms | 66 ms | 2.3 s | bounded (~652 avg) |
-| `latency`, `MAX_BACKLOG=off` (AIMD only) | on | off | **~22,000** | 61 ms | — | — | bounded |
-| `admission` **(old: both off)** | off | off | ~21,500 | **107 s** | 843 s | 857 s | **unbounded (828k)** |
+| config | agg comp/s | p50 | p90 | p99 | max | agg backlog | actor_ms |
+|--------|-----------:|----:|----:|----:|----:|------------:|---------:|
+| `latency` (AIMD + backlog governor) | ~46,000 | 35 ms | 87 ms | 1.46 s | 2.66 s | 28k → **drains to ~0** | 2 ms |
+| `admission` + AIMD **(this build)** | **~68,000** | 52 ms | **14.3 s** | 31.9 s | 35.3 s | ~1.2M (loadgen-capped) | 82 ms |
+| `admission`, AIMD off (`BACKPRESSURE_MAX_INFLIGHT=off`) | ~64,000 | 49 ms | 23.0 s | 37.5 s | 38.2 s | ~1.2M (loadgen-capped) | 14 ms |
 
-**Finding.** Suppressing the AIMD limiter (what the old `admission` mode did on top
-of dropping the backlog governor) bought **zero extra throughput** — ~21.5k/s is the
-same single-writer ceiling the AIMD-on config already reaches at ~22k/s — while
-**exploding p50 from 61 ms to 107 s** and letting the backlog grow **unbounded**
-(828k instances/node). The AIMD limiter is not a throughput throttle; because creates
-and completions share the single-writer actor, it is a **self-balancing valve** that
-paces intake down to the drain rate, which is exactly what keeps the backlog bounded.
+**Finding 1 — the backlog governor, not AIMD, is what bounds the backlog.** Both
+`admission` variants pin at the **same ~1.2M** backlog (that is the loadgen's
+`MAX_INFLIGHT` ceiling, *not* an engine bound — the engine did not stop it climbing).
+Only `latency` mode's active-backlog governor holds the backlog tight (28k, drained to
+~0 by end). AIMD sheds on create-*processing* concurrency, which stays low because
+creates apply in ~9 µs even while the *completion* side falls behind — so it never
+sheds on this fast create→complete workload and cannot bound the accumulated backlog
+(consistent with the 2026-07-07 dead-gate analysis above). **The earlier claim that
+AIMD "paces intake to the drain rate / keeps the backlog bounded" in `admission` mode
+was wrong** and is corrected here and in ADR 0013.
 
-**Change (this build).** `admission` now **keeps the AIMD limiter armed** and relaxes
-**only** the proactive backlog governor (`server/src/main.rs`
-`create_process_instance_impl`, gate no longer conditioned on `sheds_for_latency()`).
-So `admission` admits everything the engine can actually drain — throughput at the
-ceiling, backlog bounded — paced via retryable `503`s, instead of 200-accepting into
-an unbounded queue. This makes `admission` the AIMD-only column above (~22k/s @ p50
-61 ms), a genuine higher-throughput / looser-but-bounded-tail point distinct from
-`latency`'s tight-tail governor (~14k/s @ p99 2.3 s). **Secondary result:** even at
-828k resident instances/node the bounded-spill fix held the writer to ≤141 ms holds
-(vs 8.2 s pre-fix) — no congestion collapse at the extreme.
+**Finding 2 — arming AIMD in `admission` is still a win.** Isolating it (row 2 vs row
+3, both fresh-journal, differing only in the AIMD gate): AIMD-on gives **~+6%
+throughput (68k vs 64k) and a ~40% tighter p90 tail (14.3 s vs 23.0 s)**, p99 31.9 s
+vs 37.5 s, at no cost. So keeping the AIMD engine-overload guard armed in both modes
+(this build's change) is beneficial — it just is not a backlog bound.
+
+**Finding 3 — the real mode tradeoff (now measured cleanly).** `admission` reaches the
+engine's **true drain ceiling** (~68k/s, ~+48% over `latency`'s 46k) with a good
+median (p50 52 ms) but a heavy tail (p99 32 s) and a backlog that climbs to the
+memory-safety rails. `latency` sacrifices ~32% throughput to hold a tight tail (p99
+1.46 s) and a tightly bounded backlog. (An earlier "`admission` p50 = 107 s" figure
+was an artifact of flipping SLA at runtime on an **un-wiped** journal with pre-existing
+backlog; with a fresh journal `admission`'s median is 52 ms.) **Secondary:** even at
+1.2M resident/node aggregate the bounded-spill fix held the writer to ≤82 ms holds (vs
+8.2 s pre-fix) — no congestion collapse.
 
 ### 2026-07-07 — Open-loop 24k reject soak: the backlog gate bounds **memory**, not **throughput**
 

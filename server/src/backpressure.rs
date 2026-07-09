@@ -70,19 +70,21 @@ pub enum SlaMode {
     /// letting its already-running instances slow down. Enforced by the AIMD
     /// concurrency limiter *and* the proactive active-backlog governor.
     Latency,
-    /// **Preserve admission** (accept latency). At the ceiling, keep admitting as
-    /// much work as the engine can actually drain, letting end-to-end latency grow
-    /// instead of proactively rejecting work. This is the "start-every-process
-    /// SLA": only the proactive **active-backlog governor** is suppressed. The
-    /// **AIMD concurrency limiter stays armed** (see [`Self::sheds_for_latency`])
-    /// because it is not a throughput throttle but a self-balancing valve — it
-    /// paces intake down to the drain rate, so `admission` admits everything the
-    /// engine can complete (via retryable `503`s) without letting the backlog grow
-    /// unbounded. Empirically, suppressing it bought zero extra throughput while
-    /// exploding p50 latency ~1700× and running the backlog away (see ADR 0013
-    /// Addendum / `PERFORMANCE.md` 2026-07-10). Terminal state frees on completion
-    /// (ADR 0012) and live variables spill to disk, so the backlog the valve
-    /// settles at is cheap to hold.
+    /// **Preserve admission** (accept latency). At the ceiling, drop the proactive
+    /// active-backlog governor and run the engine at its true drain ceiling
+    /// (measured ~+48% throughput vs `Latency`), letting end-to-end latency and the
+    /// backlog grow with demand. This is the "start-every-process SLA": only the
+    /// proactive **active-backlog governor** is suppressed. The **AIMD concurrency
+    /// limiter stays armed** (see [`Self::sheds_for_latency`]) as an engine-overload
+    /// guard — arming it measurably tightens the tail (~40% lower p90) at no
+    /// throughput cost — but note it does **not** bound the accumulated backlog: it
+    /// sheds on create-*processing* concurrency, which stays low even while the
+    /// completion side falls behind, so under sustained overload the backlog grows
+    /// until the **memory-safety rails** shed (they, not AIMD, are the backstop in
+    /// this mode). Only `Latency`'s backlog governor gives a tight, engine-enforced
+    /// bound. See ADR 0013 Addendum / `PERFORMANCE.md` 2026-07-10. Terminal state
+    /// frees on completion (ADR 0012) and live variables spill to disk, so the large
+    /// backlog is comparatively cheap to hold up to the rail.
     Admission,
 }
 
@@ -91,8 +93,10 @@ impl SlaMode {
     /// to hold a latency target. `true` in [`SlaMode::Latency`], `false` in
     /// [`SlaMode::Admission`] (which drops the proactive governor to admit more).
     /// Note this gates **only** the backlog governor: the AIMD concurrency limiter
-    /// (the self-balancing engine-overload valve) and the memory-safety rails stay
-    /// armed in both modes, so `admission` never produces an unbounded backlog.
+    /// (an engine-overload guard) and the memory-safety rails stay armed in both
+    /// modes. AIMD is not a backlog bound — under sustained overload only the
+    /// governor (i.e. `Latency` mode) keeps the backlog tightly bounded; in
+    /// `Admission` the backlog grows to the memory-safety rails.
     pub fn sheds_for_latency(&self) -> bool {
         matches!(self, SlaMode::Latency)
     }

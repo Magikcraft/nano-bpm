@@ -2383,18 +2383,18 @@ impl ServerImpl {
         // relaxed atomic load, so this check costs no engine round-trip — a small
         // race against concurrent creates is irrelevant for an approximate limit.
         //
-        // Armed in BOTH SLA modes. This is not a latency *target* gate — it is a
-        // self-balancing engine-overload valve: because creates and completions
-        // share the single writer, saturating the actor makes this shed creates,
-        // pacing intake down to the drain rate and thereby keeping the backlog
-        // bounded *at no throughput cost*. Empirically (GCP 3-node flood) leaving
-        // it on yields ~22k/s @ p50 61 ms with a bounded backlog, whereas
-        // suppressing it in `SlaMode::Admission` bought zero extra throughput
-        // (~21.5k/s, the same single-writer ceiling) while exploding p50 to 107 s
-        // and growing the backlog unbounded (828k/node). So admission mode relaxes
-        // only the proactive *backlog governor* (in `admission_shed`), not this
-        // valve: it admits everything the engine can actually drain, paced via
-        // retryable 503s, rather than 200-accepting into an unbounded queue.
+        // Armed in BOTH SLA modes. This is an engine-overload guard, not a backlog
+        // bound: because creates and completions share the single writer, it sheds
+        // creates when create-*processing* concurrency saturates, protecting the
+        // writer thread. It does NOT bound the accumulated backlog (it keys off
+        // processing concurrency, which stays low even while completions fall
+        // behind), so under sustained overload the backlog grows to the
+        // memory-safety rails regardless — the active-backlog governor (latency
+        // mode only, in `admission_shed`) is the sole tight backlog bound. Keeping
+        // this guard armed in `admission` still pays off: measured ~+6% throughput
+        // and a ~40% tighter p90 tail vs suppressing it, at no cost (GCP 3-node
+        // fresh-journal A/B; see PERFORMANCE.md 2026-07-10 / ADR 0013 Addendum). So
+        // `admission` relaxes only the proactive backlog governor, not this guard.
         if let Some(limit) = self.backpressure.current_limit() {
             let processing = self.processing.load(Ordering::Relaxed);
             if self.backpressure.should_shed(processing) {
