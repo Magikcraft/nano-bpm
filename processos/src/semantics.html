@@ -92,6 +92,18 @@
   /* Save status line + drift banner. */
   .status { font-size: 12px; color: var(--po-text-muted); margin-left: 8px; }
   .drift { background: var(--po-warn-wash, var(--po-inset)); border: 1px solid var(--po-warn, var(--po-edge)); color: var(--po-warn-soft, var(--po-text)); padding: 8px 12px; border-radius: 8px; font-size: 12.5px; margin: 8px 0 4px; }
+
+  /* Flow-membership chips (sel panel) and per-node controls (flows tab). */
+  .flow-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+  .flow-chip { border: 1px solid var(--po-edge); background: var(--po-inset); color: var(--po-text-muted); border-radius: 999px; padding: 2px 8px; font-size: 11.5px; display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+  .flow-chip.on { border-color: var(--po-accent-strong); background: var(--po-ok-wash); color: var(--po-text); }
+  .flow-chip .pill { font-size: 10px; padding: 0 6px; }
+  .flow-node { display: inline-flex; align-items: center; gap: 2px; margin-right: 6px; }
+  .flow-node-btn { border: 0; background: transparent; padding: 0 2px; color: var(--po-text-faint); cursor: pointer; font-size: 11px; line-height: 1; }
+  .flow-node-btn:hover { color: var(--po-accent-strong); }
+  .flow-id, .flow-kind { font-size: 12px; padding: 3px 6px; }
+  .flow-del { border: 0; background: transparent; padding: 2px 6px; cursor: pointer; color: var(--po-danger-soft); }
+  .flow-del:hover { background: var(--po-hover); border-radius: 6px; }
 </style>
 </head>
 <body>
@@ -126,6 +138,7 @@ const $ = sel => document.querySelector(sel);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 const ROLES = ['decision','review','notification','compensation','external'];
+const FLOW_KINDS = ['primary','exception','escalation','compensation'];
 
 // Everything the page needs — updated by loader + mutate(), read by render().
 const S = {
@@ -325,6 +338,7 @@ function renderTab(){
   if(S.tab === 'flows') host.innerHTML = flowsTabHtml();
   else if(S.tab === 'costtime') host.innerHTML = costTimeTabHtml();
   else host.innerHTML = provenanceTabHtml();
+  if(S.tab === 'flows') wireFlowsTab(host);
   // Delegate row-clicks on element ids to selection.
   host.querySelectorAll('[data-el]').forEach(el =>
     el.onclick = () => selectElementById(el.dataset.el));
@@ -340,17 +354,58 @@ function selectElementById(id){
 
 function flowsTabHtml(){
   const flows = S.ann.flows || [];
-  if(!flows.length) return '<p class="muted">No named flows yet. Selecting a shape and choosing a flow kind will add one.</p>';
+  const empty = !flows.length
+    ? '<p class="muted" style="margin:6px 0 10px">No named flows yet. Create one below, or select a shape and use its "Flows" chips.</p>'
+    : '';
   const rows = flows.map((f, i) => {
     const kind = f.kind || 'primary';
-    const nodes = (f.nodes||[]).map(n => `<span class="element-link" data-el="${esc(n)}">${esc(n)}</span>`).join(', ');
+    const kindOpts = FLOW_KINDS.map(k => `<option value="${k}"${k===kind?' selected':''}>${k}</option>`).join('');
+    const nodes = (f.nodes||[]).map((n, ni) => `
+      <span class="flow-node">
+        <span class="element-link" data-el="${esc(n)}">${esc(n)}</span>
+        <button class="flow-node-btn" title="Move up"     data-fi="${i}" data-ni="${ni}" data-act="up">▲</button>
+        <button class="flow-node-btn" title="Move down"   data-fi="${i}" data-ni="${ni}" data-act="down">▼</button>
+        <button class="flow-node-btn" title="Remove"      data-fi="${i}" data-ni="${ni}" data-act="rm">×</button>
+      </span>`).join(' ');
     return `<tr>
-      <td><code>${esc(f.id || 'flow_'+i)}</code></td>
-      <td><span class="pill inferred">${esc(kind)}</span></td>
-      <td>${nodes}</td>
+      <td><input class="flow-id" data-fi="${i}" value="${esc(f.id || 'flow_'+i)}" style="width:150px"></td>
+      <td><select class="flow-kind" data-fi="${i}">${kindOpts}</select></td>
+      <td>${nodes || '<span class="muted">(empty — add nodes from the sel panel)</span>'}</td>
+      <td><button class="flow-del" data-fi="${i}" title="Delete this flow">🗑</button></td>
     </tr>`;
   }).join('');
-  return `<table><thead><tr><th>id</th><th>kind</th><th>nodes</th></tr></thead><tbody>${rows}</tbody></table>`;
+  const table = flows.length
+    ? `<table><thead><tr><th>id</th><th>kind</th><th>nodes</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+    : '';
+  return empty + table + `
+    <div class="btnrow" style="margin-top:10px">
+      <button id="flowNew" class="primary">+ New flow</button>
+      <span class="hint muted">Flows are ordered lists of node ids. <code>primary</code> becomes the horizontal centerline; <code>exception</code> drops below, <code>escalation</code> rises above, <code>compensation</code> sits below the exception band.</span>
+    </div>`;
+}
+
+// Wire up the editable flows-tab controls (rebuilt from scratch on every
+// renderTab, so bind after innerHTML lands).
+function wireFlowsTab(host){
+  host.querySelectorAll('.flow-id').forEach(inp => {
+    inp.onchange = () => setFlowId(+inp.dataset.fi, inp.value.trim());
+  });
+  host.querySelectorAll('.flow-kind').forEach(sel => {
+    sel.onchange = () => setFlowKind(+sel.dataset.fi, sel.value);
+  });
+  host.querySelectorAll('.flow-del').forEach(btn => {
+    btn.onclick = () => deleteFlow(+btn.dataset.fi);
+  });
+  host.querySelectorAll('.flow-node-btn').forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      const fi = +btn.dataset.fi, ni = +btn.dataset.ni, act = btn.dataset.act;
+      if(act === 'rm') removeFlowNode(fi, ni);
+      else moveFlowNode(fi, ni, act === 'up' ? -1 : +1);
+    };
+  });
+  const newBtn = host.querySelector('#flowNew');
+  if(newBtn) newBtn.onclick = () => createFlow();
 }
 
 function costTimeTabHtml(){
@@ -395,7 +450,6 @@ function renderSelPanel(){
   const role = (S.ann.roles||{})[id] || '';
   const cost = (S.ann.costs||{})[id] || null;
   const time = (S.ann.times||{})[id] || null;
-  const flowsWith = (S.ann.flows||[]).filter(f => (f.nodes||[]).includes(id));
 
   const roleOpts = ['<option value="">— none —</option>']
     .concat(ROLES.map(r => `<option value="${r}"${r===role?' selected':''}>${r}</option>`))
@@ -430,8 +484,21 @@ function renderSelPanel(){
     </div>
 
     <div class="field">
-      <label>In flows</label>
-      <div class="muted" style="font-size:11.5px">${flowsWith.length ? flowsWith.map(f => `${esc(f.id)} <span class="pill inferred">${esc(f.kind||'primary')}</span>`).join(' · ') : '—'}</div>
+      <label>Flows</label>
+      <div class="flow-chips">
+        ${(S.ann.flows||[]).map((f, i) => {
+          const inFlow = (f.nodes||[]).includes(id);
+          const cls = inFlow ? 'flow-chip on' : 'flow-chip';
+          return `<button type="button" class="${cls}" data-fi="${i}" title="${inFlow?'Remove from':'Add to'} ${esc(f.id)} (${esc(f.kind||'primary')})">${esc(f.id)} <span class="pill inferred">${esc(f.kind||'primary')}</span></button>`;
+        }).join(' ') || '<span class="muted">no flows yet</span>'}
+      </div>
+      <div class="row" style="margin-top:6px; gap:6px">
+        <select id="fNewFlowKind" style="flex:0 0 auto">
+          ${FLOW_KINDS.map(k => `<option value="${k}">${k}</option>`).join('')}
+        </select>
+        <button type="button" id="fNewFlow" title="Create a new flow seeded with this element">+ new flow</button>
+      </div>
+      <div class="hint">Click a chip to toggle membership. Rename, reorder, and delete on the Flows tab.</div>
     </div>
 
     <div class="btnrow" style="margin-top:12px">
@@ -442,6 +509,11 @@ function renderSelPanel(){
 
   $('#fApply').onclick = () => applySelPanel(id);
   $('#fClear').onclick = () => clearSel(id);
+  host.querySelectorAll('.flow-chip').forEach(btn => {
+    btn.onclick = () => toggleFlowMember(+btn.dataset.fi, id);
+  });
+  const newBtn = $('#fNewFlow');
+  if(newBtn) newBtn.onclick = () => createFlow($('#fNewFlowKind').value, id);
 }
 
 function applySelPanel(id){
@@ -490,6 +562,97 @@ function mutate(fn){
   fn(next);
   S.ann = next;
   renderTab();
+}
+
+// ── Flow mutators ────────────────────────────────────────────────────────
+// All flow edits go through mutate() so undo/save-with-diff see them as one
+// coherent working-copy transition. Sel panel + flows tab both re-render on
+// each mutation so membership pills stay in sync with the table rows.
+
+function nextFlowId(existing, kind){
+  const taken = new Set((existing || []).map(f => f.id));
+  const base = kind || 'flow';
+  if(!taken.has(base)) return base;
+  let n = 2;
+  while(taken.has(`${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+function createFlow(kind, seedNodeId){
+  const k = FLOW_KINDS.includes(kind) ? kind : 'primary';
+  mutate(a => {
+    a.flows = a.flows || [];
+    const id = nextFlowId(a.flows, k);
+    const nodes = seedNodeId ? [seedNodeId] : [];
+    a.flows.push({ id, kind: k, nodes });
+  });
+  renderSelPanel();
+  toast(`added ${k} flow`);
+}
+
+function deleteFlow(idx){
+  mutate(a => {
+    if(!Array.isArray(a.flows) || idx < 0 || idx >= a.flows.length) return;
+    a.flows.splice(idx, 1);
+  });
+  renderSelPanel();
+}
+
+function setFlowId(idx, id){
+  const clean = (id || '').replace(/\s+/g, '_');
+  if(!clean){ toast('flow id cannot be empty'); renderTab(); return; }
+  mutate(a => {
+    if(!Array.isArray(a.flows) || idx < 0 || idx >= a.flows.length) return;
+    // Enforce uniqueness — bail (with a toast) if the new id collides.
+    if(a.flows.some((f, i) => i !== idx && f.id === clean)){
+      toast(`another flow already uses id "${clean}"`);
+      return;
+    }
+    a.flows[idx].id = clean;
+  });
+  renderSelPanel();
+}
+
+function setFlowKind(idx, kind){
+  if(!FLOW_KINDS.includes(kind)) return;
+  mutate(a => {
+    if(!Array.isArray(a.flows) || idx < 0 || idx >= a.flows.length) return;
+    a.flows[idx].kind = kind;
+  });
+  renderSelPanel();
+}
+
+function toggleFlowMember(idx, elId){
+  mutate(a => {
+    if(!Array.isArray(a.flows) || idx < 0 || idx >= a.flows.length) return;
+    const f = a.flows[idx];
+    f.nodes = Array.isArray(f.nodes) ? f.nodes.slice() : [];
+    const at = f.nodes.indexOf(elId);
+    if(at >= 0) f.nodes.splice(at, 1);
+    else f.nodes.push(elId);
+  });
+  renderSelPanel();
+}
+
+function removeFlowNode(idx, nodeIdx){
+  mutate(a => {
+    if(!Array.isArray(a.flows) || idx < 0 || idx >= a.flows.length) return;
+    const f = a.flows[idx];
+    if(!Array.isArray(f.nodes) || nodeIdx < 0 || nodeIdx >= f.nodes.length) return;
+    f.nodes.splice(nodeIdx, 1);
+  });
+  renderSelPanel();
+}
+
+function moveFlowNode(idx, nodeIdx, dir){
+  mutate(a => {
+    if(!Array.isArray(a.flows) || idx < 0 || idx >= a.flows.length) return;
+    const f = a.flows[idx];
+    if(!Array.isArray(f.nodes)) return;
+    const j = nodeIdx + dir;
+    if(nodeIdx < 0 || nodeIdx >= f.nodes.length || j < 0 || j >= f.nodes.length) return;
+    const tmp = f.nodes[nodeIdx]; f.nodes[nodeIdx] = f.nodes[j]; f.nodes[j] = tmp;
+  });
 }
 
 function toast(msg){
@@ -570,19 +733,43 @@ function openSaveDialog(){
 
 // ── Diff ────────────────────────────────────────────────────────────────
 // Reports each per-key delta in the three per-element maps (roles / costs /
-// times) plus a coarse-grained flows/clusters summary. Kept simple —
-// exhaustive per-flow diffs are noisy and slice 6 doesn't yet edit flows
-// from the panel, so a count-based summary is honest enough.
+// times) and enumerates per-flow adds / removes / renames / kind changes /
+// node membership changes. Clusters remain a coarse count-diff.
 function computeDiff(a, b){
   const items = [];
   diffMap('roles', a.roles || {}, b.roles || {}, items, v => String(v));
   diffMap('costs', a.costs || {}, b.costs || {}, items, v => JSON.stringify(v));
   diffMap('times', a.times || {}, b.times || {}, items, v => JSON.stringify(v));
-  const flowsBefore = (a.flows||[]).length, flowsAfter = (b.flows||[]).length;
-  if(flowsBefore !== flowsAfter) items.push({ head: 'flows', lines: [ctx(`count ${flowsBefore} → ${flowsAfter}`)] });
+  diffFlows(a.flows || [], b.flows || [], items);
   const clustersBefore = (a.clusters||[]).length, clustersAfter = (b.clusters||[]).length;
   if(clustersBefore !== clustersAfter) items.push({ head: 'clusters', lines: [ctx(`count ${clustersBefore} → ${clustersAfter}`)] });
   return items;
+}
+
+// Match flows by id when possible so a node-list edit shows as one change,
+// not a delete + re-add. Unmatched entries are add/remove blocks.
+function diffFlows(before, after, items){
+  const lines = [];
+  const byIdA = new Map(before.map((f, i) => [f.id || 'flow_'+i, f]));
+  const byIdB = new Map(after.map((f, i)  => [f.id || 'flow_'+i, f]));
+  const keys = new Set([...byIdA.keys(), ...byIdB.keys()]);
+  Array.from(keys).sort().forEach(k => {
+    const fa = byIdA.get(k), fb = byIdB.get(k);
+    if(fa && !fb){
+      lines.push(rem(`${k} (${fa.kind||'primary'}): ${JSON.stringify(fa.nodes||[])}`));
+    } else if(!fa && fb){
+      lines.push(add(`${k} (${fb.kind||'primary'}): ${JSON.stringify(fb.nodes||[])}`));
+    } else if(fa && fb){
+      const kindA = fa.kind || 'primary', kindB = fb.kind || 'primary';
+      const nodesA = JSON.stringify(fa.nodes||[]), nodesB = JSON.stringify(fb.nodes||[]);
+      if(kindA !== kindB) lines.push(ctx(`${k}: kind ${kindA} → ${kindB}`));
+      if(nodesA !== nodesB){
+        lines.push(rem(`${k}.nodes: ${nodesA}`));
+        lines.push(add(`${k}.nodes: ${nodesB}`));
+      }
+    }
+  });
+  if(lines.length) items.push({ head: 'flows', lines });
 }
 
 function diffMap(name, before, after, items, fmt){
