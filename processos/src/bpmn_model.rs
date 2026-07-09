@@ -1614,7 +1614,7 @@ pub(crate) fn preserve_nano_extensions_in(
             // <extensionElements> with just the nano block.
             let replacement = format!(
                 "{}>\n      <bpmn:extensionElements>\n{}      </bpmn:extensionElements>\n    </{}>",
-                &open_tag[..open_tag.len() - 2].trim_end(),
+                open_tag[..open_tag.len() - 2].trim_end(),
                 indented_fragment,
                 local_name
             );
