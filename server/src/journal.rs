@@ -1368,11 +1368,11 @@ impl Journal {
         self.cold.as_mut().expect("cold set").shedding = true;
         let store = Arc::clone(&self.cold.as_ref().expect("cold set").store);
         // Evict dormant instances under a bounded per-tick wall-clock budget
-        // ([`SPILL_TICK_BUDGET`]), then compact + purge ONCE — same rationale as
-        // the variable sweep: holding the single writer through a `shrink()` +
-        // `purge()` per 64-instance batch until resident fell under the low-water
-        // mark stalled create/complete under a deep backlog. Successive ticks
-        // resume where this one left off (latched by `shedding`).
+        // ([`SPILL_TICK_BUDGET`]), then purge ONCE — same rationale as the variable
+        // sweep: holding the single writer through a `shrink()` + `purge()` per
+        // 64-instance batch until resident fell under the low-water mark stalled
+        // create/complete under a deep backlog. Successive ticks resume where this
+        // one left off (latched by `shedding`).
         let deadline = std::time::Instant::now() + SPILL_TICK_BUDGET;
         let mut spilled = 0usize;
         loop {
@@ -1404,17 +1404,20 @@ impl Journal {
             }
         }
         if spilled > 0 {
-            self.engine.shrink();
             let _ = crate::memory::purge();
-            // Clear the latch immediately if this sweep already dropped resident
-            // under the low-water target, so the next tick doesn't re-engage.
-            if crate::memory::resident_bytes().is_some_and(|now| (now as u64) < low) {
-                self.cold.as_mut().expect("cold set").shedding = false;
-            }
             tracing::info!(
                 "cold spill: shed {spilled} dormant instance(s) to disk ({} now cold, budgeted)",
                 self.cold.as_ref().expect("cold set").index.len(),
             );
+            // Clear the latch once this sweep has dropped resident under the
+            // low-water target. Cold spill removes *whole* instances (unlike a
+            // variable spill), so the engine's state maps now carry dead capacity:
+            // compact them ONCE here, at the end of the shedding episode, rather
+            // than `shrink_to_fit`-ing all ten maps on every firing tick.
+            if crate::memory::resident_bytes().is_some_and(|now| (now as u64) < low) {
+                self.cold.as_mut().expect("cold set").shedding = false;
+                self.engine.shrink();
+            }
         }
     }
 
@@ -1785,15 +1788,20 @@ impl Journal {
         }
 
         // Shed the oldest active-backlog variables under a bounded per-tick
-        // wall-clock budget ([`SPILL_TICK_BUDGET`]), then compact + purge ONCE.
-        // The previous design ran `shrink()` + jemalloc `purge()` + a resident
-        // re-read after *every* batch, looping until resident fell under the
-        // target — a >100 ms single-writer hold per tick under a deep backlog that
-        // starved create/complete. Now the hold is bounded: shed what fits the
-        // budget, then return the freed pages to the OS once so the next sweep's
-        // resident reading is accurate (jemalloc's background thread would
-        // otherwise defer the page return past its decay window and over-fire the
-        // RSS gate). Successive sweeps converge under the mark.
+        // wall-clock budget ([`SPILL_TICK_BUDGET`]), then purge ONCE. The original
+        // design ran `shrink()` + jemalloc `purge()` + a resident re-read after
+        // *every* batch, looping until resident fell under the target — a >100 ms
+        // single-writer hold per tick under a deep backlog that starved
+        // create/complete. Now the hold is bounded: shed what fits the budget,
+        // then return the freed pages to the OS once so the next sweep's resident
+        // reading is accurate (jemalloc's background thread would otherwise defer
+        // the page return past its decay window and over-fire the RSS gate).
+        //
+        // No `shrink()` here: a variable spill keeps the *instance* resident (only
+        // its `variables` map is emptied), so the engine's state maps do not
+        // shrink — a `shrink_to_fit` across all ten of them would reallocate huge
+        // maps for zero relief. The relief is the freed variable payloads, which
+        // `purge()` returns to the OS. Successive sweeps converge under the mark.
         let deadline = std::time::Instant::now() + SPILL_TICK_BUDGET;
         let mut total = 0usize;
         loop {
@@ -1809,7 +1817,6 @@ impl Journal {
             }
         }
         if total > 0 {
-            self.engine.shrink();
             let _ = crate::memory::purge();
             tracing::info!(
                 "variable spill (adaptive): shed {total} instance(s)' variables \
