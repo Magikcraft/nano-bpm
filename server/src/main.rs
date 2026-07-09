@@ -1608,10 +1608,18 @@ enum WorkerConcurrency {
 
 /// The self-optimizing floor for the [`WorkerConcurrency::Auto`] governor: the
 /// fewest subscribers per job type the dispatcher will narrow to under congestion.
-/// Small so the governor can throttle a worst-case over-provisioned fleet hard
-/// (concentrating a fixed job supply on few, fully-utilized streams), but not so
-/// small that a single slow worker stalls the drain.
-const MIN_WORKER_GOVERNOR_WIDTH: usize = 16;
+///
+/// This is the **measured drain knee**, not an arbitrary small value. Two
+/// independent live sweeps on the RF=3 cluster land on the same point: a
+/// subscribed-worker sweep peaks at 50 workers/node (46.7k/s, vs 12–24k at
+/// 100–400), and a fixed per-pass-width calibration at 400 over-provisioned
+/// workers/node peaks sharply at width 50 (**42.0k/s, p99 9.3s** — vs 13–17k and
+/// p99 65–75s at off/100/200/800). Because the single-writer engine keeps latency
+/// inflated under sustained overload, the AIMD grow path cannot climb to the knee
+/// from below — so, exactly like the backlog governor, the floor must *be* the
+/// knee. Pinned here, a worst-case over-provisioned fleet is throttled back to the
+/// throughput optimum instead of collapsing (activation swamping completions).
+const MIN_WORKER_GOVERNOR_WIDTH: usize = 50;
 /// The ceiling for the [`WorkerConcurrency::Auto`] governor: effectively "all
 /// subscribers" for any realistic fleet, so a genuinely healthy, drain-bound
 /// workload is never throttled below the number of workers that keep completing.

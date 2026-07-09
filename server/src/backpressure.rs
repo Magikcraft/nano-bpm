@@ -792,7 +792,7 @@ mod tests {
         c.with_backlog_governor(2_000, 200_000, Arc::new(AtomicUsize::new(0)));
         assert!(c.is_active());
         let mut c = AdaptiveController::new();
-        c.with_worker_governor(16, 4_096, Arc::new(AtomicUsize::new(0)));
+        c.with_worker_governor(50, 4_096, Arc::new(AtomicUsize::new(0)));
         assert!(c.is_active());
     }
 
@@ -805,8 +805,8 @@ mod tests {
         // active dispatch width upward from the floor.
         let backlog = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let width = c.with_worker_governor(16, 4_096, backlog.clone());
-        assert_eq!(width.load(Ordering::Relaxed), 16, "starts at the floor");
+        let width = c.with_worker_governor(50, 4_096, backlog.clone());
+        assert_eq!(width.load(Ordering::Relaxed), 50, "starts at the floor");
 
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
         let after_baseline = width.load(Ordering::Relaxed);
@@ -825,18 +825,18 @@ mod tests {
         // subscribers stop swamping the push dispatcher.
         let backlog = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let width = c.with_worker_governor(16, 4_096, backlog.clone());
+        let width = c.with_worker_governor(50, 4_096, backlog.clone());
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
         for _ in 0..5 {
             drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // grow a bit first
         }
-        assert!(width.load(Ordering::Relaxed) > 16);
+        assert!(width.load(Ordering::Relaxed) > 50);
         for _ in 0..200 {
             drive_window(&mut c, 5_000, WINDOW_MIN_SAMPLES); // sustained congestion
         }
         assert_eq!(
             width.load(Ordering::Relaxed),
-            16,
+            50,
             "congestion must hold the active width at the knee floor"
         );
     }
@@ -848,14 +848,14 @@ mod tests {
         // backlog signal and the width must stay pinned at the floor.
         let backlog = Arc::new(AtomicUsize::new(0));
         let mut c = AdaptiveController::new();
-        let width = c.with_worker_governor(16, 4_096, backlog.clone());
+        let width = c.with_worker_governor(50, 4_096, backlog.clone());
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
         for _ in 0..20 {
             drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
         }
         assert_eq!(
             width.load(Ordering::Relaxed),
-            16,
+            50,
             "no backlog to drain must never widen the active fan-out"
         );
     }

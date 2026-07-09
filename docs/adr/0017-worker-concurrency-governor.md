@@ -59,7 +59,8 @@ is the **runnable task-job backlog** (`jobs.len()`, Created+Activated — the sa
 parked-safe signal as the backlog governor). AIMD semantics: slow-start the active width
 upward while there is backlog to drain *and* latency stays below the self-calibrated
 baseline × congestion ratio; multiplicative back-off the moment latency inflates. It
-converges the width on the completion-throughput knee. Floor `MIN_WORKER_GOVERNOR_WIDTH=16`,
+converges the width on the completion-throughput knee. Floor `MIN_WORKER_GOVERNOR_WIDTH=50`
+(**the measured drain knee**, not an arbitrary minimum — see Validation),
 ceiling `MAX_WORKER_GOVERNOR_WIDTH=4096` (effectively "all subscribers").
 
 `NANOBPMN_WORKER_CONCURRENCY`: `auto` (default, governor) / `<n>` (fixed width) /
@@ -100,17 +101,36 @@ parked. The console `/config` view surfaces `NANOBPMN_WORKER_CONCURRENCY`.
 - **Global, not per-job-type.** The width is one global cap applied uniformly per job type,
   because the latency signal is global (partition-0). Per-type widths would need per-type
   latency windows — deferred as future work.
-- **GROW rarely engages under pure single-writer overload.** As with the backlog governor,
-  overload here surfaces as *latency* (not healthy-but-loaded backlog), so the governor
-  correctly pins near the floor; GROW is unit-tested and engages when there is genuine
-  drainable backlog at healthy latency. The floor (16) is a conservative safe minimum; the
-  sweep knee (~50 workers/node) informs it but the AIMD path finds the operating point.
+- **GROW rarely engages under pure single-writer overload — so the floor IS the knee.**
+  As with the backlog governor, overload here surfaces as *latency* (not
+  healthy-but-loaded backlog), so the AIMD grow path cannot climb from below and the
+  governor pins at the floor. An initial floor of 16 was therefore actively harmful
+  (it clamped the fan-out *below* the drain knee and roughly halved throughput). The
+  floor was recalibrated to **50** — the empirically measured knee — so pinning there
+  *is* the optimum. GROW remains unit-tested and engages if a workload ever presents
+  genuine drainable backlog at healthy latency.
 
 ## Validation
 
+- **Fixed-width calibration (400 over-provisioned workers/node, RF=3 cluster).** Vary
+  only the per-pass width cap; measure sustained cluster throughput + tail:
+
+  | width cap | cluster tput | max p99 |
+  |----------:|-------------:|--------:|
+  | off       | 14,842 /s    | 74.5 s  |
+  | **50**    | **41,996 /s**| **9.3 s**|
+  | 100       | 13,828 /s    | 71.2 s  |
+  | 200       | 13,515 /s    | 64.8 s  |
+  | 800       | 17,058 /s    | 74.9 s  |
+
+  Width 50 is a **sharp, isolated optimum**: capping an over-provisioned fleet to 50
+  active subscribers/type nearly triples throughput (14.8k → 42.0k) and cuts p99 8x
+  (74.5s → 9.3s). It independently matches the subscribed-worker sweep knee (50
+  workers/node → 46.7k/s), confirming the per-pass width cap ≈ effective worker
+  concurrency. This is why the floor is 50.
 - Unit tests (`backpressure.rs`): `worker_governor_grows_active_width_while_healthy_and_loaded`,
   `worker_governor_backs_off_to_floor_under_congestion`,
   `worker_governor_does_not_widen_without_backlog`, plus the `is_active` coverage.
-- Worker sweep (above) establishes the knee and the over-provisioning penalty the governor
-  removes.
+- Subscribed-worker sweep establishes the knee and the over-provisioning penalty the
+  governor removes.
 - `cargo build --release` green; `cargo clippy --all-targets` clean; worker-governor tests pass.

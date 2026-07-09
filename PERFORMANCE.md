@@ -1466,3 +1466,22 @@ broadcast on width change so cooperating SDKs can self-size. Gauge:
 
 3 new worker-governor unit tests (grow / back-off / gate-on-backlog) + clippy
 `--all-targets` clean; release build green. See ADR 0017.
+
+### Live validation: the width cap recovers the knee (floor recalibrated 16 -> 50)
+First live run exposed a calibration bug: floor=16 pinned the fan-out *below* the
+knee and made 400-worker/node WORSE than uncapped (~9k vs 18k) — under sustained
+overload latency is always inflated, so AIMD can't grow to the knee from below; the
+floor must BE the knee (as with the backlog governor). A fixed-width calibration at
+400 over-provisioned workers/node found a sharp optimum at width 50:
+
+| width cap | cluster tput | max p99 |
+|----------:|-------------:|--------:|
+| off       | 14,842/s     | 74.5 s  |
+| **50**    | **41,996/s** | **9.3 s**|
+| 100       | 13,828/s     | 71.2 s  |
+| 200       | 13,515/s     | 64.8 s  |
+| 800       | 17,058/s     | 74.9 s  |
+
+Capping an over-provisioned fleet to 50 active subscribers/type nearly triples
+throughput (14.8k->42k) and cuts p99 8x (74.5s->9.3s), matching the subscribed-worker
+knee (50 workers/node -> 46.7k). `MIN_WORKER_GOVERNOR_WIDTH` set to 50.
