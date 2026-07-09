@@ -543,7 +543,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 .items
                                 .into_iter()
                                 .map(|ReplicatedCommand { command, now }| {
-                                    journal.apply_command_at(command, now)
+                                    // Per-command actor profiling (off unless
+                                    // NANOBPM_CMD_PROFILE): time + allocated-byte
+                                    // delta by command kind, on the engine thread.
+                                    let timer = crate::cmd_profile::start();
+                                    let kind = command.kind();
+                                    let outcome = journal.apply_command_at(command, now);
+                                    crate::cmd_profile::finish(timer, kind);
+                                    outcome
                                 })
                                 .collect()
                         })

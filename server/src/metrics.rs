@@ -189,6 +189,28 @@ struct Metrics {
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
     /// can show each pressure signal's headroom to its shed point.
     admission_limit: prometheus::IntGaugeVec,
+
+    // ---- Per-command engine-actor profiling (NANOBPM_CMD_PROFILE) ----
+    /// Wall time of a single applied [`Command`](nanobpmn_engine_core::Command)
+    /// on the engine actor, labelled by `kind`. Its `_count`/`_sum` give the mean
+    /// per-command service time; correlate the rise of the mean against active
+    /// backlog to test the "congestion collapse is O(active) per command"
+    /// hypothesis. Only recorded when `NANOBPM_CMD_PROFILE` is set.
+    cmd_seconds: prometheus::HistogramVec,
+    /// jemalloc thread-allocated bytes attributed to a single applied command on
+    /// the engine actor (the delta of `thread.allocated` across the apply),
+    /// labelled by `kind`. THE discriminator for the create/complete collapse:
+    /// if per-command *time* rises with active backlog while *alloc bytes/command*
+    /// stays flat, the residual cost is hashmap-probe / cache-miss (bigger maps,
+    /// no extra allocation); if alloc bytes/command rises, it is allocator/copy
+    /// cost. Only recorded when `NANOBPM_CMD_PROFILE` is set.
+    cmd_alloc_bytes: prometheus::HistogramVec,
+    /// Live engine-state cardinality per partition, labelled by `partition` and
+    /// `what` (`instances` = resident process instances, `jobs` = total jobs,
+    /// `activated` = leased jobs). The independent variable the per-command
+    /// `cmd_seconds`/`cmd_alloc_bytes` means are regressed against to localize the
+    /// O(active) term. Sampled ~1 Hz off the hot path.
+    engine_cardinality: prometheus::IntGaugeVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -503,6 +525,35 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge vec");
 
+    // Per-command actor profiling. Time buckets span 1µs .. ~16s (the multi-second
+    // stalls observed under collapse); alloc buckets span 0 B .. ~256 MB.
+    let cmd_seconds = prometheus::HistogramVec::new(
+        HistogramOpts::new(
+            "nanobpm_cmd_seconds",
+            "Wall time of a single applied engine command on the actor, by kind (NANOBPM_CMD_PROFILE).",
+        )
+        .buckets(prometheus::exponential_buckets(0.000001, 4.0, 13).expect("valid buckets")),
+        &["kind"],
+    )
+    .expect("valid histogram vec");
+    let cmd_alloc_bytes = prometheus::HistogramVec::new(
+        HistogramOpts::new(
+            "nanobpm_cmd_alloc_bytes",
+            "jemalloc thread-allocated bytes attributed to a single applied engine command, by kind (NANOBPM_CMD_PROFILE).",
+        )
+        .buckets(prometheus::exponential_buckets(64.0, 4.0, 12).expect("valid buckets")),
+        &["kind"],
+    )
+    .expect("valid histogram vec");
+    let engine_cardinality = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_engine_cardinality",
+            "Live engine-state cardinality per partition (what=instances|jobs|activated); the independent variable the per-command cost is regressed against to localize the O(active) term.",
+        ),
+        &["partition", "what"],
+    )
+    .expect("valid gauge vec");
+
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
@@ -545,6 +596,9 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(runnable_backlog.clone())))
         .and(registry.register(Box::new(active_worker_target.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
+        .and(registry.register(Box::new(cmd_seconds.clone())))
+        .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
+        .and(registry.register(Box::new(engine_cardinality.clone())))
         .expect("register metrics");
 
     Metrics {
@@ -590,6 +644,9 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         runnable_backlog,
         active_worker_target,
         admission_limit,
+        cmd_seconds,
+        cmd_alloc_bytes,
+        engine_cardinality,
     }
 });
 
@@ -808,6 +865,39 @@ pub fn set_actor_stats(
         .actor_lo_depth
         .with_label_values(&[&p])
         .set(lo_depth as i64);
+}
+
+/// Records the wall time and jemalloc-allocated bytes attributed to a single
+/// applied engine command, labelled by kind. Called from the raft state-machine
+/// apply loop (on the engine thread) only when `NANOBPM_CMD_PROFILE` is set — see
+/// [`crate::cmd_profile`]. The two histograms together split the create/complete
+/// congestion collapse's residual per-command cost into allocator (alloc bytes
+/// rise with active) vs hashmap-probe/cache (time rises, alloc flat).
+pub fn record_command(kind: &'static str, seconds: f64, alloc_bytes: u64) {
+    METRICS.cmd_seconds.with_label_values(&[kind]).observe(seconds);
+    METRICS
+        .cmd_alloc_bytes
+        .with_label_values(&[kind])
+        .observe(alloc_bytes as f64);
+}
+
+/// Publishes a partition's live engine-state cardinality (resident instances,
+/// total jobs, leased jobs) — the independent variable the per-command cost is
+/// regressed against. Sampled ~1 Hz from the monitor loop, off the hot path.
+pub fn set_engine_cardinality(partition: u64, instances: usize, jobs: usize, activated: usize) {
+    let p = partition.to_string();
+    METRICS
+        .engine_cardinality
+        .with_label_values(&[&p, "instances"])
+        .set(instances as i64);
+    METRICS
+        .engine_cardinality
+        .with_label_values(&[&p, "jobs"])
+        .set(jobs as i64);
+    METRICS
+        .engine_cardinality
+        .with_label_values(&[&p, "activated"])
+        .set(activated as i64);
 }
 
 /// Records one admission shed (a `createProcessInstance` rejected to protect

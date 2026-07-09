@@ -11,6 +11,7 @@
 
 mod backpressure;
 mod cluster;
+mod cmd_profile;
 mod coldspill;
 #[cfg(feature = "console")]
 mod console;
@@ -11099,6 +11100,31 @@ async fn main() {
                         s.hi_depth.load(std::sync::atomic::Ordering::Relaxed),
                         s.lo_depth.load(std::sync::atomic::Ordering::Relaxed),
                     );
+                }
+
+                // Engine-state cardinality per partition — the independent
+                // variable the per-command cost (nanobpm_cmd_*) is regressed
+                // against to localize the create/complete collapse's O(active)
+                // term. Only sampled when NANOBPM_CMD_PROFILE is set, to avoid a
+                // per-partition actor round-trip every tick otherwise.
+                if crate::cmd_profile::enabled() {
+                    for handle in monitor_server.engine.all() {
+                        let partition = handle.stats().partition;
+                        let (instances, jobs, activated) = handle
+                            .with(|journal| {
+                                let engine = journal.engine();
+                                let state = engine.state();
+                                (
+                                    engine.resident_instance_count(),
+                                    state.jobs.len(),
+                                    state.activated_jobs.len(),
+                                )
+                            })
+                            .await;
+                        crate::metrics::set_engine_cardinality(
+                            partition, instances, jobs, activated,
+                        );
+                    }
                 }
             }
         });
