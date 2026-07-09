@@ -268,6 +268,41 @@ latency gate are the second line that bounds memory when a misbehaving open-loop
 producer defeats backpressure. Neither is the binding constraint for well-behaved
 load, so throughput and latency are unaffected in the common case.
 
+### 2026-07-10 — `admission` keeps the AIMD valve armed (open-loop collapse A/B)
+
+The "modes converge" A/B above ran a **gentle** open-loop offered load; this one
+drives the cluster **hard past** the drain ceiling to separate the two latency rails
+`SlaMode` controls: the proactive **backlog governor** and the **AIMD concurrency
+limiter**. Same RF=3 / 12-partition GCP cluster, bounded-spill build, three
+open-loop loadgens (`WORKERS=400`/node, `PROD_CONNS=256`, `RATE=30000`,
+`MAX_INFLIGHT=400000`), `SLA_MODE` flipped live via the console
+(`PUT /console/api/config/server/sla`, broadcasts cluster-wide).
+
+| Config | AIMD | backlog gov. | agg comp/s | p50 | p90 | p99 | per-node backlog |
+|--------|:----:|:------------:|-----------:|----:|----:|----:|-----------------:|
+| `latency` (default) | on | on | ~14,000 | 32 ms | 66 ms | 2.3 s | bounded (~652 avg) |
+| `latency`, `MAX_BACKLOG=off` (AIMD only) | on | off | **~22,000** | 61 ms | — | — | bounded |
+| `admission` **(old: both off)** | off | off | ~21,500 | **107 s** | 843 s | 857 s | **unbounded (828k)** |
+
+**Finding.** Suppressing the AIMD limiter (what the old `admission` mode did on top
+of dropping the backlog governor) bought **zero extra throughput** — ~21.5k/s is the
+same single-writer ceiling the AIMD-on config already reaches at ~22k/s — while
+**exploding p50 from 61 ms to 107 s** and letting the backlog grow **unbounded**
+(828k instances/node). The AIMD limiter is not a throughput throttle; because creates
+and completions share the single-writer actor, it is a **self-balancing valve** that
+paces intake down to the drain rate, which is exactly what keeps the backlog bounded.
+
+**Change (this build).** `admission` now **keeps the AIMD limiter armed** and relaxes
+**only** the proactive backlog governor (`server/src/main.rs`
+`create_process_instance_impl`, gate no longer conditioned on `sheds_for_latency()`).
+So `admission` admits everything the engine can actually drain — throughput at the
+ceiling, backlog bounded — paced via retryable `503`s, instead of 200-accepting into
+an unbounded queue. This makes `admission` the AIMD-only column above (~22k/s @ p50
+61 ms), a genuine higher-throughput / looser-but-bounded-tail point distinct from
+`latency`'s tight-tail governor (~14k/s @ p99 2.3 s). **Secondary result:** even at
+828k resident instances/node the bounded-spill fix held the writer to ≤141 ms holds
+(vs 8.2 s pre-fix) — no congestion collapse at the extreme.
+
 ### 2026-07-07 — Open-loop 24k reject soak: the backlog gate bounds **memory**, not **throughput**
 
 The closed-loop table above never builds a server backlog, so it never exercised

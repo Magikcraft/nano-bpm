@@ -74,11 +74,18 @@ That is `NANOBPMN_SLA_MODE`:
 
 - **`latency`** (default) — *"seat fewer, serve fast."* Preserve end-to-end speed by
   shedding admission at the ceiling. A **time-to-complete** SLA.
-- **`admission`** — *"seat everyone, warn of the wait."* Keep admitting instances and
-  let latency grow. A **start-every-process** SLA.
+- **`admission`** — *"seat everyone the kitchen can keep up with."* Drop the
+  proactive latency-preserving shedding, but keep the self-balancing AIMD valve that
+  paces the door to the engine's real drain rate. You admit everything the engine can
+  actually complete — throughput stays at the ceiling and the backlog stays bounded,
+  but end-to-end latency runs looser than in `latency` mode. A **start-every-process**
+  SLA, paced by retryable `503`s rather than an unbounded queue.
 
-In both modes the memory-safety rails still guard against OOM — `admission` accepts
-latency, never a crash. This is the only behavioural policy you choose, and it is
+In both modes the memory-safety rails still guard against OOM **and the self-balancing
+AIMD valve stays armed** — so `admission` never lets the backlog run away: it paces
+intake to the drain rate instead of accepting into an unbounded queue. `admission`
+accepts looser latency, never a crash and never a runaway backlog. This is the only
+behavioural policy you choose, and it is
 [**switchable at runtime, cluster-wide**](docs/adr/0013-sla-modes-and-varstore-wal-bounding.md)
 (flip it on one node and it propagates to the rest).
 
@@ -925,7 +932,7 @@ deliberately orthogonal — pick each axis independently for your workload.
 | **High throughput under worker over-provisioning** | `NANOBPMN_REPLICATE_ACTIVATION=0` (leader-local) or `=digest` | Keep the activation lease off the Raft log (~3× activation throughput). `digest` adds a best-effort lease broadcast so failover redelivery is narrowed. All modes stay at-least-once. |
 | **Even job drain across nodes** | on by default (`NANOBPMN_ACTIVATION_FAIRNESS=2`); set `=off` to disable | Default `2` caps each source by its live backlog so the deepest node drains fastest; `1` is rotation+quota only; `off` restores strict local-first. |
 | **A producer that outpaces the workers** | leave backpressure on (default **Adaptive**), or pin `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT=<n>` | Adaptive (AIMD) sizes the in-flight watermark from measured latency and sheds excess creates with `503 RESOURCE_EXHAUSTED`, so the producer converges to the drain rate. |
-| **Behaviour at the saturation ceiling** | `NANOBPMN_SLA_MODE=latency` (default) or `=admission` | `latency` preserves end-to-end speed by shedding admission (**time-to-complete SLA**). `admission` keeps admitting instances and lets latency grow (**start-every-process SLA**); the memory-safety rails still guard against OOM in both modes. |
+| **Behaviour at the saturation ceiling** | `NANOBPMN_SLA_MODE=latency` (default) or `=admission` | `latency` preserves end-to-end speed by proactively shedding admission (**time-to-complete SLA**). `admission` drops that proactive shedding but keeps the self-balancing AIMD valve, so it admits everything the engine can drain at looser but still-**bounded** latency (**start-every-process SLA**, paced via retryable `503`s). The AIMD valve and the memory-safety rails stay armed in both modes, so `admission` never lets the backlog run away. |
 | **Bounded memory after bursts** | `NANOBPMN_IDLE_PURGE_MS`, `NANOBPMN_HISTORY_MAX_INSTANCES`, `NANOBPMN_VAR_SPILL*` | Idle-purge compacts hot state and returns freed arenas to the OS. Cap retained completed instances to bound read-model growth. |
 | **Bounded var-store WAL on disk** | `NANOBPMN_VARSTORE_WAL_CHECKPOINT_SECS` (default `30`, `0`/`off` disables) | Periodically runs `wal_checkpoint(TRUNCATE)` on the durable var-store so its `-wal` file can't grow without bound under a sustained large-payload write load. |
 

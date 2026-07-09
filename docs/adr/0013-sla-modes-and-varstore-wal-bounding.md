@@ -60,6 +60,9 @@ Add `NANOBPMN_SLA_MODE`:
   shed admission (`503`) to keep accepted instances fast.
 - **`admission`**: suppress the latency-preservation gates so creates keep being
   admitted, accepting higher end-to-end latency.
+  *(Revised 2026-07-10 — see Addendum: `admission` now suppresses only the proactive
+  backlog governor and keeps the AIMD limiter armed. It never produces an unbounded
+  backlog.)*
 
 Crucially, `SlaMode` governs **only** the latency gates. The **memory-safety
 rails** — create-queue depth (bounds the pre-apply mailbox of variable-carrying
@@ -242,3 +245,35 @@ modes cost nothing relative to each other.
   a blended envelope rather than one of the two canonical behaviours.
 - ~~Soak-validate admission mode on the cluster~~ (done — see Validation; modes
   converge under closed-loop clients, WAL stays bounded).
+
+## Addendum (2026-07-10) — `admission` keeps the AIMD limiter armed
+
+The follow-up open-loop overload test (now feasible with a Rust producer; see
+`PERFORMANCE.md` "2026-07-10 — `admission` keeps the AIMD valve armed") drove the
+cluster hard past the drain ceiling and revised one part of the decision above.
+
+**Finding.** Under genuine overload, suppressing the **AIMD concurrency limiter** in
+`admission` mode (which the original decision did, alongside dropping the backlog
+governor) bought **zero** additional throughput — ~21.5k/s, the same single-writer
+ceiling the AIMD-on config already reaches — while exploding p50 latency from 61 ms
+to **107 s** and letting the backlog grow **unbounded** (828k instances/node). The
+AIMD limiter is not a throughput throttle: because creates and completions share the
+single-writer actor, it is a **self-balancing valve** that paces intake down to the
+drain rate, which is precisely what keeps the backlog bounded at no throughput cost.
+
+**Revision.** `SlaMode::Admission` now suppresses **only** the proactive
+active-backlog governor, and **keeps the AIMD limiter armed in both modes**
+(`create_process_instance_impl` no longer conditions the AIMD gate on
+`sheds_for_latency()`; the backlog rail in `admission_shed` remains latency-gated).
+
+**Effect on the compressor/limiter model.** The clean "admission = pure compressor,
+nothing rejected" framing above is superseded: `admission` is now a **soft-knee
+compressor with the AIMD limiter always in circuit** — it still admits everything the
+engine can *drain*, but paces the door with retryable `503`s instead of accepting
+into an unbounded queue. This keeps the honest device description from the model
+section ("a soft-knee compressor with a safety limiter that is always in circuit")
+literally true of the mechanism, and it collapses the practical difference between
+the two modes to: `latency` runs the proactive backlog governor for a tight tail
+(~14k/s, p99 2.3 s); `admission` drops it for max drain-limited throughput at a
+looser but still-**bounded** tail (~22k/s, p50 61 ms). Neither mode can produce an
+unbounded backlog. The `ratio`/soft-knee middle-SLA follow-up is unaffected.
