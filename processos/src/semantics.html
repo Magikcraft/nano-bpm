@@ -114,6 +114,38 @@
   .flow-id, .flow-kind { font-size: 12px; padding: 3px 6px; }
   .flow-del { border: 0; background: transparent; padding: 2px 6px; cursor: pointer; color: var(--po-danger-soft); }
   .flow-del:hover { background: var(--po-hover); border-radius: 6px; }
+
+  /* Semantics Curator pane (slice 12) — a collapsible strip below the header
+     btnrow, above the workbench grid. Survives model reloads because it
+     lives outside #wbHost. */
+  .cur-pane { border: 1px solid var(--po-accent, var(--po-edge-strong)); border-radius: 10px; background: var(--po-raised); margin: 8px 0 12px; overflow: hidden; }
+  .cur-head { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--po-edge); background: var(--po-inset); }
+  .cur-head .cur-close { margin-left: auto; border: 0; background: transparent; color: var(--po-text-muted); padding: 2px 6px; }
+  .cur-head .cur-close:hover { color: var(--po-danger-soft); }
+  .cur-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .cur-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .cur-actions .rlbl { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--po-text-muted); margin-right: 4px; }
+  .cur-actions button[data-axis] { padding: 4px 12px; font-size: 12.5px; }
+  .cur-spin { font-size: 12px; }
+  .cur-chat { max-height: 160px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+  .cur-msg { padding: 4px 8px; border-radius: 6px; background: var(--po-inset); }
+  .cur-msg .cur-role { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--po-text-faint); margin-right: 6px; }
+  .cur-msg-user { background: var(--po-hover); }
+  .cur-msg-asst { background: var(--po-inset); font-family: ui-monospace, monospace; font-size: 11.5px; }
+  .cur-proposal { border-top: 1px dashed var(--po-edge); padding-top: 8px; margin-top: 4px; }
+  .cur-items { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+  .cur-item { display: flex; gap: 8px; align-items: flex-start; padding: 4px 6px; border-radius: 6px; cursor: pointer; }
+  .cur-item:hover { background: var(--po-hover); }
+  .cur-item input[type="checkbox"] { margin-top: 3px; }
+  .cur-item-body { flex: 1; font-size: 12.5px; }
+  .cur-item-body code { font-size: 11.5px; }
+  .cur-item-body .cur-detail { color: var(--po-text-muted); font-size: 11.5px; margin-top: 2px; font-family: ui-monospace, monospace; }
+  .cur-tag { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; margin-right: 4px; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+  .cur-tag-add    { background: var(--po-ok-wash);   color: var(--po-ok-soft); }
+  .cur-tag-update { background: var(--po-info-wash); color: var(--po-info-soft); }
+  .cur-tag-noop   { background: var(--po-hover);     color: var(--po-text-faint); }
+  .cur-foot { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+
 </style>
 </head>
 <body>
@@ -169,6 +201,16 @@ const S = {
   renderer: 'default',             // 'default' | 'rowbias' | 'field' — canvas renderer
   previewDebounceTimer: null,     // debounce id for auto-refresh on annotation edits
   previewInFlight: false,         // true while a /api/layout call is pending (for spinner UX)
+  // Slice 12: Semantics Curator — LLM assistant for STRUCTURAL annotations
+  // only (flows/clusters/roles). Cost/time proposals are explicitly out of
+  // scope and stripped server-side. See processos/src/curator.rs.
+  curator: {
+    open: false,          // pane is toggled by the 🤖 button in the header row
+    running: false,       // true while a /api/curator/propose call is in flight
+    chatHistory: [],      // [{role, content}, …] — folded into the next request
+    proposal: null,       // { axis, payload, selected: {index/id: bool}, receivedAt } | null
+    lastError: null,      // last error message, shown inline in the pane
+  },
 };
 function emptyAnn(){ return { flows: [], clusters: [], roles: {}, costs: {}, times: {} }; }
 function deepClone(v){ return JSON.parse(JSON.stringify(v)); }
@@ -268,12 +310,15 @@ function renderShell(){
     <div class="btnrow">
       <button class="primary" id="btnSave">💾 Save</button>
       <button id="btnRevert" title="Discard local edits, reload the on-disk sidecar">Revert</button>
+      <button id="btnCurator" title="Ask the Semantics Curator LLM to propose flows, clusters or roles">🤖 Curator</button>
       <span class="status" id="saveStatus"></span>
     </div>
+    <div id="curatorPane" style="display:none"></div>
     <div id="wbHost"></div>`;
 
   $('#btnSave').onclick = openSaveDialog;
   $('#btnRevert').onclick = revert;
+  $('#btnCurator').onclick = toggleCurator;
 }
 
 async function mountModeler(xml){
@@ -721,6 +766,269 @@ function mutate(fn){
   renderTab();
   schedulePreviewRefresh();
 }
+
+// ── Semantics Curator (LLM assistant, slice 12) ─────────────────────────
+// The Curator is a workbench-scoped LLM helper that proposes STRUCTURAL
+// annotations (flows/clusters/roles). Cost/time proposals are out of scope
+// by design and stripped server-side (see processos/src/curator.rs). The
+// pane is a collapsible strip inserted between the header btnrow and the
+// workbench grid — it survives model reloads because `#curatorPane` lives
+// outside `#wbHost`.
+
+function toggleCurator(){
+  S.curator.open = !S.curator.open;
+  renderCuratorPane();
+}
+
+function renderCuratorPane(){
+  const host = $('#curatorPane');
+  if(!host) return;
+  if(!S.curator.open){
+    host.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+  host.style.display = 'block';
+  const c = S.curator;
+  const spin = c.running ? '<span class="cur-spin">⏳</span>' : '';
+  const err = c.lastError
+    ? `<div class="err" style="margin:6px 0">${esc(c.lastError)}</div>` : '';
+  const chatRows = c.chatHistory.length
+    ? c.chatHistory.slice(-6).map(t => {
+        const roleClass = t.role === 'user' ? 'cur-msg-user' : 'cur-msg-asst';
+        // Assistant messages are raw JSON — truncate for the transcript view.
+        const preview = t.role === 'assistant' && t.content.length > 200
+          ? t.content.slice(0, 200) + '…' : t.content;
+        return `<div class="cur-msg ${roleClass}"><span class="cur-role">${esc(t.role)}</span>${esc(preview)}</div>`;
+      }).join('')
+    : '<div class="muted" style="font-size:12px">No conversation yet — pick an axis to propose, or send a freeform note.</div>';
+  const disabled = c.running ? 'disabled' : '';
+
+  host.innerHTML = `
+    <div class="cur-pane">
+      <div class="cur-head">
+        <strong>🤖 Semantics Curator</strong>
+        <span class="muted" style="font-size:11.5px">structural axes only — no costs or times</span>
+        ${spin}
+        <button class="cur-close" title="Close" onclick="toggleCurator()">✕</button>
+      </div>
+      <div class="cur-body">
+        <div class="cur-actions">
+          <label class="rlbl">Propose for axis</label>
+          <button data-axis="flows"    ${disabled}>Flows</button>
+          <button data-axis="clusters" ${disabled}>Clusters</button>
+          <button data-axis="roles"    ${disabled}>Roles</button>
+          <input id="curInput" type="text" placeholder="Optional refinement, e.g. &quot;keep the happy flow short&quot;"
+                 style="flex:1; min-width:180px" ${disabled}>
+        </div>
+        ${err}
+        <div class="cur-chat">${chatRows}</div>
+        ${renderCuratorProposal()}
+      </div>
+    </div>`;
+
+  host.querySelectorAll('.cur-actions button[data-axis]').forEach(b => {
+    b.onclick = () => proposeCurator(b.dataset.axis, $('#curInput').value.trim());
+  });
+  const input = host.querySelector('#curInput');
+  if(input){
+    input.onkeydown = ev => {
+      // Enter alone = propose for the current proposal's axis, or "flows" by default.
+      if(ev.key === 'Enter'){
+        ev.preventDefault();
+        const axis = (c.proposal && c.proposal.axis) || 'flows';
+        proposeCurator(axis, input.value.trim());
+      }
+    };
+  }
+  wireProposalOverlay(host);
+}
+
+function renderCuratorProposal(){
+  const p = S.curator.proposal;
+  if(!p) return '';
+  const items = proposalItems(p.axis, p.payload);
+  if(!items.length){
+    return `<div class="cur-proposal">
+      <div class="cur-head" style="border:0"><strong>Proposal (${esc(p.axis)})</strong><span class="muted">— empty (nothing to add)</span></div>
+    </div>`;
+  }
+  const rows = items.map((it, i) => `
+    <label class="cur-item">
+      <input type="checkbox" data-cur-i="${i}" ${p.selected[i] === false ? '' : 'checked'}>
+      <span class="cur-item-body">${it.html}</span>
+    </label>`).join('');
+  const anySel = items.some((_, i) => p.selected[i] !== false);
+  return `
+    <div class="cur-proposal">
+      <div class="cur-head" style="border:0">
+        <strong>Proposal (${esc(p.axis)})</strong>
+        <span class="muted">— ${items.length} item${items.length===1?'':'s'}, check to accept</span>
+      </div>
+      <div class="cur-items">${rows}</div>
+      <div class="cur-foot">
+        <button class="primary cur-apply" ${anySel?'':'disabled'}>Apply selected</button>
+        <button class="cur-dismiss">Dismiss</button>
+        <span class="muted" style="font-size:11.5px">Accepted items merge into your working copy — Save persists them.</span>
+      </div>
+    </div>`;
+}
+
+// Enumerate the diffable items in a proposal. Each item has:
+//   { html: rendered summary, apply: function(annDraft) -> mutates draft to accept the item }
+// Order matters for stable checkbox indexing across re-renders.
+function proposalItems(axis, payload){
+  if(axis === 'flows'){
+    const flows = Array.isArray(payload && payload.flows) ? payload.flows : [];
+    // Match by id against the current working copy: existing id → "update",
+    // new id → "add". Deletes are NOT surfaced (Curator only proposes what
+    // to keep/add; the human dismisses irrelevant items via the ☐).
+    const byId = new Map((S.ann.flows||[]).map(f => [f.id, f]));
+    return flows.map(f => {
+      const existing = byId.get(f.id);
+      const label = existing ? 'update' : 'add';
+      const nodes = (f.nodes||[]).map(esc).join(' → ') || '<span class="muted">(no nodes)</span>';
+      return {
+        html: `<span class="cur-tag cur-tag-${label}">${label}</span>
+               <code>${esc(f.id)}</code> · <em>${esc(f.kind || 'primary')}</em>
+               <div class="cur-detail">${nodes}</div>`,
+        apply: (draft) => {
+          draft.flows = draft.flows || [];
+          const i = draft.flows.findIndex(x => x.id === f.id);
+          const clean = { id: f.id, kind: f.kind || 'primary', nodes: Array.isArray(f.nodes) ? f.nodes.slice() : [] };
+          if(i >= 0) draft.flows[i] = clean; else draft.flows.push(clean);
+        },
+      };
+    });
+  }
+  if(axis === 'clusters'){
+    const clusters = Array.isArray(payload && payload.clusters) ? payload.clusters : [];
+    const byId = new Map((S.ann.clusters||[]).map(c => [c.id, c]));
+    return clusters.map(c => {
+      const existing = byId.get(c.id);
+      const label = existing ? 'update' : 'add';
+      const nodes = (c.nodes||[]).map(esc).join(', ') || '<span class="muted">(no nodes)</span>';
+      const aff = (typeof c.affinity === 'number') ? c.affinity.toFixed(2) : '0.50';
+      return {
+        html: `<span class="cur-tag cur-tag-${label}">${label}</span>
+               <code>${esc(c.id)}</code> · affinity ${esc(aff)}
+               <div class="cur-detail">${nodes}</div>`,
+        apply: (draft) => {
+          draft.clusters = draft.clusters || [];
+          const i = draft.clusters.findIndex(x => x.id === c.id);
+          const clean = { id: c.id, nodes: Array.isArray(c.nodes) ? c.nodes.slice() : [], affinity: typeof c.affinity === 'number' ? c.affinity : 0.5 };
+          if(i >= 0) draft.clusters[i] = clean; else draft.clusters.push(clean);
+        },
+      };
+    });
+  }
+  if(axis === 'roles'){
+    const roles = (payload && payload.roles && typeof payload.roles === 'object') ? payload.roles : {};
+    return Object.entries(roles).map(([id, role]) => {
+      const existing = (S.ann.roles||{})[id];
+      const label = existing ? (existing === role ? 'noop' : 'update') : 'add';
+      return {
+        html: `<span class="cur-tag cur-tag-${label}">${label}</span>
+               <code>${esc(id)}</code> → <em>${esc(role)}</em>${existing && existing !== role ? ` <span class="muted">(was ${esc(existing)})</span>` : ''}`,
+        apply: (draft) => {
+          draft.roles = draft.roles || {};
+          draft.roles[id] = role;
+        },
+      };
+    });
+  }
+  return [];
+}
+
+function wireProposalOverlay(host){
+  const p = S.curator.proposal;
+  if(!p) return;
+  host.querySelectorAll('.cur-item input[type="checkbox"][data-cur-i]').forEach(cb => {
+    cb.onchange = () => {
+      p.selected[+cb.dataset.curI] = cb.checked;
+      renderCuratorPane(); // re-render to update the "Apply selected" enabled state
+    };
+  });
+  const apply = host.querySelector('.cur-apply');
+  if(apply) apply.onclick = applyCuratorProposal;
+  const dismiss = host.querySelector('.cur-dismiss');
+  if(dismiss) dismiss.onclick = () => { S.curator.proposal = null; renderCuratorPane(); };
+}
+
+async function proposeCurator(axis, userMessage){
+  if(!['flows','clusters','roles'].includes(axis)){
+    S.curator.lastError = `unknown axis: ${axis}`;
+    renderCuratorPane();
+    return;
+  }
+  if(!S.xml){
+    S.curator.lastError = 'no BPMN model loaded to reason about';
+    renderCuratorPane();
+    return;
+  }
+  S.curator.running = true;
+  S.curator.lastError = null;
+  renderCuratorPane();
+  try {
+    const body = {
+      xml: S.xml,
+      axis,
+      currentAnnotations: S.ann,
+      chatHistory: S.curator.chatHistory,
+      userMessage: userMessage || null,
+    };
+    const res = await fetch('/api/curator/propose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if(!res.ok){
+      S.curator.lastError = j.error || `${res.status} ${res.statusText}`;
+      // Even on parse errors the server returns assistantText — persist it so
+      // the operator can see what the model wrote and correct with a
+      // refinement.
+      if(j.assistantText){
+        if(userMessage) S.curator.chatHistory.push({ role: 'user', content: userMessage });
+        S.curator.chatHistory.push({ role: 'assistant', content: j.assistantText });
+      }
+      return;
+    }
+    const items = proposalItems(axis, j.proposal);
+    const selected = {};
+    items.forEach((_, i) => { selected[i] = true; });
+    S.curator.proposal = {
+      axis,
+      payload: j.proposal,
+      selected,
+      receivedAt: Date.now(),
+    };
+    if(Array.isArray(j.chatHistory)) S.curator.chatHistory = j.chatHistory;
+  } catch(e){
+    S.curator.lastError = e.message || String(e);
+  } finally {
+    S.curator.running = false;
+    renderCuratorPane();
+    // Clear the input after send.
+    const input = $('#curInput');
+    if(input) input.value = '';
+  }
+}
+
+function applyCuratorProposal(){
+  const p = S.curator.proposal;
+  if(!p) return;
+  const items = proposalItems(p.axis, p.payload);
+  const accepted = items.filter((_, i) => p.selected[i] !== false);
+  if(!accepted.length) return;
+  mutate(draft => {
+    accepted.forEach(it => it.apply(draft));
+  });
+  S.curator.proposal = null;
+  renderCuratorPane();
+  toast(`Curator: applied ${accepted.length} ${p.axis} item${accepted.length===1?'':'s'} — remember to Save`);
+}
+
 
 // ── Flow mutators ────────────────────────────────────────────────────────
 // All flow edits go through mutate() so undo/save-with-diff see them as one
