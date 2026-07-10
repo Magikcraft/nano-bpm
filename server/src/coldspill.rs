@@ -157,6 +157,13 @@ impl ColdIndex {
         self.instances.len()
     }
 
+    /// Iterator over every cold instance key. Used by reconciliation to include
+    /// cold-spilled (still-running) instances in the engine's live-instance set,
+    /// so they are never mistaken for orphaned read rows.
+    pub fn keys(&self) -> impl Iterator<Item = Key> + '_ {
+        self.instances.keys().copied()
+    }
+
     /// The cold instance owning `job_key`, if any.
     pub fn instance_for_job(&self, job_key: Key) -> Option<Key> {
         self.by_job.get(&job_key).copied()
