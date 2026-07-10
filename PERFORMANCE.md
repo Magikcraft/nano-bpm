@@ -1594,3 +1594,41 @@ reclaim terminal shells on apply, so they never accumulate. The ~675 residual
 active_backlog + ~765 MB is the separate, pre-existing owned-partition wedge
 (checkpoint 149 theme), unchanged by this fix. Congestion/latency unaffected
 (flood p99 ~63 ms). Cluster left on 352dfb4e in the production latency default.
+
+## Residual active_backlog "wedge": a read-model orphan artifact (not an engine lease leak)
+
+The ~675 residual `active_backlog` carried across the prior sections was assumed
+to be genuinely wedged instances. It is not. A `/debug/instances` dump on a
+no-wipe-restarted node (journal replayed) showed **every partition empty**
+(`instances={} jobs={}`, zero leases, zero incidents) while `active_backlog`
+still read 139 — the engine holds **zero** instances, hot or cold (cold-spill
+table also empty).
+
+**Root cause.** `active_backlog` is the `inflight` gauge, seeded at boot from the
+persisted read model: `COUNT(*) FROM process_instances WHERE state = 0`
+(`main.rs` `inflight_seed` / `readstore.rs active_instance_count`). A read row
+strands in `Active` when its CREATE is projected but its terminal event never is:
+the per-partition read store is written only by that partition's **leader**
+exporter, so a mid-instance leadership handoff projects the create on the old
+leader and the completion on the new one — the old leader's row stays `Active`
+forever. On restart these orphans re-seed the gauge → a phantom backlog that
+biases admission control and Stage-2 fairness routing. (The Issue-#1
+genuine-transition delta fix stops *live* double-counting; it does not reconcile
+persisted orphans or the boot seed.)
+
+**Fix (read-model reconciliation against engine truth).**
+- `Journal::collect_live_instance_keys` (hot ∪ cold) exposes the engine's
+  authoritative live-instance set; `ReadStore::reconcile_orphaned_active(live)`
+  retires every `Active` row absent from it (→ `Completed`, idempotent under the
+  `WHERE state = 0` guard).
+- **Boot:** reconcile the replayed read model before seeding `inflight`, so the
+  gauge starts from the true count.
+- **Runtime:** a 60 s quiescence-gated sweep (`reconcile_orphans_once`, skipped
+  while `processing > 0`) retires orphans that form afterwards, decrementing the
+  gauge via an atomic saturating add the exporter now shares.
+- Added `/debug/instances` as a permanent diagnostic (like `/debug/raft`).
+
+**GCP validation (build 0e8514bd, node0 no-wipe restart over the wedged
+journal).** Boot log: `read-model reconcile: marked orphaned Active rows Completed
+at boot ... reconciled=139 live=0`; `nanobpm_active_backlog` **139 → 0**. The
+gauge now matches authoritative engine state.

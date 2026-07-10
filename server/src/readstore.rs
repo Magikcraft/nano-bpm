@@ -704,6 +704,76 @@ impl ReadStore {
         .unwrap_or(0)
     }
 
+    /// Reconciles orphaned `Active` rows against authoritative engine state.
+    ///
+    /// A read row can be stranded in `Active` (`state = 0`) when its CREATE was
+    /// projected here but the matching terminal event never was — e.g. this shard
+    /// projected the create while it led the partition, then leadership moved and
+    /// the completion was applied+exported by the *new* leader, so the terminal
+    /// transition never reached this read model. Such a row inflates
+    /// [`active_instance_count`](Self::active_instance_count) — and hence the
+    /// in-flight admission gauge it seeds at boot — forever, even though the
+    /// engine holds no such live instance (the engine evicts an instance the
+    /// instant it reaches a terminal state).
+    ///
+    /// `live` is the set of instance keys the engine actually holds (hot ∪ cold)
+    /// for the partitions this shard covers. Every `Active` row whose key is
+    /// absent from `live` is transitioned to `Completed` (best effort: the engine
+    /// evicted it on reaching a terminal state, and completion is the dominant
+    /// drain path). The `WHERE state = 0` guard makes this idempotent and safe to
+    /// race with a genuinely in-flight completion event: whichever applies first
+    /// transitions the row, the other is a no-op, so the instance is counted
+    /// exactly once. Returns the number of rows reconciled — the amount by which
+    /// the in-flight gauge was over-counting.
+    pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
+        let mut conn = self.conn.lock().expect("read store poisoned");
+        let active: Vec<i64> = {
+            let mut stmt = match conn.prepare("SELECT key FROM process_instances WHERE state = 0") {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            let rows = match stmt.query_map([], |r| r.get::<_, i64>(0)) {
+                Ok(r) => r,
+                Err(_) => return 0,
+            };
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let orphans: Vec<i64> = active
+            .into_iter()
+            .filter(|k| !live.contains(&(*k as Key)))
+            .collect();
+        if orphans.is_empty() {
+            return 0;
+        }
+        let tx = match conn.transaction() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let completed = instance_state_code(ProcessInstanceState::Completed);
+        let resolved = incident_state_code(IncidentState::Resolved);
+        let active_inc = incident_state_code(IncidentState::Active);
+        let mut reconciled = 0usize;
+        for k in &orphans {
+            if let Ok(1) = tx.cexecute(
+                "UPDATE process_instances SET state = ?2, has_incident = 0 \
+                 WHERE key = ?1 AND state = 0",
+                params![*k, completed],
+            ) {
+                reconciled += 1;
+            }
+            // Close any still-open incident so the reconciled instance does not
+            // surface as having an open incident.
+            let _ = tx.cexecute(
+                "UPDATE incidents SET state = ?2 WHERE instance_key = ?1 AND state = ?3",
+                params![*k, resolved, active_inc],
+            );
+        }
+        if tx.commit().is_err() {
+            return 0;
+        }
+        reconciled
+    }
+
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -1040,6 +1110,21 @@ impl ReadModel {
 
     pub fn active_instance_count(&self) -> usize {
         self.shards.iter().map(|s| s.active_instance_count()).sum()
+    }
+
+    /// Reconciles orphaned `Active` rows across every shard against the engine's
+    /// authoritative live-instance set (`live` = hot ∪ cold keys for all owned
+    /// partitions). Because instance keys are globally unique (they encode the
+    /// partition), a single global `live` set is safe to apply to every shard: a
+    /// key that is genuinely live on its own partition is present in `live` and is
+    /// never reconciled. Returns the total rows reconciled — the amount by which
+    /// the in-flight gauge was over-counting. See
+    /// [`ReadStore::reconcile_orphaned_active`].
+    pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.reconcile_orphaned_active(live))
+            .sum()
     }
 
     pub fn process_instance_count(&self) -> i64 {
@@ -1879,6 +1964,46 @@ mod definition_xml_tests {
 
         // Net gauge over the whole life is zero, and the row is terminal.
         assert_eq!(store.active_instance_count(), 0);
+    }
+
+    #[test]
+    fn reconcile_orphaned_active_retires_rows_absent_from_the_live_set() {
+        use nanobpmn_engine_core::ProcessInstanceState;
+        let store = ReadStore::open(None).unwrap();
+        // Three creates, none completed: all Active.
+        for k in [10u64, 11, 12] {
+            store.export(&[&created_event(k)]).unwrap();
+        }
+        assert_eq!(store.active_instance_count(), 3);
+
+        // Engine truth: only 11 is genuinely live (e.g. cold-spilled). 10 and 12
+        // are orphans — their CREATE was projected but the terminal event never
+        // was — so the engine holds no such instance.
+        let mut live = std::collections::HashSet::new();
+        live.insert(11u64);
+
+        let reconciled = store.reconcile_orphaned_active(&live);
+        assert_eq!(reconciled, 2, "10 and 12 are retired; 11 is live");
+        assert_eq!(store.active_instance_count(), 1);
+        // The live instance is untouched and still Active; the orphans are now
+        // Completed (not deleted — the row is preserved for queries).
+        assert_eq!(
+            store.process_instance(11).map(|r| r.state),
+            Some(ProcessInstanceState::Active)
+        );
+        assert_eq!(
+            store.process_instance(10).map(|r| r.state),
+            Some(ProcessInstanceState::Completed)
+        );
+
+        // Idempotent: a second sweep with the same live set retires nothing.
+        assert_eq!(store.reconcile_orphaned_active(&live), 0);
+
+        // A late genuine completion re-delivery for an already-reconciled orphan
+        // is inert (the `WHERE state = 0` guard), so the gauge never double-counts.
+        let done = Event::ProcessInstanceCompleted { instance_key: 10 };
+        assert_eq!(store.export(&[&done]).unwrap().inflight_delta, 0);
+        assert_eq!(store.active_instance_count(), 1);
     }
 
     #[test]

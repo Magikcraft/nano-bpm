@@ -446,6 +446,30 @@ impl ServerImpl {
                 }
             }
         }
+        // Reconcile the persisted read model against authoritative engine state
+        // before seeding the in-flight gauge. A read row can be stranded in
+        // `Active` when its CREATE was projected here but the matching terminal
+        // event never was (leadership moved mid-instance, so the completion was
+        // exported by the new leader). Such orphans inflate the active-backlog
+        // gauge — biasing admission control and Stage-2 fairness routing — even
+        // though the engine, having driven those instances to a terminal state
+        // and evicted them, holds no such live instance. Build the engine's live
+        // set (hot ∪ cold across every replayed partition) and mark every Active
+        // read row absent from it as Completed, then seed the gauge from the
+        // reconciled (true) count.
+        let mut live_keys: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        for journal in journals.iter() {
+            journal.collect_live_instance_keys(&mut live_keys);
+        }
+        let reconciled = store.reconcile_orphaned_active(&live_keys);
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled,
+                live = live_keys.len(),
+                "read-model reconcile: marked orphaned Active rows Completed at boot \
+                 (stranded creates whose terminal event was never projected)"
+            );
+        }
         let inflight_seed = store.active_instance_count();
         let inflight = Arc::new(AtomicUsize::new(inflight_seed));
         // Request-processing concurrency starts at zero: nothing is mid-apply at
@@ -1073,6 +1097,26 @@ fn build_server_in_memory(journals: Vec<Journal>, topology: cluster::Topology) -
     build_server(journals, store, topology)
 }
 
+/// Applies a signed delta to an in-flight instance gauge atomically, saturating
+/// at zero. Used by the read-model exporter (per-batch net create/terminal
+/// delta) and by the reconciliation sweep (orphan retirement), which are
+/// concurrent writers of the same gauge; a compare-exchange loop lets both
+/// compose without losing an update, while still clamping at zero defensively.
+fn inflight_saturating_add_signed(gauge: &AtomicUsize, delta: i64) {
+    let mut cur = gauge.load(Ordering::Relaxed);
+    loop {
+        let next = if delta >= 0 {
+            cur.saturating_add(delta as usize)
+        } else {
+            cur.saturating_sub(delta.unsigned_abs() as usize)
+        };
+        match gauge.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 /// Spawns one read-model exporter thread for a single partition's shard. It
 /// drains the shard's channel (batching queued commands' events), projects the
 /// batch into the shard's [`ReadStore`], then evicts any now-completed instances
@@ -1184,13 +1228,14 @@ fn spawn_exporter(
                     p_batches += 1;
                 }
                 // Update the in-flight backpressure gauge by the exact net delta
-                // (+genuine creates − genuine terminals). Single-writer (this
-                // thread), so a plain load/store is race-free and saturates at
-                // zero defensively.
+                // (+genuine creates − genuine terminals). The read-model
+                // reconciliation sweep is a second writer (it decrements the
+                // gauge for orphaned Active rows it retires), so the update goes
+                // through an atomic saturating add rather than a plain load/store
+                // — both writers compose without losing an update, and it still
+                // saturates at zero defensively.
                 if delta != 0 {
-                    let next =
-                        (inflight.load(Ordering::Relaxed) as i64 + delta).max(0) as usize;
-                    inflight.store(next, Ordering::Relaxed);
+                    inflight_saturating_add_signed(&inflight, delta);
                 }
                 // The read store now reflects this batch; wake any
                 // `awaitCompletion` requests so they can observe a terminal
@@ -7570,6 +7615,52 @@ impl ServerImpl {
         self.raft_replicas.lock().unwrap().get(&p).cloned()
     }
 
+    /// One read-model reconciliation sweep. Rebuilds the engine's authoritative
+    /// live-instance set (hot ∪ cold) across every partition this node hosts and
+    /// retires any read-model `Active` row absent from it — an orphan whose CREATE
+    /// was projected here but whose terminal event never was (e.g. leadership
+    /// moved mid-instance, so the completion was exported by the new leader).
+    /// Left unreconciled such rows inflate the active-backlog gauge forever,
+    /// biasing admission control and Stage-2 fairness routing.
+    ///
+    /// Skipped while creates are mid-apply (`processing > 0`) so it runs only when
+    /// the node is quiescent: the residual it targets forms *after* a load drains,
+    /// and gating keeps the (worst-case O(active)) sweep off the hot path. The
+    /// gauge is decremented by the number retired via the same atomic saturating
+    /// add the exporter uses, so a genuinely in-flight completion that races the
+    /// sweep (idempotent under the read model's `WHERE state = 0` guard) can never
+    /// double-count. Returns the number of rows reconciled.
+    async fn reconcile_orphans_once(&self) -> usize {
+        if self.processing.load(Ordering::Relaxed) != 0 {
+            return 0;
+        }
+        let num = self.engine.topology().num_partitions;
+        let mut live: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        for p in 0..num {
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            let keys = handle
+                .with(|journal| {
+                    let mut s = std::collections::HashSet::new();
+                    journal.collect_live_instance_keys(&mut s);
+                    s
+                })
+                .await;
+            live.extend(keys);
+        }
+        let reconciled = self.store.reconcile_orphaned_active(&live);
+        if reconciled > 0 {
+            inflight_saturating_add_signed(&self.inflight, -(reconciled as i64));
+            tracing::info!(
+                reconciled,
+                live = live.len(),
+                "read-model reconcile: retired orphaned Active rows (runtime sweep)"
+            );
+        }
+        reconciled
+    }
+
     /// Stores the latest best-effort lease digest received from `partition`'s
     /// leader (soft state; never journaled). Consulted on leadership takeover by
     /// [`Self::run_lease_digest`]. A no-op-cost overwrite: only the most recent
@@ -9942,6 +10033,136 @@ fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
         .expect("raft debug response builds")
 }
 
+/// Diagnostic dump of non-terminal instance / job state, per partition this node
+/// hosts (owned or replica). Characterizes "wedged" instances that remain
+/// `Active` after load drains: for each partition it reports state histograms
+/// (instances, jobs), the activated/activatable index sizes, active incidents,
+/// and a sample of `Active` instances with their parked element ids and each
+/// owning job's state / activation / lease-due flag. Read-only.
+async fn instances_debug_body(server: &ServerImpl) -> Response {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    let now = now_millis();
+    let node_id = server.engine.topology().node_id as u64;
+    let num_parts = server.engine.topology().num_partitions;
+
+    let mut body = String::new();
+    let _ = writeln!(body, "node={node_id} now={now} partitions={num_parts}");
+
+    for p in 0..num_parts {
+        let owned = server.engine.local_for_partition(p).is_some();
+        let led = server
+            .raft_registry()
+            .get(p)
+            .is_some_and(|part| part.raft.metrics().borrow().current_leader == Some(node_id));
+        let Some(handle) = server.engine_handle_for(p) else {
+            continue;
+        };
+        let summary = handle
+            .with(move |journal| {
+                let s = journal.engine().state();
+                let mut inst_states: BTreeMap<&'static str, usize> = BTreeMap::new();
+                let mut active_no_job = 0usize; // Active instance, no owning job at all
+                let mut active_with_incident = 0usize;
+                let mut sample = String::new();
+                let mut sampled = 0usize;
+                for inst in s.instances.values() {
+                    let label = match inst.state {
+                        ProcessInstanceState::Active => "Active",
+                        ProcessInstanceState::Completed => "Completed",
+                        ProcessInstanceState::Terminated => "Terminated",
+                    };
+                    *inst_states.entry(label).or_default() += 1;
+                    if !matches!(inst.state, ProcessInstanceState::Active) {
+                        continue;
+                    }
+                    if !inst.incidents.is_empty() {
+                        active_with_incident += 1;
+                    }
+                    // Jobs owned by this instance and their live state.
+                    let job_keys = s.jobs_by_instance.get(&inst.key);
+                    let has_job = job_keys.is_some_and(|js| !js.is_empty());
+                    if !has_job {
+                        active_no_job += 1;
+                    }
+                    if sampled < 20 {
+                        sampled += 1;
+                        let elems: Vec<String> =
+                            inst.active.values().map(|e| e.to_string()).collect();
+                        let jobs: Vec<String> = job_keys
+                            .map(|js| {
+                                js.iter()
+                                    .filter_map(|k| s.jobs.get(k))
+                                    .map(|j| {
+                                        let due = j
+                                            .deadline
+                                            .map(|d| if d <= now { "DUE" } else { "future" })
+                                            .unwrap_or("none");
+                                        format!(
+                                            "{:?}(act={} dl={:?} due={} worker={:?})",
+                                            j.state, j.activated, j.deadline, due, j.worker
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let _ = writeln!(
+                            sample,
+                            "    inst={} elems={:?} incidents={} jobs={:?}",
+                            inst.key,
+                            elems,
+                            inst.incidents.len(),
+                            jobs
+                        );
+                    }
+                }
+                let mut job_states: BTreeMap<&'static str, usize> = BTreeMap::new();
+                for j in s.jobs.values() {
+                    let label = match j.state {
+                        nanobpmn_engine_core::JobState::Created => "Created",
+                        nanobpmn_engine_core::JobState::Activated => "Activated",
+                        nanobpmn_engine_core::JobState::Failed => "Failed",
+                        nanobpmn_engine_core::JobState::Errored => "Errored",
+                        nanobpmn_engine_core::JobState::Canceled => "Canceled",
+                        nanobpmn_engine_core::JobState::Completed => "Completed",
+                    };
+                    *job_states.entry(label).or_default() += 1;
+                }
+                let activated_due = s
+                    .activated_jobs
+                    .iter()
+                    .filter(|k| {
+                        s.jobs
+                            .get(*k)
+                            .and_then(|j| j.deadline)
+                            .is_some_and(|d| d <= now)
+                    })
+                    .count();
+                let activatable: usize = s.activatable_jobs.values().map(|set| set.len()).sum();
+                format!(
+                    "  instances={inst_states:?} jobs={job_states:?} \
+                     activated_idx={} activated_due={activated_due} activatable_idx={activatable} \
+                     active_no_job={active_no_job} active_with_incident={active_with_incident} \
+                     active_incidents_total={}\n{sample}",
+                    s.activated_jobs.len(),
+                    s.incidents
+                        .values()
+                        .filter(|i| matches!(i.state, IncidentState::Active))
+                        .count(),
+                )
+            })
+            .await;
+        let _ = writeln!(body, "partition={p} owned={owned} led={led}\n{summary}");
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("instances debug response builds")
+}
+
 async fn metrics_handler() -> Response {
     let mut body = metrics::gather();
     // jemalloc memory decomposition: resident (≈RSS) vs allocated (true live
@@ -10856,6 +11077,10 @@ async fn main() {
     // Captured for the /debug/raft diagnostic route before `server` is moved into
     // the generated router below.
     let raft_reg_dbg = server.raft_registry().clone();
+    // Captured for the /debug/instances diagnostic route (non-terminal instance /
+    // job state breakdown per led partition — used to characterize wedged
+    // instances that never reach a terminal state after load drains).
+    let dbg_server = server.clone();
 
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
@@ -10901,6 +11126,24 @@ async fn main() {
         });
     }
 
+    // Read-model reconciliation sweep. Retires orphaned Active rows (creates whose
+    // terminal event was never projected — the leadership-churn residual) against
+    // authoritative engine state on a slow cadence, keeping the active-backlog
+    // gauge honest for a long-running cluster that never restarts. Boot already
+    // reconciles once from the replayed journals; this catches orphans that form
+    // afterwards. Gated on quiescence inside `reconcile_orphans_once`.
+    {
+        let recon_server = server.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                recon_server.reconcile_orphans_once().await;
+            }
+        });
+    }
+
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route("/metrics", axum::routing::get(metrics_handler))
@@ -10909,6 +11152,13 @@ async fn main() {
             axum::routing::get(move || {
                 let reg = raft_reg_dbg.clone();
                 async move { raft_debug_body(&reg) }
+            }),
+        )
+        .route(
+            "/debug/instances",
+            axum::routing::get(move || {
+                let srv = dbg_server.clone();
+                async move { instances_debug_body(&srv).await }
             }),
         )
         .route(

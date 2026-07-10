@@ -1251,6 +1251,19 @@ impl Journal {
         self.cold.as_ref().map(|c| c.index.len()).unwrap_or(0)
     }
 
+    /// Collects every live (non-terminal) instance key the engine holds for this
+    /// partition — hot resident instances plus cold-spilled ones — into `out`.
+    /// This is the authoritative set reconciliation compares the read model's
+    /// `Active` rows against: any read row whose key is absent here corresponds to
+    /// an instance the engine has already driven to a terminal state and evicted,
+    /// so its read row is an orphan (its terminal event was never projected).
+    pub fn collect_live_instance_keys(&self, out: &mut std::collections::HashSet<Key>) {
+        out.extend(self.state().instances.keys().copied());
+        if let Some(cold) = self.cold.as_ref() {
+            out.extend(cold.index.keys());
+        }
+    }
+
     /// Rehydrates the cold instance `key` back into hot state: takes its snapshot
     /// from the store, restores it into the engine, and drops its routing-index
     /// entries. A no-op (returns `false`) if cold spill is unset or `key` is not
