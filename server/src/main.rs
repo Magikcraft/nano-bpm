@@ -1687,8 +1687,7 @@ const MAX_ACTIVE_BACKLOG_CAP: usize = 1_000_000;
 /// unit-tested without the environment.
 fn active_backlog_cap_default_from_limit(limit_bytes: u64) -> usize {
     let budget = pipeline_bytes_watermark_default_from_limit(limit_bytes);
-    ((budget / NOMINAL_ACTIVE_BYTES) as usize)
-        .clamp(MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP)
+    ((budget / NOMINAL_ACTIVE_BYTES) as usize).clamp(MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP)
 }
 
 /// Nominal resident bytes charged per submitted-but-unapplied create when
@@ -7258,13 +7257,18 @@ impl ServerImpl {
         // No local exporter unless this node statically owns `p`; a promoted
         // replica must evict terminal shells itself (see bootstrap_member).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
-        let part = match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await {
-            Ok(part) => Arc::new(part),
-            Err(e) => {
-                tracing::error!("leader-durable: promote partition {p} failed to build group: {e}");
-                return;
-            }
-        };
+        let part =
+            match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal)
+                .await
+            {
+                Ok(part) => Arc::new(part),
+                Err(e) => {
+                    tracing::error!(
+                        "leader-durable: promote partition {p} failed to build group: {e}"
+                    );
+                    return;
+                }
+            };
         let mut members = std::collections::BTreeMap::new();
         members.insert(
             me,
@@ -7463,7 +7467,8 @@ impl ServerImpl {
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
-        match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await {
+        match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await
+        {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
                 tracing::info!(
@@ -10913,7 +10918,11 @@ async fn main() {
         .route(
             "/debug/heap/prof",
             axum::routing::get(|| async {
-                let path = format!("{}/nano-heap-{}.prof", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()), std::process::id());
+                let path = format!(
+                    "{}/nano-heap-{}.prof",
+                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+                    std::process::id()
+                );
                 if crate::memory::prof_dump(&path) {
                     format!("dumped {path}\n")
                 } else {
@@ -14974,9 +14983,10 @@ mod clustered_startup_tests {
         // it) but NEVER form the group — its owner (node 1) is absent, exactly as
         // in a staggered cold start. Its `current_leader` therefore stays `None`.
         let engine = node0.replica_engine_for(1).await;
-        let part = RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None, false)
-            .await
-            .expect("host a replica member for partition 1");
+        let part =
+            RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None, false)
+                .await
+                .expect("host a replica member for partition 1");
         node0.raft_registry().insert(Arc::new(part));
 
         // The other replicas are unreachable, so node 0 IS the first-reachable

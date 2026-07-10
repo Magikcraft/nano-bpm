@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
-use tikv_jemalloc_ctl::thread::{allocatedp, ThreadLocal};
+use tikv_jemalloc_ctl::thread::{ThreadLocal, allocatedp};
 
 /// Tri-state cache of the `NANOBPM_CMD_PROFILE` gate: 0 = unresolved, 1 = on,
 /// 2 = off. Resolved once on first use.

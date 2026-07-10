@@ -874,7 +874,10 @@ pub fn set_actor_stats(
 /// congestion collapse's residual per-command cost into allocator (alloc bytes
 /// rise with active) vs hashmap-probe/cache (time rises, alloc flat).
 pub fn record_command(kind: &'static str, seconds: f64, alloc_bytes: u64) {
-    METRICS.cmd_seconds.with_label_values(&[kind]).observe(seconds);
+    METRICS
+        .cmd_seconds
+        .with_label_values(&[kind])
+        .observe(seconds);
     METRICS
         .cmd_alloc_bytes
         .with_label_values(&[kind])

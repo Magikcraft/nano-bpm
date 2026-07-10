@@ -503,7 +503,9 @@ pub enum ServerFrame {
     /// polling. Purely advisory — the server also enforces the cap by truncating
     /// each job type's per-pass fan-out, so uncooperative clients are still bounded.
     #[serde(rename_all = "camelCase")]
-    WorkerAdvice { recommended_concurrency: i64 },
+    WorkerAdvice {
+        recommended_concurrency: i64,
+    },
     Heartbeat,
 }
 

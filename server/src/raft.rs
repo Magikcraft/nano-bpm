@@ -601,8 +601,8 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     // after a failover) it serves reads/status from this engine,
                     // so it must keep terminal shells resident — exactly the
                     // ADR-0012 reason an owned leader defers to its exporter.
-                    let evict_terminal = self.evict_eligible
-                        && self.leader.load(Ordering::Relaxed) != self.node_id;
+                    let evict_terminal =
+                        self.evict_eligible && self.leader.load(Ordering::Relaxed) != self.node_id;
                     let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
                     for outcome in outcomes {
                         match outcome {
@@ -1726,14 +1726,19 @@ mod tests {
         }
         parts[0].initialize(members).await.expect("form group");
         assert!(
-            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader == Some(0)).await,
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
             "node 0 wins the initial election"
         );
 
         // Deploy, then create an instance of the `p` process (start -> end, no
         // wait state) so it runs straight to a terminal ProcessInstanceCompleted
         // in the same replicated command on every voter.
-        parts[0].propose(deploy_command(), 1_000).await.expect("deploy");
+        parts[0]
+            .propose(deploy_command(), 1_000)
+            .await
+            .expect("deploy");
         parts[0]
             .propose(
                 Command::CreateInstance {
