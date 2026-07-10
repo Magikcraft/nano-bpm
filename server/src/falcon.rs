@@ -567,6 +567,22 @@ impl Connection {
         }
         self.tx.try_send(frame).is_ok()
     }
+
+    /// Grants `n` submission credits, accounting them in `submission_outstanding`
+    /// only if the frame is actually enqueued. `send` drops frames when the
+    /// outbound buffer is full (slow-consumer guard); incrementing `outstanding`
+    /// for a dropped grant permanently inflates it, so `topup`'s
+    /// `grant = window - outstanding` computes 0 forever and the client's
+    /// submission window never reopens — the producer wedges. Accounting on the
+    /// send result makes a dropped grant self-heal on the next top-up pass.
+    /// Returns whether the grant was enqueued.
+    fn grant_submission_credits(&self, n: i64) -> bool {
+        if !self.send(ServerFrame::SubmissionCredits { n }) {
+            return false;
+        }
+        self.submission_outstanding.fetch_add(n, Ordering::Relaxed);
+        true
+    }
 }
 
 /// Server-wide registry of falcon connections and the job-type dispatch
@@ -1900,8 +1916,7 @@ fn grant_submission_credit_if_clear(server: &ServerImpl, conn: &Arc<Connection>,
     if n <= 0 || server.submission_pressure() {
         return;
     }
-    conn.submission_outstanding.fetch_add(n, Ordering::Relaxed);
-    conn.send(ServerFrame::SubmissionCredits { n });
+    conn.grant_submission_credits(n);
 }
 
 // ----------------------------------------------------------------------------
@@ -2461,9 +2476,7 @@ fn topup_submission_credits(server: &ServerImpl, registry: &Arc<Registry>) {
         let outstanding = conn.submission_outstanding.load(Ordering::Relaxed);
         let grant = conn.submission_window - outstanding;
         if grant > 0 {
-            conn.submission_outstanding
-                .fetch_add(grant, Ordering::Relaxed);
-            conn.send(ServerFrame::SubmissionCredits { n: grant });
+            conn.grant_submission_credits(grant);
         }
     }
 }
@@ -2612,6 +2625,58 @@ mod registry_tests {
         assert!(
             !registry.unregister(999),
             "unregistering an unknown id is a no-op too"
+        );
+    }
+
+    fn test_connection_with_rx(id: ConnId, cap: usize) -> (Arc<Connection>, mpsc::Receiver<ServerFrame>) {
+        let (tx, rx) = mpsc::channel::<ServerFrame>(cap);
+        let conn = Arc::new(Connection {
+            id,
+            tx,
+            subs: Mutex::new(HashMap::new()),
+            submission_outstanding: AtomicI64::new(0),
+            submission_window: 0,
+            create_slots: Arc::new(tokio::sync::Semaphore::new(0)),
+            closed: AtomicBool::new(false),
+            wants_redispatch: Arc::new(AtomicBool::new(false)),
+            last_seen_ms: AtomicU64::new(0),
+            shutdown: Notify::new(),
+        });
+        (conn, rx)
+    }
+
+    #[test]
+    fn a_dropped_credit_grant_does_not_inflate_outstanding() {
+        // Regression: `send` drops frames when the outbound buffer is full. If the
+        // grant is accounted before the (dropped) send, `submission_outstanding`
+        // inflates permanently and `topup`'s `window - outstanding` computes 0
+        // forever, wedging the producer. grant_submission_credits must account only
+        // on a successful enqueue.
+        let (conn, _rx) = test_connection_with_rx(1, 1);
+        // tx buffer capacity is 1; fill it so the next enqueue fails.
+        assert!(conn.send(ServerFrame::SubmissionCredits { n: 1 }), "buffer has room");
+        assert!(
+            !conn.grant_submission_credits(8),
+            "grant is dropped when the outbound buffer is full"
+        );
+        assert_eq!(
+            conn.submission_outstanding.load(Ordering::Relaxed),
+            0,
+            "a dropped grant must NOT inflate outstanding"
+        );
+    }
+
+    #[test]
+    fn a_delivered_credit_grant_accounts_outstanding() {
+        let (conn, _rx) = test_connection_with_rx(1, 4);
+        assert!(
+            conn.grant_submission_credits(5),
+            "grant enqueues when the buffer has room"
+        );
+        assert_eq!(
+            conn.submission_outstanding.load(Ordering::Relaxed),
+            5,
+            "a delivered grant accounts exactly n"
         );
     }
 }
