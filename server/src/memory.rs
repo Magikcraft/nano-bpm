@@ -25,9 +25,44 @@ mod imp {
     // Return dirty/muzzy pages to the OS ~5 s after they fall idle. On Linux the
     // background thread (enabled at startup) applies this automatically; on macOS,
     // which has no jemalloc background thread, the idle-purge tick forces it.
+    // Under the `heapprof` diagnostic feature, additionally turn on sampled
+    // allocation-backtrace profiling from startup (jeprof-readable via
+    // `prof_dump`) to pin the call sites behind live-heap growth.
+    #[cfg(not(feature = "heapprof"))]
     #[allow(non_upper_case_globals)]
     #[unsafe(export_name = "_rjem_malloc_conf")]
     pub static malloc_conf: &[u8] = b"dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+    #[cfg(feature = "heapprof")]
+    #[allow(non_upper_case_globals)]
+    #[unsafe(export_name = "_rjem_malloc_conf")]
+    pub static malloc_conf: &[u8] =
+        b"prof:true,prof_active:true,lg_prof_sample:18,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
+    /// Writes a jemalloc heap profile (sampled live allocations with backtraces)
+    /// to `path`, for offline analysis with `jeprof`. Returns `true` on success;
+    /// `false` when the binary was built without the `heapprof` feature (jemalloc
+    /// lacks `--enable-prof`, so the `prof.dump` mallctl is absent).
+    pub fn prof_dump(path: &str) -> bool {
+        use std::ffi::{CString, c_char, c_void};
+        let Ok(cpath) = CString::new(path) else {
+            return false;
+        };
+        let ptr: *const c_char = cpath.as_ptr();
+        // SAFETY: `prof.dump` takes a `const char *` new-value (the target file
+        // path); we pass a pointer to that pointer with its exact size. `cpath`
+        // outlives the synchronous call.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                c"prof.dump".as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &ptr as *const *const c_char as *mut c_void,
+                std::mem::size_of::<*const c_char>(),
+            )
+        };
+        rc == 0
+    }
 
     /// Best-effort: enable jemalloc's background purge thread. Supported on Linux;
     /// a no-op (returns an error we ignore) where unavailable, e.g. macOS.
@@ -93,6 +128,40 @@ mod imp {
             retained: stats::retained::read().ok()? as u64,
         })
     }
+
+    /// Dumps jemalloc's full `malloc_stats_print` report as text. The merged
+    /// per-size-class bin histogram (`bins:` section) names the exact size class
+    /// carrying the live heap, which — cross-referenced with completion count —
+    /// pins the structure behind a per-instance leak. `opts = "a"` omits the
+    /// noisy per-arena breakdown while keeping the merged bin stats.
+    pub fn stats_print() -> String {
+        use std::ffi::{CStr, c_char, c_void};
+        // jemalloc invokes this once per output chunk with a NUL-terminated C
+        // string; `opaque` is our `&mut String` accumulator.
+        extern "C" fn write_cb(opaque: *mut c_void, msg: *const c_char) {
+            // SAFETY: `opaque` is the `&mut String` we passed below, and `msg` is
+            // a valid NUL-terminated string owned by jemalloc for the call.
+            unsafe {
+                let buf = &mut *(opaque as *mut String);
+                if let Ok(s) = CStr::from_ptr(msg).to_str() {
+                    buf.push_str(s);
+                }
+            }
+        }
+        // Advance the stats epoch so the report reflects the current heap.
+        let _ = tikv_jemalloc_ctl::epoch::advance();
+        let mut buf = String::new();
+        // SAFETY: standard `malloc_stats_print` call; `write_cb` matches the
+        // required signature and `buf` outlives the (synchronous) call.
+        unsafe {
+            tikv_jemalloc_sys::malloc_stats_print(
+                Some(write_cb),
+                &mut buf as *mut String as *mut c_void,
+                c"a".as_ptr(),
+            );
+        }
+        buf
+    }
 }
 
 #[cfg(target_env = "msvc")]
@@ -106,6 +175,12 @@ mod imp {
     }
     pub fn stats() -> Option<super::MemStats> {
         None
+    }
+    pub fn stats_print() -> String {
+        String::new()
+    }
+    pub fn prof_dump(_path: &str) -> bool {
+        false
     }
 }
 
@@ -121,7 +196,7 @@ pub struct MemStats {
     pub retained: u64,
 }
 
-pub use imp::{enable_background_thread, purge, resident_bytes, stats};
+pub use imp::{enable_background_thread, prof_dump, purge, resident_bytes, stats, stats_print};
 
 /// Live system memory available to userspace, in bytes, read fresh from
 /// `/proc/meminfo` (`MemAvailable`). Unlike the boot-time memory *limit*, this

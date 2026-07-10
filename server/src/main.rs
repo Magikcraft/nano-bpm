@@ -10893,6 +10893,21 @@ async fn main() {
             }),
         )
         .route(
+            "/debug/heap",
+            axum::routing::get(|| async { crate::memory::stats_print() }),
+        )
+        .route(
+            "/debug/heap/prof",
+            axum::routing::get(|| async {
+                let path = format!("{}/nano-heap-{}.prof", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()), std::process::id());
+                if crate::memory::prof_dump(&path) {
+                    format!("dumped {path}\n")
+                } else {
+                    "prof unavailable: build with --features heapprof\n".to_string()
+                }
+            }),
+        )
+        .route(
             "/v2/system/memory",
             axum::routing::get(system_memory_handler),
         );
