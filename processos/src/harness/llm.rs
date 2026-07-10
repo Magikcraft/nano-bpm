@@ -307,6 +307,146 @@ async fn complete_openai(
         })
 }
 
+/// The final assembled outputs of a streamed OpenAI completion — the raw
+/// reasoning trace (from `reasoning_content` deltas, if the model surfaces
+/// one; empty for models that don't) and the answer content.
+///
+/// For the Curator this is folded into `format!("<think>{}</think>\n{}",
+/// reasoning, content)` so callers that still expect the concatenated form
+/// (as [`complete`] returns) can `.into_folded()` uniformly.
+#[derive(Debug, Clone, Default)]
+pub struct StreamedCompletion {
+    pub reasoning: String,
+    pub content: String,
+}
+
+impl StreamedCompletion {
+    /// Fold `<think>…</think>` reasoning + content back into one string so the
+    /// existing `<think>` splitter downstream keeps working unchanged.
+    pub fn into_folded(self) -> String {
+        let reasoning = self.reasoning.trim();
+        if reasoning.is_empty() {
+            self.content
+        } else {
+            format!("<think>{reasoning}</think>\n{}", self.content)
+        }
+    }
+}
+
+/// Streaming variant of [`complete`] for OpenAI-compatible endpoints — the
+/// live "thinking stream" primitive shared with the cockpit's chat pane.
+///
+/// Same wire shape as [`complete`], but sets `"stream": true` on the request
+/// and parses the resulting `text/event-stream`. Each SSE chunk's `delta`
+/// is inspected for two channels the OpenAI-compatible ecosystem uses:
+///
+/// * `choices[0].delta.reasoning_content` — the model's chain-of-thought as
+///   surfaced by llama.cpp (PR #23971 onwards), OpenAI-compatible servers
+///   that expose reasoning, and increasingly hosted providers.
+/// * `choices[0].delta.content` — the user-facing answer.
+///
+/// Callbacks fire with each *non-empty* chunk as it arrives; the assembled
+/// `(reasoning, content)` is returned when the stream closes.
+///
+/// **Anthropic is not supported** — the Curator's use case is a local
+/// llama.cpp/vLLM/Ollama sidecar, and Anthropic's SSE shape is different
+/// enough that adding it here would double the code without buying much.
+/// Callers targeting Anthropic should fall back to [`complete`].
+pub async fn complete_streaming<F, G>(
+    cfg: &LlmConfig,
+    system: &str,
+    user: &str,
+    mut on_reasoning: F,
+    mut on_answer: G,
+) -> Result<StreamedCompletion, String>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
+    if !cfg.is_ready() {
+        return Err(
+            "no LLM model configured (set PROCESSOS_LLM_MODEL or pass llm.model in the request)"
+                .to_string(),
+        );
+    }
+    if cfg.provider != Provider::Openai {
+        return Err(format!(
+            "streaming completions are only supported for the OpenAI-compatible provider \
+             (got {:?}); use complete() for Anthropic instead",
+            cfg.provider
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let base = cfg.base_url.trim_end_matches('/');
+    let url = format!("{base}/chat/completions");
+    let mut body = json!({
+        "model": cfg.model,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_tokens,
+        "frequency_penalty": cfg.frequency_penalty,
+        "stream": true,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user },
+        ],
+    });
+    apply_thinking_budget(&mut body, cfg);
+    let mut req = client.post(&url).json(&body);
+    if let Some(key) = &cfg.api_key {
+        req = req.bearer_auth(key);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("LLM request to {url} failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("LLM returned {status}: {}", truncate(&text, 500)));
+    }
+
+    use futures_util::StreamExt;
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    let mut buf = String::new();
+    let mut stream = resp.bytes_stream();
+    'outer: while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("LLM stream error: {e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].trim().to_string();
+            buf.drain(..=pos);
+            let data = match line.strip_prefix("data:") {
+                Some(d) => d.trim(),
+                None => continue,
+            };
+            if data == "[DONE]" {
+                break 'outer;
+            }
+            let v: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let delta = &v["choices"][0]["delta"];
+            if let Some(r) = delta["reasoning_content"].as_str() {
+                if !r.is_empty() {
+                    reasoning.push_str(r);
+                    on_reasoning(r);
+                }
+            }
+            if let Some(c) = delta["content"].as_str() {
+                if !c.is_empty() {
+                    content.push_str(c);
+                    on_answer(c);
+                }
+            }
+        }
+    }
+    Ok(StreamedCompletion { reasoning, content })
+}
+
 async fn complete_anthropic(
     client: &reqwest::Client,
     cfg: &LlmConfig,
@@ -582,5 +722,64 @@ mod tests {
         apply_thinking_budget(&mut body, &cfg);
         assert_eq!(body["thinking_budget_tokens"], json!(4_000));
         assert_eq!(body["reasoning_budget"], json!(4_000));
+    }
+
+    #[test]
+    fn streamed_completion_folds_reasoning_into_think_tags() {
+        let sc = StreamedCompletion {
+            reasoning: "step 1\nstep 2".into(),
+            content: r#"{"flows":[]}"#.into(),
+        };
+        let folded = sc.into_folded();
+        assert!(folded.contains("<think>step 1\nstep 2</think>"));
+        assert!(folded.contains(r#"{"flows":[]}"#));
+    }
+
+    #[test]
+    fn streamed_completion_empty_reasoning_yields_content_verbatim() {
+        let sc = StreamedCompletion {
+            reasoning: "   ".into(),
+            content: r#"{"flows":[]}"#.into(),
+        };
+        assert_eq!(sc.into_folded(), r#"{"flows":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_rejects_anthropic() {
+        let cfg = LlmConfig {
+            provider: Provider::Anthropic,
+            base_url: default_base_url(Provider::Anthropic),
+            model: "claude".into(),
+            api_key: Some("test".into()),
+            max_tokens: 128,
+            temperature: 0.2,
+            frequency_penalty: 0.0,
+            thinking_level: None,
+        };
+        let err = complete_streaming(&cfg, "sys", "user", |_| {}, |_| {})
+            .await
+            .unwrap_err();
+        assert!(err.contains("OpenAI-compatible"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_errors_when_no_model_configured() {
+        let cfg = LlmConfig {
+            provider: Provider::Openai,
+            base_url: "http://127.0.0.1:1/v1".into(),
+            model: String::new(),
+            api_key: None,
+            max_tokens: 128,
+            temperature: 0.2,
+            frequency_penalty: 0.0,
+            thinking_level: None,
+        };
+        let err = complete_streaming(&cfg, "sys", "user", |_| {}, |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("no LLM model configured"),
+            "unexpected error: {err}"
+        );
     }
 }

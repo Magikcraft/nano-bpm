@@ -48,7 +48,10 @@ pub use evolve::{
 pub use example::example_scenario;
 pub use hypothesize::run_hypothesis;
 pub use hypothesize::DEFAULT_SYSTEM_PROMPT;
-pub use llm::{complete as llm_complete, list_models, LlmConfig, LlmOverride, ThinkingLevel};
+pub use llm::{
+    complete as llm_complete, complete_streaming as llm_complete_streaming, list_models, LlmConfig,
+    LlmOverride, Provider, StreamedCompletion, ThinkingLevel,
+};
 pub use production::build_baseline;
 #[allow(unused_imports)]
 pub use production::ProductionBaseline;
