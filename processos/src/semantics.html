@@ -89,6 +89,16 @@
   .diff .ctx { color: var(--po-text-muted); }
   .diff pre { margin: 4px 0; padding: 6px 10px; background: var(--po-inset); border-radius: 6px; white-space: pre-wrap; }
 
+  /* Renderer picker toolbar above the canvas. */
+  .wb-canvas-toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .wb-canvas-toolbar .rlbl { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--po-text-muted); }
+  .wb-canvas-toolbar .seg { display: inline-flex; border: 1px solid var(--po-edge); border-radius: 8px; overflow: hidden; background: var(--po-inset); }
+  .wb-canvas-toolbar .seg button { border: 0; border-radius: 0; background: transparent; padding: 5px 12px; font-size: 12px; color: var(--po-text-muted); }
+  .wb-canvas-toolbar .seg button + button { border-left: 1px solid var(--po-edge); }
+  .wb-canvas-toolbar .seg button.active { background: var(--po-raised); color: var(--po-accent-soft); font-weight: 600; }
+  .wb-canvas-toolbar .rhint { font-size: 11.5px; }
+  .wb-canvas-toolbar .rspin { font-size: 12px; min-width: 12px; }
+
   /* Save status line + drift banner. */
   .status { font-size: 12px; color: var(--po-text-muted); margin-left: 8px; }
   .drift { background: var(--po-warn-wash, var(--po-inset)); border: 1px solid var(--po-warn, var(--po-edge)); color: var(--po-warn-soft, var(--po-text)); padding: 8px 12px; border-radius: 8px; font-size: 12.5px; margin: 8px 0 4px; }
@@ -155,6 +165,10 @@ const S = {
   modeler: null,                  // bpmn-js viewer
   elements: [],                    // list of BPMN element {id, name, type} from bpmn-js
   driftBanner: false,             // true when the sidecar's current entry is for a different revision
+  xml: '',                        // raw model.bpmn — the source of truth for previews
+  renderer: 'default',             // 'default' | 'rowbias' | 'field' — canvas renderer
+  previewDebounceTimer: null,     // debounce id for auto-refresh on annotation edits
+  previewInFlight: false,         // true while a /api/layout call is pending (for spinner UX)
 };
 function emptyAnn(){ return { flows: [], clusters: [], roles: {}, costs: {}, times: {} }; }
 function deepClone(v){ return JSON.parse(JSON.stringify(v)); }
@@ -222,6 +236,7 @@ async function loadModelAndAnnotations(base){
     // still be worth reviewing.
     S.driftBanner = !!(S.sidecar && S.sidecar.current && S.sidecar.current !== S.revision);
   }
+  S.xml = xml;
   await mountModeler(xml);
   render();
 }
@@ -266,6 +281,16 @@ async function mountModeler(xml){
     ${S.driftBanner ? `<div class="drift">⚠︎ The sidecar's <code>current</code> entry is for a different model revision. Editing starts from the inferred baseline; saving records a new entry for the current revision (${esc((S.revision||'').slice(0,10))}…). Historic entries are kept.</div>` : ''}
     <div class="wb">
       <div>
+        <div class="wb-canvas-toolbar">
+          <label class="rlbl">Renderer</label>
+          <div class="seg" id="rendererSeg">
+            <button type="button" data-r="default" class="active" title="Show the diagram as authored (existing BPMN DI)">As authored</button>
+            <button type="button" data-r="rowbias" title="Server-side Row-Bias solver: flows become horizontal centerlines by kind">Row-Bias</button>
+            <button type="button" data-r="field"   title="Server-side field/Fromme physics solver: annotations pull nodes into semantic zones">Field</button>
+          </div>
+          <span class="rhint muted" id="rendererHint">Renders as-authored — edit flows/clusters, then pick Row-Bias or Field to preview.</span>
+          <span class="rspin" id="rendererSpin"></span>
+        </div>
         <div class="wb-canvas" id="wbCanvas"></div>
         <div class="wb-tabs" style="margin-top:12px">
           <div class="wb-tabbar">
@@ -281,29 +306,83 @@ async function mountModeler(xml){
     </div>`;
 
   $$('#wbHost .wb-tabbar button').forEach(b => b.onclick = () => setTab(b.dataset.tab));
+  $$('#rendererSeg button').forEach(b => b.onclick = () => setRenderer(b.dataset.r));
 
   if(typeof BpmnJS === 'undefined'){
     $('#wbCanvas').innerHTML = '<p class="err" style="padding:12px">bpmn-js viewer bundle unavailable</p>';
     return;
   }
+  await renderCanvas();
+}
+
+// Render the canvas using the current renderer setting. `default` imports
+// the raw XML with bpmn-js (as-authored DI); the semantic solvers POST to
+// /api/layout with the working-copy annotations and import the re-DI'd XML.
+// Every render rebuilds a fresh viewer and re-wires the click-to-select
+// handler — bpmn-js has no incremental "re-import different XML" path that
+// reliably clears the previous diagram.
+async function renderCanvas(){
+  const container = $('#wbCanvas');
+  const hint = $('#rendererHint');
+  const spin = $('#rendererSpin');
+  if(!container) return;
+  container.innerHTML = '';
+  if(spin) spin.textContent = '⏳';
+  S.previewInFlight = true;
+  let readyXml = S.xml;
   try {
-    S.modeler = new BpmnJS({ container: $('#wbCanvas') });
-    await S.modeler.importXML(xml);
-    S.modeler.get('canvas').zoom('fit-viewport', 'auto');
+    if(S.renderer !== 'default'){
+      const body = { xml: S.xml, solver: S.renderer, annotations: S.ann };
+      const j = await api('/api/layout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      readyXml = j.bpmn_xml || S.xml;
+    }
+    S.modeler = new BpmnJS({ container });
+    await S.modeler.importXML(readyXml);
+    try { S.modeler.get('canvas').zoom('fit-viewport', 'auto'); } catch(_){}
     S.elements = collectElements(S.modeler);
     // Selection wiring — clicking a shape populates the right-hand panel.
     S.modeler.get('eventBus').on('element.click', e => {
       const el = e && e.element;
       if(!el || el.type === 'label' || (el.type||'').indexOf('bpmn:') !== 0) return;
-      // Skip the SubProcess-parent-of-canvas root selection.
       if(el.id && el.id.indexOf('_Plane') === -1 && el.type !== 'bpmn:Process' && el.type !== 'bpmn:Definitions'){
         S.selection = { id: el.id, name: (el.businessObject && el.businessObject.name) || '', type: el.type };
         renderSelPanel();
       }
     });
+    if(hint){
+      if(S.renderer === 'default') hint.textContent = 'Renders as-authored — edit flows/clusters, then pick Row-Bias or Field to preview.';
+      else if(S.renderer === 'rowbias') hint.textContent = 'Row-Bias: primary flow becomes the horizontal centerline; exception/escalation/compensation bands stack around it.';
+      else hint.textContent = 'Field: springs + physics pull annotated nodes into semantic zones. Auto-refreshes on annotation edits (500ms debounce).';
+    }
   } catch(e){
-    $('#wbCanvas').innerHTML = `<p class="err" style="padding:12px">could not render model: ${esc(e.message||e)}</p>`;
+    container.innerHTML = `<div class="err" style="padding:12px">${esc(S.renderer)} layout failed: ${esc((e&&e.message)||e)}</div>`;
+  } finally {
+    S.previewInFlight = false;
+    if(spin) spin.textContent = '';
   }
+}
+
+function setRenderer(r){
+  if(!r || r === S.renderer) return;
+  S.renderer = r;
+  $$('#rendererSeg button').forEach(b => b.classList.toggle('active', b.dataset.r === r));
+  renderCanvas();
+}
+
+// Schedule a preview refresh after an annotation edit. Only active when a
+// semantic renderer is selected — otherwise editing has no visual effect on
+// the canvas and we can skip the layout call.
+function schedulePreviewRefresh(){
+  if(S.renderer === 'default') return;
+  if(S.previewDebounceTimer) clearTimeout(S.previewDebounceTimer);
+  S.previewDebounceTimer = setTimeout(() => {
+    S.previewDebounceTimer = null;
+    renderCanvas();
+  }, 500);
 }
 
 const $$ = sel => Array.from(document.querySelectorAll(sel));
@@ -640,6 +719,7 @@ function mutate(fn){
   fn(next);
   S.ann = next;
   renderTab();
+  schedulePreviewRefresh();
 }
 
 // ── Flow mutators ────────────────────────────────────────────────────────
