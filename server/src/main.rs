@@ -6875,7 +6875,14 @@ impl ServerImpl {
             // replica engine actor here (seeded with the current deployments) for
             // the state machine to apply the replicated log into.
             for p in topology.replica_partitions() {
-                let engine = match server.engine.local_for_partition(p) {
+                // A partition this node OWNS is served + exported locally; its
+                // exporter drives terminal-instance eviction. A partition this
+                // node only REPLICATES (follower under RF>1) has no exporter, so
+                // the state machine must evict terminal shells itself or they
+                // grow without bound (the RF>1 hot-state leak).
+                let owned = server.engine.local_for_partition(p);
+                let evict_terminal = owned.is_none();
+                let engine = match owned {
                     Some(owned) => owned.clone(),
                     None => server.replica_engine_for(p).await,
                 };
@@ -6885,6 +6892,7 @@ impl ServerImpl {
                     engine,
                     transport.clone(),
                     raft_log_dir_for(p),
+                    evict_terminal,
                 )
                 .await
                 {
@@ -7247,7 +7255,10 @@ impl ServerImpl {
         // node as the sole voter so it elects itself immediately, then add the
         // reachable survivors as learners so new writes ship to them.
         let transport = self.raft_transport();
-        let part = match RaftPartition::bootstrap_member(me, p, engine, transport, None).await {
+        // No local exporter unless this node statically owns `p`; a promoted
+        // replica must evict terminal shells itself (see bootstrap_member).
+        let evict_terminal = self.engine.local_for_partition(p).is_none();
+        let part = match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await {
             Ok(part) => Arc::new(part),
             Err(e) => {
                 tracing::error!("leader-durable: promote partition {p} failed to build group: {e}");
@@ -7449,7 +7460,10 @@ impl ServerImpl {
             old.raft.shutdown().await.ok();
         }
         let transport = self.raft_transport();
-        match RaftPartition::bootstrap_member(me, p, engine, transport, None).await {
+        // Rejoining as a follower/receiver of the new leader: evict terminal
+        // shells locally unless this node statically owns `p` (has an exporter).
+        let evict_terminal = self.engine.local_for_partition(p).is_none();
+        match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
                 tracing::info!(
@@ -12868,6 +12882,7 @@ mod clustered_startup_tests {
                 DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 node0.raft_transport(),
                 None,
+                false,
             )
             .await
             .expect("boot raft member on node 0"),
@@ -12881,6 +12896,7 @@ mod clustered_startup_tests {
                 DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 node1.raft_transport(),
                 None,
+                false,
             )
             .await
             .expect("boot raft member on node 1"),
@@ -13313,6 +13329,33 @@ mod clustered_startup_tests {
             .expect("raft-routed create commits");
         let part = nanobpmn_engine_core::partition_of(instance_key);
 
+        // Grab the follower's replica engine actor up front so we can watch it
+        // apply each replicated command in lockstep.
+        let replica = {
+            let map = node1.raft_replicas.lock().unwrap();
+            map.get(&part).cloned()
+        }
+        .expect("node 1 hosts a replica engine actor for the leader's partition");
+
+        // Phase 1: the create must replicate and apply on the follower, parking
+        // the instance at the service task. It stays parked until we activate +
+        // complete below, so this reliably observes it present before eviction.
+        let mut saw_parked = false;
+        for _ in 0..400 {
+            if replica
+                .with(move |journal| journal.engine().instance(instance_key).is_some())
+                .await
+            {
+                saw_parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_parked,
+            "the follower replica applied the create and parked the instance"
+        );
+
         // Activate through the leader (a LOGGED ActivateJobs), then complete.
         let mut job_key = None;
         for _ in 0..50 {
@@ -13333,20 +13376,26 @@ mod clustered_startup_tests {
             .wait()
             .await;
 
-        // The follower's REPLICA engine actor for this partition must converge to
-        // the instance being COMPLETED (Raft apply is async after commit, so poll).
-        let replica = {
-            let map = node1.raft_replicas.lock().unwrap();
-            map.get(&part).cloned()
-        }
-        .expect("node 1 hosts a replica engine actor for the leader's partition");
-
+        // Phase 2: the follower's REPLICA engine actor must converge to the
+        // instance being COMPLETED — proof it applied the replicated `CompleteJob`
+        // cleanly (the pre-fix divergence swallowed `JobNotActivated` and left the
+        // instance stuck PARKED forever). A follower has no exporter, so `apply`
+        // then reclaims the terminal shell (the RF>1 leak fix); since we already
+        // saw it parked, its disappearance is proof it reached terminal — the only
+        // follower removal path is terminal eviction (a diverged instance would
+        // stay parked and present, never evicting).
         let mut converged = false;
         for _ in 0..400 {
-            let done = replica
-                .with(move |journal| journal.engine().is_completed(instance_key))
+            let (present, done) = replica
+                .with(move |journal| {
+                    let e = journal.engine();
+                    (
+                        e.instance(instance_key).is_some(),
+                        e.is_completed(instance_key),
+                    )
+                })
                 .await;
-            if done {
+            if done || !present {
                 converged = true;
                 break;
             }
@@ -13370,7 +13419,8 @@ mod clustered_startup_tests {
         assert!(
             converged,
             "follower replica must converge: the instance completes there too \
-             (logged activation keeps the replica in lockstep for the complete)"
+             (logged activation keeps the replica in lockstep for the complete), \
+             then its terminal shell is evicted since a follower has no exporter"
         );
 
         for node in [&node0, &node1] {
@@ -14114,28 +14164,41 @@ mod clustered_startup_tests {
             .parse()
             .expect("numeric instance key");
 
-        // The instance must be present on a FOLLOWER engine actor too — proof the
-        // REST create replicated through Raft rather than applying only locally.
+        // The instance's partition must APPLY on a FOLLOWER too — proof the REST
+        // create replicated through Raft rather than applying only locally. We
+        // check the follower's Raft applied index converges to the leader's
+        // (lockstep apply) rather than engine residency: the process
+        // auto-completes, and a follower has no exporter, so `apply` reclaims the
+        // terminal shell the instant the complete applies (the RF>1 leak fix) —
+        // it is correctly gone from the follower's hot state.
         let p = nanobpmn_engine_core::partition_of(instance_key);
-        let follower = if node0
+        let leader_part = node0
             .raft_registry()
             .get(p)
-            .and_then(|part| part.raft.metrics().borrow().current_leader)
-            == Some(1)
-        {
-            &node2
+            .expect("node 0 hosts partition p");
+        let follower_part = if leader_part.raft.metrics().borrow().current_leader == Some(1) {
+            node2.raft_registry().get(p)
         } else {
-            &node1
-        };
-        let handle = follower
-            .engine_handle_for(p)
-            .expect("the follower replicates the instance's partition");
+            node1.raft_registry().get(p)
+        }
+        .expect("a follower hosts the instance's partition");
+        let target = leader_part
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
         let mut present = false;
         for _ in 0..200 {
-            if handle
-                .with(move |journal| journal.engine().instance(instance_key).is_some())
-                .await
-            {
+            let applied = follower_part
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
+            if applied >= target {
                 present = true;
                 break;
             }
@@ -14143,7 +14206,7 @@ mod clustered_startup_tests {
         }
         assert!(
             present,
-            "the REST-created instance is replicated to a follower's partition"
+            "the REST-created instance's log replicated and applied on a follower's partition"
         );
 
         for node in [&node0, &node1, &node2] {
@@ -14911,7 +14974,7 @@ mod clustered_startup_tests {
         // it) but NEVER form the group — its owner (node 1) is absent, exactly as
         // in a staggered cold start. Its `current_leader` therefore stays `None`.
         let engine = node0.replica_engine_for(1).await;
-        let part = RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None)
+        let part = RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None, false)
             .await
             .expect("host a replica member for partition 1");
         node0.raft_registry().insert(Arc::new(part));

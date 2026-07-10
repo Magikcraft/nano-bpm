@@ -1524,3 +1524,73 @@ floor must BE the knee (as with the backlog governor). A fixed-width calibration
 Capping an over-provisioned fleet to 50 active subscribers/type nearly triples
 throughput (14.8k->42k) and cuts p99 8x (74.5s->9.3s), matching the subscribed-worker
 knee (50 workers/node -> 46.7k). `MIN_WORKER_GOVERNOR_WIDTH` set to 50.
+
+## 2026-07-10 (cont.6) — RF>1 follower terminal-shell leak (idle heap never reclaims)
+
+The 30-min latency soak ended clean on throughput/latency but left **~13-15 GB
+resident/node at idle** for only ~723 live instances — heap that never reclaimed
+even after completions drained and the idle-purge tick ran hundreds of times.
+
+### Root cause: a replica has no exporter to evict its terminal shells
+On `ProcessInstanceCompleted`, `state::apply` (state.rs) drops the instance's
+variables/scope but keeps its **shell** in `state.instances` "until eviction so
+status queries resolve during the projection gap" (ADR-0012). Eviction — removal
+from `instances`, `jobs`, `jobs_by_instance` — is driven **only by the read-model
+exporter** (main.rs), which exists **only for statically-owned shards**.
+
+On RF=3 each node also **replicates ~8 partitions it does not own** (`raft_replicas`).
+Those replica engines apply create+complete through the Raft state machine but have
+**no exporter**, so their terminal shells + completed job records accumulate
+**without bound**. Millions of ~3.5 KB shells → the 13-15 GB idle heap. Idle-purge
+(`shrink`+`purge`) fires but cannot free entries that are still live in the maps.
+
+### Fix: leader-aware terminal eviction in the replica apply path
+`PartitionStateMachine::apply` now reclaims terminal instances itself when the
+member is an **evict-eligible follower** (a replicated, non-owned partition) **and
+is not currently the partition leader**:
+
+```
+evict_terminal = evict_eligible && leader.load() != node_id
+```
+
+- `evict_eligible` is set at bootstrap from `local_for_partition(p).is_none()` — true
+  exactly for replicated partitions the node does not own (owned partitions defer to
+  their exporter, unchanged).
+- The `leader` atomic is kept fresh by a per-member task watching `raft.metrics()`.
+  Leadership is **dynamic**: a follower can win an openraft election with none of our
+  code running, and once it leads it serves reads/status from this engine — so it
+  must **stop** evicting and keep shells resident (exactly the ADR-0012 reason an
+  owned leader defers to its exporter). The gate flips off the instant it wins.
+- Terminal instance keys are collected from applied events via a new
+  `Event::terminal_instance_key()` (Completed | Terminated) and evicted in one
+  fire-and-forget `spawn_job` batch after the apply loop.
+
+Net: steady-state followers reclaim terminal shells (leak fixed); a follower
+elected/promoted to leader retains shells while it serves (failover continuity
+preserved); owned leaders are unaffected.
+
+Tests: `raft::follower_replica_evicts_terminal_instances` (3-voter group: the two
+followers evict, the leader retains). The two convergence tests that previously
+asserted a follower *holds* a completed instance now assert lockstep another way —
+`a_rest_create_replicates_through_raft_and_awaits_completion` checks the follower's
+Raft **applied index** converges (residency is gone by design), and
+`a_raft_routed_complete_converges_the_follower_replica_actor` confirms the follower
+saw the instance parked, then completed-or-evicted (a diverged replica would stay
+parked and present forever — the only follower removal path is terminal eviction).
+
+### GCP RF=3 validation (build 352dfb4e, clean journal)
+A 5-min create+complete flood (~4.5M instances, 3 producers × 300 workers,
+latency default) then idle:
+
+| phase | resident/node |
+|-------|--------------:|
+| fresh baseline | 35 MB |
+| peak (flood) | ~1,000 MB |
+| **idle after drain (4+ min stable)** | **~765 MB** |
+
+The pre-fix 30-min soak left **13–15 GB/node** idle for the same ~700 residual
+wedged instances; post-fix idle is **~765 MB — a ~95% reduction**. Followers now
+reclaim terminal shells on apply, so they never accumulate. The ~675 residual
+active_backlog + ~765 MB is the separate, pre-existing owned-partition wedge
+(checkpoint 149 theme), unchanged by this fix. Congestion/latency unaffected
+(flood p99 ~63 ms). Cluster left on 352dfb4e in the production latency default.

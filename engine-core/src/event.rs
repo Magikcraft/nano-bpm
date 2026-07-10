@@ -608,6 +608,19 @@ pub enum Event {
 }
 
 impl Event {
+    /// The process-instance key of a **terminal** transition (completed or
+    /// terminated), if this event is one. Used by the follower-replica apply
+    /// path to reclaim the hot-state shell of an instance the moment it reaches
+    /// a terminal state — a replica has no read-model exporter to drive that
+    /// eviction, so without this its terminal shells would accumulate unbounded.
+    pub fn terminal_instance_key(&self) -> Option<Key> {
+        match self {
+            Event::ProcessInstanceCompleted { instance_key }
+            | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+            _ => None,
+        }
+    }
+
     /// The process-instance key this event relates to, if any.
     ///
     /// Used by the engine to decide which instances to check for completion
