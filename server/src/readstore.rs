@@ -352,6 +352,19 @@ pub struct ReadStore {
     path: Option<PathBuf>,
 }
 
+/// Result of projecting a batch of events into the read model.
+pub struct ExportOutcome {
+    /// Keys of instances that made a *genuine* Active->terminal transition in
+    /// this batch (idempotent re-deliveries excluded). Used to evict hot engine
+    /// state exactly once per instance.
+    pub terminal_keys: Vec<Key>,
+    /// Exact net change to the in-flight instance gauge for this batch:
+    /// `+genuine_creates - genuine_terminals`. Because it counts only real state
+    /// transitions (never raw event occurrences), re-delivered create/terminal
+    /// events contribute zero, so the gauge cannot drift under idempotent replay.
+    pub inflight_delta: i64,
+}
+
 impl ReadStore {
     /// Opens the read store at `path`, or an in-memory database when `path` is
     /// `None`. A persistent database whose schema version does not match (or
@@ -478,24 +491,32 @@ impl ReadStore {
     /// evict them from hot engine state. Projection is idempotent, so replaying
     /// an overlapping prefix is safe. Takes event references so a caller batching
     /// several `Arc<Vec<Event>>` can project them without deep-copying payloads.
-    pub fn export(&self, events: &[&Event]) -> rusqlite::Result<Vec<Key>> {
+    pub fn export(&self, events: &[&Event]) -> rusqlite::Result<ExportOutcome> {
         let mut conn = self.conn.lock().expect("read store poisoned");
         let tx = conn.transaction()?;
-        let mut completed = Vec::new();
+        let mut terminal_keys = Vec::new();
+        let mut inflight_delta: i64 = 0;
         for &event in events {
-            if let Event::ProcessInstanceCompleted { instance_key }
-            | Event::ProcessInstanceTerminated { instance_key } = event
+            let d = project(&tx, event)?;
+            inflight_delta += d;
+            // Collect only GENUINE terminal transitions (d < 0) for hot-state
+            // eviction; a re-delivered terminal (d == 0) was already evicted.
+            if d < 0
+                && let Event::ProcessInstanceCompleted { instance_key }
+                | Event::ProcessInstanceTerminated { instance_key } = event
             {
-                completed.push(*instance_key);
+                terminal_keys.push(*instance_key);
             }
-            project(&tx, event)?;
         }
         tx.cexecute(
             "UPDATE meta SET v = v + ?1 WHERE k = 'exported_position'",
             params![events.len() as i64],
         )?;
         tx.commit()?;
-        Ok(completed)
+        Ok(ExportOutcome {
+            terminal_keys,
+            inflight_delta,
+        })
     }
 
     /// Caps retained *terminal* (Completed/Terminated) process instances at
@@ -1259,7 +1280,14 @@ fn instance_version(tx: &rusqlite::Transaction, instance_key: Key) -> i32 {
 /// `search*`/`get*` projection are materialized; the rest (element lifecycle,
 /// sequence flows, timers, message subscriptions, start subscriptions) carry no
 /// queryable read-model state and are ignored.
-fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
+/// Applies `event` to the read model and returns its exact contribution to the
+/// in-flight instance gauge: `+1` when it genuinely creates a new active
+/// instance, `-1` when it genuinely transitions an active instance to terminal,
+/// and `0` otherwise — crucially including idempotent re-deliveries, which must
+/// not move the gauge (they were the source of the historical `active_backlog`
+/// drift where re-delivered creates permanently inflated the counter).
+fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
+    let mut delta: i64 = 0;
     match event {
         Event::ProcessDeployed {
             process_definition_key,
@@ -1300,15 +1328,17 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                 .unwrap_or_else(|| ("-1".to_string(), 0));
             // Serialize tags as comma-separated string for storage
             let tags_str = tags.join(",");
-            tx.cexecute(
+            // `DO NOTHING` (not `DO UPDATE`): a create is the first event for a
+            // key, so the only conflict is an idempotent re-delivery carrying
+            // identical fields — refreshing them would be a no-op. `DO NOTHING`
+            // lets the row count distinguish a genuine new instance (1 row) from
+            // a re-delivery (0 rows), which is what keeps the in-flight gauge
+            // exact under replay.
+            let inserted = tx.cexecute(
                 "INSERT INTO process_instances (key, process_id, process_definition_id, \
                  process_definition_key, version, state, start_date_ms, has_incident, tags, business_id) \
                  VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
-                 ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, \
-                 process_definition_id = excluded.process_definition_id, \
-                 process_definition_key = excluded.process_definition_key, \
-                 version = excluded.version, start_date_ms = excluded.start_date_ms, \
-                 tags = excluded.tags, business_id = excluded.business_id",
+                 ON CONFLICT(key) DO NOTHING",
                 params![
                     *instance_key as i64,
                     process_id,
@@ -1319,30 +1349,48 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
                     tags_str,
                     business_id.as_ref(),
                 ],
-            )?;
-            // Variables the instance was created with (the process-instance row
-            // exists now, so the scope's denormalized definition resolves).
-            upsert_variables(tx, *instance_key, *instance_key, variables)?;
+            )? == 1;
+            if inserted {
+                delta = 1;
+                // Variables the instance was created with (the process-instance
+                // row exists now, so the scope's denormalized definition
+                // resolves). Skipped on re-delivery: the row already carries
+                // them and the instance may since have been pruned/spilled, so
+                // re-upserting could resurrect reclaimed variables.
+                upsert_variables(tx, *instance_key, *instance_key, variables)?;
+            }
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
-            tx.cexecute(
-                "UPDATE process_instances SET state = ?2 WHERE key = ?1",
+            // `AND state = 0` (Active): only a genuine Active->terminal transition
+            // updates a row (1 change => delta -1); a re-delivered completion
+            // finds the row already terminal (0 changes) and must not move the
+            // gauge.
+            let transitioned = tx.cexecute(
+                "UPDATE process_instances SET state = ?2 WHERE key = ?1 AND state = 0",
                 params![
                     *instance_key as i64,
                     instance_state_code(ProcessInstanceState::Completed)
                 ],
-            )?;
+            )? == 1;
+            if transitioned {
+                delta = -1;
+            }
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
-            tx.cexecute(
-                "UPDATE process_instances SET state = ?2, has_incident = 0 WHERE key = ?1",
+            // `AND state = 0`: count a genuine Active->Terminated transition only
+            // (see ProcessInstanceCompleted).
+            let transitioned = tx.cexecute(
+                "UPDATE process_instances SET state = ?2, has_incident = 0 WHERE key = ?1 AND state = 0",
                 params![
                     *instance_key as i64,
                     instance_state_code(ProcessInstanceState::Terminated)
                 ],
-            )?;
+            )? == 1;
+            if transitioned {
+                delta = -1;
+            }
             // Close any incident still active on the terminated instance, so it
             // no longer surfaces as open in incident search.
             tx.cexecute(
@@ -1672,7 +1720,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<()> {
         // Events with no queryable read-model projection.
         _ => {}
     }
-    Ok(())
+    Ok(delta)
 }
 
 #[cfg(test)]
@@ -1803,6 +1851,47 @@ mod definition_xml_tests {
         store.export(&[&event]).unwrap();
         // Present but empty — the handler maps this to a 204, not a 404.
         assert_eq!(store.process_definition_xml(7).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn export_inflight_delta_is_exact_under_idempotent_redelivery() {
+        let store = ReadStore::open(None).unwrap();
+
+        // A genuine create contributes +1.
+        let created = created_event(1);
+        assert_eq!(store.export(&[&created]).unwrap().inflight_delta, 1);
+        // Re-delivering the same create must NOT move the gauge (this is the
+        // historical drift: idempotent projection double-counted raw events).
+        let out = store.export(&[&created]).unwrap();
+        assert_eq!(out.inflight_delta, 0);
+        assert!(out.terminal_keys.is_empty());
+
+        // A genuine completion contributes -1 and reports the terminal key once.
+        let done = Event::ProcessInstanceCompleted { instance_key: 1 };
+        let out = store.export(&[&done]).unwrap();
+        assert_eq!(out.inflight_delta, -1);
+        assert_eq!(out.terminal_keys, vec![1]);
+        // Re-delivering the completion (or a late create re-delivery) is inert.
+        let out = store.export(&[&done]).unwrap();
+        assert_eq!(out.inflight_delta, 0);
+        assert!(out.terminal_keys.is_empty());
+        assert_eq!(store.export(&[&created]).unwrap().inflight_delta, 0);
+
+        // Net gauge over the whole life is zero, and the row is terminal.
+        assert_eq!(store.active_instance_count(), 0);
+    }
+
+    #[test]
+    fn export_inflight_delta_sums_a_mixed_batch() {
+        let store = ReadStore::open(None).unwrap();
+        // Two creates + one completion in one batch => net +1.
+        let c2 = created_event(2);
+        let c3 = created_event(3);
+        let done2 = Event::ProcessInstanceCompleted { instance_key: 2 };
+        let out = store.export(&[&c2, &c3, &done2]).unwrap();
+        assert_eq!(out.inflight_delta, 1);
+        assert_eq!(out.terminal_keys, vec![2]);
+        assert_eq!(store.active_instance_count(), 1);
     }
 
     fn created_event(instance_key: super::Key) -> Event {

@@ -62,7 +62,7 @@ use crate::backpressure::{
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
 use crate::partition::Partitions;
-use crate::readstore::{ReadModel, ReadStore};
+use crate::readstore::{ExportOutcome, ReadModel, ReadStore};
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
@@ -1152,13 +1152,17 @@ fn spawn_exporter(
                 // are separate commands at genuinely different instants).
                 #[cfg(feature = "console")]
                 trace_store.ingest(&refs, now_millis());
-                let created = refs
-                    .iter()
-                    .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
-                    .count();
                 let before_export = std::time::Instant::now();
-                let completed = match store.export(&refs) {
-                    Ok(keys) => keys,
+                // The exporter is the single writer of this shard's read model,
+                // so it derives the exact in-flight delta from genuine state
+                // transitions (see ExportOutcome) rather than counting raw
+                // create/terminal event occurrences — which double-counted under
+                // idempotent re-delivery and drifted the gauge.
+                let ExportOutcome {
+                    terminal_keys: completed,
+                    inflight_delta: delta,
+                } = match store.export(&refs) {
+                    Ok(outcome) => outcome,
                     Err(e) => {
                         tracing::error!("read-model export failed: {e}");
                         // The batch is dropped regardless, so release its queue
@@ -1179,12 +1183,13 @@ fn spawn_exporter(
                     p_events += refs.len() as u64;
                     p_batches += 1;
                 }
-                // Update the in-flight backpressure gauge: +created, −terminal.
-                // Single-writer (this thread), so a plain load/store is race-free
-                // for the value and saturates at zero defensively.
-                let delta = created as isize - completed.len() as isize;
+                // Update the in-flight backpressure gauge by the exact net delta
+                // (+genuine creates − genuine terminals). Single-writer (this
+                // thread), so a plain load/store is race-free and saturates at
+                // zero defensively.
                 if delta != 0 {
-                    let next = (inflight.load(Ordering::Relaxed) as isize + delta).max(0) as usize;
+                    let next =
+                        (inflight.load(Ordering::Relaxed) as i64 + delta).max(0) as usize;
                     inflight.store(next, Ordering::Relaxed);
                 }
                 // The read store now reflects this batch; wake any
