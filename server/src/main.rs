@@ -11,6 +11,7 @@
 
 mod backpressure;
 mod cluster;
+mod cmd_profile;
 mod coldspill;
 #[cfg(feature = "console")]
 mod console;
@@ -61,7 +62,7 @@ use crate::backpressure::{
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
 use crate::partition::Partitions;
-use crate::readstore::{ReadModel, ReadStore};
+use crate::readstore::{ExportOutcome, ReadModel, ReadStore};
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
@@ -165,7 +166,29 @@ pub struct ServerImpl {
     /// retry signal instead of queueing them for seconds. Durability and
     /// at-least-once are unaffected: a shed create is never journaled, and accepted
     /// instances' jobs retain their lease/replay guarantees.
-    admission_max_backlog: usize,
+    /// The live per-node active-backlog admission cap the gate compares the
+    /// *runnable* (task-job) backlog against; `0` = off. Held behind an atomic
+    /// because in `AdmissionBacklog::Auto` mode the engine thread's
+    /// [`crate::backpressure::AdaptiveController`] backlog governor retunes it
+    /// each latency window to hold the system just left of the congestion-collapse
+    /// knee. In `Fixed`/`Off` mode it is a constant. Read on the hot admission
+    /// path with a relaxed load.
+    backlog_cap: Arc<AtomicUsize>,
+    /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
+    /// completed *service-task* jobs, summed across owned partitions. This is the
+    /// parked-excluded load signal the admission gate and the backlog governor
+    /// read — instances parked on timers/messages create subscriptions/timers,
+    /// not jobs, so they never appear here and are never shed against. Refreshed
+    /// by the ~1 Hz monitor tick; read with a relaxed load.
+    runnable_backlog: Arc<AtomicUsize>,
+    /// The live per-job-type active dispatch width the push dispatcher caps its
+    /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
+    /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
+    /// thread's [`crate::backpressure::AdaptiveController`] worker governor retunes
+    /// it each latency window, holding the fan-out just left of the point where
+    /// High-priority activation swamps completions. In `Fixed`/`Off` mode it is a
+    /// constant. Read on the dispatch path with a relaxed load.
+    active_worker_cap: Arc<AtomicUsize>,
     /// Create-queue-depth admission limit (0 = off, the default). When set,
     /// `createProcessInstance` is shed once the standing backlog of submitted-but-
     /// not-yet-applied creates (summed across partitions' `Low` queues) is at or
@@ -371,9 +394,9 @@ impl ServerImpl {
         // engine places message subscriptions on the partition owning their
         // correlation key (`hash(correlation_key)`). With a single partition this
         // is `1`, so placement stays local and behaviour is unchanged.
-        let replicate_activation = replicate_activation_from_env();
-        let lease_digest = lease_digest_from_env();
         let replication_mode = replication_mode_from_env();
+        let replicate_activation = replicate_activation_from_env(replication_mode);
+        let lease_digest = lease_digest_from_env();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
             // Leader-local activation mode: replicas must accept a replicated
@@ -429,17 +452,18 @@ impl ServerImpl {
         // boot, regardless of how large the replayed backlog is.
         let processing = Arc::new(AtomicUsize::new(0));
 
-        // Resolve the backpressure mode and, for adaptive mode, build the
-        // latency controller that the engine thread will drive. The controller
-        // owns the shared limit atomic; the server keeps the read side. The
-        // controller's "is the limit being used" signal reads the processing
-        // gauge (the gated quantity), not the backlog.
-        let (backpressure, mut controller) = match backpressure_setting_from_env() {
-            BackpressureSetting::Disabled => (Backpressure::Disabled, None),
-            BackpressureSetting::Fixed(n) => (Backpressure::Fixed(n), None),
+        // Resolve the backpressure mode and the admission-backlog policy, then
+        // build the single latency controller the engine thread drives. It hosts
+        // up to two AIMD limiters off the one per-command latency signal: the
+        // create-concurrency watermark (adaptive backpressure) and the
+        // self-optimizing active-backlog governor (auto admission-backlog). The
+        // controller owns the shared atomics; the server keeps the read sides.
+        let mut controller = AdaptiveController::new();
+        let backpressure = match backpressure_setting_from_env() {
+            BackpressureSetting::Disabled => Backpressure::Disabled,
+            BackpressureSetting::Fixed(n) => Backpressure::Fixed(n),
             BackpressureSetting::Adaptive => {
-                let (ctrl, limit) = AdaptiveController::new(processing.clone());
-                (Backpressure::Adaptive(limit), Some(ctrl))
+                Backpressure::Adaptive(controller.with_create_limiter(processing.clone()))
             }
         };
         tracing::info!("backpressure: {}", backpressure.describe());
@@ -448,12 +472,59 @@ impl ServerImpl {
         tracing::info!("SLA mode at ceiling: {}", sla_mode.describe());
         let sla_mode = SharedSlaMode::new(sla_mode);
 
-        let admission_max_backlog = admission_max_backlog_from_env();
-        if admission_max_backlog > 0 {
-            tracing::info!(
-                "admission control: on, max active backlog {admission_max_backlog} instance(s)"
-            );
-        }
+        // Runnable (task-job) backlog: the parked-excluded load signal the
+        // admission gate and the backlog governor read. Refreshed by the ~1 Hz
+        // monitor tick from `activatable_job_counts` (parked instances create no
+        // jobs, so they are excluded by construction). Seeded at 0.
+        let runnable_backlog = Arc::new(AtomicUsize::new(0));
+        // `backlog_cap` is the live active-backlog admission cap the gate reads
+        // (0 = off). Its value comes from one of three policies:
+        //  - Off:   a fixed 0 (never sheds on backlog).
+        //  - Fixed: a fixed operator-set cap.
+        //  - Auto:  a self-optimizing governor tunes it between the knee floor and
+        //           the memory-derived ceiling from the engine's latency signal.
+        let backlog_cap = match admission_backlog_from_env() {
+            AdmissionBacklog::Off => Arc::new(AtomicUsize::new(0)),
+            AdmissionBacklog::Fixed(n) => {
+                tracing::info!(
+                    "admission control: on, fixed active-backlog cap {n} runnable job(s)/node"
+                );
+                Arc::new(AtomicUsize::new(n))
+            }
+            AdmissionBacklog::Auto { floor, ceiling } => {
+                tracing::info!(
+                    "admission control: on, self-optimizing active-backlog governor \
+                     (floor {floor}, ceiling {ceiling} runnable jobs/node)"
+                );
+                controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone())
+            }
+        };
+        // `active_worker_cap` is the live per-job-type active dispatch width the
+        // push dispatcher reads (0 = no cap). Resolved from one of three policies,
+        // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
+        // governor tuned off the same engine latency signal, gated on the runnable
+        // backlog (grow the fan-out only while there is work to drain).
+        let active_worker_cap = match worker_concurrency_from_env() {
+            WorkerConcurrency::Off => Arc::new(AtomicUsize::new(0)),
+            WorkerConcurrency::Fixed(n) => {
+                tracing::info!(
+                    "worker concurrency: on, fixed active dispatch width {n} subscriber(s)/job type"
+                );
+                Arc::new(AtomicUsize::new(n))
+            }
+            WorkerConcurrency::Auto { floor, ceiling } => {
+                tracing::info!(
+                    "worker concurrency: on, self-optimizing worker governor \
+                     (floor {floor}, ceiling {ceiling} subscribers/job type)"
+                );
+                controller.with_worker_governor(floor, ceiling, runnable_backlog.clone())
+            }
+        };
+        let mut controller = if controller.is_active() {
+            Some(controller)
+        } else {
+            None
+        };
         let admission_max_create_queue = admission_max_create_queue_from_env();
         if admission_max_create_queue > 0 {
             tracing::info!(
@@ -614,7 +685,9 @@ impl ServerImpl {
             inflight,
             processing,
             activity: Arc::new(AtomicU64::new(0)),
-            admission_max_backlog,
+            backlog_cap,
+            runnable_backlog,
+            active_worker_cap,
             admission_max_create_queue,
             mem_watermark_bytes,
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
@@ -1079,13 +1152,17 @@ fn spawn_exporter(
                 // are separate commands at genuinely different instants).
                 #[cfg(feature = "console")]
                 trace_store.ingest(&refs, now_millis());
-                let created = refs
-                    .iter()
-                    .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
-                    .count();
                 let before_export = std::time::Instant::now();
-                let completed = match store.export(&refs) {
-                    Ok(keys) => keys,
+                // The exporter is the single writer of this shard's read model,
+                // so it derives the exact in-flight delta from genuine state
+                // transitions (see ExportOutcome) rather than counting raw
+                // create/terminal event occurrences — which double-counted under
+                // idempotent re-delivery and drifted the gauge.
+                let ExportOutcome {
+                    terminal_keys: completed,
+                    inflight_delta: delta,
+                } = match store.export(&refs) {
+                    Ok(outcome) => outcome,
                     Err(e) => {
                         tracing::error!("read-model export failed: {e}");
                         // The batch is dropped regardless, so release its queue
@@ -1106,12 +1183,13 @@ fn spawn_exporter(
                     p_events += refs.len() as u64;
                     p_batches += 1;
                 }
-                // Update the in-flight backpressure gauge: +created, −terminal.
-                // Single-writer (this thread), so a plain load/store is race-free
-                // for the value and saturates at zero defensively.
-                let delta = created as isize - completed.len() as isize;
+                // Update the in-flight backpressure gauge by the exact net delta
+                // (+genuine creates − genuine terminals). Single-writer (this
+                // thread), so a plain load/store is race-free and saturates at
+                // zero defensively.
                 if delta != 0 {
-                    let next = (inflight.load(Ordering::Relaxed) as isize + delta).max(0) as usize;
+                    let next =
+                        (inflight.load(Ordering::Relaxed) as i64 + delta).max(0) as usize;
                     inflight.store(next, Ordering::Relaxed);
                 }
                 // The read store now reflects this batch; wake any
@@ -1306,14 +1384,23 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
     )
 }
 
-/// Whether the job activation lock is replicated through Raft. `true` (the
-/// default) keeps the original fully-replicated lifecycle. Setting
-/// `NANOBPMN_REPLICATE_ACTIVATION=0` (or `false`/`off`/`no`) makes the lock
-/// leader-local: activation and lock-expiry stay off the Raft log, so each job
-/// costs 2 quorum commits instead of 3 and per-worker activation commits stop
-/// fragmenting the per-partition commit budget. Replicas then run with lenient
-/// completion so a replicated completion applies without having seen the
+/// Whether the job activation lock is replicated through Raft. When set,
+/// `NANOBPMN_REPLICATE_ACTIVATION` is honored explicitly: `1`/`true`/`on`/`yes`
+/// keeps the fully-replicated lifecycle; `0`/`false`/`off`/`no`/`digest` makes
+/// the lock leader-local, so activation and lock-expiry stay off the Raft log —
+/// each job costs 2 quorum commits instead of 3 and per-worker activation commits
+/// stop fragmenting the per-partition commit budget. Replicas then run with
+/// lenient completion so a replicated completion applies without having seen the
 /// activation. No effect without Raft (single node / RF=1).
+///
+/// DEFAULT (env unset) is mode-dependent: under `leader-durable` replication the
+/// default is leader-local (`false`), because that tier already acks on the leader
+/// alone with lenient follower completion — replicating activation there only adds
+/// a per-job quorum proposal that LOCKS jobs faster than they complete under
+/// sustained load, leaking leases until the activatable pool drains to zero and
+/// completions freeze (proven by the 2026-07-08 A/B; see PERFORMANCE.md). Under
+/// `quorum` replication the default stays fully-replicated (`true`) to preserve
+/// the node-loss-durable lease semantics every existing benchmark validates.
 ///
 /// DURABILITY TRADE-OFF: the lease (`Activated`/`worker`/`deadline`) then lives
 /// ONLY in the leader's in-memory engine — it is NOT durable and does NOT survive
@@ -1323,9 +1410,9 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
 /// the replicated lease deadline to expire. Both modes are at-least-once (jobs
 /// must be idempotent); this mode merely widens the failover redelivery window to
 /// "immediate". Durable PROGRESS (create/complete/fail/throw/timers) is still
-/// fully replicated. Prefer the default for workloads that need failover to honor
-/// in-flight lease deadlines; opt in for throughput-bound, idempotent workloads.
-fn replicate_activation_from_env() -> bool {
+/// fully replicated. Set `NANOBPMN_REPLICATE_ACTIVATION=1` to force the replicated
+/// lease under leader-durable when failover must honor in-flight lease deadlines.
+fn replicate_activation_from_env(replication_mode: ReplicationMode) -> bool {
     match std::env::var("NANOBPMN_REPLICATE_ACTIVATION")
         .ok()
         .as_deref()
@@ -1334,7 +1421,10 @@ fn replicate_activation_from_env() -> bool {
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off" | "no" | "digest"
         ),
-        None => true,
+        // Leader-durable already acks leader-locally with lenient follower
+        // completion; replicating activation there leaks leases under load. Quorum
+        // keeps the durable replicated lease.
+        None => !matches!(replication_mode, ReplicationMode::LeaderDurable),
     }
 }
 
@@ -1433,21 +1523,171 @@ struct ReceivedDigest {
     leases: Vec<(u64, u64)>,
 }
 
-/// Resolves the active-instance-backlog admission limit, or `0` (off) by default.
+/// The resolved active-backlog admission policy (see
+/// [`admission_backlog_from_env`]). The quantity bounded is the **runnable
+/// (task-job) backlog** per node — parked instances (timers/messages) create no
+/// jobs and are excluded by construction, so the cap never sheds against a
+/// legitimately parked population.
+enum AdmissionBacklog {
+    /// Never shed on backlog (`off`/`0`/`false`/`no`).
+    Off,
+    /// A fixed operator-set cap on the runnable backlog.
+    Fixed(usize),
+    /// Self-optimizing: a latency-driven governor tunes the cap between `floor`
+    /// (≈ the throughput knee) and `ceiling` (the memory-derived backstop).
+    Auto { floor: usize, ceiling: usize },
+}
+
+/// Resolves the active-backlog admission policy from `NANOBPMN_ADMISSION_MAX_BACKLOG`.
 ///
-/// `NANOBPMN_ADMISSION_MAX_BACKLOG=<n>` caps the number of active (created-but-not-
-/// terminal) instances: once the backlog reaches `n`, `createProcessInstance` is
-/// shed with a 503 `RESOURCE_EXHAUSTED` so clients back off, keeping end-to-end
-/// latency and memory bounded under sustained overload. Unset or `0` disables it
-/// (the default) — appropriate for workloads with a legitimately large parked
-/// population (e.g. many instances waiting on timers/messages), where the backlog
-/// is not a load signal. Distinct from `NANOBPMN_BACKPRESSURE_MAX_INFLIGHT`, which
-/// gates on create-processing *concurrency*, not the standing backlog.
-fn admission_max_backlog_from_env() -> usize {
-    std::env::var("NANOBPMN_ADMISSION_MAX_BACKLOG")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+/// The cap bounds the **runnable (task-job) backlog** per node: once it is
+/// reached, `createProcessInstance` is shed with a 503 `RESOURCE_EXHAUSTED` so
+/// clients back off, keeping end-to-end latency and memory bounded under
+/// sustained overload. Because only service tasks create jobs, parked instances
+/// (waiting on timers/messages) are never counted and never shed against.
+///
+/// - `off` (or `0`/`false`/`no`): [`AdmissionBacklog::Off`] — disabled.
+/// - `=<n>`: [`AdmissionBacklog::Fixed`], an explicit per-node cap. Tune to the
+///   **throughput knee** (a few thousand/node) to pin the system at its peak
+///   sustained throughput — bounding the runnable set keeps the engine actor's
+///   per-command cost off its O(active) tail (see PERFORMANCE.md, congestion
+///   collapse).
+/// - unset / `adaptive` / `auto` / `on`: [`AdmissionBacklog::Auto`] — **the
+///   default**. A self-optimizing governor (the engine thread's
+///   [`crate::backpressure::AdaptiveController`]) tunes the cap from the measured
+///   per-command latency, holding the system just left of the congestion knee so
+///   the peak sustained throughput is delivered *by default* — no manual knee
+///   tuning. It floors at [`MIN_BACKLOG_GOVERNOR_CAP`] (never starving the
+///   workers or shedding a modest parked burst) and ceilings at the memory-derived
+///   [`active_backlog_cap_default_from_limit`] (the OOM backstop). Only sheds in
+///   [`SlaMode::Latency`]; the memory-safety rails handle admission mode.
+fn admission_backlog_from_env() -> AdmissionBacklog {
+    if let Ok(v) = std::env::var("NANOBPMN_ADMISSION_MAX_BACKLOG") {
+        let t = v.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "off" | "false" | "no") {
+            return AdmissionBacklog::Off;
+        }
+        if let Ok(n) = t.parse::<usize>() {
+            // Explicit number wins, including `0` = off.
+            return if n == 0 {
+                AdmissionBacklog::Off
+            } else {
+                AdmissionBacklog::Fixed(n)
+            };
+        }
+        // "on"/"adaptive"/"auto"/anything else falls through to the auto governor.
+    }
+    let ceiling = detect_memory_limit_bytes()
+        .map(active_backlog_cap_default_from_limit)
+        .unwrap_or(MIN_ACTIVE_BACKLOG_CAP);
+    // The governor floor is the knee target, but never above the memory ceiling
+    // (on a tiny host the ceiling could clamp below the nominal floor).
+    let floor = MIN_BACKLOG_GOVERNOR_CAP.min(ceiling);
+    AdmissionBacklog::Auto { floor, ceiling }
+}
+
+/// The self-optimizing floor for the [`AdmissionBacklog::Auto`] governor: the
+/// lowest cap it will tune down to under congestion. Set near the measured
+/// throughput knee (a few thousand runnable jobs/node — see PERFORMANCE.md) so
+/// the governor holds the system just left of the congestion-collapse point
+/// without starving the workers or shedding a modest parked/burst backlog.
+const MIN_BACKLOG_GOVERNOR_CAP: usize = 2_000;
+
+/// The resolved worker-concurrency (active dispatch width) policy — see
+/// [`worker_concurrency_from_env`]. Bounds how many subscribers the push
+/// dispatcher fans a given job type out to per pass. The push dispatcher, not the
+/// engine CPU, is the throughput ceiling (activation is High-priority in the
+/// engine mailbox and swamps completions when spread across too many
+/// subscribers), so right-sizing this width is the primary lever for sustained
+/// completion throughput. Excess subscribers are parked, rotated round-robin so
+/// none is starved.
+enum WorkerConcurrency {
+    /// No cap — dispatch to every subscriber every pass (the historical behavior).
+    Off,
+    /// A fixed operator-set active-dispatch width per job type.
+    Fixed(usize),
+    /// Self-optimizing: a latency-driven governor tunes the width between `floor`
+    /// and `ceiling` from the engine's per-command latency, gated on the runnable
+    /// backlog (grow only while there is work to drain).
+    Auto { floor: usize, ceiling: usize },
+}
+
+/// The self-optimizing floor for the [`WorkerConcurrency::Auto`] governor: the
+/// fewest subscribers per job type the dispatcher will narrow to under congestion.
+///
+/// This is the **measured drain knee**, not an arbitrary small value. Two
+/// independent live sweeps on the RF=3 cluster land on the same point: a
+/// subscribed-worker sweep peaks at 50 workers/node (46.7k/s, vs 12–24k at
+/// 100–400), and a fixed per-pass-width calibration at 400 over-provisioned
+/// workers/node peaks sharply at width 50 (**42.0k/s, p99 9.3s** — vs 13–17k and
+/// p99 65–75s at off/100/200/800). Because the single-writer engine keeps latency
+/// inflated under sustained overload, the AIMD grow path cannot climb to the knee
+/// from below — so, exactly like the backlog governor, the floor must *be* the
+/// knee. Pinned here, a worst-case over-provisioned fleet is throttled back to the
+/// throughput optimum instead of collapsing (activation swamping completions).
+const MIN_WORKER_GOVERNOR_WIDTH: usize = 50;
+/// The ceiling for the [`WorkerConcurrency::Auto`] governor: effectively "all
+/// subscribers" for any realistic fleet, so a genuinely healthy, drain-bound
+/// workload is never throttled below the number of workers that keep completing.
+const MAX_WORKER_GOVERNOR_WIDTH: usize = 4_096;
+
+/// Resolves the worker-concurrency (active dispatch width) policy from
+/// `NANOBPMN_WORKER_CONCURRENCY`.
+///
+/// - `off` (or `0`/`false`/`no`): [`WorkerConcurrency::Off`] — no cap (dispatch to
+///   every subscriber every pass).
+/// - `=<n>`: [`WorkerConcurrency::Fixed`], an explicit per-job-type active width.
+/// - unset / `adaptive` / `auto` / `on`: [`WorkerConcurrency::Auto`] — **the
+///   default**. A self-optimizing governor (the engine thread's
+///   [`crate::backpressure::AdaptiveController`], third limiter) tunes the width
+///   from the measured per-command latency, holding the fan-out just left of the
+///   point where activation swamps completions. Floors at
+///   [`MIN_WORKER_GOVERNOR_WIDTH`], ceilings at [`MAX_WORKER_GOVERNOR_WIDTH`].
+fn worker_concurrency_from_env() -> WorkerConcurrency {
+    if let Ok(v) = std::env::var("NANOBPMN_WORKER_CONCURRENCY") {
+        let t = v.trim().to_ascii_lowercase();
+        if matches!(t.as_str(), "off" | "false" | "no") {
+            return WorkerConcurrency::Off;
+        }
+        if let Ok(n) = t.parse::<usize>() {
+            return if n == 0 {
+                WorkerConcurrency::Off
+            } else {
+                WorkerConcurrency::Fixed(n)
+            };
+        }
+        // "on"/"adaptive"/"auto"/anything else falls through to the auto governor.
+    }
+    WorkerConcurrency::Auto {
+        floor: MIN_WORKER_GOVERNOR_WIDTH,
+        ceiling: MAX_WORKER_GOVERNOR_WIDTH,
+    }
+}
+
+/// Nominal resident bytes charged per active (created-but-not-terminal) instance
+/// when deriving the default backlog cap from the memory budget: an instance
+/// record plus a small live variable set and a parked job. Larger than
+/// [`NOMINAL_CREATE_BYTES`] because an active instance is longer-lived and carries
+/// more resting state; deliberately conservative so the derived count is a
+/// generous safety backstop rather than a tight throughput clip.
+const NOMINAL_ACTIVE_BYTES: u64 = 16 * 1024;
+/// Never auto-derive a backlog cap below this — a lower floor would shed against a
+/// legitimately large parked population (timers/messages) or a modest burst on a
+/// small host. Well above the create-queue floor because parked instances are a
+/// normal steady state, not a load signal.
+const MIN_ACTIVE_BACKLOG_CAP: usize = 50_000;
+/// Never auto-derive a backlog cap above this — beyond it the coarse resident-
+/// memory / pipeline-byte rails are the right OOM backstop.
+const MAX_ACTIVE_BACKLOG_CAP: usize = 1_000_000;
+
+/// Computes the default per-node active-backlog cap from a detected memory
+/// `limit`: budget the same fraction the in-flight-byte rail uses, expressed as a
+/// *count* of nominal active instances, clamped to
+/// `[MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP]`. Pure so it can be
+/// unit-tested without the environment.
+fn active_backlog_cap_default_from_limit(limit_bytes: u64) -> usize {
+    let budget = pipeline_bytes_watermark_default_from_limit(limit_bytes);
+    ((budget / NOMINAL_ACTIVE_BYTES) as usize).clamp(MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP)
 }
 
 /// Nominal resident bytes charged per submitted-but-unapplied create when
@@ -2147,13 +2387,19 @@ impl ServerImpl {
         // relaxed atomic load, so this check costs no engine round-trip — a small
         // race against concurrent creates is irrelevant for an approximate limit.
         //
-        // Suppressed in `SlaMode::Admission`: that mode preferentially admits
-        // instances and accepts higher latency, so it does not shed on the
-        // latency-driven concurrency limit (the memory-safety rails in
-        // `admission_shed` still apply and keep the node from OOMing).
-        if self.sla_mode.get().sheds_for_latency()
-            && let Some(limit) = self.backpressure.current_limit()
-        {
+        // Armed in BOTH SLA modes. This is an engine-overload guard, not a backlog
+        // bound: because creates and completions share the single writer, it sheds
+        // creates when create-*processing* concurrency saturates, protecting the
+        // writer thread. It does NOT bound the accumulated backlog (it keys off
+        // processing concurrency, which stays low even while completions fall
+        // behind), so under sustained overload the backlog grows to the
+        // memory-safety rails regardless — the active-backlog governor (latency
+        // mode only, in `admission_shed`) is the sole tight backlog bound. Keeping
+        // this guard armed in `admission` still pays off: measured ~+6% throughput
+        // and a ~40% tighter p90 tail vs suppressing it, at no cost (GCP 3-node
+        // fresh-journal A/B; see PERFORMANCE.md 2026-07-10 / ADR 0013 Addendum). So
+        // `admission` relaxes only the proactive backlog governor, not this guard.
+        if let Some(limit) = self.backpressure.current_limit() {
             let processing = self.processing.load(Ordering::Relaxed);
             if self.backpressure.should_shed(processing) {
                 return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
@@ -6628,7 +6874,14 @@ impl ServerImpl {
             // replica engine actor here (seeded with the current deployments) for
             // the state machine to apply the replicated log into.
             for p in topology.replica_partitions() {
-                let engine = match server.engine.local_for_partition(p) {
+                // A partition this node OWNS is served + exported locally; its
+                // exporter drives terminal-instance eviction. A partition this
+                // node only REPLICATES (follower under RF>1) has no exporter, so
+                // the state machine must evict terminal shells itself or they
+                // grow without bound (the RF>1 hot-state leak).
+                let owned = server.engine.local_for_partition(p);
+                let evict_terminal = owned.is_none();
+                let engine = match owned {
                     Some(owned) => owned.clone(),
                     None => server.replica_engine_for(p).await,
                 };
@@ -6638,6 +6891,7 @@ impl ServerImpl {
                     engine,
                     transport.clone(),
                     raft_log_dir_for(p),
+                    evict_terminal,
                 )
                 .await
                 {
@@ -7000,13 +7254,21 @@ impl ServerImpl {
         // node as the sole voter so it elects itself immediately, then add the
         // reachable survivors as learners so new writes ship to them.
         let transport = self.raft_transport();
-        let part = match RaftPartition::bootstrap_member(me, p, engine, transport, None).await {
-            Ok(part) => Arc::new(part),
-            Err(e) => {
-                tracing::error!("leader-durable: promote partition {p} failed to build group: {e}");
-                return;
-            }
-        };
+        // No local exporter unless this node statically owns `p`; a promoted
+        // replica must evict terminal shells itself (see bootstrap_member).
+        let evict_terminal = self.engine.local_for_partition(p).is_none();
+        let part =
+            match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal)
+                .await
+            {
+                Ok(part) => Arc::new(part),
+                Err(e) => {
+                    tracing::error!(
+                        "leader-durable: promote partition {p} failed to build group: {e}"
+                    );
+                    return;
+                }
+            };
         let mut members = std::collections::BTreeMap::new();
         members.insert(
             me,
@@ -7202,7 +7464,11 @@ impl ServerImpl {
             old.raft.shutdown().await.ok();
         }
         let transport = self.raft_transport();
-        match RaftPartition::bootstrap_member(me, p, engine, transport, None).await {
+        // Rejoining as a follower/receiver of the new leader: evict terminal
+        // shells locally unless this node statically owns `p` (has an exporter).
+        let evict_terminal = self.engine.local_for_partition(p).is_none();
+        match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await
+        {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
                 tracing::info!(
@@ -7650,8 +7916,11 @@ impl ServerImpl {
         let worker_for_trace = worker.clone();
         let activated: Vec<ActivatedJobWithIdentity> = handle
             .with(move |engine| {
+                // Leader-local activation bypasses the Raft `apply_command_at`
+                // path, so it is profiled here directly on the engine thread.
+                let timer = cmd_profile::start();
                 let now = now_millis();
-                engine
+                let out: Vec<ActivatedJobWithIdentity> = engine
                     .activate_jobs(&job_type, &worker, want, timeout, now)
                     .into_iter()
                     .map(|job| {
@@ -7673,7 +7942,9 @@ impl ServerImpl {
                             process_definition_key,
                         }
                     })
-                    .collect()
+                    .collect();
+                cmd_profile::finish(timer, "activate_jobs");
+                out
             })
             .await;
         #[cfg(feature = "console")]
@@ -7825,16 +8096,32 @@ impl ServerImpl {
         // now. Only the leader runs this gate; followers never propose, so safe.
         let (timers_due, jobs_due) = handle
             .with(move |journal| {
+                // The tick pre-check gate runs on the single-writer engine actor
+                // every tick per led partition; profiled here to attribute its
+                // share of the actor hold under load.
+                let timer = cmd_profile::start();
                 // Shed active-backlog variables first (cheaper, instance stays
                 // live), then whole dormant instances — both gated on RAM pressure.
                 journal.maybe_var_spill_pressure();
                 journal.maybe_cold_spill();
                 let state = journal.engine().state();
                 let timers_due = state.timers.values().any(|t| t.due_at <= now);
-                let jobs_due = state
-                    .jobs
-                    .values()
-                    .any(|j| j.deadline.is_some_and(|d| d <= now));
+                // Only `Activated` jobs hold a lease deadline, and `ExpireJobs`
+                // reclaims exactly that set (it iterates `activated_jobs`). Gate on
+                // the same index rather than scanning every job: this pre-check runs
+                // on the single-writer engine actor every tick (~2 Hz) per led
+                // partition, so a full `jobs.values()` walk is O(total backlog) —
+                // O(active) — and starves activation/completion on the actor as the
+                // in-flight backlog grows (the congestion-collapse hot path). The
+                // indexed walk is O(activated), bounded by concurrently-leased jobs.
+                let jobs_due = state.activated_jobs.iter().any(|k| {
+                    state
+                        .jobs
+                        .get(k)
+                        .and_then(|j| j.deadline)
+                        .is_some_and(|d| d <= now)
+                });
+                cmd_profile::finish(timer, "tick_precheck");
                 (timers_due, jobs_due)
             })
             .await;
@@ -7881,7 +8168,14 @@ impl ServerImpl {
                 // emit `JobLockExpired` on the leader (job is Activated) but nothing
                 // on followers (their job is still Created), diverging the replicated
                 // event stream. Expire directly on the leader's engine actor.
-                let expired = handle.with(move |journal| journal.expire_jobs(now)).await;
+                let expired = handle
+                    .with(move |journal| {
+                        let timer = cmd_profile::start();
+                        let expired = journal.expire_jobs(now);
+                        cmd_profile::finish(timer, "expire_jobs");
+                        expired
+                    })
+                    .await;
                 if !expired.is_empty() {
                     produced = true;
                 }
@@ -8799,7 +9093,7 @@ impl ServerImpl {
     ///   latency gate would have.
     pub(crate) fn admission_shed(&self) -> Option<String> {
         let cq_limit = self.admission_max_create_queue;
-        let backlog_limit = self.admission_max_backlog;
+        let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
         let latency_mode = self.sla_mode.get().sheds_for_latency();
         // The standing create-queue depth (submitted-but-not-yet-applied creates)
         // is the backlog that actually grows under overload — completion-priority
@@ -8827,21 +9121,24 @@ impl ServerImpl {
             ));
         }
         // Latency-preservation rail (latency SLA mode only): shed once either the
-        // parked active-instance backlog *or* the create-side backlog reaches the
-        // configured limit, so end-to-end latency stays bounded. The create-side
-        // term is the one that bites for fast create->complete workloads: their
-        // active-instance count (`self.inflight`, projected by the read-model
-        // exporter) stays ~0 because instances complete as fast as they're
-        // projected, so the active-instance term alone was a no-op under a create
-        // flood. Bounding the create queue bounds create->apply latency, which is
-        // the dominant queue an overloaded producer waits behind.
+        // runnable (task-job) backlog *or* the create-side backlog reaches the
+        // cap, so end-to-end latency stays bounded. The runnable-backlog term is
+        // the congestion-collapse guard: it is the parked-excluded load signal
+        // (only service tasks create jobs), so bounding it holds the engine
+        // actor's per-command cost off its O(active) tail *without* shedding a
+        // legitimately parked population. The create-side term is the one that
+        // bites for fast create->complete workloads: their runnable backlog drains
+        // as fast as it's created, so bounding the create queue bounds
+        // create->apply latency, the dominant queue an overloaded producer waits
+        // behind. In `AdmissionBacklog::Auto` mode `backlog_limit` is retuned live
+        // by the backlog governor to sit just left of the throughput knee.
         if latency_mode && backlog_limit > 0 {
-            let backlog = self.inflight.load(Ordering::Relaxed);
+            let backlog = self.runnable_backlog.load(Ordering::Relaxed);
             if backlog >= backlog_limit {
                 crate::metrics::record_admission_shed("active_backlog");
                 return Some(format!(
-                    "Admission control: {backlog} active instances at or above the \
-                     configured backlog limit of {backlog_limit}. Retry after a backoff."
+                    "Admission control: {backlog} runnable jobs at or above the \
+                     active-backlog cap of {backlog_limit}. Retry after a backoff."
                 ));
             }
             if create_queue >= backlog_limit {
@@ -8950,12 +9247,12 @@ impl ServerImpl {
     pub(crate) fn ceiling_state(&self) -> (bool, bool) {
         let processing = self.processing.load(Ordering::Relaxed);
         let mut throughput = self.backpressure.should_shed(processing);
-        let backlog_limit = self.admission_max_backlog;
+        let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
         if !throughput && backlog_limit > 0 && self.sla_mode.get().sheds_for_latency() {
             // Mirror the latency-preservation rail in `admission_shed`: it trips on
-            // either the parked active-instance backlog or the create-side backlog
+            // either the runnable (task-job) backlog or the create-side backlog
             // (the term that bites for fast create->complete workloads).
-            throughput = self.inflight.load(Ordering::Relaxed) >= backlog_limit
+            throughput = self.runnable_backlog.load(Ordering::Relaxed) >= backlog_limit
                 || self.engine.pending_create_queue() >= backlog_limit;
         }
 
@@ -9033,6 +9330,15 @@ impl ServerImpl {
     /// signal being lost mid-pass.
     pub(crate) fn dispatch_wake_handle(&self) -> Arc<tokio::sync::Notify> {
         self.dispatch_wake.clone()
+    }
+
+    /// The live per-job-type active dispatch width the push dispatcher caps its
+    /// per-pass subscriber fan-out at; `0` = no cap. In [`WorkerConcurrency::Auto`]
+    /// mode the engine thread's worker governor retunes this each latency window
+    /// to hold the fan-out just left of activation swamping completions. Read with
+    /// a relaxed load on the dispatch path.
+    pub(crate) fn active_worker_cap(&self) -> usize {
+        self.active_worker_cap.load(Ordering::Relaxed)
     }
 }
 
@@ -10606,6 +10912,25 @@ async fn main() {
             }),
         )
         .route(
+            "/debug/heap",
+            axum::routing::get(|| async { crate::memory::stats_print() }),
+        )
+        .route(
+            "/debug/heap/prof",
+            axum::routing::get(|| async {
+                let path = format!(
+                    "{}/nano-heap-{}.prof",
+                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+                    std::process::id()
+                );
+                if crate::memory::prof_dump(&path) {
+                    format!("dumped {path}\n")
+                } else {
+                    "prof unavailable: build with --features heapprof\n".to_string()
+                }
+            }),
+        )
+        .route(
             "/v2/system/memory",
             axum::routing::get(system_memory_handler),
         );
@@ -10774,10 +11099,11 @@ async fn main() {
                     monitor_server.engine.pending_create_queue() as i64,
                     monitor_server.active_backlog(),
                     monitor_server.mem_pressure_bytes.load(Ordering::Relaxed) as i64,
+                    monitor_server.runnable_backlog.load(Ordering::Relaxed) as i64,
                 );
                 crate::metrics::set_admission_limit(
                     "backlog",
-                    monitor_server.admission_max_backlog as i64,
+                    monitor_server.backlog_cap.load(Ordering::Relaxed) as i64,
                 );
                 crate::metrics::set_admission_limit(
                     "create_queue",
@@ -10791,8 +11117,24 @@ async fn main() {
                     "mem_watermark",
                     monitor_server.mem_watermark_bytes as i64,
                 );
+                crate::metrics::set_active_worker_target(
+                    monitor_server.active_worker_cap.load(Ordering::Relaxed) as i64,
+                );
 
                 let activatable = monitor_server.engine.activatable_job_counts().await;
+                // Refresh the runnable (task-job) backlog the admission gate and
+                // backlog governor read: the total count of task jobs the engine
+                // holds (Created + Activated), summed across owned partitions.
+                // Parked instances create no jobs, so this excludes them by
+                // construction — and it counts leased-but-uncompleted jobs, so a
+                // worker-starved backlog that has drained into the activated set is
+                // still seen (activatable alone would miss it). The governor can
+                // pull the cap toward the knee without ever shedding a legitimately
+                // parked population.
+                let runnable = monitor_server.engine.job_backlog().await;
+                monitor_server
+                    .runnable_backlog
+                    .store(runnable, Ordering::Relaxed);
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =
                     std::collections::HashSet::with_capacity(activatable.len() + workers.len());
@@ -10824,6 +11166,31 @@ async fn main() {
                         s.hi_depth.load(std::sync::atomic::Ordering::Relaxed),
                         s.lo_depth.load(std::sync::atomic::Ordering::Relaxed),
                     );
+                }
+
+                // Engine-state cardinality per partition — the independent
+                // variable the per-command cost (nanobpm_cmd_*) is regressed
+                // against to localize the create/complete collapse's O(active)
+                // term. Only sampled when NANOBPM_CMD_PROFILE is set, to avoid a
+                // per-partition actor round-trip every tick otherwise.
+                if crate::cmd_profile::enabled() {
+                    for handle in monitor_server.engine.all() {
+                        let partition = handle.stats().partition;
+                        let (instances, jobs, activated) = handle
+                            .with(|journal| {
+                                let engine = journal.engine();
+                                let state = engine.state();
+                                (
+                                    engine.resident_instance_count(),
+                                    state.jobs.len(),
+                                    state.activated_jobs.len(),
+                                )
+                            })
+                            .await;
+                        crate::metrics::set_engine_cardinality(
+                            partition, instances, jobs, activated,
+                        );
+                    }
                 }
             }
         });
@@ -11228,6 +11595,36 @@ mod clustered_startup_tests {
         assert_eq!(
             create_queue_cap_default_from_limit(tiny),
             MIN_CREATE_QUEUE_CAP
+        );
+    }
+
+    #[test]
+    fn active_backlog_cap_default_scales_and_clamps() {
+        // 64 GiB host: byte budget 8% = ~5.1 GiB; /16 KiB per active is ~335k,
+        // within [50k, 1M].
+        let big = 64 * 1024 * 1024 * 1024;
+        let cap = active_backlog_cap_default_from_limit(big);
+        assert_eq!(
+            cap,
+            (pipeline_bytes_watermark_default_from_limit(big) / NOMINAL_ACTIVE_BYTES) as usize
+        );
+        assert!((MIN_ACTIVE_BACKLOG_CAP..=MAX_ACTIVE_BACKLOG_CAP).contains(&cap));
+
+        // Mid host: 4 GiB -> byte budget floored at MIN_PIPELINE_BYTES (512 MiB);
+        // 512 MiB / 16 KiB = 32_768, below the 50k floor -> clamped up.
+        let mid = 4 * 1024 * 1024 * 1024;
+        assert_eq!(
+            active_backlog_cap_default_from_limit(mid),
+            ((MIN_PIPELINE_BYTES / NOMINAL_ACTIVE_BYTES) as usize)
+                .clamp(MIN_ACTIVE_BACKLOG_CAP, MAX_ACTIVE_BACKLOG_CAP)
+        );
+
+        // Tiny limit -> budget is the whole tiny limit; /16 KiB is far below the
+        // 50k floor -> clamped up to MIN_ACTIVE_BACKLOG_CAP.
+        let tiny = 64 * 1024 * 1024; // 64 MiB
+        assert_eq!(
+            active_backlog_cap_default_from_limit(tiny),
+            MIN_ACTIVE_BACKLOG_CAP
         );
     }
 
@@ -12494,6 +12891,7 @@ mod clustered_startup_tests {
                 DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 node0.raft_transport(),
                 None,
+                false,
             )
             .await
             .expect("boot raft member on node 0"),
@@ -12507,6 +12905,7 @@ mod clustered_startup_tests {
                 DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 node1.raft_transport(),
                 None,
+                false,
             )
             .await
             .expect("boot raft member on node 1"),
@@ -12939,6 +13338,33 @@ mod clustered_startup_tests {
             .expect("raft-routed create commits");
         let part = nanobpmn_engine_core::partition_of(instance_key);
 
+        // Grab the follower's replica engine actor up front so we can watch it
+        // apply each replicated command in lockstep.
+        let replica = {
+            let map = node1.raft_replicas.lock().unwrap();
+            map.get(&part).cloned()
+        }
+        .expect("node 1 hosts a replica engine actor for the leader's partition");
+
+        // Phase 1: the create must replicate and apply on the follower, parking
+        // the instance at the service task. It stays parked until we activate +
+        // complete below, so this reliably observes it present before eviction.
+        let mut saw_parked = false;
+        for _ in 0..400 {
+            if replica
+                .with(move |journal| journal.engine().instance(instance_key).is_some())
+                .await
+            {
+                saw_parked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_parked,
+            "the follower replica applied the create and parked the instance"
+        );
+
         // Activate through the leader (a LOGGED ActivateJobs), then complete.
         let mut job_key = None;
         for _ in 0..50 {
@@ -12959,20 +13385,26 @@ mod clustered_startup_tests {
             .wait()
             .await;
 
-        // The follower's REPLICA engine actor for this partition must converge to
-        // the instance being COMPLETED (Raft apply is async after commit, so poll).
-        let replica = {
-            let map = node1.raft_replicas.lock().unwrap();
-            map.get(&part).cloned()
-        }
-        .expect("node 1 hosts a replica engine actor for the leader's partition");
-
+        // Phase 2: the follower's REPLICA engine actor must converge to the
+        // instance being COMPLETED — proof it applied the replicated `CompleteJob`
+        // cleanly (the pre-fix divergence swallowed `JobNotActivated` and left the
+        // instance stuck PARKED forever). A follower has no exporter, so `apply`
+        // then reclaims the terminal shell (the RF>1 leak fix); since we already
+        // saw it parked, its disappearance is proof it reached terminal — the only
+        // follower removal path is terminal eviction (a diverged instance would
+        // stay parked and present, never evicting).
         let mut converged = false;
         for _ in 0..400 {
-            let done = replica
-                .with(move |journal| journal.engine().is_completed(instance_key))
+            let (present, done) = replica
+                .with(move |journal| {
+                    let e = journal.engine();
+                    (
+                        e.instance(instance_key).is_some(),
+                        e.is_completed(instance_key),
+                    )
+                })
                 .await;
-            if done {
+            if done || !present {
                 converged = true;
                 break;
             }
@@ -12996,7 +13428,8 @@ mod clustered_startup_tests {
         assert!(
             converged,
             "follower replica must converge: the instance completes there too \
-             (logged activation keeps the replica in lockstep for the complete)"
+             (logged activation keeps the replica in lockstep for the complete), \
+             then its terminal shell is evicted since a follower has no exporter"
         );
 
         for node in [&node0, &node1] {
@@ -13740,28 +14173,41 @@ mod clustered_startup_tests {
             .parse()
             .expect("numeric instance key");
 
-        // The instance must be present on a FOLLOWER engine actor too — proof the
-        // REST create replicated through Raft rather than applying only locally.
+        // The instance's partition must APPLY on a FOLLOWER too — proof the REST
+        // create replicated through Raft rather than applying only locally. We
+        // check the follower's Raft applied index converges to the leader's
+        // (lockstep apply) rather than engine residency: the process
+        // auto-completes, and a follower has no exporter, so `apply` reclaims the
+        // terminal shell the instant the complete applies (the RF>1 leak fix) —
+        // it is correctly gone from the follower's hot state.
         let p = nanobpmn_engine_core::partition_of(instance_key);
-        let follower = if node0
+        let leader_part = node0
             .raft_registry()
             .get(p)
-            .and_then(|part| part.raft.metrics().borrow().current_leader)
-            == Some(1)
-        {
-            &node2
+            .expect("node 0 hosts partition p");
+        let follower_part = if leader_part.raft.metrics().borrow().current_leader == Some(1) {
+            node2.raft_registry().get(p)
         } else {
-            &node1
-        };
-        let handle = follower
-            .engine_handle_for(p)
-            .expect("the follower replicates the instance's partition");
+            node1.raft_registry().get(p)
+        }
+        .expect("a follower hosts the instance's partition");
+        let target = leader_part
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
         let mut present = false;
         for _ in 0..200 {
-            if handle
-                .with(move |journal| journal.engine().instance(instance_key).is_some())
-                .await
-            {
+            let applied = follower_part
+                .raft
+                .metrics()
+                .borrow()
+                .last_applied
+                .map(|l| l.index)
+                .unwrap_or(0);
+            if applied >= target {
                 present = true;
                 break;
             }
@@ -13769,7 +14215,7 @@ mod clustered_startup_tests {
         }
         assert!(
             present,
-            "the REST-created instance is replicated to a follower's partition"
+            "the REST-created instance's log replicated and applied on a follower's partition"
         );
 
         for node in [&node0, &node1, &node2] {
@@ -14537,9 +14983,10 @@ mod clustered_startup_tests {
         // it) but NEVER form the group — its owner (node 1) is absent, exactly as
         // in a staggered cold start. Its `current_leader` therefore stays `None`.
         let engine = node0.replica_engine_for(1).await;
-        let part = RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None)
-            .await
-            .expect("host a replica member for partition 1");
+        let part =
+            RaftPartition::bootstrap_member(0, 1, engine, node0.raft_transport(), None, false)
+                .await
+                .expect("host a replica member for partition 1");
         node0.raft_registry().insert(Arc::new(part));
 
         // The other replicas are unreachable, so node 0 IS the first-reachable

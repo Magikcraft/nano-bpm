@@ -61,9 +61,9 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "NANOBPMN_ADMISSION_MAX_BACKLOG",
         "Admission & SLA",
-        "Max active backlog",
-        "off",
-        "Active-instance backlog above which creates are shed (latency mode). Off by default.",
+        "Max runnable backlog",
+        "auto",
+        "Per-node runnable (task-job) backlog above which creates are shed (latency mode); parked instances create no jobs and are never shed. Default `auto` runs a self-optimizing governor that tunes the cap to the throughput knee from measured latency. Set an explicit fixed cap (a few thousand/node), or 'off' to disable.",
     ),
     (
         "NANOBPMN_ADMISSION_MAX_CREATE_QUEUE",
@@ -71,6 +71,13 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
         "Max create queue",
         "adaptive",
         "Create-queue depth rail — a memory-safety guard active in every SLA mode.",
+    ),
+    (
+        "NANOBPMN_WORKER_CONCURRENCY",
+        "Admission & SLA",
+        "Worker concurrency governor",
+        "auto",
+        "Active dispatch width: how many subscribers the push dispatcher fans each job type out to per pass. Over-provisioning past the ~50-worker/node knee roughly halves throughput (activation is High-priority in the shared engine mailbox). Default `auto` runs a self-optimizing governor that converges the active width on the completion-throughput knee from measured latency; excess subscribers are parked (round-robin, never starved). Set an explicit fixed width, or 'off' for no cap. See ADR 0017.",
     ),
     (
         "NANOBPMN_BACKPRESSURE_MAX_INFLIGHT",

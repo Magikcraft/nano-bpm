@@ -68,23 +68,35 @@ pub enum SlaMode {
     /// instances keep completing fast. This is the "time-to-complete SLA": a
     /// client that outpaces the drain rate is told to back off rather than
     /// letting its already-running instances slow down. Enforced by the AIMD
-    /// concurrency limiter and the active-backlog admission gate.
+    /// concurrency limiter *and* the proactive active-backlog governor.
     Latency,
-    /// **Preserve admission** (accept latency). At the ceiling, keep admitting
-    /// new instances and let end-to-end latency grow instead of rejecting work.
-    /// This is the "start-every-process SLA": the latency-preservation gates (the
-    /// AIMD concurrency limiter and the active-backlog gate) are suppressed, so
-    /// creates are admitted until a genuine memory-safety rail bites. Terminal
-    /// state now frees on completion (ADR 0012) and live variables spill to disk,
-    /// so far more instances start before that hard rail is reached.
+    /// **Preserve admission** (accept latency). At the ceiling, drop the proactive
+    /// active-backlog governor and run the engine at its true drain ceiling
+    /// (measured ~+48% throughput vs `Latency`), letting end-to-end latency and the
+    /// backlog grow with demand. This is the "start-every-process SLA": only the
+    /// proactive **active-backlog governor** is suppressed. The **AIMD concurrency
+    /// limiter stays armed** (see [`Self::sheds_for_latency`]) as an engine-overload
+    /// guard — arming it measurably tightens the tail (~40% lower p90) at no
+    /// throughput cost — but note it does **not** bound the accumulated backlog: it
+    /// sheds on create-*processing* concurrency, which stays low even while the
+    /// completion side falls behind, so under sustained overload the backlog grows
+    /// until the **memory-safety rails** shed (they, not AIMD, are the backstop in
+    /// this mode). Only `Latency`'s backlog governor gives a tight, engine-enforced
+    /// bound. See ADR 0013 Addendum / `PERFORMANCE.md` 2026-07-10. Terminal state
+    /// frees on completion (ADR 0012) and live variables spill to disk, so the large
+    /// backlog is comparatively cheap to hold up to the rail.
     Admission,
 }
 
 impl SlaMode {
-    /// Whether latency-preservation gates (AIMD concurrency shed + active-backlog
-    /// shed) should reject admission. `true` in [`SlaMode::Latency`], `false` in
-    /// [`SlaMode::Admission`] (which prefers admitting and accepts the latency).
-    /// Memory-safety rails ignore this and always apply.
+    /// Whether the **proactive active-backlog governor** should reject admission
+    /// to hold a latency target. `true` in [`SlaMode::Latency`], `false` in
+    /// [`SlaMode::Admission`] (which drops the proactive governor to admit more).
+    /// Note this gates **only** the backlog governor: the AIMD concurrency limiter
+    /// (an engine-overload guard) and the memory-safety rails stay armed in both
+    /// modes. AIMD is not a backlog bound — under sustained overload only the
+    /// governor (i.e. `Latency` mode) keeps the backlog tightly bounded; in
+    /// `Admission` the backlog grows to the memory-safety rails.
     pub fn sheds_for_latency(&self) -> bool {
         matches!(self, SlaMode::Latency)
     }
@@ -327,56 +339,171 @@ impl AimdLimit {
     }
 }
 
-/// Engine-thread side of the adaptive limiter: accumulates per-command latency
-/// into windows, runs an [`AimdLimit`] step per window, and publishes the result
-/// to the shared `limit` atomic that request handlers read. Owned by the single
-/// engine thread, so its window state needs no synchronization.
-pub struct AdaptiveController {
+/// One AIMD limiter publishing to a shared atomic, stepped once per latency
+/// window by the [`AdaptiveController`]. `signal` is the live quantity whose
+/// pressure gates *growth* (the limit only grows while it is being approached, so
+/// an idle engine doesn't inflate the watermark); `shared` is where the resolved
+/// limit is published for the hot path to read.
+struct LatencyLimiter {
     aimd: AimdLimit,
     shared: Arc<AtomicUsize>,
-    inflight: Arc<AtomicUsize>,
+    signal: Arc<AtomicUsize>,
+    /// Stable tag for the verbose convergence log (`adaptive`, `backlog-governor`).
+    label: &'static str,
+}
+
+impl LatencyLimiter {
+    /// Fold one window average into the limit and publish it.
+    fn step(&mut self, avg_us: f64, verbose: bool) {
+        let signal = self.signal.load(Ordering::Relaxed);
+        let prev = self.aimd.limit();
+        let new_limit = self.aimd.on_window(avg_us, signal);
+        self.shared.store(new_limit, Ordering::Relaxed);
+        if verbose && new_limit != prev {
+            tracing::info!(
+                "backpressure({}): limit {prev} -> {new_limit} (avg {avg_us:.0}us, \
+                 baseline {:.0}us, signal {signal})",
+                self.label,
+                self.aimd.baseline_us(),
+            );
+        }
+    }
+}
+
+/// Engine-thread side of the adaptive limiters: accumulates per-command latency
+/// into windows and, once a window has enough samples and has run long enough,
+/// steps every installed [`LatencyLimiter`] from the *same* window average.
+/// Owned by the single (partition-0) engine thread, so its window state needs no
+/// synchronization. Two limiters can be installed, both driven off the one
+/// per-command latency signal:
+/// - the **create limiter** (present in adaptive backpressure mode) sizes the
+///   create-processing concurrency watermark, gated on the `processing` gauge;
+/// - the **backlog governor** (present in auto admission-backlog mode) sizes the
+///   active-backlog admission cap between a knee floor and a memory ceiling,
+///   gated on the runnable (task-job) backlog — self-optimizing the throughput
+///   knee without shedding parked instances (which create no jobs).
+pub struct AdaptiveController {
+    create: Option<LatencyLimiter>,
+    backlog: Option<LatencyLimiter>,
+    workers: Option<LatencyLimiter>,
     count: u64,
     sum_us: f64,
     window_start: Instant,
     /// Log every limit change at INFO (gated by `NANOBPM_ACTOR_PROFILE`) so the
-    /// limiter's convergence is observable during tuning.
+    /// limiters' convergence is observable during tuning.
     verbose: bool,
 }
 
+impl Default for AdaptiveController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdaptiveController {
-    /// Builds the controller and returns it alongside the shared limit handle to
-    /// install in [`Backpressure::Adaptive`].
-    pub fn new(inflight: Arc<AtomicUsize>) -> (Self, Arc<AtomicUsize>) {
-        let shared = Arc::new(AtomicUsize::new(INITIAL_LIMIT));
-        let controller = Self {
-            aimd: AimdLimit::new(INITIAL_LIMIT, MIN_LIMIT, MAX_LIMIT),
-            shared: shared.clone(),
-            inflight,
+    /// An empty controller with no limiters installed. Install limiters with
+    /// [`with_create_limiter`](Self::with_create_limiter) and/or
+    /// [`with_backlog_governor`](Self::with_backlog_governor); check
+    /// [`is_active`](Self::is_active) to decide whether it needs driving at all.
+    pub fn new() -> Self {
+        Self {
+            create: None,
+            backlog: None,
+            workers: None,
             count: 0,
             sum_us: 0.0,
             window_start: Instant::now(),
             verbose: std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some(),
-        };
-        (controller, shared)
+        }
+    }
+
+    /// Install the create-processing concurrency limiter (the historical adaptive
+    /// backpressure watermark). Growth is gated on the `inflight` processing
+    /// gauge. Returns the shared limit handle to install in
+    /// [`Backpressure::Adaptive`].
+    pub fn with_create_limiter(&mut self, inflight: Arc<AtomicUsize>) -> Arc<AtomicUsize> {
+        let shared = Arc::new(AtomicUsize::new(INITIAL_LIMIT));
+        self.create = Some(LatencyLimiter {
+            aimd: AimdLimit::new(INITIAL_LIMIT, MIN_LIMIT, MAX_LIMIT),
+            shared: shared.clone(),
+            signal: inflight,
+            label: "adaptive",
+        });
+        shared
+    }
+
+    /// Install the self-optimizing active-backlog governor: it tunes the
+    /// admission backlog cap between `floor` (≈ the measured throughput knee) and
+    /// `ceiling` (the memory-derived backstop) from the same per-command latency
+    /// signal, gated on the current `runnable` backlog. Starts at `floor` and
+    /// slow-starts upward while the backlog is loaded and latency is healthy,
+    /// backing off multiplicatively the moment per-command latency inflates past
+    /// its self-calibrated baseline — i.e. it holds the system just left of the
+    /// congestion-collapse knee. Returns the shared cap handle the admission gate
+    /// reads.
+    pub fn with_backlog_governor(
+        &mut self,
+        floor: usize,
+        ceiling: usize,
+        runnable: Arc<AtomicUsize>,
+    ) -> Arc<AtomicUsize> {
+        let shared = Arc::new(AtomicUsize::new(floor));
+        self.backlog = Some(LatencyLimiter {
+            aimd: AimdLimit::new(floor, floor, ceiling),
+            shared: shared.clone(),
+            signal: runnable,
+            label: "backlog-governor",
+        });
+        shared
+    }
+
+    /// Install the self-optimizing worker-concurrency governor: it tunes the
+    /// number of subscribers the push dispatcher fans a job type out to per pass
+    /// between `floor` and `ceiling`, from the same per-command latency signal,
+    /// gated on the current `backlog` (runnable task-jobs waiting to drain). The
+    /// push dispatcher is the throughput ceiling — activation is High-priority in
+    /// the engine mailbox, so fanning a fixed job supply across too many
+    /// subscribers swamps completions and inflates per-command latency. Starting
+    /// at `floor`, the governor slow-starts the active-subscriber width upward
+    /// while there is backlog to drain and latency is healthy, and backs off
+    /// multiplicatively the moment latency inflates past its self-calibrated
+    /// baseline — converging on the worker concurrency that maximizes completion
+    /// throughput. Excess subscribers are parked (rotated round-robin, never
+    /// starved). Returns the shared width handle the dispatcher reads.
+    pub fn with_worker_governor(
+        &mut self,
+        floor: usize,
+        ceiling: usize,
+        backlog: Arc<AtomicUsize>,
+    ) -> Arc<AtomicUsize> {
+        let shared = Arc::new(AtomicUsize::new(floor));
+        self.workers = Some(LatencyLimiter {
+            aimd: AimdLimit::new(floor, floor, ceiling),
+            shared: shared.clone(),
+            signal: backlog,
+            label: "worker-governor",
+        });
+        shared
+    }
+    pub fn is_active(&self) -> bool {
+        self.create.is_some() || self.backlog.is_some() || self.workers.is_some()
     }
 
     /// Record one command's processing latency. Evaluates the window (and updates
-    /// the published limit) once it has enough samples and has run long enough.
+    /// every installed limiter) once it has enough samples and has run long enough.
     pub fn record(&mut self, latency: Duration) {
         self.count += 1;
         self.sum_us += latency.as_micros() as f64;
         if self.count >= WINDOW_MIN_SAMPLES && self.window_start.elapsed() >= WINDOW_MIN_INTERVAL {
             let avg = self.sum_us / self.count as f64;
-            let inflight = self.inflight.load(Ordering::Relaxed);
-            let prev = self.aimd.limit();
-            let new_limit = self.aimd.on_window(avg, inflight);
-            self.shared.store(new_limit, Ordering::Relaxed);
-            if self.verbose && new_limit != prev {
-                tracing::info!(
-                    "backpressure(adaptive): limit {prev} -> {new_limit} (avg {avg:.0}us, \
-                     baseline {:.0}us, inflight {inflight})",
-                    self.aimd.baseline_us(),
-                );
+            if let Some(c) = self.create.as_mut() {
+                c.step(avg, self.verbose);
+            }
+            if let Some(b) = self.backlog.as_mut() {
+                b.step(avg, self.verbose);
+            }
+            if let Some(w) = self.workers.as_mut() {
+                w.step(avg, self.verbose);
             }
             self.count = 0;
             self.sum_us = 0.0;
@@ -594,6 +721,154 @@ mod tests {
             a.limit(),
             256,
             "must stay shedding at the floor under sustained congestion"
+        );
+    }
+
+    // --- self-optimizing backlog governor (AdaptiveController) ---------------
+
+    /// Feed `n` synthetic commands of `us` microseconds each; enough to satisfy
+    /// `WINDOW_MIN_SAMPLES`, with a sleep so `WINDOW_MIN_INTERVAL` also elapses.
+    fn drive_window(c: &mut AdaptiveController, us: u64, n: u64) {
+        std::thread::sleep(WINDOW_MIN_INTERVAL + Duration::from_millis(1));
+        for _ in 0..n.max(WINDOW_MIN_SAMPLES) {
+            c.record(Duration::from_micros(us));
+        }
+    }
+
+    #[test]
+    fn backlog_governor_grows_toward_ceiling_while_healthy_and_loaded() {
+        let runnable = Arc::new(AtomicUsize::new(100_000)); // backlog well above the cap
+        let mut c = AdaptiveController::new();
+        let cap = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        assert_eq!(cap.load(Ordering::Relaxed), 2_000, "starts at the floor");
+
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
+        let after_baseline = cap.load(Ordering::Relaxed);
+        drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy + loaded => slow-start grows
+        assert!(
+            cap.load(Ordering::Relaxed) > after_baseline,
+            "healthy loaded windows must grow the cap: {after_baseline} -> {}",
+            cap.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn backlog_governor_backs_off_to_floor_under_congestion() {
+        let runnable = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let cap = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
+        // Grow it up a bit first.
+        for _ in 0..5 {
+            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES);
+        }
+        assert!(cap.load(Ordering::Relaxed) > 2_000);
+        // Sustained congestion (latency >> baseline) must drive it back to the floor.
+        for _ in 0..200 {
+            drive_window(&mut c, 5_000, WINDOW_MIN_SAMPLES);
+        }
+        assert_eq!(
+            cap.load(Ordering::Relaxed),
+            2_000,
+            "congestion must hold the cap at the knee floor"
+        );
+    }
+
+    #[test]
+    fn backlog_governor_does_not_grow_on_pure_parked_load() {
+        // Runnable backlog stays ~0 (all instances parked on timers/messages: no
+        // jobs). The governor must not inflate the cap on latency alone — growth
+        // is gated on the runnable signal being loaded — so a parked population is
+        // never the reason the cap moves.
+        let runnable = Arc::new(AtomicUsize::new(0));
+        let mut c = AdaptiveController::new();
+        let cap = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
+        for _ in 0..20 {
+            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
+        }
+        assert_eq!(
+            cap.load(Ordering::Relaxed),
+            2_000,
+            "pure parked load (runnable=0) must never grow the cap"
+        );
+    }
+
+    #[test]
+    fn controller_is_active_only_with_a_limiter_installed() {
+        assert!(!AdaptiveController::new().is_active());
+        let mut c = AdaptiveController::new();
+        c.with_create_limiter(Arc::new(AtomicUsize::new(0)));
+        assert!(c.is_active());
+        let mut c = AdaptiveController::new();
+        c.with_backlog_governor(2_000, 200_000, Arc::new(AtomicUsize::new(0)));
+        assert!(c.is_active());
+        let mut c = AdaptiveController::new();
+        c.with_worker_governor(50, 4_096, Arc::new(AtomicUsize::new(0)));
+        assert!(c.is_active());
+    }
+
+    // --- self-optimizing worker-concurrency governor -------------------------
+
+    #[test]
+    fn worker_governor_grows_active_width_while_healthy_and_loaded() {
+        // Backlog well above the width => there is work to fan out across more
+        // subscribers, and latency stays healthy, so the governor slow-starts the
+        // active dispatch width upward from the floor.
+        let backlog = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let width = c.with_worker_governor(50, 4_096, backlog.clone());
+        assert_eq!(width.load(Ordering::Relaxed), 50, "starts at the floor");
+
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
+        let after_baseline = width.load(Ordering::Relaxed);
+        drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy + loaded => grow
+        assert!(
+            width.load(Ordering::Relaxed) > after_baseline,
+            "healthy loaded windows must widen the fan-out: {after_baseline} -> {}",
+            width.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn worker_governor_backs_off_to_floor_under_congestion() {
+        // Over-provisioning past the knee inflates per-command latency; the
+        // governor must narrow the active width back to the floor so excess
+        // subscribers stop swamping the push dispatcher.
+        let backlog = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let width = c.with_worker_governor(50, 4_096, backlog.clone());
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
+        for _ in 0..5 {
+            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // grow a bit first
+        }
+        assert!(width.load(Ordering::Relaxed) > 50);
+        for _ in 0..200 {
+            drive_window(&mut c, 5_000, WINDOW_MIN_SAMPLES); // sustained congestion
+        }
+        assert_eq!(
+            width.load(Ordering::Relaxed),
+            50,
+            "congestion must hold the active width at the knee floor"
+        );
+    }
+
+    #[test]
+    fn worker_governor_does_not_widen_without_backlog() {
+        // No runnable backlog (workers idle / nothing to drain): widening the
+        // fan-out would only add dispatcher overhead, so growth is gated on the
+        // backlog signal and the width must stay pinned at the floor.
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let mut c = AdaptiveController::new();
+        let width = c.with_worker_governor(50, 4_096, backlog.clone());
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
+        for _ in 0..20 {
+            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
+        }
+        assert_eq!(
+            width.load(Ordering::Relaxed),
+            50,
+            "no backlog to drain must never widen the active fan-out"
         );
     }
 }

@@ -268,6 +268,45 @@ latency gate are the second line that bounds memory when a misbehaving open-loop
 producer defeats backpressure. Neither is the binding constraint for well-behaved
 load, so throughput and latency are unaffected in the common case.
 
+### 2026-07-10 — `admission` keeps the AIMD guard armed (clean 3-way A/B)
+
+Console build `a42ced29`, RF=3 / 12-partition GCP cluster, **journal wiped fresh
+between every run**, three open-loop loadgens (`WORKERS=400`/node, `PROD_CONNS=256`,
+`RATE=30000`, `MAX_INFLIGHT=400000`). Three configs, same flood:
+
+| config | agg comp/s | p50 | p90 | p99 | max | agg backlog | actor_ms |
+|--------|-----------:|----:|----:|----:|----:|------------:|---------:|
+| `latency` (AIMD + backlog governor) | ~46,000 | 35 ms | 87 ms | 1.46 s | 2.66 s | 28k → **drains to ~0** | 2 ms |
+| `admission` + AIMD **(this build)** | **~68,000** | 52 ms | **14.3 s** | 31.9 s | 35.3 s | ~1.2M (loadgen-capped) | 82 ms |
+| `admission`, AIMD off (`BACKPRESSURE_MAX_INFLIGHT=off`) | ~64,000 | 49 ms | 23.0 s | 37.5 s | 38.2 s | ~1.2M (loadgen-capped) | 14 ms |
+
+**Finding 1 — the backlog governor, not AIMD, is what bounds the backlog.** Both
+`admission` variants pin at the **same ~1.2M** backlog (that is the loadgen's
+`MAX_INFLIGHT` ceiling, *not* an engine bound — the engine did not stop it climbing).
+Only `latency` mode's active-backlog governor holds the backlog tight (28k, drained to
+~0 by end). AIMD sheds on create-*processing* concurrency, which stays low because
+creates apply in ~9 µs even while the *completion* side falls behind — so it never
+sheds on this fast create→complete workload and cannot bound the accumulated backlog
+(consistent with the 2026-07-07 dead-gate analysis above). **The earlier claim that
+AIMD "paces intake to the drain rate / keeps the backlog bounded" in `admission` mode
+was wrong** and is corrected here and in ADR 0013.
+
+**Finding 2 — arming AIMD in `admission` is still a win.** Isolating it (row 2 vs row
+3, both fresh-journal, differing only in the AIMD gate): AIMD-on gives **~+6%
+throughput (68k vs 64k) and a ~40% tighter p90 tail (14.3 s vs 23.0 s)**, p99 31.9 s
+vs 37.5 s, at no cost. So keeping the AIMD engine-overload guard armed in both modes
+(this build's change) is beneficial — it just is not a backlog bound.
+
+**Finding 3 — the real mode tradeoff (now measured cleanly).** `admission` reaches the
+engine's **true drain ceiling** (~68k/s, ~+48% over `latency`'s 46k) with a good
+median (p50 52 ms) but a heavy tail (p99 32 s) and a backlog that climbs to the
+memory-safety rails. `latency` sacrifices ~32% throughput to hold a tight tail (p99
+1.46 s) and a tightly bounded backlog. (An earlier "`admission` p50 = 107 s" figure
+was an artifact of flipping SLA at runtime on an **un-wiped** journal with pre-existing
+backlog; with a fresh journal `admission`'s median is 52 ms.) **Secondary:** even at
+1.2M resident/node aggregate the bounded-spill fix held the writer to ≤82 ms holds (vs
+8.2 s pre-fix) — no congestion collapse.
+
 ### 2026-07-07 — Open-loop 24k reject soak: the backlog gate bounds **memory**, not **throughput**
 
 The closed-loop table above never builds a server backlog, so it never exercised
@@ -1208,3 +1247,350 @@ that is simply too tight for a 12-partition (4 leader + 8 follower replicas/node
 Raft fan-out at load. That is where the next debugging round should focus. The
 `7032663` observability is a keeper regardless: it converted a silent, ambiguous
 "actor stall" into a decisively falsified hypothesis.
+
+---
+
+## 2026-07-08 (cont.) — ROOT CAUSE FOUND: raft-coupled activation lease-leak
+
+The transport reframe above was half the story. The HOL fix `7d78b21` (spawn the
+inbound `ClientFrame::Raft` dispatch instead of awaiting it inline in `reader_loop`)
+was deployed and **did** unstick the raft lane — raft stream-frames went from ~21/s
+to ~1428/s — **but the completion-freeze reproduced identically anyway.** So the
+250 ms AppendEntries timeouts were a *symptom* of a downstream stall, not the cause.
+
+### The decisive A/B
+With the HOL fix in place, the *only* variable changed was activation coupling:
+
+| variable | `REPLICATE_ACTIVATION=1` (default) | `REPLICATE_ACTIVATION=0` (leader-local) |
+|---|---|---|
+| completions at ~9 min | **0/s (frozen)** | **14,410/s (holding)** |
+| active_backlog | pinned at 60,001, frozen | ~20k/node, flowing |
+| admission_shed | 0 | 0 |
+
+Same binary (`110381033f95864e`), same closed-loop loadgen (3× `MAX_INFLIGHT=20000`,
+200 workers, stream transport), same cluster. Flipping activation from a Raft
+proposal to a leader-local lock made the collapse **vanish** and throughput hold
+sustained past the ~4-min mark where it had frozen every prior run.
+
+### Mechanism (lease-leak)
+Under `replicate_activation=true`, **every** worker activation is a Raft
+`ActivateJobs` proposal (`try_activate` → `activate_on_raft`, main.rs:7706) that
+LOCKS the leased jobs. Those locks are ephemeral, leader-only, and never
+journaled/exported. During ramp, dispatch leases jobs via raft faster than workers
+receive+complete them; when a worker's outbound channel fills, `send_job` drops
+already-locked jobs → the lease leaks. Reclaim (`ExpireJobs`) is *also* a raft tick
+on the same commit lane and cannot keep pace. The activatable pool drains
+monotonically to 0 → permanent starvation. Meanwhile `activate_on_raft` **silently
+returns empty on any propose error** (main.rs:7731-7732), so the freeze is invisible
+in the read model (jobs show `state:"Created", worker:null` even while locked).
+Leader-local activation (`activate_on_local`, main.rs:7688) locks directly on the
+leader without a quorum round-trip and uses lenient follower completion, so
+activation is never gated on the partition's commit budget and cannot leak this way.
+
+### Fix direction
+Make `replicate_activation=0` the default under `leader-durable` replication (the
+completion path is already lenient there), OR bound leases to available outbound
+room so dispatch never leases a job it cannot deliver, OR make lease reclaim
+leader-local + fast. A locked/leaked-lease gauge would make this observable — none
+exists today, so the leak was inferred from the A/B, not directly measured.
+
+The keeper commits from this arc: `9744685` (actor liveness observability),
+`7d78b21` (raft inbound HOL fix — real transport win regardless), and this finding.
+
+## 2026-07-08 (cont. 2) — CONGESTION COLLAPSE is the real ceiling (1Hz DuckDB time-series)
+
+Built a 1Hz Prometheus scraper (`/tmp/prom-scrape.sh`, all 3 nodes → long-format
+`ts_ms,node,metric,labels,value` CSV) + a DuckDB analysis harness
+(`session-state/.../files/promts.py`: counter rates via LAG, gauge summaries,
+histogram avg-latency from Δsum/Δcount, knee detection). This replaced the broken
+in-soak sampler (`soakclh.log` was garbage — `s+: syntax error`, used a nonexistent
+create metric), which is why the ceiling had looked "flat" before.
+
+### Finding: the saturation ceiling is NOT flat — it is congestion collapse
+Time-series of two fresh 10-min instrumented soaks (mode-0 replicate_activation=0,
+mode-1 =1) plus a decisive `MAX_INFLIGHT` sweep overturned the "flat ceiling" framing.
+
+**Steady-state congestion curve (sec 60–170 avg, same binary `110381033f95864e`,
+same closed-loop loadgen, only MAX_INFLIGHT/node varied):**
+
+| MAX_INFLIGHT/node | completions/s | actorOps/s | active | µs per actor-op |
+|------------------:|--------------:|-----------:|-------:|----------------:|
+| 1,000  | 23,016 | 997,749 | 569    | 36  |
+| 4,000  | 23,380 | 976,505 | 602    | 37  |
+| 20,000 | 16,329 | 228,288 | 44,860 | 158 |
+
+Latency (loadgen p50/p90): MI=1000 → 23ms/—; MI=4000 → 25ms/—;
+MI=20000 → 247ms / 4,379ms (and sinks further to ~14k/s @ ~3.9s p50 over a full
+10-min run as `active` keeps climbing to the ~58k cap).
+
+**Mechanism — the engine actor's per-command cost is O(active).** As the active set
+grows 569 → 44,860 (79×), cost-per-actor-op grows 36µs → 158µs (4.4×), so actorOps/s
+collapses 998k → 228k (−77%) and completion throughput falls 23k → 16k (−29%). This is
+a runaway negative feedback loop: active↑ → per-op cost↑ → throughput↓ → active↑,
+which drives the system to the in-flight cap.
+
+**Ruled out** (all measured, not inferred):
+- Durability lane: `commit_wait` avg 85µs (clean) → 30µs (congested) — *faster* when
+  slower; the raft commit path is not the bottleneck.
+- Memory: 19–37GB of the 54GB watermark, climbs smoothly through the knee, zero
+  shedding events.
+- Raft transport: balanced log entries, `commit_inflight`≈0 in mode-0.
+
+**Prime code suspect for O(active):** `engine-core/src/engine/mod.rs` `Command::ActivateJobs`
+walk (~L811–854): designed O(max_jobs) but the `job_activatable` `.filter(...).take(max_jobs)`
+degrades to O(scan depth) when the activatable-index front fills with locked/expiring
+jobs — not yet proven with scan-depth instrumentation.
+
+### Two distinct phenomena, now cleanly separated
+1. **Congestion collapse (both modes)** — the real ceiling above. Fix = admission
+   control on the *active/in-flight* backlog (not just the create queue), holding the
+   cluster left of the knee (~few thousand active/node) to keep it at its ~23k/s peak;
+   secondary = fix the O(active) activatable scan if confirmed.
+2. **Raft-coupled activation lease-leak (mode-1 only)** — the hard freeze, fixed by
+   `replicate_activation=0` (prior section). Under mode-1, active climbs monotonically
+   from t=0 and hard-freezes at ~60k (comp=0, actor churns futile ~1,500 ops/s).
+   `replicate_activation=0` removes the FREEZE but not the congestion ceiling.
+
+### Actionable conclusion
+Bounding in-flight recovers **+41% throughput (16.3k → 23.4k/s) and ~170× lower p50
+latency (3.9s → 23ms)** vs the unbounded cap. The sweet spot is broad — anything
+keeping cluster active below ~12k holds ~23k/s. Add admission control on active
+in-flight backlog to pin the system at its peak.
+
+## 2026-07-08 (cont. 3) — FIXES SHIPPED for congestion collapse + lease-leak
+
+Three changes land the findings above (all in `server/src/main.rs`, `+` console/config):
+
+1. **Tick pre-check no longer O(active).** `tick_partition_via_raft`'s per-tick
+   `jobs_due` gate scanned `state.jobs.values()` (every job in the backlog) every
+   ~500ms on the single-writer engine actor per led partition — an O(active) walk
+   that starves activation/completion as the backlog grows. Replaced with an
+   O(activated) walk over the `activated_jobs` index (only `Activated` jobs hold a
+   lease deadline, and `ExpireJobs` already reclaims exactly that set), so the gate
+   is bounded by concurrently-leased jobs, not total backlog.
+
+2. **Active-backlog admission is on by default (adaptive backstop).**
+   `NANOBPMN_ADMISSION_MAX_BACKLOG` now auto-derives a generous per-node cap from
+   the detected memory limit (`active_backlog_cap_default_from_limit`, clamped
+   `[50k, 1M]`), latency-SLA-mode only, env-overridable (explicit number, or
+   `off`). This self-protects against an unbounded active runaway / OOM out of the
+   box. It is a *safety* backstop above typical parked populations — to pin the
+   ~23k/s throughput peak, set an explicit lower cap at the knee (a few
+   thousand/node), which the sweep showed recovers +41% throughput and ~170× lower
+   p50 latency.
+
+3. **`replicate_activation` defaults to leader-local under `leader-durable`.**
+   The raft-coupled activation lease-leak (phenomenon 2) only occurs when
+   activation is a per-job Raft proposal. Under `leader-durable` replication the
+   tier already acks leader-locally with lenient follower completion, so
+   replicating activation adds only a lease-leaking quorum proposal. The default is
+   now mode-dependent: leader-local (`false`) under `leader-durable`, fully
+   replicated (`true`) under `quorum` (unchanged, node-loss-durable). Force with
+   `NANOBPMN_REPLICATE_ACTIVATION=1` when failover must honor in-flight leases.
+
+Tests: `active_backlog_cap_default_scales_and_clamps` added; full server unit suite
+(183) + clippy `--all-targets` clean.
+
+## 2026-07-08 (cont. 4) — LIVE VERIFICATION on the RF=3 cluster (new binary 8a45d06a)
+
+Deployed the fixed binary to all 3 nodes under `leader-durable` with the NEW
+defaults (activation env UNSET -> leader-local; admission as noted) and re-ran the
+MI=20000 point with 1Hz capture.
+
+| run | build / mode | tput/s | p50 | p90 | mean | steady active | actorOps/s | µs/op |
+|-----|--------------|-------:|----:|----:|-----:|--------------:|-----------:|------:|
+| pre-fix   | old, MI=20000, no admission | 18,119 | 247ms | 4379ms | 1989ms | 34,231 | 424,685 | 85 |
+| **verifyA** | **new, MI=20000, admission off** | **19,425** | **41ms** | 4245ms | 1377ms | 12,985 | 796,788 | 45 |
+| **verifyB** | **new, MI=20000, admission cap=4000/node** | **23,597** | **27ms** | **52ms** | **48ms** | ~757 (peak node ~4.9k) | — | — |
+
+Reads:
+- **Tick pre-check fix (verifyA vs pre-fix, same offered load):** the engine actor
+  sustains ~1.9× the ops/s (797k vs 425k) at ~half the per-op cost (45 vs 85µs) and
+  holds <½ the active backlog (13k vs 34k) — p50 latency 247 -> 41ms. The O(active)
+  actor scan is gone.
+- **Admission cap (verifyB):** an explicit per-node cap of 4,000 holds the ~23.6k/s
+  peak at p50 27ms / **p90 52ms** even under a 20k-inflight flood (vs p90 4,245ms
+  uncapped — ~80× lower). Peak single-node active stayed ~4.9k (the gate bites),
+  avg cluster active ~757. This is the proven congestion-collapse remedy.
+- **Lease-leak default:** the cluster booted and ran healthy under `leader-durable`
+  with `NANOBPMN_REPLICATE_ACTIVATION` UNSET (new default = leader-local) — no
+  freeze across all runs.
+
+Deploy note: the GCP nodes are Linux x86_64; a macOS build is an Exec-format-error
+there. Built the release binary natively on the loadbox (16-core x86_64) after
+`rustup` + `build-essential`, then fanned `nano-gw-new` out to the nodes.
+
+## 2026-07-09 — SELF-OPTIMIZING admission-backlog governor (build 0146c188)
+
+Replaced the *static* per-node backlog cap with a self-tuning **backlog governor**:
+the proven latency-driven `AimdLimit` (self-calibrated baseline, already used for the
+create limiter) now also drives the admission-backlog cap between a floor
+(`MIN_BACKLOG_GOVERNOR_CAP=2000`) and a memory-derived ceiling, stepped off the same
+per-command engine-latency window. Enabled **by default** (`NANOBPMN_ADMISSION_MAX_BACKLOG`
+unset → `auto`; a number pins a static cap; `off` disables). So the previously-proven
+peak throughput is delivered out of the box, and the cap only grows while the engine is
+*healthy and loaded* — never by shedding legitimately-parked instances.
+
+**Parked-safety by construction:** the gate/governor signal is the **runnable task-job
+backlog** = total jobs the engine holds (`jobs.len()`, Created + Activated), summed across
+owned partitions. Only `ServiceTask` mints a job (`create_job_for`), so timer/message/
+signal/conditional parks never appear. This replaces the old `self.inflight` (which
+counted parked instances).
+
+**Signal fix (this build):** the first cut summed only `activatable_jobs` (Created/waiting)
+and read ~0 under worker starvation (jobs were *leased* into the activated set), so the
+governor flew blind and active ran to 190k. Switched the signal to total `jobs.len()`
+(`Partitions::job_backlog()`), which counts leased-but-uncompleted jobs — the real
+O(active) congestion driver.
+
+Verification (default/auto; two regimes):
+
+| run | offered | workers/node | tput/s | p50 | p99 | engine actor max ms | runnable (steady) | active peak | collapse? |
+|-----|---------|-------------:|-------:|----:|----:|--------------------:|------------------:|------------:|:---------:|
+| **govAuto** (healthy) | MI=20000, 200 w | ~24,000 | ~low | — | ~0 | ~0 | ~150 | **no** |
+| **starveAuto2** (flood) | RATE=20k×3, MI=400k | ~13.9k (worker-bound) | 43s | 50s | **428** | **~2000/node (floor)** | 669k (exporter lag) | **no** |
+
+Reads:
+- **Healthy (govAuto):** default/auto holds the **~24k/s peak** (matches the explicit
+  cap=4000 verifyB run, beats uncapped verifyA 19.4k/s) with the governor **dormant at
+  the floor** — runnable ~0, active ~150, zero spurious shedding. Peak by default.
+- **Flood (starveAuto2):** with only 15 workers/node the throughput is worker-bound
+  (~13.9k/s), but the **engine never collapses** — `actor_current_job_ms` maxed at
+  **428ms** (p50 ≈ 0) and completions held steady ~13–17k/s across the whole sustained
+  phase. The corrected signal held the **runnable backlog at the ~2000/node floor** by
+  shedding creates (752,900 `active_backlog` sheds cluster-wide). The 447k–669k
+  `active_backlog` is exporter-projected instance lag (admitted-but-not-yet-exported-
+  complete), *not* live engine congestion — the job map (the O(active) collapse driver)
+  is bounded.
+
+Net: the governor delivers the proven +21% peak by default, is parked-safe by
+construction, and bounds the engine's live backlog under a worst-case worker-starved
+flood without any static tuning. 187 bin tests (incl. 4 new governor tests) + clippy
+`--all-targets` clean.
+
+## 2026-07-09 (cont.) — WORKER-CONCURRENCY GOVERNOR (dispatcher right-sizing)
+
+The backlog governor tunes *how much work is admitted*. A well-provisioned high-worker
+soak showed the actual ceiling on this architecture is elsewhere: **worker
+over-provisioning of the single push dispatcher.** Dispatch is push-based (falcon.rs) —
+workers subscribe per job type and park; one server-wide dispatcher fans jobs out per
+connection, and each lease is a **High-priority** activation in the shared single-writer
+engine mailbox. Fan a fixed job supply across too many subscribers and activation swamps
+completions (engine threads measured ~16% busy at the knee — the dispatcher, not engine
+CPU, is the wall).
+
+### Sweep: over-provisioning roughly halves throughput (non-monotonic)
+Same binary, fixed `MAXPAR=50`/`RATE=30000` flood, only workers/node varied:
+
+| workers/node | cluster tput | max p99 |
+|-------------:|-------------:|--------:|
+| **50**       | **46,694/s** | 29.3 s  |
+| 100          | 12,083/s     | 85.9 s  |
+| 200          | 23,672/s     | 57.4 s  |
+| 400          | 17,946/s     | 60.7 s  |
+
+Knee ~50 workers/node; past it throughput ~halves and tail latency triples.
+
+### Fix: a third shared-signal AIMD limiter
+`AdaptiveController` now runs three limiters off the SAME partition-0 latency window:
+create limiter + backlog governor (ADR 0014) + **worker governor**. The worker governor
+(`with_worker_governor`, floor=16, ceiling=4096) tunes the **active dispatch width** —
+subscribers fanned out per job type per pass — gated on the runnable task-job backlog
+(grow only while there's work to drain, back off when latency inflates). Enforcement:
+`dispatch_plan(per_type_cap)` truncates each type's targets to the width, round-robin
+cursor rotating so excess subscribers are parked, never starved (`0` = no cap).
+Advisory: edge-triggered `ServerFrame::WorkerAdvice { recommended_concurrency }`
+broadcast on width change so cooperating SDKs can self-size. Gauge:
+`nanobpm_active_worker_target`. Env `NANOBPMN_WORKER_CONCURRENCY=auto|<n>|off`.
+
+3 new worker-governor unit tests (grow / back-off / gate-on-backlog) + clippy
+`--all-targets` clean; release build green. See ADR 0017.
+
+### Live validation: the width cap recovers the knee (floor recalibrated 16 -> 50)
+First live run exposed a calibration bug: floor=16 pinned the fan-out *below* the
+knee and made 400-worker/node WORSE than uncapped (~9k vs 18k) — under sustained
+overload latency is always inflated, so AIMD can't grow to the knee from below; the
+floor must BE the knee (as with the backlog governor). A fixed-width calibration at
+400 over-provisioned workers/node found a sharp optimum at width 50:
+
+| width cap | cluster tput | max p99 |
+|----------:|-------------:|--------:|
+| off       | 14,842/s     | 74.5 s  |
+| **50**    | **41,996/s** | **9.3 s**|
+| 100       | 13,828/s     | 71.2 s  |
+| 200       | 13,515/s     | 64.8 s  |
+| 800       | 17,058/s     | 74.9 s  |
+
+Capping an over-provisioned fleet to 50 active subscribers/type nearly triples
+throughput (14.8k->42k) and cuts p99 8x (74.5s->9.3s), matching the subscribed-worker
+knee (50 workers/node -> 46.7k). `MIN_WORKER_GOVERNOR_WIDTH` set to 50.
+
+## 2026-07-10 (cont.6) — RF>1 follower terminal-shell leak (idle heap never reclaims)
+
+The 30-min latency soak ended clean on throughput/latency but left **~13-15 GB
+resident/node at idle** for only ~723 live instances — heap that never reclaimed
+even after completions drained and the idle-purge tick ran hundreds of times.
+
+### Root cause: a replica has no exporter to evict its terminal shells
+On `ProcessInstanceCompleted`, `state::apply` (state.rs) drops the instance's
+variables/scope but keeps its **shell** in `state.instances` "until eviction so
+status queries resolve during the projection gap" (ADR-0012). Eviction — removal
+from `instances`, `jobs`, `jobs_by_instance` — is driven **only by the read-model
+exporter** (main.rs), which exists **only for statically-owned shards**.
+
+On RF=3 each node also **replicates ~8 partitions it does not own** (`raft_replicas`).
+Those replica engines apply create+complete through the Raft state machine but have
+**no exporter**, so their terminal shells + completed job records accumulate
+**without bound**. Millions of ~3.5 KB shells → the 13-15 GB idle heap. Idle-purge
+(`shrink`+`purge`) fires but cannot free entries that are still live in the maps.
+
+### Fix: leader-aware terminal eviction in the replica apply path
+`PartitionStateMachine::apply` now reclaims terminal instances itself when the
+member is an **evict-eligible follower** (a replicated, non-owned partition) **and
+is not currently the partition leader**:
+
+```
+evict_terminal = evict_eligible && leader.load() != node_id
+```
+
+- `evict_eligible` is set at bootstrap from `local_for_partition(p).is_none()` — true
+  exactly for replicated partitions the node does not own (owned partitions defer to
+  their exporter, unchanged).
+- The `leader` atomic is kept fresh by a per-member task watching `raft.metrics()`.
+  Leadership is **dynamic**: a follower can win an openraft election with none of our
+  code running, and once it leads it serves reads/status from this engine — so it
+  must **stop** evicting and keep shells resident (exactly the ADR-0012 reason an
+  owned leader defers to its exporter). The gate flips off the instant it wins.
+- Terminal instance keys are collected from applied events via a new
+  `Event::terminal_instance_key()` (Completed | Terminated) and evicted in one
+  fire-and-forget `spawn_job` batch after the apply loop.
+
+Net: steady-state followers reclaim terminal shells (leak fixed); a follower
+elected/promoted to leader retains shells while it serves (failover continuity
+preserved); owned leaders are unaffected.
+
+Tests: `raft::follower_replica_evicts_terminal_instances` (3-voter group: the two
+followers evict, the leader retains). The two convergence tests that previously
+asserted a follower *holds* a completed instance now assert lockstep another way —
+`a_rest_create_replicates_through_raft_and_awaits_completion` checks the follower's
+Raft **applied index** converges (residency is gone by design), and
+`a_raft_routed_complete_converges_the_follower_replica_actor` confirms the follower
+saw the instance parked, then completed-or-evicted (a diverged replica would stay
+parked and present forever — the only follower removal path is terminal eviction).
+
+### GCP RF=3 validation (build 352dfb4e, clean journal)
+A 5-min create+complete flood (~4.5M instances, 3 producers × 300 workers,
+latency default) then idle:
+
+| phase | resident/node |
+|-------|--------------:|
+| fresh baseline | 35 MB |
+| peak (flood) | ~1,000 MB |
+| **idle after drain (4+ min stable)** | **~765 MB** |
+
+The pre-fix 30-min soak left **13–15 GB/node** idle for the same ~700 residual
+wedged instances; post-fix idle is **~765 MB — a ~95% reduction**. Followers now
+reclaim terminal shells on apply, so they never accumulate. The ~675 residual
+active_backlog + ~765 MB is the separate, pre-existing owned-partition wedge
+(checkpoint 149 theme), unchanged by this fix. Congestion/latency unaffected
+(flood p99 ~63 ms). Cluster left on 352dfb4e in the production latency default.

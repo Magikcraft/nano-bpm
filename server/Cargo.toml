@@ -83,6 +83,11 @@ serde_json = "1"
 # does not require a built frontend under ../console/dist.
 [features]
 console = ["dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/process", "tokio/io-util"]
+# Diagnostic-only: builds jemalloc with heap profiling (--enable-prof) and turns
+# on sampled allocation-backtrace capture at startup. Adds per-allocation
+# sampling overhead, so it is NEVER enabled in a production build — it exists to
+# pin the structure behind a live-heap growth via `/debug/heap/prof` + jeprof.
+heapprof = ["tikv-jemallocator/profiling", "tikv-jemalloc-sys/profiling"]
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate

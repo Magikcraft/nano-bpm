@@ -359,6 +359,26 @@ pub struct PartitionStateMachine {
     /// Directory holding this partition's snapshot files (both the current cached
     /// snapshot and transient incoming ones). Created on construction.
     snapshot_dir: PathBuf,
+    /// This node's id, compared against [`leader`](Self::leader) so `apply` can
+    /// tell whether it is currently the leader of this partition.
+    node_id: NodeId,
+    /// Whether this member is *eligible* to evict terminal instances in `apply`:
+    /// `true` only for a partition this node REPLICATES but does not statically
+    /// own (a follower under RF>1), which has no read-model exporter to drive
+    /// eviction. Combined with the dynamic leadership check below.
+    evict_eligible: bool,
+    /// The partition's current Raft leader node id (`u64::MAX` = none), kept live
+    /// by a metrics watcher spawned in [`bootstrap_member`](RaftPartition::bootstrap_member).
+    ///
+    /// Eviction is gated on `evict_eligible && leader != node_id`: a follower
+    /// reclaims each instance's hot-state shell the moment it turns terminal
+    /// (it has no exporter, so otherwise terminal shells accumulate without
+    /// bound — the RF>1 leak). But the instant this member *becomes* the leader
+    /// (elected or promoted after a failover) it STOPS evicting, because it now
+    /// serves reads/status straight from its engine — exactly the ADR-0012
+    /// reason a statically-owned leader keeps the shell resident (its exporter
+    /// drives eviction there instead).
+    leader: Arc<AtomicU64>,
 }
 
 impl PartitionStateMachine {
@@ -366,6 +386,9 @@ impl PartitionStateMachine {
         engine: DeepthiHandle,
         partition_id: u64,
         snapshot_dir: PathBuf,
+        node_id: NodeId,
+        evict_eligible: bool,
+        leader: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&snapshot_dir)?;
         // Clear any stale snapshot files left by a previous process: on boot the
@@ -397,6 +420,9 @@ impl PartitionStateMachine {
             recv_idx: AtomicU64::new(0),
             current_snapshot: Mutex::new(None),
             snapshot_dir,
+            node_id,
+            evict_eligible,
+            leader,
         })
     }
 
@@ -415,9 +441,17 @@ impl PartitionStateMachine {
     }
 
     /// [`new`](Self::new) with a fresh temp snapshot directory. Used by the
-    /// in-memory (volatile-log) bootstraps and the unit tests.
+    /// in-memory (volatile-log) bootstraps and the unit tests. Never eligible to
+    /// evict (owned/serving semantics), so the leader flag is inert.
     fn new_temp(engine: DeepthiHandle, partition_id: u64) -> std::io::Result<Self> {
-        Self::new(engine, partition_id, Self::temp_snapshot_dir(partition_id))
+        Self::new(
+            engine,
+            partition_id,
+            Self::temp_snapshot_dir(partition_id),
+            0,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
+        )
     }
 }
 
@@ -543,7 +577,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 .items
                                 .into_iter()
                                 .map(|ReplicatedCommand { command, now }| {
-                                    journal.apply_command_at(command, now)
+                                    // Per-command actor profiling (off unless
+                                    // NANOBPM_CMD_PROFILE): time + allocated-byte
+                                    // delta by command kind, on the engine thread.
+                                    let timer = crate::cmd_profile::start();
+                                    let kind = command.kind();
+                                    let outcome = journal.apply_command_at(command, now);
+                                    crate::cmd_profile::finish(timer, kind);
+                                    outcome
                                 })
                                 .collect()
                         })
@@ -552,10 +593,26 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     // Phase 2: await the durable barriers (now coalesced by the
                     // group-commit writer) and build the per-command responses.
                     let mut items = Vec::with_capacity(outcomes.len());
+                    // A follower replica has no read-model exporter to drive
+                    // hot-state eviction, so reclaim each instance's shell (+ its
+                    // completed job records) the moment it reaches a terminal
+                    // state. But only while this member is NOT the partition
+                    // leader: the instant it wins leadership (elected or promoted
+                    // after a failover) it serves reads/status from this engine,
+                    // so it must keep terminal shells resident — exactly the
+                    // ADR-0012 reason an owned leader defers to its exporter.
+                    let evict_terminal =
+                        self.evict_eligible && self.leader.load(Ordering::Relaxed) != self.node_id;
+                    let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
                     for outcome in outcomes {
                         match outcome {
                             Ok((events, commit)) => {
                                 commit.wait().await;
+                                if evict_terminal {
+                                    terminal.extend(
+                                        events.iter().filter_map(|e| e.terminal_instance_key()),
+                                    );
+                                }
                                 items.push(ReplicatedItem {
                                     events: events.to_vec(),
                                     error: None,
@@ -571,6 +628,11 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 });
                             }
                         }
+                    }
+                    if !terminal.is_empty() {
+                        self.engine.spawn_job(move |journal| {
+                            journal.evict_instances(&terminal);
+                        });
                     }
                     self.inner.lock().unwrap().last_applied = Some(log_id);
                     responses.push(ReplicatedResponse { items });
@@ -1011,6 +1073,9 @@ impl RaftPartition {
             engine,
             partition_id,
             log_dir.join("snapshots"),
+            node_id,
+            false,
+            Arc::new(AtomicU64::new(u64::MAX)),
         )?);
         let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
@@ -1053,6 +1118,7 @@ impl RaftPartition {
         engine: DeepthiHandle,
         transport: Arc<dyn RaftTransport>,
         log_dir: Option<std::path::PathBuf>,
+        evict_eligible: bool,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(raft_config(partition_id).validate()?);
         // Anchor snapshots next to the durable log when there is one, else a temp
@@ -1061,10 +1127,17 @@ impl RaftPartition {
             Some(dir) => dir.join("snapshots"),
             None => PartitionStateMachine::temp_snapshot_dir(partition_id),
         };
+        // Live current-leader signal the state machine's terminal-eviction gate
+        // reads. Only meaningful for an evict-eligible follower; kept fresh by a
+        // metrics watcher spawned below once the Raft handle exists.
+        let leader = Arc::new(AtomicU64::new(u64::MAX));
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
             snapshot_dir,
+            node_id,
+            evict_eligible,
+            leader.clone(),
         )?);
         let network = PartitionNetwork::new(transport, partition_id);
         // One `Raft` handle, two possible log stores. The handle erases the log
@@ -1081,6 +1154,21 @@ impl RaftPartition {
             }
         };
         let batcher = Batcher::spawn(raft.clone());
+        // Keep the state machine's leader signal fresh so its terminal-eviction
+        // gate flips off the instant this member wins leadership. Only needed for
+        // an evict-eligible follower; an owned member never evicts in `apply`.
+        if evict_eligible {
+            let mut metrics = raft.metrics();
+            tokio::spawn(async move {
+                loop {
+                    let cur = metrics.borrow().current_leader.unwrap_or(u64::MAX);
+                    leader.store(cur, Ordering::Relaxed);
+                    if metrics.changed().await.is_err() {
+                        break; // Raft dropped: the watcher's job is done.
+                    }
+                }
+            });
+        }
         Ok(Self {
             raft,
             node_id,
@@ -1533,6 +1621,7 @@ mod tests {
                 DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
                 transport.clone(),
                 None,
+                false,
             )
             .await
             .expect("boot member");
@@ -1590,6 +1679,103 @@ mod tests {
             .await;
             assert!(applied, "node {id} did not apply up to index {target}");
         }
+
+        for p in parts {
+            p.raft.shutdown().await.expect("clean shutdown");
+        }
+    }
+
+    /// A **follower replica** (`evict_eligible = true`, not currently leader) has
+    /// no read-model exporter to reclaim terminal instances, so `apply` evicts
+    /// the shell the moment an instance turns terminal — otherwise completed
+    /// instances accumulate in a follower's hot state without bound (the RF>1
+    /// leak). The **leader** keeps the shell resident (it serves reads/status
+    /// from its engine, per ADR-0012).
+    #[tokio::test]
+    async fn follower_replica_evicts_terminal_instances() {
+        use crate::raft_net::LocalCluster;
+
+        let cluster = LocalCluster::default();
+        let transport: Arc<dyn RaftTransport> = Arc::new(cluster.clone());
+
+        // Three voters of partition 0. The leader (node 0) is not evict-eligible
+        // (an owned partition defers to its exporter); the two followers are.
+        let mut parts = Vec::new();
+        let mut engines = Vec::new();
+        for id in 0u64..3 {
+            let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            engines.push(engine.clone());
+            let evict_eligible = id != 0;
+            let p = RaftPartition::bootstrap_member(
+                id,
+                0,
+                engine,
+                transport.clone(),
+                None,
+                evict_eligible,
+            )
+            .await
+            .expect("boot member");
+            cluster.register(0, id, p.raft.clone());
+            parts.push(p);
+        }
+
+        let mut members = BTreeMap::new();
+        for id in 0u64..3 {
+            members.insert(id, BasicNode::new(format!("local-{id}")));
+        }
+        parts[0].initialize(members).await.expect("form group");
+        assert!(
+            wait_until(3_000, || parts[0].raft.metrics().borrow().current_leader
+                == Some(0))
+            .await,
+            "node 0 wins the initial election"
+        );
+
+        // Deploy, then create an instance of the `p` process (start -> end, no
+        // wait state) so it runs straight to a terminal ProcessInstanceCompleted
+        // in the same replicated command on every voter.
+        parts[0]
+            .propose(deploy_command(), 1_000)
+            .await
+            .expect("deploy");
+        parts[0]
+            .propose(
+                Command::CreateInstance {
+                    process_id: "p".into(),
+                    variables: Default::default(),
+                    tags: Vec::new(),
+                    business_id: None,
+                },
+                2_000,
+            )
+            .await
+            .expect("create");
+
+        // The leader retains the terminal shell; both followers evict it (their
+        // eviction is a fire-and-forget actor hop after apply, so poll to drain).
+        let resident = |engine: DeepthiHandle| async move {
+            engine.with(|j| j.engine().state().instances.len()).await
+        };
+        let mut followers_evicted = false;
+        for _ in 0..300 {
+            let f1 = resident(engines[1].clone()).await;
+            let f2 = resident(engines[2].clone()).await;
+            if f1 == 0 && f2 == 0 {
+                followers_evicted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            followers_evicted,
+            "both followers evict the terminal instance shell"
+        );
+        assert_eq!(
+            resident(engines[0].clone()).await,
+            1,
+            "the leader keeps the terminal shell resident for its serving path"
+        );
 
         for p in parts {
             p.raft.shutdown().await.expect("clean shutdown");

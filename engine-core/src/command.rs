@@ -234,6 +234,38 @@ impl UserTaskChangeset {
 }
 
 impl Command {
+    /// A stable, allocation-free `&'static str` discriminant for this command,
+    /// used as a metrics label so per-command actor cost (wall time and
+    /// allocated bytes) can be attributed by kind. Kept in lockstep with the
+    /// enum variants; a new variant must be added here.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::DeployProcess(_) => "deploy_process",
+            Command::DeployResources(_) => "deploy_resources",
+            Command::CreateInstance { .. } => "create_instance",
+            Command::CompleteJob { .. } => "complete_job",
+            Command::AssignUserTask { .. } => "assign_user_task",
+            Command::UnassignUserTask { .. } => "unassign_user_task",
+            Command::UpdateUserTask { .. } => "update_user_task",
+            Command::CompleteUserTask { .. } => "complete_user_task",
+            Command::ActivateJobs { .. } => "activate_jobs",
+            Command::ExpireJobs { .. } => "expire_jobs",
+            Command::TriggerTimers { .. } => "trigger_timers",
+            Command::FailJob { .. } => "fail_job",
+            Command::ThrowJobError { .. } => "throw_job_error",
+            Command::UpdateJobRetries { .. } => "update_job_retries",
+            Command::ResolveIncident { .. } => "resolve_incident",
+            Command::SetVariables { .. } => "set_variables",
+            Command::CorrelateMessage { .. } => "correlate_message",
+            Command::BroadcastSignal { .. } => "broadcast_signal",
+            Command::OpenMessageSubscription { .. } => "open_message_subscription",
+            Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
+            Command::CloseMessageSubscription { .. } => "close_message_subscription",
+            Command::CancelInstance { .. } => "cancel_instance",
+            Command::DispatchStartInstance { .. } => "dispatch_start_instance",
+        }
+    }
+
     /// Convenience constructor for a `CreateInstance` with no variables, tags, or
     /// business id.
     pub fn create_instance(process_id: impl Into<String>) -> Self {
@@ -438,5 +470,35 @@ impl Command {
     /// Convenience constructor for a `CancelInstance`.
     pub fn cancel_instance(instance_key: Key) -> Self {
         Command::CancelInstance { instance_key }
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn kind_labels_the_hot_commands() {
+        assert_eq!(Command::create_instance("p").kind(), "create_instance");
+        assert_eq!(
+            Command::CompleteJob {
+                job_key: 1,
+                variables: HashMap::new()
+            }
+            .kind(),
+            "complete_job"
+        );
+        assert_eq!(Command::ExpireJobs { now: 0 }.kind(), "expire_jobs");
+        assert_eq!(
+            Command::ActivateJobs {
+                job_type: "t".into(),
+                worker: "w".into(),
+                max_jobs: 1,
+                timeout: 0,
+                now: 0
+            }
+            .kind(),
+            "activate_jobs"
+        );
     }
 }

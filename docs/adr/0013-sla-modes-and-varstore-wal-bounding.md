@@ -60,6 +60,9 @@ Add `NANOBPMN_SLA_MODE`:
   shed admission (`503`) to keep accepted instances fast.
 - **`admission`**: suppress the latency-preservation gates so creates keep being
   admitted, accepting higher end-to-end latency.
+  *(Revised 2026-07-10 — see Addendum: `admission` now suppresses only the proactive
+  backlog governor and keeps the AIMD guard armed. Its backlog is bounded only by the
+  memory-safety rails, not by AIMD.)*
 
 Crucially, `SlaMode` governs **only** the latency gates. The **memory-safety
 rails** — create-queue depth (bounds the pre-apply mailbox of variable-carrying
@@ -242,3 +245,36 @@ modes cost nothing relative to each other.
   a blended envelope rather than one of the two canonical behaviours.
 - ~~Soak-validate admission mode on the cluster~~ (done — see Validation; modes
   converge under closed-loop clients, WAL stays bounded).
+
+## Addendum (2026-07-10) — `admission` keeps the AIMD guard armed (backlog bound revised)
+
+A clean 3-way A/B on GCP (RF=3, journal wiped fresh between runs; see `PERFORMANCE.md`
+"2026-07-10 — `admission` keeps the AIMD guard armed") revised the mechanism claimed
+in the original decision **and corrected an interim overclaim**.
+
+**Finding.** Suppressing the AIMD concurrency limiter in `admission` mode buys nothing
+useful, so `admission` now **keeps AIMD armed in both modes** (the AIMD gate in
+`create_process_instance_impl` is no longer conditioned on `sheds_for_latency()`; only
+the proactive active-backlog governor in `admission_shed` remains latency-gated).
+Isolating the AIMD gate (both fresh-journal, differing only in it): arming it gives
+**~+6% throughput and a ~40% tighter p90 tail (14.3 s vs 23.0 s)** at no cost. So the
+change is beneficial.
+
+**Correction to the compressor/limiter model.** An interim version of this addendum
+claimed AIMD is a "self-balancing valve that paces intake to the drain rate and keeps
+the backlog bounded." **That is wrong.** AIMD sheds on create-*processing* concurrency,
+which stays low (creates apply in ~9 µs) even while the completion side falls behind,
+so it does **not** bound the accumulated backlog: under sustained overload both
+`admission` variants grow the backlog to the same ceiling (in test, the loadgen's
+`MAX_INFLIGHT`; in production, the **memory-safety rails**). The **active-backlog
+governor** — active only in `latency` mode — is the sole tight, engine-enforced backlog
+bound (28k, drained to ~0, vs `admission`'s runaway climb).
+
+So the honest model is: `admission` is a compressor **whose only backstop is the
+memory-safety limiter** (not AIMD, not the governor) — it runs the engine at its true
+drain ceiling (~+48% throughput vs `latency`) and lets the backlog and latency grow with
+demand until a hard memory rail sheds. AIMD remains in circuit in both modes purely as
+an **engine-overload guard** (protecting the single-writer thread and tightening the
+tail), not as a backlog bound. `latency` = the brick-wall limiter (governor holds a tight
+tail + bounded backlog, at ~32% less throughput); `admission` = soft compression down to
+the memory rail. The `ratio`/soft-knee middle-SLA follow-up is unaffected.
