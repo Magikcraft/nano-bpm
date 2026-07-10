@@ -330,8 +330,9 @@ async function mountModeler(xml){
           <label class="rlbl">Renderer</label>
           <div class="seg" id="rendererSeg">
             <button type="button" data-r="default" class="active" title="Show the diagram as authored (existing BPMN DI)">As authored</button>
-            <button type="button" data-r="rowbias" title="Server-side Row-Bias solver: flows become horizontal centerlines by kind">Row-Bias</button>
-            <button type="button" data-r="field"   title="Server-side field/Fromme physics solver: annotations pull nodes into semantic zones">Field</button>
+            <button type="button" data-r="authored-colour" title="As-authored DI with light pastel fills showing flow membership">As authored (coloured)</button>
+            <button type="button" data-r="rowbias" title="Server-side Row-Bias solver: flows become horizontal centerlines by kind, coloured by flow membership">Row-Bias</button>
+            <button type="button" data-r="field"   title="Server-side field/Fromme physics solver: annotations pull nodes into semantic zones, coloured by flow membership">Field</button>
           </div>
           <span class="rhint muted" id="rendererHint">Renders as-authored — edit flows/clusters, then pick Row-Bias or Field to preview.</span>
           <span class="rspin" id="rendererSpin"></span>
@@ -376,8 +377,16 @@ async function renderCanvas(){
   S.previewInFlight = true;
   let readyXml = S.xml;
   try {
-    if(S.renderer !== 'default'){
-      const body = { xml: S.xml, solver: S.renderer, annotations: S.ann };
+    if(S.renderer === 'authored-colour'){
+      const body = { xml: S.xml, annotations: S.ann };
+      const j = await api('/api/colorize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      readyXml = j.bpmn_xml || S.xml;
+    } else if(S.renderer !== 'default'){
+      const body = { xml: S.xml, solver: S.renderer, annotations: S.ann, colorize: true };
       const j = await api('/api/layout', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -399,9 +408,10 @@ async function renderCanvas(){
       }
     });
     if(hint){
-      if(S.renderer === 'default') hint.textContent = 'Renders as-authored — edit flows/clusters, then pick Row-Bias or Field to preview.';
-      else if(S.renderer === 'rowbias') hint.textContent = 'Row-Bias: primary flow becomes the horizontal centerline; exception/escalation/compensation bands stack around it.';
-      else hint.textContent = 'Field: springs + physics pull annotated nodes into semantic zones. Auto-refreshes on annotation edits (500ms debounce).';
+      if(S.renderer === 'default') hint.textContent = 'Renders as-authored — edit flows/clusters, then pick a semantic renderer or "As authored (coloured)" to see flow colours.';
+      else if(S.renderer === 'authored-colour') hint.textContent = 'As-authored DI with light pastel fills: happy=blue, exception=red, escalation=amber, compensation=lavender.';
+      else if(S.renderer === 'rowbias') hint.textContent = 'Row-Bias: primary flow becomes the horizontal centerline; exception/escalation/compensation bands stack around it. Shapes coloured by flow.';
+      else hint.textContent = 'Field: springs + physics pull annotated nodes into semantic zones. Shapes coloured by flow. Auto-refreshes on annotation edits (500ms debounce).';
     }
   } catch(e){
     container.innerHTML = `<div class="err" style="padding:12px">${esc(S.renderer)} layout failed: ${esc((e&&e.message)||e)}</div>`;

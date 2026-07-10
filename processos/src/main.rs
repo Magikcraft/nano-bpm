@@ -18,6 +18,7 @@ mod camunda_import;
 mod chat;
 mod chat_prompts;
 mod cockpit;
+mod colorize;
 mod conformance;
 mod contracts;
 mod conversation;
@@ -496,6 +497,7 @@ async fn main() {
         .route("/api/pilot", get(pilot_get).put(pilot_put))
         .route("/api/pilot/reset", post(pilot_reset))
         .route("/api/layout", post(layout_relayout))
+        .route("/api/colorize", post(colorize_flows_handler))
         .route("/api/curator/propose", post(curator_propose))
         .route("/workspace", get(workspace_page))
         .route("/semantics", get(semantics_page))
@@ -951,6 +953,12 @@ struct LayoutRequest {
     solver: String,
     #[serde(default)]
     annotations: Option<layout::SemanticAnnotations>,
+    /// Slice 13: when true, run [`colorize::colorize_flows`] on the
+    /// returned bpmn_xml so flow-membership becomes visible as light
+    /// pastel fills on the shapes. Rendering-only — the stored model
+    /// on disk is never touched.
+    #[serde(default)]
+    colorize: bool,
 }
 
 async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
@@ -967,19 +975,76 @@ async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
     let structural = layout::annotate::infer_from_xml(&req.xml);
     let ann = layout::annotate::merge(req.annotations, structural);
     match layout::layout_with(&req.xml, &ann, solver) {
-        Ok(out) => Json(serde_json::json!({
-            "bpmn_xml": out.bpmn_xml,
-            "debug_svg": out.debug_svg,
-            "solver": req.solver,
-            "annotations_used": ann,
-        }))
-        .into_response(),
+        Ok(out) => {
+            let bpmn_xml = if req.colorize {
+                colorize::colorize_flows(&out.bpmn_xml, &ann)
+            } else {
+                out.bpmn_xml
+            };
+            Json(serde_json::json!({
+                "bpmn_xml": bpmn_xml,
+                "debug_svg": out.debug_svg,
+                "solver": req.solver,
+                "annotations_used": ann,
+                "colorized": req.colorize,
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e })),
         )
             .into_response(),
     }
+}
+
+/// `POST /api/colorize` — apply the flow colour pass to a BPMN XML
+/// document without changing its layout. Powers the "As authored
+/// (coloured)" renderer option in the Semantics Workbench: the model
+/// keeps its original DI (positions and edges as authored), and shapes
+/// get a light pastel fill based on flow membership.
+///
+/// Rendering-only — the stored `model.bpmn` on disk is never mutated
+/// (the workbench holds the input in memory and this endpoint returns a
+/// fresh string to hand to bpmn-js).
+///
+/// Request body:
+/// ```json
+/// { "xml": "<bpmn:definitions>…</bpmn:definitions>",
+///   "annotations": { "flows": [ … ] } }
+/// ```
+///
+/// Response body:
+/// ```json
+/// { "bpmn_xml": "<bpmn:definitions …>… with color:background-color …</bpmn:definitions>",
+///   "colorized": true }
+/// ```
+#[derive(Deserialize)]
+struct ColorizeRequest {
+    xml: String,
+    #[serde(default)]
+    annotations: Option<layout::SemanticAnnotations>,
+}
+
+async fn colorize_flows_handler(Json(req): Json<ColorizeRequest>) -> impl IntoResponse {
+    if req.xml.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "xml is required" })),
+        )
+            .into_response();
+    }
+    // Merge caller annotations with the structural inference so a
+    // caller who only passes flows still gets clusters/roles inferred
+    // (parity with /api/layout).
+    let structural = layout::annotate::infer_from_xml(&req.xml);
+    let ann = layout::annotate::merge(req.annotations, structural);
+    let bpmn_xml = colorize::colorize_flows(&req.xml, &ann);
+    Json(serde_json::json!({
+        "bpmn_xml": bpmn_xml,
+        "colorized": true,
+    }))
+    .into_response()
 }
 
 /// `POST /api/curator/propose` — the Semantics Workbench's LLM assistant for
