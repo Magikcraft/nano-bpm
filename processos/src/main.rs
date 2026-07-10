@@ -22,6 +22,7 @@ mod conformance;
 mod contracts;
 mod conversation;
 mod corpus;
+mod curator;
 mod dataset;
 mod deps;
 mod experiment;
@@ -495,6 +496,7 @@ async fn main() {
         .route("/api/pilot", get(pilot_get).put(pilot_put))
         .route("/api/pilot/reset", post(pilot_reset))
         .route("/api/layout", post(layout_relayout))
+        .route("/api/curator/propose", post(curator_propose))
         .route("/workspace", get(workspace_page))
         .route("/semantics", get(semantics_page))
         .route(
@@ -978,6 +980,163 @@ async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+/// `POST /api/curator/propose` — the Semantics Workbench's LLM assistant for
+/// STRUCTURAL semantic annotations (flows, clusters, roles).
+///
+/// The Curator is a one-shot LLM call — no tool loop, no dataset binding —
+/// that reads the BPMN XML and emits ONE JSON object for the requested axis.
+/// Cost and time proposals are out of scope by design (numbers need real
+/// telemetry, not LLM guesses); [`curator::parse_proposal`] strips them if
+/// the LLM leaks them.
+///
+/// Request body:
+/// ```json
+/// { "xml": "<bpmn:definitions>…</bpmn:definitions>",
+///   "axis": "flows" | "clusters" | "roles",
+///   "currentAnnotations": { … optional SemanticAnnotations … },
+///   "chatHistory": [{"role":"user"|"assistant","content":"…"}],
+///   "userMessage": "make the happy flow shorter",
+///   "llm": { … optional LlmOverride … } }
+/// ```
+///
+/// Response body:
+/// ```json
+/// { "proposal": { "flows": [ … ] },      // exactly the requested axis subset
+///   "assistantText": "{\"flows\": …}",   // raw LLM reply, for the chat log
+///   "chatHistory": [ … history with new user+assistant turns appended … ] }
+/// ```
+/// Errors return 400 with `{ "error": "…" }`.
+const CURATOR_PERSONA_ID: &str = "semantics-curator";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CuratorProposeRequest {
+    xml: String,
+    axis: String,
+    #[serde(default)]
+    current_annotations: Option<layout::SemanticAnnotations>,
+    #[serde(default)]
+    chat_history: Vec<curator::ChatTurn>,
+    #[serde(default)]
+    user_message: Option<String>,
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+}
+
+async fn curator_propose(
+    State(state): State<AppState>,
+    Json(req): Json<CuratorProposeRequest>,
+) -> impl IntoResponse {
+    let axis = match curator::Axis::parse(&req.axis) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    if req.xml.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "xml is required" })),
+        )
+            .into_response();
+    }
+
+    let cfg = resolve_llm(&state, req.llm.as_ref());
+    if !cfg.is_ready() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no LLM model configured (set PROCESSOS_LLM_MODEL, pick a profile, \
+                          or pass llm.model in the request body)"
+            })),
+        )
+            .into_response();
+    }
+
+    let persona = match state.personas.get(CURATOR_PERSONA_ID) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "curator persona {CURATOR_PERSONA_ID:?} missing from persona library"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let current = req.current_annotations.unwrap_or_default();
+    let user_prompt = curator::build_user_prompt(
+        axis,
+        &req.xml,
+        &current,
+        &req.chat_history,
+        req.user_message.as_deref(),
+    );
+
+    let raw = match llm_complete(&cfg, &persona.system, &user_prompt).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("LLM call failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let proposal = match curator::parse_proposal(axis, &raw) {
+        Ok(p) => p,
+        Err(e) => {
+            // Include the raw text so the operator can see what the model actually
+            // said — usually enough to diagnose ("it wrote prose again", "it emitted
+            // clusters instead of flows").
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": e,
+                    "assistantText": raw,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Append this turn to the returned history so the client can persist it
+    // for iterative refinement without having to reconstruct the assistant
+    // turn from the parsed proposal.
+    let mut history = req.chat_history;
+    if let Some(msg) = req
+        .user_message
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        history.push(curator::ChatTurn {
+            role: "user".into(),
+            content: msg.to_string(),
+        });
+    }
+    history.push(curator::ChatTurn {
+        role: "assistant".into(),
+        content: raw.clone(),
+    });
+
+    Json(serde_json::json!({
+        "proposal": proposal,
+        "assistantText": raw,
+        "chatHistory": history,
+    }))
+    .into_response()
 }
 
 /// The features page, leading with the two flagship capabilities. Served at
