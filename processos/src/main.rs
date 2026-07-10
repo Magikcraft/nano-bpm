@@ -66,7 +66,7 @@ use serde::Deserialize;
 use crate::contracts::NanoClient;
 use crate::harness::{
     apply_calibration, build_baseline, build_cluster_summary, build_evolve_prompt,
-    calibrate_from_measured, example_scenario, list_models, llm_complete,
+    calibrate_from_measured, example_scenario, list_models, llm_complete, llm_complete_streaming,
     parse_structural_candidates, rank_candidates_by_replay, replay_dataset, replay_instance,
     run_hypothesis, run_scenario, staff_for_summary, summarize_dataset, CandidateModel, LlmConfig,
     LlmOverride, MeasuredJobType, Prompt, PromptLibrary, RecordedInstance, Scenario,
@@ -499,6 +499,7 @@ async fn main() {
         .route("/api/layout", post(layout_relayout))
         .route("/api/colorize", post(colorize_flows_handler))
         .route("/api/curator/propose", post(curator_propose))
+        .route("/api/curator/propose/stream", post(curator_propose_stream))
         .route("/workspace", get(workspace_page))
         .route("/semantics", get(semantics_page))
         .route(
@@ -1202,6 +1203,211 @@ async fn curator_propose(
         "chatHistory": history,
     }))
     .into_response()
+}
+
+/// `POST /api/curator/propose/stream` — streaming variant of
+/// [`curator_propose`]. Same request body, but returns
+/// `text/event-stream` so the workbench can render the model's thinking
+/// live (mirroring the Cockpit's chat-stream feedback loop).
+///
+/// Event types (all payloads are JSON):
+/// * `{ "type": "llm", "provider": "openai" | "anthropic", "baseUrl": …, "model": …, "profileName": …, "sidecarReady": true|false }`
+///   — emitted once at the start so the UI can show which model is answering.
+/// * `{ "type": "reasoning", "text": "…" }` — a chunk of the model's
+///   chain-of-thought (only when the endpoint surfaces `reasoning_content`
+///   deltas; older servers just produce `answer` chunks).
+/// * `{ "type": "answer", "text": "…" }` — a chunk of the model's final
+///   JSON reply.
+/// * `{ "type": "proposal", "proposal": { … }, "chatHistory": [ … ] }` —
+///   the validated per-axis proposal, emitted once the stream closes.
+/// * `{ "type": "done" }` — terminal marker.
+/// * `{ "type": "error", "message": "…", "assistantText": "…" }` — the
+///   request failed (LLM error, unparseable proposal, misconfigured
+///   endpoint). The raw model reply is included when available so the
+///   operator can see what the model actually said.
+async fn curator_propose_stream(
+    State(state): State<AppState>,
+    Json(req): Json<CuratorProposeRequest>,
+) -> impl IntoResponse {
+    // Validate the axis + xml up front — an early 400 is nicer than a
+    // one-line SSE stream that just carries an error event.
+    let axis = match curator::Axis::parse(&req.axis) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+    if req.xml.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "xml is required" })),
+        )
+            .into_response();
+    }
+    let cfg = resolve_llm(&state, req.llm.as_ref());
+    if !cfg.is_ready() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "no LLM model configured (set PROCESSOS_LLM_MODEL, pick a profile, \
+                          or pass llm.model in the request body)"
+            })),
+        )
+            .into_response();
+    }
+    let persona = match state.personas.get(CURATOR_PERSONA_ID) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "curator persona {CURATOR_PERSONA_ID:?} missing from persona library"
+                    )
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Look up the active profile's *name* so the UI can show "gemma-4-local
+    // (llama.cpp @ …/v1)" instead of just the model file. Also check
+    // whether that profile's sidecar (if any) is ready to answer — the
+    // Curator was hanging silently for the operator whose sidecar had been
+    // started but hadn't yet finished loading.
+    let snap = state.settings.snapshot();
+    let active_profile = snap.active();
+    let profile_id = active_profile.map(|p| p.id.clone());
+    let profile_name = active_profile.map(|p| p.name.clone());
+    let profile_is_sidecar = active_profile.is_some_and(|p| p.sidecar);
+    let sidecar_ready = if profile_is_sidecar {
+        profile_id
+            .as_deref()
+            .map(|id| {
+                let s = state.llama.status_of(id);
+                s.running && s.port.is_some() && s.error.is_none()
+            })
+            .unwrap_or(false)
+    } else {
+        // Non-sidecar profile (external endpoint) — nothing to ready-check;
+        // report `true` so the UI doesn't display a spurious warning.
+        true
+    };
+
+    let live = LiveTurn::new(String::new());
+    let live_tx = live.clone();
+
+    // Emit the LLM info header event immediately so the pane can render
+    // "answering with …" before the first reasoning chunk arrives (some
+    // models take several seconds before their first token).
+    live_tx.emit(serde_json::json!({
+        "type": "llm",
+        "provider": cfg.provider.as_str(),
+        "baseUrl": cfg.base_url,
+        "model": cfg.model,
+        "profileId": profile_id,
+        "profileName": profile_name,
+        "sidecar": profile_is_sidecar,
+        "sidecarReady": sidecar_ready,
+    }));
+
+    let current = req.current_annotations.unwrap_or_default();
+    let user_prompt = curator::build_user_prompt(
+        axis,
+        &req.xml,
+        &current,
+        &req.chat_history,
+        req.user_message.as_deref(),
+    );
+    let system = persona.system.clone();
+    let history_in = req.chat_history;
+    let user_message = req.user_message;
+    let cfg_for_task = cfg.clone();
+
+    tokio::spawn(async move {
+        // Fall back to a single non-streaming call on Anthropic (which
+        // [`llm_complete_streaming`] rejects); the header event has already
+        // been sent, so the operator still sees which model was used.
+        let streamed = if cfg_for_task.provider == harness::Provider::Openai {
+            let tx_r = live_tx.clone();
+            let tx_a = live_tx.clone();
+            let on_r = move |chunk: &str| {
+                tx_r.emit(serde_json::json!({ "type": "reasoning", "text": chunk }));
+            };
+            let on_a = move |chunk: &str| {
+                tx_a.emit(serde_json::json!({ "type": "answer", "text": chunk }));
+            };
+            llm_complete_streaming(&cfg_for_task, &system, &user_prompt, on_r, on_a).await
+        } else {
+            match llm_complete(&cfg_for_task, &system, &user_prompt).await {
+                Ok(text) => {
+                    live_tx.emit(serde_json::json!({ "type": "answer", "text": text.clone() }));
+                    Ok(harness::StreamedCompletion {
+                        reasoning: String::new(),
+                        content: text,
+                    })
+                }
+                Err(e) => Err(e),
+            }
+        };
+
+        let raw = match streamed {
+            Ok(sc) => sc.into_folded(),
+            Err(e) => {
+                live_tx.emit(serde_json::json!({
+                    "type": "error",
+                    "message": format!("LLM call failed: {e}"),
+                }));
+                return;
+            }
+        };
+
+        // Parse the proposal on the same side as the one-shot endpoint.
+        // Include the raw text on parse failure so the operator can see
+        // what the model wrote and correct with a refinement (same
+        // contract as /api/curator/propose).
+        let proposal = match curator::parse_proposal(axis, &raw) {
+            Ok(p) => p,
+            Err(e) => {
+                live_tx.emit(serde_json::json!({
+                    "type": "error",
+                    "message": e,
+                    "assistantText": raw,
+                }));
+                return;
+            }
+        };
+
+        let mut history = history_in;
+        if let Some(msg) = user_message
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            history.push(curator::ChatTurn {
+                role: "user".into(),
+                content: msg.to_string(),
+            });
+        }
+        history.push(curator::ChatTurn {
+            role: "assistant".into(),
+            content: raw.clone(),
+        });
+
+        live_tx.emit(serde_json::json!({
+            "type": "proposal",
+            "proposal": proposal,
+            "assistantText": raw,
+            "chatHistory": history,
+        }));
+        live_tx.emit(serde_json::json!({ "type": "done" }));
+    });
+
+    sse_from_live(live).into_response()
 }
 
 /// The features page, leading with the two flagship capabilities. Served at

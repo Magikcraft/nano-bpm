@@ -146,6 +146,31 @@
   .cur-tag-noop   { background: var(--po-hover);     color: var(--po-text-faint); }
   .cur-foot { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
 
+  /* Slice 14: LLM info strip + live thinking transcript.
+     Mirrors the Cockpit chat's `.think-body` collapsible-reasoning pattern
+     so the operator gets the same "watch the model think" affordance in
+     the Semantics Workbench. */
+  .cur-llm { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center;
+             font-size: 11.5px; color: var(--po-text-muted);
+             padding: 4px 8px; background: var(--po-inset); border-radius: 6px;
+             border: 1px solid var(--po-edge); }
+  .cur-llm code { color: var(--po-text); }
+  .cur-llm .cur-warn { color: var(--po-danger-soft); }
+  .cur-live { border: 1px solid var(--po-edge); border-radius: 6px;
+              background: var(--po-inset); padding: 6px 8px; font-size: 12px; }
+  .cur-live > summary { cursor: pointer; color: var(--po-text-muted);
+                        font-size: 11.5px; user-select: none; }
+  .cur-live[open] > summary { margin-bottom: 6px; }
+  .cur-live .cur-think { font-family: ui-monospace, monospace; font-size: 11.5px;
+                         color: var(--po-text-muted);
+                         white-space: pre-wrap; max-height: 220px;
+                         overflow-y: auto; border-left: 2px solid var(--po-edge);
+                         padding-left: 8px; margin: 4px 0; }
+  .cur-live .cur-answer { font-family: ui-monospace, monospace; font-size: 11.5px;
+                          color: var(--po-text); white-space: pre-wrap;
+                          max-height: 220px; overflow-y: auto; margin-top: 4px; }
+  .cur-live .cur-axis-hint { color: var(--po-text-faint); font-size: 11px; }
+
 </style>
 </head>
 <body>
@@ -210,6 +235,18 @@ const S = {
     chatHistory: [],      // [{role, content}, …] — folded into the next request
     proposal: null,       // { axis, payload, selected: {index/id: bool}, receivedAt } | null
     lastError: null,      // last error message, shown inline in the pane
+    // Slice 14: live-stream feedback (SSE from /api/curator/propose/stream).
+    // llm — { provider, baseUrl, model, profileName, sidecar, sidecarReady }
+    // populated from the first "llm" event; nulled out between calls.
+    llm: null,
+    // Live thinking + answer transcript for the in-flight call. Cleared
+    // when a new propose starts; kept on-screen after done so the operator
+    // can review what the model thought.
+    liveThinking: '',
+    liveAnswer: '',
+    // Which axis is being proposed in the current call — shown as a subtle
+    // "thinking about flows…" hint while streaming.
+    liveAxis: null,
   },
 };
 function emptyAnn(){ return { flows: [], clusters: [], roles: {}, costs: {}, times: {} }; }
@@ -788,6 +825,42 @@ function mutate(fn){
 function toggleCurator(){
   S.curator.open = !S.curator.open;
   renderCuratorPane();
+  if(S.curator.open && !S.curator.llm){
+    // Best-effort background probe so the LLM strip fills in with the
+    // currently-active profile + sidecar readiness on pane open, before
+    // the operator hits "Propose". Any error is swallowed — the strip
+    // will fill on the first stream event anyway.
+    primeCuratorLlmInfo();
+  }
+}
+
+async function primeCuratorLlmInfo(){
+  try {
+    const [settings, llama] = await Promise.all([
+      fetch('/api/settings').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch('/api/llama/status').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    if(!settings) return;
+    const activeId = settings.activeProfile || null;
+    const profile = (settings.profiles || []).find(p => p.id === activeId);
+    if(!profile) return;
+    let sidecarReady = true;
+    if(profile.sidecar){
+      const sc = (llama && Array.isArray(llama.sidecars) ? llama.sidecars : [])
+        .find(s => s.profileId === activeId);
+      sidecarReady = !!(sc && sc.phase === 'ready');
+    }
+    S.curator.llm = {
+      provider: profile.provider || 'openai',
+      baseUrl: profile.baseUrl || '',
+      model: profile.model || '',
+      profileId: profile.id,
+      profileName: profile.name,
+      sidecar: !!profile.sidecar,
+      sidecarReady,
+    };
+    renderCuratorPane();
+  } catch(_){ /* keep the initial placeholder */ }
 }
 
 function renderCuratorPane(){
@@ -823,6 +896,7 @@ function renderCuratorPane(){
         <button class="cur-close" title="Close" onclick="toggleCurator()">✕</button>
       </div>
       <div class="cur-body">
+        ${renderCuratorLlmInfo()}
         <div class="cur-actions">
           <label class="rlbl">Propose for axis</label>
           <button data-axis="flows"    ${disabled}>Flows</button>
@@ -832,6 +906,7 @@ function renderCuratorPane(){
                  style="flex:1; min-width:180px" ${disabled}>
         </div>
         ${err}
+        ${renderCuratorLive()}
         <div class="cur-chat">${chatRows}</div>
         ${renderCuratorProposal()}
       </div>
@@ -852,6 +927,56 @@ function renderCuratorPane(){
     };
   }
   wireProposalOverlay(host);
+}
+
+// Slice 14: which LLM is answering this Curator? Populated from the first
+// "llm" SSE event. Before the first call we don't know — best-effort probe
+// /api/settings so the strip isn't empty on pane open. Sidecar readiness
+// (from /api/llama/status) surfaces the "you started a sidecar but it's
+// still loading" case which was silent before.
+function renderCuratorLlmInfo(){
+  const info = S.curator.llm;
+  if(!info){
+    return '<div class="cur-llm"><em class="muted">Loading model info…</em></div>';
+  }
+  const model = info.model || '(no model configured)';
+  const profile = info.profileName ? `<strong>${esc(info.profileName)}</strong>` : '<em class="muted">(no profile)</em>';
+  const provider = info.provider ? esc(info.provider) : '?';
+  const base = info.baseUrl ? esc(info.baseUrl) : '';
+  let readiness = '';
+  if(info.sidecar){
+    readiness = info.sidecarReady
+      ? '<span style="color:var(--po-ok-soft)">● sidecar ready</span>'
+      : '<span class="cur-warn">⚠ sidecar not ready — start or wait for it (Cockpit → LLMs)</span>';
+  }
+  return `<div class="cur-llm">
+    <span>Answering with</span>
+    ${profile}
+    <span>·</span>
+    <code>${esc(model)}</code>
+    <span class="muted">(${provider}${base ? ' @ '+base : ''})</span>
+    ${readiness}
+  </div>`;
+}
+
+// Live thinking + answer transcript for the current or last streamed call.
+// Uses <details> so the operator can collapse a long thinking trace but
+// still glance at the axis hint while it streams.
+function renderCuratorLive(){
+  const c = S.curator;
+  if(!c.liveThinking && !c.liveAnswer && !c.running) return '';
+  const hint = c.liveAxis ? `<span class="cur-axis-hint">— ${esc(c.liveAxis)}</span>` : '';
+  const label = c.running
+    ? `Thinking${c.liveThinking ? '…' : ' (waiting for first token)…'}`
+    : (c.liveThinking ? 'Thinking (previous run)' : 'Response (previous run)');
+  const think = c.liveThinking
+    ? `<div class="cur-think">${esc(c.liveThinking)}</div>` : '';
+  const answer = c.liveAnswer
+    ? `<div class="cur-answer">${esc(c.liveAnswer)}</div>` : '';
+  return `<details class="cur-live" ${c.running ? 'open' : ''}>
+    <summary>${esc(label)} ${hint}</summary>
+    ${think}${answer}
+  </details>`;
 }
 
 function renderCuratorProposal(){
@@ -978,51 +1103,148 @@ async function proposeCurator(axis, userMessage){
   }
   S.curator.running = true;
   S.curator.lastError = null;
+  S.curator.liveThinking = '';
+  S.curator.liveAnswer = '';
+  S.curator.liveAxis = axis;
   renderCuratorPane();
+  const body = {
+    xml: S.xml,
+    axis,
+    currentAnnotations: S.ann,
+    chatHistory: S.curator.chatHistory,
+    userMessage: userMessage || null,
+  };
   try {
-    const body = {
-      xml: S.xml,
-      axis,
-      currentAnnotations: S.ann,
-      chatHistory: S.curator.chatHistory,
-      userMessage: userMessage || null,
-    };
-    const res = await fetch('/api/curator/propose', {
+    const res = await fetch('/api/curator/propose/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const j = await res.json().catch(() => ({}));
-    if(!res.ok){
+    // A 4xx before the stream even opens is delivered as JSON, not SSE
+    // (the server short-circuits on invalid input / no model configured).
+    if(!res.ok && (res.headers.get('content-type') || '').indexOf('text/event-stream') < 0){
+      const j = await res.json().catch(() => ({}));
       S.curator.lastError = j.error || `${res.status} ${res.statusText}`;
-      // Even on parse errors the server returns assistantText — persist it so
-      // the operator can see what the model wrote and correct with a
-      // refinement.
-      if(j.assistantText){
-        if(userMessage) S.curator.chatHistory.push({ role: 'user', content: userMessage });
-        S.curator.chatHistory.push({ role: 'assistant', content: j.assistantText });
-      }
       return;
     }
-    const items = proposalItems(axis, j.proposal);
-    const selected = {};
-    items.forEach((_, i) => { selected[i] = true; });
-    S.curator.proposal = {
-      axis,
-      payload: j.proposal,
-      selected,
-      receivedAt: Date.now(),
-    };
-    if(Array.isArray(j.chatHistory)) S.curator.chatHistory = j.chatHistory;
+    if(!res.body){
+      S.curator.lastError = 'stream returned no body';
+      return;
+    }
+    await consumeCuratorStream(res.body, axis, userMessage);
   } catch(e){
     S.curator.lastError = e.message || String(e);
   } finally {
     S.curator.running = false;
+    S.curator.liveAxis = null;
     renderCuratorPane();
-    // Clear the input after send.
     const input = $('#curInput');
     if(input) input.value = '';
   }
+}
+
+// Read the SSE stream from /api/curator/propose/stream. Event types:
+//   llm       → header w/ profile/model/sidecar readiness (fills the LLM info strip)
+//   reasoning → chunk of the model's chain-of-thought (may be empty stream if the endpoint
+//               doesn't surface reasoning_content — the answer still streams via `answer`)
+//   answer    → chunk of the model's final JSON reply
+//   proposal  → validated per-axis payload + chatHistory (terminal state)
+//   error     → LLM/parse failure — assistantText carries the raw reply so the operator
+//               can see what the model actually said and correct with a refinement
+//   done      → normal terminator (after `proposal`)
+// If the server sends `<think>…</think>` in the `answer` channel instead of separate
+// `reasoning` deltas (llama.cpp older builds), splitThinking() strips them at the end.
+async function consumeCuratorStream(body, axis, userMessage){
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  let assistantText = null;
+  let done = false;
+  while(!done){
+    const { value, done: rDone } = await reader.read();
+    if(rDone) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while((idx = buf.indexOf('\n\n')) >= 0){
+      const frame = buf.slice(0, idx); buf = buf.slice(idx+2);
+      const dataLine = frame.split('\n').find(l => l.startsWith('data:'));
+      if(!dataLine) continue;
+      const payload = dataLine.slice(5).trim();
+      if(!payload) continue;
+      let ev;
+      try { ev = JSON.parse(payload); } catch(_){ continue; }
+      try {
+        if(ev.type === 'llm'){
+          S.curator.llm = {
+            provider: ev.provider,
+            baseUrl: ev.baseUrl,
+            model: ev.model,
+            profileId: ev.profileId,
+            profileName: ev.profileName,
+            sidecar: !!ev.sidecar,
+            sidecarReady: !!ev.sidecarReady,
+          };
+          renderCuratorPane();
+        } else if(ev.type === 'reasoning'){
+          S.curator.liveThinking += ev.text || '';
+          renderCuratorPane();
+        } else if(ev.type === 'answer'){
+          S.curator.liveAnswer += ev.text || '';
+          renderCuratorPane();
+        } else if(ev.type === 'proposal'){
+          assistantText = ev.assistantText || null;
+          const items = proposalItems(axis, ev.proposal);
+          const selected = {};
+          items.forEach((_, i) => { selected[i] = true; });
+          S.curator.proposal = {
+            axis,
+            payload: ev.proposal,
+            selected,
+            receivedAt: Date.now(),
+          };
+          if(Array.isArray(ev.chatHistory)) S.curator.chatHistory = ev.chatHistory;
+          // If the model streamed reasoning in-band as <think>…</think>
+          // in the answer channel, extract it now so the collapsed
+          // thinking pane retains the trace even after the stream ends.
+          if(!S.curator.liveThinking && S.curator.liveAnswer){
+            const sp = splitCuratorThinking(S.curator.liveAnswer);
+            if(sp.think){
+              S.curator.liveThinking = sp.think;
+              S.curator.liveAnswer = sp.answer;
+            }
+          }
+        } else if(ev.type === 'error'){
+          S.curator.lastError = ev.message || 'stream error';
+          if(ev.assistantText){
+            assistantText = ev.assistantText;
+            if(userMessage) S.curator.chatHistory.push({ role: 'user', content: userMessage });
+            S.curator.chatHistory.push({ role: 'assistant', content: ev.assistantText });
+          }
+          done = true;
+        } else if(ev.type === 'done'){
+          done = true;
+        }
+      } catch(err){
+        console.error('curator stream event handler failed', err, ev);
+      }
+    }
+  }
+  return assistantText;
+}
+
+// Pull <think>/<thinking> reasoning out of a text so it can be shown
+// collapsed. Ported from cockpit.html:splitThinking to keep both panes on
+// the same convention.
+function splitCuratorThinking(text){
+  let t = text || '';
+  let think = '';
+  t = t.replace(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi, (_, body) => {
+    think += (think ? '\n\n' : '') + body.trim();
+    return '';
+  });
+  const open = t.match(/<think(?:ing)?>([\s\S]*)$/i);
+  if(open){ think += (think ? '\n\n' : '') + open[1].trim(); t = t.slice(0, open.index); }
+  return { think: think.trim(), answer: t.trim() };
 }
 
 function applyCuratorProposal(){
