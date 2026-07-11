@@ -1743,3 +1743,47 @@ is the benign in-flight tail stranded when loadgen workers disconnect at end of 
 un-completed engine state (0.08% of throughput), **not** the idempotent-redelivery
 counter-drift (which shows backlog>0 while creates==completes). It is flat (no
 workers to complete it) and recycles on job-lease/liveness expiry.
+
+## 2026-07-11 — Quorum mode at 50KB: `replicate_activation=digest` is mandatory
+
+With the byte-bound AppendEntries fix in place (build `03803dd0`), we validated
+**quorum replication** (`NANOBPMN_REPLICATION=quorum`: all replicas voters, majority
+commit) at the same 50 KB / max-throughput profile as the leader-durable run above.
+The transport wedge does **not** return in either mode — the byte cap is what fixes
+that. But quorum has a second, independent cliff at 50 KB that leader-durable never
+hit: **the activation-replication policy.**
+
+**Leg A — quorum, default activation (`replicate_activation=true`).** Every job
+activation becomes a 50 KB majority Raft round-trip (≈3 quorum commits/job). Result:
+throughput **collapsed ~125×** — comp_rate fell 161→0/s, backlog exploded 42k→85k,
+aggregate **~19 completions/s** vs leader-durable's ~2,400/s. No transport timeouts
+(connections stable at 332), so this is a **commit-pipeline saturation**, not the
+wedge: `commit_inflight` crawled at ~44 while admission shed 69,795 on backlog.
+Leader-durable dodged this because the leader acks activations locally (quorum=1).
+
+**Leg B — quorum, `replicate_activation=digest`** (leader-local activation, leases
+kept off the Raft log). Full 30 min, RF=3, fresh journal, compaction governor ON,
+RATE=14000/prod.
+
+| metric | quorum + default act. | quorum + **digest** | leader-durable (ref) |
+| --- | --- | --- | --- |
+| throughput (agg) | **~19/s (125× collapse)** | **~2,398/s** (787+806+805) | ~2,400/s |
+| completed instances | — (backlog exploded) | **4,315,731** | ~4.3M |
+| latency (50 KB) | — | **p50 58 ms · p90 64 ms · p99 91 ms · max 104 ms** | p50 53 · p99 91 ms |
+| backlog (steady) | 42k→85k unbounded | **bounded ~250** | bounded |
+| stream_connections/node | 332 (no wedge) | **332 stable** | 332 |
+| commit_inflight | ~44 saturated | **124 flowing** | — |
+| raft_log_entries | — | **flat ~12k (node0) / ~37k agg** | ~12k/node |
+| raft_log_bytes/node | — | **13.05 GB** | 13.3 GB |
+| jemalloc-active/node | — | **19.3 GB** | 14.4 GB |
+
+**Verdict.** Quorum mode is fully viable at 50 KB **only** with
+`NANOBPMN_REPLICATE_ACTIVATION=digest`. With it, quorum reaches **throughput and
+latency parity** with leader-durable (2,398/s vs 2,400/s; p99 91 ms in both) while
+providing node-loss durability, at a memory cost of ~1.3× (19.3 vs 14.4 GB
+jemalloc/node — voters materialize full follower state where leader-durable's
+learners lag). The default `replicate_activation=true` is unusable at 50 KB (125×
+collapse) and should not be used for large-payload quorum deployments. raftlog stays
+bounded/flat under the compaction governor in both modes. The end-of-run backlog
+spike (to ~69k) is the same benign teardown tail — workers disconnect before
+producers stop, stranding in-flight creates that never get completed.
