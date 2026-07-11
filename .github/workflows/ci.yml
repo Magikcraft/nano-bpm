@@ -55,6 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-core
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
       - name: Clippy
         working-directory: engine-core
         run: cargo clippy --all-targets -- -D warnings
@@ -154,6 +156,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: processos
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
       - name: Clippy
         working-directory: processos
         run: cargo clippy --all-targets -- -D warnings
@@ -177,6 +181,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: server
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
       - uses: taiki-e/install-action@nextest
       - name: Generate REST layer + stub impls
         # The server depends on the path crate ../generated and on
