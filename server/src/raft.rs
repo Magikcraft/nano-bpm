@@ -56,7 +56,7 @@ use std::fmt::Debug;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -850,8 +850,36 @@ fn raft_config(partition_id: u64) -> Config {
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(snapshot_logs_for_partition(
             partition_id,
         )),
+        // Entries retained below the snapshot point for followers to catch up via
+        // log replication instead of a full snapshot install. openraft's default
+        // is 1000; under large variable payloads a single batched entry can be
+        // >1 MB, so 1000 retained entries pin >1 GB per partition *even right
+        // after a snapshot*. Env-tunable (`NANOBPMN_RAFT_KEEP_LOGS`) so a
+        // large-payload deployment can shrink this floor — a lagging follower then
+        // catches up from the (lean) snapshot, which for big payloads is cheaper
+        // than shipping the retained log tail.
+        max_in_snapshot_log_to_keep: raft_env_u64("NANOBPMN_RAFT_KEEP_LOGS", 1000),
         ..Default::default()
     }
+}
+
+/// Per-partition live-log byte ceiling that drives a byte-based snapshot: when a
+/// partition's non-purged log exceeds this, the compaction governor triggers a
+/// snapshot regardless of the (entry-count) `LogsSinceLast` policy. The
+/// entry-count cadence is blind to payload size — under 50 KB variables a batched
+/// entry is ~1 MB, so 5000 entries is ~5 GB of log before a snapshot would
+/// otherwise fire. Bounding by *bytes* keeps the committed log (and thus RSS)
+/// bounded under large payloads. `0` disables the byte trigger.
+/// (`NANOBPMN_RAFT_SNAPSHOT_BYTES`, default 128 MiB.)
+fn snapshot_bytes_threshold() -> i64 {
+    raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_BYTES", 128 * 1024 * 1024) as i64
+}
+
+/// How often the compaction governor evaluates each partition for a byte-based or
+/// quiescence-triggered snapshot. (`NANOBPMN_RAFT_COMPACT_TICK_MS`, default 5 s;
+/// `0` disables the governor entirely.)
+fn compaction_tick_ms() -> u64 {
+    raft_env_u64("NANOBPMN_RAFT_COMPACT_TICK_MS", 5000)
 }
 
 /// Upper bound on commands coalesced into a single Raft log entry. Caps per-entry
@@ -1016,6 +1044,11 @@ pub struct RaftPartition {
     pub node_id: NodeId,
     pub partition_id: u64,
     batcher: Batcher,
+    /// Live (non-purged) log byte footprint, published by the durable log store.
+    /// `0` for the volatile `MemLogStore` (in-memory/test deployments), which the
+    /// compaction governor simply never byte-triggers. Read by the governor to
+    /// decide byte-based snapshots — see [`snapshot_bytes_threshold`].
+    log_bytes: Arc<AtomicI64>,
 }
 
 impl RaftPartition {
@@ -1049,6 +1082,7 @@ impl RaftPartition {
             node_id,
             partition_id,
             batcher,
+            log_bytes: Arc::new(AtomicI64::new(0)),
         })
     }
 
@@ -1069,6 +1103,7 @@ impl RaftPartition {
 
         let log_dir = log_dir.as_ref().to_path_buf();
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
+        let log_bytes = log_store.bytes_handle();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -1094,6 +1129,7 @@ impl RaftPartition {
             node_id,
             partition_id,
             batcher,
+            log_bytes,
         })
     }
 
@@ -1142,15 +1178,22 @@ impl RaftPartition {
         let network = PartitionNetwork::new(transport, partition_id);
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
-        // `Raft` inside each arm avoids needing a common concrete store type.
-        let raft = match log_dir {
+        // `Raft` inside each arm avoids needing a common concrete store type. The
+        // durable arm also captures the store's live-byte handle for the governor;
+        // the volatile arm has none (never byte-triggered).
+        let (raft, log_bytes) = match log_dir {
             Some(dir) => {
                 let log_store = crate::raft_logstore::RaftLogStore::open(dir)?;
-                openraft::Raft::new(node_id, config, network, log_store, state_machine).await?
+                let log_bytes = log_store.bytes_handle();
+                let raft =
+                    openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
+                (raft, log_bytes)
             }
             None => {
                 let log_store = MemLogStore::default();
-                openraft::Raft::new(node_id, config, network, log_store, state_machine).await?
+                let raft =
+                    openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
+                (raft, Arc::new(AtomicI64::new(0)))
             }
         };
         let batcher = Batcher::spawn(raft.clone());
@@ -1174,6 +1217,7 @@ impl RaftPartition {
             node_id,
             partition_id,
             batcher,
+            log_bytes,
         })
     }
 
@@ -1232,6 +1276,23 @@ impl RaftPartition {
     pub fn is_shutdown(&self) -> bool {
         self.raft.metrics().borrow().state == openraft::ServerState::Shutdown
     }
+
+    /// This partition's live (non-purged) Raft log byte footprint. `0` for a
+    /// volatile (in-memory-log) partition. Read by the compaction governor.
+    pub fn log_bytes(&self) -> i64 {
+        self.log_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Applied-log index and the index the last local snapshot covers, for the
+    /// compaction governor. `unsnapshotted = last_applied − snapshot` is the log
+    /// tail a snapshot would compact away.
+    fn compaction_indices(&self) -> (u64, u64) {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        let last_applied = m.last_applied.map(|l| l.index).unwrap_or(0);
+        let snapshot = m.snapshot.map(|l| l.index).unwrap_or(0);
+        (last_applied, snapshot)
+    }
 }
 
 /// The set of Raft groups this node hosts, keyed by partition id. A node hosts a
@@ -1278,6 +1339,84 @@ impl RaftRegistry {
     }
 }
 
+/// Spawns the per-node **compaction governor**: a periodic task that compacts each
+/// hosted partition's Raft log beyond what the entry-count `LogsSinceLast` policy
+/// achieves, so committed memory stays bounded under large payloads *and* is
+/// reclaimed at idle.
+///
+/// The entry-count snapshot cadence is blind to payload size and only fires while
+/// entries are being applied. Under large variable payloads (~1 MB batched
+/// entries) that leaves two gaps this governor closes:
+///
+/// - **Byte cadence:** when a partition's live log exceeds
+///   [`snapshot_bytes_threshold`], trigger a snapshot now rather than waiting for
+///   `LogsSinceLast` entries — bounding the committed log (hence RSS) by *bytes*.
+/// - **Quiescence compaction:** when a partition stops applying (its
+///   `last_applied` is unchanged across a tick) but still has an un-snapshotted
+///   log tail, trigger a snapshot so an idle node truncates its payload-bearing
+///   log instead of pinning it until the next write.
+///
+/// Triggering is idempotent (openraft coalesces a redundant request) and runs on
+/// every member — leader *and* follower — because each compacts its own local log.
+/// After the snapshot, openraft purges below `max_in_snapshot_log_to_keep`. A `0`
+/// tick interval (`NANOBPMN_RAFT_COMPACT_TICK_MS=0`) disables the governor.
+/// Pure decision for the compaction governor: given a partition's applied/snapshot
+/// indices, its live log bytes, the byte threshold, and the `last_applied` observed
+/// on the previous tick, decide whether to trigger a snapshot now.
+///
+/// Triggers when there is an un-snapshotted log tail AND either the log has grown
+/// past `byte_threshold` (byte cadence) or the partition applied nothing since the
+/// previous tick (quiescence). Returns `false` when the log is already fully
+/// snapshotted, so an idle-and-already-compacted partition is never re-triggered.
+fn should_compact(
+    last_applied: u64,
+    snapshot: u64,
+    log_bytes: i64,
+    byte_threshold: i64,
+    prev_applied: Option<u64>,
+) -> bool {
+    if last_applied.saturating_sub(snapshot) == 0 {
+        return false;
+    }
+    let over_bytes = byte_threshold > 0 && log_bytes >= byte_threshold;
+    let quiescent = prev_applied == Some(last_applied);
+    over_bytes || quiescent
+}
+
+pub fn spawn_compaction_governor(registry: Arc<RaftRegistry>) {
+    let tick_ms = compaction_tick_ms();
+    if tick_ms == 0 {
+        return;
+    }
+    let byte_threshold = snapshot_bytes_threshold();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Per-partition `last_applied` observed on the previous tick, to detect
+        // quiescence (a partition that applied nothing since last tick).
+        let mut prev_applied: HashMap<u64, u64> = HashMap::new();
+        loop {
+            interval.tick().await;
+            for part in registry.all() {
+                let pid = part.partition_id;
+                let (last_applied, snapshot) = part.compaction_indices();
+                let was = prev_applied.insert(pid, last_applied);
+                if should_compact(
+                    last_applied,
+                    snapshot,
+                    part.log_bytes(),
+                    byte_threshold,
+                    was,
+                ) {
+                    // Best-effort: a redundant or in-flight trigger is a no-op, and
+                    // a transient error (e.g. mid-election) is retried next tick.
+                    let _ = part.raft.trigger().snapshot().await;
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use nanobpmn_engine_core::ProcessBuilder;
@@ -1292,6 +1431,24 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    #[test]
+    fn should_compact_only_with_unsnapshotted_tail() {
+        let thresh = 128 * 1024 * 1024;
+        // Fully snapshotted -> never compact, even if quiescent or over bytes.
+        assert!(!should_compact(100, 100, thresh + 1, thresh, Some(100)));
+        // Un-snapshotted tail + over byte threshold -> compact (byte cadence).
+        assert!(should_compact(200, 100, thresh, thresh, None));
+        // Under byte threshold but not quiescent (applied advanced) -> hold.
+        assert!(!should_compact(200, 100, thresh - 1, thresh, Some(150)));
+        // Quiescent (applied unchanged since last tick) with a tail -> compact.
+        assert!(should_compact(200, 100, 0, thresh, Some(200)));
+        // First observation (no prior) under threshold, not quiescent -> hold.
+        assert!(!should_compact(200, 100, 0, thresh, None));
+        // Byte threshold disabled (0): only quiescence triggers.
+        assert!(!should_compact(200, 100, i64::MAX, 0, Some(150)));
+        assert!(should_compact(200, 100, i64::MAX, 0, Some(200)));
     }
 
     #[test]

@@ -34,6 +34,51 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## 2026-07-11 — Raft-log compaction governor (50KB-payload memory + throughput)
+
+**Problem (from the 50KB soak, see below):** under 50KB variable payloads the
+committed memory ran to **~40GB/node and did not reclaim at idle**, while
+throughput crawled to ~375/s agg. Root-caused to the **payload-bearing Raft log**,
+not instance state: `jemalloc allocated` 37–49GB was genuinely *live* (only ~5GB
+purge-reclaimable), `resident_var_bytes=0`, and only ~1,975 tiny instance shells
+were resident. The log wouldn't reclaim because:
+
+1. `snapshot_policy: LogsSinceLast(5000)` triggers on **applied entry count** — blind
+   to payload size (a batched entry is ~1MB at 50KB × up-to-1024 commands) and only
+   fires while entries are being applied. Load stops → no applies → no snapshot → the
+   payload log is pinned indefinitely.
+2. `max_in_snapshot_log_to_keep` fell through to openraft's default **1000**, pinning
+   ~1.36GB/partition even immediately after a snapshot at 50KB payloads.
+
+**Fix — a per-node compaction governor** (`server/src/raft.rs`
+`spawn_compaction_governor`, spawned once after the node registers its Raft
+members). Every `NANOBPMN_RAFT_COMPACT_TICK_MS` (default 5000, `0`=off) it walks
+every hosted partition — **leader and follower**, since each compacts its own local
+log — and triggers a snapshot when there is an un-snapshotted log tail AND either:
+
+- **byte cadence:** live log bytes ≥ `NANOBPMN_RAFT_SNAPSHOT_BYTES` (default 128MiB),
+  bounding committed memory by *bytes* rather than entry count; or
+- **quiescence:** the partition's `last_applied` is unchanged since the previous tick
+  (idle) — so an idle node compacts its payload log instead of pinning it until the
+  next write.
+
+Triggering is idempotent (openraft coalesces redundant/in-flight requests); after a
+snapshot openraft purges below the (now env-tunable) keep-floor
+`NANOBPMN_RAFT_KEEP_LOGS` (default 1000). Live log bytes are tracked with an
+`AtomicI64` fed from `RaftLogStore` (`bytes_handle()`), updated on
+append/truncate/purge.
+
+**Throughput link:** bounding the log bounds RSS → less memory pressure → the
+variable-spill machinery fires less → the single-writer engine actor stalls less →
+higher sustained 50KB throughput. Purely-additive to the entry-count policy
+(whichever fires first wins).
+
+Decision logic is unit-tested (`should_compact`); release build + `clippy
+--all-targets` clean; 265 bin tests pass. GCP 50KB before/after numbers pending
+re-measurement on the cluster.
+
+---
+
 ## 2026-07-07 — Durability A/B ceiling: the "journal-writer wall" is a **misdiagnosis**
 
 **Question:** how much of the RF=3 ceiling is the journal-writer fsync barrier?
