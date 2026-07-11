@@ -59,11 +59,38 @@ use super::schema::{FlowKind, SemanticAnnotations};
 const K_ATTRACT: f64 = 20.0;
 const K_REPEL: f64 = 3000.0;
 const K_CLUSTER: f64 = 40.0;
-const K_HARD_OVERLAP: f64 = 6000.0;
+/// Slice 16: linear-kernel node repel is the successor to the earlier
+/// `1/r^3`-decay push. Force = `K_HARD_OVERLAP × max(0, contact − r)`
+/// where `contact` is half the sum of node dims plus [`PERSONAL_SPACE`].
+/// Linear grows *harder* the more the boxes intrude, without ever
+/// vanishing at the touching boundary the way the inverse-cube kernel did
+/// (see the field.rs module comment for the physics rationale).
+const K_HARD_OVERLAP: f64 = 60.0;
+/// Extra breathing room (px) beyond the node's own bounding rect that the
+/// overlap kernel treats as forbidden. 12px matches the row-bias solver's
+/// visual gap so the two solvers settle at comparable spacings.
+const PERSONAL_SPACE: f64 = 12.0;
 /// Spring toward each node's target x (derived from longest-path graph
 /// distance). A restoring force, so the system can converge — the earlier
 /// constant LTR drift never let terminal velocity reach zero.
-const K_LTR_SPRING: f64 = 8.0;
+///
+/// Slice 16: raised from 8.0 to 20.0 so the x-anchor actually wins against
+/// cluster attraction and the new directional edge-order penalty doesn't
+/// have to be huge to keep successors right of their predecessors.
+const K_LTR_SPRING: f64 = 20.0;
+/// Slice 16: directional edge-order penalty. Applied per sequence-flow
+/// edge — free when `target.x >= source.x + MIN_LTR_GAP`, quadratic push
+/// (source left, target right) otherwise. This is what makes sequence
+/// order a *hard* constraint of the physics: a successor can be directly
+/// above or below its predecessor, but never to the left. Analogous to
+/// d3-force's `forceLink().strength()` interacting with `forceX()`, but
+/// asymmetric so equal-column siblings aren't penalised.
+const K_LTR_ORDER: f64 = 0.6;
+/// Minimum horizontal gap between the centres of a sequence-flow edge's
+/// source and target nodes (px). Below this the order-penalty kicks in.
+/// Sized to leave visible room between two default-size tasks (`110px`
+/// wide with a small margin) — anything tighter reads as overlap.
+const MIN_LTR_GAP: f64 = 120.0;
 /// Spring toward each node's flow-kind band y. Weaker than the LTR spring
 /// (nodes are freer along y to accommodate cluster/repel pushes) but strong
 /// enough to keep exception nodes below and escalation nodes above.
@@ -72,6 +99,10 @@ const K_BAND_SPRING: f64 = 4.0;
 const COL_SPACING: f64 = 160.0;
 /// First-column x, so target_x = FIRST_COL_X + graph_dist * COL_SPACING.
 const FIRST_COL_X: f64 = 120.0;
+/// Slice 16: within a shared (rank, band), stripe nodes vertically by this
+/// many pixels so they never start on top of each other. Sized to be at
+/// least one default node height plus [`PERSONAL_SPACE`].
+const LANE_ROW_PX: f64 = 100.0;
 /// Soft-core repulsion between edge segments — prevents unrelated edges from
 /// occupying the same coordinates while still letting same-kind ones bundle.
 const K_EDGE_REPEL: f64 = 200.0;
@@ -203,11 +234,34 @@ pub struct SimDiagnostics {
 /// same inputs (init positions are derived from graph distance, no RNG).
 pub fn simulate(def: &ProcessDefinition, ann: &SemanticAnnotations) -> FieldOutput {
     let mut particles = init_particles(def, ann);
+    // Slice 16: pre-compute sequence-flow edge order pairs (as particle
+    // indices) once — used by the directional order penalty in
+    // compute_all_forces to keep successors right of their predecessors.
+    let edge_order: Vec<(usize, usize)> = {
+        let idx_of: HashMap<&str, usize> = particles
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.kind == ParticleKind::Node)
+            .map(|(i, p)| (p.id.as_str(), i))
+            .collect();
+        let mut pairs = Vec::new();
+        for (src_id, el) in &def.elements {
+            let Some(&si) = idx_of.get(src_id.as_str()) else {
+                continue;
+            };
+            for f in &el.outgoing {
+                if let Some(&ti) = idx_of.get(f.to.as_str()) {
+                    pairs.push((si, ti));
+                }
+            }
+        }
+        pairs
+    };
     let mut ke_streak: usize = 0;
     let mut diag = SimDiagnostics::default();
 
     for step in 0..MAX_STEPS {
-        let forces = compute_all_forces(&particles);
+        let forces = compute_all_forces(&particles, &edge_order);
         let ke = integrate(&mut particles, &forces);
         diag.final_kinetic_energy = ke;
         diag.steps = step + 1;
@@ -229,6 +283,18 @@ pub fn simulate(def: &ProcessDefinition, ann: &SemanticAnnotations) -> FieldOutp
         }
     }
 
+    // Slice 16: post-sim column snap. The order penalty + LTR spring keep
+    // successors right of predecessors, but soft-spring equilibria still
+    // leave nodes a few pixels off their target column. Snapping to the
+    // nearest COL_SPACING multiple restores clean vertical alignment for
+    // parallel branches — same trick the bake-off physics engine uses.
+    for p in particles.iter_mut() {
+        if p.kind == ParticleKind::Node {
+            let col = ((p.pos.0 - FIRST_COL_X) / COL_SPACING).round();
+            p.pos.0 = FIRST_COL_X + col * COL_SPACING;
+        }
+    }
+
     extract_output(&particles, diag)
 }
 
@@ -242,21 +308,56 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
     let mut particles: Vec<Particle> = Vec::new();
 
     // --- Node particles --------------------------------------------------
-    // Init position: x from graph distance × 160px, y from flow-kind band
-    // (same y-offsets as the row-bias solver — see schema.rs). This gives the
-    // sim a sensible starting point so it doesn't have to discover LTR from
-    // scratch, and lets us fall back to it if the sim never converges.
+    // Init position: x from graph distance × COL_SPACING, y from flow-kind
+    // band (same y-offsets as the row-bias solver — see schema.rs). Nodes
+    // sharing (rank_column, band) are striped across distinct y slots
+    // (slice 16) so no two ever start on top of each other — the
+    // symmetric-init deadlock where two primary siblings collide and can
+    // never separate is impossible from step 0.
     let max_dist = graph_dist
         .values()
         .copied()
         .fold(0.0_f64, f64::max)
         .max(1.0);
+
+    // Assign a lane offset per (rank, band) group. Iteration over
+    // `def.elements` is stable (BTreeMap in engine-core), and we sort within
+    // each group by id, so the whole init is deterministic.
+    let mut lane_offset: HashMap<String, f64> = HashMap::new();
+    {
+        let mut buckets: std::collections::BTreeMap<(i64, i64), Vec<&String>> =
+            std::collections::BTreeMap::new();
+        for id in def.elements.keys() {
+            let d = graph_dist.get(id).copied().unwrap_or(0.0);
+            let band = node_kind
+                .get(id)
+                .copied()
+                .map(|k| k.target_row())
+                .unwrap_or(0.0);
+            let rank_key = d.round() as i64;
+            let band_key = (band * 10.0).round() as i64;
+            buckets.entry((rank_key, band_key)).or_default().push(id);
+        }
+        for members in buckets.values_mut() {
+            members.sort();
+            let n = members.len() as f64;
+            for (i, id) in members.iter().enumerate() {
+                // Symmetric stripe around the band centre: 0 → 0, [0, +1, -1, +2, -2, …]
+                // so a solitary node stays on-centre and the band spring
+                // has nothing to fight.
+                let slot = (i as f64) - (n - 1.0) * 0.5;
+                lane_offset.insert((*id).clone(), slot * LANE_ROW_PX);
+            }
+        }
+    }
+
     for id in def.elements.keys() {
         let kind = node_kind.get(id).copied();
         let d = graph_dist.get(id).copied().unwrap_or(0.0);
         let target_x = FIRST_COL_X + d * COL_SPACING;
         let init_x = target_x;
-        let init_y = 200.0 + kind.map(|k| k.target_row()).unwrap_or(0.0) * 110.0;
+        let band_y = 200.0 + kind.map(|k| k.target_row()).unwrap_or(0.0) * 110.0;
+        let init_y = band_y + lane_offset.get(id).copied().unwrap_or(0.0);
         let target_y = init_y;
         let mut charges = Charges {
             flow_kind: Charges::flow_kind_from(kind),
@@ -347,7 +448,7 @@ fn init_particles(def: &ProcessDefinition, ann: &SemanticAnnotations) -> Vec<Par
 
 // --- Forces ----------------------------------------------------------------
 
-fn compute_all_forces(particles: &[Particle]) -> Vec<(f64, f64)> {
+fn compute_all_forces(particles: &[Particle], edge_order: &[(usize, usize)]) -> Vec<(f64, f64)> {
     let n = particles.len();
     let mut forces = vec![(0.0_f64, 0.0_f64); n];
     for i in 0..n {
@@ -411,6 +512,22 @@ fn compute_all_forces(particles: &[Particle]) -> Vec<(f64, f64)> {
             }
         }
     }
+
+    // Slice 16: directional edge-order penalty. For every sequence-flow
+    // edge (source, target), if target.x - source.x < MIN_LTR_GAP apply a
+    // quadratic push: source is pushed *left*, target is pushed *right*.
+    // Above the gap threshold the force is exactly zero — nodes are free
+    // to sit directly above or below each other, but never to the left of
+    // their predecessor.
+    for &(si, ti) in edge_order {
+        let gap = particles[ti].pos.0 - particles[si].pos.0 - MIN_LTR_GAP;
+        if gap < 0.0 {
+            let mag = K_LTR_ORDER * gap * gap;
+            forces[si].0 -= mag;
+            forces[ti].0 += mag;
+        }
+    }
+
     forces
 }
 
@@ -441,13 +558,25 @@ fn pairwise_force(a: &Particle, b: &Particle) -> (f64, f64) {
     }
     net += cluster_share * K_CLUSTER / r;
 
-    // Node-node hard overlap — inverse-square push if bounding rects intersect.
+    // Slice 16: linear-kernel node hard overlap. Contact radius = half sum
+    // of sizes + PERSONAL_SPACE (positive breathing room, not the earlier
+    // -8 tolerance). The kernel is linear in the *smaller* overlap axis so
+    // separation happens along the shortest exit — nodes slide apart the
+    // short way rather than shooting off diagonally.
     if a.kind == ParticleKind::Node && b.kind == ParticleKind::Node {
-        let overlap_x = ((a.size.0 + b.size.0) * 0.5 - dx.abs() - 8.0).max(0.0);
-        let overlap_y = ((a.size.1 + b.size.1) * 0.5 - dy.abs() - 8.0).max(0.0);
+        let contact_x = (a.size.0 + b.size.0) * 0.5 + PERSONAL_SPACE;
+        let contact_y = (a.size.1 + b.size.1) * 0.5 + PERSONAL_SPACE;
+        let overlap_x = (contact_x - dx.abs()).max(0.0);
+        let overlap_y = (contact_y - dy.abs()).max(0.0);
         if overlap_x > 0.0 && overlap_y > 0.0 {
-            let mag = K_HARD_OVERLAP * (overlap_x + overlap_y) / r2;
-            net -= mag / r;
+            // Degenerate case: both centres coincide. Use id ordering to
+            // pick a deterministic separation direction so the two never
+            // stay welded together (would happen from t=0 with old init).
+            if dx.abs() < 1e-6 && dy.abs() < 1e-6 {
+                let bias = if a.id > b.id { 1.0 } else { -1.0 };
+                return (bias * K_HARD_OVERLAP * contact_x, 0.0);
+            }
+            net -= K_HARD_OVERLAP * overlap_x.min(overlap_y);
         }
     }
 
@@ -907,5 +1036,75 @@ mod tests {
             handle_y > taskb_y + 40.0,
             "HandleError (y={handle_y}) should settle below TaskB (y={taskb_y})"
         );
+    }
+
+    /// Slice 16 invariant: every sequence-flow edge respects L→R order.
+    /// A successor may sit directly above or below its predecessor but
+    /// never to its left. Enforced by the directional edge-order penalty
+    /// in [`compute_all_forces`] plus the post-sim column snap.
+    #[test]
+    fn successor_never_left_of_predecessor() {
+        let bpmn = include_str!("../../fixtures/layout/tiny.bpmn");
+        let ann_json = include_str!("../../fixtures/layout/tiny.annotations.json");
+        let ann: SemanticAnnotations = serde_json::from_str(ann_json).unwrap();
+        let defs = parse_bpmn(bpmn).unwrap();
+        let def = defs.into_iter().next().unwrap();
+        let out = simulate(&def, &ann);
+        for (src_id, el) in &def.elements {
+            let Some(&(sx, _)) = out.nodes.get(src_id) else {
+                continue;
+            };
+            for f in &el.outgoing {
+                let Some(&(tx, _)) = out.nodes.get(&f.to) else {
+                    continue;
+                };
+                // 1px slop for float noise on top of the column snap.
+                assert!(
+                    tx >= sx - 1.0,
+                    "successor {} (x={tx}) is left of predecessor {} (x={sx})",
+                    f.to,
+                    src_id,
+                );
+            }
+        }
+    }
+
+    /// Slice 16 invariant: after simulation settles, no two leaf-node
+    /// bounding rects overlap. Enforced by the linear-kernel hard-overlap
+    /// force with `PERSONAL_SPACE` margin and rank-lane init that
+    /// eliminates the symmetric-init deadlock.
+    #[test]
+    fn leaves_do_not_overlap() {
+        let bpmn = include_str!("../../fixtures/layout/tiny.bpmn");
+        let ann_json = include_str!("../../fixtures/layout/tiny.annotations.json");
+        let ann: SemanticAnnotations = serde_json::from_str(ann_json).unwrap();
+        let defs = parse_bpmn(bpmn).unwrap();
+        let def = defs.into_iter().next().unwrap();
+        let out = simulate(&def, &ann);
+
+        let rects: Vec<(&String, f64, f64, f64, f64)> = def
+            .elements
+            .iter()
+            .filter_map(|(id, el)| {
+                let (cx, cy) = *out.nodes.get(id)?;
+                let (w, h) = node_dims(el);
+                Some((id, cx - w * 0.5, cy - h * 0.5, w, h))
+            })
+            .collect();
+
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let (id_a, ax, ay, aw, ah) = &rects[i];
+                let (id_b, bx, by, bw, bh) = &rects[j];
+                let dx = (ax + aw * 0.5 - bx - bw * 0.5).abs();
+                let dy = (ay + ah * 0.5 - by - bh * 0.5).abs();
+                let overlap_x = ((aw + bw) * 0.5 - dx).max(0.0);
+                let overlap_y = ((ah + bh) * 0.5 - dy).max(0.0);
+                assert!(
+                    overlap_x <= 0.0 || overlap_y <= 0.0,
+                    "nodes {id_a} and {id_b} overlap by ({overlap_x}, {overlap_y})"
+                );
+            }
+        }
     }
 }
