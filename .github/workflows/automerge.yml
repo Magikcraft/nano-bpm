@@ -1,0 +1,30 @@
+# Turns on GitHub's native auto-merge for every non-draft PR from this repo, so a
+# PR squash-merges automatically once the required CI checks (see the branch
+# protection on `main`) go green — no manual `gh pr merge --auto` needed.
+#
+# Auto-merge only *arms* the merge; branch protection still gates it on the CI
+# jobs passing, so this never merges a red PR. Fork PRs get a read-only token and
+# are skipped (the head-repo guard) rather than failing the run.
+name: auto-merge
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  enable-auto-merge:
+    runs-on: ubuntu-24.04
+    # Skip drafts (can't auto-merge) and PRs from forks (read-only token).
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Enable auto-merge (squash)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr merge --auto --squash "$PR" --repo "$GITHUB_REPOSITORY"

@@ -37,6 +37,12 @@ rationale for following the Camunda 8 (Zeebe) model rather than the Camunda 7 PV
   [`uv`](https://docs.astral.sh/uv/); `uv sync` provisions it.
 - `curl` or `wget` (to fetch the generator JAR on first run)
 - Node.js (only to build the web console frontend under `console/`)
+- **Linux only:** the [`mold`](https://github.com/rui314/mold) linker. The
+  workspace `.cargo/config.toml` wires `mold` as the linker for the
+  `x86_64-unknown-linux-gnu` target (it's much faster, and the deploy/soak
+  build leans on it), so a Linux `cargo build` fails with `cannot find 'ld'`
+  until it's installed: `sudo apt-get install -y mold`. macOS builds are
+  unaffected (the config is scoped to the Linux target triple only).
 
 > Java is **build-time only**: it runs the OpenAPI generator. The resulting
 > binary has no Java (or other) runtime dependency.
