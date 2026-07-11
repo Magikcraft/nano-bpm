@@ -253,27 +253,26 @@ pub struct ServerImpl {
     /// path (reads and job dispatch always go to the leader's owned actor). Empty
     /// unless per-partition Raft is enabled with RF>1 — zero overhead otherwise.
     raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, DeepthiHandle>>>,
-    /// Whether the job activation lock is replicated through Raft.
+    /// How the per-job activation lock is replicated ([`ActivationPolicy`], from
+    /// `NANOBPMN_REPLICATE_ACTIVATION`). Resolved once at startup; the per-partition
+    /// answer is [`Self::replicate_activation_for`].
     ///
-    /// `true` (the default, from `NANOBPMN_REPLICATE_ACTIVATION`) is the original
-    /// fully-replicated lifecycle: `ActivateJobs` and lock-expiry go through the
-    /// log, so every replica holds the lease (3 quorum commits per job).
-    ///
-    /// `false` makes the lock **leader-local**: `ActivateJobs` is NOT proposed
-    /// through the log (the leader locks jobs in its own engine actor only) and
-    /// lock-expiry stays local too. Only the durable progress commands
-    /// (create / complete / fail / throw / timers) are replicated, so each job
-    /// costs 2 quorum commits instead of 3 and per-worker activation commits stop
-    /// fragmenting the per-partition commit budget. Replicas run with lenient
-    /// completion (see [`Engine::set_lenient_completion`]) so a replicated
-    /// completion applies even though they never saw the activation.
+    /// `Always` is the historical fully-replicated lifecycle: `ActivateJobs` and
+    /// lock-expiry go through the log, so every replica holds the lease (3 quorum
+    /// commits per job). The leader-local variants (`LeaderLocal`/`Digest`/`Auto`)
+    /// do NOT propose `ActivateJobs`: the leader
+    /// locks jobs in its own engine actor only and lock-expiry stays local, so each
+    /// job costs 2 quorum commits and per-worker activation stops fragmenting the
+    /// commit budget. Replicas then run with lenient completion (see
+    /// [`Engine::set_lenient_completion`]) so a replicated completion applies even
+    /// though they never saw the activation.
     ///
     /// No effect on a single node / RF=1 (no Raft). DURABILITY TRADE-OFF in the
-    /// `false` mode: the lease is leader-RAM-only and does NOT survive failover —
-    /// a new leader re-dispatches in-flight jobs immediately (vs. waiting for the
-    /// replicated deadline). Both modes are at-least-once; this one widens the
-    /// failover redelivery window. See [`replicate_activation_from_env`].
-    replicate_activation: bool,
+    /// leader-local variants: the lease is leader-RAM-only and does NOT survive
+    /// failover — a new leader re-dispatches in-flight jobs immediately (vs. waiting
+    /// for the replicated deadline), narrowed by the soft digest under
+    /// `Digest`/`Auto`. All variants are at-least-once.
+    activation_policy: ActivationPolicy,
     /// Best-effort soft lease digest mode (`NANOBPMN_REPLICATE_ACTIVATION=digest`).
     /// Layered on top of leader-local activation (so `replicate_activation` is
     /// also `false`): a partition leader periodically broadcasts its currently-held
@@ -395,16 +394,18 @@ impl ServerImpl {
         // correlation key (`hash(correlation_key)`). With a single partition this
         // is `1`, so placement stays local and behaviour is unchanged.
         let replication_mode = replication_mode_from_env();
-        let replicate_activation = replicate_activation_from_env(replication_mode);
-        let lease_digest = lease_digest_from_env();
+        let activation_policy = activation_policy_from_env(replication_mode);
+        // The soft lease digest broadcasts under `digest` and `auto` (where an
+        // activation is leader-local and so needs the digest to cover failover).
+        let lease_digest = activation_policy.broadcasts_lease_digest();
         for journal in journals.iter_mut() {
             journal.set_num_partitions(topology.num_partitions);
-            // Leader-local activation mode: replicas must accept a replicated
-            // completion for a job they never saw activated (the lock is not
-            // replicated). Harmless on a single node (no follower ever applies a
-            // completion for an un-activated job in practice, but the relaxed
-            // check is still correct there).
-            if !replicate_activation {
+            // Leader-local activation (any policy that can lock leader-only): replicas
+            // must accept a replicated completion for a job they never saw activated
+            // (the lock is not replicated). Harmless on a single node (no follower
+            // ever applies a completion for an un-activated job in practice, but the
+            // relaxed check is still correct there).
+            if activation_policy.may_be_leader_local() {
                 journal.set_lenient_completion(true);
             }
         }
@@ -720,7 +721,7 @@ impl ServerImpl {
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            replicate_activation,
+            activation_policy,
             lease_digest,
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             replication_mode,
@@ -1429,68 +1430,99 @@ fn backpressure_setting_from_env() -> BackpressureSetting {
     )
 }
 
-/// Whether the job activation lock is replicated through Raft. When set,
-/// `NANOBPMN_REPLICATE_ACTIVATION` is honored explicitly: `1`/`true`/`on`/`yes`
-/// keeps the fully-replicated lifecycle; `0`/`false`/`off`/`no`/`digest` makes
-/// the lock leader-local, so activation and lock-expiry stay off the Raft log —
-/// each job costs 2 quorum commits instead of 3 and per-worker activation commits
-/// stop fragmenting the per-partition commit budget. Replicas then run with
-/// lenient completion so a replicated completion applies without having seen the
-/// activation. No effect without Raft (single node / RF=1).
-///
-/// DEFAULT (env unset) is mode-dependent: under `leader-durable` replication the
-/// default is leader-local (`false`), because that tier already acks on the leader
-/// alone with lenient follower completion — replicating activation there only adds
-/// a per-job quorum proposal that LOCKS jobs faster than they complete under
-/// sustained load, leaking leases until the activatable pool drains to zero and
-/// completions freeze (proven by the 2026-07-08 A/B; see PERFORMANCE.md). Under
-/// `quorum` replication the default stays fully-replicated (`true`) to preserve
-/// the node-loss-durable lease semantics every existing benchmark validates.
-///
-/// DURABILITY TRADE-OFF: the lease (`Activated`/`worker`/`deadline`) then lives
-/// ONLY in the leader's in-memory engine — it is NOT durable and does NOT survive
-/// leader failover. Followers always see an activated job as `Created`, so on
-/// failover a new leader re-dispatches in-flight jobs IMMEDIATELY (it has no
-/// record of the lease or its deadline), versus the default mode which waits for
-/// the replicated lease deadline to expire. Both modes are at-least-once (jobs
-/// must be idempotent); this mode merely widens the failover redelivery window to
-/// "immediate". Durable PROGRESS (create/complete/fail/throw/timers) is still
-/// fully replicated. Set `NANOBPMN_REPLICATE_ACTIVATION=1` to force the replicated
-/// lease under leader-durable when failover must honor in-flight lease deadlines.
-fn replicate_activation_from_env(replication_mode: ReplicationMode) -> bool {
-    match std::env::var("NANOBPMN_REPLICATE_ACTIVATION")
-        .ok()
-        .as_deref()
-    {
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no" | "digest"
-        ),
-        // Leader-durable already acks leader-locally with lenient follower
-        // completion; replicating activation there leaks leases under load. Quorum
-        // keeps the durable replicated lease.
-        None => !matches!(replication_mode, ReplicationMode::LeaderDurable),
+/// How the per-job activation lock is replicated (`NANOBPMN_REPLICATE_ACTIVATION`).
+/// The activation *command* itself is small, but under `quorum` every activation is
+/// an extra majority commit. That extra commit collapses completion throughput
+/// whenever the commit pipeline is under pressure — either by BYTES (e.g. 50 KB
+/// variables: ~125× collapse in the 2026-07-11 GCP A/B) or by COUNT (negligible
+/// payload at tens of thousands of jobs/s wedges the same way). Because the cost
+/// is a per-activation commit, it is unsafe at any non-trivial throughput, not just
+/// at large payloads. Leader-local activation keeps the lock off the Raft log
+/// entirely (2 commits/job instead of 3) at the cost of a wider failover redelivery
+/// window; the soft lease digest narrows that window back. See PERFORMANCE.md.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationPolicy {
+    /// `1`/`true`/`on`/`yes`/`quorum`: always replicate the activation lock through
+    /// Raft (fully node-loss-durable lease; 3 quorum commits/job). The historical
+    /// `quorum` default; unusable at large payloads (throughput collapse).
+    Always,
+    /// `0`/`false`/`off`/`no`/`leader-local`: never replicate; the lock lives only
+    /// in the leader's engine actor, followers run lenient completion. No digest
+    /// broadcast, so failover redelivers in-flight jobs immediately.
+    LeaderLocal,
+    /// `digest`: leader-local activation PLUS the periodic soft lease-digest
+    /// broadcast so a promoted follower honours in-flight deadlines before
+    /// redelivering. Payload-independent throughput; the right pick for large
+    /// payloads under quorum.
+    Digest,
+    /// `auto` (the **default** under `quorum`): a zero-config alias that resolves to
+    /// leader-local activation plus the soft lease digest — behaviourally identical
+    /// to [`ActivationPolicy::Digest`]. The operator never has to set a flag: this
+    /// default is validated healthy across the whole payload/throughput range
+    /// (2,400/s @ 50 KB and ~36k/s @ negligible payload; see PERFORMANCE.md).
+    ///
+    /// An earlier design flipped per partition between the strict replicated lease
+    /// (small payloads) and leader-local (large payloads) using a payload-byte EWMA,
+    /// but that was unsound: the strict lease's cost is a per-activation quorum
+    /// commit, which wedges at high throughput *regardless* of payload size (a
+    /// negligible-payload soak at ~61k/s wedged in the 2026-07-11 GCP validation).
+    /// `auto` therefore never keeps the strict replicated lease.
+    Auto,
+}
+
+impl ActivationPolicy {
+    /// The soft lease-digest broadcast runs under `digest` and `auto` (where an
+    /// activation may be leader-local and thus needs the digest to cover failover).
+    fn broadcasts_lease_digest(self) -> bool {
+        matches!(self, ActivationPolicy::Digest | ActivationPolicy::Auto)
+    }
+
+    /// Whether an activation can ever be leader-local under this policy — i.e.
+    /// followers must run with lenient completion. True for every policy except
+    /// [`ActivationPolicy::Always`].
+    fn may_be_leader_local(self) -> bool {
+        !matches!(self, ActivationPolicy::Always)
     }
 }
 
-/// Whether the best-effort soft lease digest is enabled
-/// (`NANOBPMN_REPLICATE_ACTIVATION=digest`). `digest` is leader-local activation
-/// (so [`replicate_activation_from_env`] also returns `false`) PLUS a periodic,
-/// fire-and-forget broadcast of the leader's currently-held leases to its
-/// followers. On promotion a follower recovers those leases so the new leader
-/// honours their deadlines before redelivering — narrowing the failover
-/// redelivery window that plain leader-local activation opens, at no per-job
-/// quorum cost and with no external infrastructure. The digest is lossy/soft by
-/// design (a dropped or stale digest only widens the window slightly), so it never
-/// affects correctness — only the failover redelivery timing.
-fn lease_digest_from_env() -> bool {
-    matches!(
+/// Resolves the activation-replication policy from `NANOBPMN_REPLICATE_ACTIVATION`.
+/// When unset the default is mode-dependent: `leader-durable` defaults to
+/// [`ActivationPolicy::LeaderLocal`] (that tier already acks leader-locally with
+/// lenient follower completion; replicating activation there leaks leases under
+/// load — proven by the 2026-07-08 A/B), while `quorum` defaults to
+/// [`ActivationPolicy::Auto`] (leader-local + soft digest) so workloads dodge the
+/// completion collapse without the operator having to know the knob exists.
+fn activation_policy_from_env(replication_mode: ReplicationMode) -> ActivationPolicy {
+    parse_activation_policy(
         std::env::var("NANOBPMN_REPLICATE_ACTIVATION")
             .ok()
-            .as_deref()
-            .map(|v| v.trim().to_ascii_lowercase()),
-        Some(ref v) if v == "digest"
+            .as_deref(),
+        replication_mode,
     )
+}
+
+/// Pure resolution of [`ActivationPolicy`] from a raw `NANOBPMN_REPLICATE_ACTIVATION`
+/// value (or `None` when unset), split out so it is unit-testable without touching
+/// the process environment.
+fn parse_activation_policy(
+    raw: Option<&str>,
+    replication_mode: ReplicationMode,
+) -> ActivationPolicy {
+    match raw.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(ref v) => match v.as_str() {
+            "1" | "true" | "on" | "yes" | "quorum" | "replicate" => ActivationPolicy::Always,
+            "digest" => ActivationPolicy::Digest,
+            "auto" => ActivationPolicy::Auto,
+            // "0"/"false"/"off"/"no"/"leader-local"/"local" and anything
+            // unrecognised fall back to plain leader-local (the conservative
+            // off switch), matching the historical parse.
+            _ => ActivationPolicy::LeaderLocal,
+        },
+        None => match replication_mode {
+            ReplicationMode::LeaderDurable => ActivationPolicy::LeaderLocal,
+            ReplicationMode::Quorum => ActivationPolicy::Auto,
+        },
+    }
 }
 
 /// The replication durability tier for the partition Raft log (ADR 0003), the
@@ -7562,6 +7594,21 @@ impl ServerImpl {
             .await
     }
 
+    /// Whether partition `p`'s activation lock is replicated through Raft. Static:
+    /// only [`ActivationPolicy::Always`] replicates the lock. `Auto` (like
+    /// `LeaderLocal`/`Digest`) never does — the strict replicated lease costs a
+    /// per-activation quorum commit that wedges at high throughput regardless of
+    /// payload size, so the zero-config default stays leader-local and lets the soft
+    /// digest cover failover. The `p` argument is retained for call-site symmetry.
+    fn replicate_activation_for(&self, _p: u64) -> bool {
+        match self.activation_policy {
+            ActivationPolicy::Always => true,
+            ActivationPolicy::LeaderLocal | ActivationPolicy::Digest | ActivationPolicy::Auto => {
+                false
+            }
+        }
+    }
+
     /// Returns (building if necessary) the dedicated engine actor for a partition
     /// this node **replicates but does not own**. The Raft state machine drives it
     /// to apply the replicated log on a follower; it is not part of the read-model
@@ -7574,7 +7621,7 @@ impl ServerImpl {
         }
         let mut journal = Journal::in_memory_partition(p);
         journal.set_num_partitions(self.engine.topology().num_partitions);
-        if !self.replicate_activation {
+        if self.activation_policy.may_be_leader_local() {
             journal.set_lenient_completion(true);
         }
         let seed = self.current_deployment_events().await;
@@ -7918,7 +7965,7 @@ impl ServerImpl {
                     continue;
                 }
                 let p = led[(start + off) % ln];
-                if self.replicate_activation {
+                if self.replicate_activation_for(p) {
                     futures.push(
                         self.activate_on_raft(p, job_type, worker, want, timeout)
                             .boxed(),
@@ -8250,7 +8297,7 @@ impl ServerImpl {
             }
         }
         if jobs_due {
-            if self.replicate_activation {
+            if self.replicate_activation_for(p) {
                 if let Ok(resp) = part.propose_result(Command::ExpireJobs { now }, now).await
                     && resp.error.is_none()
                     && !resp.events.is_empty()
@@ -11745,6 +11792,54 @@ mod clustered_startup_tests {
     }
 
     #[test]
+    fn activation_policy_parses_explicit_values() {
+        use ActivationPolicy::*;
+        // Explicit values resolve the same regardless of replication mode.
+        for mode in [ReplicationMode::Quorum, ReplicationMode::LeaderDurable] {
+            assert_eq!(parse_activation_policy(Some("1"), mode), Always);
+            assert_eq!(parse_activation_policy(Some("true"), mode), Always);
+            assert_eq!(parse_activation_policy(Some("quorum"), mode), Always);
+            assert_eq!(parse_activation_policy(Some(" ON "), mode), Always);
+            assert_eq!(parse_activation_policy(Some("digest"), mode), Digest);
+            assert_eq!(parse_activation_policy(Some("Auto"), mode), Auto);
+            assert_eq!(parse_activation_policy(Some("0"), mode), LeaderLocal);
+            assert_eq!(parse_activation_policy(Some("off"), mode), LeaderLocal);
+            assert_eq!(
+                parse_activation_policy(Some("leader-local"), mode),
+                LeaderLocal
+            );
+            // Unrecognised -> conservative off switch (leader-local).
+            assert_eq!(parse_activation_policy(Some("banana"), mode), LeaderLocal);
+        }
+    }
+
+    #[test]
+    fn activation_policy_default_is_mode_dependent() {
+        use ActivationPolicy::*;
+        // Unset: quorum auto-tunes; leader-durable stays leader-local.
+        assert_eq!(parse_activation_policy(None, ReplicationMode::Quorum), Auto);
+        assert_eq!(
+            parse_activation_policy(None, ReplicationMode::LeaderDurable),
+            LeaderLocal
+        );
+    }
+
+    #[test]
+    fn activation_policy_structural_flags() {
+        use ActivationPolicy::*;
+        // Digest broadcast runs under digest and auto (both can go leader-local).
+        assert!(Digest.broadcasts_lease_digest());
+        assert!(Auto.broadcasts_lease_digest());
+        assert!(!Always.broadcasts_lease_digest());
+        assert!(!LeaderLocal.broadcasts_lease_digest());
+        // Followers must run lenient completion for every policy except Always.
+        assert!(!Always.may_be_leader_local());
+        assert!(LeaderLocal.may_be_leader_local());
+        assert!(Digest.may_be_leader_local());
+        assert!(Auto.may_be_leader_local());
+    }
+
+    #[test]
     fn spill_floor_scales_and_stays_below_low() {
         // 64 GiB host: floor ~10% (6.4 GiB) — well below the 65% pressure band and
         // its 7/8 low-water, so a growth reclaim to the floor bounds a burst far
@@ -13965,16 +14060,15 @@ mod clustered_startup_tests {
         let mut node1 = build_node(1);
         let mut node2 = build_node(2);
 
-        // Digest mode = leader-local activation (replicate_activation = false) PLUS
-        // the soft lease broadcast (lease_digest = true). Configure both directly
-        // (the env reader can't be used safely under parallel tests) and relax the
-        // completion check on every owned engine actor, exactly as
-        // `ServerImpl::new` would have for `replicate_activation = false`. The
-        // follower replica engines built during `raft_bootstrap` then pick up
-        // lenient completion automatically (they read the now-false field).
+        // Digest mode = leader-local activation PLUS the soft lease broadcast.
+        // Configure the policy directly (the env reader can't be used safely under
+        // parallel tests) and relax the completion check on every owned engine
+        // actor, exactly as `ServerImpl::new` would have for a leader-local policy.
+        // The follower replica engines built during `raft_bootstrap` then pick up
+        // lenient completion automatically (they read the now-leader-local policy).
         if digest {
             for node in [&mut node0, &mut node1, &mut node2] {
-                node.replicate_activation = false;
+                node.activation_policy = ActivationPolicy::Digest;
                 node.lease_digest = true;
                 for handle in node.engine.all() {
                     handle

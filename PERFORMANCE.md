@@ -1787,3 +1787,40 @@ collapse) and should not be used for large-payload quorum deployments. raftlog s
 bounded/flat under the compaction governor in both modes. The end-of-run backlog
 spike (to ~69k) is the same benign teardown tail — workers disconnect before
 producers stop, stranding in-flight creates that never get completed.
+
+### Follow-up — zero-config `auto` activation policy (default under quorum)
+
+The two findings above (default quorum activation collapses at 50KB; `digest` restores
+parity) are now resolved without operator intervention. `NANOBPMN_REPLICATE_ACTIVATION`
+gains an `auto` mode, which is the **new default under quorum**. `auto` is a zero-config
+alias for **leader-local activation + the soft lease digest** (behaviourally identical to
+`=digest`); it never keeps the strict replicated lease.
+
+An earlier revision made `auto` *adaptive* — keeping the strict replicated lease at small
+payloads (from a payload-byte EWMA) and flipping to leader-local + digest at large ones.
+The 2026-07-11 GCP validation **disproved that premise**: a *negligible*-payload soak at
+~61k jobs/s **wedged** (creates and completions both froze, producers hit `MAX_INFLIGHT`)
+precisely because `auto` kept the strict replicated lease there. The strict lease's cost
+is a **per-activation quorum commit**, which is unsafe at *any* non-trivial throughput —
+commit-COUNT pressure at small payloads, BYTE pressure at large ones — so a
+payload-byte signal is the wrong signal. `auto` therefore always goes leader-local +
+digest.
+
+Validation of the shipped `auto` default (quorum, RF=3, byte-bound propose fix, governor
+on) — each leg on a freshly-wiped cluster:
+
+| Payload | Aggregate tput | p50 / p99 | Backlog (in-run) | Result |
+|---|---|---|---|---|
+| Negligible (VB=0) | ~33.7k/s (3×~11.2k/s) | 28 / ~100 ms | ~0 | healthy, no wedge |
+| 50 KB (VB=51200) | ~2,411/s (3×~805/s) | 59 / 94 ms | ~100/node | parity w/ leader-durable/digest |
+
+The 50 KB leg matches the `digest` baseline above (2,398/s, p50 58 / p99 91 ms) exactly,
+confirming `auto` == leader-local + digest at both payload extremes. NB: each leg must run
+on a **wiped** cluster — stacking the 50 KB leg on top of the negligible leg's ~8M
+retained instances (no wipe) starves it (jemalloc ~15 GB/node, throughput → tens/s); this
+is accumulated read-model/raftlog pressure, not an activation regression.
+
+Create/complete/timer durability is fully quorum-committed in every mode; only the
+activation lease is leader-local (covered by the digest on failover). The strict
+replicated lease remains available via `=1`/`quorum` for parity/testing, not recommended
+at scale. See ADR 0002 Part C.
