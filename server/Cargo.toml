@@ -114,3 +114,22 @@ panic = "abort"
 inherits = "release"
 panic = "unwind"
 
+# Fast-iteration profile for building deploy/soak binaries (NOT for shipping).
+# Keeps opt-level 3 (runtime throughput must stay realistic — the debug build is
+# ~3.5x slower), but trades the production-binary polish for build speed:
+#   * `lto = "thin"` instead of fat LTO — recovers ~all cross-crate inlining wins
+#     at a fraction of the whole-program link cost, and (unlike fat LTO) does NOT
+#     serialize codegen or nullify incremental.
+#   * `codegen-units = 16` re-enables intra-crate codegen parallelism (the server
+#     is a single ~48k-line crate, so this matters a lot).
+#   * `incremental = true` — small edits to one file (e.g. falcon.rs/main.rs, our
+#     hot loop) recompile only the changed codegen units.
+#   * `strip = false` skips the strip pass (symbols are fine for a soak binary).
+# Build with: cargo build --profile deploy-fast --features console
+[profile.deploy-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+strip = false
+

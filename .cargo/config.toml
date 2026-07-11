@@ -1,0 +1,13 @@
+# Cargo config for the nanobpmn workspace.
+#
+# Faster linking on the Linux build/deploy node (node0 builds the cluster
+# binary). `mold` collapses the final link from tens of seconds to a couple —
+# a win that grows once fat LTO is off (see server's `deploy-fast` profile).
+#
+# Scoped to the Linux target triple ONLY, so local macOS builds
+# (aarch64-apple-darwin) are completely unaffected and don't require mold.
+# Uses the default `cc` (gcc >= 12.1) driver's `-fuse-ld=mold`, so only mold
+# itself is required on the build node:
+#   sudo apt-get install -y mold          # Debian/Ubuntu
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
