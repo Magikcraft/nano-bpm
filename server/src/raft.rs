@@ -859,6 +859,14 @@ fn raft_config(partition_id: u64) -> Config {
         // catches up from the (lean) snapshot, which for big payloads is cheaper
         // than shipping the retained log tail.
         max_in_snapshot_log_to_keep: raft_env_u64("NANOBPMN_RAFT_KEEP_LOGS", 1000),
+        // Cap on entries coalesced into one AppendEntries RPC. openraft's default
+        // is 300; combined with large (50 KB-variable) batched entries a single
+        // catch-up RPC would carry hundreds of MB and blow the ~250 ms
+        // AppendEntries timeout, so a lagging follower can never catch up and
+        // replication collapses. Bounding entries-per-RPC (with the byte-bounded
+        // entries from the propose batcher) keeps each AppendEntries shippable
+        // within the timeout. Env-tunable (`NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES`).
+        max_payload_entries: raft_env_u64("NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES", 16),
         ..Default::default()
     }
 }
@@ -886,6 +894,21 @@ fn compaction_tick_ms() -> u64 {
 /// apply work and entry size; under a steady flood the batch fills toward this and
 /// openraft's per-entry overhead is amortized across the whole batch.
 const MAX_PROPOSE_BATCH: usize = 1024;
+
+/// Byte budget for a single coalesced Raft log entry, capping the propose
+/// batcher in addition to [`MAX_PROPOSE_BATCH`] (a count). Under large variable
+/// payloads (e.g. 50 KB/instance) a count-only batch of 1024 creates forms a
+/// ~50 MB entry; openraft may then bundle several such entries into one
+/// AppendEntries, whose transfer cannot finish within the ~250 ms RPC timeout —
+/// replication collapses and (sharing the stream transport) starves client
+/// traffic, wedging producers. Bounding the entry by bytes keeps each entry (and
+/// thus each AppendEntries, with `max_payload_entries`) shippable in time. The
+/// batch always contains at least its first command, so a lone oversized command
+/// still makes progress. Env-tunable (`NANOBPMN_RAFT_MAX_ENTRY_BYTES`, default
+/// 1 MiB).
+fn max_entry_bytes() -> u64 {
+    raft_env_u64("NANOBPMN_RAFT_MAX_ENTRY_BYTES", 1024 * 1024)
+}
 
 /// One queued command awaiting placement into a batched Raft entry, plus the
 /// one-shot the batcher fulfils with that command's [`ReplicatedItem`] (or a
@@ -952,6 +975,7 @@ impl Batcher {
     fn spawn(raft: openraft::Raft<RaftConfig>) -> Self {
         let (hi_tx, mut hi_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
+        let max_bytes = max_entry_bytes();
         tokio::spawn(async move {
             loop {
                 // Block until at least one submission is queued on either lane.
@@ -965,13 +989,23 @@ impl Batcher {
                     Some(s) = lo_rx.recv() => s,
                     else => break,
                 };
+                // Track the coalesced entry's payload size so a batch of large
+                // (e.g. 50 KB-variable) commands stays within `max_bytes` and the
+                // entry remains shippable in one AppendEntries within the RPC
+                // timeout. The first command is always included, so a lone command
+                // larger than the budget still makes progress.
+                let mut batch_bytes = first.item.command.approx_bytes();
                 let mut subs = vec![first];
                 // Drain ALL pending high-priority (drain) commands into this
-                // batch first, bounded by the cap — so a completion
-                // never queues behind a backlog of creates in a later entry.
-                while subs.len() < MAX_PROPOSE_BATCH {
+                // batch first, bounded by the count and byte caps — so a
+                // completion never queues behind a backlog of creates in a later
+                // entry.
+                while subs.len() < MAX_PROPOSE_BATCH && batch_bytes < max_bytes {
                     match hi_rx.try_recv() {
-                        Ok(s) => subs.push(s),
+                        Ok(s) => {
+                            batch_bytes += s.item.command.approx_bytes();
+                            subs.push(s);
+                        }
                         Err(_) => break,
                     }
                 }
@@ -980,9 +1014,12 @@ impl Batcher {
                 // (the intended backpressure); a completion can never outnumber
                 // the creates that produced its jobs, so this is self-limiting and
                 // does not permanently starve admission.
-                while subs.len() < MAX_PROPOSE_BATCH {
+                while subs.len() < MAX_PROPOSE_BATCH && batch_bytes < max_bytes {
                     match lo_rx.try_recv() {
-                        Ok(s) => subs.push(s),
+                        Ok(s) => {
+                            batch_bytes += s.item.command.approx_bytes();
+                            subs.push(s);
+                        }
                         Err(_) => break,
                     }
                 }
