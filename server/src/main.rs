@@ -7035,6 +7035,11 @@ impl ServerImpl {
                     }
                 }
             }
+
+            // All hosted members are registered; start the compaction governor
+            // (once per node) to bound the payload-bearing Raft log by bytes and
+            // reclaim it at idle — beyond what the entry-count snapshot policy does.
+            crate::raft::spawn_compaction_governor(server.raft_registry().clone());
         }
     }
 

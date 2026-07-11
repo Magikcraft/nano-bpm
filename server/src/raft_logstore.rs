@@ -47,6 +47,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -260,6 +261,12 @@ impl Drop for Inner {
 #[derive(Clone)]
 pub struct RaftLogStore {
     inner: Arc<Mutex<Inner>>,
+    /// Per-partition live (non-purged) log byte footprint, republished after every
+    /// append/truncate/purge. The openraft `Raft` handle erases the concrete log
+    /// store type, so the compaction governor cannot read `Inner::log_bytes`
+    /// directly; this shared handle is the bridge it reads to make byte-based
+    /// snapshot/compaction decisions for the partition.
+    bytes: Arc<AtomicI64>,
 }
 
 fn log_path(dir: &Path) -> PathBuf {
@@ -336,6 +343,14 @@ fn migrate_legacy_log(dir: &Path) -> io::Result<()> {
 }
 
 impl RaftLogStore {
+    /// A shared handle to this partition's live log byte footprint, kept current
+    /// after every append/truncate/purge. Read by the compaction governor to make
+    /// byte-based snapshot decisions (the openraft `Raft` handle hides the store
+    /// type, so this is the only way to observe per-partition log bytes).
+    pub fn bytes_handle(&self) -> Arc<AtomicI64> {
+        self.bytes.clone()
+    }
+
     /// Opens (creating if absent) a durable log store rooted at `dir`, replaying
     /// any existing `seg-*.ndjson` segments (or a legacy `log.ndjson`), `vote.json`
     /// and `state.json` to reconstruct the in-memory index, the persisted vote and
@@ -438,6 +453,7 @@ impl RaftLogStore {
                 unsynced_bytes: 0,
                 state_dirty: false,
             })),
+            bytes: Arc::new(AtomicI64::new(log_bytes as i64)),
         };
         crate::metrics::raft_log_delta(entries, log_bytes as i64);
 
@@ -683,6 +699,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             }
         }
         crate::metrics::raft_log_delta(added, new_bytes as i64);
+        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
         drop(inner);
         callback.log_io_completed(Ok(()));
         Ok(())
@@ -702,6 +719,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             inner.log.len() as i64 - before_entries,
             inner.log_bytes as i64 - before_bytes,
         );
+        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -742,6 +760,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             inner.log.len() as i64 - before_entries,
             inner.log_bytes as i64 - before_bytes,
         );
+        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
         // Persist the durable purge marker (a small atomic write whose directory
         // fsync also makes the segment unlinks durable). No log rewrite.
         inner.state_dirty = false;

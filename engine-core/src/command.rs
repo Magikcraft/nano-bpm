@@ -266,6 +266,37 @@ impl Command {
         }
     }
 
+    /// A cheap upper-ish estimate of this command's serialized payload size in
+    /// bytes, dominated by any carried `variables` map. Used by the Raft propose
+    /// batcher to bound a coalesced log entry by bytes (not just command count):
+    /// under large variable payloads (e.g. 50 KB/instance) a count-only batch of
+    /// 1024 creates would form a ~50 MB entry that cannot replicate within the
+    /// AppendEntries RPC timeout, collapsing replication. Non-payload commands
+    /// return a small constant — their exact size does not matter for batching.
+    pub fn approx_bytes(&self) -> u64 {
+        // Small fixed overhead for keys, enum tag, and the fixed scalar fields
+        // every command carries; the variable payload dominates when present.
+        const BASE: u64 = 64;
+        let vars = |variables: &HashMap<String, Value>| -> u64 {
+            variables
+                .iter()
+                .map(|(k, v)| k.len() as u64 + v.approx_bytes())
+                .sum()
+        };
+        let payload = match self {
+            Command::CreateInstance { variables, .. }
+            | Command::CompleteJob { variables, .. }
+            | Command::CompleteUserTask { variables, .. }
+            | Command::SetVariables { variables, .. }
+            | Command::CorrelateMessage { variables, .. }
+            | Command::BroadcastSignal { variables, .. }
+            | Command::CorrelateMessageSubscription { variables, .. }
+            | Command::DispatchStartInstance { variables, .. } => vars(variables),
+            _ => 0,
+        };
+        BASE + payload
+    }
+
     /// Convenience constructor for a `CreateInstance` with no variables, tags, or
     /// business id.
     pub fn create_instance(process_id: impl Into<String>) -> Self {
@@ -499,6 +530,27 @@ mod kind_tests {
             }
             .kind(),
             "activate_jobs"
+        );
+    }
+
+    #[test]
+    fn approx_bytes_scales_with_variable_payload() {
+        // A payload-free command is just the fixed base.
+        let empty = Command::create_instance("p").approx_bytes();
+        // A create carrying a big string variable is dominated by that payload.
+        let big = "x".repeat(50_000);
+        let mut vars = HashMap::new();
+        vars.insert("p".to_string(), Value::Str(big));
+        let heavy = Command::create_instance_with("p", vars).approx_bytes();
+        assert!(
+            heavy >= empty + 50_000,
+            "payload must dominate: heavy={heavy} empty={empty}"
+        );
+        // Non-payload commands stay at the small base regardless of keys.
+        let tick = Command::ExpireJobs { now: 123 }.approx_bytes();
+        assert!(
+            tick <= empty,
+            "tick={tick} should be <= empty create={empty}"
         );
     }
 }
