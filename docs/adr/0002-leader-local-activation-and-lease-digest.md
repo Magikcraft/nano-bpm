@@ -1,6 +1,6 @@
 # ADR 0002 — Leader-local job activation & best-effort lease digest
 
-Status: **Leader-local activation Accepted (shipped, opt-in). Lease digest Accepted (implemented, opt-in; live failover A/B pending).**
+Status: **Leader-local activation Accepted (shipped, opt-in). Lease digest Accepted (implemented, opt-in; live failover A/B pending). Zero-config `auto` policy Accepted (shipped, DEFAULT under quorum) — see Part C (2026-07-11); resolves to leader-local + digest.**
 Date: 2026-06-23.
 Relates to: ADR 0001 (cluster job-activation fairness), `docs/distributed-scaling-design.md`.
 
@@ -237,7 +237,54 @@ keeping Part A's steady-state throughput. Record here.
   shipped) for throughput-bound workloads that also want a narrowed failover
   redelivery window without external infra.
 
-## References
+## Part C — zero-config `auto` policy (2026-07-11, DEFAULT under quorum)
+
+### Context
+
+Parts A & B were **opt-in**: `NANOBPMN_REPLICATE_ACTIVATION` defaulted to fully
+replicated (`true`) under `quorum`. The 2026-07-11 GCP A/B (see PERFORMANCE.md, "Quorum
+mode at 50KB") showed that default is a **throughput cliff**: with 50 KB variable
+payloads, quorum + replicated activation collapsed completion throughput ~125×
+(2,400 → 19/s, backlog 42k→85k). The activation *command* is small, but under `quorum`
+every activation is an extra majority commit; that per-activation commit tips an already
+loaded commit pipeline over. Switching to `digest` restored full parity with
+leader-durable (2,398/s, p99 91 ms). Requiring the operator to *know* they must set
+`=digest` is a foot-gun.
+
+An earlier revision of this part tried to be clever: an **adaptive per-partition policy**
+that kept the strict replicated lease at small payloads (using a payload-byte EWMA) and
+flipped to leader-local + digest only at large payloads. The 2026-07-11 validation soak
+**disproved that premise**: a *negligible*-payload workload at ~61k jobs/s **wedged**
+(creates and completions both froze, producers hit `MAX_INFLIGHT` and stopped) precisely
+because `auto` kept the strict replicated lease there. The cost of the strict lease is a
+**per-activation quorum commit**, which is unsafe at *any* non-trivial throughput —
+driven by commit COUNT at small payloads and by BYTE volume at large payloads. A signal
+keyed on payload bytes cannot see the count-pressure case. The strict lease is only
+affordable at genuinely low throughput, where its marginal benefit (no failover
+redelivery) does not justify the wedge risk.
+
+### Decision
+
+`NANOBPMN_REPLICATE_ACTIVATION=auto` is the **default under `quorum`** (`leader-durable`
+keeps its Part-A leader-local default). `auto` is a **zero-config alias for leader-local
+activation + the soft lease digest** — behaviourally identical to `=digest` (Part B). It
+never keeps the strict replicated lease. This is validated healthy across the whole
+payload/throughput range:
+
+- **50 KB payload:** 2,400/s, p99 91 ms (parity with leader-durable).
+- **Negligible payload:** ~36k/s aggregate, p50 28 ms / p99 88 ms, backlog ~0.
+
+The operator sets nothing; the strict replicated lease remains available via `=1`/`quorum`
+for parity/testing but is not recommended at scale.
+
+### Parse / precedence
+
+`1`/`true`/`on`/`yes`/`quorum`/`replicate` → Always (Part-A `true`); `digest` → Digest
+(Part B); `auto` → Auto (this part, == Digest behaviour); `0`/`false`/`off`/`no`/`leader-local`/`local`
+(and anything unrecognised) → LeaderLocal (Part-A `false`). Unset → `auto` under quorum,
+leader-local under leader-durable.
+
+
 
 - Code (Part A): `engine-core/src/engine.rs` (`lenient_completion`,
   `set_lenient_completion`, relaxed completion guards),
@@ -245,6 +292,10 @@ keeping Part A's steady-state throughput. Record here.
   `server/src/main.rs` (`replicate_activation_from_env`,
   `ServerImpl.replicate_activation`, `try_activate`, `activate_on_local`,
   `tick_partition_via_raft`). Env: `NANOBPMN_REPLICATE_ACTIVATION`.
+- Code (Part C, zero-config `auto`): `server/src/main.rs`
+  (`ActivationPolicy`, `parse_activation_policy`/`activation_policy_from_env`,
+  `ServerImpl.replicate_activation_for`). Env: `NANOBPMN_REPLICATE_ACTIVATION=auto`
+  (default under quorum).
 - Driver: `~/workspace/nano-demo/scripts/ch2-workers.sh`,
   `driver/src/bin/ch2_workers.rs`.
 - Related: ADR 0001 (the peer piggyback channel Part B reuses),
