@@ -1632,3 +1632,113 @@ persisted orphans or the boot seed.)
 journal).** Boot log: `read-model reconcile: marked orphaned Active rows Completed
 at boot ... reconciled=139 live=0`; `nanobpm_active_backlog` **139 → 0**. The
 gauge now matches authoritative engine state.
+
+## 2026-07-11 — 30 m max-throughput soaks: negligible vs 50 KB payload (build e31567bb)
+
+Two back-to-back 30-minute soaks on the RF=3 GCP cluster (12 partitions,
+`leader-durable`, `SLA_MODE=latency`, build **e31567bb** — the credit-wedge fix,
+below), each from a **wiped journal**. Same offered load in both:
+`RATE=14000/producer × 3 producers` (~42 k/s aggregate offered), `WORKERS=200`,
+`PROD_CONNS=128`, `MAX_INFLIGHT=50000`, `TRANSPORT=stream`. Only `VAR_BYTES`
+differs (0 vs 51200). Loadgen `RESULT` is per-producer (×3); latencies in ms.
+
+| Run | payload | agg tput | completed (30 m) | p50 | p90 | p99 | max | RSS/node |
+|-----|---------|----------|------------------|-----|-----|-----|-----|----------|
+| A   | 0 B     | ~11 k/s  | ~20.2 M          | 22  | 41  | ~70 | ~560 | ~1.4 GB |
+| B   | 50 KB   | ~0.38 k/s| ~0.68 M          | ~2450 | 21–34 k | 51–73 k | ~86 k | ~35 GB |
+
+**Run A (negligible payload)** held cleanly for the full 30 min — no wedge, no
+collapse, tight tail throughout (p99 ~70 ms), memory bounded ~1.4 GB (vs the
+Jul-9 pre-fix leak that degraded 15 k→1.5 k/s with RSS 3→15 GB). Throughput
+self-regulated 40 k/s → ~5 k/s steady as the latency-mode AIMD limiter paced
+intake to hold the tail; `created ≈ completed`, backlog bounded ~50–120 the whole
+run. Validates the heap-leak (cont.6), orphan-reconcile, and credit-wedge fixes
+together.
+
+**Run B (50 KB payload)** is payload-bound: throughput fell from ~1.6 k/s (min 1)
+to ~430/s (min 5) and kept sliding to a whole-run mean of ~120/s/producer; p50
+climbed to ~2.4 s, p99 to ~50–73 s. **No wedge or collapse** — admission shed
+~49 k creates to hold the runnable backlog bounded (~180–700), and the
+bounded-spill fix kept the single writer responsive (no multi-second actor
+stalls). Per-node RSS plateaued ~30 GB early, then crept to ~35–38 GB.
+
+### Why is memory ~35 GB with only a few hundred active instances?
+
+The `nanobpm_mem_pressure_bytes` gauge is **jemalloc resident**, i.e. the OS
+footprint (what Activity Monitor / RSS shows and what triggers the spill
+machinery). It is a *pressure* signal, **not** a measure of live logical state,
+and under large payloads it decouples entirely from the in-flight process count.
+Post-drain snapshot on node0 (loadgens stopped, instances drained) makes this
+unambiguous:
+
+```
+nanobpm_jemalloc_bytes{kind="allocated"} 36.3 GB   <- genuinely live, in-use
+nanobpm_jemalloc_bytes{kind="resident"}  41.2 GB
+nanobpm_jemalloc_bytes{kind="retained"}  37.0 GB   <- freed to OS, still mapped
+nanobpm_raft_log_bytes                   18.35 GB  (13,514 entries, ~1.36 MB/entry)
+nanobpm_resident_var_bytes               0          <- ZERO live instance variables
+nanobpm_active_backlog                   87
+```
+
+So the 36 GB of *allocated* memory is not fragmentation and not instance state
+(`resident_var_bytes = 0`, backlog ~87). It is dominated by the **Raft
+replication log**: every `CreateInstance` carries its 50 KB payload, is journaled
+and replicated RF=3, and the log segments retain those raw command entries until
+a snapshot compacts past them. `LEAN_SNAPSHOT=1` keeps *snapshots* control-only
+(no payloads), but the **log between snapshots** still holds every payload —
+18.35 GB here (~1.36 MB/entry = ~30 batched 50 KB commands/entry). The remainder
+is journal / follower-replica / exporter buffering of the same payloads across
+the 12-partition × RF=3 fan-out, plus jemalloc holding freed pages resident under
+sustained large-allocation churn. The negligible-payload run stayed at ~1.4 GB
+precisely because its log entries are tiny.
+
+**Does the metric make sense?** Yes, as an OS-pressure signal — but it must not
+be read as "memory per active instance". Under large payloads it tracks
+*cumulative replicated-payload volume not yet compacted/returned*, which is why
+it can sit at 35 GB while the engine holds essentially zero live instances.
+
+**Why throughput crawls over time (Run B).** A memory-pressure negative-feedback
+loop: each admitted 50 KB create grows the Raft log and heap → larger
+AppendEntries payloads + heavier apply/compaction + rising resident memory → the
+var-spill machinery fires more and the allocator works harder → apply slows →
+admission sheds more → fewer creates land. The system stays *stable and bounded*
+(no OOM, no wedge) but settles at a much lower payload-bound operating point.
+
+**Follow-ups (not addressed here).** (1) At idle post-Run-B, RSS stays ~35 GB and
+`raft_log_bytes` stays 18 GB — nothing drives snapshot compaction while quiescent,
+so the payload-bearing log is not truncated; a quiescence-triggered compaction (or
+tighter `RAFT_SNAPSHOT_LOGS` under payload-weighted sizing) would reclaim it.
+(2) jemalloc `retained` 37 GB suggests an idle purge / `background_thread` pass
+would return more to the OS. (3) A payload-aware admission signal (bytes in-flight,
+not just runnable-job count) would let the operator bound memory directly rather
+than via the emergent spill/shed feedback.
+
+## 2026-07-11 — Stream submission-credit wedge under sustained load (fix, build e31567bb)
+
+**Symptom.** Sustained near-knee stream load wedged individual producer
+connections after a few minutes — `created` and `completed` fell to ~0 on a
+connection while the engine stayed healthy (manual REST create = 200 in ~11 ms,
+`commit_inflight = 0`, `stream_credit_stalls_total = 0`). Per-connection: a fresh
+connection produced fine; only wedged under load.
+
+**Root cause.** Both submission-credit grant paths in `server/src/falcon.rs`
+(`grant_submission_credit_if_clear`, `topup_submission_credits`) incremented
+`Connection::submission_outstanding` **before** sending the `SubmissionCredits`
+frame. `Connection::send` is a `try_send` that **silently drops** the frame when
+the bounded outbound buffer is full (the slow-consumer guard). Under load the
+buffer fills, the grant frame is dropped, but `outstanding` was already inflated —
+so `topup`'s `grant = submission_window − outstanding` computes `0` on every
+subsequent pass. The client's submission window never reopens: a **permanent
+per-connection producer wedge**.
+
+**Fix.** Factor the send-first / account-on-success logic into
+`Connection::grant_submission_credits(n)`: send the frame, and only
+`fetch_add(n)` into `submission_outstanding` **iff** the enqueue succeeded. A
+dropped grant now self-heals on the next top-up pass. Both call sites use the
+helper. Two unit regression tests cover it (dropped grant ⇒ no inflate; delivered
+grant ⇒ accounts exactly `n`).
+
+**Validation.** The 30-minute negligible-payload soak above (Run A) ran the full
+duration without wedging; the pre-fix build wedged at ~4 min under the same paced
+near-knee load. Release build green, `clippy --features console --all-targets`
+clean.

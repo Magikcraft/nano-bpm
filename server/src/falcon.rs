@@ -2628,7 +2628,10 @@ mod registry_tests {
         );
     }
 
-    fn test_connection_with_rx(id: ConnId, cap: usize) -> (Arc<Connection>, mpsc::Receiver<ServerFrame>) {
+    fn test_connection_with_rx(
+        id: ConnId,
+        cap: usize,
+    ) -> (Arc<Connection>, mpsc::Receiver<ServerFrame>) {
         let (tx, rx) = mpsc::channel::<ServerFrame>(cap);
         let conn = Arc::new(Connection {
             id,
@@ -2654,7 +2657,10 @@ mod registry_tests {
         // on a successful enqueue.
         let (conn, _rx) = test_connection_with_rx(1, 1);
         // tx buffer capacity is 1; fill it so the next enqueue fails.
-        assert!(conn.send(ServerFrame::SubmissionCredits { n: 1 }), "buffer has room");
+        assert!(
+            conn.send(ServerFrame::SubmissionCredits { n: 1 }),
+            "buffer has room"
+        );
         assert!(
             !conn.grant_submission_credits(8),
             "grant is dropped when the outbound buffer is full"
