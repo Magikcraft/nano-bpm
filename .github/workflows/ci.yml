@@ -158,6 +158,14 @@ jobs:
           workspaces: processos
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
+      # DuckDB (libduckdb-sys) compiles a large amount of C++; a cold build (e.g.
+      # when the cache key changes) writes enough object files to exhaust the
+      # runner's root disk. Reclaim space from preinstalled SDKs we don't use.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - name: Clippy
         working-directory: processos
         run: cargo clippy --all-targets -- -D warnings
