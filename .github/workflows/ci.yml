@@ -177,6 +177,17 @@ jobs:
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v5
+      # DuckDB (libduckdb-sys) compiles a large amount of C++; a cold build (e.g.
+      # when the cache key changes) writes enough object files to exhaust the
+      # runner's root disk. Reclaim space from preinstalled SDKs we don't use.
+      # NOTE: this MUST run before sccache-action / taiki-e install tools, because
+      # $AGENT_TOOLSDIRECTORY == /opt/hostedtoolcache, which is where those
+      # actions place their binaries — wiping it afterwards deletes sccache.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -187,14 +198,6 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: taiki-e/install-action@nextest
-      # DuckDB (libduckdb-sys) compiles a large amount of C++; a cold build (e.g.
-      # when the cache key changes) writes enough object files to exhaust the
-      # runner's root disk. Reclaim space from preinstalled SDKs we don't use.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          df -h /
       - name: Clippy
         working-directory: processos
         run: cargo clippy --all-targets -- -D warnings
