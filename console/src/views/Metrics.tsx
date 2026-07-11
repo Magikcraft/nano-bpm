@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from "react";
+import { useRef, useState, useSyncExternalStore } from "react";
 import { nodeConsoleUrl } from "../lib/api";
 import { metricsStore } from "../lib/metricsStore";
 import { Badge, Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
@@ -316,7 +316,9 @@ function Stat({
 
 /// A self-contained inline-SVG sparkline (no chart library — keeps the bundle
 /// lean and the distribution fully offline). Scales the series to its own
-/// min/max and draws a filled area + line.
+/// min/max and draws a filled area + line. Hovering the chart shows a
+/// crosshair + tooltip on the nearest sample (samples are 1s apart — see
+/// `LOCAL_INTERVAL_MS` in metricsStore).
 function Chart({
   title,
   values,
@@ -330,6 +332,16 @@ function Chart({
   const H = 120;
   const pad = 4;
   const last = values[values.length - 1] ?? 0;
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+
+  const hasSeries = values.length >= 2;
+  const max = hasSeries ? Math.max(...values, 1) : 1;
+  const min = hasSeries ? Math.min(...values, 0) : 0;
+  const span = max - min || 1;
+  const n = values.length;
+  const xOf = (i: number) => pad + (i / Math.max(n - 1, 1)) * (W - 2 * pad);
+  const yOf = (v: number) => H - pad - ((v - min) / span) * (H - 2 * pad);
 
   let body: React.ReactNode = (
     <text x={W / 2} y={H / 2} fill="var(--nano-text-faint)" fontSize="13" textAnchor="middle">
@@ -337,14 +349,8 @@ function Chart({
     </text>
   );
 
-  if (values.length >= 2) {
-    const max = Math.max(...values, 1);
-    const min = Math.min(...values, 0);
-    const span = max - min || 1;
-    const n = values.length;
-    const x = (i: number) => pad + (i / (n - 1)) * (W - 2 * pad);
-    const y = (v: number) => H - pad - ((v - min) / span) * (H - 2 * pad);
-    const line = values.map((v, i) => `${x(i)},${y(v)}`).join(" ");
+  if (hasSeries) {
+    const line = values.map((v, i) => `${xOf(i)},${yOf(v)}`).join(" ");
     const area = `${pad},${H - pad} ${line} ${W - pad},${H - pad}`;
     body = (
       <>
@@ -357,25 +363,89 @@ function Chart({
           strokeLinejoin="round"
           strokeLinecap="round"
         />
+        {hoverIdx != null && hoverIdx >= 0 && hoverIdx < n && (
+          <>
+            <line
+              x1={xOf(hoverIdx)}
+              x2={xOf(hoverIdx)}
+              y1={pad}
+              y2={H - pad}
+              stroke="var(--nano-text-faint)"
+              strokeWidth={0.75}
+              strokeDasharray="3 3"
+              opacity={0.7}
+            />
+            <circle
+              cx={xOf(hoverIdx)}
+              cy={yOf(values[hoverIdx])}
+              r={3}
+              fill={color}
+              stroke="var(--nano-app)"
+              strokeWidth={1.5}
+            />
+          </>
+        )}
       </>
     );
   }
+
+  const onMove = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (!hasSeries) return;
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    // Map from client pixels back to viewBox space (SVG is set to
+    // preserveAspectRatio="none" so it stretches horizontally).
+    const vx = (px / rect.width) * W;
+    const t = ((vx - pad) / (W - 2 * pad)) * (n - 1);
+    const idx = Math.max(0, Math.min(n - 1, Math.round(t)));
+    setHoverIdx(idx);
+  };
+
+  const secondsAgo =
+    hoverIdx != null && hasSeries ? n - 1 - hoverIdx : null;
+  const hoverValue = hoverIdx != null ? values[hoverIdx] : null;
+
+  // Tooltip left offset in %, clamped so it stays inside the plot at the edges.
+  const tipLeftPct =
+    hoverIdx != null && hasSeries
+      ? Math.max(4, Math.min(96, (xOf(hoverIdx) / W) * 100))
+      : 0;
 
   return (
     <Card className="p-4">
       <div className="mb-2 flex items-baseline justify-between">
         <span className="text-sm text-fg-muted">{title}</span>
         <span className="text-sm font-semibold tabular-nums" style={{ color }}>
-          {fmt(last, last < 10 ? 1 : 0)}
+          {fmt(hoverValue ?? last, (hoverValue ?? last) < 10 ? 1 : 0)}
         </span>
       </div>
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="none"
-        className="h-28 w-full"
-      >
-        {body}
-      </svg>
+      <div className="relative">
+        <svg
+          ref={svgRef}
+          viewBox={`0 0 ${W} ${H}`}
+          preserveAspectRatio="none"
+          className="h-28 w-full"
+          onPointerMove={onMove}
+          onPointerLeave={() => setHoverIdx(null)}
+        >
+          {body}
+        </svg>
+        {hoverIdx != null && hoverValue != null && (
+          <div
+            className="pointer-events-none absolute -top-1 z-10 -translate-x-1/2 -translate-y-full rounded-md border border-edge bg-raised px-2 py-1 text-xs shadow-md"
+            style={{ left: `${tipLeftPct}%` }}
+          >
+            <div className="font-semibold tabular-nums" style={{ color }}>
+              {fmt(hoverValue, hoverValue < 10 ? 2 : 0)}
+            </div>
+            <div className="text-fg-faint tabular-nums">
+              {secondsAgo === 0 ? "now" : `${secondsAgo}s ago`}
+            </div>
+          </div>
+        )}
+      </div>
     </Card>
   );
 }
