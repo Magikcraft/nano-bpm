@@ -35,8 +35,13 @@
 //! re-run layout → eyeball the debug SVG.
 
 pub mod annotate;
+pub mod conformance;
 pub mod debug_svg;
 pub mod field;
+pub mod gates;
+pub mod geom;
+pub mod guarded;
+pub mod polish;
 pub mod schema;
 pub mod solver;
 

@@ -28,3 +28,6 @@ processos/.venv/
 # Console workspace (NANOBPMN_WORKSPACE_DIR: authoring source of truth — BPMN
 # models + worker code). User content, not committed.
 nanobpm-workspace/
+
+.processos-nano-data/
+nohup.out

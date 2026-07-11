@@ -497,6 +497,7 @@ async fn main() {
         .route("/api/pilot", get(pilot_get).put(pilot_put))
         .route("/api/pilot/reset", post(pilot_reset))
         .route("/api/layout", post(layout_relayout))
+        .route("/api/layout/score", post(layout_score))
         .route("/api/colorize", post(colorize_flows_handler))
         .route("/api/curator/propose", post(curator_propose))
         .route("/api/curator/propose/stream", post(curator_propose_stream))
@@ -935,17 +936,32 @@ const LANDING_HTML: &str = include_str!("landing.html");
 /// eyeball how a proposed model looks under the ELK client-side layout vs. the
 /// server-side row-bias or Fromme (field) semantic layouts.
 ///
+/// Slice 15 additions: the response now includes a `conformance` score
+/// (weighted mean of 8 BPMN best-practice rules — see
+/// [`layout::conformance`]) and `gates` block (coverage + overlap), and
+/// the request accepts `polish: bool` to run the deterministic polish pass
+/// (grid-snap + gateway centring + happy-path align, non-regressing).
+/// The solver call goes through [`layout::guarded::run`] so a panicking
+/// experimental solver falls back to RowBias instead of 500-ing.
+///
 /// Request body:
 /// ```json
 /// { "xml": "<bpmn:definitions>…</bpmn:definitions>",
 ///   "solver": "rowbias" | "field",
-///   "annotations": { … optional SemanticAnnotations … } }
+///   "annotations": { … optional SemanticAnnotations … },
+///   "colorize": false,
+///   "polish": false }
 /// ```
 /// Response body:
 /// ```json
 /// { "bpmn_xml": "<bpmn:definitions>… with fresh DI …</bpmn:definitions>",
 ///   "debug_svg": "<svg …/>",
-///   "solver": "rowbias" }
+///   "solver": "rowbias",
+///   "used_solver": "rowbias",
+///   "fallback": null,
+///   "conformance": { "score": 0.81, "rules": [ … ] },
+///   "gates": { "coverage": 1.0, "overlap_ratio": 0.0, "passed": true, … },
+///   "polish": { "moves": 3, "aligns": 2, "reverted": false, "candidate": 0 } }
 /// ```
 /// Errors return 400 with `{ "error": "…" }`.
 #[derive(Deserialize)]
@@ -960,6 +976,12 @@ struct LayoutRequest {
     /// on disk is never touched.
     #[serde(default)]
     colorize: bool,
+    /// Slice 15: when true, run [`layout::polish::polish`] on the solver
+    /// output. Non-regressing — if the polish pass would lower conformance
+    /// or raise overlap, the original layout is shipped and
+    /// `polish.reverted = true` in the response.
+    #[serde(default)]
+    polish: bool,
 }
 
 async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
@@ -975,28 +997,105 @@ async fn layout_relayout(Json(req): Json<LayoutRequest>) -> impl IntoResponse {
     };
     let structural = layout::annotate::infer_from_xml(&req.xml);
     let ann = layout::annotate::merge(req.annotations, structural);
-    match layout::layout_with(&req.xml, &ann, solver) {
-        Ok(out) => {
-            let bpmn_xml = if req.colorize {
-                colorize::colorize_flows(&out.bpmn_xml, &ann)
-            } else {
-                out.bpmn_xml
-            };
-            Json(serde_json::json!({
-                "bpmn_xml": bpmn_xml,
-                "debug_svg": out.debug_svg,
-                "solver": req.solver,
-                "annotations_used": ann,
-                "colorized": req.colorize,
-            }))
-            .into_response()
+    let declared = layout::guarded::declared_shape_count(&req.xml);
+    let guarded = match layout::guarded::run(&req.xml, &ann, solver, declared) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
         }
-        Err(e) => (
+    };
+    let (polished_xml, polish_meta) = if req.polish {
+        let (px, pm) = layout::polish::polish(&guarded.output.bpmn_xml, &ann);
+        (px, Some(pm))
+    } else {
+        (guarded.output.bpmn_xml, None)
+    };
+    let bpmn_xml = if req.colorize {
+        colorize::colorize_flows(&polished_xml, &ann)
+    } else {
+        polished_xml
+    };
+    // Score the final laid-out geometry (post-polish, pre-colorize is fine
+    // — colorize only adds attributes, doesn't move things).
+    let geom = layout::geom::parse(&bpmn_xml);
+    let conf = layout::conformance::score(&geom, &ann);
+    let gates = layout::gates::evaluate(&geom, declared);
+    let used_solver_name = match guarded.used_solver {
+        layout::Solver::RowBias => "rowbias",
+        layout::Solver::Field => "field",
+    };
+    Json(serde_json::json!({
+        "bpmn_xml": bpmn_xml,
+        "debug_svg": guarded.output.debug_svg,
+        "solver": req.solver,
+        "used_solver": used_solver_name,
+        "fallback": guarded.fallback,
+        "annotations_used": ann,
+        "colorized": req.colorize,
+        "conformance": conf,
+        "gates": gates,
+        "polish": polish_meta,
+    }))
+    .into_response()
+}
+
+/// `POST /api/layout/score` — score an already-laid-out BPMN document
+/// against the 8-rule BPMN best-practices conformance metric plus the
+/// coverage / overlap correctness gates. Does not modify the input.
+///
+/// Slice 15: exposes [`layout::conformance::score`] + [`layout::gates::evaluate`]
+/// so callers can objectively compare renderer outputs (RowBias vs Field vs
+/// bpmn-js ELK vs the authored DI) without eyeballing them. Annotations
+/// are optional — when omitted, the structural pass infers the happy path
+/// so `happyPathStraight` is still meaningful.
+///
+/// Request body:
+/// ```json
+/// { "xml": "<bpmn:definitions>… with DI …</bpmn:definitions>",
+///   "annotations": { … optional SemanticAnnotations … } }
+/// ```
+/// Response body:
+/// ```json
+/// { "conformance": { "score": 0.81, "rules": [
+///     { "key": "flowDirection", "label": "Left-to-right flow",
+///       "weight": 0.22, "score": 1.0,
+///       "source": "Silver M&S; Camunda; Effinger" }, … ] },
+///   "gates": { "coverage": 1.0, "overlap_ratio": 0.0, "passed": true,
+///              "penalty": 1.0, "failures": [] },
+///   "declared_shapes": 5, "drawn_shapes": 5 }
+/// ```
+#[derive(Deserialize)]
+struct LayoutScoreRequest {
+    xml: String,
+    #[serde(default)]
+    annotations: Option<layout::SemanticAnnotations>,
+}
+
+async fn layout_score(Json(req): Json<LayoutScoreRequest>) -> impl IntoResponse {
+    if req.xml.trim().is_empty() {
+        return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
+            Json(serde_json::json!({ "error": "xml is required" })),
         )
-            .into_response(),
+            .into_response();
     }
+    let structural = layout::annotate::infer_from_xml(&req.xml);
+    let ann = layout::annotate::merge(req.annotations, structural);
+    let declared = layout::guarded::declared_shape_count(&req.xml);
+    let geom = layout::geom::parse(&req.xml);
+    let conf = layout::conformance::score(&geom, &ann);
+    let gates = layout::gates::evaluate(&geom, declared);
+    Json(serde_json::json!({
+        "conformance": conf,
+        "gates": gates,
+        "declared_shapes": declared,
+        "drawn_shapes": geom.nodes.len(),
+    }))
+    .into_response()
 }
 
 /// `POST /api/colorize` — apply the flow colour pass to a BPMN XML

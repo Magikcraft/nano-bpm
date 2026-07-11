@@ -34,6 +34,51 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## 2026-07-11 — Raft-log compaction governor (50KB-payload memory + throughput)
+
+**Problem (from the 50KB soak, see below):** under 50KB variable payloads the
+committed memory ran to **~40GB/node and did not reclaim at idle**, while
+throughput crawled to ~375/s agg. Root-caused to the **payload-bearing Raft log**,
+not instance state: `jemalloc allocated` 37–49GB was genuinely *live* (only ~5GB
+purge-reclaimable), `resident_var_bytes=0`, and only ~1,975 tiny instance shells
+were resident. The log wouldn't reclaim because:
+
+1. `snapshot_policy: LogsSinceLast(5000)` triggers on **applied entry count** — blind
+   to payload size (a batched entry is ~1MB at 50KB × up-to-1024 commands) and only
+   fires while entries are being applied. Load stops → no applies → no snapshot → the
+   payload log is pinned indefinitely.
+2. `max_in_snapshot_log_to_keep` fell through to openraft's default **1000**, pinning
+   ~1.36GB/partition even immediately after a snapshot at 50KB payloads.
+
+**Fix — a per-node compaction governor** (`server/src/raft.rs`
+`spawn_compaction_governor`, spawned once after the node registers its Raft
+members). Every `NANOBPMN_RAFT_COMPACT_TICK_MS` (default 5000, `0`=off) it walks
+every hosted partition — **leader and follower**, since each compacts its own local
+log — and triggers a snapshot when there is an un-snapshotted log tail AND either:
+
+- **byte cadence:** live log bytes ≥ `NANOBPMN_RAFT_SNAPSHOT_BYTES` (default 128MiB),
+  bounding committed memory by *bytes* rather than entry count; or
+- **quiescence:** the partition's `last_applied` is unchanged since the previous tick
+  (idle) — so an idle node compacts its payload log instead of pinning it until the
+  next write.
+
+Triggering is idempotent (openraft coalesces redundant/in-flight requests); after a
+snapshot openraft purges below the (now env-tunable) keep-floor
+`NANOBPMN_RAFT_KEEP_LOGS` (default 1000). Live log bytes are tracked with an
+`AtomicI64` fed from `RaftLogStore` (`bytes_handle()`), updated on
+append/truncate/purge.
+
+**Throughput link:** bounding the log bounds RSS → less memory pressure → the
+variable-spill machinery fires less → the single-writer engine actor stalls less →
+higher sustained 50KB throughput. Purely-additive to the entry-count policy
+(whichever fires first wins).
+
+Decision logic is unit-tested (`should_compact`); release build + `clippy
+--all-targets` clean; 265 bin tests pass. GCP 50KB before/after numbers pending
+re-measurement on the cluster.
+
+---
+
 ## 2026-07-07 — Durability A/B ceiling: the "journal-writer wall" is a **misdiagnosis**
 
 **Question:** how much of the RF=3 ceiling is the journal-writer fsync barrier?
@@ -1742,3 +1787,150 @@ grant ⇒ accounts exactly `n`).
 duration without wedging; the pre-fix build wedged at ~4 min under the same paced
 near-knee load. Release build green, `clippy --features console --all-targets`
 clean.
+
+## 2026-07-11 — 50KB producer wedge ROOT-CAUSED (Raft AppendEntries) + FIXED + GCP-validated
+
+The 50KB soak collapsed to **0 throughput at ~4 min** (throughput "limped" then
+wedged) even with the credit-wedge (PR #78) and compaction-governor (PR #80) fixes
+deployed. The engine stayed healthy throughout (manual create = 200 in ~7 ms,
+admission not shedding, `active_backlog` ~0) — a producer-side wedge, not an engine
+stall.
+
+**Root cause — oversized AppendEntries vs the 250 ms RPC timeout.** The Raft propose
+`Batcher` (`server/src/raft.rs`) coalesced up to `MAX_PROPOSE_BATCH=1024` commands
+into ONE log entry by **count only** — at 50 KB/instance that is a ~51 MB entry
+(observed avg ~1 MB/entry). openraft then bundles up to `max_payload_entries`
+(default **300**) such entries into a single AppendEntries → hundreds of MB per RPC.
+That cannot transfer within openraft's ~250 ms AppendEntries timeout
+(= `heartbeat_interval`), so replication **times out bidirectionally between all
+peers**, a lagging follower can never catch up, and the shared falcon stream
+transport starves: client creates stall, job frames and heartbeats delay, and
+connections are reaped (**332 → 4**). Decisive journal evidence during the collapse:
+continuous `openraft ... timeout after 250ms when AppendEntries` between every peer
+pair (0↔1, 0↔2, 1↔2).
+
+**Fix (commit `b477735`).** Bound a coalesced entry by **bytes** as well as count
+(`NANOBPMN_RAFT_MAX_ENTRY_BYTES`, default 1 MiB; the first command is always
+included so a lone oversized command still progresses) via a new
+`Command::approx_bytes()` estimator dominated by carried `variables`; and cap
+entries-per-AppendEntries (`NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES`, default **16**).
+Together these keep each AppendEntries ≤ ~16 MiB — shippable well within the RPC
+timeout regardless of payload size. Small-payload throughput is unchanged (the byte
+cap never binds, so entries still hold up to 1024 commands; 16 entries/RPC keeps
+follower catch-up fast).
+
+**GCP validation (build `03803dd0` = compaction governor + credit-wedge +
+byte-bound batcher, RF=3 leader-durable, fresh journal, SLA=latency, 50 KB payload,
+RATE=14000/prod).**
+
+Ran the **full 30 min** (DUR=1800s, W=200, PC=128, RATE=14000/prod).
+
+| metric | PRE-FIX (cadf39e0) | POST-FIX (03803dd0), full 30 min |
+| --- | --- | --- |
+| throughput (agg) | ramp then **0 at ~4 min** | **~2,400/s held the entire run** |
+| completed instances | — (wedged) | **~4.3M** (1.39M+1.44M+1.48M/loadgen) |
+| latency (50 KB payload) | — | **p50 53 ms · p90 65 ms · p99 91 ms · max 111 ms** |
+| stream_connections/node | collapse **332 → 4** | **332 stable** (→4 only post-run) |
+| AppendEntries 250ms timeouts | continuous, all peer pairs | ~6 sporadic / 3 min |
+| raft_log_entries | froze (wedged) | **flat ~12k/node (bounded)** |
+| raft_partition_shutdown | — | 0 |
+
+Memory at 50 KB is **bounded, not leaking**: ~18 GB RSS / ~14.4 GB jemalloc-active
+per node, ~13.3 GB `raft_log_bytes`/node — all held **flat** across the run (entries
+steady ~12k/node). Each entry now byte-caps near 1 MiB (13.3 GB / 12.3k entries ≈
+1.08 MB/entry), so the log size is a direct function of `keep-floor` × entry-byte-cap.
+The residual is dominated by the retained 50 KB payloads in the Raft log; further
+reduction needs a lower `NANOBPMN_RAFT_KEEP_LOGS` and/or learner-catch-up-aware purge
+under leader-durable (a follower is a learner whose lag currently gates openraft log
+purge) — or a quorum-mode run. That is the remaining memory lever; the **throughput
+wedge itself is resolved**.
+
+The admission backlog rail shed **6,219** during backlog spikes (governor working as
+intended). Post-run residual **3,468 active** (node0 1,593 · node1 1,875 · node2 0)
+is the benign in-flight tail stranded when loadgen workers disconnect at end of run:
+`creates_total − job_completions_total` equals `active_backlog` exactly on every node
+(1,440,267 − 1,438,674 = 1,593 on node0), so the gauge is **accurate** — this is real
+un-completed engine state (0.08% of throughput), **not** the idempotent-redelivery
+counter-drift (which shows backlog>0 while creates==completes). It is flat (no
+workers to complete it) and recycles on job-lease/liveness expiry.
+
+## 2026-07-11 — Quorum mode at 50KB: `replicate_activation=digest` is mandatory
+
+With the byte-bound AppendEntries fix in place (build `03803dd0`), we validated
+**quorum replication** (`NANOBPMN_REPLICATION=quorum`: all replicas voters, majority
+commit) at the same 50 KB / max-throughput profile as the leader-durable run above.
+The transport wedge does **not** return in either mode — the byte cap is what fixes
+that. But quorum has a second, independent cliff at 50 KB that leader-durable never
+hit: **the activation-replication policy.**
+
+**Leg A — quorum, default activation (`replicate_activation=true`).** Every job
+activation becomes a 50 KB majority Raft round-trip (≈3 quorum commits/job). Result:
+throughput **collapsed ~125×** — comp_rate fell 161→0/s, backlog exploded 42k→85k,
+aggregate **~19 completions/s** vs leader-durable's ~2,400/s. No transport timeouts
+(connections stable at 332), so this is a **commit-pipeline saturation**, not the
+wedge: `commit_inflight` crawled at ~44 while admission shed 69,795 on backlog.
+Leader-durable dodged this because the leader acks activations locally (quorum=1).
+
+**Leg B — quorum, `replicate_activation=digest`** (leader-local activation, leases
+kept off the Raft log). Full 30 min, RF=3, fresh journal, compaction governor ON,
+RATE=14000/prod.
+
+| metric | quorum + default act. | quorum + **digest** | leader-durable (ref) |
+| --- | --- | --- | --- |
+| throughput (agg) | **~19/s (125× collapse)** | **~2,398/s** (787+806+805) | ~2,400/s |
+| completed instances | — (backlog exploded) | **4,315,731** | ~4.3M |
+| latency (50 KB) | — | **p50 58 ms · p90 64 ms · p99 91 ms · max 104 ms** | p50 53 · p99 91 ms |
+| backlog (steady) | 42k→85k unbounded | **bounded ~250** | bounded |
+| stream_connections/node | 332 (no wedge) | **332 stable** | 332 |
+| commit_inflight | ~44 saturated | **124 flowing** | — |
+| raft_log_entries | — | **flat ~12k (node0) / ~37k agg** | ~12k/node |
+| raft_log_bytes/node | — | **13.05 GB** | 13.3 GB |
+| jemalloc-active/node | — | **19.3 GB** | 14.4 GB |
+
+**Verdict.** Quorum mode is fully viable at 50 KB **only** with
+`NANOBPMN_REPLICATE_ACTIVATION=digest`. With it, quorum reaches **throughput and
+latency parity** with leader-durable (2,398/s vs 2,400/s; p99 91 ms in both) while
+providing node-loss durability, at a memory cost of ~1.3× (19.3 vs 14.4 GB
+jemalloc/node — voters materialize full follower state where leader-durable's
+learners lag). The default `replicate_activation=true` is unusable at 50 KB (125×
+collapse) and should not be used for large-payload quorum deployments. raftlog stays
+bounded/flat under the compaction governor in both modes. The end-of-run backlog
+spike (to ~69k) is the same benign teardown tail — workers disconnect before
+producers stop, stranding in-flight creates that never get completed.
+
+### Follow-up — zero-config `auto` activation policy (default under quorum)
+
+The two findings above (default quorum activation collapses at 50KB; `digest` restores
+parity) are now resolved without operator intervention. `NANOBPMN_REPLICATE_ACTIVATION`
+gains an `auto` mode, which is the **new default under quorum**. `auto` is a zero-config
+alias for **leader-local activation + the soft lease digest** (behaviourally identical to
+`=digest`); it never keeps the strict replicated lease.
+
+An earlier revision made `auto` *adaptive* — keeping the strict replicated lease at small
+payloads (from a payload-byte EWMA) and flipping to leader-local + digest at large ones.
+The 2026-07-11 GCP validation **disproved that premise**: a *negligible*-payload soak at
+~61k jobs/s **wedged** (creates and completions both froze, producers hit `MAX_INFLIGHT`)
+precisely because `auto` kept the strict replicated lease there. The strict lease's cost
+is a **per-activation quorum commit**, which is unsafe at *any* non-trivial throughput —
+commit-COUNT pressure at small payloads, BYTE pressure at large ones — so a
+payload-byte signal is the wrong signal. `auto` therefore always goes leader-local +
+digest.
+
+Validation of the shipped `auto` default (quorum, RF=3, byte-bound propose fix, governor
+on) — each leg on a freshly-wiped cluster:
+
+| Payload | Aggregate tput | p50 / p99 | Backlog (in-run) | Result |
+|---|---|---|---|---|
+| Negligible (VB=0) | ~33.7k/s (3×~11.2k/s) | 28 / ~100 ms | ~0 | healthy, no wedge |
+| 50 KB (VB=51200) | ~2,411/s (3×~805/s) | 59 / 94 ms | ~100/node | parity w/ leader-durable/digest |
+
+The 50 KB leg matches the `digest` baseline above (2,398/s, p50 58 / p99 91 ms) exactly,
+confirming `auto` == leader-local + digest at both payload extremes. NB: each leg must run
+on a **wiped** cluster — stacking the 50 KB leg on top of the negligible leg's ~8M
+retained instances (no wipe) starves it (jemalloc ~15 GB/node, throughput → tens/s); this
+is accumulated read-model/raftlog pressure, not an activation regression.
+
+Create/complete/timer durability is fully quorum-committed in every mode; only the
+activation lease is leader-local (covered by the digest on failover). The strict
+replicated lease remains available via `=1`/`quorum` for parity/testing, not recommended
+at scale. See ADR 0002 Part C.
