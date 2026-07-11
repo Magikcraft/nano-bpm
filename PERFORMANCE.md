@@ -1677,3 +1677,56 @@ persisted orphans or the boot seed.)
 journal).** Boot log: `read-model reconcile: marked orphaned Active rows Completed
 at boot ... reconciled=139 live=0`; `nanobpm_active_backlog` **139 → 0**. The
 gauge now matches authoritative engine state.
+
+## 2026-07-11 — 50KB producer wedge ROOT-CAUSED (Raft AppendEntries) + FIXED + GCP-validated
+
+The 50KB soak collapsed to **0 throughput at ~4 min** (throughput "limped" then
+wedged) even with the credit-wedge (PR #78) and compaction-governor (PR #80) fixes
+deployed. The engine stayed healthy throughout (manual create = 200 in ~7 ms,
+admission not shedding, `active_backlog` ~0) — a producer-side wedge, not an engine
+stall.
+
+**Root cause — oversized AppendEntries vs the 250 ms RPC timeout.** The Raft propose
+`Batcher` (`server/src/raft.rs`) coalesced up to `MAX_PROPOSE_BATCH=1024` commands
+into ONE log entry by **count only** — at 50 KB/instance that is a ~51 MB entry
+(observed avg ~1 MB/entry). openraft then bundles up to `max_payload_entries`
+(default **300**) such entries into a single AppendEntries → hundreds of MB per RPC.
+That cannot transfer within openraft's ~250 ms AppendEntries timeout
+(= `heartbeat_interval`), so replication **times out bidirectionally between all
+peers**, a lagging follower can never catch up, and the shared falcon stream
+transport starves: client creates stall, job frames and heartbeats delay, and
+connections are reaped (**332 → 4**). Decisive journal evidence during the collapse:
+continuous `openraft ... timeout after 250ms when AppendEntries` between every peer
+pair (0↔1, 0↔2, 1↔2).
+
+**Fix (commit `b477735`).** Bound a coalesced entry by **bytes** as well as count
+(`NANOBPMN_RAFT_MAX_ENTRY_BYTES`, default 1 MiB; the first command is always
+included so a lone oversized command still progresses) via a new
+`Command::approx_bytes()` estimator dominated by carried `variables`; and cap
+entries-per-AppendEntries (`NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES`, default **16**).
+Together these keep each AppendEntries ≤ ~16 MiB — shippable well within the RPC
+timeout regardless of payload size. Small-payload throughput is unchanged (the byte
+cap never binds, so entries still hold up to 1024 commands; 16 entries/RPC keeps
+follower catch-up fast).
+
+**GCP validation (build `03803dd0` = compaction governor + credit-wedge +
+byte-bound batcher, RF=3 leader-durable, fresh journal, SLA=latency, 50 KB payload,
+RATE=14000/prod).**
+
+| metric | PRE-FIX (cadf39e0) | POST-FIX (03803dd0) |
+| --- | --- | --- |
+| throughput (agg) | ramp then **0 at ~4 min** | **~2,400/s HELD 11+ min** |
+| stream_connections/node | collapse **332 → 4** | **332 stable** |
+| AppendEntries 250ms timeouts | continuous, all peer pairs | ~6 sporadic / 3 min |
+| raft_log_entries | froze (wedged) | **flat ~12k/node (bounded)** |
+| raft_partition_shutdown | — | 0 |
+
+Memory at 50 KB is **bounded, not leaking**: ~18 GB RSS/node and ~13.3 GB
+`raft_log_bytes`/node held **flat** across the run (entries steady ~12k/node). Each
+entry now byte-caps near 1 MiB (13.3 GB / 12.3k entries ≈ 1.08 MB/entry), so the log
+size is a direct function of `keep-floor` × entry-byte-cap. The residual ~18 GB is
+dominated by the retained 50 KB payloads in the Raft log; further reduction needs a
+lower `NANOBPMN_RAFT_KEEP_LOGS` and/or learner-catch-up-aware purge under
+leader-durable (a follower is a learner whose lag currently gates openraft log
+purge) — or a quorum-mode run. That is the remaining memory lever; the **throughput
+wedge itself is resolved**.
