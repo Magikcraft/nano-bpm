@@ -1713,20 +1713,33 @@ follower catch-up fast).
 byte-bound batcher, RF=3 leader-durable, fresh journal, SLA=latency, 50 KB payload,
 RATE=14000/prod).**
 
-| metric | PRE-FIX (cadf39e0) | POST-FIX (03803dd0) |
+Ran the **full 30 min** (DUR=1800s, W=200, PC=128, RATE=14000/prod).
+
+| metric | PRE-FIX (cadf39e0) | POST-FIX (03803dd0), full 30 min |
 | --- | --- | --- |
-| throughput (agg) | ramp then **0 at ~4 min** | **~2,400/s HELD 11+ min** |
-| stream_connections/node | collapse **332 → 4** | **332 stable** |
+| throughput (agg) | ramp then **0 at ~4 min** | **~2,400/s held the entire run** |
+| completed instances | — (wedged) | **~4.3M** (1.39M+1.44M+1.48M/loadgen) |
+| latency (50 KB payload) | — | **p50 53 ms · p90 65 ms · p99 91 ms · max 111 ms** |
+| stream_connections/node | collapse **332 → 4** | **332 stable** (→4 only post-run) |
 | AppendEntries 250ms timeouts | continuous, all peer pairs | ~6 sporadic / 3 min |
 | raft_log_entries | froze (wedged) | **flat ~12k/node (bounded)** |
 | raft_partition_shutdown | — | 0 |
 
-Memory at 50 KB is **bounded, not leaking**: ~18 GB RSS/node and ~13.3 GB
-`raft_log_bytes`/node held **flat** across the run (entries steady ~12k/node). Each
-entry now byte-caps near 1 MiB (13.3 GB / 12.3k entries ≈ 1.08 MB/entry), so the log
-size is a direct function of `keep-floor` × entry-byte-cap. The residual ~18 GB is
-dominated by the retained 50 KB payloads in the Raft log; further reduction needs a
-lower `NANOBPMN_RAFT_KEEP_LOGS` and/or learner-catch-up-aware purge under
-leader-durable (a follower is a learner whose lag currently gates openraft log
+Memory at 50 KB is **bounded, not leaking**: ~18 GB RSS / ~14.4 GB jemalloc-active
+per node, ~13.3 GB `raft_log_bytes`/node — all held **flat** across the run (entries
+steady ~12k/node). Each entry now byte-caps near 1 MiB (13.3 GB / 12.3k entries ≈
+1.08 MB/entry), so the log size is a direct function of `keep-floor` × entry-byte-cap.
+The residual is dominated by the retained 50 KB payloads in the Raft log; further
+reduction needs a lower `NANOBPMN_RAFT_KEEP_LOGS` and/or learner-catch-up-aware purge
+under leader-durable (a follower is a learner whose lag currently gates openraft log
 purge) — or a quorum-mode run. That is the remaining memory lever; the **throughput
 wedge itself is resolved**.
+
+The admission backlog rail shed **6,219** during backlog spikes (governor working as
+intended). Post-run residual **3,468 active** (node0 1,593 · node1 1,875 · node2 0)
+is the benign in-flight tail stranded when loadgen workers disconnect at end of run:
+`creates_total − job_completions_total` equals `active_backlog` exactly on every node
+(1,440,267 − 1,438,674 = 1,593 on node0), so the gauge is **accurate** — this is real
+un-completed engine state (0.08% of throughput), **not** the idempotent-redelivery
+counter-drift (which shows backlog>0 while creates==completes). It is flat (no
+workers to complete it) and recycles on job-lease/liveness expiry.
