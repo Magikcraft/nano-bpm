@@ -32,7 +32,7 @@
 //! it is recoverable when *all* sealed segments have been compacted away).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,6 +73,142 @@ pub fn segment_bytes_from_env() -> u64 {
         },
         Err(_) => DEFAULT_SEGMENT_BYTES,
     }
+}
+
+/// Whether the segmented journal should frame-compress its durable writes.
+/// Off by default; set `NANOBPMN_JOURNAL_COMPRESS=1` to enable. This is the
+/// "value codec": the writer deflates each group-commit batch *before* it hits
+/// the active segment, shrinking the physical write bandwidth that bounds
+/// large-payload (50 KB-class) throughput — the 264 MB/s per-node disk-write
+/// wall. Only the *segmented* path honours it; the legacy single-file journal
+/// always writes plaintext.
+pub fn journal_compress_from_env() -> bool {
+    matches!(
+        std::env::var("NANOBPMN_JOURNAL_COMPRESS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Frame magic: ASCII RS (record separator, `0x1E`). A plaintext journal record
+/// always begins with a digit (`<partition>\t…`) or `{` (bare event JSON), never
+/// `0x1E`, so a reader can tell a compressed frame from a legacy line by looking
+/// at one byte — which lets a single segment freely interleave the two (the
+/// compression flag can flip across a restart while the same active segment is
+/// still open).
+const FRAME_MAGIC: u8 = 0x1E;
+/// Frame carries the batch verbatim (compression declined but framing kept).
+const CODEC_RAW: u8 = 0;
+/// Frame body is raw-deflate (mirrors the Raft wire codec in `raft_net.rs`).
+const CODEC_DEFLATE: u8 = 1;
+/// Frame header: `magic(1) | codec(1) | raw_len(u32 LE) | comp_len(u32 LE)`.
+const FRAME_HEADER_LEN: usize = 10;
+/// Don't frame batches below this — the header + deflate cost isn't worth it,
+/// and (crucially) the negligible/high-rate regime commits small batches that
+/// must stay verbatim so the single journal-writer thread is never taxed.
+const MIN_FRAME_BYTES: usize = 16 * 1024;
+/// Only compress when the batch's *mean* event is at least this big. This gates
+/// compression to the big-payload regime and skips high-rate small-event
+/// batches even when they aggregate past `MIN_FRAME_BYTES`.
+const MIN_AVG_EVENT_BYTES: usize = 1024;
+
+/// Frames a group-commit `buf` for durable append, deflating it when it is worth
+/// it. Returns `None` when the batch should be written verbatim (too small, mean
+/// event too small, deflate failed, or the result didn't actually shrink it) —
+/// mixing framed and plaintext records in one segment is expected and the reader
+/// tolerates it. Never errors: compression is best-effort, durability is not.
+fn frame_compress(buf: &[u8], events: u64) -> Option<Vec<u8>> {
+    if buf.len() < MIN_FRAME_BYTES {
+        return None;
+    }
+    if buf.len() / (events.max(1) as usize) < MIN_AVG_EVENT_BYTES {
+        return None;
+    }
+    use std::io::Write;
+
+    use flate2::{Compression, write::DeflateEncoder};
+    let mut enc = DeflateEncoder::new(Vec::with_capacity(buf.len() / 2), Compression::fast());
+    if enc.write_all(buf).is_err() {
+        return None;
+    }
+    let comp = enc.finish().ok()?;
+    // Only worth a frame if it meaningfully shrinks the physical write.
+    if comp.len().checked_add(FRAME_HEADER_LEN)? >= buf.len() {
+        return None;
+    }
+    let raw_len = u32::try_from(buf.len()).ok()?;
+    let comp_len = u32::try_from(comp.len()).ok()?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + comp.len());
+    frame.push(FRAME_MAGIC);
+    frame.push(CODEC_DEFLATE);
+    frame.extend_from_slice(&raw_len.to_le_bytes());
+    frame.extend_from_slice(&comp_len.to_le_bytes());
+    frame.extend_from_slice(&comp);
+    Some(frame)
+}
+
+/// Decodes a segment file into its logical plaintext bytes — the concatenated
+/// newline-terminated records the writer appended — transparently inflating any
+/// compressed frames. Walks the file record-by-record: a [`FRAME_MAGIC`] byte
+/// begins a frame, anything else begins a legacy plaintext line, so a segment
+/// may freely interleave the two. A torn trailing frame header/body (a crash
+/// mid-append that was never fsynced, hence never acked) is dropped, matching
+/// the writer's ack-after-write-before-fsync durability contract.
+fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let raw = fs::read(path)?;
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == FRAME_MAGIC {
+            if i + FRAME_HEADER_LEN > raw.len() {
+                break; // torn header tail — nothing durable past here
+            }
+            let codec = raw[i + 1];
+            let raw_len = u32::from_le_bytes(raw[i + 2..i + 6].try_into().unwrap()) as usize;
+            let comp_len = u32::from_le_bytes(raw[i + 6..i + 10].try_into().unwrap()) as usize;
+            let start = i + FRAME_HEADER_LEN;
+            let Some(end) = start.checked_add(comp_len).filter(|e| *e <= raw.len()) else {
+                break; // torn frame body
+            };
+            let payload = &raw[start..end];
+            match codec {
+                CODEC_RAW => out.extend_from_slice(payload),
+                CODEC_DEFLATE => {
+                    use std::io::Read;
+
+                    use flate2::read::DeflateDecoder;
+                    let before = out.len();
+                    DeflateDecoder::new(payload).read_to_end(&mut out)?;
+                    if out.len() - before != raw_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "journal frame inflated to unexpected length",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unknown journal frame codec {other}"),
+                    ));
+                }
+            }
+            i = end;
+        } else {
+            // Legacy plaintext record: copy through the next newline (inclusive),
+            // or to end-of-file for an unterminated (torn) trailing line.
+            match raw[i..].iter().position(|&b| b == b'\n') {
+                Some(nl) => {
+                    out.extend_from_slice(&raw[i..=i + nl]);
+                    i += nl + 1;
+                }
+                None => {
+                    out.extend_from_slice(&raw[i..]);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Whether the segmented journal is enabled for the persistent single-partition
@@ -157,6 +293,11 @@ pub struct SegShared {
     /// [`PPHEAD_NAME`] so `base_p` is recoverable when every sealed segment has
     /// been compacted away. Empty for the single-partition path.
     pub per_partition_active_start: Vec<AtomicU64>,
+    /// Whether the writer frame-compresses group-commit batches before they hit
+    /// the active segment (the value codec). Set from
+    /// [`journal_compress_from_env`] on the segmented path; always `false` on the
+    /// legacy single-file path.
+    pub compress: bool,
 }
 
 impl SegShared {
@@ -178,6 +319,7 @@ impl SegShared {
             segment_bytes: u64::MAX,
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
+            compress: false,
         })
     }
 
@@ -265,10 +407,22 @@ impl ActiveSegment {
     }
 
     /// Appends a group-committed batch of `events` (already serialized to
-    /// newline-terminated `buf`) to the active segment.
+    /// newline-terminated `buf`) to the active segment. When the shared state
+    /// has `compress` set, the batch is frame-compressed first (see
+    /// [`frame_compress`]) so the *physical* write — the disk-bandwidth wall for
+    /// large payloads — shrinks; `self.bytes` therefore tracks on-disk bytes, so
+    /// size-based sealing rotates on physical size.
     pub fn write_all(&mut self, buf: &[u8], events: u64) -> io::Result<()> {
-        self.file.write_all(buf)?;
-        self.bytes += buf.len() as u64;
+        let written = if self.shared.compress
+            && let Some(frame) = frame_compress(buf, events)
+        {
+            self.file.write_all(&frame)?;
+            frame.len() as u64
+        } else {
+            self.file.write_all(buf)?;
+            buf.len() as u64
+        };
+        self.bytes += written;
         self.shared
             .total_events
             .fetch_add(events, Ordering::Release);
@@ -468,12 +622,14 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
     let mut events = Vec::new();
     if path.exists() {
-        for line in BufReader::new(File::open(path)?).lines() {
-            let line = line?;
+        let decoded = decode_segment_bytes(path)?;
+        for line in decoded.split(|&b| b == b'\n') {
+            let line = std::str::from_utf8(line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_str(&line)
+            let event: Event = serde_json::from_str(line)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             events.push(event);
         }
@@ -492,14 +648,16 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
 fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
     let mut events = Vec::new();
     if path.exists() {
-        for line in BufReader::new(File::open(path)?).lines() {
-            let line = line?;
+        let decoded = decode_segment_bytes(path)?;
+        for line in decoded.split(|&b| b == b'\n') {
+            let line = std::str::from_utf8(line)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             if line.trim().is_empty() {
                 continue;
             }
             let (tag, json) = match line.split_once('\t') {
                 Some((t, rest)) => (t.parse::<u64>().ok(), rest),
-                None => (None, line.as_str()),
+                None => (None, line),
             };
             let event: Event = serde_json::from_str(json)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -615,6 +773,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         segment_bytes: segment_bytes_from_env(),
         per_partition_total: Vec::new(),
         per_partition_active_start: Vec::new(),
+        compress: journal_compress_from_env(),
     });
 
     Ok((
@@ -986,6 +1145,7 @@ pub fn recover_multi(
             .into_iter()
             .map(AtomicU64::new)
             .collect(),
+        compress: journal_compress_from_env(),
     });
 
     Ok(MultiSegRecovery {
@@ -1608,6 +1768,216 @@ mod tests {
         assert!(
             engines[&2].instance(inst2).is_some(),
             "partition 2 instance restored (definition arrived via broadcast)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A large, compressible group-commit batch survives the value-codec
+    /// round-trip: `frame_compress` shrinks it (the point) and
+    /// `decode_segment_bytes` reconstructs the exact original bytes.
+    #[test]
+    fn journal_frame_compress_roundtrips_and_shrinks() {
+        let dir = temp_dir("frame-roundtrip");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Realistic-ish repeated JSON lines: highly compressible, one big event.
+        let mut buf = Vec::new();
+        for i in 0..64 {
+            buf.extend_from_slice(
+                format!(
+                    "0\t{{\"seq\":{i},\"payload\":\"{}\"}}\n",
+                    "abcdefgh".repeat(256)
+                )
+                .as_bytes(),
+            );
+        }
+        assert!(buf.len() >= MIN_FRAME_BYTES, "batch big enough to frame");
+
+        let frame = frame_compress(&buf, 64).expect("large compressible batch frames");
+        assert!(
+            frame.len() < buf.len(),
+            "frame shrank the physical write: {} -> {}",
+            buf.len(),
+            frame.len()
+        );
+        assert_eq!(frame[0], FRAME_MAGIC);
+        assert_eq!(frame[1], CODEC_DEFLATE);
+
+        let path = dir.join("frame.bin");
+        fs::write(&path, &frame).unwrap();
+        assert_eq!(
+            decode_segment_bytes(&path).unwrap(),
+            buf,
+            "exact round-trip"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The size/mean-event gates keep the negligible/high-rate regime verbatim:
+    /// a small batch (or one of tiny events) declines framing, so the writer
+    /// thread is never taxed and the segment stays legacy plaintext.
+    #[test]
+    fn journal_frame_compress_declines_small_batches() {
+        // Below the byte floor.
+        assert!(frame_compress(b"0\t{}\n", 1).is_none());
+        // Past the byte floor but the mean event is tiny (many small events).
+        let many_small: Vec<u8> = std::iter::repeat_n(b"0\t{\"x\":1}\n", 4096)
+            .flatten()
+            .copied()
+            .collect();
+        assert!(many_small.len() >= MIN_FRAME_BYTES);
+        assert!(
+            frame_compress(&many_small, 4096).is_none(),
+            "tiny mean event skips compression"
+        );
+    }
+
+    /// A segment may interleave legacy plaintext lines and compressed frames
+    /// (the flag can flip across a restart while the same active segment is
+    /// open). `decode_segment_bytes` walks record-by-record and reconstructs the
+    /// concatenated logical stream regardless of the mix.
+    #[test]
+    fn journal_decode_handles_interleaved_plaintext_and_frames() {
+        let dir = temp_dir("frame-interleave");
+        fs::create_dir_all(&dir).unwrap();
+
+        let head = b"0\t{\"seq\":\"head\"}\n".to_vec();
+        let mut mid = Vec::new();
+        for i in 0..40 {
+            mid.extend_from_slice(
+                format!("0\t{{\"seq\":{i},\"p\":\"{}\"}}\n", "z".repeat(1400)).as_bytes(),
+            );
+        }
+        let tail = b"0\t{\"seq\":\"tail\"}\n".to_vec();
+
+        let frame = frame_compress(&mid, 40).expect("mid batch frames");
+        let mut file = Vec::new();
+        file.extend_from_slice(&head); // legacy plaintext
+        file.extend_from_slice(&frame); // compressed frame
+        file.extend_from_slice(&tail); // legacy plaintext again
+
+        let path = dir.join("mixed.jsonl");
+        fs::write(&path, &file).unwrap();
+
+        let mut expected = head.clone();
+        expected.extend_from_slice(&mid);
+        expected.extend_from_slice(&tail);
+        assert_eq!(decode_segment_bytes(&path).unwrap(), expected);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A torn trailing frame (crash mid-append, never fsynced/acked) is dropped:
+    /// decode returns the durable prefix and never errors, matching the writer's
+    /// ack-after-write-before-fsync contract.
+    #[test]
+    fn journal_decode_drops_a_torn_frame_tail() {
+        let dir = temp_dir("frame-torn");
+        fs::create_dir_all(&dir).unwrap();
+
+        let durable = b"0\t{\"seq\":\"durable\"}\n".to_vec();
+        let mut big = Vec::new();
+        for i in 0..40 {
+            big.extend_from_slice(
+                format!("0\t{{\"seq\":{i},\"p\":\"{}\"}}\n", "q".repeat(1400)).as_bytes(),
+            );
+        }
+        let frame = frame_compress(&big, 40).expect("frames");
+
+        // Truncate the frame mid-body to simulate a torn write.
+        let mut file = durable.clone();
+        file.extend_from_slice(&frame[..frame.len() - 4]);
+
+        let path = dir.join("torn.jsonl");
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            decode_segment_bytes(&path).unwrap(),
+            durable,
+            "durable prefix survives, torn frame dropped"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end through the segment reader: a compressed active segment written
+    /// by `ActiveSegment::write_all` (with `compress` on) recovers the exact same
+    /// events as the plaintext path.
+    #[test]
+    fn compressed_active_segment_recovers_events() {
+        let dir = temp_dir("frame-active");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Serialize real events by minting them through an in-memory journal, so
+        // the reader exercises the true event JSON shape.
+        let mut j = crate::journal::Journal::in_memory_partition(0);
+        let (deploy, _) = j.apply_command(Command::DeployProcess(demo())).unwrap();
+        let mut lines = Vec::new();
+        let mut n_events: u64 = 0;
+        for e in deploy.iter() {
+            lines.extend_from_slice(serde_json::to_string(e).unwrap().as_bytes());
+            lines.push(b'\n');
+            n_events += 1;
+        }
+        for _ in 0..80 {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert(
+                "payload".to_string(),
+                nanobpmn_engine_core::Value::Str("y".repeat(16384)),
+            );
+            let (evs, _) = j
+                .apply_command(Command::create_instance_with("demo", vars))
+                .unwrap();
+            for e in evs.iter() {
+                lines.extend_from_slice(serde_json::to_string(e).unwrap().as_bytes());
+                lines.push(b'\n');
+                n_events += 1;
+            }
+        }
+
+        // Baseline: plaintext segment.
+        let plain_path = dir.join("plain.jsonl");
+        fs::write(&plain_path, &lines).unwrap();
+        let baseline = read_segment_events(&plain_path).unwrap();
+        assert_eq!(baseline.len() as u64, n_events);
+
+        // Compressed active segment via the real writer path.
+        let active_path = dir.join(ACTIVE_NAME);
+        let shared = Arc::new(SegShared {
+            dir: dir.clone(),
+            active_path: active_path.clone(),
+            total_events: AtomicU64::new(0),
+            active_start: AtomicU64::new(0),
+            sealed: Mutex::new(Vec::new()),
+            segment_bytes: u64::MAX,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
+            compress: true,
+        });
+        {
+            let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
+            seg.write_all(&lines, n_events).unwrap();
+            seg.fsync().unwrap();
+        }
+        // The on-disk segment must actually be a compressed frame, not plaintext.
+        let on_disk = fs::read(&active_path).unwrap();
+        assert_eq!(
+            on_disk[0], FRAME_MAGIC,
+            "active segment is frame-compressed"
+        );
+        assert!(on_disk.len() < lines.len(), "physical write shrank");
+
+        let recovered = read_segment_events(&active_path).unwrap();
+        assert_eq!(recovered.len(), baseline.len());
+        // The strongest guarantee: the compressed segment decodes to the exact
+        // bytes a plaintext write would have produced (re-serializing parsed
+        // events would be flaky — the process definition's element map has
+        // nondeterministic iteration order).
+        assert_eq!(
+            decode_segment_bytes(&active_path).unwrap(),
+            lines,
+            "compressed active segment decodes byte-for-byte to the plaintext batch"
         );
 
         let _ = fs::remove_dir_all(&dir);
