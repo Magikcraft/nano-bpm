@@ -201,8 +201,17 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.processos == 'true' }}
     env:
-      SCCACHE_GHA_ENABLED: 'true'
       RUSTC_WRAPPER: 'sccache'
+      # Local sccache backend persisted by a dedicated actions/cache below, so the
+      # DuckDB C/C++ objects survive independently of the shared, LRU-evicted GHA
+      # cache pool. cc-rs auto-routes the libduckdb-sys compile through this
+      # wrapper (RUSTC_WRAPPER fallback), so ~590 DuckDB translation units are
+      # content-addressed and reused instead of recompiled (~20 min when cold).
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      # Comfortably above one cold build's writes (~590 DuckDB objects + Rust
+      # crates, ~3G) so DuckDB objects are never LRU-evicted mid-run, while still
+      # bounding the cached dir so it can't monopolise the repo cache quota.
+      SCCACHE_CACHE_SIZE: '5G'
       CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v5
@@ -217,6 +226,23 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
+      # Key the DuckDB object cache on the libduckdb-sys version only: it's the one
+      # input to the C++ build that "doesn't change" between unrelated commits, so
+      # a matching key yields ~100% C/C++ sccache hits and only rotates on a real
+      # DuckDB bump. Restored *before* sccache starts its server.
+      - name: Resolve libduckdb-sys version
+        id: duckdb
+        run: |
+          ver=$(awk -F'"' '/name = "libduckdb-sys"/{getline; print $2}' processos/Cargo.lock)
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "libduckdb-sys=$ver"
+      - name: Cache DuckDB build (sccache objects, keyed on libduckdb-sys version)
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-duckdb-${{ runner.os }}-${{ steps.duckdb.outputs.ver }}
+          restore-keys: |
+            sccache-duckdb-${{ runner.os }}-
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -235,6 +261,9 @@ jobs:
         # processos is a binary crate (no lib target) => no doctests, so nextest
         # loses no coverage and gains process isolation + retries.
         run: cargo nextest run
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   server:
     name: server (clippy + test)
