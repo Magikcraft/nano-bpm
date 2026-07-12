@@ -258,7 +258,15 @@ mod tests {
     fn tmp() -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("processos-nano-{}-{}.json", new_id(), n))
+        // new_id() is millisecond+process-global-counter based, which collides
+        // across nextest's per-test processes; add the PID so each test process
+        // writes to a private file.
+        std::env::temp_dir().join(format!(
+            "processos-nano-{}-{}-{}.json",
+            std::process::id(),
+            new_id(),
+            n
+        ))
     }
 
     #[test]

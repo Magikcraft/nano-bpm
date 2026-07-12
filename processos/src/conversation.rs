@@ -163,11 +163,23 @@ mod tests {
 
     fn tmp() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
-        // A monotonic counter guarantees a distinct dir per call even when several
-        // tests run in parallel within the same millisecond.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // nextest runs each test in its own process, so a process-global counter
+        // resets to 0 in every test and now_ms() alone collides when two test
+        // processes land in the same millisecond. Include the PID and a
+        // nanosecond clock so every call yields a distinct dir across processes.
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("processos-convo-{}-{}", now_ms(), n));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "processos-convo-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            n
+        ));
         let _ = fs::remove_dir_all(&p);
         p
     }
