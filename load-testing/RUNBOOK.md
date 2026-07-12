@@ -7,12 +7,29 @@ the results. Companion to [`README.md`](README.md) (topology + script reference)
 
 ## Golden rule: wipe the journal between runs
 
-**Always** run `restart-verify.sh` (which `rm -rf ~/nano-data` and restarts all
+**Always** run `deploy.sh` (which `rm -rf ~/nano-data` and restarts all
 nodes) between A/B arms or scenario runs. Residual backlog from a prior arm —
 instances created but never completed because that arm's workers are gone — is
 the #1 cause of spurious "wedges" in the next arm.
 
 The `backlog-recovery.sh` scenario wipes automatically by default (`WIPE=1`).
+
+---
+
+## The standard test matrix
+
+We validate the **out-of-the-box defaults** across payload × duration:
+
+|          | negligible (`neg`, `VAR_BYTES=0`) | 50 KB (`50kb`, `VAR_BYTES=51200` JSON) |
+|----------|-----------------------------------|----------------------------------------|
+| **5 min** | `scenario.sh neg 5m`              | `scenario.sh 50kb 5m`                  |
+| **30 min**| `scenario.sh neg 30m`             | `scenario.sh 50kb 30m`                 |
+
+Each cell runs against a freshly built branch binary **with the console embedded**
+(`build-server.sh`), on a clean-wiped cluster, behind a **disk preflight**. Use
+`scenario.sh ... --build --branch <b>` to rebuild+stage; omit `--build` to reuse
+the staged binary across cells. `neg` isolates the CPU/single-writer knee; `50kb`
+exercises the durable-write path and memory rails.
 
 ---
 
@@ -78,7 +95,7 @@ drift. Increase `QUIESCE_S` for very large payloads / higher inject volumes.
 
 ## Interpreting the memory rails (hot-window cache)
 
-Run `hotcache-mon.sh` alongside a soak/backlog run. The pair to watch, per node:
+Run `monitor.sh` alongside a soak/backlog run. The pair to watch, per node:
 
 - `nanobpm_raft_log_bytes` — **full** on-disk Raft-log tail (can be many GB).
 - `nanobpm_raft_log_ram_bytes` — **resident** hot window kept in RAM.
@@ -96,6 +113,40 @@ soak the effect is larger: **12.3 GB full tail vs 765 MB resident ≈ 17× reduc
 Set `NANOBPMN_RAFT_LOG_RAM_BYTES=0` (in the node launcher — see
 `scripts/node-launch-verify.reference.sh`) to disable the cache for an A/B
 baseline arm.
+
+---
+
+## Disk sizing (avoid the ENOSPC crash)
+
+A soak is a heavy durable writer. Per node it accumulates **Raft segments +
+read-model SQLite + var-store**; a 20-min 50 KB soak consumed **~33 GB/node**. If
+a node fills to 100% the server aborts with `No space left on device (os error
+28)` — a **real crash by design** (`journal.rs` aborts rather than serve
+non-durable state), *not* a bug. This first bit node0, which doubles as the build
+host (its `~/build-console/target` adds ~7 GB).
+
+Mitigations, both in place:
+
+1. **Bigger disks.** The node boot disks were grown from 50 GB → **200 GB**
+   (`pd-ssd`), giving ~150 GB free headroom. Note this buys **capacity, not
+   throughput** — the ~276 MB/s write ceiling is the per-VM PD cap, not
+   disk-size-derived. To resize:
+   ```
+   gcloud compute disks resize nano-node-N --size=200 --zone=us-central1-a --quiet
+   ssh <node> 'sudo growpart /dev/sda 1 && sudo resize2fs /dev/sda1'
+   ```
+   (`growpart` is in `cloud-guest-utils`; the node images ship without it.)
+
+2. **Guardrails in the scripts** (`disk-guard.sh`):
+   - `deploy.sh` runs `disk-guard.sh preflight` after wiping — **refuses to start**
+     a soak if any node has < 40 GB free (override `DISK_MIN_FREE_GB`).
+   - `soak.sh` runs `disk-guard.sh watch` in the background — **aborts the soak**
+     (kills loadgens) if any node drops below 15 GB free (`DISK_FLOOR_GB`).
+   - `monitor.sh` prints a per-node **free-GB** column as an early warning.
+   - `disk-guard.sh report` shows per-node `df` + `nano-data` size on demand.
+
+Keep the build host (node0) tidy: `cargo clean` in `~/build-console` and remove
+stale `~/nano-gw-*` / old `~/nano-data` between build cycles.
 
 ---
 
