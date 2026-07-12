@@ -215,6 +215,166 @@ fn seg_path(dir: &Path, start: u64) -> PathBuf {
     dir.join(format!("seg-{start:020}.ndjson"))
 }
 
+/// Opt-in per-entry compression of the Raft log segments, controlled by
+/// `NANOBPMN_RAFT_LOG_COMPRESS` (off by default). Unlike the engine-journal codec
+/// (`crate::seglog`), which is a no-op when Raft is enabled (the engine journal is
+/// dormant then), this compresses the *replicated Raft log* — the dominant durable
+/// writer under Raft — so large replicated payloads (e.g. 50 KB process variables)
+/// shrink on disk, easing the per-node write-bandwidth wall.
+fn raft_log_compress_from_env() -> bool {
+    matches!(
+        std::env::var("NANOBPMN_RAFT_LOG_COMPRESS").as_deref(),
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes")
+    )
+}
+
+/// Frame magic: ASCII RS (`0x1E`). A plaintext entry line is JSON, always starting
+/// with `{` (`0x7B`), never `0x1E`, so one byte distinguishes a compressed frame
+/// from a plaintext line. This lets a single segment freely interleave the two —
+/// the compression flag can flip across a restart while a segment stays open, and
+/// pre-compression segments read back unchanged.
+const FRAME_MAGIC: u8 = 0x1E;
+/// Frame body is raw-deflate (mirrors the Raft wire codec in `raft_net.rs`).
+const CODEC_DEFLATE: u8 = 1;
+/// Frame header: `magic(1) | codec(1) | raw_len(u32 LE) | comp_len(u32 LE)`.
+const FRAME_HEADER_LEN: usize = 10;
+/// Don't frame entries whose serialized JSON is below this — the header + deflate
+/// cost isn't worth it for small entries (heartbeat / membership / config), which
+/// stay verbatim so the append critical path is untouched in the small-entry regime.
+const MIN_COMPRESS_BYTES: usize = 1024;
+
+/// Frames a single entry's serialized JSON for durable append, deflating it when
+/// worthwhile. Returns `None` (write the plaintext `json + '\n'` verbatim) when the
+/// entry is small, deflate fails, or the framed form wouldn't actually shrink the
+/// write. Best-effort: compression never risks durability.
+fn frame_entry(json: &[u8]) -> Option<Vec<u8>> {
+    if json.len() < MIN_COMPRESS_BYTES {
+        return None;
+    }
+    use flate2::{Compression, write::DeflateEncoder};
+    let mut enc = DeflateEncoder::new(Vec::with_capacity(json.len() / 2), Compression::fast());
+    if enc.write_all(json).is_err() {
+        return None;
+    }
+    let comp = enc.finish().ok()?;
+    // The plaintext form costs `json.len() + 1` (the trailing newline); only frame
+    // when the framed form is strictly smaller (i.e. header + body <= json.len()).
+    if comp.len().checked_add(FRAME_HEADER_LEN)? > json.len() {
+        return None;
+    }
+    let raw_len = u32::try_from(json.len()).ok()?;
+    let comp_len = u32::try_from(comp.len()).ok()?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + comp.len());
+    frame.push(FRAME_MAGIC);
+    frame.push(CODEC_DEFLATE);
+    frame.extend_from_slice(&raw_len.to_le_bytes());
+    frame.extend_from_slice(&comp_len.to_le_bytes());
+    frame.extend_from_slice(&comp);
+    Some(frame)
+}
+
+/// Deserializes one on-disk record — a compressed frame (leading [`FRAME_MAGIC`]) or
+/// a plaintext JSON line (optionally newline-terminated) — back into an [`Entry`].
+/// Used by both the sequential recovery scan and the random-access demoted-entry
+/// read, so the two never disagree on the wire format.
+fn entry_from_record(rec: &[u8]) -> io::Result<Entry<RaftConfig>> {
+    if rec.first() == Some(&FRAME_MAGIC) {
+        if rec.len() < FRAME_HEADER_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated raft log frame header",
+            ));
+        }
+        let comp_len = u32::from_le_bytes([rec[6], rec[7], rec[8], rec[9]]) as usize;
+        let body = rec
+            .get(FRAME_HEADER_LEN..FRAME_HEADER_LEN + comp_len)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated raft log frame body")
+            })?;
+        let raw_len = u32::from_le_bytes([rec[2], rec[3], rec[4], rec[5]]) as usize;
+        let mut json = Vec::with_capacity(raw_len);
+        use flate2::read::DeflateDecoder;
+        DeflateDecoder::new(body).read_to_end(&mut json)?;
+        serde_json::from_slice(&json).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    } else {
+        let end = if rec.last() == Some(&b'\n') {
+            rec.len() - 1
+        } else {
+            rec.len()
+        };
+        serde_json::from_slice(&rec[..end])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// One entry recovered from a segment file, with the physical byte span it occupies.
+struct ScannedEntry {
+    index: u64,
+    log_id: LogId<NodeId>,
+    offset: usize,
+    len: usize,
+    entry: Entry<RaftConfig>,
+}
+
+/// Walks a segment file record-by-record, tolerating a free interleave of plaintext
+/// JSON lines and compressed frames (the codec flag can flip across restarts). Each
+/// record is length-delimited — a frame by its header's `comp_len`, a plaintext line
+/// by its terminating `\n` — so the physical `(offset, len)` spans returned stay
+/// valid for random-access reads regardless of codec. Also returns the total bytes
+/// walked (the physical segment size, used for append/roll accounting). Errors on a
+/// malformed/torn record, matching the pre-codec line-based scan's strictness.
+fn scan_segment(path: &Path) -> io::Result<(Vec<ScannedEntry>, usize)> {
+    let raw = fs::read(path)?;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < raw.len() {
+        let (rec_len, is_frame) = if raw[i] == FRAME_MAGIC {
+            if i + FRAME_HEADER_LEN > raw.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated raft log frame header",
+                ));
+            }
+            let comp_len =
+                u32::from_le_bytes([raw[i + 6], raw[i + 7], raw[i + 8], raw[i + 9]]) as usize;
+            let len = FRAME_HEADER_LEN + comp_len;
+            if i + len > raw.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated raft log frame body",
+                ));
+            }
+            (len, true)
+        } else {
+            match raw[i..].iter().position(|&b| b == b'\n') {
+                Some(p) => (p + 1, false),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unterminated raft log line",
+                    ));
+                }
+            }
+        };
+        let rec = &raw[i..i + rec_len];
+        // Skip blank plaintext lines (defensive; the writer never emits them).
+        if !is_frame && rec.iter().all(|b| b.is_ascii_whitespace()) {
+            i += rec_len;
+            continue;
+        }
+        let entry = entry_from_record(rec)?;
+        out.push(ScannedEntry {
+            index: entry.log_id.index,
+            log_id: entry.log_id,
+            offset: i,
+            len: rec_len,
+            entry,
+        });
+        i += rec_len;
+    }
+    Ok((out, raw.len()))
+}
+
 /// Parses a segment file name (`seg-<start>.ndjson`) back to its start index.
 fn parse_seg_start(name: &str) -> Option<u64> {
     name.strip_prefix("seg-")?
@@ -266,6 +426,10 @@ struct Inner {
     /// Async only: the committed/purge markers changed in memory but `state.json`
     /// has not yet been durably rewritten. The background flusher persists it.
     state_dirty: bool,
+    /// Per-entry compression of appended segment records (`NANOBPMN_RAFT_LOG_COMPRESS`).
+    /// Fixed at open. Reads stay codec-agnostic (frames are self-describing), so
+    /// flipping this across a restart safely interleaves plaintext and framed records.
+    compress: bool,
 }
 
 impl Inner {
@@ -490,32 +654,20 @@ impl RaftLogStore {
         for (pos, &start) in starts.iter().enumerate() {
             let is_last = pos + 1 == starts.len();
             let path = seg_path(&dir, start);
-            let mut seg_bytes: usize = 0;
+            let (records, seg_bytes) = scan_segment(&path)?;
             let mut last: Option<u64> = None;
-            let reader = BufReader::new(File::open(&path)?);
-            for line in reader.lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let len = line.len() + 1;
-                let offset = seg_bytes;
-                seg_bytes += len;
-                let entry: Entry<RaftConfig> = serde_json::from_str(&line)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let index = entry.log_id.index;
-                let log_id = entry.log_id;
-                last = Some(index);
-                if purged_upto.map(|p| index > p).unwrap_or(true) {
-                    log_bytes += len;
+            for r in records {
+                last = Some(r.index);
+                if purged_upto.map(|p| r.index > p).unwrap_or(true) {
+                    log_bytes += r.len;
                     log.insert(
-                        index,
+                        r.index,
                         Stored {
-                            log_id,
-                            len,
+                            log_id: r.log_id,
+                            len: r.len,
                             seg_start: start,
-                            offset,
-                            entry: Some(entry),
+                            offset: r.offset,
+                            entry: Some(r.entry),
                         },
                     );
                 }
@@ -566,6 +718,7 @@ impl RaftLogStore {
                 flush: async_flush_from_env(),
                 unsynced_bytes: 0,
                 state_dirty: false,
+                compress: raft_log_compress_from_env(),
             })),
             bytes: Arc::new(AtomicI64::new(log_bytes as i64)),
         };
@@ -697,9 +850,10 @@ impl RaftLogStore {
 
 /// Reads back a single demoted log entry from its on-disk segment: seeks to the
 /// recorded `offset` in `seg-<seg_start>.ndjson`, reads exactly `len` bytes (the
-/// serialized JSON line plus its trailing `\n`), and deserializes it. The bytes
-/// were written by `append`; on the same process they are visible via the page
-/// cache even before an fsync, so a demoted entry is always readable while live.
+/// physical record — a plaintext JSON line with its trailing `\n`, or a compressed
+/// frame), and deserializes it. The bytes were written by `append`; on the same
+/// process they are visible via the page cache even before an fsync, so a demoted
+/// entry is always readable while live.
 fn read_entry_at(
     dir: &Path,
     seg_start: u64,
@@ -711,13 +865,9 @@ fn read_entry_at(
     f.seek(SeekFrom::Start(offset as u64))?;
     let mut buf = vec![0u8; len];
     f.read_exact(&mut buf)?;
-    // `len` includes the trailing newline; deserialize the JSON portion.
-    let end = if buf.last() == Some(&b'\n') {
-        len - 1
-    } else {
-        len
-    };
-    serde_json::from_slice(&buf[..end]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    // The record is either a plaintext JSON line (with trailing newline) or a
+    // self-describing compressed frame; `entry_from_record` handles both.
+    entry_from_record(&buf)
 }
 
 /// Reads and deserializes a JSON file, returning `None` if it does not exist.
@@ -833,9 +983,21 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         let mut added = 0i64;
         let mut new_bytes = 0usize;
         for entry in entries {
-            let mut line = Vec::new();
-            serde_json::to_writer(&mut line, &entry).map_err(io_err)?;
-            line.push(b'\n');
+            let mut json = Vec::new();
+            serde_json::to_writer(&mut json, &entry).map_err(io_err)?;
+            // Compress large entries into a self-describing frame when enabled; small
+            // entries (and the disabled path) stay verbatim as `json + '\n'`. `len` is
+            // the physical on-disk record length either way, so the offset/roll/demote
+            // bookkeeping below is codec-agnostic.
+            let line = if inner.compress {
+                frame_entry(&json).unwrap_or_else(|| {
+                    json.push(b'\n');
+                    json
+                })
+            } else {
+                json.push(b'\n');
+                json
+            };
             let len = line.len();
             let index = entry.log_id.index;
             let log_id = entry.log_id;
@@ -1310,6 +1472,153 @@ mod tests {
             "migrated into a start-0 segment"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Per-entry compression codec (NANOBPMN_RAFT_LOG_COMPRESS) ----
+
+    /// Builds a large, compressible `Normal` entry (a `CreateInstance` carrying a
+    /// business-like string payload) so the codec's size/shrink gates engage.
+    fn big_entry(index: u64, payload_len: usize) -> Entry<RaftConfig> {
+        use std::collections::HashMap;
+
+        use nanobpmn_engine_core::{Command, Value};
+        let mut s = String::with_capacity(payload_len + 32);
+        while s.len() < payload_len {
+            s.push_str("order-customer-invoice-amount-region ");
+        }
+        s.truncate(payload_len);
+        let mut vars = HashMap::new();
+        vars.insert("p".to_string(), Value::Str(s));
+        let cmd = Command::create_instance_with("demo", vars);
+        let batch = crate::raft::ReplicatedBatch::single(cmd, 12_345);
+        Entry {
+            log_id: log_id(index),
+            payload: EntryPayload::Normal(batch),
+        }
+    }
+
+    fn plaintext_record(index: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        serde_json::to_writer(&mut b, &entry(index)).unwrap();
+        b.push(b'\n');
+        b
+    }
+
+    fn framed_record(e: &Entry<RaftConfig>) -> (Vec<u8>, Vec<u8>) {
+        let mut json = Vec::new();
+        serde_json::to_writer(&mut json, e).unwrap();
+        let frame = frame_entry(&json).expect("large compressible entry should frame");
+        (frame, json)
+    }
+
+    #[test]
+    fn frame_entry_roundtrips_and_shrinks_a_large_entry() {
+        let e = big_entry(7, 50 * 1024);
+        let (frame, json) = framed_record(&e);
+        assert_eq!(frame[0], FRAME_MAGIC);
+        assert_eq!(frame[1], CODEC_DEFLATE);
+        assert!(
+            frame.len() < json.len() + 1,
+            "frame ({}) must shrink the plaintext write ({}+1)",
+            frame.len(),
+            json.len()
+        );
+        // Decoding the frame yields byte-identical entry JSON.
+        let decoded = entry_from_record(&frame).unwrap();
+        let mut got = Vec::new();
+        serde_json::to_writer(&mut got, &decoded).unwrap();
+        assert_eq!(got, json);
+    }
+
+    #[test]
+    fn frame_entry_declines_a_small_entry() {
+        let mut json = Vec::new();
+        serde_json::to_writer(&mut json, &entry(3)).unwrap();
+        assert!(
+            frame_entry(&json).is_none(),
+            "a tiny Blank entry must stay verbatim"
+        );
+    }
+
+    #[test]
+    fn entry_from_record_reads_both_plaintext_and_frames() {
+        // Plaintext (with and without trailing newline) and a frame all decode.
+        let pt = plaintext_record(5);
+        assert_eq!(entry_from_record(&pt).unwrap().log_id.index, 5);
+        assert_eq!(
+            entry_from_record(&pt[..pt.len() - 1]).unwrap().log_id.index,
+            5
+        );
+        let (frame, _) = framed_record(&big_entry(6, 20 * 1024));
+        assert_eq!(entry_from_record(&frame).unwrap().log_id.index, 6);
+    }
+
+    #[test]
+    fn scan_segment_walks_interleaved_plaintext_and_frames() {
+        let dir = tmp_dir("scan-interleave");
+        let r0 = plaintext_record(0);
+        let (r1, _) = framed_record(&big_entry(1, 40 * 1024));
+        let r2 = plaintext_record(2);
+        let mut file = Vec::new();
+        file.extend_from_slice(&r0);
+        file.extend_from_slice(&r1);
+        file.extend_from_slice(&r2);
+        std::fs::write(seg_path(&dir, 0), &file).unwrap();
+
+        let (records, total) = scan_segment(&seg_path(&dir, 0)).unwrap();
+        assert_eq!(total, file.len(), "total bytes = physical file size");
+        assert_eq!(
+            records.iter().map(|r| r.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Physical, contiguous offsets — the invariant random-access reads rely on.
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[0].len, r0.len());
+        assert_eq!(records[1].offset, r0.len());
+        assert_eq!(records[1].len, r1.len());
+        assert_eq!(records[2].offset, r0.len() + r1.len());
+        // Reading each record's exact byte span decodes to the right entry — exactly
+        // what `read_entry_at` does with a demoted entry's (offset, len).
+        for r in &records {
+            let span = &file[r.offset..r.offset + r.len];
+            assert_eq!(entry_from_record(span).unwrap().log_id.index, r.index);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_segment_errors_on_a_torn_frame_tail() {
+        let dir = tmp_dir("scan-torn");
+        let (frame, _) = framed_record(&big_entry(1, 30 * 1024));
+        // Drop the last 100 body bytes to simulate a torn write.
+        let torn = &frame[..frame.len() - 100];
+        std::fs::write(seg_path(&dir, 0), torn).unwrap();
+        assert!(
+            scan_segment(&seg_path(&dir, 0)).is_err(),
+            "a truncated frame body must be rejected, not silently accepted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn open_recovers_a_segment_mixing_plaintext_and_frames() {
+        let dir = tmp_dir("open-compressed");
+        let r0 = plaintext_record(0);
+        let (r1, _) = framed_record(&big_entry(1, 50 * 1024));
+        let (r2, _) = framed_record(&big_entry(2, 50 * 1024));
+        let mut file = Vec::new();
+        file.extend_from_slice(&r0);
+        file.extend_from_slice(&r1);
+        file.extend_from_slice(&r2);
+        std::fs::write(seg_path(&dir, 0), &file).unwrap();
+
+        let mut store = RaftLogStore::open(&dir).unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2]);
+        // The recovered entries read back intact (payload survives the codec).
+        let got = store.try_get_log_entries(1..=2).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0].payload, EntryPayload::Normal(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
