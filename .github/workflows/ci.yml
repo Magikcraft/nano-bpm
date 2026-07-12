@@ -23,6 +23,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Cheap change-detection so the expensive per-crate jobs only run when their
+  # sources actually change. A skipped required check is treated as success by
+  # branch protection, so gating a job with `if:` still lets a docs/scripts-only
+  # PR merge without burning a full crate build.
+  changes:
+    name: detect changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      processos: ${{ steps.filter.outputs.processos }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            processos:
+              - 'processos/**'
+              - 'engine-core/**'
+              - '.github/workflows/ci.yml'
+
   fmt:
     name: rustfmt (pinned nightly)
     runs-on: ubuntu-24.04
@@ -171,6 +194,12 @@ jobs:
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04
+    # processos compiles engine-core as a path dep, so it must re-run when either
+    # crate changes (or when this workflow changes). It's the heaviest job
+    # (DuckDB/libduckdb-sys builds a large C++ tree), so skipping it on unrelated
+    # PRs — docs, scripts, other crates — is the biggest CI-minute saver.
+    needs: changes
+    if: ${{ needs.changes.outputs.processos == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       RUSTC_WRAPPER: 'sccache'
