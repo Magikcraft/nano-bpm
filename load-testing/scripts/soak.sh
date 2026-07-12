@@ -18,7 +18,10 @@ LG="$HOME/rw-build/target/release/loadgen"
 GUARD="$(dirname "$0")/disk-guard.sh"; [ -x "$GUARD" ] || GUARD="$HOME/disk-guard.sh"
 
 # Steady operating point (the validated knee): see RUNBOOK.md.
-W=200; PC=128; MP=112; RATE=14000; MI=50000
+# Each knob may be overridden from the environment to probe higher ceilings, e.g.
+#   PROD_CONNS=256 MAXPAR=224 LOADGENS_PER_NODE=2 soak.sh 50kb 5m ceiling
+W=${WORKERS:-200}; PC=${PROD_CONNS:-128}; MP=${MAXPAR:-112}; RATE=${RATE:-14000}; MI=${MAX_INFLIGHT:-50000}
+LGN=${LOADGENS_PER_NODE:-1}
 
 PAYLOAD="${1:?usage: soak.sh <neg|50kb> <5m|30m|SECONDS> [label]}"
 DURSPEC="${2:?usage: soak.sh <neg|50kb> <5m|30m|SECONDS> [label]}"
@@ -40,7 +43,7 @@ PDK=$(curl -s --max-time 10 -F resources=@"$HOME/test-job-process.bpmn" \
   http://10.128.0.19:8080/v2/deployments \
   | grep -o "\"processDefinitionKey\":\"[0-9]*\"" | grep -o "[0-9]*" | head -1)
 [ -z "$PDK" ] && { echo "[$(date +%H:%M:%S)] $LABEL DEPLOY FAILED"; exit 1; }
-echo "[$(date +%H:%M:%S)] $LABEL START payload=$PAYLOAD VB=$VB dur=${DUR}s PDK=$PDK rate=${RATE}/prod MI=$MI"
+echo "[$(date +%H:%M:%S)] $LABEL START payload=$PAYLOAD VB=$VB dur=${DUR}s PDK=$PDK conns=$PC maxpar=$MP lgPerNode=$LGN rate=${RATE}/prod MI=$MI"
 
 # Background disk watchdog: kills loadgens (ends the soak) if a node drops below floor.
 WATCH_PID=""
@@ -51,11 +54,13 @@ fi
 sleep 3
 i=0
 for ip in $IPS; do
-  env BASE_URL=http://$ip:8080 PDK=$PDK WORKERS=$W PROD_CONNS=$PC MAXPAR=$MP RATE=$RATE \
-    WARMUP_S=12 DURATION_S=$DUR DRAIN_S=15 MAX_INFLIGHT=$MI TRANSPORT=stream \
-    VAR_BYTES=$VB "${VBENV[@]}" \
-    "$LG" > "$HOME/$LABEL-$i.out" 2>&1 &
-  i=$((i+1))
+  for ((j=0; j<LGN; j++)); do
+    env BASE_URL=http://$ip:8080 PDK=$PDK WORKERS=$W PROD_CONNS=$PC MAXPAR=$MP RATE=$RATE \
+      WARMUP_S=12 DURATION_S=$DUR DRAIN_S=15 MAX_INFLIGHT=$MI TRANSPORT=stream \
+      VAR_BYTES=$VB "${VBENV[@]}" \
+      "$LG" > "$HOME/$LABEL-$i.out" 2>&1 &
+    i=$((i+1))
+  done
 done
 
 # Mid-run steady-state sample: per-node sda write MB/s + completes/s + backlog.
