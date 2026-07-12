@@ -1142,9 +1142,23 @@ mod tests {
 
     fn tmp() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
         static SEQ: AtomicU64 = AtomicU64::new(0);
+        // nextest runs each test in its own process, so the process-local SEQ
+        // resets to 0 in every test. Include the PID and a nanosecond clock so
+        // two tests running in parallel never derive the same temp dir (a
+        // collision lets one test's remove_dir_all wipe another's store).
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("processos-chat-{}-{}", now_ms(), n));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "processos-chat-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            n
+        ));
         let _ = fs::remove_dir_all(&p);
         p
     }
