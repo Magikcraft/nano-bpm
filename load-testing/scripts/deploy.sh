@@ -1,6 +1,7 @@
 #!/bin/bash
-# Swap in nano-gw-new + wipe-restart all 3 nodes with the verification launcher.
-# Usage: restart-verify.sh <MAXBKLOG|default|off> [CAP] [LIVENESS]
+# deploy.sh - swap in nano-gw-new + wipe-restart all 3 nodes on OOTB defaults
+# (leader-durable, RF3, 12 partitions, adaptive rails; the verification launcher).
+# Usage: deploy.sh <MAXBKLOG|default|off> [CAP] [LIVENESS]
 SSHK="-i /home/joshua.wulf/.ssh/google_compute_engine -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 NODES="10.128.0.19 10.128.0.20 10.128.0.18"
 MAXBKLOG="${1:-default}"; CAP="${2:-100000}"; LIVENESS="${3:-600000}"
@@ -9,6 +10,11 @@ for ip in $NODES; do
   echo "--- deploy+wipe $ip ---"
   ssh $SSHK $ip "echo '$LB64' | base64 -d > ~/node-launch-verify.sh && chmod +x ~/node-launch-verify.sh; for p in \$(pgrep -x nano-gw); do kill \$p; done; for i in \$(seq 1 40); do pgrep -x nano-gw >/dev/null || break; sleep 1; done; if pgrep -x nano-gw >/dev/null; then for p in \$(pgrep -x nano-gw); do kill -9 \$p; done; fi; sleep 1; rm -rf ~/nano-data; echo wiped-\$(pgrep -x nano-gw|wc -l)"
 done
+# --- disk preflight: refuse to launch a soak without headroom (prevents ENOSPC crash) ---
+GUARD="$(dirname "$0")/disk-guard.sh"; [ -x "$GUARD" ] || GUARD="$HOME/disk-guard.sh"
+if [ -x "$GUARD" ]; then
+  "$GUARD" preflight "${DISK_MIN_FREE_GB:-40}" || { echo "ABORT: disk preflight failed (see above)"; exit 1; }
+fi
 echo "=== staggered start (leader-durable, DEFAULT activation, maxBacklog=$MAXBKLOG) ==="
 for ip in $NODES; do
   ssh $SSHK $ip "nohup ~/node-launch-verify.sh $MAXBKLOG $CAP $LIVENESS >~/nano-launch.log 2>&1 & echo started-$ip"
@@ -16,4 +22,4 @@ for ip in $NODES; do
 done
 sleep 4
 for ip in $NODES; do ssh $SSHK $ip "cat ~/nano-launch.log 2>/dev/null | tail -1"; done
-echo "=== RESTART-VERIFY DONE ==="
+echo "=== DEPLOY DONE ==="
