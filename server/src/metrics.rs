@@ -75,8 +75,25 @@ struct Metrics {
     /// this is byte-unbounded (snapshot policy counts entries, not bytes), so it
     /// is a prime suspect for the RSS balloon.
     raft_log_bytes: IntGauge,
+    /// Bytes of the retained Raft log tail whose serialized entry is *resident in
+    /// RAM* (as opposed to demoted to descriptor-only, read back from its on-disk
+    /// segment on demand). With the byte-bounded hot-window cache this is capped at
+    /// the RAM budget even when `raft_log_bytes` (the full on-disk tail footprint)
+    /// grows under large payloads — the gap is what the adaptation reclaimed.
+    raft_log_ram_bytes: IntGauge,
     /// Count of uncompacted Raft log entries in memory across all owned partitions.
     raft_log_entries: IntGauge,
+    /// Distribution of a single appended Raft log entry's serialized byte length
+    /// (one observation per entry, on every owned partition). A batched entry
+    /// carries all coalesced commands' payloads, so this is the payload-size
+    /// signal that governs the RSS cost of the retained log tail (see the
+    /// entry-count `max_in_snapshot_log_to_keep` floor). Its mean (`_sum/_count`)
+    /// and buckets tell whether large (e.g. 50 KB) payloads are a steady
+    /// workload before we invest in adaptive spill/compression.
+    raft_log_entry_bytes: Histogram,
+    /// High-water mark of the largest single Raft log entry appended since start
+    /// (never reset). Complements the histogram with the exact observed peak.
+    raft_log_entry_bytes_max: IntGauge,
     /// Resident read-model export backlog bytes (forwarded but not yet projected).
     exporter_queue_bytes: IntGauge,
     /// Approx resident instance variable-payload bytes (burst-balloon attribution).
@@ -356,9 +373,30 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Serialized bytes of uncompacted in-memory Raft log entries (all partitions).",
     )
     .expect("valid gauge");
+    let raft_log_ram_bytes = IntGauge::new(
+        "nanobpm_raft_log_ram_bytes",
+        "Serialized bytes of retained Raft log entries resident in RAM (all partitions); \
+         capped by the hot-window RAM budget, the rest read from disk on demand.",
+    )
+    .expect("valid gauge");
     let raft_log_entries = IntGauge::new(
         "nanobpm_raft_log_entries",
         "Uncompacted in-memory Raft log entries (all partitions).",
+    )
+    .expect("valid gauge");
+    // Per-entry serialized size. Buckets span 64 B .. ~256 MB (exp base 4) to
+    // cover negligible batched creates through very large variable payloads.
+    let raft_log_entry_bytes = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_raft_log_entry_bytes",
+            "Serialized byte length of a single appended Raft log entry (one observation per entry, all partitions).",
+        )
+        .buckets(prometheus::exponential_buckets(64.0, 4.0, 12).expect("valid buckets")),
+    )
+    .expect("valid histogram");
+    let raft_log_entry_bytes_max = IntGauge::new(
+        "nanobpm_raft_log_entry_bytes_max",
+        "Largest single Raft log entry (serialized bytes) appended since start (high-water mark).",
     )
     .expect("valid gauge");
 
@@ -573,7 +611,10 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_completions_total.clone())))
         .and(registry.register(Box::new(stream_complete_outcome_total.clone())))
         .and(registry.register(Box::new(raft_log_bytes.clone())))
+        .and(registry.register(Box::new(raft_log_ram_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
+        .and(registry.register(Box::new(raft_log_entry_bytes.clone())))
+        .and(registry.register(Box::new(raft_log_entry_bytes_max.clone())))
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
         .and(registry.register(Box::new(resident_var_bytes.clone())))
         .and(registry.register(Box::new(journal_inflight_bytes.clone())))
@@ -621,7 +662,10 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_completions_total,
         stream_complete_outcome_total,
         raft_log_bytes,
+        raft_log_ram_bytes,
         raft_log_entries,
+        raft_log_entry_bytes,
+        raft_log_entry_bytes_max,
         exporter_queue_bytes,
         resident_var_bytes,
         journal_inflight_bytes,
@@ -704,6 +748,28 @@ pub fn set_pipeline_bytes(bytes: u64) {
 pub fn raft_log_delta(entries_delta: i64, bytes_delta: i64) {
     METRICS.raft_log_entries.add(entries_delta);
     METRICS.raft_log_bytes.add(bytes_delta);
+}
+
+/// Adjusts the aggregate resident (in-RAM) Raft-log byte gauge by a signed delta.
+/// Called by each partition's log store when entries are appended (positive),
+/// demoted to descriptor-only (negative), rehydrated (positive), or dropped by
+/// purge/truncate (negative). The gap between `raft_log_bytes` (full tail) and
+/// `raft_log_ram_bytes` (resident) is the RAM the hot-window cache reclaimed.
+pub fn raft_log_ram_delta(bytes_delta: i64) {
+    METRICS.raft_log_ram_bytes.add(bytes_delta);
+}
+
+/// Records one appended Raft log entry's serialized byte length: observes the
+/// size distribution and advances the peak high-water mark. Called once per entry
+/// from the log store's `append` (the `len` is already computed there, so this is
+/// free of extra serialization). Diagnostic-only; drives the decision on whether
+/// large payloads warrant adaptive log-tail spill/compression.
+pub fn raft_log_entry_appended(len: usize) {
+    let len = len as i64;
+    METRICS.raft_log_entry_bytes.observe(len as f64);
+    if len > METRICS.raft_log_entry_bytes_max.get() {
+        METRICS.raft_log_entry_bytes_max.set(len);
+    }
 }
 
 /// Publishes the aggregate resident read-model export-backlog byte gauge (summed

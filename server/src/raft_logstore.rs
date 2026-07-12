@@ -44,7 +44,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -128,11 +128,39 @@ struct PersistedState {
 }
 
 /// A log entry held in the in-memory index, tagged with its serialized on-disk
-/// byte length so purge/truncate can adjust the live-byte footprint in `O(dropped)`
-/// without re-serializing anything.
+/// byte length and the location (segment + byte offset) of its one line in that
+/// segment file.
+///
+/// # Byte-bounded hot-window cache
+///
+/// The full serialized entry is *already* durably on disk in its segment file, so
+/// keeping it in RAM as well is a redundant copy. Under large (e.g. 50 KB)
+/// payloads the retained post-snapshot tail (`NANOBPMN_RAFT_KEEP_LOGS` entries per
+/// partition) is entry-count-bounded, so that redundant RAM copy dominates RSS.
+///
+/// `entry` is therefore an *optional* in-RAM cache of the on-disk line:
+/// - `Some(entry)` — resident ("hot"): served directly, no I/O.
+/// - `None` — demoted ("cold"): the entry lives only in `seg-<seg_start>.ndjson`
+///   at `[offset, offset+len)` and is read back on demand in
+///   [`try_get_log_entries`](RaftLogReader::try_get_log_entries).
+///
+/// The most-recent entries (which drive steady-state replication) stay resident;
+/// only the colder low-index tail is demoted, keeping resident RAM under a byte
+/// budget (`NANOBPMN_RAFT_LOG_RAM_BYTES`) regardless of payload size. Demotion is
+/// an O(1) in-memory drop (the bytes are already on disk) off the fsync critical
+/// path, so the write path is unchanged.
 struct Stored {
-    entry: Entry<RaftConfig>,
+    /// The entry's log id (kept even when demoted, so `get_log_state` and the
+    /// truncate/purge bookkeeping never have to touch disk).
+    log_id: LogId<NodeId>,
+    /// Serialized byte length of this entry's on-disk line (JSON + `\n`).
     len: usize,
+    /// Start index of the segment file holding this entry's line.
+    seg_start: u64,
+    /// Byte offset of this entry's line within that segment file.
+    offset: usize,
+    /// In-RAM copy of the entry, or `None` when demoted to descriptor-only.
+    entry: Option<Entry<RaftConfig>>,
 }
 
 /// One on-disk log segment (`seg-<start>.ndjson`). Entries are appended in index
@@ -161,6 +189,25 @@ fn seg_max_bytes_from_env() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .map(|n| n.max(1 << 20))
         .unwrap_or(DEFAULT_SEG_MAX_BYTES)
+}
+
+/// Default RAM budget for resident (hot) Raft log entries per partition replica:
+/// 64 MiB. Entries beyond this — the colder, lower-index tail — are demoted to
+/// descriptor-only and read back from their segment file on demand, so the
+/// resident footprint of the retained tail stays bounded even under large
+/// payloads. `0` disables demotion (every retained entry stays resident, the
+/// pre-adaptation behaviour).
+const DEFAULT_RAM_BUDGET_BYTES: usize = 64 << 20;
+
+/// Resident-entry RAM budget (bytes) from `NANOBPMN_RAFT_LOG_RAM_BYTES`. `0`
+/// disables demotion; any other value is used verbatim (a single oversized entry
+/// can still exceed it, since at least the most-recent entry is always resident).
+/// Read once at open.
+fn ram_budget_from_env() -> usize {
+    std::env::var("NANOBPMN_RAFT_LOG_RAM_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RAM_BUDGET_BYTES)
 }
 
 fn seg_path(dir: &Path, start: u64) -> PathBuf {
@@ -195,6 +242,18 @@ struct Inner {
     /// published to the aggregate `nanobpm_raft_log_bytes` gauge for RSS-balloon
     /// attribution.
     log_bytes: usize,
+    /// Serialized byte footprint of the entries currently *resident* in RAM (the
+    /// subset of `log` whose `entry` is `Some`). Kept in step with demote/rehydrate
+    /// and purge/truncate, and published to `nanobpm_raft_log_ram_bytes`. Held at
+    /// or below `ram_budget` by the hot-window cache.
+    ram_bytes: usize,
+    /// Resident-RAM byte budget for retained log entries; `0` disables demotion.
+    ram_budget: usize,
+    /// Demotion frontier: every present index strictly below this has already been
+    /// demoted (`entry == None`), so `enforce_ram_budget` only scans from here up.
+    /// Invariant: nothing below it is ever resident (purge only drops below it;
+    /// truncate only drops a recent suffix; append only adds above it).
+    demote_scan_from: u64,
     last_purged: Option<LogId<NodeId>>,
     committed: Option<LogId<NodeId>>,
     vote: Option<Vote<NodeId>>,
@@ -210,6 +269,47 @@ struct Inner {
 }
 
 impl Inner {
+    /// Demotes the coldest (lowest-index) resident entries to descriptor-only until
+    /// the resident footprint is at or below `ram_budget`, keeping the most-recent
+    /// entries in RAM for hot-path replication. A no-op when demotion is disabled
+    /// (`ram_budget == 0`) or already within budget. Demotion just drops the in-RAM
+    /// `Entry` (its bytes are already durably on disk in the segment file), so it
+    /// does no I/O and never touches the fsync critical path.
+    ///
+    /// The single most-recent entry is always kept resident so a just-appended
+    /// entry — the one steady-state replication needs — is never served from disk.
+    fn enforce_ram_budget(&mut self) {
+        if self.ram_budget == 0 || self.ram_bytes <= self.ram_budget {
+            return;
+        }
+        let newest = self.log.keys().next_back().copied();
+        let mut freed = 0usize;
+        let mut cursor = self.demote_scan_from;
+        while self.ram_bytes > self.ram_budget {
+            // Find the lowest-index still-resident entry at or above the frontier.
+            let next = self
+                .log
+                .range(cursor..)
+                .find(|(_, s)| s.entry.is_some())
+                .map(|(idx, _)| *idx);
+            let Some(idx) = next else { break };
+            // Never demote the newest entry (hot replication target).
+            if Some(idx) == newest {
+                break;
+            }
+            if let Some(s) = self.log.get_mut(&idx) {
+                s.entry = None;
+                self.ram_bytes -= s.len;
+                freed += s.len;
+            }
+            cursor = idx + 1;
+        }
+        self.demote_scan_from = cursor;
+        if freed > 0 {
+            crate::metrics::raft_log_ram_delta(-(freed as i64));
+        }
+    }
+
     /// Rolls the active segment: seals the current one and opens a fresh
     /// `seg-<start>.ndjson` as the new active append target. Called when the active
     /// segment reaches `seg_max_bytes`, so a single segment never grows without
@@ -399,14 +499,25 @@ impl RaftLogStore {
                     continue;
                 }
                 let len = line.len() + 1;
+                let offset = seg_bytes;
                 seg_bytes += len;
                 let entry: Entry<RaftConfig> = serde_json::from_str(&line)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let index = entry.log_id.index;
+                let log_id = entry.log_id;
                 last = Some(index);
                 if purged_upto.map(|p| index > p).unwrap_or(true) {
                     log_bytes += len;
-                    log.insert(index, Stored { entry, len });
+                    log.insert(
+                        index,
+                        Stored {
+                            log_id,
+                            len,
+                            seg_start: start,
+                            offset,
+                            entry: Some(entry),
+                        },
+                    );
                 }
             }
             let fully_purged = matches!((last, purged_upto), (Some(l), Some(p)) if l <= p);
@@ -445,6 +556,9 @@ impl RaftLogStore {
                 seg_max_bytes: seg_max_bytes_from_env(),
                 log,
                 log_bytes,
+                ram_bytes: log_bytes,
+                ram_budget: ram_budget_from_env(),
+                demote_scan_from: 0,
                 last_purged: state.last_purged,
                 committed: state.committed,
                 vote,
@@ -456,6 +570,10 @@ impl RaftLogStore {
             bytes: Arc::new(AtomicI64::new(log_bytes as i64)),
         };
         crate::metrics::raft_log_delta(entries, log_bytes as i64);
+        crate::metrics::raft_log_ram_delta(log_bytes as i64);
+        // A recovered tail loads fully resident; demote its cold prefix so a
+        // restart under a large-payload workload does not re-balloon RAM.
+        store.inner.lock().unwrap().enforce_ram_budget();
 
         // Async mode amortises fsync off the append critical path; a background
         // ticker bounds the unfsynced window even when the partition goes quiet
@@ -535,26 +653,30 @@ impl RaftLogStore {
             }];
             return Ok(());
         }
-        // Rewrite the straddling (now last-kept) segment from the live entries it
-        // still holds; its predecessors are untouched.
+        // Rewrite the straddling (now last-kept) segment down to just its surviving
+        // prefix. The kept entries are a prefix of the segment written at unchanged
+        // byte offsets, so we truncate the file to the end of the last survivor
+        // rather than re-serializing — which also avoids rehydrating any demoted
+        // (descriptor-only) entries and keeps every `Stored.offset` valid.
         let active = kept.last().unwrap();
         let active_start = active.start;
-        let mut bytes = Vec::new();
+        let path = seg_path(&inner.dir, active_start);
+        let mut cut = 0usize;
         let mut last: Option<u64> = None;
         for (idx, stored) in inner.log.range(active_start..) {
-            serde_json::to_writer(&mut bytes, &stored.entry).map_err(io_err)?;
-            bytes.push(b'\n');
+            cut = stored.offset + stored.len;
             last = Some(*idx);
         }
-        let path = seg_path(&inner.dir, active_start);
-        atomic_write(&inner.dir, &path, &bytes).map_err(io_err)?;
+        let existing = fs::read(&path).map_err(io_err)?;
+        let cut = cut.min(existing.len());
+        atomic_write(&inner.dir, &path, &existing[..cut]).map_err(io_err)?;
         let active_file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .map_err(io_err)?;
         inner.active_file = active_file;
-        inner.active_bytes = bytes.len();
+        inner.active_bytes = cut;
         inner.unsynced_bytes = 0;
         let n = kept.len();
         kept[n - 1].last = last;
@@ -571,6 +693,31 @@ impl RaftLogStore {
         let bytes = serde_json::to_vec(&state).map_err(io_err)?;
         atomic_write(&inner.dir, &state_path(&inner.dir), &bytes).map_err(io_err)
     }
+}
+
+/// Reads back a single demoted log entry from its on-disk segment: seeks to the
+/// recorded `offset` in `seg-<seg_start>.ndjson`, reads exactly `len` bytes (the
+/// serialized JSON line plus its trailing `\n`), and deserializes it. The bytes
+/// were written by `append`; on the same process they are visible via the page
+/// cache even before an fsync, so a demoted entry is always readable while live.
+fn read_entry_at(
+    dir: &Path,
+    seg_start: u64,
+    offset: usize,
+    len: usize,
+) -> io::Result<Entry<RaftConfig>> {
+    let path = seg_path(dir, seg_start);
+    let mut f = File::open(&path)?;
+    f.seek(SeekFrom::Start(offset as u64))?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    // `len` includes the trailing newline; deserialize the JSON portion.
+    let end = if buf.last() == Some(&b'\n') {
+        len - 1
+    } else {
+        len
+    };
+    serde_json::from_slice(&buf[..end]).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Reads and deserializes a JSON file, returning `None` if it does not exist.
@@ -595,12 +742,46 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<RaftConfig>>, StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .log
-            .range(range)
-            .map(|(_, s)| s.entry.clone())
-            .collect())
+        // Snapshot the range under the lock into either a resident clone or a
+        // (segment, offset, len) descriptor, then release the lock before doing any
+        // disk reads so demoted-entry rehydration never serialises other appends
+        // behind the store mutex.
+        enum Resolved {
+            Ram(Entry<RaftConfig>),
+            Disk {
+                seg_start: u64,
+                offset: usize,
+                len: usize,
+            },
+        }
+        let planned: Vec<Resolved> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .log
+                .range(range)
+                .map(|(_, s)| match &s.entry {
+                    Some(e) => Resolved::Ram(e.clone()),
+                    None => Resolved::Disk {
+                        seg_start: s.seg_start,
+                        offset: s.offset,
+                        len: s.len,
+                    },
+                })
+                .collect()
+        };
+        let dir = { self.inner.lock().unwrap().dir.clone() };
+        let mut out = Vec::with_capacity(planned.len());
+        for r in planned {
+            match r {
+                Resolved::Ram(e) => out.push(e),
+                Resolved::Disk {
+                    seg_start,
+                    offset,
+                    len,
+                } => out.push(read_entry_at(&dir, seg_start, offset, len).map_err(io_err)?),
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -613,7 +794,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             .log
             .values()
             .next_back()
-            .map(|s| s.entry.log_id)
+            .map(|s| s.log_id)
             .or(inner.last_purged);
         Ok(LogState {
             last_purged_log_id: inner.last_purged,
@@ -657,6 +838,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             line.push(b'\n');
             let len = line.len();
             let index = entry.log_id.index;
+            let log_id = entry.log_id;
 
             // Roll to a fresh segment once the active one is full (and non-empty, so
             // a single oversized entry still lands somewhere). The outgoing segment
@@ -668,16 +850,31 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
                 inner.roll_active(index).map_err(io_err)?;
             }
 
+            // Record where this entry's line lands (post-roll) so it can later be
+            // demoted to descriptor-only and read back from the segment file.
+            let seg_start = inner.segments.last().map(|s| s.start).unwrap_or(index);
+            let offset = inner.active_bytes;
             inner.active_file.write_all(&line).map_err(io_err)?;
             inner.active_bytes += len;
             if let Some(seg) = inner.segments.last_mut() {
                 seg.last = Some(index);
             }
-            inner.log.insert(index, Stored { entry, len });
+            inner.log.insert(
+                index,
+                Stored {
+                    log_id,
+                    len,
+                    seg_start,
+                    offset,
+                    entry: Some(entry),
+                },
+            );
             inner.log_bytes += len;
+            inner.ram_bytes += len;
             inner.unsynced_bytes += len;
             new_bytes += len;
             added += 1;
+            crate::metrics::raft_log_entry_appended(len);
         }
         match inner.mode {
             // Sync: fsync before acknowledging — a flushed entry is power-loss
@@ -699,6 +896,10 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             }
         }
         crate::metrics::raft_log_delta(added, new_bytes as i64);
+        crate::metrics::raft_log_ram_delta(new_bytes as i64);
+        // Demote the cold tail back under the RAM budget (O(1) in-memory drops; the
+        // bytes are already durably on disk). Off the fsync path above.
+        inner.enforce_ram_budget();
         self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
         drop(inner);
         callback.log_io_completed(Ok(()));
@@ -713,12 +914,19 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         let before_bytes = inner.log_bytes as i64;
         let removed = inner.log.split_off(&log_id.index);
         let removed_bytes: usize = removed.values().map(|s| s.len).sum();
+        let removed_ram: usize = removed
+            .values()
+            .filter(|s| s.entry.is_some())
+            .map(|s| s.len)
+            .sum();
         inner.log_bytes = inner.log_bytes.saturating_sub(removed_bytes);
+        inner.ram_bytes = inner.ram_bytes.saturating_sub(removed_ram);
         Self::rewrite_after_truncate(&mut inner, log_id.index)?;
         crate::metrics::raft_log_delta(
             inner.log.len() as i64 - before_entries,
             inner.log_bytes as i64 - before_bytes,
         );
+        crate::metrics::raft_log_ram_delta(-(removed_ram as i64));
         self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
         Ok(())
     }
@@ -738,7 +946,14 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         let keep = inner.log.split_off(&(log_id.index + 1));
         let dropped = std::mem::replace(&mut inner.log, keep);
         let dropped_bytes: usize = dropped.values().map(|s| s.len).sum();
+        let dropped_ram: usize = dropped
+            .values()
+            .filter(|s| s.entry.is_some())
+            .map(|s| s.len)
+            .sum();
         inner.log_bytes = inner.log_bytes.saturating_sub(dropped_bytes);
+        inner.ram_bytes = inner.ram_bytes.saturating_sub(dropped_ram);
+        crate::metrics::raft_log_ram_delta(-(dropped_ram as i64));
 
         // Reclaim whole sealed segments now entirely below the purge point.
         let upto = log_id.index;
@@ -970,6 +1185,104 @@ mod tests {
         // A reopen reconstructs exactly the truncated log.
         let mut reopened = RaftLogStore::open(&dir).unwrap();
         assert_eq!(indices_in(&mut reopened).await, vec![0, 1, 2, 3]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Demotes all-but-the-newest entry (budget = 1 byte) and proves the reader
+    /// transparently rehydrates the descriptor-only entries from their segment file
+    /// — the whole point of the byte-bounded hot-window cache.
+    #[tokio::test]
+    async fn demoted_entries_are_rehydrated_from_disk_on_read() {
+        let dir = tmp_dir("demote-read");
+        write_segment(&dir, 0, &[0, 1, 2, 3, 4]);
+        let mut store = RaftLogStore::open(&dir).unwrap();
+
+        {
+            let mut inner = store.inner.lock().unwrap();
+            inner.ram_budget = 1;
+            inner.demote_scan_from = 0;
+            inner.enforce_ram_budget();
+            // Everything but the newest entry (index 4) is demoted to descriptor-only.
+            let resident: Vec<u64> = inner
+                .log
+                .iter()
+                .filter(|(_, s)| s.entry.is_some())
+                .map(|(i, _)| *i)
+                .collect();
+            assert_eq!(resident, vec![4], "only the newest entry stays resident");
+            assert_eq!(
+                inner.ram_bytes,
+                inner.log.get(&4).unwrap().len,
+                "resident bytes collapse to just the hot entry"
+            );
+        }
+
+        // Reads still return every entry, in order, reading the demoted ones back
+        // from disk.
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4]);
+        let sub = store.try_get_log_entries(1..4).await.unwrap();
+        assert_eq!(
+            sub.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        // The last-log-id is served from the retained id even when demotion is in play.
+        assert_eq!(
+            store.get_log_state().await.unwrap().last_log_id,
+            Some(log_id(4))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `truncate` must handle demoted entries in the straddled segment: it keeps the
+    /// surviving byte prefix without needing to rehydrate/re-serialize them.
+    #[tokio::test]
+    async fn truncate_with_demoted_entries_keeps_the_surviving_prefix() {
+        let dir = tmp_dir("demote-truncate");
+        write_segment(&dir, 0, &[0, 1, 2, 3, 4, 5]);
+        let mut store = RaftLogStore::open(&dir).unwrap();
+        {
+            let mut inner = store.inner.lock().unwrap();
+            inner.ram_budget = 1;
+            inner.demote_scan_from = 0;
+            inner.enforce_ram_budget();
+        }
+
+        store.truncate(log_id(3)).await.unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2]);
+
+        // The surviving prefix is durable and byte-correct across a reopen.
+        let mut reopened = RaftLogStore::open(&dir).unwrap();
+        assert_eq!(indices_in(&mut reopened).await, vec![0, 1, 2]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `purge` must drop demoted prefix entries and keep resident-byte accounting in
+    /// step (dropped entries were descriptor-only, so `ram_bytes` should not move).
+    #[tokio::test]
+    async fn purge_with_demoted_entries_drops_the_prefix() {
+        let dir = tmp_dir("demote-purge");
+        write_segment(&dir, 0, &[0, 1, 2]);
+        write_segment(&dir, 3, &[3, 4, 5]);
+        let mut store = RaftLogStore::open(&dir).unwrap();
+        let ram_after_demote = {
+            let mut inner = store.inner.lock().unwrap();
+            inner.ram_budget = 1;
+            inner.demote_scan_from = 0;
+            inner.enforce_ram_budget();
+            inner.ram_bytes
+        };
+
+        store.purge(log_id(2)).await.unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![3, 4, 5]);
+        // The purged entries were demoted (descriptor-only), so resident bytes are
+        // unchanged by the purge.
+        assert_eq!(store.inner.lock().unwrap().ram_bytes, ram_after_demote);
+
+        let mut reopened = RaftLogStore::open(&dir).unwrap();
+        assert_eq!(indices_in(&mut reopened).await, vec![3, 4, 5]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

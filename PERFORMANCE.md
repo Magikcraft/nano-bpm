@@ -34,6 +34,69 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## 2026-07-12 — Byte-bounded Raft-log hot-window cache (50KB-payload RAM) — clean A/B validated
+
+**Problem:** the compaction governor (below) bounds the log by *bytes*, but the
+post-snapshot retention floor (`NANOBPMN_RAFT_KEEP_LOGS`, default 1000) is
+**entry-count** based, so the retained tail is byte-unbounded under large payloads.
+At 50KB the redundant in-RAM copy of that retained tail dominated RSS
+(~13GB/node raft-log resident, ~14.4GB RSS).
+
+**Fix (`server/src/raft_logstore.rs`, commit `e5f6f0d`):** make the in-RAM `Entry`
+an *optional cache* of the on-disk segment line. Keep the most-recent entries
+resident (hot replication) up to a per-partition RAM byte budget
+(`NANOBPMN_RAFT_LOG_RAM_BYTES`, default 64 MiB); demote the colder low-index tail
+to a `(seg_start, offset, len)` descriptor and read it back on demand in
+`try_get_log_entries` (planned under the store mutex, disk read **outside** it, so
+rehydration never serialises appends). Demotion is an O(1) in-RAM drop off the
+fsync path — the bytes are already durable on disk — so the write path is
+unchanged. Adaptation is **emergent** from the byte-bounded recency cache: small
+payloads keep the whole tail resident (no change); large payloads bound resident
+RAM at the budget. No size threshold, no mode flip. `0` disables demotion
+(pre-adaptation behaviour) for A/B. New metric `nanobpm_raft_log_ram_bytes`
+(resident) alongside `nanobpm_raft_log_bytes` (full tail); the gap is what the
+cache reclaimed.
+
+**Clean A/B (GCP 3-node RF3 Raft-ON, 12 partitions, leader-durable/sync, adaptive
+`fc20a02c`; journal wiped between every arm — see methodology note).**
+
+| workload | agg tput | latency | resident raft-log / node | RSS / node | stability |
+|---|---|---|---|---|---|
+| 50KB (VB=51200, 10 min) | ~2,406/s | p50 60s* / p99 92s* | **765 MB** (full tail 12.3 GB) | **6–7 GB** | 0 shed, no wedge |
+| negligible (VB=0, 5 min) | ~39.5k/s | p50 24 / **p99 <80 ms** | ≈ full (no demotion, by design) | ~2 GB | 0 shed, no wedge |
+
+\* the ~60s p50 at 50KB is the loadgen's `MAX_INFLIGHT=50000` standing-queue
+artifact (50k inflight ÷ 800/s ≈ 62s residence), **not** server latency — identical
+to the prior baseline; throughput is unregressed.
+
+**Result:** ~17× resident raft-log RAM reduction at 50KB (13 GB → 765 MB/node; RSS
+14.4 → 6–7 GB) with **zero throughput regression** in either regime. The resident
+floor is the per-partition budget × 12 partitions (64 MiB × 12 ≈ 768 MiB).
+
+**Methodology note — wipe the journal between arms.** An earlier back-to-back
+A→B→neg sequence (no wipe) showed a dramatic "5.5-min wedge" (completions → 0,
+active-backlog 300 → 56k, `admission_shed_total{active_backlog}=149548`). Clean
+wiped re-runs of the *same* binary held steady with 0 shed. The wedge was
+**cross-run contamination** — residual orphaned backlog from the prior arm
+(instances whose workers were gone) pushing the next arm past the admission cap —
+**not** a display artifact and **not** an adaptive-build regression. Always
+`rm -rf ~/nano-data` + restart every node between arms (`restart-verify.sh`).
+
+**Not a congestion collapse.** The engine actor is a High/Low priority mailbox
+(`server/src/deepthi.rs`): completions/reads run at `High`, instance-creates at
+`Low`, drained High-before-Low so a create flood cannot starve completion (mirrored
+in the raft apply path, `server/src/raft.rs`). With completion-priority plus the
+auto-tuned multi-rail admission shedding (`admission_shed`), backlog is self-draining
+under overload — the benchmark wedge required a non-backing-off loadgen sitting on
+orphaned instances, a harness condition, not a server collapse.
+
+Release build + `clippy --all-targets` clean; demotion/rehydration unit-tested
+(`demoted_entries_are_rehydrated_from_disk_on_read`,
+`truncate_with_demoted_entries_keeps_the_surviving_prefix`,
+`purge_with_demoted_entries_drops_the_prefix`).
+
+---
+
 ## 2026-07-11 — Raft-log compaction governor (50KB-payload memory + throughput)
 
 **Problem (from the 50KB soak, see below):** under 50KB variable payloads the
