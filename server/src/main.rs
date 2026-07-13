@@ -1130,6 +1130,33 @@ fn inflight_saturating_add_signed(gauge: &AtomicUsize, delta: i64) {
     }
 }
 
+/// Retries `op` with capped exponential backoff (5ms doubling to a 1s ceiling)
+/// until it returns `Ok`, calling `on_retry(attempt, err)` before each
+/// re-attempt and `sleep(backoff)` between attempts. Never gives up: the read
+/// model must stay a faithful projection of the durable journal, so its exporter
+/// can wait out transient store contention but must never skip a batch (which
+/// would desync the projection irrecoverably). `sleep` is injected so tests drive
+/// the loop without real delay. See the call site in [`spawn_exporter`].
+fn retry_until_ok<T, E>(
+    mut op: impl FnMut() -> Result<T, E>,
+    mut on_retry: impl FnMut(u32, E),
+    mut sleep: impl FnMut(std::time::Duration),
+) -> T {
+    let mut backoff = std::time::Duration::from_millis(5);
+    let mut attempt = 0u32;
+    loop {
+        match op() {
+            Ok(value) => return value,
+            Err(err) => {
+                attempt += 1;
+                on_retry(attempt, err);
+                sleep(backoff);
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+}
+
 /// Spawns one read-model exporter thread for a single partition's shard. It
 /// drains the shard's channel (batching queued commands' events), projects the
 /// batch into the shard's [`ReadStore`], then evicts any now-completed instances
@@ -1215,21 +1242,43 @@ fn spawn_exporter(
                 // transitions (see ExportOutcome) rather than counting raw
                 // create/terminal event occurrences — which double-counted under
                 // idempotent re-delivery and drifted the gauge.
+                //
+                // The exporter must NEVER skip a batch. `exported_position`
+                // advances by event COUNT and events arrive as a consecutive,
+                // log-ordered stream, so dropping a batch permanently desyncs the
+                // projection from the journal: later successful batches advance
+                // the position past the gap, burying the un-projected events below
+                // the exporter watermark where compaction reclaims them —
+                // unrecoverable read-model loss (stuck-Active / missing instances /
+                // wrong awaitCompletion), even across a restart. A store write
+                // failure here is almost always transient lock contention with the
+                // retention pruner / WAL checkpoint (SQLite `database is locked`
+                // outliving `busy_timeout`), so retry with capped exponential
+                // backoff until it clears. Blocking is the correct backpressure:
+                // the in-order channel backs up and the exporter-queue budget sheds
+                // new creates, exactly as a genuine projection lag would. The batch
+                // bytes stay accounted (no early `fetch_sub`) so that backpressure
+                // holds while we retry. The engine's durable state is unaffected —
+                // the exporter is downstream of fsync; only the projection waits.
                 let ExportOutcome {
                     terminal_keys: completed,
                     inflight_delta: delta,
-                } = match store.export(&refs) {
-                    Ok(outcome) => outcome,
-                    Err(e) => {
-                        tracing::error!("read-model export failed: {e}");
-                        // The batch is dropped regardless, so release its queue
-                        // accounting to keep the create-admission gauge honest.
-                        if batch_bytes > 0 {
-                            queued.fetch_sub(batch_bytes, Ordering::Relaxed);
+                } = retry_until_ok(
+                    || store.export(&refs),
+                    |attempt, e| {
+                        crate::metrics::record_read_model_export_retry();
+                        // Rate-limit the log: the first failure, then once per ~64
+                        // attempts (a few seconds at the 1s backoff ceiling).
+                        if attempt == 1 || attempt.is_multiple_of(64) {
+                            tracing::warn!(
+                                attempt,
+                                "read-model export failed ({e}); retrying \
+                                 (the batch is never dropped)"
+                            );
                         }
-                        continue;
-                    }
-                };
+                    },
+                    std::thread::sleep,
+                );
                 // Projected: this batch no longer occupies the exporter queue, so
                 // release its bytes from the create-admission backpressure gauge.
                 if batch_bytes > 0 {
@@ -11932,6 +11981,53 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod clustered_startup_tests {
     use super::*;
+
+    #[test]
+    fn retry_until_ok_retries_transient_failures_then_returns_without_dropping() {
+        // The read-model exporter must never drop a batch on a transient store
+        // write failure (SQLite `database is locked`) — dropping desyncs the
+        // projection from the durable journal irrecoverably. Assert the retry
+        // combinator re-attempts until success, sleeps once per failure (never
+        // after success), and surfaces the eventual value.
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let retries = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+
+        let out = retry_until_ok(
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                // Fail twice (as a transient lock would), then succeed.
+                if n < 3 {
+                    Err("database is locked")
+                } else {
+                    Ok(42u32)
+                }
+            },
+            |attempt, _e: &str| {
+                retries.set(retries.get() + 1);
+                assert_eq!(
+                    attempt,
+                    retries.get(),
+                    "attempt count is 1-based and monotonic"
+                );
+            },
+            |_backoff| sleeps.set(sleeps.get() + 1),
+        );
+
+        assert_eq!(
+            out, 42,
+            "the eventual Ok value is returned, batch not dropped"
+        );
+        assert_eq!(calls.get(), 3, "op invoked until it succeeded");
+        assert_eq!(retries.get(), 2, "on_retry fired once per failure");
+        assert_eq!(
+            sleeps.get(),
+            2,
+            "backoff slept per failure, never after success"
+        );
+    }
 
     #[test]
     fn spill_default_scales_with_memory_limit() {

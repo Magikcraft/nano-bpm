@@ -56,6 +56,12 @@ struct Metrics {
     stream_frames_total: prometheus::IntCounterVec,
     /// How many times a streaming client stalled waiting for submission credits.
     stream_credit_stalls_total: IntCounter,
+    /// How many times the read-model exporter retried a batch after a transient
+    /// store write failure (e.g. SQLite `database is locked`) rather than
+    /// dropping it. A climbing value means read-model projection is contending
+    /// with the retention pruner / WAL checkpoint; sustained growth is the signal
+    /// to widen `busy_timeout` or the exporter-queue budget.
+    read_model_export_retries_total: IntCounter,
     /// Active falcon WebSocket connections.
     stream_connections_active: IntGauge,
     /// Time spent processing each falcon frame (read + apply + reply).
@@ -332,6 +338,13 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let stream_credit_stalls_total = IntCounter::new(
         "nanobpm_stream_credit_stalls_total",
         "Streaming clients stalled waiting for submission credits.",
+    )
+    .expect("valid counter");
+
+    let read_model_export_retries_total = IntCounter::new(
+        "nanobpm_read_model_export_retries_total",
+        "Read-model export batches retried after a transient store write failure \
+         (never silently dropped).",
     )
     .expect("valid counter");
 
@@ -629,6 +642,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(writer_busy_seconds.clone())))
         .and(registry.register(Box::new(stream_frames_total.clone())))
         .and(registry.register(Box::new(stream_credit_stalls_total.clone())))
+        .and(registry.register(Box::new(read_model_export_retries_total.clone())))
         .and(registry.register(Box::new(stream_connections_active.clone())))
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
         .and(registry.register(Box::new(creates_total.clone())))
@@ -682,6 +696,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         writer_busy_seconds,
         stream_frames_total,
         stream_credit_stalls_total,
+        read_model_export_retries_total,
         stream_connections_active,
         stream_frame_processing_seconds,
         creates_total,
@@ -1055,6 +1070,13 @@ pub fn record_stream_frame(frame_type: &str) {
 /// Records a streaming client stalling for submission credits.
 pub fn record_stream_credit_stall() {
     METRICS.stream_credit_stalls_total.inc();
+}
+
+/// Records one retry of a read-model export batch after a transient store write
+/// failure. Called once per retry attempt, so the counter reflects total retry
+/// work, not just the number of contended batches.
+pub fn record_read_model_export_retry() {
+    METRICS.read_model_export_retries_total.inc();
 }
 
 /// Falcon connection opened (+1).
