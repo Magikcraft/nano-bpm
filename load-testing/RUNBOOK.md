@@ -33,6 +33,66 @@ exercises the durable-write path and memory rails.
 
 ---
 
+## Getting source onto the build host (rsync — no git on the nodes)
+
+The build host (node0, `10.128.0.19`) has **no `git`** installed and its
+`~/build-console` tree is **not a git checkout** — so `scenario.sh --build
+--branch <b>` (which runs `git fetch && git checkout`) does **not** work there.
+Instead, sync the source from a machine that *does* have the repo (your dev box),
+then build in place with `build-server.sh`.
+
+The nodes are only reachable *through* the loadbox (they lack the peer SSH key and
+sit behind the IAP tunnel), so sync in two hops: **dev box → loadbox → node0**.
+
+```bash
+# On the dev box, at the repo root, with main checked out at the commit to build:
+git checkout main && git pull
+
+# Only these crates change between builds; console/dist rarely does. --delete keeps
+# the build host tree identical to the source (no stale files leaking into a build).
+SSHK="-i $HOME/.ssh/google_compute_engine"
+RSYNC_EXCLUDES="--exclude target --exclude .git --exclude nano-data"
+
+# Hop 1: dev box -> loadbox (via the persistent IAP tunnel on localhost:2223)
+rsync -az --delete $RSYNC_EXCLUDES \
+  -e "ssh $SSHK -p 2223" \
+  engine-core server generated \
+  joshua.wulf@localhost:~/src-stage/
+
+# Hop 2: loadbox -> node0 build-console (run from the loadbox)
+ssh $SSHK -p 2223 joshua.wulf@localhost \
+  'rsync -az --delete ~/src-stage/engine-core ~/src-stage/server \
+     ~/src-stage/generated \
+     -e "ssh -i ~/.ssh/google_compute_engine -o StrictHostKeyChecking=no" \
+     10.128.0.19:~/build-console/'
+```
+
+Then build + stage + deploy + soak as usual:
+
+```bash
+# Build on node0 (embeds the console; --stage writes ~/nano-gw-new):
+ssh $SSHK -p 2223 joshua.wulf@localhost \
+  'ssh -i ~/.ssh/google_compute_engine 10.128.0.19 \
+     "cd ~/build-console && CARGO=~/.cargo/bin/cargo \
+        load-testing/scripts/build-server.sh --stage ~/nano-gw-new"'
+
+# Fan the binary out, wipe+restart all nodes, then soak (on the loadbox):
+ssh $SSHK -p 2223 joshua.wulf@localhost \
+  '~/stage-binary.sh --from node0 && ~/deploy.sh default && \
+   PROD_CONNS=256 MAXPAR=224 ~/soak.sh 50kb 30m my-soak'
+```
+
+Notes:
+- Keep `--delete` on both hops so a merged/rebased `main` cannot leave a stale
+  source file behind and produce a build that doesn't match the commit.
+- `deploy.sh` has **no compression**; use `deploy-compress.sh` to launch with
+  `NANOBPMN_RAFT_LOG_COMPRESS=1` when reproducing the compressed-soak conditions.
+- If you prefer git on the build host, `sudo apt-get install -y git` on node0
+  works (it has outbound internet), after which `scenario.sh --build --branch`
+  becomes viable — but the rsync path avoids depending on node0 state.
+
+---
+
 ## Post-mortem: the "50 KB soak wedge" (2026-07-12)
 
 A 50 KB soak time-series showed completions collapsing to ~0 mid-run while the
