@@ -1434,6 +1434,14 @@ impl Journal {
         }
     }
 
+    /// Test hook: whether cold-spill is configured (a cold store is wired). Used
+    /// to assert that lazily-created Raft replica engines inherit the same spill
+    /// tiers as owned engines, so a follower can reclaim hot RAM.
+    #[cfg(test)]
+    pub fn cold_spill_configured(&self) -> bool {
+        self.cold.is_some()
+    }
+
     /// Test hook: cold-spills every currently dormant instance regardless of the
     /// memory watermark, returning the number shed. Lets tests exercise the
     /// spill/rehydrate seams deterministically without driving real RAM pressure.
