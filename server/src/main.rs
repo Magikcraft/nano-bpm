@@ -190,6 +190,25 @@ pub struct ServerImpl {
     /// not jobs, so they never appear here and are never shed against. Refreshed
     /// by the ~1 Hz monitor tick; read with a relaxed load.
     runnable_backlog: Arc<AtomicUsize>,
+    /// The live **unified admission setpoint**: the effective per-node active-backlog
+    /// cap the throttle converges intake to, `min(latency_cap, memory_cap)` clamped
+    /// to `[backlog_cap_floor, backlog_cap_ceiling]`. `0` = no active setpoint (the
+    /// backlog cap is disabled — `NANOBPMN_ADMISSION_MAX_BACKLOG=off`), in which case
+    /// the drain-guard servo falls back to its absolute band. Computed each ~1 Hz
+    /// monitor tick from the latency governor's `backlog_cap` and the live memory
+    /// headroom, so it is adaptive to *both* latency and memory. The drain-guard
+    /// servo bands against it (pacing submission credits to hold the backlog here in
+    /// both SLA modes) and the post-credit backlog shed fires only above it — the
+    /// single throttle both the client and server converge on. See
+    /// [`Self::backlog_shed_level`].
+    effective_backlog_cap: Arc<AtomicUsize>,
+    /// Lower bound for the unified setpoint (`effective_backlog_cap`): the memory
+    /// clamp can pull the setpoint down, but never below this (the governor knee
+    /// floor, or the fixed cap's floor). `0` when the backlog cap is disabled.
+    backlog_cap_floor: usize,
+    /// Upper bound for the unified setpoint (`effective_backlog_cap`): the memory
+    /// backstop / governor ceiling (or the fixed cap). `0` when disabled.
+    backlog_cap_ceiling: usize,
     /// The live per-job-type active dispatch width the push dispatcher caps its
     /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
     /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
@@ -535,12 +554,21 @@ impl ServerImpl {
         // In Auto mode we also keep the governor's bounds + latency read handle
         // (`backlog_gov`) so the monitor and shed message can explain the cap.
         let mut backlog_gov: Option<BacklogGovernor> = None;
+        // Bounds for the unified admission setpoint (`effective_backlog_cap`): the
+        // memory clamp moves the setpoint within `[floor, ceiling]`. `0` means the
+        // backlog cap is disabled (Off) — the servo then uses its absolute band.
+        let mut backlog_cap_floor: usize = 0;
+        let mut backlog_cap_ceiling: usize = 0;
         let backlog_cap = match admission_backlog_from_env() {
             AdmissionBacklog::Off => Arc::new(AtomicUsize::new(0)),
             AdmissionBacklog::Fixed(n) => {
                 tracing::info!(
                     "admission control: on, fixed active-backlog cap {n} runnable job(s)/node"
                 );
+                // A fixed cap is the ceiling; the memory clamp may still pull the
+                // unified setpoint below it (down to the knee floor) for safety.
+                backlog_cap_floor = MIN_BACKLOG_GOVERNOR_CAP.min(n);
+                backlog_cap_ceiling = n;
                 Arc::new(AtomicUsize::new(n))
             }
             AdmissionBacklog::Auto { floor, ceiling } => {
@@ -548,6 +576,8 @@ impl ServerImpl {
                     "admission control: on, self-optimizing active-backlog governor \
                      (floor {floor}, ceiling {ceiling} runnable jobs/node)"
                 );
+                backlog_cap_floor = floor;
+                backlog_cap_ceiling = ceiling;
                 let (cap, obs) =
                     controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone());
                 backlog_gov = Some(BacklogGovernor {
@@ -558,6 +588,9 @@ impl ServerImpl {
                 cap
             }
         };
+        // The unified setpoint, recomputed each monitor tick. Seed at 0 (no clamp)
+        // until the first tick folds in the live latency + memory signals.
+        let effective_backlog_cap = Arc::new(AtomicUsize::new(0));
         // `active_worker_cap` is the live per-job-type active dispatch width the
         // push dispatcher reads (0 = no cap). Resolved from one of three policies,
         // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
@@ -732,6 +765,9 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
             backlog_gov,
+            backlog_cap_floor,
+            backlog_cap_ceiling,
+            effective_backlog_cap,
             runnable_backlog,
             active_worker_cap,
             admission_max_create_queue,
@@ -1755,6 +1791,14 @@ fn admission_backlog_from_env() -> AdmissionBacklog {
 /// the governor holds the system just left of the congestion-collapse point
 /// without starving the workers or shedding a modest parked/burst backlog.
 const MIN_BACKLOG_GOVERNOR_CAP: usize = 2_000;
+
+/// Margin (percent of the unified setpoint) at which the post-credit active-backlog
+/// shed fires. The completion-paced credit servo holds intake at the setpoint
+/// ([`Server::effective_backlog_cap`]); this shed is a burst backstop above it, so
+/// it catches an overshoot the credit throttle could not (e.g. a REST create burst
+/// that bypasses the submission-credit window) without colliding with the servo and
+/// oscillating the way a shed *at* the setpoint did.
+const SHED_BACKSTOP_MARGIN_PCT: usize = 150;
 
 /// The resolved worker-concurrency (active dispatch width) policy — see
 /// [`worker_concurrency_from_env`]. Bounds how many subscribers the push
@@ -9415,6 +9459,63 @@ impl ServerImpl {
         self.inflight.load(Ordering::Relaxed) as i64
     }
 
+    /// Recomputes the unified admission setpoint from the live latency + memory
+    /// signals and stores it in [`Self::effective_backlog_cap`]. Called each ~1 Hz
+    /// monitor tick. This is the single throttle the whole system converges on:
+    ///
+    /// * `latency_cap` = the backlog governor's live output (the latency knee). Only
+    ///   participates in `SlaMode::Latency`; admission mode prefers admitting over
+    ///   bounding latency, so it is bounded by memory alone.
+    /// * `memory_cap` = the current backlog plus the number of additional nominal
+    ///   active instances that fit in the remaining memory headroom before the
+    ///   resident watermark. As RAM fills this shrinks toward the current backlog,
+    ///   pulling the setpoint down so intake paces to what memory can hold.
+    ///
+    /// The result is `min(latency_cap, memory_cap)` clamped to the configured
+    /// `[floor, ceiling]`. Returns the stored value. Returns `0` (no setpoint) when
+    /// the backlog cap is disabled, leaving the servo on its absolute band.
+    fn refresh_effective_backlog_cap(&self, active_backlog: i64) -> usize {
+        let ceiling = self.backlog_cap_ceiling;
+        if ceiling == 0 {
+            // Backlog cap disabled (Off): no unified setpoint.
+            self.effective_backlog_cap.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        let latency_cap = self.backlog_cap.load(Ordering::Relaxed);
+        let latency_component = if self.sla_mode.get().sheds_for_latency() && latency_cap > 0 {
+            latency_cap
+        } else {
+            usize::MAX
+        };
+        let memory_cap = if self.mem_watermark_bytes > 0 {
+            let used = self.mem_pressure_bytes.load(Ordering::Relaxed);
+            let headroom_bytes = self.mem_watermark_bytes.saturating_sub(used);
+            let headroom_insts = (headroom_bytes / NOMINAL_ACTIVE_BYTES) as usize;
+            (active_backlog.max(0) as usize).saturating_add(headroom_insts)
+        } else {
+            usize::MAX
+        };
+        let eff = latency_component
+            .min(memory_cap)
+            .clamp(self.backlog_cap_floor, ceiling);
+        self.effective_backlog_cap.store(eff, Ordering::Relaxed);
+        eff
+    }
+
+    /// The active-backlog / create-backlog shed threshold: a burst backstop set a
+    /// margin *above* the unified setpoint so the completion-paced credit servo owns
+    /// the operating band and the shed only catches an overshoot the credit throttle
+    /// could not. Falls back to the raw governor cap when there is no active setpoint
+    /// (backlog cap disabled or the first monitor tick has not run yet).
+    fn backlog_shed_level(&self) -> usize {
+        let eff = self.effective_backlog_cap.load(Ordering::Relaxed);
+        if eff > 0 {
+            eff.saturating_mul(SHED_BACKSTOP_MARGIN_PCT) / 100
+        } else {
+            self.backlog_cap.load(Ordering::Relaxed)
+        }
+    }
+
     /// Trailing sentence for an active-backlog / create-backlog shed message that
     /// explains *why* the cap is what it is — so an operator isn't left staring at
     /// a shed threshold they never configured. In `Auto` mode the cap is the live
@@ -9483,7 +9584,11 @@ impl ServerImpl {
             return Some(reason);
         }
         let cq_limit = self.admission_max_create_queue;
-        let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
+        // Post-credit backlog shed threshold: a burst backstop a margin *above* the
+        // unified admission setpoint (the servo's operating band), not the raw
+        // governor cap — so the completion-paced credit servo holds the backlog and
+        // this shed only catches an overshoot the credit throttle could not.
+        let backlog_limit = self.backlog_shed_level();
         let latency_mode = self.sla_mode.get().sheds_for_latency();
         // The standing create-queue depth (submitted-but-not-yet-applied creates)
         // is the backlog that actually grows under overload — completion-priority
@@ -11788,10 +11893,16 @@ async fn main() {
                     prev_completions = completions_now;
                     let completes_per_sec = if dt > 0.0 { completed as f64 / dt } else { 0.0 };
                     let backlog = monitor_server.active_backlog();
+                    // Recompute the unified admission setpoint (latency ∧ memory)
+                    // from the live signals, publish it, and band the servo against
+                    // it so intake is paced to the *current* cap in both SLA modes.
+                    let effective_cap = monitor_server.refresh_effective_backlog_cap(backlog);
+                    crate::metrics::set_admission_limit("backlog_effective", effective_cap as i64);
 
                     let decision = drain_sm.observe(crate::drain_guard::DrainSample {
                         completes_per_sec,
                         backlog,
+                        backlog_cap: effective_cap as i64,
                         actor_alive: any_actor_alive,
                     });
                     let guard = monitor_server.drain_guard();
