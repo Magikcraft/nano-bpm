@@ -708,6 +708,17 @@ fn attr_type_label(t: AttrType) -> &'static str {
     }
 }
 
+/// The checked-in grammar file — the on-disk artifact that `emit_gbnf()` produced at build time
+/// of the last committed source. Consumers that want to hand a `--grammar-file` to `llama-server`
+/// or inline the grammar into a request body should use this rather than re-running
+/// [`emit_gbnf`] every call — it's a `&'static str` baked into the binary at compile time.
+///
+/// A drift test ([`tests::checked_in_grammar_matches_emitter`]) fails CI if this file falls
+/// behind the emitter. The fix is `processos emit-gbnf --out processos/assets/ir.gbnf`.
+pub fn ir_gbnf() -> &'static str {
+    include_str!("../assets/ir.gbnf")
+}
+
 // -------------------------------------------------------------------------------------------------
 // Parity harness — exhaustive sample instances of every ElementKind for the parity test and for
 // programmatic consumers (e.g. golden-fixture generators). Adding a new variant → the exhaustive
@@ -1093,5 +1104,27 @@ mod tests {
 
         let bogus = describe(Some("no_such_kind"));
         assert!(bogus.get("error").is_some());
+    }
+
+    /// The checked-in `processos/assets/ir.gbnf` MUST equal what `emit_gbnf()` produces from the
+    /// current source — otherwise runtime consumers (`ir_gbnf()`, hosted-model callers) would
+    /// hand out a stale grammar that no longer matches the engine surface.
+    ///
+    /// If this fails in CI, regenerate:
+    ///
+    /// ```sh
+    /// cargo run --bin processos -- emit-gbnf --out processos/assets/ir.gbnf
+    /// ```
+    ///
+    /// and commit the result.
+    #[test]
+    fn checked_in_grammar_matches_emitter() {
+        let generated = emit_gbnf();
+        let checked_in = ir_gbnf();
+        assert_eq!(
+            generated, checked_in,
+            "processos/assets/ir.gbnf is out of date — run `cargo run --bin processos -- \
+             emit-gbnf --out processos/assets/ir.gbnf` and commit the regenerated file.",
+        );
     }
 }

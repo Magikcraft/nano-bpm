@@ -508,6 +508,7 @@ async fn main() {
         .route("/api/colorize", post(colorize_flows_handler))
         .route("/api/curator/propose", post(curator_propose))
         .route("/api/curator/propose/stream", post(curator_propose_stream))
+        .route("/api/ir/grammar.gbnf", get(ir_grammar_gbnf))
         .route("/workspace", get(workspace_page))
         .route("/semantics", get(semantics_page))
         .route(
@@ -1106,6 +1107,22 @@ struct LayoutScoreRequest {
     xml: String,
     #[serde(default)]
     annotations: Option<layout::SemanticAnnotations>,
+}
+
+/// `GET /api/ir/grammar.gbnf` — serve the checked-in reversible-IR GBNF as `text/plain`.
+///
+/// This is the runtime source of truth for consumers that want to hand the grammar to a
+/// llama.cpp sidecar over HTTP (rather than a local `--grammar-file` path). The body is the
+/// committed [`processos/assets/ir.gbnf`] via [`ir_spec::ir_gbnf`], kept in sync with the
+/// emitter by the `checked_in_grammar_matches_emitter` parity test.
+async fn ir_grammar_gbnf() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        ir_spec::ir_gbnf(),
+    )
 }
 
 async fn layout_score(Json(req): Json<LayoutScoreRequest>) -> impl IntoResponse {
