@@ -1783,7 +1783,7 @@ fn pipeline_job_command(
 ) {
     match outcome {
         Ok(commit) => {
-            crate::metrics::record_job_completion("stream");
+            server.note_job_completion("stream");
             let server = server.clone();
             let conn = conn.clone();
             tokio::spawn(async move {
@@ -1913,7 +1913,7 @@ fn spawn_await_completion(
 /// keeping the client's intake window full under healthy load and letting it
 /// drain (the client stalls) under pressure.
 fn grant_submission_credit_if_clear(server: &ServerImpl, conn: &Arc<Connection>, n: i64) {
-    if n <= 0 || server.submission_pressure() {
+    if n <= 0 || server.create_admission_blocked() {
         return;
     }
     conn.grant_submission_credits(n);
@@ -1944,8 +1944,10 @@ pub fn spawn_dispatcher(server: ServerImpl, registry: Arc<Registry>) {
 
             // Edge-triggered fleet pressure signal: broadcast once on each
             // transition so workers can coordinate without polling. O(streams)
-            // only when the state actually flips.
-            let pressure = server.submission_pressure();
+            // only when the state actually flips. Reflects the drain-stall guard
+            // too, so a drain collapse turns the fleet red (workers back off new
+            // creates) even in the admission SLA mode where latency never sheds.
+            let pressure = server.create_admission_blocked();
             if pressure != last_pressure {
                 let frame = if pressure {
                     ServerFrame::Pressure {
@@ -2466,7 +2468,7 @@ fn dispatch_concurrency() -> usize {
 /// Refills each connection's submission window when the engine has headroom, so a
 /// client that stalled under pressure resumes intake once pressure clears.
 fn topup_submission_credits(server: &ServerImpl, registry: &Arc<Registry>) {
-    if server.submission_pressure() {
+    if server.create_admission_blocked() {
         return;
     }
     for conn in registry.all_connections() {
