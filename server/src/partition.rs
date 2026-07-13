@@ -571,22 +571,28 @@ impl Partitions {
         totals
     }
 
-    /// Total runnable (task-job) backlog: the count of jobs currently held in the
-    /// engine `jobs` map — both `Created` (waiting for a worker) and `Activated`
-    /// (leased, in-flight at a worker) — summed across every owned partition. This
-    /// is the parked-excluded O(active) congestion signal the admission gate and
-    /// the self-optimizing backlog governor read: only service tasks create jobs,
-    /// so instances parked on timers/messages never appear here. Unlike
+    /// Total runnable (task-job) backlog: the count of *live* jobs — both
+    /// `Created` (waiting for a worker) and `Activated` (leased, in-flight at a
+    /// worker) — summed across every owned partition. This is the parked-excluded
+    /// O(active) congestion signal the admission gate and the self-optimizing
+    /// backlog governor read: only service tasks create jobs, so instances parked
+    /// on timers/messages never appear here. Unlike
     /// [`activatable_job_counts`](Self::activatable_job_counts) (which counts only
     /// the *waiting* front), this includes leased-but-uncompleted jobs, so a
     /// worker-starved backlog that has drained into the activated set is still
-    /// counted. Runs each partition's cheap `jobs.len()` at `Low` priority (never
+    /// counted. It deliberately excludes terminal (`Completed`/`Failed`/`Errored`)
+    /// jobs that linger in hot state until the exporter evicts their instance:
+    /// folding those in (via a raw `jobs.len()`) let an exporter that fell behind
+    /// — or was stalled by a locked read-model store — inflate the signal with
+    /// dead weight and shed legitimate new work, a throughput collapse that never
+    /// cleared. See [`State::live_job_count`](nanobpmn_engine_core::State::live_job_count).
+    /// Runs each partition's cheap `live_job_count()` at `Low` priority (never
     /// preempts completion) and is awaited only off the hot path.
     pub async fn job_backlog(&self) -> usize {
         let mut total = 0usize;
         for h in self.all() {
             total += h
-                .with_low(|j: &mut crate::journal::Journal| j.state().jobs.len())
+                .with_low(|j: &mut crate::journal::Journal| j.state().live_job_count())
                 .await;
         }
         total
