@@ -1435,7 +1435,7 @@ fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
                 if Arc::strong_count(&store) <= 1 {
                     break;
                 }
-                match ReadStore::adaptive_prune_once(
+                match store.adaptive_prune_once(
                     &mut conn,
                     high_bytes,
                     low_bytes,

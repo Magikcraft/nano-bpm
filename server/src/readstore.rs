@@ -345,6 +345,19 @@ fn prune_oldest_terminal(conn: &mut Connection, batch: usize) -> rusqlite::Resul
 /// with engine writes.
 pub struct ReadStore {
     conn: Mutex<Connection>,
+    /// In-process write-coordination lock shared by the two independent SQLite
+    /// writers on this shard's WAL file: the exporter (`export`, on `conn`) and
+    /// the decoupled adaptive pruner (`adaptive_prune_once`, on the separate
+    /// connection from `prune_connection`). WAL permits only one writer, so a
+    /// long pruner delete + `wal_checkpoint(TRUNCATE)` would otherwise trip the
+    /// other connection's `busy_timeout` and surface as `database is locked`
+    /// (dropped/retried export batches — see #96/#97). Gating both writers on
+    /// this mutex turns that cross-connection SQLite lock race into a cheap
+    /// in-process wait, so their writes interleave cleanly and never error.
+    /// Held only around actual write statements and short enough (the pruner
+    /// acquires it per delete chunk) that neither side is starved; reads
+    /// (`page_stats`, request-handler queries) never take it.
+    write_lock: Mutex<()>,
     /// The shard's on-disk path (None for `:memory:`). Retained so the decoupled
     /// adaptive pruner can open its own second connection to the same WAL file and
     /// evict on an independent schedule, rather than competing for CPU with
@@ -394,6 +407,7 @@ impl ReadStore {
         }
         let store = Self {
             conn: Mutex::new(conn),
+            write_lock: Mutex::new(()),
             path: path.map(|p| p.to_path_buf()),
         };
         store.ensure_schema()?;
@@ -492,6 +506,14 @@ impl ReadStore {
     /// an overlapping prefix is safe. Takes event references so a caller batching
     /// several `Arc<Vec<Event>>` can project them without deep-copying payloads.
     pub fn export(&self, events: &[&Event]) -> rusqlite::Result<ExportOutcome> {
+        // Serialize against the adaptive pruner's separate connection in-process
+        // (see `write_lock`) so the two WAL writers never race SQLite's lock and
+        // trip `database is locked`; this is a cheap uncontended lock on the
+        // common path (pruner idle) and a short wait when the pruner is active.
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
         let mut conn = self.conn.lock().expect("read store poisoned");
         let tx = conn.transaction()?;
         let mut terminal_keys = Vec::new();
@@ -623,10 +645,12 @@ impl ReadStore {
     /// Opens a second connection to this shard's database file for the decoupled
     /// adaptive pruner (see [`prune_oldest_terminal`]). Returns `Ok(None)` for an
     /// in-memory store (a second connection would be a distinct empty database),
-    /// so the caller keeps pruning inline in that case. WAL mode lets this
-    /// connection's small delete transactions interleave with the exporter's
-    /// insert transactions at SQLite's write-lock granularity; `busy_timeout`
-    /// makes each side wait for the lock rather than erroring under contention.
+    /// so the caller keeps pruning inline in that case. This connection's delete
+    /// transactions are serialized against the exporter by the shared in-process
+    /// [`ReadStore::write_lock`] (see [`ReadStore::adaptive_prune_once`]), so the
+    /// two writers never race SQLite's WAL lock; `busy_timeout` remains only as a
+    /// backstop for any writer this process does not coordinate (e.g. an external
+    /// reader holding a checkpoint back).
     pub fn prune_connection(&self) -> rusqlite::Result<Option<Connection>> {
         let Some(path) = self.path.as_ref() else {
             return Ok(None);
@@ -645,6 +669,7 @@ impl ReadStore {
     /// terminal instances remain. Returns the number evicted; checkpoint-truncates
     /// the WAL if it deleted anything so freed pages do not accumulate there.
     pub fn adaptive_prune_once(
+        &self,
         conn: &mut Connection,
         high_bytes: u64,
         low_bytes: u64,
@@ -662,13 +687,27 @@ impl ReadStore {
                 break;
             }
             let want = batch.min(max_deletes - total);
-            let evicted = prune_oldest_terminal(conn, want)?;
+            // Gate each delete chunk on the shared in-process write lock so the
+            // pruner's connection never writes to the WAL while the exporter's
+            // does (no `database is locked`); the lock is released between chunks
+            // so the exporter interleaves and is never starved for a whole wake.
+            let evicted = {
+                let _write = self
+                    .write_lock
+                    .lock()
+                    .expect("read store write lock poisoned");
+                prune_oldest_terminal(conn, want)?
+            };
             if evicted == 0 {
                 break;
             }
             total += evicted;
         }
         if total > 0 {
+            let _write = self
+                .write_lock
+                .lock()
+                .expect("read store write lock poisoned");
             let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         }
         Ok(total)
@@ -2102,7 +2141,9 @@ mod definition_xml_tests {
 
         // Under budget (huge high-water): a cheap no-op, evicts nothing.
         assert_eq!(
-            ReadStore::adaptive_prune_once(&mut conn, u64::MAX, u64::MAX, 4096, 4096).unwrap(),
+            store
+                .adaptive_prune_once(&mut conn, u64::MAX, u64::MAX, 4096, 4096)
+                .unwrap(),
             0
         );
         assert_eq!(store.instance_count(), 7);
@@ -2110,7 +2151,7 @@ mod definition_xml_tests {
         // Over budget (high=low=1 forces eviction), capped at 2 deletes this wake:
         // the OLDEST two terminal (keys 1, 2) go first.
         assert_eq!(
-            ReadStore::adaptive_prune_once(&mut conn, 1, 1, 4096, 2).unwrap(),
+            store.adaptive_prune_once(&mut conn, 1, 1, 4096, 2).unwrap(),
             2
         );
         assert!(store.process_instance(1).is_none());
@@ -2120,7 +2161,9 @@ mod definition_xml_tests {
 
         // Next wake with a generous cap drains the remaining terminal (3,4,5)…
         assert_eq!(
-            ReadStore::adaptive_prune_once(&mut conn, 1, 1, 4096, 4096).unwrap(),
+            store
+                .adaptive_prune_once(&mut conn, 1, 1, 4096, 4096)
+                .unwrap(),
             3
         );
         // …but never the active instances.
@@ -2131,11 +2174,66 @@ mod definition_xml_tests {
 
         // Nothing terminal left: a no-op even while "over budget".
         assert_eq!(
-            ReadStore::adaptive_prune_once(&mut conn, 1, 1, 4096, 4096).unwrap(),
+            store
+                .adaptive_prune_once(&mut conn, 1, 1, 4096, 4096)
+                .unwrap(),
             0
         );
 
         drop(conn);
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn export_waits_on_the_shared_write_lock_instead_of_erroring() {
+        // Regression for #97: the exporter and the adaptive pruner are two
+        // independent WAL writers. With only SQLite's `busy_timeout` a long
+        // pruner write would surface to the exporter as `database is locked`
+        // (dropped/retried batch). The shared in-process `write_lock` must turn
+        // that into a clean wait: while the lock is held, `export` blocks and
+        // then succeeds — it never errors.
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-writelock-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = std::sync::Arc::new(ReadStore::open(Some(&path)).unwrap());
+
+        // Hold the write lock, mimicking a pruner mid delete+checkpoint.
+        let guard = store.write_lock.lock().expect("write lock");
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let store = store.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let created = created_event(1);
+                // Blocks on `write_lock` until the main thread releases it; must
+                // return Ok (no `database is locked`).
+                store.export(&[&created]).expect("export must not error");
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        // While the lock is held the export cannot have completed.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "export completed while the write lock was held — it did not serialize"
+        );
+
+        // Release; the export now proceeds and commits.
+        drop(guard);
+        handle.join().expect("export thread panicked");
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.process_instance(1).is_some());
+
         drop(store);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
