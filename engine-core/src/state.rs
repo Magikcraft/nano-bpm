@@ -765,6 +765,29 @@ impl State {
         Self::default()
     }
 
+    /// Count of jobs that represent *live* runnable congestion — `Created`
+    /// (waiting for a worker, in the activatable index) plus `Activated`
+    /// (leased, in-flight at a worker, in the activated index). Terminal jobs
+    /// (`Completed`/`Failed`/`Errored`) are deliberately excluded: they are
+    /// deindexed from both sets the instant they settle (see
+    /// [`resync_job_index`]) but linger in `jobs` until their owning instance is
+    /// evicted by the exporter. Counting `jobs.len()` instead would fold those
+    /// dead, un-evicted terminal jobs into the backpressure reading, so an
+    /// exporter that falls behind (or is stalled by a locked read-model store)
+    /// silently inflates the admission/governor congestion signal and sheds
+    /// legitimate new work — a self-inflicted throughput collapse that never
+    /// clears, since the leaked terminal jobs are never re-exported. The two
+    /// indices are disjoint and kept in lockstep with `jobs`, so their combined
+    /// size is the exact live backlog at `O(#job_types)`.
+    pub fn live_job_count(&self) -> usize {
+        self.activated_jobs.len()
+            + self
+                .activatable_jobs
+                .values()
+                .map(|set| set.len())
+                .sum::<usize>()
+    }
+
     /// Removes `key` from both job indices (the activatable set under
     /// `job_type`, and the activated set), pruning an emptied per-type set.
     /// Used when a job is dropped from `jobs` entirely (eviction), where
