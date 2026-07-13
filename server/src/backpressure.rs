@@ -18,8 +18,23 @@
 //! is limited (instances) — it makes the *limit itself* track latency.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Live-published internal state of a self-optimizing [`LatencyLimiter`] governor,
+/// so the ~1 Hz monitor can surface *why* the governor is holding its cap where it
+/// is (and a shed message can explain it). The limiter owns the write side (the
+/// engine thread updates it each window); the server keeps a clone of the read
+/// side. Latencies are whole microseconds. All zero until the first window folds.
+#[derive(Clone, Default)]
+pub struct GovernorObs {
+    /// Self-calibrated uncongested baseline latency (µs) the congestion threshold
+    /// is derived from (`threshold = baseline × `[`CONGESTION_RATIO`]).
+    pub baseline_us: Arc<AtomicU64>,
+    /// The most recent window's mean per-command latency (µs) — the value compared
+    /// against the threshold. Above it, the governor backed the cap off.
+    pub window_avg_us: Arc<AtomicU64>,
+}
 
 /// Parsed configuration for the backpressure subsystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,7 +259,7 @@ const MAX_LIMIT: usize = 20_000;
 const INITIAL_LIMIT: usize = MIN_LIMIT;
 /// A window's average latency above `baseline * CONGESTION_RATIO` is treated as
 /// queueing (congestion) and triggers a multiplicative decrease.
-const CONGESTION_RATIO: f64 = 2.0;
+pub const CONGESTION_RATIO: f64 = 2.0;
 /// Multiplicative-decrease factor applied on congestion (AIMD's "MD").
 const BACKOFF: f64 = 0.9;
 /// Per-window upward drift of the latency baseline when no faster sample is seen,
@@ -350,6 +365,10 @@ struct LatencyLimiter {
     signal: Arc<AtomicUsize>,
     /// Stable tag for the verbose convergence log (`adaptive`, `backlog-governor`).
     label: &'static str,
+    /// Optional live-published governor state for the ~1 Hz monitor / shed message.
+    /// Present for the backlog governor; `None` for limiters whose internals aren't
+    /// surfaced.
+    obs: Option<GovernorObs>,
 }
 
 impl LatencyLimiter {
@@ -359,6 +378,11 @@ impl LatencyLimiter {
         let prev = self.aimd.limit();
         let new_limit = self.aimd.on_window(avg_us, signal);
         self.shared.store(new_limit, Ordering::Relaxed);
+        if let Some(obs) = &self.obs {
+            obs.baseline_us
+                .store(self.aimd.baseline_us() as u64, Ordering::Relaxed);
+            obs.window_avg_us.store(avg_us as u64, Ordering::Relaxed);
+        }
         if verbose && new_limit != prev {
             tracing::info!(
                 "backpressure({}): limit {prev} -> {new_limit} (avg {avg_us:.0}us, \
@@ -428,6 +452,7 @@ impl AdaptiveController {
             shared: shared.clone(),
             signal: inflight,
             label: "adaptive",
+            obs: None,
         });
         shared
     }
@@ -440,21 +465,24 @@ impl AdaptiveController {
     /// backing off multiplicatively the moment per-command latency inflates past
     /// its self-calibrated baseline — i.e. it holds the system just left of the
     /// congestion-collapse knee. Returns the shared cap handle the admission gate
-    /// reads.
+    /// reads, plus a [`GovernorObs`] read handle whose baseline / window-latency
+    /// the monitor and shed message surface to explain the live cap.
     pub fn with_backlog_governor(
         &mut self,
         floor: usize,
         ceiling: usize,
         runnable: Arc<AtomicUsize>,
-    ) -> Arc<AtomicUsize> {
+    ) -> (Arc<AtomicUsize>, GovernorObs) {
         let shared = Arc::new(AtomicUsize::new(floor));
+        let obs = GovernorObs::default();
         self.backlog = Some(LatencyLimiter {
             aimd: AimdLimit::new(floor, floor, ceiling),
             shared: shared.clone(),
             signal: runnable,
             label: "backlog-governor",
+            obs: Some(obs.clone()),
         });
-        shared
+        (shared, obs)
     }
 
     /// Install the self-optimizing worker-concurrency governor: it tunes the
@@ -482,6 +510,7 @@ impl AdaptiveController {
             shared: shared.clone(),
             signal: backlog,
             label: "worker-governor",
+            obs: None,
         });
         shared
     }
@@ -739,7 +768,7 @@ mod tests {
     fn backlog_governor_grows_toward_ceiling_while_healthy_and_loaded() {
         let runnable = Arc::new(AtomicUsize::new(100_000)); // backlog well above the cap
         let mut c = AdaptiveController::new();
-        let cap = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
         assert_eq!(cap.load(Ordering::Relaxed), 2_000, "starts at the floor");
 
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
@@ -756,7 +785,7 @@ mod tests {
     fn backlog_governor_backs_off_to_floor_under_congestion() {
         let runnable = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let cap = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
         // Grow it up a bit first.
         for _ in 0..5 {
@@ -782,7 +811,7 @@ mod tests {
         // never the reason the cap moves.
         let runnable = Arc::new(AtomicUsize::new(0));
         let mut c = AdaptiveController::new();
-        let cap = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
         for _ in 0..20 {
             drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
@@ -792,6 +821,32 @@ mod tests {
             2_000,
             "pure parked load (runnable=0) must never grow the cap"
         );
+    }
+
+    #[test]
+    fn backlog_governor_publishes_observability_baseline_and_window_latency() {
+        let runnable = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let (_cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        // Nothing published until a window folds.
+        assert_eq!(obs.baseline_us.load(Ordering::Relaxed), 0);
+        assert_eq!(obs.window_avg_us.load(Ordering::Relaxed), 0);
+
+        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // first window sets the baseline
+        assert_eq!(
+            obs.baseline_us.load(Ordering::Relaxed),
+            100,
+            "baseline is published from the first folded window"
+        );
+        assert_eq!(obs.window_avg_us.load(Ordering::Relaxed), 100);
+
+        // A congested window must publish the elevated window latency while the
+        // baseline stays frozen at the uncongested floor (never adapts upward to a
+        // congested sample) — exactly the pair a shed message needs to explain the
+        // backoff.
+        drive_window(&mut c, 5_000, WINDOW_MIN_SAMPLES);
+        assert_eq!(obs.baseline_us.load(Ordering::Relaxed), 100);
+        assert_eq!(obs.window_avg_us.load(Ordering::Relaxed), 5_000);
     }
 
     #[test]
